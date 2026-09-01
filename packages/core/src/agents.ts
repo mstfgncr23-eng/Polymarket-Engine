@@ -57,10 +57,45 @@ if (externalAgentRoleDefinitions.length !== 6 || new Set(externalAgentRoleDefini
   throw new Error("EXACTLY_SIX_EXTERNAL_GROK_ROLES_REQUIRED");
 }
 
+export const grokWriteToolNames = ["submit_signal", "submit_analysis", "recommend_hedge", "recommend_veto"] as const;
+export type GrokWriteToolName = (typeof grokWriteToolNames)[number];
+
+export class GrokSignalValidationError extends Error {
+  constructor(readonly code: string, message = code) {
+    super(message);
+    this.name = "GrokSignalValidationError";
+  }
+}
+
 export function validateExternalAgentRoleId(value: unknown): ExternalAgentRoleId {
   return externalAgentRoleIdSchema.parse(value);
 }
 
 export function validateGrokSignalSubmission(value: unknown): GrokSignalSubmission {
   return grokSignalSubmissionSchema.parse(value);
+}
+
+/** Maps the four limited MCP write tools onto the same Zod-validated inbox payload. */
+export function parseGrokWritePayload(tool: string, raw: unknown): GrokSignalSubmission {
+  if (!(grokWriteToolNames as readonly string[]).includes(tool)) {
+    throw new GrokSignalValidationError("UNKNOWN_WRITE_TOOL", `Unsupported write tool: ${tool}`);
+  }
+  const parsed = grokSignalSubmissionSchema.safeParse(raw);
+  if (!parsed.success) throw parsed.error;
+  const submission = parsed.data;
+  if (tool === "submit_analysis" && submission.agentId !== "fair_probability_analyst") {
+    throw new GrokSignalValidationError("WRITE_TOOL_ROLE_MISMATCH", "submit_analysis requires fair_probability_analyst");
+  }
+  if (tool === "recommend_veto" || tool === "recommend_hedge") {
+    if (submission.agentId !== "risk_hedge_analyst") {
+      throw new GrokSignalValidationError("WRITE_TOOL_ROLE_MISMATCH", `${tool} requires risk_hedge_analyst`);
+    }
+    if (tool === "recommend_veto" && submission.output.recommendVeto !== true) {
+      throw new GrokSignalValidationError("VETO_RECOMMENDATION_REQUIRED");
+    }
+    if (tool === "recommend_hedge" && submission.output.recommendVeto === true) {
+      throw new GrokSignalValidationError("HEDGE_TOOL_CANNOT_VETO");
+    }
+  }
+  return submission;
 }

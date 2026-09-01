@@ -2,56 +2,59 @@
 
 Production-shaped, event-driven research system for a 48-hour experiment using public live Polymarket and BTC data. It creates **paper orders only**. There is no wallet integration, signer, private CLOB client, or live-order path; `TRADING_MODE` accepts only `paper`, and the live adapter always throws `LIVE_TRADING_DISABLED`.
 
+Research comes from **external Grok Bots** over a bearer-authenticated Streamable HTTP MCP endpoint. This repository does not call OpenAI, does not require `OPENAI_API_KEY`, and does not place live Polymarket orders.
+
 ## Architecture
 
 ```mermaid
 flowchart LR
-  PM[Polymarket public CLOB v2\nREST + market WebSocket] --> E[Always-on engine]
+  GB[Six Grok Bots] -->|Streamable HTTP MCP /mcp\nbearer auth| E[Always-on Fly engine]
+  PM[Polymarket public CLOB v2\nREST + market WebSocket] --> E
   BTC[Binance BTC aggTrade\nWebSocket] --> E
   E --> T[Deterministic trigger engine]
-  T --> A[Six-agent orchestrator]
-  A --> C[Validated consensus]
+  T --> IN[Signal inbox / freshness window]
+  GB --> IN
+  IN --> C[Validated consensus]
   C --> R[Deterministic risk veto]
   R --> X[Conservative paper execution]
   X --> L[Ledger + positions]
   E --> J[(PostgreSQL append-only journal\n+ checkpoints)]
   L --> J
-  E --> API[Fastify REST + SSE + metrics]
+  E --> API[Fastify REST + SSE + /health /ready /metrics]
   API --> D[Separate Next.js dashboard]
 ```
 
-The pnpm workspace contains `apps/engine`, `apps/dashboard`, and focused `packages/core`, `packages/db`, and `packages/market-data`. PostgreSQL journal events are the canonical audit trail. Typed tables and migrations cover markets, snapshots, triggers, invocations/outputs, consensus, risk, orders/fills, positions/hedges, PnL, costs, health, strategy versions/proposals, experiments, journal events, and checkpoints.
+The pnpm workspace contains `apps/engine`, `apps/dashboard`, and focused `packages/core`, `packages/db`, and `packages/market-data`. PostgreSQL journal events are the canonical audit trail.
 
-Every important event carries a trace ID. `/api/traces/:traceId` reconstructs the source market evidence, participating agents, consensus, risk result, order/fill, and resulting position from the append-only journal.
+Every important event carries a trace ID. `/api/traces/:traceId` reconstructs the source market evidence, participating Grok roles, consensus, risk result, order/fill, and resulting position from the append-only journal.
 
-## Trigger and agent flow
+## Trigger and Grok Bot flow
 
 ```mermaid
 flowchart TD
   M[Every market message] --> F[Decimal-safe features]
   F --> G{Threshold + debounce\n+ cooldown + dedupe}
-  G -->|Level 0| N[Persist/monitor only]
-  G -->|Level 1| L[Luna microstructure + BTC]
-  G -->|Info justified| I[Luna information + web search]
-  G -->|Level 2| T[Luna then two Terra agents]
-  G -->|Level 3| S[Luna + Terra + possible Sol]
+  G -->|Any level| P[Persist trigger immediately]
+  P --> W[Grok research window]
+  W -->|fresh signals meet minimum roles| C[Weighted consensus]
+  W -->|Grok unavailable or stale| M2[Continue monitoring\nno paper order]
 ```
 
 ```mermaid
 flowchart LR
-  L1[Luna #1\nMicrostructure] --> T1[Terra #1\nFair probability]
-  L2[Luna #2\nBTC regime] --> T1
-  L3[Luna #3\nInformation, only when justified] --> T1
-  L1 --> T2[Terra #2\nRisk & hedge recommendation]
-  L2 --> T2
-  T1 --> D{Severe event, disagreement,\nloss/regime escalation?}
-  T2 --> D
-  D -->|yes| S[Sol supervisor]
-  S --> P[Strategy change stored PROPOSED]
-  D -->|no| C[Consensus]
+  S1[market_microstructure_scanner] --> IN[MCP submit_signal]
+  S2[crypto_market_scanner] --> IN
+  S3[news_x_intelligence_scanner] --> IN
+  A1[fair_probability_analyst] --> AN[MCP submit_analysis]
+  R1[risk_hedge_analyst] --> H[MCP recommend_hedge / recommend_veto]
+  SV[strategy_supervisor] --> IN
+  IN --> C[Consensus]
+  AN --> C
+  H --> V{Deterministic risk}
+  C --> V
 ```
 
-Exactly six logical agent definitions exist: three `gpt-5.6-luna`, two `gpt-5.6-terra`, and one escalation-only `gpt-5.6-sol`. They use the OpenAI Agents SDK `Agent`, `Runner`, Zod `outputType`, cancellation, tracing metadata, usage capture, and replaceable pricing. Agents receive no order tool. Missing `OPENAI_API_KEY` produces model-unavailable events while deterministic monitoring continues.
+Exactly six logical Grok Bot roles exist. They are **external** MCP clients. They may only read bounded state and submit structured research. They have no wallet, signer, or `place_order` tool. Missing Grok Bots produce no fake activity; deterministic monitoring continues.
 
 ## Deterministic trade and risk
 
@@ -67,22 +70,7 @@ flowchart LR
   R -->|any reason code| V[Persist rejection]
 ```
 
-```mermaid
-flowchart TD
-  Q[Candidate] --> A{Feeds fresh?}
-  A -->|no| V[VETO]
-  A --> B{DB and timestamps valid?}
-  B -->|no| V
-  B --> C{Loss, drawdown, exposure,\nliquidity and spread within limits?}
-  C -->|no| V
-  C --> D{Signal fresh/confident,\nedge after costs sufficient?}
-  D -->|no| V
-  D --> E{Call/cost budgets, cooldown,\ndeduplication and experiment open?}
-  E -->|no| V
-  E -->|yes| P[ALLOW PAPER EXECUTION]
-```
-
-Risk has absolute veto authority and emits machine-readable codes. Limits include order/market/total/directional/unhedged exposure, unhedged duration, loss/drawdown, liquidity, edge, spread, signal confidence/expiry, feed staleness, agent rate/cost budgets, cooldown, duplicates, unknown fees, execution failures, experiment closure, and shutdown.
+Risk has absolute veto authority and emits machine-readable codes. Limits include order/market/total/directional/unhedged exposure, unhedged duration, loss/drawdown, liquidity, edge, spread, signal confidence/expiry, feed staleness, external signal rate, cooldown, duplicates, unknown fees, execution failures, experiment closure, and shutdown.
 
 The Temporal Pair/Hedge strategy is behind a pluggable interface. A pair becomes locked only after both real-book-derived simulated fills exist. Until then, first-leg quantity and directional exposure remain explicit.
 
@@ -114,7 +102,7 @@ pnpm dev:engine
 pnpm dev:dashboard
 ```
 
-Dashboard: `http://localhost:3000`; engine liveness/readiness/metrics: `http://localhost:8080/health`, `/ready`, `/metrics`. The dashboard connects through its server-side `ENGINE_INTERNAL_URL` proxy, so the private engine address and engine secrets are not shipped to the browser.
+Dashboard: `http://localhost:3000`; engine liveness/readiness/metrics: `http://localhost:8080/health`, `/ready`, `/metrics`. Grok MCP: `http://localhost:8080/mcp` (POST, bearer auth). The dashboard connects through its server-side `ENGINE_INTERNAL_URL` proxy, so the private engine address and `GROK_MCP_BEARER_TOKENS` are not shipped to the browser.
 
 ### Environment variables
 
@@ -131,9 +119,9 @@ Dashboard: `http://localhost:3000`; engine liveness/readiness/metrics: `http://l
 | `POLYMARKET_MARKET_SLUGS` | Optional comma-separated explicit live markets |
 | `POLYMARKET_TOKEN_IDS` | Optional manual public token IDs; missing fee metadata will veto fills |
 | `BTC_WS_URL`, `BTC_SYMBOL` | Public BTC feed; Binance aggTrade default |
-| `AI_ENABLED` | Enables event-triggered calls; monitoring survives failures/budget exhaustion |
-| `OPENAI_API_KEY` | Optional engine-only secret; never required/provisioned by this repository |
-| `AI_HOURLY_BUDGET_USD`, `AI_DAILY_BUDGET_USD` | Hard nonessential-call budgets |
+| `GROK_MCP_BEARER_TOKENS` | Engine-only `clientId:token` list. Dashboard never receives it. Token fingerprints, not raw tokens, are audited. |
+| `GROK_MCP_ALLOWED_ORIGINS` | Allowed `Origin` values; missing Origin is allowed for server-side Grok clients. Default `https://grok.com,https://x.ai` |
+| `GROK_MCP_RATE_LIMIT_PER_MINUTE` | Per-client MCP request cap, default `60` |
 | `ESTIMATED_INFRA_COST_PER_HOUR_USD` | Accrued into economic PnL |
 | `DASHBOARD_ORIGIN` | Allowed browser origin for engine API |
 | `ENGINE_INTERNAL_URL` | Dashboard server-to-engine URL; not `NEXT_PUBLIC_*` |
@@ -141,31 +129,33 @@ Dashboard: `http://localhost:3000`; engine liveness/readiness/metrics: `http://l
 | `GIT_SHA` | Recorded in experiment manifest |
 | `REPORT_DIRECTORY` | Automatic summary output, default `reports` |
 
-Do not put wallet keys, signing keys, or Polymarket private credentials in this milestone.
+Do not put wallet keys, signing keys, OpenAI keys, or Polymarket private credentials in this milestone. This repository does not create or provision xAI credentials and does not call an xAI inference API.
+
+See [docs/GROK_BOT.md](docs/GROK_BOT.md) for the exact Grok Bot UI steps.
 
 ## Commands and verification
 
 ```bash
 pnpm typecheck             # strict TypeScript across all workspaces
-pnpm test                  # unit, integration-boundary, malicious-output acceptance
+pnpm test                  # unit, integration-boundary, MCP/auth, malicious-output acceptance
 pnpm build                 # engine bundle + standalone Next dashboard
 pnpm smoke                 # deterministic fixture: consensus -> fill -> ledger
 pnpm smoke:live            # public Polymarket + BTC connectivity; no orders/agents
 pnpm report                # rebuild reports/48h-summary.{json,md} from DATABASE_URL journal
 ```
 
-Tests cover pair/PnL math, fee curve, slippage/VWAP, exposure/accounting, consensus, stale/expired/budget/risk vetoes, maker/taker execution, insufficient depth, trigger dedupe, provider failure, invalid output, timeout, journal outage/recovery, reconnect backoff, feed parsing, exact-six topology, and the hard live-order gate.
+Tests cover pair/PnL math, fee curve, slippage/VWAP, exposure/accounting, consensus, stale/expired/budget/risk vetoes, maker/taker execution, insufficient depth, trigger dedupe, Grok unavailable continuity, malformed/duplicate/stale/unauthorized MCP behavior, forbidden trade-tool rejection, journal outage/recovery, reconnect backoff, feed parsing, exact-six topology, and the hard live-order gate.
 
 ## 48-hour procedure
 
-1. Set a durable `DATABASE_URL`, `TRADING_MODE=paper`, market selection (or allow BTC discovery), budget values, `GIT_SHA`, and optionally an existing `OPENAI_API_KEY`.
+1. Set a durable `DATABASE_URL`, `TRADING_MODE=paper`, market selection (or allow BTC discovery), `GROK_MCP_BEARER_TOKENS`, `GIT_SHA`.
 2. Run all verification commands and `pnpm smoke:live`.
 3. Start once with `EXPERIMENT_DURATION_HOURS=48 pnpm experiment:start` (PowerShell: `$env:EXPERIMENT_DURATION_HOURS='48'; pnpm experiment:start`).
-4. Monitor `/ready`, `/metrics`, dashboard SSE state, risk vetoes, AI budget, directional positions, and journal growth.
+4. Point the six Grok Bots at `https://<engine>/mcp` using the operator-managed bearer tokens. Monitor `/ready`, `/metrics`, dashboard SSE state, risk vetoes, Grok signal freshness, directional positions, and journal growth.
 5. At the deadline the engine changes the manifest to `ENTRY_CLOSED`, stops opening new positions, checkpoints, retains raw data, and writes both summary files. Existing positions remain observed per policy.
 6. Rebuild the report at any time with `DATABASE_URL=... EXPERIMENT_ID=... pnpm report`.
 
-The report includes opportunities, accepts/rejects, orders/fills and rates, maker/taker split, completed/incomplete pairs, win/loss events, PnL/cost layers, drawdown/exposure, hedge duration/failures, pair/edge statistics, per-agent counts/cost/performance events, regime/hour attribution, counterfactual event counts, and errors. Metrics without observed attribution events remain empty/zero rather than fabricated.
+The report includes opportunities, accepts/rejects, orders/fills and rates, maker/taker split, completed/incomplete pairs, win/loss events, PnL/cost layers, drawdown/exposure, hedge duration/failures, pair/edge statistics, per-role Grok signal counts, regime/hour attribution, counterfactual event counts, and errors. Metrics without observed attribution events remain empty/zero rather than fabricated.
 
 ## Fly.io: two independent apps
 
@@ -180,22 +170,22 @@ docker build -f Dockerfile.engine -t polymarket-engine:local .
 docker build -f Dockerfile.dashboard -t polymarket-dashboard:local .
 ```
 
-Exact creation/deployment sequence (run only after validation):
+Exact creation/deployment sequence (run only after validation; this repository does not deploy):
 
 ```bash
 fly apps create polymarket-engine --org <org>
 fly apps create polymarket-dashboard --org <org>
-fly secrets set -a polymarket-engine DATABASE_URL='<postgres-url>' OPENAI_API_KEY='<optional-existing-key>'
+fly secrets set -a polymarket-engine DATABASE_URL='<postgres-url>' GROK_MCP_BEARER_TOKENS='market_microstructure_scanner:<token>,crypto_market_scanner:<token>,news_x_intelligence_scanner:<token>,fair_probability_analyst:<token>,risk_hedge_analyst:<token>,strategy_supervisor:<token>'
 fly secrets set -a polymarket-dashboard ENGINE_INTERNAL_URL='http://polymarket-engine.flycast:8080'
 fly deploy -a polymarket-engine -c fly.engine.toml --flycast --ha=false
 fly deploy -a polymarket-dashboard -c fly.dashboard.toml --ha=false
 ```
 
-`fly.engine.toml` has `auto_stop_machines="off"`, one minimum Machine, SIGTERM/60s, `/health`, `/ready`, Prometheus metrics, and restart-always. `fly.dashboard.toml` has its own image/fate, health check, autostop, and no engine credentials.
+`fly.engine.toml` has `auto_stop_machines="off"`, one minimum Machine, SIGTERM/60s, `/health`, `/ready`, Prometheus metrics, and restart-always. `fly.dashboard.toml` has its own image/fate, health check, autostop, and no engine credentials. `/mcp` is served by the same engine HTTP service.
 
 ## Recovery and operational behavior
 
-On SIGTERM the engine marks itself draining/not-ready, rejects new decisions, aborts pending agent runs, stops feed loops, accrues infrastructure cost, saves an experiment/ledger/position/resting-order checkpoint, closes SSE/journal, and exits before Fly's kill timeout. On boot it migrates/checks PostgreSQL with bounded retry, restores the latest checkpoint, reconnects both feeds, and becomes ready only after DB plus first messages from both feeds.
+On SIGTERM the engine marks itself draining/not-ready, rejects new decisions, stops feed loops, accrues infrastructure cost, saves an experiment/ledger/position/resting-order/Grok-signal checkpoint, closes SSE/journal, and exits before Fly's kill timeout. On boot it migrates/checks PostgreSQL with bounded retry, restores the latest checkpoint, reconnects both feeds, and becomes ready only after DB plus first messages from both feeds.
 
 Health semantics: `/health` means the process is alive; `/ready` requires non-draining engine, DB, connected Polymarket/BTC streams, and initial messages. Fly health-check failures alone do not restart a process; the always restart policy covers process exits.
 
@@ -203,11 +193,12 @@ Health semantics: `/health` means the process is alive; `/ready` requires non-dr
 
 - No live trading, wallet, authentication/signing, settlement transaction, or private CLOB endpoint exists by design.
 - A real 48-hour outcome cannot be produced during repository construction. Reports are generated only from recorded events; no performance claim is included.
-- Live agent calls need an operator-supplied existing `OPENAI_API_KEY`; without it, their real token/cost and contribution statistics cannot be observed.
+- Grok Bots are configured in the Grok UI by the operator. This repo never provisions xAI credentials or calls an xAI inference API.
+- If Grok Bots are disconnected, the engine continues deterministic monitoring and will not invent agent activity or paper trades from missing research.
 - Full PostgreSQL/docker recovery and strict Fly validation require locally available PostgreSQL, Docker, and Fly CLI. In-memory recovery tests validate the repository contract but are not a substitute for a fault-injected production database test.
 - Public feed payloads/rate limits/fees can evolve. The adapter uses current unified `@polymarket/client` market APIs and preserves raw payloads, but should be revalidated before each experiment.
 - Maker queue inference cannot identify cancellations, hidden liquidity, or queue priority; the 50% post-queue rule is deliberately conservative.
 - Initial Fly topology is a singleton engine. Horizontal engine scaling is unsafe until leader election and event claiming are implemented.
 - Attribution-by-agent/regime/hour and rejected-winner labels require downstream outcome/settlement observations; absent labels are reported as absent, never inferred.
 
-Current implementation references: [OpenAI Agents SDK](https://openai.github.io/openai-agents-js/), [OpenAI model documentation](https://platform.openai.com/docs/models), [Polymarket developer documentation](https://docs.polymarket.com/), and [Fly Machines documentation](https://fly.io/docs/machines/).
+Current implementation references: [MCP Streamable HTTP](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http), [xAI remote MCP tools](https://docs.x.ai/developers/tools/remote-mcp), [Grok connectors](https://docs.x.ai/grok/connectors), [Polymarket developer documentation](https://docs.polymarket.com/), and [Fly Machines documentation](https://fly.io/docs/machines/).

@@ -44,8 +44,8 @@ if (command === "experiment:start") {
   const consensus = buildConsensus({
     traceId, triggerId: createId("trigger"), deterministicEdge: 0.04, now,
     signals: [
-      { agentId: "luna_market_microstructure", direction: "UP", confidence: 0.8, expiresAt: new Date(now.getTime() + 30_000).toISOString(), evidenceIds: [snapshot.eventId] },
-      { agentId: "terra_fair_probability", direction: "UP", confidence: 0.82, expiresAt: new Date(now.getTime() + 30_000).toISOString(), evidenceIds: [snapshot.eventId] },
+      { agentId: "market_microstructure_scanner", direction: "UP", confidence: 0.8, expiresAt: new Date(now.getTime() + 30_000).toISOString(), evidenceIds: [snapshot.eventId] },
+      { agentId: "fair_probability_analyst", direction: "UP", confidence: 0.82, expiresAt: new Date(now.getTime() + 30_000).toISOString(), evidenceIds: [snapshot.eventId] },
     ], config: defaultConsensusConfig,
   });
   const strategy = new TemporalPairHedgeStrategy();

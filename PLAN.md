@@ -4,8 +4,8 @@
 
 ### Current repository state
 
-- The production-shaped paper engine, PostgreSQL journal/checkpoints, market adapters, trigger/consensus/risk/execution/accounting pipeline, REST/SSE API, dashboard, experiment/reporting, Docker/Fly files, and 20-test baseline already exist and pass locally.
-- The component being replaced is the push-style OpenAI Agents SDK provider/orchestrator, its `OPENAI_API_KEY` runtime dependency, GPT-5.6 Luna/Terra/Sol identifiers, and OpenAI token-pricing accounting.
+- The production-shaped paper engine, PostgreSQL journal/checkpoints, market adapters, trigger/consensus/risk/execution/accounting pipeline, REST/SSE API, dashboard, experiment/reporting, Docker/Fly files, and baseline tests already exist.
+- The 2026-09-01 Grok Bot / remote MCP migration replaced the OpenAI Agents SDK runtime path: no `OPENAI_API_KEY`, no GPT-5.6 Luna/Terra/Sol runtime routing, no OpenAI token billing. External Grok Bots submit research through authenticated `/mcp`.
 - Deterministic monitoring and all order/risk boundaries remain in place; the migration must not add any wallet, order, signer, or live-trading MCP capability.
 
 ### Target architecture
@@ -93,7 +93,7 @@ BTC WebSocket -------------------/             |
 - `polymarket-dashboard` is a separate Fly app. It reads only the engine's public dashboard API and may autostop independently.
 - PostgreSQL is the durable source of truth. In-memory state is a projection rebuilt from persisted checkpoints plus journal events.
 - Browser clients use SSE for live updates with event IDs and reconnect support. Historical chart data uses bounded REST queries.
-- LLMs never receive order-submission tools and can never bypass schema validation, deterministic consensus, deterministic calculations, or risk vetoes.
+- `LLMs` / Grok Bots never receive order-submission tools and can never bypass schema validation, deterministic consensus, deterministic calculations, or risk vetoes.
 
 ## Implementation phases
 
@@ -182,7 +182,7 @@ BTC WebSocket -------------------/             |
 - Both images run as non-root users, use Node.js 22, have deterministic build/start commands, and expose only required ports.
 - Engine shutdown handles SIGTERM by marking readiness false, stopping new decisions/orders, canceling pending simulated decisions, draining/persisting journal state, checkpointing positions, closing feeds, stopping the HTTP server, and exiting before Fly's kill timeout.
 - Engine boot loads/checks the latest experiment and strategy version, replays/reconciles positions and resting paper orders, starts readiness as false, reconnects both feeds, and becomes ready only after the DB and required fresh market state are available.
-- Secrets are documented as Fly secrets. Dashboard configuration must never include OpenAI, wallet, signing, or Polymarket private credentials.
+- Secrets are documented as Fly secrets. Dashboard configuration must never include Grok MCP bearer tokens, OpenAI keys, wallet, signing, or Polymarket private credentials.
 - Pre-deployment sequence will validate environment schemas, build/test both apps, build images, run `fly config validate --strict` for each config, inspect the rendered configuration, and only then document (not execute) `fly deploy` commands.
 
 ## Completion evidence to report
