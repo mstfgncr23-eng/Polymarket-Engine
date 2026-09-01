@@ -6,7 +6,7 @@ import {
   createId,
   decidePaperOrder,
   defaultConsensusConfig,
-  engineEnvSchema,
+  parseEngineEnv,
   executePaperTaker,
   experimentManifestSchema,
   qualificationConfigSchema,
@@ -1333,7 +1333,7 @@ export class EngineService {
   pruneRuntimeBookkeepingForTest(): void { this.pruneRuntimeBookkeeping(); }
 }
 
-export function parseEnv(env: NodeJS.ProcessEnv): EngineEnv { return engineEnvSchema.parse(env); }
+export function parseEnv(env: NodeJS.ProcessEnv): EngineEnv { return parseEngineEnv(env); }
 function splitList(value: string): string[] { return value.split(",").map((item) => item.trim()).filter(Boolean); }
 function uniqueStrings(values: readonly string[]): string[] { return [...new Set(values.filter(Boolean))]; }
 function dateOrNull(value: string | null | undefined): Date | null { return value ? new Date(value) : null; }

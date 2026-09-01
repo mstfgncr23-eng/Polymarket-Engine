@@ -23,3 +23,14 @@ jobs:
       - run: pnpm build
       - run: pnpm smoke
       # Live Polymarket/Binance smokes are operator/manual. They need no repo secrets but are network-flaky.
+
+  engine-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build engine image
+        run: docker build -f Dockerfile.engine -t polymarket-engine:ci .
+      - name: Report directory writable as engine user
+        run: >
+          docker run --rm --user engine --entrypoint sh polymarket-engine:ci -c
+          'test "$(id -un)" = engine && test -w /app/reports && touch /app/reports/.writable && test -f /app/reports/.writable'

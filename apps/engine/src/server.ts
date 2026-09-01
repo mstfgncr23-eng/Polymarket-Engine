@@ -132,8 +132,8 @@ export async function createApiServer(input: {
     return { events: await input.journal.queryEvents({ types: DECISION_EVENT_TYPES, limit: 500 }) };
   });
   app.post("/api/operator/experiment/start", async (request, reply) => {
-    const token = input.operatorToken ?? input.engineReadToken;
-    const auth = protect(request, token, true);
+    if (!input.operatorToken) return reply.code(401).send({ error: "ENGINE_OPERATOR_UNAUTHORIZED" });
+    const auth = protect(request, input.operatorToken, true);
     if (!auth.ok) return reply.code(401).send({ error: "ENGINE_OPERATOR_UNAUTHORIZED" });
     if (!input.startExperiment) return reply.code(503).send({ error: "EXPERIMENT_START_UNAVAILABLE" });
     return input.startExperiment();

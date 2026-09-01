@@ -50,7 +50,7 @@ Paper settlement uses **public** Polymarket resolution only (`state.closed` / `r
 
 HTTP 451/403 from the reference venue is `REGION_BLOCKED` / `PROVIDER_BLOCKED`: fail closed, visible health, no paper execution that requires that reference, and a slow recheck (~30 min) rather than a 30–60s retry storm.
 
-The 48h **experiment clock does not start on boot**. Monitoring/discovery/feeds can start in `IDLE`. An operator starts the experiment with `pnpm experiment:start` or `POST /api/operator/experiment/start` (engine operator/read token). Preflight requires paper mode, Postgres, and working discovery; if `EXPERIMENT_REQUIRES_GROK=true` and `GROK_ACTIVATION_PROVIDER=noop`, start is blocked. Slack HTTP success is not a Grok wake.
+The 48h **experiment clock does not start on boot**. Monitoring/discovery/feeds can start in `IDLE`. An operator starts the experiment with `pnpm experiment:start` or `POST /api/operator/experiment/start` (`ENGINE_OPERATOR_TOKEN` only; the read token cannot start it). Preflight requires paper mode, Postgres, and working discovery; if `EXPERIMENT_REQUIRES_GROK=true` and `GROK_ACTIVATION_PROVIDER=noop`, start is blocked. Slack HTTP success is not a Grok wake.
 
 `EXPERIMENT_CLOSE_POLICY=observe_until_settlement` (default) stops new first legs at 48h, continues hedges/settlement, and writes the FINAL report only after experiment positions settle. `mark_to_market` snapshots remaining books, marks unresolved, and does not fabricate wins/losses.
 
@@ -231,6 +231,10 @@ Dashboard: `http://localhost:3000`; engine liveness/readiness/metrics: `http://l
 Do not put wallet keys, signing keys, OpenAI keys, or Polymarket private credentials in this milestone. This repository does not create or provision xAI credentials and does not call an xAI inference API.
 
 See [docs/GROK_BOT.md](docs/GROK_BOT.md) for the exact Grok Bot UI steps.
+
+## Deployment
+
+Operator runbook: [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) (Supabase `DATABASE_URL`, Fly secret **names**, Vercel server-only env, MONITOR_ONLY first boot). This repository does not auto-start the 48h experiment or enable live trading.
 
 ## Commands and verification
 
