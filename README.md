@@ -232,6 +232,10 @@ Do not put wallet keys, signing keys, OpenAI keys, or Polymarket private credent
 
 See [docs/GROK_BOT.md](docs/GROK_BOT.md) for the exact Grok Bot UI steps.
 
+## Deployment
+
+Operator runbook: [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) (Supabase `DATABASE_URL`, Fly secret **names**, Vercel server-only env, MONITOR_ONLY first boot). This repository does not auto-start the 48h experiment or enable live trading.
+
 ## Commands and verification
 
 ```bash

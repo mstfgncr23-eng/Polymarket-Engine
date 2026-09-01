@@ -1,12 +1,17 @@
 import Dashboard from "./dashboard";
+import { engineInternalUrl, engineReadHeaders } from "../lib/engine";
 import type { DashboardSnapshot } from "../lib/types";
 
 export const dynamic = "force-dynamic";
 
 async function initialSnapshot(): Promise<DashboardSnapshot | null> {
-  const base = process.env.ENGINE_INTERNAL_URL ?? "http://127.0.0.1:8080";
+  const base = engineInternalUrl();
   try {
-    const response = await fetch(`${base}/api/dashboard`, { cache: "no-store", signal: AbortSignal.timeout(3_000) });
+    const response = await fetch(`${base}/api/dashboard`, {
+      cache: "no-store",
+      signal: AbortSignal.timeout(3_000),
+      headers: engineReadHeaders(),
+    });
     return response.ok ? await response.json() as DashboardSnapshot : null;
   } catch {
     return null;

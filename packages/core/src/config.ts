@@ -103,6 +103,16 @@ export const engineEnvSchema = z.object({
 });
 export type EngineEnv = z.infer<typeof engineEnvSchema>;
 
+/** Production boot contract. Paper-only; durable Postgres journal; read token required. */
+export function assertProductionEngineEnv(env: EngineEnv): void {
+  if (env.TRADING_MODE !== "paper") throw new Error("LIVE_TRADING_DISABLED");
+  if (env.JOURNAL_MODE !== "postgres") throw new Error("IN_MEMORY_JOURNAL_FORBIDDEN_IN_PRODUCTION");
+  if (!env.DATABASE_URL) throw new Error("DATABASE_URL_REQUIRED_FOR_POSTGRES_JOURNAL");
+  if (!env.ENGINE_READ_TOKEN) throw new Error("ENGINE_READ_TOKEN_REQUIRED_IN_PRODUCTION");
+}
+
 export function parseEngineEnv(env: NodeJS.ProcessEnv): EngineEnv {
-  return engineEnvSchema.parse(env);
+  const parsed = engineEnvSchema.parse(env);
+  if (parsed.NODE_ENV === "production") assertProductionEngineEnv(parsed);
+  return parsed;
 }

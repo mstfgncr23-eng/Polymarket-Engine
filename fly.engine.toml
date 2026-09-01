@@ -1,3 +1,8 @@
+# Intended Fly app name. Operator must create/own this app (or pass --app).
+# Secrets stay in `fly secrets`, never in this file.
+# Paper MONITOR_ONLY boot: TRADING_MODE=paper, GROK_ACTIVATION_PROVIDER=noop.
+# Experiment stays IDLE until an explicit operator start. Do not enable live trading.
+# No Fly Managed Postgres — use operator-provisioned Supabase DATABASE_URL.
 app = "polymarket-engine"
 primary_region = "fra"
 kill_signal = "SIGTERM"
