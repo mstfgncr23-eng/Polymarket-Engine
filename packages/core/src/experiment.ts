@@ -78,7 +78,7 @@ Generated: ${summary.generatedAt}
 
 - Gross PnL: $${summary.grossPnlUsd.toFixed(2)}
 - Net trading PnL: $${summary.netTradingPnlUsd.toFixed(2)}
-- AI cost: $${summary.aiCostUsd.toFixed(2)}
+- AI cost (legacy ledger field, should remain $0 without OpenAI): $${summary.aiCostUsd.toFixed(2)}
 - Estimated infrastructure cost: $${summary.estimatedInfrastructureCostUsd.toFixed(2)}
 - Economic PnL: $${summary.economicPnlUsd.toFixed(2)}
 - Maximum drawdown: $${summary.maximumDrawdownUsd.toFixed(2)}
@@ -98,8 +98,8 @@ Generated: ${summary.generatedAt}
 
 - Maximum directional exposure: $${summary.maximumDirectionalExposureUsd.toFixed(2)}
 - Average unhedged duration: ${summary.averageUnhedgedDurationMs.toFixed(0)} ms
-- Model invocations: ${JSON.stringify(summary.modelInvocationCounts)}
-- Model cost by agent: ${JSON.stringify(summary.modelCostByAgentUsd)}
+- Grok Bot signals: ${JSON.stringify(summary.modelInvocationCounts)}
+- OpenAI token cost: $0 (runtime inference is not billed here)
 - Failures: ${JSON.stringify(summary.failureStatistics)}
 
 This report is computed from the append-only journal. Raw data is retained.

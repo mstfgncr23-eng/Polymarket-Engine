@@ -234,12 +234,31 @@ export class EngineService {
   }
 
   /** The only ingress for external Grok research; it cannot create orders directly. */
-  async submitGrokSignal(raw: GrokSignalSubmission, clientId: string): Promise<{ status: "accepted" | "duplicate" | "stale" | "unknown_trigger" | "trace_mismatch"; signalId?: string }> {
-    const submission = grokSignalSubmissionSchema.parse(raw);
+  async submitGrokSignal(raw: GrokSignalSubmission, clientId: string): Promise<{ status: "accepted" | "duplicate" | "stale" | "unknown_trigger" | "trace_mismatch" | "market_mismatch" | "replay_rejected" | "malformed" | "identity_mismatch"; signalId?: string }> {
+    let submission: GrokSignalSubmission;
+    try { submission = grokSignalSubmissionSchema.parse(raw); }
+    catch {
+      this.state.recordGrokRejection("rejected");
+      this.metrics.grokSignals.inc({ agent: "unknown", status: "malformed" });
+      return { status: "malformed" };
+    }
+    if (submission.agentId !== submission.role || clientId !== submission.agentId) {
+      this.state.recordGrokRejection("rejected");
+      this.metrics.grokSignals.inc({ agent: submission.agentId, status: "identity_mismatch" });
+      return { status: "identity_mismatch" };
+    }
     const now = new Date();
     const trigger = this.activeTriggers.get(submission.triggerId);
     if (!trigger) { this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "unknown_trigger" }); return { status: "unknown_trigger" }; }
     if (trigger.traceId !== submission.traceId) { this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "trace_mismatch" }); return { status: "trace_mismatch" }; }
+    if (trigger.marketId && trigger.marketId !== submission.marketId) {
+      this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "market_mismatch" }); return { status: "market_mismatch" };
+    }
+    const submittedAt = new Date(submission.timestamp).getTime();
+    const maxSkewMs = 5 * 60_000;
+    if (!Number.isFinite(submittedAt) || submittedAt > now.getTime() + 60_000 || submittedAt < now.getTime() - maxSkewMs) {
+      this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "replay_rejected" }); return { status: "replay_rejected" };
+    }
     if (new Date(trigger.expiresAt).getTime() <= now.getTime() || new Date(submission.output.expiresAt).getTime() <= now.getTime()) {
       this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "stale" }); return { status: "stale" };
     }
@@ -248,8 +267,9 @@ export class EngineService {
 
     const signal: GrokSignalEnvelope = grokSignalEnvelopeSchema.parse({
       signalId: createId("grok_signal"), submissionId: submission.submissionId, traceId: submission.traceId,
-      triggerId: submission.triggerId, agentId: submission.agentId, provider: "grok_bot_mcp", clientId,
-      receivedAt: now.toISOString(), output: submission.output, resultingDecision: null,
+      triggerId: submission.triggerId, correlationId: submission.correlationId, marketId: submission.marketId,
+      agentId: submission.agentId, role: submission.role, provider: "grok_bot_mcp", clientId,
+      receivedAt: now.toISOString(), timestamp: submission.timestamp, output: submission.output, resultingDecision: null,
     });
     const byRole = this.signalsByTrigger.get(trigger.id) ?? new Map<ExternalAgentRoleId, GrokSignalEnvelope>();
     byRole.set(signal.agentId, signal);

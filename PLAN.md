@@ -4,8 +4,8 @@
 
 ### Current repository state
 
-- The production-shaped paper engine, PostgreSQL journal/checkpoints, market adapters, trigger/consensus/risk/execution/accounting pipeline, REST/SSE API, dashboard, experiment/reporting, Docker/Fly files, and 20-test baseline already exist and pass locally.
-- The component being replaced is the push-style OpenAI Agents SDK provider/orchestrator, its `OPENAI_API_KEY` runtime dependency, GPT-5.6 Luna/Terra/Sol identifiers, and OpenAI token-pricing accounting.
+- The production-shaped paper engine, PostgreSQL journal/checkpoints, market adapters, trigger/consensus/risk/execution/accounting pipeline, REST/SSE API, dashboard, experiment/reporting, Docker/Fly files, and baseline tests already exist.
+- The 2026-09-01 Grok Bot / remote MCP migration replaced the OpenAI Agents SDK runtime path: no `OPENAI_API_KEY`, no GPT-5.6 Luna/Terra/Sol runtime routing, no OpenAI token billing. External Grok Bots submit research through authenticated `/mcp`.
 - Deterministic monitoring and all order/risk boundaries remain in place; the migration must not add any wallet, order, signer, or live-trading MCP capability.
 
 ### Target architecture
@@ -28,14 +28,16 @@
 ### Assumptions and open blockers
 
 - Grok Bots are external MCP clients; this repository does not create or provision xAI credentials and does not call an xAI inference API.
+- Write identity is bound server-side: authenticated `clientId` (the `GROK_MCP_BEARER_TOKENS` left-hand role ID) must equal `submission.agentId` and `submission.role`, and the write tool must be in that role’s allow-list. Tokens cannot impersonate another role.
+- **Issue #2 limitation:** Official Grok Bot docs (2026-09-01) do **not** support `custom Polymarket event → Grok Bot actually starts work immediately`. An MCP server cannot wake a Bot. `get_recent_triggers` is not event-driven activation. There is no custom inbound webhook (Cursor forum “inbound webhook is a great idea” is not official product). Documented event triggers are only Cursor-account integrations (examples: Slack message or GitHub notification). Viable subscription-only options, with no latency SLA in the docs: **(A)** scheduled routine — Bot polls MCP after cron; up to 50 routines/Bot; background works with laptop closed; this is polling lag, not event-driven; **(B)** Slack/GitHub Cursor integration event — only if someone/something posts into Slack/GitHub matching a routine; not a Polymarket webhook; **(C)** user chat or Bot-to-Bot message can wake a Bot — still not unattended-on-market-tick; MCP cannot send that message. Grok Bot ≠ grok.com chat ≠ xAI API. Do not mix grok.com custom MCP or Grok Build hooks (outbound) as if they wake Grok Bot. This engine implements no webhook/wake path and does not call an xAI inference API. Sources: https://docs.x.ai/grok-bot/skills-routines-and-automations , https://docs.x.ai/grok-bot/troubleshooting , https://x.ai/news/introducing-grok-bot , https://docs.x.ai/grok-bot/chat-and-collaboration . See `docs/GROK_BOT.md`.
 - Initial machine-to-machine authentication uses operator-managed high-entropy bearer tokens supplied only to the engine as secrets. Token fingerprints—not raw tokens—are audited. OAuth-protected-resource discovery can be added later if the deployed Grok client requires delegated user authorization.
 - A single Fly engine Machine remains the supported topology; in-memory rate/idempotency caches are backed by durable journal checks where required but horizontally shared rate limits need Redis/PostgreSQL advisory coordination before scaling.
-- Docker/Fly CLIs and a real PostgreSQL instance are still unavailable locally; strict Fly, container, and real-DB fault tests remain explicit deployment gates.
+- Docker/Fly CLIs: Fly CLI can be installed, but `fly config validate --strict` requires a logged-in access token. Docker is not installed and `docker.io` is not available from apt in this environment. Strict Fly and container builds remain explicit deployment gates.
 
 ### Test strategy
 
 - Preserve all deterministic math, risk, execution, checkpoint/recovery, paper-only and dashboard build tests.
-- Add MCP protocol/auth tests, per-client rate-limit behavior, tool input/output schemas, redacted audit events, malformed role output, duplicate idempotency key, stale signal rejection, unavailable-Grok monitoring continuity, and forbidden/unknown trade tool rejection.
+- Add MCP protocol/auth tests, per-client rate-limit behavior, token-to-role identity binding and impersonation rejection, tool input/output schemas, redacted audit events, malformed role output, duplicate idempotency key, stale signal rejection, unavailable-Grok monitoring continuity, and forbidden/unknown trade tool rejection.
 - Acceptance remains: external text or malformed Grok data cannot become a paper order without schema validation, fresh consensus, deterministic calculations, and absolute risk approval.
 
 ### Fly deployment strategy
@@ -53,7 +55,7 @@
 - This project will be created at `outputs/polymarket-research-engine` as a new pnpm/TypeScript monorepo.
 - Local tools observed: Node.js `v26.7.0` and pnpm `11.16.0`. Docker was not available on `PATH` during initial inspection. Fly CLI availability still needs an isolated check.
 - Official-documentation verification completed against current OpenAI Agents/Responses/model, Polymarket unified CLOB v2/WebSocket/fee/rate-limit, and Fly Machines lifecycle documentation before the corresponding adapters/configuration were finalized.
-- Implementation status (2026-09-01): strict typecheck passes, 20 tests pass, deterministic smoke passes, engine and standalone dashboard production builds pass. The public live smoke received 392 real BTC messages; Polymarket discovery timed out behind this host's TLS inspection/proxy, so no Polymarket stream result is claimed. Docker and Fly CLIs are not installed locally, so their validations remain operator steps.
+- Implementation status (2026-09-01, Grok MCP continuation): strict typecheck passes, 27 tests pass, deterministic smoke passes, engine and standalone dashboard production builds pass. Live smoke received 502 real Polymarket messages and 1 real BTC aggTrade on `data-stream.binance.vision`. `stream.binance.com` returns HTTP 451 from this host. Fly CLI is installed but `fly config validate --strict` requires login. Docker is not installed (`docker.io` package not available).
 
 ## Architecture
 
@@ -93,7 +95,7 @@ BTC WebSocket -------------------/             |
 - `polymarket-dashboard` is a separate Fly app. It reads only the engine's public dashboard API and may autostop independently.
 - PostgreSQL is the durable source of truth. In-memory state is a projection rebuilt from persisted checkpoints plus journal events.
 - Browser clients use SSE for live updates with event IDs and reconnect support. Historical chart data uses bounded REST queries.
-- LLMs never receive order-submission tools and can never bypass schema validation, deterministic consensus, deterministic calculations, or risk vetoes.
+- `LLMs` / Grok Bots never receive order-submission tools and can never bypass schema validation, deterministic consensus, deterministic calculations, or risk vetoes.
 
 ## Implementation phases
 
@@ -182,7 +184,7 @@ BTC WebSocket -------------------/             |
 - Both images run as non-root users, use Node.js 22, have deterministic build/start commands, and expose only required ports.
 - Engine shutdown handles SIGTERM by marking readiness false, stopping new decisions/orders, canceling pending simulated decisions, draining/persisting journal state, checkpointing positions, closing feeds, stopping the HTTP server, and exiting before Fly's kill timeout.
 - Engine boot loads/checks the latest experiment and strategy version, replays/reconciles positions and resting paper orders, starts readiness as false, reconnects both feeds, and becomes ready only after the DB and required fresh market state are available.
-- Secrets are documented as Fly secrets. Dashboard configuration must never include OpenAI, wallet, signing, or Polymarket private credentials.
+- Secrets are documented as Fly secrets. Dashboard configuration must never include Grok MCP bearer tokens, OpenAI keys, wallet, signing, or Polymarket private credentials.
 - Pre-deployment sequence will validate environment schemas, build/test both apps, build images, run `fly config validate --strict` for each config, inspect the rendered configuration, and only then document (not execute) `fly deploy` commands.
 
 ## Completion evidence to report

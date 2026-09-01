@@ -11,7 +11,7 @@ kill_timeout = 60
   TRADING_MODE = "paper"
   PORT = "8080"
   ENGINE_REGION = "fra"
-  JOURNAL_MODE = "postgres"
+  GROK_MCP_ALLOWED_ORIGINS = "https://grok.com,https://x.ai"
 
 [http_service]
   internal_port = 8080

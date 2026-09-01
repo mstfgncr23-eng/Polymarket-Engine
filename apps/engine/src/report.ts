@@ -8,7 +8,8 @@ export function buildExperimentSummary(events: readonly JournalEvent[], experime
   const positions = latestByAggregate(byType("POSITION_UPDATED")).map((event) => event.payload as unknown as Position);
   const pnlEvents = byType("PNL_SNAPSHOT");
   const ledger = pnlEvents.at(-1)?.payload as unknown as LedgerState | undefined;
-  const agentOutputs = byType("AGENT_OUTPUT");
+  const grokSignals = byType("GROK_SIGNAL_ACCEPTED");
+  const agentOutputs = [...byType("AGENT_OUTPUT"), ...grokSignals];
   const risk = byType("RISK_EVALUATION");
   const accepted = risk.filter((event) => (event.payload as { accepted?: boolean }).accepted === true).length;
   const rejected = risk.length - accepted;
@@ -28,6 +29,10 @@ export function buildExperimentSummary(events: readonly JournalEvent[], experime
   for (const event of byType("AGENT_FAILURE")) {
     const code = String((event.payload as { code?: unknown }).code ?? "UNKNOWN");
     failureStatistics[code] = (failureStatistics[code] ?? 0) + 1;
+  }
+  for (const event of byType("MCP_INTERACTION")) {
+    const status = String((event.payload as { status?: unknown }).status ?? "MCP");
+    if (status !== "HANDLED") failureStatistics[`MCP_${status}`] = (failureStatistics[`MCP_${status}`] ?? 0) + 1;
   }
   for (const event of byType("PAPER_EXECUTION_ERROR")) failureStatistics.PAPER_EXECUTION_ERROR = (failureStatistics.PAPER_EXECUTION_ERROR ?? 0) + 1;
   const grossPnl = Number(ledger?.grossPnl ?? 0);

@@ -185,13 +185,22 @@ export type FairProbabilityOutput = z.infer<typeof fairProbabilityOutputSchema>;
 export type RiskHedgeOutput = z.infer<typeof riskHedgeOutputSchema>;
 export type StrategySupervisorOutput = z.infer<typeof strategySupervisorOutputSchema>;
 
+const grokSubmissionMeta = {
+  submissionId: idSchema,
+  triggerId: idSchema,
+  traceId: idSchema,
+  correlationId: idSchema,
+  marketId: idSchema,
+  timestamp: timestampSchema,
+};
+
 export const grokSignalSubmissionSchema = z.discriminatedUnion("agentId", [
-  z.object({ submissionId: idSchema, triggerId: idSchema, traceId: idSchema, agentId: z.literal("market_microstructure_scanner"), output: marketMicrostructureOutputSchema }).strict(),
-  z.object({ submissionId: idSchema, triggerId: idSchema, traceId: idSchema, agentId: z.literal("crypto_market_scanner"), output: cryptoMarketOutputSchema }).strict(),
-  z.object({ submissionId: idSchema, triggerId: idSchema, traceId: idSchema, agentId: z.literal("news_x_intelligence_scanner"), output: newsXIntelligenceOutputSchema }).strict(),
-  z.object({ submissionId: idSchema, triggerId: idSchema, traceId: idSchema, agentId: z.literal("fair_probability_analyst"), output: fairProbabilityOutputSchema }).strict(),
-  z.object({ submissionId: idSchema, triggerId: idSchema, traceId: idSchema, agentId: z.literal("risk_hedge_analyst"), output: riskHedgeOutputSchema }).strict(),
-  z.object({ submissionId: idSchema, triggerId: idSchema, traceId: idSchema, agentId: z.literal("strategy_supervisor"), output: strategySupervisorOutputSchema }).strict(),
+  z.object({ ...grokSubmissionMeta, agentId: z.literal("market_microstructure_scanner"), role: z.literal("market_microstructure_scanner"), output: marketMicrostructureOutputSchema }).strict(),
+  z.object({ ...grokSubmissionMeta, agentId: z.literal("crypto_market_scanner"), role: z.literal("crypto_market_scanner"), output: cryptoMarketOutputSchema }).strict(),
+  z.object({ ...grokSubmissionMeta, agentId: z.literal("news_x_intelligence_scanner"), role: z.literal("news_x_intelligence_scanner"), output: newsXIntelligenceOutputSchema }).strict(),
+  z.object({ ...grokSubmissionMeta, agentId: z.literal("fair_probability_analyst"), role: z.literal("fair_probability_analyst"), output: fairProbabilityOutputSchema }).strict(),
+  z.object({ ...grokSubmissionMeta, agentId: z.literal("risk_hedge_analyst"), role: z.literal("risk_hedge_analyst"), output: riskHedgeOutputSchema }).strict(),
+  z.object({ ...grokSubmissionMeta, agentId: z.literal("strategy_supervisor"), role: z.literal("strategy_supervisor"), output: strategySupervisorOutputSchema }).strict(),
 ]);
 export type GrokSignalSubmission = z.infer<typeof grokSignalSubmissionSchema>;
 
@@ -200,10 +209,14 @@ export const grokSignalEnvelopeSchema = z.object({
   submissionId: idSchema,
   traceId: idSchema,
   triggerId: idSchema,
+  correlationId: idSchema,
+  marketId: idSchema,
   agentId: externalAgentRoleIdSchema,
+  role: externalAgentRoleIdSchema,
   provider: z.literal("grok_bot_mcp"),
   clientId: idSchema,
   receivedAt: timestampSchema,
+  timestamp: timestampSchema,
   output: z.unknown(),
   resultingDecision: z.string().nullable(),
 }).strict();

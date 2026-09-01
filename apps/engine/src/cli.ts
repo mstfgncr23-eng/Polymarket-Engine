@@ -44,8 +44,8 @@ if (command === "experiment:start") {
   const consensus = buildConsensus({
     traceId, triggerId: createId("trigger"), deterministicEdge: 0.04, now,
     signals: [
-      { agentId: "luna_market_microstructure", direction: "UP", confidence: 0.8, expiresAt: new Date(now.getTime() + 30_000).toISOString(), evidenceIds: [snapshot.eventId] },
-      { agentId: "terra_fair_probability", direction: "UP", confidence: 0.82, expiresAt: new Date(now.getTime() + 30_000).toISOString(), evidenceIds: [snapshot.eventId] },
+      { agentId: "market_microstructure_scanner", direction: "UP", confidence: 0.8, expiresAt: new Date(now.getTime() + 30_000).toISOString(), evidenceIds: [snapshot.eventId] },
+      { agentId: "fair_probability_analyst", direction: "UP", confidence: 0.82, expiresAt: new Date(now.getTime() + 30_000).toISOString(), evidenceIds: [snapshot.eventId] },
     ], config: defaultConsensusConfig,
   });
   const strategy = new TemporalPairHedgeStrategy();
@@ -75,7 +75,7 @@ if (command === "experiment:start") {
   const complete = new Promise<void>((resolve) => { finish = resolve; });
   const check = () => { if (polymarketMessages > 0 && btcMessages > 0) finish(); };
   if (tokenIds.length > 0) void market.run(tokenIds, { onSnapshot: () => { polymarketMessages += 1; check(); }, onConnection: () => undefined, onError: (error) => { failures.push(`polymarket:${error.message}`); } }, abort.signal);
-  const btc = new BtcWebSocketAdapter(process.env.BTC_WS_URL ?? "wss://stream.binance.com:9443/ws/btcusdt@aggTrade", process.env.BTC_SYMBOL ?? "BTCUSDT");
+  const btc = new BtcWebSocketAdapter(process.env.BTC_WS_URL ?? "wss://data-stream.binance.vision/ws/btcusdt@aggTrade", process.env.BTC_SYMBOL ?? "BTCUSDT");
   void btc.run({ onTick: () => { btcMessages += 1; check(); }, onConnection: () => undefined, onError: (error) => { failures.push(`btc:${error.message}`); } }, abort.signal);
   await Promise.race([complete, new Promise<void>((resolve) => setTimeout(resolve, 25_000))]);
   abort.abort("smoke complete");
