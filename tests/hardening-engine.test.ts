@@ -376,13 +376,13 @@ describe("J maker reservation through the engine", () => {
     await first.start();
     await first.restMakerForTest(order("MAKER", { quantity: "10", requestedPrice: "0.47" }), snapshot());
     expect(Number(first.reservedCash())).toBeCloseTo(4.7, 8);
-    await expect(first.restMakerForTest(order("MAKER", { quantity: "1000", requestedPrice: "0.90" }), snapshot())).rejects.toThrow("INSUFFICIENT_CASH");
+    await expect(first.restMakerForTest(order("MAKER", { quantity: "2000", requestedPrice: "0.90" }), snapshot())).rejects.toThrow("INSUFFICIENT_CASH");
     await first.stop();
     const second = new EngineService(env, journal, logger, { market: pendingFeed() as never });
     await second.start();
     try {
       expect(Number(second.reservedCash())).toBeCloseTo(4.7, 8);
-      await expect(second.restMakerForTest(order("MAKER", { quantity: "1000", requestedPrice: "0.90" }), snapshot())).rejects.toThrow("INSUFFICIENT_CASH");
+      await expect(second.restMakerForTest(order("MAKER", { quantity: "2000", requestedPrice: "0.90" }), snapshot())).rejects.toThrow("INSUFFICIENT_CASH");
     } finally {
       await second.stop();
     }
