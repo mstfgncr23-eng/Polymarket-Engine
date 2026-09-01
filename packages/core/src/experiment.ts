@@ -1,4 +1,4 @@
-import { createId, type ExperimentManifest } from "./domain.js";
+import { createId, type ExperimentClosePolicy, type ExperimentManifest, type Position } from "./domain.js";
 
 export interface ExperimentStartInput {
   durationHours: number;
@@ -9,28 +9,88 @@ export interface ExperimentStartInput {
   systemVersion: string;
   gitSha: string;
   now: Date;
+  closePolicy?: ExperimentClosePolicy;
+  id?: string;
 }
 
-export function startExperiment(input: ExperimentStartInput): ExperimentManifest {
+export function createIdleExperiment(input: Omit<ExperimentStartInput, "now"> & { now?: Date }): ExperimentManifest {
   return {
-    id: createId("experiment"), status: "RUNNING", durationHours: input.durationHours,
+    id: input.id ?? createId("experiment"), status: "IDLE", durationHours: input.durationHours,
     strategyVersion: input.strategyVersion, riskConfiguration: input.riskConfiguration,
     modelConfiguration: input.modelConfiguration, startingBalance: input.startingBalance,
-    systemVersion: input.systemVersion, gitSha: input.gitSha, startedAt: input.now.toISOString(),
-    entryClosesAt: new Date(input.now.getTime() + input.durationHours * 3_600_000).toISOString(), completedAt: null,
+    systemVersion: input.systemVersion, gitSha: input.gitSha,
+    closePolicy: input.closePolicy ?? "observe_until_settlement",
+    startedAt: null, entryClosesAt: null, completedAt: null, unresolvedPositionCount: 0, markToMarketAt: null,
   };
 }
 
-export function refreshExperiment(manifest: ExperimentManifest, now: Date): ExperimentManifest {
-  if (manifest.status === "RUNNING" && now.getTime() >= new Date(manifest.entryClosesAt).getTime()) {
+export function startExperiment(input: ExperimentStartInput): ExperimentManifest {
+  const startedAt = input.now.toISOString();
+  return {
+    id: input.id ?? createId("experiment"), status: "RUNNING", durationHours: input.durationHours,
+    strategyVersion: input.strategyVersion, riskConfiguration: input.riskConfiguration,
+    modelConfiguration: input.modelConfiguration, startingBalance: input.startingBalance,
+    systemVersion: input.systemVersion, gitSha: input.gitSha,
+    closePolicy: input.closePolicy ?? "observe_until_settlement",
+    startedAt, entryClosesAt: new Date(input.now.getTime() + input.durationHours * 3_600_000).toISOString(),
+    completedAt: null, unresolvedPositionCount: 0, markToMarketAt: null,
+  };
+}
+
+export function openPositionsRemain(positions: Iterable<Position>): boolean {
+  return [...positions].some((position) => Number(position.upQuantity) > 0 || Number(position.downQuantity) > 0);
+}
+
+export function refreshExperiment(
+  manifest: ExperimentManifest,
+  now: Date,
+  options: { openPositions?: boolean; unresolvedCount?: number } = {},
+): ExperimentManifest {
+  if (manifest.status === "IDLE" || manifest.status === "COMPLETED" || manifest.status === "FAILED") return manifest;
+  if (manifest.status === "RUNNING" && manifest.entryClosesAt && now.getTime() >= new Date(manifest.entryClosesAt).getTime()) {
     return { ...manifest, status: "ENTRY_CLOSED" };
   }
+  if (manifest.status === "ENTRY_CLOSED") {
+    const policy = manifest.closePolicy ?? "observe_until_settlement";
+    const open = options.openPositions ?? false;
+    const unresolved = options.unresolvedCount ?? 0;
+    if (policy === "observe_until_settlement" && !open) {
+      return { ...manifest, status: "COMPLETED", completedAt: now.toISOString(), unresolvedPositionCount: 0 };
+    }
+    if (policy === "mark_to_market") {
+      return {
+        ...manifest, status: "COMPLETED", completedAt: now.toISOString(),
+        markToMarketAt: now.toISOString(), unresolvedPositionCount: unresolved,
+      };
+    }
+  }
   return manifest;
+}
+
+export function experimentAllowsFirstLeg(manifest: ExperimentManifest | null): boolean {
+  return manifest?.status === "RUNNING";
+}
+
+export function experimentAllowsHedge(manifest: ExperimentManifest | null): boolean {
+  return manifest == null || manifest.status === "RUNNING" || manifest.status === "ENTRY_CLOSED" || manifest.status === "IDLE";
+}
+
+export function shouldWriteFinalReport(manifest: ExperimentManifest, openPositions: boolean): boolean {
+  if (manifest.status === "COMPLETED") return true;
+  if (manifest.status !== "ENTRY_CLOSED") return false;
+  if ((manifest.closePolicy ?? "observe_until_settlement") === "observe_until_settlement" && openPositions) return false;
+  return (manifest.closePolicy ?? "observe_until_settlement") === "mark_to_market";
 }
 
 export interface ExperimentSummary {
   experimentId: string;
   generatedAt: string;
+  status: string;
+  closePolicy: string;
+  reportKind: "interim" | "final";
+  unresolvedPositionCount: number;
+  settlementCount: number;
+  settlementPnlUsd: number;
   totalOpportunities: number;
   acceptedOpportunities: number;
   rejectedOpportunities: number;
@@ -90,6 +150,7 @@ export interface MarketAssetAttribution {
   realizedPnlUsd: number;
   feesUsd: number;
   slippageUsd: number;
+  settlementPnlUsd: number;
   netTradingPnlUsd: number;
   fills: number;
   opportunities: number;
@@ -101,11 +162,17 @@ export function renderExperimentSummaryMarkdown(summary: ExperimentSummary): str
   return `# 48-Hour Paper Experiment Summary
 
 Generated: ${summary.generatedAt}
+Status: ${summary.status}
+Close policy: ${summary.closePolicy}
+Report kind: ${summary.reportKind}
 
 ## Decision outcome
 
 - Gross PnL: $${summary.grossPnlUsd.toFixed(2)}
-- Net trading PnL: $${summary.netTradingPnlUsd.toFixed(2)}
+- Net trading PnL (includes binary settlement): $${summary.netTradingPnlUsd.toFixed(2)}
+- Settlement PnL: $${summary.settlementPnlUsd.toFixed(2)}
+- Settlements: ${summary.settlementCount}
+- Unresolved positions: ${summary.unresolvedPositionCount}
 - AI cost (legacy ledger field, should remain $0 without OpenAI): $${summary.aiCostUsd.toFixed(2)}
 - Estimated infrastructure cost: $${summary.estimatedInfrastructureCostUsd.toFixed(2)}
 - Economic PnL: $${summary.economicPnlUsd.toFixed(2)}
@@ -136,6 +203,6 @@ Generated: ${summary.generatedAt}
 - OpenAI token cost: $0 (runtime inference is not billed here)
 - Failures: ${JSON.stringify(summary.failureStatistics)}
 
-This report is computed from the append-only journal. Raw data is retained.
+This report is computed from the append-only decision/accounting journal. Raw high-frequency telemetry is sampled.
 `;
 }

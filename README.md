@@ -44,7 +44,17 @@ Window expiry comes from the official client `market.state.endDate` (Gamma `endD
 
 Zero qualified markets at startup is valid. The engine stays up, keeps the database/health/dashboard available, and keeps scanning. Dynamically discovered markets **cannot qualify without a deterministic underlying asset**. The engine does not guess tickers. Manual `POLYMARKET_TOKEN_IDS` fixtures remain separately supported. Asset exposure is aggregated only among markets that share a known asset; unknown identity never silently falls back to per-market exposure.
 
-When a market later qualifies, discovery reconciliation adds it: token IDs are applied immediately, the Polymarket stream is resubscribed if the client cannot mutate subscriptions in place, and the matching reference feed starts. Removed or expired markets stop being monitored; a reference feed stops when no remaining market needs that asset. Multiple markets that share one asset share one feed.
+When a market later qualifies, discovery reconciliation adds it. **Entry-qualified markets** (spread/liquidity/duration pass) can receive new first-leg paper entries. **Managed markets** stay subscribed whenever an open paper position, resting maker, pending hedge, or unsettled position exists — even if they temporarily fail qualification. `MAX_QUALIFIED_MARKETS` never evicts an already-managed position. A flat, disqualified market with no resting order is dropped normally. Reference feeds stay up for any asset still required by a managed market.
+
+Paper settlement uses **public** Polymarket resolution only (`state.closed` / `resolution.umaResolutionStatus` in `{resolved,settled}` and binary 0/1 outcome prices). The engine never guesses a winner. After expiry it polls with bounded backoff, pays winning tokens $1 and losing tokens $0, updates cash/realized PnL, and journals `MARKET_RESOLUTION_OBSERVED` / `POSITION_SETTLED` / `POSITION_WIN|LOSS|BREAKEVEN`. 48h reports include settlement PnL; they are not SELL-fill-only.
+
+HTTP 451/403 from the reference venue is `REGION_BLOCKED` / `PROVIDER_BLOCKED`: fail closed, visible health, no paper execution that requires that reference, and a slow recheck (~30 min) rather than a 30–60s retry storm.
+
+The 48h **experiment clock does not start on boot**. Monitoring/discovery/feeds can start in `IDLE`. An operator starts the experiment with `pnpm experiment:start` or `POST /api/operator/experiment/start` (engine operator/read token). Preflight requires paper mode, Postgres, and working discovery; if `EXPERIMENT_REQUIRES_GROK=true` and `GROK_ACTIVATION_PROVIDER=noop`, start is blocked. Slack HTTP success is not a Grok wake.
+
+`EXPERIMENT_CLOSE_POLICY=observe_until_settlement` (default) stops new first legs at 48h, continues hedges/settlement, and writes the FINAL report only after experiment positions settle. `mark_to_market` snapshots remaining books, marks unresolved, and does not fabricate wins/losses.
+
+Engine `/api/dashboard`, `/api/history/*`, `/api/traces/*`, and `/events` require `ENGINE_READ_TOKEN` in production. The dashboard proxy sends that token server-side; it is never `NEXT_PUBLIC_*`. `/health` stays liveness. `/metrics` may use optional `METRICS_TOKEN` for a Fly-private scrape.
 
 Explicit reason codes (reject unless `QUALIFIED`):
 
@@ -238,12 +248,13 @@ Tests cover pair/PnL math, fee curve, slippage/VWAP, exposure/accounting, consen
 
 ## 48-hour procedure
 
-1. Set a durable `DATABASE_URL`, `TRADING_MODE=paper`, optional market slugs (otherwise crypto discovery runs), `GROK_MCP_BEARER_TOKENS`, `GROK_ACTIVATION_PROVIDER` (`noop` unless Slack wake transport is configured), `GIT_SHA`.
+1. Set a durable `DATABASE_URL`, `TRADING_MODE=paper`, optional market slugs (otherwise crypto discovery runs), `GROK_MCP_BEARER_TOKENS`, `GROK_ACTIVATION_PROVIDER` (`noop` unless Slack wake transport is configured), `ENGINE_READ_TOKEN`, `GIT_SHA`.
 2. Run all verification commands and `pnpm smoke:live`.
-3. Start once with `EXPERIMENT_DURATION_HOURS=48 pnpm experiment:start` (PowerShell: `$env:EXPERIMENT_DURATION_HOURS='48'; pnpm experiment:start`).
-4. Point the six Grok Bots at `https://<engine>/mcp` using the operator-managed bearer tokens. Monitor `/ready`, `/metrics`, dashboard SSE state, risk vetoes, Grok signal freshness, directional positions, and journal growth.
-5. At the deadline the engine changes the manifest to `ENTRY_CLOSED`, stops opening new positions, checkpoints, retains raw data, and writes both summary files. Existing positions remain observed per policy.
-6. Rebuild the report at any time with `DATABASE_URL=... EXPERIMENT_ID=... pnpm report`.
+3. Boot the engine (`pnpm dev:engine` / Fly). Discovery and feeds may run while the experiment stays `IDLE`.
+4. Start the 48h clock explicitly: `EXPERIMENT_DURATION_HOURS=48 pnpm experiment:start` (PowerShell: `$env:EXPERIMENT_DURATION_HOURS='48'; pnpm experiment:start`) or `POST /api/operator/experiment/start` with the operator token. Preflight must pass; a noop activation provider does not count as a validated Grok wake.
+5. Point the six Grok Bots at `https://<engine>/mcp` using the operator-managed bearer tokens. Monitor `/ready`, `/metrics`, dashboard SSE state, risk vetoes, Grok signal freshness, directional positions, and journal growth.
+6. At 48h the engine enters `ENTRY_CLOSED` and stops new first-leg entries. With `observe_until_settlement` it continues hedges and public settlement until positions are flat, then `COMPLETED` plus the FINAL report. With `mark_to_market` it snapshots remaining books, records unresolved count, and does not invent wins/losses.
+7. Rebuild the report at any time with `DATABASE_URL=... EXPERIMENT_ID=... pnpm report`.
 
 The report includes opportunities, accepts/rejects, orders/fills and rates, maker/taker split, completed/incomplete pairs, win/loss events, PnL/cost layers, drawdown/exposure, hedge duration/failures, pair/edge statistics, per-role Grok signal counts, regime/hour attribution, counterfactual event counts, and errors. Trading attribution (`pnlByMarket` / `pnlByAsset`, fills, fees, slippage, opportunities, vetoes) is computed from fills and risk events. `eventCountByMarket` / `eventCountByAsset` are activity volume, not profitability — a noisy market is not treated as more profitable because it generated more journal events. Metrics without observed attribution events remain empty/zero rather than fabricated.
 

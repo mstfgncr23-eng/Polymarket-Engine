@@ -4,6 +4,7 @@ import {
   TemporalPairHedgeStrategy,
   buildConsensus,
   createId,
+  DECISION_EVENT_TYPES,
   defaultConsensusConfig,
   executePaperTaker,
   feeScheduleSchema,
@@ -20,14 +21,19 @@ const command = process.argv[2] ?? "help";
 if (command === "experiment:start") {
   if (process.env.TRADING_MODE && process.env.TRADING_MODE !== "paper") throw new Error("LIVE_TRADING_DISABLED");
   process.env.TRADING_MODE = "paper";
-  await startRuntime();
-  console.log(JSON.stringify({ status: "running", mode: "paper", durationHours: Number(process.env.EXPERIMENT_DURATION_HOURS ?? 48) }));
+  const runtime = await startRuntime();
+  const result = await runtime.engine.beginExperiment();
+  console.log(JSON.stringify({ status: result.ok ? "running" : "blocked", mode: "paper", durationHours: Number(process.env.EXPERIMENT_DURATION_HOURS ?? 48), ...result }));
 } else if (command === "report") {
   const journal = process.env.DATABASE_URL
     ? new PostgresEventJournal(process.env.DATABASE_URL, process.env.DB_MIGRATIONS_DIR ?? resolve(process.cwd(), "packages/db/migrations"))
     : new MemoryEventJournal();
   await journal.initialize();
-  const summary = buildExperimentSummary(await journal.readAll(), process.env.EXPERIMENT_ID ?? "no-persisted-memory-experiment");
+  const summary = buildExperimentSummary(
+    await journal.queryEvents({ types: DECISION_EVENT_TYPES, limit: 8_000 }),
+    process.env.EXPERIMENT_ID ?? "no-persisted-memory-experiment",
+    { reportKind: "final" },
+  );
   const paths = await writeExperimentSummary(summary, resolve(process.cwd(), "reports"));
   await journal.close();
   console.log(JSON.stringify(paths));
@@ -117,7 +123,13 @@ if (command === "experiment:start") {
     });
     const adapter = registry.adapterFor(asset);
     if (!adapter) {
-      failures.push(resolution.status === "TRANSIENT_FAILURE" ? `reference-transient:${asset}:${resolution.detail ?? resolution.reason}` : `reference-unsupported:${asset}`);
+      if (resolution.status === "PROVIDER_BLOCKED" || resolution.status === "REGION_BLOCKED") {
+        failures.push(`reference-blocked:${asset}:${resolution.detail ?? resolution.reason}`);
+      } else if (resolution.status === "TRANSIENT_FAILURE") {
+        failures.push(`reference-transient:${asset}:${resolution.detail ?? resolution.reason}`);
+      } else {
+        failures.push(`reference-unsupported:${asset}`);
+      }
       continue;
     }
     referenceMessages[asset] = 0;

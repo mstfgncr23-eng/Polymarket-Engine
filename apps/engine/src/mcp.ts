@@ -5,6 +5,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { z } from "zod";
 import {
   createId,
+  DECISION_EVENT_TYPES,
   grokSignalSubmissionSchema,
   parseGrokWritePayload,
   clientMayCallWriteTool,
@@ -52,6 +53,8 @@ export const ALLOWED_MCP_WRITE_TOOLS = [
 ] as const;
 
 export const ALLOWED_MCP_TOOLS = new Set<string>([...ALLOWED_MCP_READ_TOOLS, ...ALLOWED_MCP_WRITE_TOOLS]);
+
+let strategyMetricsCache: { at: number; value: ReturnType<typeof buildExperimentSummary> } | null = null;
 
 export const FORBIDDEN_MCP_TRADE_TOOLS = new Set([
   "place_order", "submit_order", "create_order", "cancel_order", "replace_order",
@@ -281,7 +284,18 @@ export function createGrokMcpServer(clientId: string, dependencies: McpDependenc
   server.registerTool("get_strategy_metrics", {
     description: "Read journal-derived paper strategy and experiment performance.",
     inputSchema: {}, annotations: readOnly,
-  }, async () => toolResult(buildExperimentSummary(await dependencies.journal.readAll(), dependencies.state.experimentId ?? "unknown")));
+  }, async () => {
+    const now = Date.now();
+    if (strategyMetricsCache && now - strategyMetricsCache.at < 15_000) return toolResult(strategyMetricsCache.value);
+    const experimentId = dependencies.state.experimentId ?? "unknown";
+    const events = await dependencies.journal.queryEvents({ types: DECISION_EVENT_TYPES, limit: 5_000 });
+    const summary = buildExperimentSummary(events, experimentId, {
+      status: dependencies.state.experimentStatus ?? "unknown",
+      reportKind: "interim",
+    });
+    strategyMetricsCache = { at: now, value: summary };
+    return toolResult(summary);
+  });
 
   server.registerTool("get_recent_decisions", {
     description: "Read the recent persisted decision feed (triggers, consensus, risk, paper fills).",

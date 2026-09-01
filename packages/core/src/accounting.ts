@@ -1,6 +1,7 @@
 import { Decimal } from "decimal.js";
 import { createId, type LedgerState, type PaperFill, type Position } from "./domain.js";
 import { d, decimal } from "./calculations.js";
+import { classifySettledOutcome, settlementCashDelta, settlementRealizedDelta } from "./settlement.js";
 
 export class PaperLedger {
   readonly positions = new Map<string, Position>();
@@ -108,6 +109,31 @@ export class PaperLedger {
     return structuredClone(next);
   }
 
+  settlePosition(marketId: string, upPayoff: "0" | "1", downPayoff: "0" | "1", at = new Date()): {
+    position: Position;
+    cashDelta: string;
+    realizedDelta: string;
+    outcome: "POSITION_WIN" | "POSITION_LOSS" | "POSITION_BREAKEVEN";
+  } | null {
+    const position = this.positions.get(marketId);
+    if (!position) return null;
+    if (d(position.upQuantity).eq(0) && d(position.downQuantity).eq(0)) {
+      this.positions.delete(marketId);
+      return null;
+    }
+    const cashDelta = settlementCashDelta(position, upPayoff, downPayoff);
+    const realizedDelta = settlementRealizedDelta(position, upPayoff, downPayoff);
+    this.state.cash = decimal(d(this.state.cash).plus(cashDelta));
+    this.state.realizedPnl = decimal(d(this.state.realizedPnl).plus(realizedDelta));
+    this.positions.delete(marketId);
+    this.state.updatedAt = at.toISOString();
+    this.revalue({}, at.toISOString());
+    return {
+      position: structuredClone(position), cashDelta, realizedDelta,
+      outcome: classifySettledOutcome(realizedDelta),
+    };
+  }
+
   addOperatingCosts(aiCost: Decimal.Value, infrastructureCost: Decimal.Value, at = new Date()): void {
     this.state.aiCost = decimal(d(this.state.aiCost).plus(aiCost));
     this.state.infrastructureCost = decimal(d(this.state.infrastructureCost).plus(infrastructureCost));
@@ -167,4 +193,34 @@ export function computePaperExposures(
     market: String(market), total: String(total), directional: String(directional), unhedged: String(unhedged),
     unhedgedDurationMs: Math.max(0, duration), asset: String(asset),
   };
+}
+
+export function projectPaperExposures(
+  current: ReturnType<typeof computePaperExposures>,
+  orderSizeUsd: number,
+  intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG",
+): ReturnType<typeof computePaperExposures> {
+  const size = Math.max(0, orderSizeUsd);
+  if (intent === "HEDGE_SECOND_LEG") {
+    return {
+      ...current,
+      directional: String(Math.max(0, Number(current.directional) - size)),
+      unhedged: String(Math.max(0, Number(current.unhedged) - size)),
+      market: String(Number(current.market) + size),
+      total: String(Number(current.total) + size),
+      asset: String(Number(current.asset) + size),
+    };
+  }
+  return {
+    ...current,
+    market: String(Number(current.market) + size),
+    total: String(Number(current.total) + size),
+    directional: String(Number(current.directional) + size),
+    unhedged: String(Number(current.unhedged) + size),
+    asset: String(Number(current.asset) + size),
+  };
+}
+
+export function makerReserveNotional(quantity: string, price: string): string {
+  return decimal(d(quantity).mul(price));
 }

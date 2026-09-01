@@ -2,10 +2,16 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { d, renderExperimentSummaryMarkdown, type ExperimentSummary, type JournalEvent, type LedgerState, type MarketAssetAttribution, type PaperFill, type Position } from "@pm/core";
 
-export function buildExperimentSummary(events: readonly JournalEvent[], experimentId = "unknown"): ExperimentSummary {
+export function buildExperimentSummary(
+  events: readonly JournalEvent[],
+  experimentId = "unknown",
+  extras: Partial<Pick<ExperimentSummary, "status" | "closePolicy" | "reportKind" | "unresolvedPositionCount">> = {},
+): ExperimentSummary {
   const byType = (type: string) => events.filter((event) => event.type === type);
   const fills = byType("PAPER_FILL").map((event) => event.payload as unknown as PaperFill & { asset?: string | null });
   const positions = latestByAggregate(byType("POSITION_UPDATED")).map((event) => event.payload as unknown as Position);
+  const settlements = byType("POSITION_SETTLED");
+  const settlementPnlUsd = settlements.reduce((sum, event) => sum + Number((event.payload as { realizedDelta?: unknown }).realizedDelta ?? 0), 0);
   const pnlEvents = byType("PNL_SNAPSHOT");
   const ledger = pnlEvents.at(-1)?.payload as unknown as LedgerState | undefined;
   const grokSignals = byType("GROK_SIGNAL_ACCEPTED");
@@ -45,7 +51,14 @@ export function buildExperimentSummary(events: readonly JournalEvent[], experime
   const byMarket = attributeTrading(events, fills, risk, "marketId");
   const byAsset = attributeTrading(events, fills, risk, "asset");
   return {
-    experimentId, generatedAt: new Date().toISOString(), totalOpportunities: risk.length,
+    experimentId, generatedAt: new Date().toISOString(),
+    status: extras.status ?? String((ledger as { experimentStatus?: unknown } | undefined)?.experimentStatus ?? "unknown"),
+    closePolicy: extras.closePolicy ?? "observe_until_settlement",
+    reportKind: extras.reportKind ?? "interim",
+    unresolvedPositionCount: extras.unresolvedPositionCount ?? unhedged.length,
+    settlementCount: settlements.length,
+    settlementPnlUsd,
+    totalOpportunities: risk.length,
     acceptedOpportunities: accepted, rejectedOpportunities: rejected, totalPaperOrders: byType("PAPER_ORDER_CREATED").length,
     totalFills: fills.length, makerFills, takerFills, completedPairs, incompleteUnhedgedPositions: unhedged.length,
     winLossDistribution: { wins: byType("POSITION_WIN").length, losses: byType("POSITION_LOSS").length, breakeven: byType("POSITION_BREAKEVEN").length },
@@ -96,7 +109,7 @@ function attributeTrading(
 ): Record<string, MarketAssetAttribution> {
   const assetByMarket = inferAssetByMarket(events);
   const empty = (): MarketAssetAttribution => ({
-    realizedPnlUsd: 0, feesUsd: 0, slippageUsd: 0, netTradingPnlUsd: 0, fills: 0, opportunities: 0, accepted: 0, vetoes: 0,
+    realizedPnlUsd: 0, feesUsd: 0, slippageUsd: 0, settlementPnlUsd: 0, netTradingPnlUsd: 0, fills: 0, opportunities: 0, accepted: 0, vetoes: 0,
   });
   const result: Record<string, MarketAssetAttribution> = {};
   const bucket = (id: string | null | undefined) => {
@@ -121,6 +134,19 @@ function attributeTrading(
       row.feesUsd += pnl.feesUsd;
       row.slippageUsd += pnl.slippageUsd;
       row.fills += marketFills.length;
+    }
+  }
+  for (const event of events.filter((item) => item.type === "POSITION_SETTLED")) {
+    const marketId = payloadString(event.payload, "marketId") ?? (event.aggregateType === "position" ? event.aggregateId : null);
+    const realized = Number((event.payload as { realizedDelta?: unknown }).realizedDelta ?? 0);
+    const targets = key === "marketId"
+      ? [marketId]
+      : [payloadString(event.payload, "asset") ?? (marketId ? assetByMarket.get(marketId) : null)].filter((item): item is string => Boolean(item));
+    for (const id of targets) {
+      const row = bucket(id);
+      if (!row) continue;
+      row.settlementPnlUsd += realized;
+      row.realizedPnlUsd += realized;
     }
   }
   for (const event of risk) {

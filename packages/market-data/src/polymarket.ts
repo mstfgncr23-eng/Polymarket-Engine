@@ -125,6 +125,17 @@ export class PolymarketMarketDataAdapter {
     return { discovered, qualified, rejected };
   }
 
+  async fetchPublicMarket(idOrSlug: string): Promise<Record<string, unknown> | null> {
+    try {
+      const raw = /^\d+$/.test(idOrSlug)
+        ? await this.client.fetchMarket({ id: idOrSlug })
+        : await this.client.fetchMarket({ slug: idOrSlug });
+      return raw as Record<string, unknown>;
+    } catch {
+      return null;
+    }
+  }
+
   closestDirectional(report: DiscoveryReport, limit = 20): DirectionalMarketDiagnostic[] {
     return closestDirectionalDiagnostics(report, limit);
   }

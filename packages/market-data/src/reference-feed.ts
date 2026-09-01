@@ -123,10 +123,10 @@ export function parseBinanceAggTrade(raw: unknown, symbol = "BTCUSDT", asset?: s
   });
 }
 
-export type ReferenceSupportStatus = "SUPPORTED" | "UNSUPPORTED_DEFINITIVE" | "TRANSIENT_FAILURE";
+export type ReferenceSupportStatus = "SUPPORTED" | "UNSUPPORTED_DEFINITIVE" | "TRANSIENT_FAILURE" | "PROVIDER_BLOCKED" | "REGION_BLOCKED";
 
 export type ReferenceProbeOutcome = {
-  kind: "supported" | "unsupported_definitive" | "transient_failure";
+  kind: "supported" | "unsupported_definitive" | "transient_failure" | "provider_blocked";
   detail: string;
 };
 
@@ -136,7 +136,7 @@ export interface ReferenceResolution {
   status: ReferenceSupportStatus;
   symbol: string | null;
   url: string | null;
-  reason: "RESOLVED" | "REFERENCE_UNSUPPORTED" | "REFERENCE_PROBE_TRANSIENT";
+  reason: "RESOLVED" | "REFERENCE_UNSUPPORTED" | "REFERENCE_PROBE_TRANSIENT" | "REFERENCE_PROVIDER_BLOCKED";
   detail?: string;
   retryAfterMs?: number;
 }
@@ -195,6 +195,13 @@ export class ReferenceFeedRegistry {
         asset, supported: false, status: "UNSUPPORTED_DEFINITIVE", symbol, url: null,
         reason: "REFERENCE_UNSUPPORTED", detail: outcome.detail,
       });
+    }
+    if (outcome.kind === "provider_blocked") {
+      const region = /451/.test(outcome.detail);
+      return this.remember(asset, {
+        asset, supported: false, status: region ? "REGION_BLOCKED" : "PROVIDER_BLOCKED", symbol, url: null,
+        reason: "REFERENCE_PROVIDER_BLOCKED", detail: outcome.detail, retryAfterMs: 1_800_000,
+      }, this.now() + 1_800_000);
     }
     const backoff = this.transientBackoff.get(asset) ?? new ExponentialBackoff({ initialDelayMs: 1_000, maxDelayMs: 60_000, multiplier: 2, jitterRatio: 0 });
     this.transientBackoff.set(asset, backoff);
@@ -268,6 +275,9 @@ export class ReferenceFeedRegistry {
 }
 
 export function classifyBinanceExchangeInfo(input: { ok: boolean; status: number; body: unknown; symbol?: string }): ReferenceProbeOutcome {
+  if (input.status === 451 || input.status === 403) {
+    return { kind: "provider_blocked", detail: `http_${input.status}` };
+  }
   if (input.status === 408 || input.status === 429 || input.status >= 500) {
     return { kind: "transient_failure", detail: `http_${input.status}` };
   }

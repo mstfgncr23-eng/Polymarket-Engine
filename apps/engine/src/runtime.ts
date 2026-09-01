@@ -21,6 +21,11 @@ export async function startRuntime(envInput: NodeJS.ProcessEnv = process.env): P
     mcp: { bearerTokens: env.GROK_MCP_BEARER_TOKENS, allowedOrigins: env.GROK_MCP_ALLOWED_ORIGINS, rateLimitPerMinute: env.GROK_MCP_RATE_LIMIT_PER_MINUTE },
     submitGrokSignal: (signal, clientId) => engine.submitGrokSignal(signal, clientId),
     noteMcpRequest: (tool, triggerId) => engine.noteMcpRequest(tool, triggerId),
+    startExperiment: () => engine.beginExperiment(),
+    engineReadToken: env.ENGINE_READ_TOKEN,
+    operatorToken: env.ENGINE_OPERATOR_TOKEN,
+    metricsToken: env.METRICS_TOKEN,
+    nodeEnv: env.NODE_ENV,
   });
   await server.listen({ host: "0.0.0.0", port: env.PORT });
   try { await engine.start(); }

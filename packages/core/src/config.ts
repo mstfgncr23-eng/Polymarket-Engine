@@ -36,6 +36,10 @@ export const triggerConfigSchema = z.object({
   expiryWarningMs: z.number().int().positive().default(3_600_000),
   maxActivationsPerMinute: z.number().int().positive().default(12),
   activationSeveritySuppression: z.number().int().min(0).max(3).default(1),
+  scheduledReviewIntervalMs: z.number().int().positive().default(900_000),
+  newsSeverityThreshold: z.number().int().min(1).max(3).default(2),
+  failedHedgeDurationMs: z.number().int().positive().default(300_000),
+  disagreementAgreementMax: z.number().min(0).max(1).default(0.45),
 });
 export type TriggerConfig = z.infer<typeof triggerConfigSchema>;
 
@@ -82,6 +86,20 @@ export const engineEnvSchema = z.object({
   MAX_QUALIFIED_MARKETS: z.coerce.number().int().positive().default(40),
   ESTIMATED_INFRA_COST_PER_HOUR_USD: z.coerce.number().nonnegative().default(0.08),
   DASHBOARD_ORIGIN: z.string().url().default("http://localhost:3000"),
+  ENGINE_READ_TOKEN: z.string().min(8).optional(),
+  ENGINE_OPERATOR_TOKEN: z.string().min(8).optional(),
+  METRICS_TOKEN: z.string().min(8).optional(),
+  EXPERIMENT_REQUIRES_GROK: z.preprocess(
+    (value) => value === true || value === "true" || value === "1",
+    z.boolean(),
+  ).default(false),
+  SETTLEMENT_POLL_MS: z.coerce.number().int().positive().default(15_000),
+  SCHEDULED_REVIEW_INTERVAL_MS: z.coerce.number().int().positive().default(900_000),
+  TELEMETRY_QUEUE_LIMIT: z.coerce.number().int().positive().default(2_000),
+  TELEMETRY_BATCH_SIZE: z.coerce.number().int().positive().default(50),
+  DASHBOARD_SNAPSHOT_HZ: z.coerce.number().positive().default(4),
+  ACTIVATION_FANOUT: z.coerce.number().int().positive().default(3),
+  ACTIVATION_MEMORY_LIMIT: z.coerce.number().int().positive().default(500),
 });
 export type EngineEnv = z.infer<typeof engineEnvSchema>;
 

@@ -9,8 +9,12 @@ export * from "./decision.js";
 export * from "./domain.js";
 export * from "./execution.js";
 export * from "./experiment.js";
+export * from "./fair-edge.js";
+export * from "./journal-types.js";
 export * from "./qualification.js";
 export * from "./risk.js";
 export * from "./role-routing.js";
+export * from "./settlement.js";
 export * from "./strategy.js";
 export * from "./trigger.js";
+

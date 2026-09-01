@@ -36,8 +36,23 @@ export class SlackGrokActivationBridge implements GrokActivationBridge {
 
   async activate(request: GrokActivationRequest): Promise<GrokActivationResult[]> {
     const parsed = grokActivationRequestSchema.parse(request);
+    if (new Date(parsed.expiresAt).getTime() <= Date.now()) {
+      return parsed.targetRoles.map((targetRole) => ({
+        provider: this.provider, ok: false, skipped: true, targetRole,
+        requestedAt: new Date().toISOString(), sentAt: null, errorCode: "TRIGGER_EXPIRED",
+        httpStatus: null, grokWakeObserved: false, idempotencyKey: activationIdempotencyKey(parsed.triggerId, targetRole),
+      }));
+    }
     const results: GrokActivationResult[] = [];
     for (const targetRole of parsed.targetRoles) {
+      if (new Date(parsed.expiresAt).getTime() <= Date.now()) {
+        results.push({
+          provider: this.provider, ok: false, skipped: true, targetRole,
+          requestedAt: new Date().toISOString(), sentAt: null, errorCode: "TRIGGER_EXPIRED",
+          httpStatus: null, grokWakeObserved: false, idempotencyKey: activationIdempotencyKey(parsed.triggerId, targetRole),
+        });
+        continue;
+      }
       results.push(await this.postRole(parsed, targetRole));
     }
     return results;
@@ -83,6 +98,10 @@ export class SlackGrokActivationBridge implements GrokActivationBridge {
           signal: AbortSignal.timeout(this.timeoutMs),
         });
         httpStatus = response.status;
+        const retryAfter = Number(response.headers.get("retry-after"));
+        if (Number.isFinite(retryAfter) && retryAfter > 0 && (response.status === 429 || response.status >= 500)) {
+          await delay(Math.min(30_000, retryAfter * 1000));
+        }
         const json = await response.json().catch(() => ({})) as SlackPostResponse;
         if (response.ok && json.ok === true) {
           return {

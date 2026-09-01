@@ -1,8 +1,8 @@
-import { desc, eq } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, lte, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/postgres-js";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
 import postgres from "postgres";
-import { createId, journalEventSchema, type JournalEvent } from "@pm/core";
+import { createId, journalEventSchema, type JournalEvent, type JournalQuery } from "@pm/core";
 import { engineCheckpoints, journalEvents, mcpIdempotencyKeys } from "./schema.js";
 
 export interface EngineCheckpoint {
@@ -20,6 +20,8 @@ export interface EventJournal {
   appendMany(events: readonly JournalEvent[]): Promise<void>;
   readTrace(traceId: string): Promise<JournalEvent[]>;
   readAll(): Promise<JournalEvent[]>;
+  queryEvents(query: JournalQuery): Promise<JournalEvent[]>;
+  countByType(types?: readonly string[]): Promise<Record<string, number>>;
   claimIdempotency(scope: string, key: string): Promise<boolean>;
   saveCheckpoint(checkpoint: Omit<EngineCheckpoint, "id" | "createdAt">): Promise<EngineCheckpoint>;
   loadLatestCheckpoint(): Promise<EngineCheckpoint | null>;
@@ -45,6 +47,27 @@ export class MemoryEventJournal implements EventJournal {
   }
   async readTrace(traceId: string): Promise<JournalEvent[]> { return structuredClone(this.events.filter((event) => event.traceId === traceId)); }
   async readAll(): Promise<JournalEvent[]> { return structuredClone(this.events); }
+  async queryEvents(query: JournalQuery): Promise<JournalEvent[]> {
+    let rows = this.events;
+    if (query.types && query.types.length > 0) rows = rows.filter((event) => query.types!.includes(event.type));
+    if (query.experimentId) {
+      rows = rows.filter((event) => event.aggregateId === query.experimentId
+        || (event.payload as { experimentId?: unknown }).experimentId === query.experimentId);
+    }
+    if (query.from) rows = rows.filter((event) => new Date(event.occurredAt).getTime() >= query.from!.getTime());
+    if (query.to) rows = rows.filter((event) => new Date(event.occurredAt).getTime() <= query.to!.getTime());
+    const offset = query.offset ?? 0;
+    const limit = query.limit ?? rows.length;
+    return structuredClone(rows.slice(offset, offset + limit));
+  }
+  async countByType(types?: readonly string[]): Promise<Record<string, number>> {
+    const counts: Record<string, number> = {};
+    for (const event of this.events) {
+      if (types && !types.includes(event.type)) continue;
+      counts[event.type] = (counts[event.type] ?? 0) + 1;
+    }
+    return counts;
+  }
   async claimIdempotency(scope: string, key: string): Promise<boolean> {
     if (!this.available) throw new Error("DATABASE_UNAVAILABLE");
     const composite = `${scope}\u0000${key}`;
@@ -97,8 +120,31 @@ export class PostgresEventJournal implements EventJournal {
     return rows.map(toJournalEvent);
   }
   async readAll(): Promise<JournalEvent[]> {
-    const rows = await this.db.select().from(journalEvents);
+    const rows = await this.db.select().from(journalEvents).limit(10_000);
     return rows.map(toJournalEvent);
+  }
+  async queryEvents(query: JournalQuery): Promise<JournalEvent[]> {
+    const filters = [];
+    if (query.types && query.types.length > 0) filters.push(inArray(journalEvents.type, [...query.types]));
+    if (query.experimentId) {
+      filters.push(sql`(${journalEvents.aggregateId} = ${query.experimentId} OR ${journalEvents.payload}->>'experimentId' = ${query.experimentId})`);
+    }
+    if (query.from) filters.push(gte(journalEvents.occurredAt, query.from));
+    if (query.to) filters.push(lte(journalEvents.occurredAt, query.to));
+    const rows = await this.db.select().from(journalEvents)
+      .where(filters.length > 0 ? and(...filters) : undefined)
+      .orderBy(desc(journalEvents.occurredAt))
+      .limit(Math.min(query.limit ?? 5_000, 20_000))
+      .offset(query.offset ?? 0);
+    return rows.map(toJournalEvent).reverse();
+  }
+  async countByType(types?: readonly string[]): Promise<Record<string, number>> {
+    const filters = types && types.length > 0 ? [inArray(journalEvents.type, [...types])] : [];
+    const rows = await this.db.select({
+      type: journalEvents.type,
+      count: sql<number>`count(*)::int`,
+    }).from(journalEvents).where(filters.length > 0 ? and(...filters) : undefined).groupBy(journalEvents.type);
+    return Object.fromEntries(rows.map((row) => [row.type, Number(row.count)]));
   }
   async claimIdempotency(scope: string, key: string): Promise<boolean> {
     const rows = await this.db.insert(mcpIdempotencyKeys).values({ scope, key })

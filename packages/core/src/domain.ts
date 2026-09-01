@@ -310,6 +310,9 @@ export const riskReasonCodeSchema = z.enum([
   "ABNORMAL_EXECUTION_ERRORS",
   "EXTERNAL_RISK_RECOMMENDED_VETO",
   "SHUTTING_DOWN",
+  "INSUFFICIENT_CASH",
+  "MARKET_NOT_ENTRY_QUALIFIED",
+  "REFERENCE_PROVIDER_BLOCKED",
 ]);
 export type RiskReasonCode = z.infer<typeof riskReasonCodeSchema>;
 
@@ -402,9 +405,14 @@ export const ledgerStateSchema = z.object({
 });
 export type LedgerState = z.infer<typeof ledgerStateSchema>;
 
+export const experimentStatusSchema = z.enum(["IDLE", "CREATED", "RUNNING", "ENTRY_CLOSED", "COMPLETED", "FAILED"]);
+export type ExperimentStatus = z.infer<typeof experimentStatusSchema>;
+export const experimentClosePolicySchema = z.enum(["observe_until_settlement", "mark_to_market"]);
+export type ExperimentClosePolicy = z.infer<typeof experimentClosePolicySchema>;
+
 export const experimentManifestSchema = z.object({
   id: idSchema,
-  status: z.enum(["CREATED", "RUNNING", "ENTRY_CLOSED", "COMPLETED", "FAILED"]),
+  status: experimentStatusSchema,
   durationHours: z.number().positive(),
   strategyVersion: z.string(),
   riskConfiguration: z.record(z.string(), z.unknown()),
@@ -412,9 +420,12 @@ export const experimentManifestSchema = z.object({
   startingBalance: decimalStringSchema,
   systemVersion: z.string(),
   gitSha: z.string(),
-  startedAt: timestampSchema,
-  entryClosesAt: timestampSchema,
+  closePolicy: experimentClosePolicySchema.default("observe_until_settlement"),
+  startedAt: timestampSchema.nullable(),
+  entryClosesAt: timestampSchema.nullable(),
   completedAt: timestampSchema.nullable(),
+  unresolvedPositionCount: z.number().int().nonnegative().default(0),
+  markToMarketAt: timestampSchema.nullable().optional(),
 });
 export type ExperimentManifest = z.infer<typeof experimentManifestSchema>;
 
