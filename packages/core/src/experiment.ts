@@ -60,6 +60,8 @@ export interface ExperimentSummary {
   modelInvocationCounts: Record<string, number>;
   modelCostByAgentUsd: Record<string, number>;
   performanceByAgentSignal: Record<string, unknown>;
+  performanceByMarket: Record<string, unknown>;
+  performanceByAsset: Record<string, unknown>;
   performanceByMarketRegime: Record<string, unknown>;
   performanceByHour: Record<string, unknown>;
   rejectedTradesThatWouldHaveWon: number;
@@ -99,6 +101,8 @@ Generated: ${summary.generatedAt}
 - Maximum directional exposure: $${summary.maximumDirectionalExposureUsd.toFixed(2)}
 - Average unhedged duration: ${summary.averageUnhedgedDurationMs.toFixed(0)} ms
 - Grok Bot signals: ${JSON.stringify(summary.modelInvocationCounts)}
+- By market: ${JSON.stringify(summary.performanceByMarket)}
+- By asset: ${JSON.stringify(summary.performanceByAsset)}
 - OpenAI token cost: $0 (runtime inference is not billed here)
 - Failures: ${JSON.stringify(summary.failureStatistics)}
 

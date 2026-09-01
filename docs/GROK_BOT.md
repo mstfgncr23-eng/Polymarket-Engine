@@ -85,34 +85,53 @@ Paste the matching instructions from `packages/core/src/agents.ts`. Every bot mu
 
 Triggers are always persisted. The engine never waits for Grok. Fresh, schema-valid signals from the **authenticated** role are assembled into consensus when minimum role/evidence requirements are met. Stale, duplicate, malformed, unauthorized, impersonated, forbidden-tool, and trade-tool calls are rejected and audited. If Grok Bots are down, monitoring continues and the dashboard shows idle/stale — it does not fake activity. Paper only: `TRADING_MODE=paper`; the live adapter always throws `LIVE_TRADING_DISABLED`.
 
-## Issue #2 — Event-driven activation: official limitation
+## Issue #2 — Event-driven activation (re-verified 2026-09-01)
 
-**Verdict:** Official Grok Bot docs do **not** support `custom Polymarket event → Grok Bot actually starts work immediately`.
+**Verdict:** Official Grok Bot docs still do **not** support `custom Polymarket event → Grok Bot actually starts work immediately`. There is **no custom inbound Grok webhook**.
 
-- An MCP server **cannot** wake a Bot.
-- Exposing `get_recent_triggers` is **not** event-driven activation.
-- There is **no custom inbound webhook**. This engine does not implement a fake webhook or wake path and does not call an xAI inference API.
-- Documented event triggers are **only Cursor-account integrations**, with examples a Slack message or a GitHub notification. They are separate from Slack or GitHub plugins. ([Skills and routines — Trigger work from an event](https://docs.x.ai/grok-bot/skills-routines-and-automations); troubleshooting for event-triggered routines checks source channel, repository, and matching rule.)
-- A Cursor forum post that inbound webhook is “a great idea / tracking the ask” is **not** official product.
+Re-verified sources:
 
-Official ways a Bot starts work (none of these are a Polymarket webhook):
+- [Skills and routines — Trigger work from an event](https://docs.x.ai/grok-bot/skills-routines-and-automations): Cursor account integrations can start a routine from an event, **such as a Slack message or a GitHub notification**. They are separate from Slack/GitHub plugins.
+- [Troubleshooting — A routine did not run](https://docs.x.ai/grok-bot/troubleshooting): for an event-triggered routine, confirm the source channel, repository, and matching rule.
+- [Message and collaborate](https://docs.x.ai/grok-bot/chat-and-collaboration): a Bot-to-Bot message can wake the receiving Bot. **MCP cannot send that message.**
+- MCP is client-initiated while a Bot is already working. `get_recent_triggers` is a pull surface, not a wake path.
+- Grok Build hooks and grok.com custom MCP are **not** Grok Bot wake paths.
 
-| Mechanism | What official docs say | Not a market-tick wake |
-|---|---|---|
-| Scheduled routine | A routine tells one Bot when to run—on a schedule. Background routines can run while the laptop is closed. A Bot can own up to 50 routines; the app keeps 20 recent run records per routine. | Polling lag after cron fires. No latency SLA in the docs. Official examples are calendar-style (“every weekday at 8:00 AM”). |
-| Cursor Slack/GitHub event | Cursor account integrations can start a routine from an event, such as a Slack message or a GitHub notification. | Only if someone/something posts into Slack/GitHub matching a routine. Not a Polymarket webhook. This engine does not post to Slack or GitHub. |
-| User chat or Bot-to-Bot message | You message a Bot; a Bot can send an asynchronous message to another Bot and the receiving Bot wakes. | Still not unattended-on-market-tick. **MCP cannot send that message.** |
+### Architecture chosen
 
-Sources: [skills-routines-and-automations](https://docs.x.ai/grok-bot/skills-routines-and-automations), [troubleshooting](https://docs.x.ai/grok-bot/troubleshooting), [introducing-grok-bot](https://x.ai/news/introducing-grok-bot), [chat-and-collaboration](https://docs.x.ai/grok-bot/chat-and-collaboration).
+The engine defines `GrokActivationBridge`. Core trigger/consensus/risk code does not import Slack.
 
-### Viable subscription-only options (no latency SLA in docs)
+| Provider | When | What it does | What it does **not** mean |
+|---|---|---|---|
+| `NoopGrokActivationBridge` | `GROK_ACTIVATION_PROVIDER=noop` (default) | Records a skipped activation. Monitoring continues. | Not a fake Grok signal, consensus, or paper order. |
+| `SlackGrokActivationBridge` | `GROK_ACTIVATION_PROVIDER=slack` plus engine-only `SLACK_BOT_TOKEN` and `SLACK_CHANNEL_ID` | Posts a **minimal wake-signal** per target role: `eventType, triggerId, traceId, marketId, asset, severity, triggerKind, createdAt, expiresAt, targetRoles`. Canonical research stays on MCP. | Adapter HTTP `ok` is **not** an observed Grok wake. Official docs do not prove that a programmatic Slack bot post (vs a human message) fires a Cursor-account routine. |
 
-No engine wake-up code is implemented. These are operator-owned Grok Bot subscriptions only:
+Bot-to-Bot fan-out is **not** used: MCP cannot send those messages, and a dispatcher Bot would add hops without validated product behavior. Role-specific Slack posts are used instead of waking all six Bots.
 
-**A) Scheduled routine.** After cron fires, the Bot polls MCP (`get_recent_triggers`, then read/write tools). Up to 50 routines per Bot. Background works with laptop closed. This is **polling lag, not event-driven**. If the interval is longer than trigger TTL (`triggerTtlMs`, default 30s), most research windows expire before the Bot runs. ([Skills and routines](https://docs.x.ai/grok-bot/skills-routines-and-automations))
+Activation is non-fatal: feed loops continue, the trigger stays persisted, the failure is journaled, no crash, no invented research, no paper order from missing Grok.
 
-**B) Slack/GitHub Cursor integration event.** Only if someone/something posts into Slack or GitHub matching a routine. Not a Polymarket webhook. This engine does not send those posts.
+A future official Grok webhook can replace the Slack provider without rewriting the trigger engine.
 
-**C) User chat or Bot-to-Bot message** can wake a Bot. Still not unattended-on-market-tick. MCP cannot send that message. ([Chat and collaboration](https://docs.x.ai/grok-bot/chat-and-collaboration))
+### Operator steps (Slack wake transport)
+
+1. In Cursor/Grok Bot, connect the **Cursor account Slack integration** (not only the Slack plugin).
+2. Invite the integration to one dedicated channel (not a production chat).
+3. For each of the six role Bots, create a **narrow** event routine, for example: *When a message in `#polymarket-wake` contains `GROK_RESEARCH_REQUEST` and my role id, call `get_recent_triggers` then inspect that `triggerId` via MCP. Submit only my allow-listed write tool. Never place an order.*
+4. Set engine secrets only: `GROK_ACTIVATION_PROVIDER=slack`, `SLACK_BOT_TOKEN`, `SLACK_CHANNEL_ID`. Never put these on the dashboard, in MCP responses, journal payloads, or browser env.
+5. Keep scheduled routines as a backup poll. If the cron interval is longer than `triggerTtlMs` (default 30s), most windows expire first. Do not silently raise TTL; measure `triggerCreatedAt → firstMcpRequestAt` (MCP is the documented proxy for Bot wake; the product exposes no wake timestamp).
+
+Latency timestamps persisted: `triggerCreatedAt`, `activationRequestedAt`, `activationSentAt`, `firstMcpRequestAt`, `firstAcceptedSignalAt`. `firstMcpRequestAt` is a proxy for wake, not a product-provided Bot-started-at field.
+
+### Role routing (do not wake all six)
+
+| Trigger family | Roles |
+|---|---|
+| Microstructure / order book (`BOOK_IMBALANCE`, `SPREAD_CHANGE`, `DEPTH_CHANGE`, `REPRICING_LAG`, `PAIR_COST_OPPORTUNITY`, `EDGE_CHANGE`, `NEARING_EXPIRY`) | `market_microstructure_scanner`, `crypto_market_scanner`, `fair_probability_analyst` |
+| Crypto reference / momentum (`BTC_RAPID_MOVE`, `CRYPTO_REFERENCE_*`) | `crypto_market_scanner`, `fair_probability_analyst` |
+| News / information | `news_x_intelligence_scanner`, `fair_probability_analyst` |
+| Hedge / exposure / risk | `risk_hedge_analyst` |
+| Severe disagreement / regime / escalation (incl. severity ≥ 3) | `strategy_supervisor` |
+
+Thousands of ticks are filtered deterministically. Only qualifying triggers request activation.
 
 Do not mix grok.com custom MCP or Grok Build hooks (outbound) into this as if they wake Grok Bot.

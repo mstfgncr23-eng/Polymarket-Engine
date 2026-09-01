@@ -27,6 +27,7 @@ export interface McpDependencies {
   journal: EventJournal;
   metrics: EngineMetrics;
   submitSignal(signal: GrokSignalSubmission, clientId: string): Promise<Record<string, unknown>>;
+  noteMcpRequest?(tool: string | null, triggerId?: string): void;
 }
 
 type AuthResult = { ok: true; clientId: string; tokenFingerprint: string } | { ok: false; status: 401 | 503; reason: string; tokenFingerprint: string | null };
@@ -66,6 +67,7 @@ const grokWriteInputShape = {
   correlationId: z.string().min(1).max(160),
   marketId: z.string().min(1).max(160),
   timestamp: z.string().min(1),
+  asset: z.string().min(1).nullable().optional(),
   agentId: z.enum([
     "market_microstructure_scanner",
     "crypto_market_scanner",
@@ -200,6 +202,7 @@ export function createMcpHttpHandler(config: McpConfig, dependencies: McpDepende
     }
 
     const server = createGrokMcpServer(auth.clientId, dependencies);
+    dependencies.noteMcpRequest?.(toolName, extractTriggerId(request.body));
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
     try {
       await server.connect(transport);
@@ -329,9 +332,9 @@ export function createGrokMcpServer(clientId: string, dependencies: McpDependenc
 }
 
 function uniqueMarkets(state: EngineStateStore) {
-  const markets = new Map<string, { marketId: string; outcomes: Array<{ tokenId: string; outcome: string }> }>();
+  const markets = new Map<string, { marketId: string; asset: string | null; outcomes: Array<{ tokenId: string; outcome: string }> }>();
   for (const snapshot of state.marketSnapshots.values()) {
-    const existing = markets.get(snapshot.marketId) ?? { marketId: snapshot.marketId, outcomes: [] };
+    const existing = markets.get(snapshot.marketId) ?? { marketId: snapshot.marketId, asset: snapshot.asset ?? null, outcomes: [] };
     if (!existing.outcomes.some((item) => item.tokenId === snapshot.tokenId)) {
       existing.outcomes.push({ tokenId: snapshot.tokenId, outcome: snapshot.outcome });
     }
@@ -365,6 +368,12 @@ function extractToolName(body: unknown): string | null {
   return typeof name === "string" ? name : null;
 }
 
+function extractTriggerId(body: unknown): string | undefined {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return undefined;
+  const args = (body as { params?: { arguments?: Record<string, unknown> } }).params?.arguments;
+  return typeof args?.triggerId === "string" ? args.triggerId : undefined;
+}
+
 function extractRpcId(body: unknown): string | number | null {
   if (!body || typeof body !== "object" || Array.isArray(body)) return null;
   const id = (body as { id?: unknown }).id;
@@ -392,6 +401,7 @@ function submissionAuditMeta(body: unknown): { idempotencyId?: string; traceId?:
       agentId: typeof args?.agentId === "string" ? args.agentId : null,
       role: typeof args?.role === "string" ? args.role : null,
       marketId: typeof args?.marketId === "string" ? args.marketId : null,
+      asset: typeof args?.asset === "string" ? args.asset : null,
       schemaValid: meta.success,
     },
   };

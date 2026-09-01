@@ -9,6 +9,7 @@ import {
   engineEnvSchema,
   executePaperTaker,
   experimentManifestSchema,
+  qualificationConfigSchema,
   refreshExperiment,
   riskLimitsSchema,
   startExperiment,
@@ -23,6 +24,7 @@ import {
   triggerEventSchema,
   type ExternalAgentRoleId,
   type Direction,
+  type GrokActivationBridge,
   type GrokSignalEnvelope,
   type GrokSignalSubmission,
   type EngineEnv,
@@ -31,27 +33,40 @@ import {
   type Outcome,
   type PaperOrder,
   type Position,
+  type ReferenceTick,
   type RestingPaperOrder,
   type TriggerEvent,
 } from "@pm/core";
 import { createJournalEvent, type EventJournal } from "@pm/db";
-import { BtcWebSocketAdapter, PolymarketMarketDataAdapter, type FeedConnectionEvent } from "@pm/market-data";
+import {
+  BtcWebSocketAdapter,
+  PolymarketMarketDataAdapter,
+  ReferenceFeedRegistry,
+  createRestProbe,
+  type DiscoveredMarket,
+  type FeedConnectionEvent,
+} from "@pm/market-data";
 import { EngineMetrics } from "./metrics.js";
 import { SseHub } from "./server.js";
 import { EngineStateStore } from "./state.js";
 import { buildExperimentSummary, writeExperimentSummary } from "./report.js";
+import { GrokActivationCoordinator, persistableActivation } from "./activation/coordinator.js";
+import { createGrokActivationBridge } from "./activation/index.js";
 
 export class EngineService {
   readonly metrics = new EngineMetrics();
   readonly sse = new SseHub();
   readonly ledger: PaperLedger;
   readonly state: EngineStateStore;
+  readonly activation: GrokActivationCoordinator;
   private readonly abort = new AbortController();
   private readonly triggerEngine;
   private readonly riskLimits;
+  private readonly triggerConfig;
   private readonly strategy = new TemporalPairHedgeStrategy();
   private readonly marketAdapter: PolymarketMarketDataAdapter;
-  private readonly btcAdapter: BtcWebSocketAdapter;
+  private readonly legacyBtcAdapter: BtcWebSocketAdapter | null;
+  private readonly referenceRegistry: ReferenceFeedRegistry;
   private readonly snapshots = new Map<string, Partial<Record<Outcome, MarketSnapshot>>>();
   private readonly restingOrders = new Map<string, RestingPaperOrder>();
   private readonly recentTrades = new Map<string, number>();
@@ -59,6 +74,10 @@ export class EngineService {
   private readonly signalsByTrigger = new Map<string, Map<ExternalAgentRoleId, GrokSignalEnvelope>>();
   private readonly signalReceivedTimes: number[] = [];
   private readonly lastEvaluatedSignalCount = new Map<string, number>();
+  private readonly marketsById = new Map<string, DiscoveredMarket>();
+  private readonly assetByMarket = new Map<string, string | null>();
+  private readonly referenceRequired = new Map<string, boolean>();
+  private tokenIds: string[] = [];
   private experiment: ExperimentManifest | null = null;
   private checkpointSequence = 0;
   private lastTradeAt: Date | null = null;
@@ -66,6 +85,7 @@ export class EngineService {
   private timestampDisorder = false;
   private started = false;
   private maintenanceTimer: NodeJS.Timeout | null = null;
+  private discoveryTimer: NodeJS.Timeout | null = null;
   private lastInfrastructureAccrualAt = Date.now();
   private reportGenerated = false;
 
@@ -73,14 +93,28 @@ export class EngineService {
     readonly env: EngineEnv,
     private readonly journal: EventJournal,
     private readonly logger: { error(bindings: object, message: string): void },
-    adapters?: { market?: PolymarketMarketDataAdapter; btc?: BtcWebSocketAdapter },
+    adapters?: {
+      market?: PolymarketMarketDataAdapter;
+      btc?: BtcWebSocketAdapter;
+      activation?: GrokActivationBridge;
+      referenceRegistry?: ReferenceFeedRegistry;
+    },
   ) {
     this.ledger = new PaperLedger(env.PAPER_START_BALANCE);
     this.state = new EngineStateStore(this.ledger.snapshot(), this.ledger.positions);
-    this.triggerEngine = new TriggerEngine(triggerConfigSchema.parse({}));
+    this.triggerConfig = triggerConfigSchema.parse({});
+    this.triggerEngine = new TriggerEngine(this.triggerConfig);
     this.riskLimits = riskLimitsSchema.parse({ maxExternalSignalsPerMinute: env.GROK_MCP_RATE_LIMIT_PER_MINUTE });
     this.marketAdapter = adapters?.market ?? new PolymarketMarketDataAdapter();
-    this.btcAdapter = adapters?.btc ?? new BtcWebSocketAdapter(env.BTC_WS_URL, env.BTC_SYMBOL, this.riskLimits.staleFeedTimeoutMs);
+    this.legacyBtcAdapter = adapters?.btc ?? null;
+    this.referenceRegistry = adapters?.referenceRegistry ?? new ReferenceFeedRegistry(
+      env.REFERENCE_WS_BASE_URL, env.REFERENCE_REST_BASE_URL, this.riskLimits.staleFeedTimeoutMs, undefined,
+      createRestProbe(env.REFERENCE_REST_BASE_URL),
+    );
+    this.activation = new GrokActivationCoordinator(
+      adapters?.activation ?? createGrokActivationBridge(env),
+      { cooldownMs: this.triggerConfig.cooldownMs, maxPerMinute: this.triggerConfig.maxActivationsPerMinute, suppressAtOrBelow: this.triggerConfig.activationSeveritySuppression },
+    );
   }
 
   async start(): Promise<void> {
@@ -89,31 +123,37 @@ export class EngineService {
     await this.initializeJournalWithRetry();
     await this.restoreOrStartExperiment();
     const configuredTokens = splitList(this.env.POLYMARKET_TOKEN_IDS);
-    let tokenIds = configuredTokens;
-    if (tokenIds.length > 0) tokenIds.forEach((tokenId, index) => this.marketAdapter.registerManualToken(tokenId, tokenId, index % 2 === 0 ? "UP" : "DOWN"));
-    else {
-      const markets = await this.marketAdapter.discoverBitcoinMarkets(splitList(this.env.POLYMARKET_MARKET_SLUGS));
-      tokenIds = markets.flatMap((market) => market.tokens.map((token) => token.tokenId));
-      await this.safeAppend(createJournalEvent({
-        traceId: createId("trace"), type: "MARKETS_DISCOVERED", aggregateType: "engine", aggregateId: "market-discovery",
-        payload: { count: markets.length, markets: markets.map((market) => ({ id: market.id, slug: market.slug, tokens: market.tokens })) },
-      }));
+    if (configuredTokens.length > 0) {
+      configuredTokens.forEach((tokenId, index) => this.marketAdapter.registerManualToken(tokenId, tokenId, index % 2 === 0 ? "UP" : "DOWN"));
+      this.tokenIds = configuredTokens;
+    } else {
+      await this.refreshDiscovery();
     }
-    if (tokenIds.length === 0) throw new Error("NO_ACTIVE_BITCOIN_MARKETS_FOUND");
+    if (this.tokenIds.length === 0) throw new Error("NO_QUALIFIED_CRYPTO_MARKETS_FOUND");
 
-    void this.marketAdapter.run(tokenIds, {
+    void this.marketAdapter.run(this.tokenIds, {
       onSnapshot: (snapshot) => this.onMarketSnapshot(snapshot),
       onConnection: (event) => this.onConnection(event),
       onError: (error) => this.onFeedError("polymarket", error),
     }, this.abort.signal);
-    void this.btcAdapter.run({
-      onTick: (tick) => this.onBtcTick(tick),
-      onConnection: (event) => this.onConnection(event),
-      onError: (error) => this.onFeedError("btc", error),
-    }, this.abort.signal);
+
+    if (this.legacyBtcAdapter) {
+      void this.legacyBtcAdapter.run({
+        onTick: (tick) => this.onReferenceTick(tick.asset ? tick : { ...tick, asset: "BTC" }),
+        onConnection: (event) => this.onConnection({ ...event, feed: event.feed === "reference" ? "btc" : event.feed, asset: event.asset ?? "BTC" }),
+        onError: (error) => this.onFeedError("btc", error),
+      }, this.abort.signal);
+    } else {
+      await this.startReferenceFeeds();
+    }
+
     this.maintenanceTimer = setInterval(() => { void this.maintainExperiment(); }, 60_000);
     this.maintenanceTimer.unref();
-    this.record("ENGINE_STARTED", this.experiment?.id ?? createId("engine"), null, { tokenIds: tokenIds.length, mode: "paper" });
+    if (configuredTokens.length === 0) {
+      this.discoveryTimer = setInterval(() => { void this.refreshDiscovery().catch((error) => this.logger.error({ err: error }, "discovery refresh failed")); }, this.env.DISCOVERY_INTERVAL_MS);
+      this.discoveryTimer.unref();
+    }
+    this.record("ENGINE_STARTED", this.experiment?.id ?? createId("engine"), null, { tokenIds: this.tokenIds.length, mode: "paper", activationProvider: this.env.GROK_ACTIVATION_PROVIDER }, null);
   }
 
   async stop(): Promise<void> {
@@ -123,11 +163,69 @@ export class EngineService {
     this.record("ENGINE_DRAINING", this.experiment?.id ?? "engine", null, {});
     this.abort.abort("SIGTERM");
     if (this.maintenanceTimer) clearInterval(this.maintenanceTimer);
+    if (this.discoveryTimer) clearInterval(this.discoveryTimer);
     this.accrueInfrastructureCost();
     await this.checkpoint();
     this.sse.close();
     await this.journal.close();
     this.record("ENGINE_STOPPED", this.experiment?.id ?? "engine", null, {});
+  }
+
+  noteMcpRequest(tool: string | null, triggerId?: string): void {
+    if (triggerId) this.activation.noteMcp([triggerId]);
+    else if (tool === "get_recent_triggers") this.activation.noteMcp([]);
+    this.state.setActivationLatency(this.activation.snapshot());
+  }
+
+  private async refreshDiscovery(): Promise<void> {
+    const report = await this.marketAdapter.discoverCryptoMarkets(
+      splitList(this.env.POLYMARKET_MARKET_SLUGS),
+      this.env.MAX_QUALIFIED_MARKETS,
+      qualificationConfigSchema.parse({ maxQualifiedMarkets: this.env.MAX_QUALIFIED_MARKETS }),
+    );
+    for (const market of report.qualified) {
+      this.marketsById.set(market.id, market);
+      this.assetByMarket.set(market.id, market.asset);
+    }
+    this.tokenIds = report.qualified.flatMap((market) => market.tokens.map((token) => token.tokenId));
+    this.marketAdapter.setTokenIds(this.tokenIds);
+    this.state.setDiscovery({
+      qualified: report.qualified.map((market) => ({ marketId: market.id, slug: market.slug, asset: market.asset, tokens: market.tokens.map((token) => token.tokenId) })),
+      rejected: report.rejected.slice(0, 100),
+    });
+    await this.safeAppend(createJournalEvent({
+      traceId: createId("trace"), type: "MARKETS_DISCOVERED", aggregateType: "engine", aggregateId: "market-discovery",
+      payload: {
+        discovered: report.discovered.length, qualified: report.qualified.length,
+        markets: report.qualified.map((market) => ({ id: market.id, slug: market.slug, asset: market.asset, tokens: market.tokens })),
+        rejected: report.rejected.slice(0, 50),
+      },
+    }));
+  }
+
+  private async startReferenceFeeds(): Promise<void> {
+    const assets = [...new Set([...this.assetByMarket.values()].filter((asset): asset is string => Boolean(asset)))];
+    for (const asset of assets) {
+      const resolution = await this.referenceRegistry.resolve(asset);
+      const markets = [...this.assetByMarket.entries()].filter(([, value]) => value === asset).map(([marketId]) => marketId);
+      if (!resolution.supported) {
+        for (const marketId of markets) this.referenceRequired.set(marketId, false);
+        await this.safeAppend(createJournalEvent({
+          traceId: createId("trace"), type: "REFERENCE_UNSUPPORTED", aggregateType: "reference", aggregateId: asset,
+          payload: { asset, reason: resolution.reason, choice: "POLYMARKET_ONLY_MONITOR" },
+        }));
+        this.record("REFERENCE_UNSUPPORTED", createId("trace"), null, { asset, choice: "POLYMARKET_ONLY_MONITOR" }, asset);
+        continue;
+      }
+      for (const marketId of markets) this.referenceRequired.set(marketId, true);
+      const adapter = this.referenceRegistry.adapterFor(asset);
+      if (!adapter) continue;
+      void adapter.run({
+        onTick: (tick) => this.onReferenceTick(tick),
+        onConnection: (event) => this.onConnection(event),
+        onError: (error) => this.onFeedError(`reference:${asset}`, error),
+      }, this.abort.signal).catch((error) => this.logger.error({ err: error, asset }, "reference feed stopped"));
+    }
   }
 
   private async initializeJournalWithRetry(): Promise<void> {
@@ -190,9 +288,10 @@ export class EngineService {
     const previous = pair[snapshot.outcome];
     pair[snapshot.outcome] = snapshot;
     this.snapshots.set(snapshot.marketId, pair);
+    if (snapshot.asset) this.assetByMarket.set(snapshot.marketId, snapshot.asset);
     this.updateReady();
     await this.safeAppend(createJournalEvent({ traceId: snapshot.traceId, type: "MARKET_SNAPSHOT", aggregateType: "market", aggregateId: snapshot.marketId, payload: snapshot, occurredAt: new Date(snapshot.sourceTimestamp), sourceEventId: snapshot.eventId }));
-    this.record("MARKET_EVENT", snapshot.traceId, snapshot.marketId, { tokenId: snapshot.tokenId, outcome: snapshot.outcome, sequence: snapshot.sequence });
+    this.record("MARKET_EVENT", snapshot.traceId, snapshot.marketId, { tokenId: snapshot.tokenId, outcome: snapshot.outcome, sequence: snapshot.sequence }, snapshot.asset ?? null);
 
     for (const [orderId, resting] of this.restingOrders) {
       if (resting.order.tokenId !== snapshot.tokenId || !previous) continue;
@@ -208,12 +307,15 @@ export class EngineService {
     this.metrics.eventLatency.observe((performance.now() - started) / 1000);
   }
 
-  private async onBtcTick(tick: Parameters<TriggerEngine["ingestBtc"]>[0]): Promise<void> {
-    this.state.lastBtcMessageAt = tick.receivedAt;
-    this.state.connections.btc.lastMessageAt = tick.receivedAt;
+  private async onReferenceTick(tick: ReferenceTick): Promise<void> {
+    this.state.noteReferenceTick(tick.asset, tick.receivedAt);
+    if (tick.asset === "BTC") {
+      this.state.lastBtcMessageAt = tick.receivedAt;
+      this.state.connections.btc.lastMessageAt = tick.receivedAt;
+    }
     this.updateReady();
-    await this.safeAppend(createJournalEvent({ traceId: tick.traceId, type: "BTC_TICK", aggregateType: "btc", aggregateId: tick.symbol, payload: tick, occurredAt: new Date(tick.sourceTimestamp), sourceEventId: tick.eventId }));
-    for (const trigger of this.triggerEngine.ingestBtc(tick)) void this.processTrigger(trigger);
+    await this.safeAppend(createJournalEvent({ traceId: tick.traceId, type: "REFERENCE_TICK", aggregateType: "reference", aggregateId: tick.asset, payload: tick, occurredAt: new Date(tick.sourceTimestamp), sourceEventId: tick.eventId }));
+    for (const trigger of this.triggerEngine.ingestReference(tick)) void this.processTrigger(trigger);
   }
 
   private async processTrigger(trigger: TriggerEvent): Promise<void> {
@@ -221,20 +323,48 @@ export class EngineService {
     this.state.queueDepth += 1;
     this.metrics.queueDepth.set(this.state.queueDepth);
     this.metrics.triggers.inc({ kind: trigger.kind, severity: String(trigger.severity) });
-    this.record(`TRIGGER_LEVEL_${trigger.severity}`, trigger.traceId, trigger.marketId, { triggerId: trigger.id, kind: trigger.kind });
+    this.record(`TRIGGER_LEVEL_${trigger.severity}`, trigger.traceId, trigger.marketId, { triggerId: trigger.id, kind: trigger.kind, asset: trigger.asset ?? null }, trigger.asset ?? null);
     await this.safeAppend(createJournalEvent({ traceId: trigger.traceId, type: "TRIGGER_EVENT", aggregateType: "trigger", aggregateId: trigger.id, payload: trigger, sourceEventId: trigger.sourceEventIds[0] ?? null }));
     try {
       this.activeTriggers.set(trigger.id, trigger);
       this.state.addTrigger(trigger);
-      this.record("GROK_RESEARCH_AVAILABLE", trigger.traceId, trigger.marketId, { triggerId: trigger.id, expiresAt: trigger.expiresAt });
+      this.record("GROK_RESEARCH_AVAILABLE", trigger.traceId, trigger.marketId, { triggerId: trigger.id, expiresAt: trigger.expiresAt }, trigger.asset ?? null);
+      await this.requestActivation(trigger);
     } finally {
       this.state.queueDepth -= 1;
       this.metrics.queueDepth.set(this.state.queueDepth);
     }
   }
 
+  private async requestActivation(trigger: TriggerEvent): Promise<void> {
+    const decision = this.activation.decide(trigger);
+    await this.safeAppend(createJournalEvent({
+      traceId: trigger.traceId, type: "GROK_ACTIVATION_DECISION", aggregateType: "activation", aggregateId: trigger.id,
+      payload: { triggerId: trigger.id, marketId: trigger.marketId, asset: trigger.asset ?? null, reason: decision.reason, activate: decision.activate },
+    }));
+    if (!decision.activate || !decision.request) {
+      this.state.addActivation({ triggerId: trigger.id, reason: decision.reason, at: new Date().toISOString(), provider: this.env.GROK_ACTIVATION_PROVIDER, grokWakeObserved: false });
+      return;
+    }
+    this.activation.markRequested(trigger, decision.request);
+    this.state.setActivationLatency(this.activation.snapshot());
+    const results = await this.activation.dispatch(decision.request);
+    for (const result of results) {
+      this.metrics.activations.inc({ provider: result.provider, status: result.ok ? "ok" : "failed" });
+      await this.safeAppend(createJournalEvent({
+        traceId: trigger.traceId, type: "GROK_ACTIVATION_RESULT", aggregateType: "activation", aggregateId: trigger.id,
+        payload: persistableActivation(result, trigger.id, decision.reason),
+      }));
+      this.state.addActivation({
+        triggerId: trigger.id, role: result.targetRole, provider: result.provider, ok: result.ok, skipped: result.skipped,
+        errorCode: result.errorCode, grokWakeObserved: false, at: result.sentAt ?? result.requestedAt,
+      });
+    }
+    this.state.setActivationLatency(this.activation.snapshot());
+  }
+
   /** The only ingress for external Grok research; it cannot create orders directly. */
-  async submitGrokSignal(raw: GrokSignalSubmission, clientId: string): Promise<{ status: "accepted" | "duplicate" | "stale" | "unknown_trigger" | "trace_mismatch" | "market_mismatch" | "replay_rejected" | "malformed" | "identity_mismatch"; signalId?: string }> {
+  async submitGrokSignal(raw: GrokSignalSubmission, clientId: string): Promise<{ status: "accepted" | "duplicate" | "stale" | "unknown_trigger" | "trace_mismatch" | "market_mismatch" | "asset_mismatch" | "replay_rejected" | "malformed" | "identity_mismatch"; signalId?: string }> {
     let submission: GrokSignalSubmission;
     try { submission = grokSignalSubmissionSchema.parse(raw); }
     catch {
@@ -254,6 +384,9 @@ export class EngineService {
     if (trigger.marketId && trigger.marketId !== submission.marketId) {
       this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "market_mismatch" }); return { status: "market_mismatch" };
     }
+    if (submission.asset && trigger.asset && submission.asset !== trigger.asset) {
+      this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "asset_mismatch" }); return { status: "asset_mismatch" };
+    }
     const submittedAt = new Date(submission.timestamp).getTime();
     const maxSkewMs = 5 * 60_000;
     if (!Number.isFinite(submittedAt) || submittedAt > now.getTime() + 60_000 || submittedAt < now.getTime() - maxSkewMs) {
@@ -268,6 +401,7 @@ export class EngineService {
     const signal: GrokSignalEnvelope = grokSignalEnvelopeSchema.parse({
       signalId: createId("grok_signal"), submissionId: submission.submissionId, traceId: submission.traceId,
       triggerId: submission.triggerId, correlationId: submission.correlationId, marketId: submission.marketId,
+      asset: submission.asset ?? trigger.asset ?? null,
       agentId: submission.agentId, role: submission.role, provider: "grok_bot_mcp", clientId,
       receivedAt: now.toISOString(), timestamp: submission.timestamp, output: submission.output, resultingDecision: null,
     });
@@ -276,8 +410,9 @@ export class EngineService {
     this.signalsByTrigger.set(trigger.id, byRole);
     this.signalReceivedTimes.push(now.getTime());
     this.state.addGrokSignal(signal);
+    this.activation.noteSignal(trigger.id, now);
     this.metrics.grokSignals.inc({ agent: signal.agentId, status: "accepted" });
-    this.record(`${signal.agentId.toUpperCase()}_COMPLETE`, signal.traceId, trigger.marketId, { signalId: signal.signalId, clientId, confidence: submission.output.confidence, expiresAt: submission.output.expiresAt });
+    this.record(`${signal.agentId.toUpperCase()}_COMPLETE`, signal.traceId, trigger.marketId, { signalId: signal.signalId, clientId, confidence: submission.output.confidence, expiresAt: submission.output.expiresAt }, trigger.asset ?? null);
     await this.safeAppend(createJournalEvent({ traceId: signal.traceId, type: "GROK_SIGNAL_ACCEPTED", aggregateType: "grok_signal", aggregateId: signal.signalId, payload: signal }));
     if (submission.agentId === "strategy_supervisor" && submission.output.proposedChange) {
       await this.safeAppend(createJournalEvent({ traceId: signal.traceId, type: "STRATEGY_CHANGE_PROPOSED", aggregateType: "strategy_change", aggregateId: signal.signalId, payload: submission.output.proposedChange }));
@@ -303,8 +438,8 @@ export class EngineService {
     this.lastEvaluatedSignalCount.set(trigger.id, outputs.length);
     const consensus = buildConsensus({ traceId: trigger.traceId, triggerId: trigger.id, signals: directional, deterministicEdge: fair.estimatedEdge, now: new Date(), config: defaultConsensusConfig });
     this.state.latestConsensus = consensus;
-    this.record("CONSENSUS_COMPLETE", trigger.traceId, trigger.marketId, { direction: consensus.consensusDirection, confidence: consensus.consensusConfidence, conflicts: consensus.conflicts });
-    await this.safeAppend(createJournalEvent({ traceId: trigger.traceId, type: "CONSENSUS_DECISION", aggregateType: "consensus", aggregateId: consensus.id, payload: consensus }));
+    this.record("CONSENSUS_COMPLETE", trigger.traceId, trigger.marketId, { direction: consensus.consensusDirection, confidence: consensus.consensusConfidence, conflicts: consensus.conflicts, triggerId: trigger.id }, trigger.asset ?? null);
+    await this.safeAppend(createJournalEvent({ traceId: trigger.traceId, type: "CONSENSUS_DECISION", aggregateType: "consensus", aggregateId: consensus.id, payload: { ...consensus, marketId: trigger.marketId, asset: trigger.asset ?? null } }));
     if (trigger.marketId) await this.evaluateTrade(trigger, consensus, outputs);
   }
 
@@ -329,11 +464,16 @@ export class EngineService {
       return expiresAt && new Date(expiresAt).getTime() < earliest.getTime() ? new Date(expiresAt) : earliest;
     }, new Date(trigger.expiresAt));
     const exposure = this.exposure(candidate.marketId);
+    const asset = trigger.asset ?? this.assetByMarket.get(candidate.marketId) ?? snapshot.asset ?? null;
+    const referenceRequired = this.referenceRequired.get(candidate.marketId) === true;
+    const referenceFeedAt = asset ? dateOrNull(this.state.referenceLastMessageAt(asset)) : null;
     const decision = decidePaperOrder({
       candidate, consensus, snapshotAfterDecisionLatency: snapshot, limits: this.riskLimits, triggerId: trigger.id,
       signalExpiresAt: earliestSignalExpiry, orderType: this.env.PAPER_EXECUTION_STYLE,
       baseRisk: {
-        now, marketFeedAt: dateOrNull(this.state.connections.polymarket.lastMessageAt), btcFeedAt: dateOrNull(this.state.lastBtcMessageAt),
+        now, marketFeedAt: dateOrNull(this.state.connections.polymarket.lastMessageAt),
+        btcFeedAt: asset === "BTC" ? referenceFeedAt ?? dateOrNull(this.state.lastBtcMessageAt) : now,
+        referenceFeedAt, referenceRequired, asset, assetExposureUsd: exposure.asset,
         databaseAvailable: await this.journal.healthCheck(), timestampDisorder: this.timestampDisorder, riskStateAvailable: true,
         dailyPnlUsd: this.ledger.snapshot().netTradingPnl, drawdownUsd: this.ledger.snapshot().drawdown,
         marketExposureUsd: exposure.market, totalExposureUsd: exposure.total, directionalExposureUsd: exposure.directional,
@@ -347,19 +487,19 @@ export class EngineService {
       },
     });
     this.state.latestRisk = decision.risk;
-    await this.safeAppend(createJournalEvent({ traceId: trigger.traceId, type: "RISK_EVALUATION", aggregateType: "risk", aggregateId: decision.risk.id, payload: decision.risk }));
+    await this.safeAppend(createJournalEvent({ traceId: trigger.traceId, type: "RISK_EVALUATION", aggregateType: "risk", aggregateId: decision.risk.id, payload: { ...decision.risk, marketId: trigger.marketId, asset } }));
     if (!decision.accepted || !decision.order) {
       for (const reason of decision.risk.vetoes) this.metrics.riskVetoes.inc({ reason });
-      this.record("RISK_VETO", trigger.traceId, trigger.marketId, { reasons: decision.risk.vetoes, netExpectedEdge: decision.netExpectedEdge });
+      this.record("RISK_VETO", trigger.traceId, trigger.marketId, { reasons: decision.risk.vetoes, netExpectedEdge: decision.netExpectedEdge }, asset);
       return;
     }
-    this.record("RISK_ACCEPT", trigger.traceId, trigger.marketId, { orderId: decision.order.id, netExpectedEdge: decision.netExpectedEdge });
+    this.record("RISK_ACCEPT", trigger.traceId, trigger.marketId, { orderId: decision.order.id, netExpectedEdge: decision.netExpectedEdge }, asset);
     await this.submitPaperOrder(decision.order, snapshot, duplicateKey);
   }
 
   private async submitPaperOrder(order: PaperOrder, decisionSnapshot: MarketSnapshot, duplicateKey: string): Promise<void> {
     this.metrics.paperOrders.inc({ type: order.orderType });
-    this.record("PAPER_ORDER_CREATED", order.traceId, order.marketId, { orderId: order.id, type: order.orderType });
+    this.record("PAPER_ORDER_CREATED", order.traceId, order.marketId, { orderId: order.id, type: order.orderType }, decisionSnapshot.asset ?? null);
     await this.safeAppend(createJournalEvent({ traceId: order.traceId, type: "PAPER_ORDER_CREATED", aggregateType: "paper_order", aggregateId: order.id, payload: order }));
     this.recentTrades.set(duplicateKey, Date.now());
     try {
@@ -392,42 +532,56 @@ export class EngineService {
     await this.safeAppend(createJournalEvent({ traceId: fill.traceId, type: "PNL_SNAPSHOT", aggregateType: "ledger", aggregateId: this.experiment?.id ?? "paper", payload: this.ledger.snapshot(), sourceEventId: fill.id }));
   }
 
-  private exposure(marketId: string): { market: string; total: string; directional: string; unhedged: string; unhedgedDurationMs: number } {
-    let total = 0; let directional = 0; let market = 0; let duration = 0;
+  private exposure(marketId: string): { market: string; total: string; directional: string; unhedged: string; unhedgedDurationMs: number; asset: string } {
+    let total = 0; let directional = 0; let market = 0; let duration = 0; let asset = 0;
+    const assetKey = this.assetByMarket.get(marketId) ?? null;
     for (const position of this.ledger.positions.values()) {
       const value = Number(position.upQuantity) * Number(position.averageUpCost) + Number(position.downQuantity) * Number(position.averageDownCost);
       const unhedged = Number(position.unpairedQuantity) * Number(position.unpairedOutcome === "UP" ? position.averageUpCost : position.averageDownCost);
       total += value; directional += unhedged;
       if (position.marketId === marketId) { market = value; if (unhedged > 0) duration = Date.now() - new Date(position.openedAt).getTime(); }
+      if (assetKey && this.assetByMarket.get(position.marketId) === assetKey) asset += value;
     }
     const selected = this.ledger.positions.get(marketId);
     const unhedged = selected ? Number(selected.unpairedQuantity) * Number(selected.unpairedOutcome === "UP" ? selected.averageUpCost : selected.averageDownCost) : 0;
-    return { market: String(market), total: String(total), directional: String(directional), unhedged: String(unhedged), unhedgedDurationMs: Math.max(0, duration) };
+    return { market: String(market), total: String(total), directional: String(directional), unhedged: String(unhedged), unhedgedDurationMs: Math.max(0, duration), asset: String(asset || market) };
   }
 
   private async onConnection(event: FeedConnectionEvent): Promise<void> {
-    const connection = this.state.connections[event.feed];
-    if (event.reconnectCount > connection.reconnects) this.metrics.wsReconnects.inc({ feed: event.feed }, event.reconnectCount - connection.reconnects);
-    connection.state = event.state;
-    connection.reconnects = event.reconnectCount;
+    if (event.feed === "polymarket") {
+      const connection = this.state.connections.polymarket;
+      if (event.reconnectCount > connection.reconnects) this.metrics.wsReconnects.inc({ feed: "polymarket" }, event.reconnectCount - connection.reconnects);
+      connection.state = event.state;
+      connection.reconnects = event.reconnectCount;
+    } else {
+      const asset = event.asset ?? (event.feed === "btc" ? "BTC" : "unknown");
+      this.state.noteReferenceConnection(asset, event.state, event.reconnectCount);
+      if (asset === "BTC") {
+        const connection = this.state.connections.btc;
+        if (event.reconnectCount > connection.reconnects) this.metrics.wsReconnects.inc({ feed: "btc" }, event.reconnectCount - connection.reconnects);
+        connection.state = event.state;
+        connection.reconnects = event.reconnectCount;
+      }
+      this.metrics.wsReconnects.inc({ feed: "reference" }, 0);
+    }
     this.updateReady();
-    this.record(`WS_${event.state}`, createId("trace"), null, { feed: event.feed, reconnects: event.reconnectCount, message: event.message });
+    this.record(`WS_${event.state}`, createId("trace"), null, { feed: event.feed, asset: event.asset ?? null, reconnects: event.reconnectCount, message: event.message }, event.asset ?? null);
   }
 
   private async onFeedError(feed: string, error: Error): Promise<void> {
     if (error.message.includes("EVENT_TIMESTAMP_DISORDER")) this.timestampDisorder = true;
-    this.logger.error({ err: error, feed }, "market feed error");
+    this.logger.error({ err: { name: error.name, message: error.message }, feed }, "market feed error");
     await this.safeAppend(createJournalEvent({ traceId: createId("trace"), type: "SYSTEM_HEALTH_EVENT", aggregateType: "feed", aggregateId: feed, payload: { status: "ERROR", message: error.message } }));
   }
 
   private updateReady(): void {
     this.state.ready = !this.state.draining && this.state.database === "UP"
-      && this.state.connections.polymarket.state === "CONNECTED" && this.state.connections.btc.state === "CONNECTED"
-      && this.state.connections.polymarket.lastMessageAt !== null && this.state.lastBtcMessageAt !== null;
+      && this.state.connections.polymarket.state === "CONNECTED"
+      && this.state.connections.polymarket.lastMessageAt !== null;
   }
 
-  private record(type: string, traceId: string, marketId: string | null, detail: Record<string, unknown>): void {
-    const item = { id: createId("feed"), at: new Date().toISOString(), type, traceId, marketId, detail };
+  private record(type: string, traceId: string, marketId: string | null, detail: Record<string, unknown>, asset: string | null = null): void {
+    const item = { id: createId("feed"), at: new Date().toISOString(), type, traceId, marketId, asset, detail };
     this.state.record(item);
     this.sse.publish("decision", item);
     this.sse.publish("snapshot", this.state.snapshot());
@@ -446,6 +600,7 @@ export class EngineService {
         ledger: this.ledger.snapshot(), positions: [...this.ledger.positions.values()], experiment: this.experiment,
         restingOrders: [...this.restingOrders.values()], activeTriggers: [...this.activeTriggers.values()],
         grokSignals: [...this.signalsByTrigger.values()].flatMap((signals) => [...signals.values()]),
+        activationLatency: this.activation.snapshot(),
       },
     });
   }
@@ -478,5 +633,5 @@ export class EngineService {
 
 export function parseEnv(env: NodeJS.ProcessEnv): EngineEnv { return engineEnvSchema.parse(env); }
 function splitList(value: string): string[] { return value.split(",").map((item) => item.trim()).filter(Boolean); }
-function dateOrNull(value: string | null): Date | null { return value ? new Date(value) : null; }
+function dateOrNull(value: string | null | undefined): Date | null { return value ? new Date(value) : null; }
 function delay(ms: number): Promise<void> { return new Promise((resolve) => setTimeout(resolve, ms)); }

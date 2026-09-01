@@ -7,11 +7,21 @@ export interface DashboardSnapshot {
   latestAgents: Partial<Record<string, GrokAgentSignal>>;
   consensus: { consensusDirection: string; consensusConfidence: number; agentAgreement: number; signalFreshness: number; conflicts: string[]; estimatedEdge: number; calculatedAt: string } | null;
   risk: { accepted: boolean; vetoes: string[]; utilization: Record<string, number>; evaluatedAt: string } | null;
-  scanner: Array<{ marketId: string; outcome: string; bid: string | null; ask: string | null; spread: number | null; depthUsd: number; lastMessageAt: string }>;
-  decisionFeed: Array<{ id: string; at: string; type: string; traceId: string; marketId: string | null; detail: Record<string, unknown> }>;
+  scanner: Array<{ marketId: string; asset?: string | null; outcome: string; bid: string | null; ask: string | null; spread: number | null; depthUsd: number; lastMessageAt: string }>;
+  decisionFeed: Array<{ id: string; at: string; type: string; traceId: string; marketId: string | null; asset?: string | null; detail: Record<string, unknown> }>;
   grokActivity: { acceptedSignals: number; rejectedSignals: number; duplicates: number; unauthorizedCalls: number; rateLimitedCalls: number; lastSeenAt: string | null; byAgent: Record<string, number> };
-  recentTriggers: Array<{ id: string; kind: string; severity: number; marketId: string | null; createdAt: string; expiresAt: string }>;
-  health: { polymarketWs: Connection; btcWs: Connection; database: "UP" | "DOWN"; eventLatencyMs: number | null; lastBtcMessageAt: string | null };
+  recentTriggers: Array<{ id: string; kind: string; severity: number; marketId: string | null; asset?: string | null; createdAt: string; expiresAt: string }>;
+  activations?: Array<{ triggerId: string; role?: string; provider: string; ok?: boolean; skipped?: boolean; errorCode?: string | null; reason?: string; grokWakeObserved: false; at: string }>;
+  activationLatency?: Array<{ triggerId: string; triggerCreatedAt: string; activationRequestedAt: string | null; activationSentAt: string | null; firstMcpRequestAt: string | null; firstAcceptedSignalAt: string | null }>;
+  discovery?: { qualified: Array<{ marketId: string; slug: string; asset: string | null; tokens: string[] }>; rejected: Array<{ id: string; slug: string; title: string; reasonCodes: string[] }> };
+  health: {
+    polymarketWs: Connection;
+    btcWs: Connection;
+    referenceFeeds?: Array<{ asset: string; state: string; lastMessageAt: string | null; reconnects: number }>;
+    database: "UP" | "DOWN";
+    eventLatencyMs: number | null;
+    lastBtcMessageAt: string | null;
+  };
   equityHistory: Array<{ at: string; equity: string; drawdown: string }>;
 }
 

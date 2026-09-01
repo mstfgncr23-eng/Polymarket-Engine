@@ -1,4 +1,4 @@
-import type { ConsensusDecision, ExternalAgentRoleId, GrokSignalEnvelope, LedgerState, MarketSnapshot, Position, RiskEvaluation, TriggerEvent } from "@pm/core";
+import type { ActivationLatency, ConsensusDecision, ExternalAgentRoleId, GrokSignalEnvelope, LedgerState, MarketSnapshot, Position, QualificationReasonCode, RiskEvaluation, TriggerEvent } from "@pm/core";
 
 export interface DecisionFeedItem {
   id: string;
@@ -6,6 +6,7 @@ export interface DecisionFeedItem {
   type: string;
   traceId: string;
   marketId: string | null;
+  asset?: string | null;
   detail: Record<string, unknown>;
 }
 
@@ -13,6 +14,18 @@ export interface ConnectionState {
   state: "CONNECTING" | "CONNECTED" | "DISCONNECTED" | "STALE" | "STOPPED";
   lastMessageAt: string | null;
   reconnects: number;
+}
+
+export interface ActivationRecord {
+  triggerId: string;
+  role?: string;
+  provider: string;
+  ok?: boolean;
+  skipped?: boolean;
+  errorCode?: string | null;
+  reason?: string;
+  grokWakeObserved: false;
+  at: string;
 }
 
 export interface DashboardSnapshot {
@@ -24,11 +37,21 @@ export interface DashboardSnapshot {
   latestAgents: Partial<Record<ExternalAgentRoleId, GrokSignalEnvelope>>;
   consensus: ConsensusDecision | null;
   risk: RiskEvaluation | null;
-  scanner: Array<{ marketId: string; outcome: string; bid: string | null; ask: string | null; spread: number | null; depthUsd: number; lastMessageAt: string }>;
+  scanner: Array<{ marketId: string; asset: string | null; outcome: string; bid: string | null; ask: string | null; spread: number | null; depthUsd: number; lastMessageAt: string }>;
   decisionFeed: DecisionFeedItem[];
   grokActivity: { acceptedSignals: number; rejectedSignals: number; duplicates: number; unauthorizedCalls: number; rateLimitedCalls: number; lastSeenAt: string | null; byAgent: Record<string, number> };
   recentTriggers: TriggerEvent[];
-  health: { polymarketWs: ConnectionState; btcWs: ConnectionState; database: "UP" | "DOWN"; eventLatencyMs: number | null; lastBtcMessageAt: string | null };
+  activations: ActivationRecord[];
+  activationLatency: ActivationLatency[];
+  discovery: { qualified: Array<{ marketId: string; slug: string; asset: string | null; tokens: string[] }>; rejected: Array<{ id: string; slug: string; title: string; reasonCodes: QualificationReasonCode[] }> };
+  health: {
+    polymarketWs: ConnectionState;
+    btcWs: ConnectionState;
+    referenceFeeds: Array<{ asset: string; state: ConnectionState["state"]; lastMessageAt: string | null; reconnects: number }>;
+    database: "UP" | "DOWN";
+    eventLatencyMs: number | null;
+    lastBtcMessageAt: string | null;
+  };
   equityHistory: Array<{ at: string; equity: string; drawdown: string }>;
 }
 
@@ -54,6 +77,10 @@ export class EngineStateStore {
   readonly feed: DecisionFeedItem[] = [];
   readonly equityHistory: Array<{ at: string; equity: string; drawdown: string }> = [];
   grokActivity = { acceptedSignals: 0, rejectedSignals: 0, duplicates: 0, unauthorizedCalls: 0, rateLimitedCalls: 0, lastSeenAt: null as string | null, byAgent: {} as Record<string, number> };
+  private readonly reference = new Map<string, ConnectionState>();
+  private discovery: DashboardSnapshot["discovery"] = { qualified: [], rejected: [] };
+  private readonly activations: ActivationRecord[] = [];
+  private activationLatency: ActivationLatency[] = [];
 
   constructor(private ledger: LedgerState, private readonly positions: Map<string, Position>) {}
 
@@ -75,6 +102,31 @@ export class EngineStateStore {
     if (this.recentTriggers.length > 500) this.recentTriggers.length = 500;
   }
 
+  addActivation(record: ActivationRecord): void {
+    this.activations.unshift(record);
+    if (this.activations.length > 200) this.activations.length = 200;
+  }
+
+  setActivationLatency(items: ActivationLatency[]): void { this.activationLatency = structuredClone(items); }
+  setDiscovery(discovery: DashboardSnapshot["discovery"]): void { this.discovery = structuredClone(discovery); }
+
+  noteReferenceTick(asset: string, at: string): void {
+    const current = this.reference.get(asset) ?? { state: "CONNECTED", lastMessageAt: null, reconnects: 0 };
+    current.lastMessageAt = at;
+    this.reference.set(asset, current);
+  }
+
+  noteReferenceConnection(asset: string, state: ConnectionState["state"], reconnects: number): void {
+    const current = this.reference.get(asset) ?? { state: "STOPPED", lastMessageAt: null, reconnects: 0 };
+    current.state = state;
+    current.reconnects = reconnects;
+    this.reference.set(asset, current);
+  }
+
+  referenceLastMessageAt(asset: string): string | null {
+    return this.reference.get(asset)?.lastMessageAt ?? (asset === "BTC" ? this.lastBtcMessageAt : null);
+  }
+
   recordGrokRejection(kind: "rejected" | "duplicate" | "unauthorized" | "rate_limited"): void {
     if (kind === "rejected") this.grokActivity.rejectedSignals += 1;
     if (kind === "duplicate") this.grokActivity.duplicates += 1;
@@ -94,14 +146,20 @@ export class EngineStateStore {
       balance: structuredClone(this.ledger), positions: structuredClone([...this.positions.values()]),
       latestAgents: Object.fromEntries(this.latestAgents), consensus: structuredClone(this.latestConsensus), risk: structuredClone(this.latestRisk),
       scanner: [...this.marketSnapshots.values()].map((snapshot) => ({
-        marketId: snapshot.marketId, outcome: snapshot.outcome, bid: snapshot.bids[0]?.price ?? null,
+        marketId: snapshot.marketId, asset: snapshot.asset ?? null, outcome: snapshot.outcome, bid: snapshot.bids[0]?.price ?? null,
         ask: snapshot.asks[0]?.price ?? null,
         spread: snapshot.bids[0] && snapshot.asks[0] ? Number(snapshot.asks[0].price) - Number(snapshot.bids[0].price) : null,
         depthUsd: [...snapshot.bids, ...snapshot.asks].reduce((sum, level) => sum + Number(level.price) * Number(level.quantity), 0),
         lastMessageAt: snapshot.receivedAt,
       })),
       decisionFeed: structuredClone(this.feed), grokActivity: structuredClone(this.grokActivity), recentTriggers: structuredClone(this.recentTriggers),
-      health: { polymarketWs: structuredClone(this.connections.polymarket), btcWs: structuredClone(this.connections.btc), database: this.database, eventLatencyMs: this.eventLatencyMs, lastBtcMessageAt: this.lastBtcMessageAt },
+      activations: structuredClone(this.activations), activationLatency: structuredClone(this.activationLatency), discovery: structuredClone(this.discovery),
+      health: {
+        polymarketWs: structuredClone(this.connections.polymarket),
+        btcWs: structuredClone(this.connections.btc),
+        referenceFeeds: [...this.reference.entries()].map(([asset, connection]) => ({ asset, state: connection.state, lastMessageAt: connection.lastMessageAt, reconnects: connection.reconnects })),
+        database: this.database, eventLatencyMs: this.eventLatencyMs, lastBtcMessageAt: this.lastBtcMessageAt,
+      },
       equityHistory: structuredClone(this.equityHistory),
     };
   }

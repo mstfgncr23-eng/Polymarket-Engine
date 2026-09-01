@@ -37,6 +37,7 @@ export async function createApiServer(input: {
   dashboardOrigin: string;
   mcp: McpConfig;
   submitGrokSignal(signal: GrokSignalSubmission, clientId: string): Promise<Record<string, unknown>>;
+  noteMcpRequest?(tool: string | null, triggerId?: string): void;
   logger: boolean | Record<string, unknown>;
 }): Promise<FastifyInstance> {
   const app = Fastify({ logger: input.logger });
@@ -51,6 +52,7 @@ export async function createApiServer(input: {
   app.get("/metrics", async (_request, reply) => reply.type(input.metrics.registry.contentType).send(await input.metrics.registry.metrics()));
   const mcpHandler = createMcpHttpHandler(input.mcp, {
     state: input.state, journal: input.journal, metrics: input.metrics, submitSignal: input.submitGrokSignal,
+    noteMcpRequest: input.noteMcpRequest,
   });
   app.route({ method: ["GET", "POST", "DELETE"], url: "/mcp", handler: mcpHandler });
   app.get("/api/dashboard", async (): Promise<DashboardSnapshot> => input.state.snapshot());

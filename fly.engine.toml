@@ -12,6 +12,7 @@ kill_timeout = 60
   PORT = "8080"
   ENGINE_REGION = "fra"
   GROK_MCP_ALLOWED_ORIGINS = "https://grok.com,https://x.ai"
+  GROK_ACTIVATION_PROVIDER = "noop"
 
 [http_service]
   internal_port = 8080

@@ -11,7 +11,7 @@ import {
   paperOrderSchema,
 } from "@pm/core";
 import { MemoryEventJournal, PostgresEventJournal } from "@pm/db";
-import { BtcWebSocketAdapter, PolymarketMarketDataAdapter } from "@pm/market-data";
+import { PolymarketMarketDataAdapter, ReferenceFeedRegistry, createRestProbe } from "@pm/market-data";
 import { buildExperimentSummary, writeExperimentSummary } from "./report.js";
 import { startRuntime } from "./runtime.js";
 
@@ -36,7 +36,7 @@ if (command === "experiment:start") {
   const traceId = createId("trace");
   const feeSchedule = feeScheduleSchema.parse({ rate: "0.07", exponent: 1, takerOnly: true, rebateRate: "0.20", source: "configured_test_fixture", effectiveAt: now.toISOString() });
   const snapshot = marketSnapshotSchema.parse({
-    eventId: createId("market"), traceId, marketId: "btc-up-down", tokenId: "up-token", outcome: "UP",
+    eventId: createId("market"), traceId, marketId: "btc-up-down", tokenId: "up-token", outcome: "UP", asset: "BTC",
     bids: [{ price: "0.47", quantity: "100" }], asks: [{ price: "0.48", quantity: "30" }, { price: "0.49", quantity: "100" }],
     lastTradePrice: "0.48", tickSize: "0.01", minOrderSize: "5", feeSchedule,
     sourceTimestamp: now.toISOString(), receivedAt: now.toISOString(), sequence: 1, hash: "fixture",
@@ -64,22 +64,55 @@ if (command === "experiment:start") {
   const abort = new AbortController();
   const market = new PolymarketMarketDataAdapter();
   const configuredSlugs = (process.env.POLYMARKET_MARKET_SLUGS ?? "").split(",").map((value) => value.trim()).filter(Boolean);
-  const currentWindow = Math.floor(Date.now() / 900_000) * 900;
   const failures: string[] = [];
-  const discovered = await market.discoverBitcoinMarkets(configuredSlugs.length ? configuredSlugs : [`btc-updown-15m-${currentWindow}`], 5)
-    .catch((error) => { failures.push(`polymarket-discovery:${error instanceof Error ? error.message : String(error)}`); return []; });
-  const tokenIds = discovered.flatMap((item) => item.tokens.map((token) => token.tokenId));
+  const report = await market.discoverCryptoMarkets(configuredSlugs, 20)
+    .catch((error) => { failures.push(`polymarket-discovery:${error instanceof Error ? error.message : String(error)}`); return { discovered: [], qualified: [], rejected: [] }; });
+  const tokenIds = report.qualified.flatMap((item) => item.tokens.map((token) => token.tokenId));
+  const assets = [...new Set(report.qualified.map((item) => item.asset).filter((item): item is string => Boolean(item)))];
   let polymarketMessages = 0;
-  let btcMessages = 0;
+  const referenceMessages: Record<string, number> = {};
   let finish!: () => void;
   const complete = new Promise<void>((resolve) => { finish = resolve; });
-  const check = () => { if (polymarketMessages > 0 && btcMessages > 0) finish(); };
+  const check = () => {
+    const refCount = Object.values(referenceMessages).reduce((sum, value) => sum + value, 0);
+    if (polymarketMessages > 0 && (assets.length === 0 || refCount > 0)) finish();
+  };
   if (tokenIds.length > 0) void market.run(tokenIds, { onSnapshot: () => { polymarketMessages += 1; check(); }, onConnection: () => undefined, onError: (error) => { failures.push(`polymarket:${error.message}`); } }, abort.signal);
-  const btc = new BtcWebSocketAdapter(process.env.BTC_WS_URL ?? "wss://data-stream.binance.vision/ws/btcusdt@aggTrade", process.env.BTC_SYMBOL ?? "BTCUSDT");
-  void btc.run({ onTick: () => { btcMessages += 1; check(); }, onConnection: () => undefined, onError: (error) => { failures.push(`btc:${error.message}`); } }, abort.signal);
+  const restBase = process.env.REFERENCE_REST_BASE_URL ?? "https://api.binance.com";
+  const wsBase = process.env.REFERENCE_WS_BASE_URL ?? "wss://data-stream.binance.vision/ws";
+  const registry = new ReferenceFeedRegistry(wsBase, restBase, 15_000, undefined, createRestProbe(restBase));
+  const referenceResolutions: Array<{ asset: string; supported: boolean; symbol: string | null }> = [];
+  for (const asset of assets) {
+    const resolution = await registry.resolve(asset);
+    referenceResolutions.push({ asset, supported: resolution.supported, symbol: resolution.symbol });
+    const adapter = registry.adapterFor(asset);
+    if (!adapter) {
+      failures.push(`reference-unsupported:${asset}`);
+      continue;
+    }
+    referenceMessages[asset] = 0;
+    void adapter.run({
+      onTick: () => { referenceMessages[asset] = (referenceMessages[asset] ?? 0) + 1; check(); },
+      onConnection: () => undefined,
+      onError: (error) => { failures.push(`reference:${asset}:${error.message}`); },
+    }, abort.signal);
+  }
   await Promise.race([complete, new Promise<void>((resolve) => setTimeout(resolve, 25_000))]);
   abort.abort("smoke complete");
-  const result = { ok: polymarketMessages > 0 && btcMessages > 0, discoveredMarkets: discovered.length, polymarketMessages, btcMessages, failures };
+  const refCount = Object.values(referenceMessages).reduce((sum, value) => sum + value, 0);
+  const result = {
+    ok: polymarketMessages > 0,
+    discoveredMarkets: report.discovered.length,
+    qualifiedMarkets: report.qualified.map((market) => ({ id: market.id, slug: market.slug, asset: market.asset, tokens: market.tokens.length })),
+    rejectedMarkets: report.rejected.slice(0, 25),
+    assets,
+    tokenSubscriptions: tokenIds.length,
+    referenceFeeds: referenceResolutions,
+    polymarketMessages,
+    referenceMessages,
+    referenceMessageCount: refCount,
+    failures,
+  };
   console.log(JSON.stringify(result, null, 2));
   if (!result.ok) process.exitCode = 1;
 } else {

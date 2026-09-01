@@ -1,20 +1,36 @@
 import { createPublicClient } from "@polymarket/client";
-import { createId, marketSnapshotSchema, type MarketSnapshot } from "@pm/core";
+import {
+  createId,
+  impliedSpread,
+  marketSnapshotSchema,
+  qualifyMarket,
+  qualificationConfigSchema,
+  type MarketSnapshot,
+  type QualificationConfig,
+  type QualificationReasonCode,
+  type QualificationResult,
+} from "@pm/core";
 import { abortableDelay, ExponentialBackoff } from "./reconnect.js";
 
 export interface DiscoveredMarket {
   id: string;
   slug: string;
   question: string;
+  title: string;
+  asset: string | null;
   endDate: string | null;
   active: boolean;
   tokens: Array<{ tokenId: string; outcome: "UP" | "DOWN"; price: string | null }>;
   feeSchedule: MarketSnapshot["feeSchedule"];
+  liquidityUsd: string | null;
+  spread: number | null;
+  qualification: QualificationResult;
   raw: Record<string, unknown>;
 }
 
 export interface FeedConnectionEvent {
-  feed: "polymarket" | "btc";
+  feed: "polymarket" | "btc" | "reference";
+  asset?: string;
   state: "CONNECTING" | "CONNECTED" | "DISCONNECTED" | "STALE" | "STOPPED";
   at: string;
   reconnectCount: number;
@@ -27,6 +43,12 @@ export interface PolymarketFeedHandlers {
   onError(error: Error): Promise<void> | void;
 }
 
+export interface DiscoveryReport {
+  discovered: DiscoveredMarket[];
+  qualified: DiscoveredMarket[];
+  rejected: Array<{ id: string; slug: string; title: string; reasonCodes: QualificationReasonCode[] }>;
+}
+
 type PublicClient = ReturnType<typeof createPublicClient>;
 
 export class PolymarketMarketDataAdapter {
@@ -35,39 +57,87 @@ export class PolymarketMarketDataAdapter {
   private readonly books = new Map<string, { marketId: string; bids: Map<string, string>; asks: Map<string, string>; lastTradePrice: string | null; timestamp: string; hash: string | null }>();
   private sequence = 0;
   private lastTimestampByToken = new Map<string, number>();
+  private tokenIds: string[] = [];
 
   constructor(client: PublicClient = createPublicClient()) { this.client = client; }
 
-  async discoverBitcoinMarkets(slugs: readonly string[] = [], maxMarkets = 20): Promise<DiscoveredMarket[]> {
+  getMarket(tokenId: string): DiscoveredMarket | undefined { return this.marketsByToken.get(tokenId); }
+  getMarkets(): DiscoveredMarket[] { return uniqueMarkets([...this.marketsByToken.values()]); }
+
+  async discoverCryptoMarkets(
+    slugs: readonly string[] = [],
+    maxMarkets = 40,
+    qualification: Partial<QualificationConfig> = {},
+    now = new Date(),
+  ): Promise<DiscoveryReport> {
+    const config = qualificationConfigSchema.parse({ ...qualification, maxQualifiedMarkets: maxMarkets });
     const rawMarkets: unknown[] = [];
     if (slugs.length > 0) {
       for (const slug of slugs) rawMarkets.push(await this.client.fetchMarket({ slug }));
     } else {
-      const page = await this.client.listMarkets({ closed: false, pageSize: 100 }).firstPage();
-      rawMarkets.push(...page.items);
+      const paginator = this.client.listMarkets({ closed: false, pageSize: 100 });
+      let pages = 0;
+      for await (const page of paginator) {
+        rawMarkets.push(...page.items);
+        pages += 1;
+        if (pages >= 8 || !page.hasMore) break;
+      }
     }
-    const normalized = rawMarkets.map(normalizeMarket).filter((market): market is DiscoveredMarket => market !== null)
-      .filter((market) => slugs.length > 0 || /\b(bitcoin|btc)\b/i.test(`${market.question} ${market.slug}`))
-      .filter((market) => market.active && market.tokens.length === 2)
-      .slice(0, maxMarkets);
-    for (const market of normalized) for (const token of market.tokens) this.marketsByToken.set(token.tokenId, market);
-    return normalized;
+    const seen = new Map<string, string>();
+    const discovered: DiscoveredMarket[] = [];
+    const rejected: DiscoveryReport["rejected"] = [];
+    for (const raw of rawMarkets) {
+      const candidate = toQualificationInput(raw);
+      if (!candidate) {
+        rejected.push({ id: "unknown", slug: "unknown", title: "unknown", reasonCodes: ["UNSUPPORTED_STRUCTURE"] });
+        continue;
+      }
+      const result = qualifyMarket(candidate.input, seen, now, config);
+      const market = toDiscoveredMarket(candidate, result);
+      discovered.push(market);
+      if (result.qualified) {
+        const tokenKey = market.tokens.map((token) => token.tokenId).sort().join(":");
+        seen.set(tokenKey, market.id);
+        seen.set(market.id, market.id);
+        for (const token of market.tokens) this.marketsByToken.set(token.tokenId, market);
+      } else {
+        rejected.push({ id: market.id, slug: market.slug, title: market.title, reasonCodes: result.reasonCodes });
+      }
+    }
+    const qualified = discovered.filter((market) => market.qualification.qualified).slice(0, config.maxQualifiedMarkets);
+    return { discovered, qualified, rejected };
   }
 
-  registerManualToken(tokenId: string, marketId = tokenId, outcome: "UP" | "DOWN" = "UP"): void {
+  /** @deprecated Use discoverCryptoMarkets. */
+  async discoverBitcoinMarkets(slugs: readonly string[] = [], maxMarkets = 20): Promise<DiscoveredMarket[]> {
+    const report = await this.discoverCryptoMarkets(slugs, maxMarkets);
+    return report.qualified;
+  }
+
+  registerManualToken(tokenId: string, marketId = tokenId, outcome: "UP" | "DOWN" = "UP", asset: string | null = null): void {
     this.marketsByToken.set(tokenId, {
-      id: marketId, slug: marketId, question: marketId, endDate: null, active: true,
-      tokens: [{ tokenId, outcome, price: null }], feeSchedule: null, raw: {},
+      id: marketId, slug: marketId, question: marketId, title: marketId, asset, endDate: null, active: true,
+      tokens: [{ tokenId, outcome, price: null }], feeSchedule: null, liquidityUsd: null, spread: null,
+      qualification: {
+        qualified: true, reasonCodes: ["QUALIFIED"], asset, crypto: true,
+        binary: { safe: true, yesOutcome: "UP", noOutcome: "DOWN", reason: "QUALIFIED" }, duplicateOf: null,
+      },
+      raw: {},
     });
   }
 
+  setTokenIds(tokenIds: readonly string[]): void { this.tokenIds = [...tokenIds]; }
+
   async run(tokenIds: readonly string[], handlers: PolymarketFeedHandlers, signal: AbortSignal): Promise<void> {
+    this.tokenIds = [...tokenIds];
     const backoff = new ExponentialBackoff({ initialDelayMs: 500, maxDelayMs: 30_000, multiplier: 2, jitterRatio: 0.2 });
     let reconnectCount = 0;
     while (!signal.aborted) {
       await handlers.onConnection({ feed: "polymarket", state: "CONNECTING", at: new Date().toISOString(), reconnectCount });
       try {
-        const stream = await this.client.subscribe([{ topic: "market", tokenIds: [...tokenIds], customFeatureEnabled: true }]);
+        const current = this.tokenIds.length > 0 ? this.tokenIds : [...tokenIds];
+        if (current.length === 0) throw new Error("NO_TOKEN_IDS");
+        const stream = await this.client.subscribe([{ topic: "market", tokenIds: [...current], customFeatureEnabled: true }]);
         backoff.reset();
         await handlers.onConnection({ feed: "polymarket", state: "CONNECTED", at: new Date().toISOString(), reconnectCount });
         for await (const event of stream) {
@@ -144,7 +214,7 @@ export class PolymarketMarketDataAdapter {
     const token = market.tokens.find((item) => item.tokenId === tokenId);
     return marketSnapshotSchema.parse({
       eventId: createId("poly"), traceId: createId("trace"), marketId: market.id, tokenId,
-      outcome: token?.outcome ?? "UP", bids: sortedLevels(state.bids, "desc"), asks: sortedLevels(state.asks, "asc"),
+      outcome: token?.outcome ?? "UP", asset: market.asset, bids: sortedLevels(state.bids, "desc"), asks: sortedLevels(state.asks, "asc"),
       lastTradePrice: state.lastTradePrice, tickSize: nullableString(raw.tickSize), minOrderSize: nullableString(raw.minOrderSize),
       feeSchedule: market.feeSchedule, sourceTimestamp: state.timestamp, receivedAt: new Date().toISOString(),
       sequence: ++this.sequence, hash: state.hash,
@@ -152,34 +222,128 @@ export class PolymarketMarketDataAdapter {
   }
 }
 
-function normalizeMarket(raw: unknown): DiscoveredMarket | null {
+interface ParsedCandidate {
+  input: Parameters<typeof qualifyMarket>[0];
+  feeSchedule: MarketSnapshot["feeSchedule"];
+  raw: Record<string, unknown>;
+}
+
+function toQualificationInput(raw: unknown): ParsedCandidate | null {
   const value = raw as Record<string, unknown>;
   const outcomes = value.outcomes as { yes?: Record<string, unknown>; no?: Record<string, unknown> } | undefined;
   const yesToken = nullableString(outcomes?.yes?.tokenId);
   const noToken = nullableString(outcomes?.no?.tokenId);
+  if (!yesToken || !noToken) {
+    const clob = Array.isArray(value.clobTokenIds) ? value.clobTokenIds.map(String) : [];
+    if (clob.length !== 2) return null;
+  }
   const state = value.state as Record<string, unknown> | undefined;
   const trading = value.trading as Record<string, unknown> | undefined;
   const rawFee = trading?.feeSchedule as Record<string, unknown> | null | undefined;
-  const feesEnabled = trading?.feesEnabled === true;
+  const feesEnabled = trading?.feesEnabled === true || value.feesEnabled === true;
   const feeSchedule = feesEnabled && rawFee ? {
     rate: String(rawFee.rate), exponent: Number(rawFee.exponent), takerOnly: Boolean(rawFee.takerOnly),
     rebateRate: String(rawFee.rebateRate ?? 0), source: "market_fee_schedule" as const, effectiveAt: new Date().toISOString(),
-  } : feesEnabled ? null : {
+  } : feesEnabled && !rawFee ? null : {
     rate: "0", exponent: 1, takerOnly: true, rebateRate: "0", source: "market_fee_schedule" as const, effectiveAt: new Date().toISOString(),
   };
-  if (!yesToken || !noToken) return null;
+  const tags = collectTags(value);
+  const yesPrice = nullableString(outcomes?.yes?.price) ?? firstPrice(value, 0);
+  const noPrice = nullableString(outcomes?.no?.price) ?? firstPrice(value, 1);
+  const liquidity = nullableString(trading?.liquidity ?? value.liquidityNum ?? value.liquidity);
   return {
-    id: String(value.id ?? value.conditionId ?? value.slug), slug: String(value.slug ?? value.id),
-    question: String(value.question ?? value.title ?? value.slug), endDate: nullableString(state?.endDate),
-    active: state?.active === true && state.closed !== true && state.acceptingOrders !== false,
-    tokens: [
-      { tokenId: yesToken, outcome: "UP", price: nullableString(outcomes?.yes?.price) },
-      { tokenId: noToken, outcome: "DOWN", price: nullableString(outcomes?.no?.price) },
-    ], feeSchedule, raw: value,
+    feeSchedule,
+    raw: value,
+    input: {
+      id: String(value.id ?? value.conditionId ?? value.slug),
+      slug: String(value.slug ?? value.id ?? ""),
+      title: String(value.question ?? value.title ?? value.slug ?? ""),
+      tags,
+      active: state?.active === true || value.active === true,
+      closed: state?.closed === true || value.closed === true,
+      acceptingOrders: state?.acceptingOrders !== false && value.acceptingOrders !== false,
+      endDate: nullableString(state?.endDate ?? value.endDateIso ?? value.endDate),
+      yesTokenId: yesToken ?? (Array.isArray(value.clobTokenIds) ? String((value.clobTokenIds as unknown[])[0]) : null),
+      noTokenId: noToken ?? (Array.isArray(value.clobTokenIds) ? String((value.clobTokenIds as unknown[])[1]) : null),
+      yesPrice, noPrice, liquidityUsd: liquidity, spread: impliedSpread(yesPrice, noPrice) ?? numberOrNull(value.spread),
+      feeSchedule, feesUnknown: feesEnabled && rawFee == null,
+      yesLabel: outcomeLabel(value, 0, outcomes?.yes), noLabel: outcomeLabel(value, 1, outcomes?.no),
+    },
   };
 }
 
+function toDiscoveredMarket(candidate: ParsedCandidate, qualification: QualificationResult): DiscoveredMarket {
+  const input = candidate.input;
+  const yesOutcome = qualification.binary.yesOutcome ?? "UP";
+  const noOutcome = qualification.binary.noOutcome ?? "DOWN";
+  return {
+    id: input.id, slug: input.slug, question: input.title, title: input.title, asset: qualification.asset,
+    endDate: input.endDate, active: input.active && !input.closed,
+    tokens: [
+      { tokenId: input.yesTokenId ?? "", outcome: yesOutcome, price: input.yesPrice },
+      { tokenId: input.noTokenId ?? "", outcome: noOutcome, price: input.noPrice },
+    ],
+    feeSchedule: candidate.feeSchedule, liquidityUsd: input.liquidityUsd, spread: input.spread,
+    qualification, raw: candidate.raw,
+  };
+}
+
+function collectTags(value: Record<string, unknown>): string[] {
+  const tags: string[] = [];
+  const push = (item: unknown) => {
+    if (typeof item === "string") tags.push(item);
+    else if (item && typeof item === "object") {
+      const record = item as Record<string, unknown>;
+      if (typeof record.slug === "string") tags.push(record.slug);
+      if (typeof record.label === "string") tags.push(record.label);
+    }
+  };
+  if (Array.isArray(value.tags)) value.tags.forEach(push);
+  if (Array.isArray(value.events)) {
+    for (const event of value.events as Array<Record<string, unknown>>) {
+      if (Array.isArray(event.tags)) event.tags.forEach(push);
+    }
+  }
+  const event = value.event as Record<string, unknown> | undefined;
+  if (event && Array.isArray(event.tags)) event.tags.forEach(push);
+  return tags;
+}
+
+function uniqueMarkets(markets: DiscoveredMarket[]): DiscoveredMarket[] {
+  const map = new Map<string, DiscoveredMarket>();
+  for (const market of markets) map.set(market.id, market);
+  return [...map.values()];
+}
+
 function nullableString(value: unknown): string | null { return value === undefined || value === null || value === "" ? null : String(value); }
+function numberOrNull(value: unknown): number | null {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+function outcomeLabel(value: Record<string, unknown>, index: number, named: Record<string, unknown> | undefined): string | null {
+  const fromNamed = nullableString(named?.name ?? named?.outcome ?? named?.label);
+  if (fromNamed) return fromNamed;
+  const outcomes = value.outcomes;
+  if (Array.isArray(outcomes) && typeof outcomes[index] === "string") return outcomes[index];
+  if (typeof outcomes === "string") {
+    try {
+      const parsed = JSON.parse(outcomes) as unknown;
+      if (Array.isArray(parsed) && typeof parsed[index] === "string") return parsed[index];
+    } catch { return null; }
+  }
+  return null;
+}
+function firstPrice(value: Record<string, unknown>, index: number): string | null {
+  const prices = value.outcomePrices;
+  if (Array.isArray(prices) && prices[index] !== undefined) return String(prices[index]);
+  if (typeof prices === "string") {
+    try {
+      const parsed = JSON.parse(prices) as unknown;
+      if (Array.isArray(parsed) && parsed[index] !== undefined) return String(parsed[index]);
+    } catch { return null; }
+  }
+  return null;
+}
 function parseSourceTimestamp(value: unknown): number {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : Date.now();

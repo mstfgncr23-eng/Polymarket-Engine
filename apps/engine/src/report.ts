@@ -58,6 +58,8 @@ export function buildExperimentSummary(events: readonly JournalEvent[], experime
     makerFillRate: rate(makerFills, byType("PAPER_MAKER_ORDER_CREATED").length), takerFillRate: rate(takerFills, byType("PAPER_TAKER_ORDER_CREATED").length || byType("PAPER_ORDER_CREATED").length),
     modelInvocationCounts: modelCounts, modelCostByAgentUsd: modelCosts,
     performanceByAgentSignal: groupPayload(byType("AGENT_SIGNAL_ATTRIBUTION"), "agentId"),
+    performanceByMarket: groupBy(events, "marketId"),
+    performanceByAsset: groupBy(events, "asset"),
     performanceByMarketRegime: groupPayload(byType("REGIME_PERFORMANCE"), "regime"),
     performanceByHour: groupPayload(byType("HOURLY_PERFORMANCE"), "hour"),
     rejectedTradesThatWouldHaveWon: byType("REJECTED_TRADE_WOULD_HAVE_WON").length,
@@ -86,4 +88,14 @@ function averageOrNull(values: readonly number[]): number | null { return values
 function rate(numerator: number, denominator: number): number { return denominator > 0 ? numerator / denominator : 0; }
 function groupPayload(events: readonly JournalEvent[], key: string): Record<string, unknown> {
   return Object.fromEntries(events.map((event) => [String(event.payload[key] ?? "unknown"), event.payload]));
+}
+function groupBy(events: readonly JournalEvent[], key: string): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const event of events) {
+    const payload = event.payload as Record<string, unknown>;
+    const value = payload[key] ?? (event.aggregateType === "market" || event.aggregateType === "position" ? event.aggregateId : null);
+    if (typeof value !== "string" || value.length === 0) continue;
+    counts[value] = (counts[value] ?? 0) + 1;
+  }
+  return counts;
 }

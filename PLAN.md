@@ -1,6 +1,36 @@
 # Implementation Plan
 
+## Multi-market crypto discovery and Grok activation (Issue #2, 2026-09-01)
+
+Continue the merged PR #1 engine. Do not rebuild. Paper only (`TRADING_MODE=paper`, `LIVE_TRADING_DISABLED`). Preserve identity binding: `authenticated clientId === submission.agentId === submission.role` and the role-to-write-tool allow-list. Exactly six Grok roles. Bots submit research only.
+
+### Target
+
+- Discover qualifying Polymarket **crypto** prediction markets dynamically (no BTC-only adapter, no BTC/ETH/SOL/XRP/DOGE hard-code).
+- Isolate all books/snapshots/triggers/signals/consensus/risk/positions/maker/hedges/journal/metrics/reports by `marketId` / `tokenId` / asset.
+- Generic `ReferencePriceFeedAdapter` + one WS per underlying asset that qualifying markets actually need.
+- `GrokActivationBridge` with Noop default + Slack wake-signal transport if Cursor-account Slack events can start routines. Core engine must not depend on Slack. Do not invent a Grok webhook. Do not call polling event-driven. Do not use Bot-to-Bot fan-out unless product behavior is validated (it is not; MCP cannot send those messages).
+- Role routing maps existing trigger families; do not wake all six on every event.
+- Activation is non-fatal. Adapter HTTP success is not an observed Grok wake. `firstMcpRequestAt` is the wake proxy.
+
+### Official Grok re-verification (2026-09-01)
+
+- No custom inbound webhook for Grok Bot.
+- Event triggers: Cursor-account integrations, examples Slack message or GitHub notification — https://docs.x.ai/grok-bot/skills-routines-and-automations , https://docs.x.ai/grok-bot/troubleshooting
+- Scheduled routines can poll MCP after cron (not event-driven).
+- Bot-to-Bot can wake a Bot; MCP cannot send those messages — https://docs.x.ai/grok-bot/chat-and-collaboration
+- MCP is client-initiated during Bot work. Grok Bot ≠ grok.com Chat ≠ xAI inference API.
+
+### Implementation phases
+
+1. Generalize domain/triggers/risk/qualification/role routing without rewriting deterministic math.
+2. Replace BTC-only discovery/feed with crypto discovery + reference registry.
+3. Add isolated activation bridge, coordinator (dedupe, cooldown, rate, severity, expiry), Slack/Noop providers, latency timestamps.
+4. Dashboard/MCP/journal/report surfaces for multi-market + activation (real persisted data only; no fake Bot activity; no secrets).
+5. Tests 1–40 plus existing suite. Run typecheck/test/build/smoke/live-smoke. Do not deploy to Fly.
+
 ## Grok Bot / remote MCP migration (2026-09-01)
+
 
 ### Current repository state
 
@@ -29,7 +59,7 @@
 
 - Grok Bots are external MCP clients; this repository does not create or provision xAI credentials and does not call an xAI inference API.
 - Write identity is bound server-side: authenticated `clientId` (the `GROK_MCP_BEARER_TOKENS` left-hand role ID) must equal `submission.agentId` and `submission.role`, and the write tool must be in that role’s allow-list. Tokens cannot impersonate another role.
-- **Issue #2 limitation:** Official Grok Bot docs (2026-09-01) do **not** support `custom Polymarket event → Grok Bot actually starts work immediately`. An MCP server cannot wake a Bot. `get_recent_triggers` is not event-driven activation. There is no custom inbound webhook (Cursor forum “inbound webhook is a great idea” is not official product). Documented event triggers are only Cursor-account integrations (examples: Slack message or GitHub notification). Viable subscription-only options, with no latency SLA in the docs: **(A)** scheduled routine — Bot polls MCP after cron; up to 50 routines/Bot; background works with laptop closed; this is polling lag, not event-driven; **(B)** Slack/GitHub Cursor integration event — only if someone/something posts into Slack/GitHub matching a routine; not a Polymarket webhook; **(C)** user chat or Bot-to-Bot message can wake a Bot — still not unattended-on-market-tick; MCP cannot send that message. Grok Bot ≠ grok.com chat ≠ xAI API. Do not mix grok.com custom MCP or Grok Build hooks (outbound) as if they wake Grok Bot. This engine implements no webhook/wake path and does not call an xAI inference API. Sources: https://docs.x.ai/grok-bot/skills-routines-and-automations , https://docs.x.ai/grok-bot/troubleshooting , https://x.ai/news/introducing-grok-bot , https://docs.x.ai/grok-bot/chat-and-collaboration . See `docs/GROK_BOT.md`.
+- **Issue #2 limitation:** Official Grok Bot docs (re-verified 2026-09-01) still do **not** support `custom Polymarket event → Grok Bot actually starts work immediately`. There is no custom inbound webhook. Documented event triggers are Cursor-account integrations (examples: Slack message or GitHub notification). This engine implements `GrokActivationBridge` + `NoopGrokActivationBridge` (default) + `SlackGrokActivationBridge` as wake-signal transport only. Canonical research stays on MCP. Bot-to-Bot is not used. Adapter HTTP success is not an observed Grok wake. Official docs do not prove a programmatic Slack bot post fires a Cursor routine. MCP cannot wake a Bot. `get_recent_triggers` is pull. Grok Bot ≠ grok.com chat ≠ xAI API. Do not mix grok.com custom MCP or Grok Build hooks as if they wake Grok Bot. Sources: https://docs.x.ai/grok-bot/skills-routines-and-automations , https://docs.x.ai/grok-bot/troubleshooting , https://docs.x.ai/grok-bot/chat-and-collaboration . See `docs/GROK_BOT.md`.
 - Initial machine-to-machine authentication uses operator-managed high-entropy bearer tokens supplied only to the engine as secrets. Token fingerprints—not raw tokens—are audited. OAuth-protected-resource discovery can be added later if the deployed Grok client requires delegated user authorization.
 - A single Fly engine Machine remains the supported topology; in-memory rate/idempotency caches are backed by durable journal checks where required but horizontally shared rate limits need Redis/PostgreSQL advisory coordination before scaling.
 - Docker/Fly CLIs: Fly CLI can be installed, but `fly config validate --strict` requires a logged-in access token. Docker is not installed and `docker.io` is not available from apt in this environment. Strict Fly and container builds remain explicit deployment gates.
@@ -63,13 +93,14 @@ The system will be a strict-TypeScript pnpm workspace with independently deploya
 
 ```text
 Polymarket CLOB WebSocket/API ----\
-                                  -> deterministic event pipeline -> journal/PostgreSQL
-BTC WebSocket -------------------/             |
-                                                +-> trigger engine (L0-L3)
-                                                +-> six-agent orchestrator
-                                                +-> deterministic consensus
-                                                +-> deterministic risk veto
-                                                +-> pluggable strategy
+                                  -> qualification + isolated multi-market state
+Generic reference WS (per asset)--/             |
+                                                +-> trigger engine
+                                                +-> GrokActivationBridge (noop|slack)
+                                                +-> six external Grok Bots over MCP
+                                                +-> deterministic consensus (trigger-scoped)
+                                                +-> deterministic risk veto (order/market/asset/portfolio)
+                                                +-> pluggable Temporal Pair/Hedge
                                                 +-> conservative paper execution
                                                 +-> ledger/experiment/reporting
                                                 +-> REST + SSE API
@@ -84,7 +115,7 @@ BTC WebSocket -------------------/             |
 - `apps/dashboard`: separate Next.js application that consumes engine REST/SSE and contains no engine-only secrets.
 - `packages/core`: domain/config schemas, decimal calculations, triggers, risk, paper execution, accounting, strategy, exactly-six agent orchestration, consensus, and experiment/report contracts.
 - `packages/db`: Drizzle PostgreSQL schema/migrations, append-only journal, idempotent event writes, checkpoints, and recovery queries.
-- `packages/market-data`: official unified Polymarket CLOB v2 REST/WebSocket adapter plus Binance BTC adapter, normalization, stale state, and reconnect/backoff/jitter.
+- `packages/market-data`: official unified Polymarket CLOB v2 REST/WebSocket adapter, dynamic crypto discovery/qualification, plus generic multi-asset reference-feed registry (one WS per underlying asset) with deprecated BTC wrapper.
 - `apps/engine`: orchestration, observability, report aggregation/writing, health/readiness/metrics, REST/SSE, checkpoint recovery, and graceful shutdown.
 - `apps/dashboard`: standalone Next.js server and private engine proxy with a reconnecting SSE terminal UI.
 - `tests`: integration fixtures and cross-package acceptance tests.

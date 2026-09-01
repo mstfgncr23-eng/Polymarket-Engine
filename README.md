@@ -1,21 +1,27 @@
 # Polymarket Research & Paper-Trading Engine
 
-Production-shaped, event-driven research system for a 48-hour experiment using public live Polymarket and BTC data. It creates **paper orders only**. There is no wallet integration, signer, private CLOB client, or live-order path; `TRADING_MODE` accepts only `paper`, and the live adapter always throws `LIVE_TRADING_DISABLED`.
+Production-shaped, event-driven research system for a 48-hour experiment using **public live Polymarket crypto prediction markets** plus **generic external crypto reference prices** for the assets those markets need. It creates **paper orders only**. There is no wallet integration, signer, private CLOB client, or live-order path; `TRADING_MODE` accepts only `paper`, and the live adapter always throws `LIVE_TRADING_DISABLED`.
 
-Research comes from **external Grok Bots** over a bearer-authenticated Streamable HTTP MCP endpoint. This repository does not call OpenAI, does not require `OPENAI_API_KEY`, and does not place live Polymarket orders.
+The engine is **not Bitcoin-only**. It discovers whichever qualifying crypto prediction markets Polymarket currently offers, qualifies them with explicit reason codes, monitors them concurrently with isolated state, and only then opens reference feeds for those underlying assets. Research comes from **external Grok Bots** over a bearer-authenticated Streamable HTTP MCP endpoint. This repository does not call OpenAI, does not require `OPENAI_API_KEY`, does not call an xAI inference API, and does not place live Polymarket orders.
+
+Thousands of ticks are cheaply filtered by the deterministic trigger engine. Only a few triggers request Grok activation for the matching roles. Missing Grok research never invents consensus or paper orders.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
   GB[Six Grok Bots] -->|Streamable HTTP MCP /mcp\nbearer auth| E[Always-on Fly engine]
-  PM[Polymarket public CLOB v2\nREST + market WebSocket] --> E
-  BTC[Binance BTC aggTrade\nWebSocket] --> E
-  E --> T[Deterministic trigger engine]
+  PM[Polymarket public CLOB v2\nREST discovery + market WebSocket] --> E
+  REF[Generic reference WS\none feed per underlying asset] --> E
+  E --> Q[Qualification + multi-market state]
+  Q --> T[Deterministic trigger engine]
+  T --> AB[GrokActivationBridge\nNoop or Slack wake transport]
+  AB -->|minimal wake signal| INT[Cursor-account integration\ne.g. Slack message]
+  GB -->|client-initiated MCP| E
   T --> IN[Signal inbox / freshness window]
   GB --> IN
-  IN --> C[Validated consensus]
-  C --> R[Deterministic risk veto]
+  IN --> C[Validated consensus\ntrigger-scoped]
+  C --> R[Deterministic risk veto\norder / market / asset / portfolio]
   R --> X[Conservative paper execution]
   X --> L[Ledger + positions]
   E --> J[(PostgreSQL append-only journal\n+ checkpoints)]
@@ -26,19 +32,76 @@ flowchart LR
 
 The pnpm workspace contains `apps/engine`, `apps/dashboard`, and focused `packages/core`, `packages/db`, and `packages/market-data`. PostgreSQL journal events are the canonical audit trail.
 
-Every important event carries a trace ID. `/api/traces/:traceId` reconstructs the source market evidence, participating Grok roles, consensus, risk result, order/fill, and resulting position from the append-only journal.
+Every important event carries a `traceId`. Journal/dashboard records also carry `marketId` and `asset` when known. `/api/traces/:traceId` reconstructs the source market evidence, participating Grok roles, consensus, risk result, order/fill, and resulting position from the append-only journal. Secrets are never written to that trail.
+
+## Discovery and qualification
+
+On a timer (`DISCOVERY_INTERVAL_MS`, default 5 minutes) the engine lists open Polymarket markets (or optional `POLYMARKET_MARKET_SLUGS`) and runs `qualifyMarket`. There is **no BTC/ETH/SOL/XRP/DOGE allow-list**. Crypto classification uses category tags and `{ticker}-updown` slug patterns. Per market the engine records `marketId`, slug, title, underlying asset if identifiable, outcome token IDs, binary outcomes, expiry, fee metadata, liquidity, and spread.
+
+Explicit reason codes (reject unless `QUALIFIED`):
+
+| Code | Meaning |
+|---|---|
+| `NOT_CRYPTO` | Not a crypto prediction market |
+| `MARKET_CLOSED` / `MARKET_INACTIVE` | Closed, inactive, or not accepting orders |
+| `UNSUPPORTED_STRUCTURE` | Cannot parse a binary token mapping |
+| `UNSUPPORTED_BINARY_SEMANTICS` | Cannot safely map outcomes to UP/DOWN; skipped, not invented |
+| `MISSING_TOKEN_IDS` | Outcome token IDs unknown |
+| `DURATION_OUT_OF_RANGE` | Remaining time outside the configured window |
+| `INSUFFICIENT_LIQUIDITY` / `SPREAD_TOO_WIDE` | Listing liquidity/spread fails thresholds (book depth is a runtime risk/execution check) |
+| `UNKNOWN_FEE_SCHEDULE` | Fees enabled but metadata missing; paper fills cannot be modeled |
+| `INVALID_PRICE` | Outcome prices outside `[0, 1]` |
+| `DUPLICATE_MARKET` | Same token pair already qualified |
+| `STALE_FEED` | Reserved; live feed freshness is enforced at risk time (`MARKET_FEED_STALE`, `REFERENCE_FEED_STALE`, `BTC_FEED_STALE`) |
+| `REFERENCE_UNSUPPORTED` | External reference venue has no tradable spot symbol; market may still be Polymarket-only monitored |
+
+Binary UP/DOWN is used only when outcome labels are clearly Up/Down (or Higher/Lower), or when the market is an explicit directional up/down listing with Yes/No or unlabeled outcomes (Polymarket crypto updown convention: Yes→UP, No→DOWN). Other binaries are skipped.
+
+State is isolated by `marketId` / `tokenId` / underlying asset: books, snapshots, triggers, Grok signals, consensus, risk, positions, maker orders, hedges, traces, journal, metrics, and reports must not mix across markets.
+
+## Reference feeds
+
+`ReferencePriceFeedAdapter` + `ReferenceFeedRegistry` share **one WebSocket per underlying asset**. Mapping is algorithmic (`BTC` → `BTCUSDT` is an example of `{ASSET}USDT`, not a closed list). “All crypto markets” means Polymarket crypto prediction markets first; reference feeds open **only** for assets those qualifying markets need.
+
+If a reference asset is unsupported, the engine does **not** crash. It journals `POLYMARKET_ONLY_MONITOR` / `REFERENCE_UNSUPPORTED` and continues Polymarket monitoring for that market. One asset’s disconnect is degraded/stale for that asset only. Reconnect uses bounded exponential backoff. Deprecated `BTC_WS_URL` / `BTC_SYMBOL` / `BtcWebSocketAdapter` still parse for old env/tests; the registry ignores them.
+
+`/ready` requires PostgreSQL plus a connected Polymarket stream with a first message. A failed reference feed does **not** keep the whole engine unready.
 
 ## Trigger and Grok Bot flow
 
 ```mermaid
 flowchart TD
-  M[Every market message] --> F[Decimal-safe features]
+  M[Every market/reference message] --> F[Decimal-safe features]
   F --> G{Threshold + debounce\n+ cooldown + dedupe}
   G -->|Any level| P[Persist trigger immediately]
+  P --> R[Role routing: only matching Grok roles]
+  R --> A[GrokActivationBridge]
+  A -->|noop default| N[Skip; monitoring continues]
+  A -->|slack| S[Minimal Slack wake payload]
   P --> W[Grok research window]
   W -->|fresh signals meet minimum roles| C[Weighted consensus]
   W -->|Grok unavailable or stale| M2[Continue monitoring\nno paper order]
 ```
+
+Triggers identify `triggerId`, `traceId`, `marketId`, underlying asset, source, kind, severity, created/expiry, and evidence IDs. They are isolated by market/asset. Deterministic trigger math is unchanged except for per-asset reference windows. BTC rapid-move math still emits `BTC_RAPID_MOVE` for BTC; other assets emit `CRYPTO_REFERENCE_RAPID_MOVE`.
+
+Activation is **non-fatal**: monitoring continues, the trigger stays persisted, failures are journaled, no crash, no fake Grok signal, no invented consensus, no paper order from missing research.
+
+### Official Grok activation (re-verified 2026-09-01)
+
+Grok Bot is **not** grok.com Chat, **not** the xAI inference API, and **not** Grok Build hooks. MCP cannot wake a Bot. `get_recent_triggers` is pull, not event-driven. There is **no custom inbound Grok webhook**.
+
+Documented event triggers are Cursor-account integrations, examples Slack message or GitHub notification:
+
+- https://docs.x.ai/grok-bot/skills-routines-and-automations
+- https://docs.x.ai/grok-bot/troubleshooting
+- Bot-to-Bot messages can wake a Bot, but MCP cannot send them: https://docs.x.ai/grok-bot/chat-and-collaboration
+
+This engine implements `GrokActivationBridge` with `NoopGrokActivationBridge` (default) and `SlackGrokActivationBridge`. Slack is **wake-signal transport only** (minimal payload: `eventType, triggerId, traceId, marketId, asset, severity, triggerKind, createdAt, expiresAt, targetRoles`). Canonical research stays on MCP. Core trigger/consensus/risk code does not import Slack. A future official Grok webhook can replace the provider without rewriting the trigger engine.
+
+Bot-to-Bot fan-out is **not** used. Role-specific activation is preferred. Official docs do **not** prove that a programmatic Slack bot post (versus a human message) fires a Cursor-account routine. Adapter HTTP success is **not** an observed Grok wake. `firstMcpRequestAt` is the documented proxy for Bot wake because the product exposes no wake timestamp.
+
+See [docs/GROK_BOT.md](docs/GROK_BOT.md) for operator steps.
 
 ```mermaid
 flowchart LR
@@ -54,7 +117,17 @@ flowchart LR
   C --> V
 ```
 
-Exactly six logical Grok Bot roles exist. They are **external** MCP clients. They may only read bounded state and submit structured research. They have no wallet, signer, or `place_order` tool. Missing Grok Bots produce no fake activity; deterministic monitoring continues.
+Exactly six logical Grok Bot roles exist. They are **external** MCP clients. They may only read bounded state and submit structured research. They have no wallet, signer, or `place_order` tool. Identity binding is unchanged from PR #1: `authenticated clientId === submission.agentId === submission.role`, plus the role-to-write-tool allow-list (scanners + supervisor: `submit_signal`; fair probability: `submit_analysis`; risk/hedge: `recommend_hedge` / `recommend_veto`).
+
+Role routing (do not wake all six):
+
+| Trigger family | Roles |
+|---|---|
+| Microstructure / order book | `market_microstructure_scanner`, `crypto_market_scanner`, `fair_probability_analyst` |
+| Crypto reference / momentum | `crypto_market_scanner`, `fair_probability_analyst` |
+| News / information | `news_x_intelligence_scanner`, `fair_probability_analyst` |
+| Hedge / exposure / risk | `risk_hedge_analyst` |
+| Severe disagreement / regime / escalation (incl. severity ≥ 3) | `strategy_supervisor` |
 
 ## Deterministic trade and risk
 
@@ -116,12 +189,19 @@ Dashboard: `http://localhost:3000`; engine liveness/readiness/metrics: `http://l
 | `PAPER_EXECUTION_LATENCY_MS` | Simulated decision-to-book latency, default `150` |
 | `EXPERIMENT_DURATION_HOURS` | Default `48` |
 | `EXPERIMENT_CLOSE_POLICY` | `observe_until_settlement` or `mark_to_market` |
-| `POLYMARKET_MARKET_SLUGS` | Optional comma-separated explicit live markets |
-| `POLYMARKET_TOKEN_IDS` | Optional manual public token IDs; missing fee metadata will veto fills |
-| `BTC_WS_URL`, `BTC_SYMBOL` | Public BTC feed; defaults to Binance aggTrade on `data-stream.binance.vision` (the `stream.binance.com` host returns HTTP 451 from some regions) |
+| `POLYMARKET_MARKET_SLUGS` | Optional comma-separated explicit live markets; otherwise Gamma listing is discovered |
+| `POLYMARKET_TOKEN_IDS` | Optional manual public token IDs (skips discovery timer); missing fee metadata will veto fills |
+| `REFERENCE_WS_BASE_URL` | Public reference WS base, default `wss://data-stream.binance.vision/ws` (`stream.binance.com` returns HTTP 451 from some regions) |
+| `REFERENCE_REST_BASE_URL` | Used to probe whether `{ASSET}USDT` exists before opening a WS, default `https://api.binance.com` |
+| `BTC_WS_URL`, `BTC_SYMBOL` | Deprecated BTC-only leftovers; accepted so old env files parse, ignored by the multi-asset registry |
+| `DISCOVERY_INTERVAL_MS` | Re-run crypto market discovery, default `300000` |
+| `MAX_QUALIFIED_MARKETS` | Cap on concurrently monitored qualifying markets, default `40` |
 | `GROK_MCP_BEARER_TOKENS` | Engine-only `roleId:token` list. `clientId` must be a Grok role ID and is bound to writes (`clientId === agentId === role`). Dashboard never receives it. Token fingerprints, not raw tokens, are audited. |
 | `GROK_MCP_ALLOWED_ORIGINS` | Allowed `Origin` values; missing Origin is allowed for server-side Grok clients. Default `https://grok.com,https://x.ai` |
 | `GROK_MCP_RATE_LIMIT_PER_MINUTE` | Per-client MCP request cap, default `60` |
+| `GROK_ACTIVATION_PROVIDER` | `noop` (default) or `slack`. Slack is wake-signal transport only. |
+| `SLACK_BOT_TOKEN`, `SLACK_CHANNEL_ID` | Engine-only Slack secrets when provider=`slack`. Never put these on the dashboard, in MCP, journal, logs, or traces. |
+| `SLACK_API_URL` | Slack `chat.postMessage` URL, default `https://slack.com/api/chat.postMessage` |
 | `ESTIMATED_INFRA_COST_PER_HOUR_USD` | Accrued into economic PnL |
 | `DASHBOARD_ORIGIN` | Allowed browser origin for engine API |
 | `ENGINE_INTERNAL_URL` | Dashboard server-to-engine URL; not `NEXT_PUBLIC_*` |
@@ -140,15 +220,15 @@ pnpm typecheck             # strict TypeScript across all workspaces
 pnpm test                  # unit, integration-boundary, MCP/auth, malicious-output acceptance
 pnpm build                 # engine bundle + standalone Next dashboard
 pnpm smoke                 # deterministic fixture: consensus -> fill -> ledger
-pnpm smoke:live            # public Polymarket + BTC connectivity; no orders/agents
+pnpm smoke:live            # public Polymarket crypto discovery + reference feeds; no orders/agents
 pnpm report                # rebuild reports/48h-summary.{json,md} from DATABASE_URL journal
 ```
 
-Tests cover pair/PnL math, fee curve, slippage/VWAP, exposure/accounting, consensus, stale/expired/budget/risk vetoes, maker/taker execution, insufficient depth, trigger dedupe, Grok unavailable continuity, malformed/duplicate/stale/unauthorized MCP behavior, forbidden trade-tool rejection, journal outage/recovery, reconnect backoff, feed parsing, exact-six topology, and the hard live-order gate.
+Tests cover pair/PnL math, fee curve, slippage/VWAP, exposure/accounting, consensus, stale/expired/budget/risk vetoes, maker/taker execution, insufficient depth, trigger dedupe, Grok unavailable continuity, malformed/duplicate/stale/unauthorized MCP behavior, forbidden trade-tool rejection, journal outage/recovery, reconnect backoff, feed parsing, exact-six topology, the hard live-order gate, multi-market isolation, Grok activation bridge/dedupe/rate limits, and identity-binding regressions.
 
 ## 48-hour procedure
 
-1. Set a durable `DATABASE_URL`, `TRADING_MODE=paper`, market selection (or allow BTC discovery), `GROK_MCP_BEARER_TOKENS`, `GIT_SHA`.
+1. Set a durable `DATABASE_URL`, `TRADING_MODE=paper`, optional market slugs (otherwise crypto discovery runs), `GROK_MCP_BEARER_TOKENS`, `GROK_ACTIVATION_PROVIDER` (`noop` unless Slack wake transport is configured), `GIT_SHA`.
 2. Run all verification commands and `pnpm smoke:live`.
 3. Start once with `EXPERIMENT_DURATION_HOURS=48 pnpm experiment:start` (PowerShell: `$env:EXPERIMENT_DURATION_HOURS='48'; pnpm experiment:start`).
 4. Point the six Grok Bots at `https://<engine>/mcp` using the operator-managed bearer tokens. Monitor `/ready`, `/metrics`, dashboard SSE state, risk vetoes, Grok signal freshness, directional positions, and journal growth.
@@ -185,16 +265,18 @@ fly deploy -a polymarket-dashboard -c fly.dashboard.toml --ha=false
 
 ## Recovery and operational behavior
 
-On SIGTERM the engine marks itself draining/not-ready, rejects new decisions, stops feed loops, accrues infrastructure cost, saves an experiment/ledger/position/resting-order/Grok-signal checkpoint, closes SSE/journal, and exits before Fly's kill timeout. On boot it migrates/checks PostgreSQL with bounded retry, restores the latest checkpoint, reconnects both feeds, and becomes ready only after DB plus first messages from both feeds.
+On SIGTERM the engine marks itself draining/not-ready, rejects new decisions, stops feed loops, accrues infrastructure cost, saves an experiment/ledger/position/resting-order/Grok-signal checkpoint, closes SSE/journal, and exits before Fly's kill timeout. On boot it migrates/checks PostgreSQL with bounded retry, restores the latest checkpoint, reconnects Polymarket plus per-asset reference feeds, and becomes ready only after DB plus the first Polymarket message.
 
-Health semantics: `/health` means the process is alive; `/ready` requires non-draining engine, DB, connected Polymarket/BTC streams, and initial messages. Fly health-check failures alone do not restart a process; the always restart policy covers process exits.
+Health semantics: `/health` means the process is alive; `/ready` requires a non-draining engine, DB, a connected Polymarket stream, and an initial Polymarket message. Reference-feed failure is degraded for that asset and does not block readiness. Fly health-check failures alone do not restart a process; the always restart policy covers process exits.
 
 ## Known limitations
 
 - No live trading, wallet, authentication/signing, settlement transaction, or private CLOB endpoint exists by design.
 - A real 48-hour outcome cannot be produced during repository construction. Reports are generated only from recorded events; no performance claim is included.
-- Grok Bots are configured in the Grok UI by the operator. This repo never provisions xAI credentials or calls an xAI inference API.
-- If Grok Bots are disconnected, the engine continues deterministic monitoring and will not invent agent activity or paper trades from missing research.
+- Grok Bots are configured in the Grok UI by the operator. This repo never provisions xAI credentials or calls an xAI inference API. There is no custom inbound Grok webhook. Slack activation is adapter HTTP only unless a Bot wake is independently observed.
+- If Grok Bots are disconnected, the engine continues deterministic monitoring and will not invent agent activity or paper trades from missing research. `aiCost` remains `$0`.
+- Consensus is trigger-scoped: a BTC signal cannot assemble into an ETH trigger.
+- Risk is evaluated per order, per market, per underlying asset, and for the total paper portfolio. Polymarket-only markets (unsupported reference) do not require a reference feed.
 - Full PostgreSQL/docker recovery and strict Fly validation require locally available PostgreSQL, Docker, and Fly CLI. In-memory recovery tests validate the repository contract but are not a substitute for a fault-injected production database test.
 - Public feed payloads/rate limits/fees can evolve. The adapter uses current unified `@polymarket/client` market APIs and preserves raw payloads, but should be revalidated before each experiment.
 - Maker queue inference cannot identify cancellations, hidden liquidity, or queue priority; the 50% post-queue rule is deliberately conservative.
