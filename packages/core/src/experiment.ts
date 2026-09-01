@@ -44,7 +44,7 @@ export function openPositionsRemain(positions: Iterable<Position>): boolean {
 export function refreshExperiment(
   manifest: ExperimentManifest,
   now: Date,
-  options: { openPositions?: boolean; unresolvedCount?: number } = {},
+  options: { openPositions?: boolean; unresolvedCount?: number; markToMarketReady?: boolean } = {},
 ): ExperimentManifest {
   if (manifest.status === "IDLE" || manifest.status === "COMPLETED" || manifest.status === "FAILED") return manifest;
   if (manifest.status === "RUNNING" && manifest.entryClosesAt && now.getTime() >= new Date(manifest.entryClosesAt).getTime()) {
@@ -58,6 +58,7 @@ export function refreshExperiment(
       return { ...manifest, status: "COMPLETED", completedAt: now.toISOString(), unresolvedPositionCount: 0 };
     }
     if (policy === "mark_to_market") {
+      if (options.markToMarketReady === false) return manifest;
       return {
         ...manifest, status: "COMPLETED", completedAt: now.toISOString(),
         markToMarketAt: now.toISOString(), unresolvedPositionCount: unresolved,
@@ -101,6 +102,8 @@ export interface ExperimentSummary {
   completedPairs: number;
   incompleteUnhedgedPositions: number;
   winLossDistribution: { wins: number; losses: number; breakeven: number };
+  /** Fee-exclusive settlement classification. winLossDistribution is net of fees. */
+  grossWinLossDistribution: { wins: number; losses: number; breakeven: number };
   grossPnlUsd: number;
   feesUsd: number;
   slippageUsd: number;
@@ -114,7 +117,10 @@ export interface ExperimentSummary {
   worstUnhedgedEvent: Record<string, unknown> | null;
   averagePairCost: number | null;
   averageLockedPairEdge: number | null;
+  /** Fee-inclusive realized edge per pair. Same as averageNetRealizedEdge. */
   averageRealizedEdge: number | null;
+  averageGrossLockedEdge: number | null;
+  averageNetRealizedEdge: number | null;
   makerFillRate: number;
   takerFillRate: number;
   modelInvocationCounts: Record<string, number>;
@@ -146,6 +152,8 @@ export interface ExperimentSummary {
   executableOpportunityRate: number;
   metricsScope: "rolling" | "complete";
   complete: boolean;
+  truncated: boolean;
+  truncatedReason: string | null;
   earliestOccurredAt: string | null;
   latestOccurredAt: string | null;
   decisionAccountingEventCount: number;
@@ -177,7 +185,9 @@ Report kind: ${summary.reportKind}
 ## Decision outcome
 
 - Gross PnL: $${summary.grossPnlUsd.toFixed(2)}
-- Net trading PnL (includes binary settlement): $${summary.netTradingPnlUsd.toFixed(2)}
+- Net trading PnL (includes binary settlement, net of fees): $${summary.netTradingPnlUsd.toFixed(2)}
+- Win/loss (net of fees): ${summary.winLossDistribution.wins} / ${summary.winLossDistribution.losses} / ${summary.winLossDistribution.breakeven}
+- Win/loss (gross, fee-exclusive): ${summary.grossWinLossDistribution.wins} / ${summary.grossWinLossDistribution.losses} / ${summary.grossWinLossDistribution.breakeven}
 - Settlement PnL: $${summary.settlementPnlUsd.toFixed(2)}
 - Settlements: ${summary.settlementCount}
 - Unresolved positions: ${summary.unresolvedPositionCount}
@@ -195,6 +205,8 @@ Report kind: ${summary.reportKind}
 - Maker / taker fills: ${summary.makerFills} / ${summary.takerFills}
 - Completed pairs: ${summary.completedPairs}
 - Incomplete or unhedged positions: ${summary.incompleteUnhedgedPositions}
+- Average gross locked pair edge (fee-exclusive): ${summary.averageGrossLockedEdge ?? "n/a"}
+- Average net realized edge (net of fees): ${summary.averageNetRealizedEdge ?? summary.averageRealizedEdge ?? "n/a"}
 - Fees / slippage: $${summary.feesUsd.toFixed(2)} / $${summary.slippageUsd.toFixed(2)}
 
 ## Risk and model evidence

@@ -155,9 +155,13 @@ const looseLimits = {
 
 describe("C experiment clock is explicit", () => {
   it("boots IDLE and does not auto-start the 48h experiment", async () => {
+    const market = new ScriptedMarketAdapter();
+    market.queue(report([qualified("btc-mkt", "BTC", "btc-up", "btc-down")]));
     const journal = new MemoryEventJournal();
-    const env = engineEnvSchema.parse({ NODE_ENV: "test", JOURNAL_MODE: "memory", TRADING_MODE: "paper", POLYMARKET_TOKEN_IDS: "up,down", ...grokPaperEnv() });
-    const engine = new EngineService(env, journal, logger, { market: pendingFeed() as never, activation: new NoopGrokActivationBridge() });
+    const env = engineEnvSchema.parse({ NODE_ENV: "test", JOURNAL_MODE: "memory", TRADING_MODE: "paper", ...grokPaperEnv(), DISCOVERY_INTERVAL_MS: "3600000" });
+    const engine = new EngineService(env, journal, logger, {
+      market: market as never, referenceRegistry: new ScriptedReferenceRegistry() as never, activation: new NoopGrokActivationBridge(),
+    });
     await engine.start();
     try {
       expect(engine.experimentManifest()?.status).toBe("IDLE");
@@ -324,25 +328,30 @@ describe("B/D/R/T settlement, close policy, recovery, accelerated lifecycle", ()
     }
   });
 
-  it("mark_to_market completes with unresolved positions and does not fabricate wins", async () => {
+  it("mark_to_market stays unresolved without a realizable bid and does not fabricate wins", async () => {
     let nowMs = Date.parse("2026-09-01T00:00:00.000Z");
+    const market = new ScriptedMarketAdapter();
+    market.queue(report([qualified("btc-mkt", "BTC", "btc-up", "btc-down", new Date(nowMs + 90 * 24 * 3_600_000).toISOString())]));
     const journal = new MemoryEventJournal();
     const env = engineEnvSchema.parse({
-      NODE_ENV: "test", JOURNAL_MODE: "memory", TRADING_MODE: "paper", POLYMARKET_TOKEN_IDS: "up,down", ...grokPaperEnv(),
-      EXPERIMENT_CLOSE_POLICY: "mark_to_market", EXPERIMENT_DURATION_HOURS: "48",
+      NODE_ENV: "test", JOURNAL_MODE: "memory", TRADING_MODE: "paper", ...grokPaperEnv(),
+      EXPERIMENT_CLOSE_POLICY: "mark_to_market", EXPERIMENT_DURATION_HOURS: "48", DISCOVERY_INTERVAL_MS: "3600000",
     });
-    const engine = new EngineService(env, journal, logger, { market: pendingFeed() as never, now: () => new Date(nowMs), activation: new NoopGrokActivationBridge() });
+    const engine = new EngineService(env, journal, logger, {
+      market: market as never, referenceRegistry: new ScriptedReferenceRegistry() as never,
+      now: () => new Date(nowMs), activation: new NoopGrokActivationBridge(),
+      resolutionFetcher: async () => null,
+    });
     await engine.start();
     try {
-      await engine.beginExperiment();
-      await engine.applyObservedFill(paperFill("btc-15m", "UP", "0.40"));
+      expect((await engine.beginExperiment()).ok).toBe(true);
+      await engine.applyObservedFill(paperFill("btc-mkt", "UP", "0.40"));
       nowMs += 48 * 3_600_000 + 1;
       await engine.tickMaintenance();
-      expect(engine.experimentManifest()?.status).toBe("COMPLETED");
-      expect(engine.experimentManifest()?.unresolvedPositionCount).toBeGreaterThan(0);
+      expect(engine.experimentManifest()?.status).toBe("ENTRY_CLOSED");
       expect((await journal.queryEvents({ types: ["POSITION_WIN"] })).length).toBe(0);
       const mtm = await journal.queryEvents({ types: ["PNL_SNAPSHOT"] });
-      expect(mtm.some((event) => (event.payload as { markToMarket?: boolean }).markToMarket === true)).toBe(true);
+      expect(mtm.some((event) => (event.payload as { markToMarket?: boolean }).markToMarket === true)).toBe(false);
     } finally {
       await engine.stop();
     }
@@ -350,14 +359,20 @@ describe("B/D/R/T settlement, close policy, recovery, accelerated lifecycle", ()
 
   it("restores open position, resting maker, ENTRY_CLOSED experiment, and activation latency", async () => {
     const journal = new MemoryEventJournal();
-    const env = engineEnvSchema.parse({
-      NODE_ENV: "test", JOURNAL_MODE: "memory", TRADING_MODE: "paper", POLYMARKET_TOKEN_IDS: "up,down", ...grokPaperEnv(),
-      EXPERIMENT_DURATION_HOURS: "48", EXPERIMENT_CLOSE_POLICY: "observe_until_settlement",
-    });
     let nowMs = Date.parse("2026-09-01T00:00:00.000Z");
-    const first = new EngineService(env, journal, logger, { market: pendingFeed() as never, now: () => new Date(nowMs), activation: new NoopGrokActivationBridge() });
+    const market = new ScriptedMarketAdapter();
+    market.queue(report([qualified("btc-15m", "BTC", "up", "down", new Date(nowMs + 90 * 24 * 3_600_000).toISOString())]));
+    const env = engineEnvSchema.parse({
+      NODE_ENV: "test", JOURNAL_MODE: "memory", TRADING_MODE: "paper", ...grokPaperEnv(),
+      EXPERIMENT_DURATION_HOURS: "48", EXPERIMENT_CLOSE_POLICY: "observe_until_settlement", DISCOVERY_INTERVAL_MS: "3600000",
+    });
+    const first = new EngineService(env, journal, logger, {
+      market: market as never, referenceRegistry: new ScriptedReferenceRegistry() as never,
+      now: () => new Date(nowMs), activation: new NoopGrokActivationBridge(),
+      resolutionFetcher: async () => null,
+    });
     await first.start();
-    await first.beginExperiment();
+    expect((await first.beginExperiment()).ok).toBe(true);
     await first.applyObservedFill(paperFill("btc-15m", "UP", "0.40"));
     await first.restMakerForTest(order("MAKER"), snapshot());
     const trigger: TriggerEvent = {
@@ -373,7 +388,10 @@ describe("B/D/R/T settlement, close policy, recovery, accelerated lifecycle", ()
     const experimentId = first.experimentManifest()?.id;
     await first.stop();
 
-    const second = new EngineService(env, journal, logger, { market: pendingFeed() as never, now: () => new Date(nowMs) });
+    const second = new EngineService(env, journal, logger, {
+      market: market as never, referenceRegistry: new ScriptedReferenceRegistry() as never,
+      now: () => new Date(nowMs), resolutionFetcher: async () => null,
+    });
     await second.start();
     try {
       expect(second.experimentManifest()?.id).toBe(experimentId);

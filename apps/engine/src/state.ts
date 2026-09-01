@@ -114,6 +114,8 @@ export class EngineStateStore {
   queueDepth = 0;
   experimentId: string | null = null;
   experimentStatus: string | null = null;
+  experimentStartedAt: string | null = null;
+  experimentCompletedAt: string | null = null;
   database: "UP" | "DOWN" = "DOWN";
   lastBtcMessageAt: string | null = null;
   eventLatencyMs: number | null = null;

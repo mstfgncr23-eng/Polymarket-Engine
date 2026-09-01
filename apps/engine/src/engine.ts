@@ -22,6 +22,7 @@ import {
   grokSignalSubmissionSchema,
   grokSignalEnvelopeSchema,
   triggerEventSchema,
+  calculatePairMetrics,
   computePaperExposures,
   projectPaperExposures,
   makerReserveNotional,
@@ -62,11 +63,11 @@ import {
 import { EngineMetrics } from "./metrics.js";
 import { SseHub } from "./server.js";
 import { EngineStateStore } from "./state.js";
-import { buildExperimentSummary, writeExperimentSummary } from "./report.js";
+import { buildExperimentSummary, filterCurrentExperimentEvents, writeExperimentSummary } from "./report.js";
 import { GrokActivationCoordinator, persistableActivation } from "./activation/coordinator.js";
 import { createGrokActivationBridge } from "./activation/index.js";
 import { BoundedJournalWriter } from "./journal-writer.js";
-import { evaluateExperimentPreflight } from "./preflight.js";
+import { evaluateExperimentPreflight, isGenuineEntryQualifiedMarket } from "./preflight.js";
 
 export class EngineService {
   readonly metrics = new EngineMetrics();
@@ -278,6 +279,8 @@ export class EngineService {
     });
     this.state.experimentId = this.experiment.id;
     this.state.experimentStatus = this.experiment.status;
+    this.state.experimentStartedAt = this.experiment.startedAt;
+    this.state.experimentCompletedAt = this.experiment.completedAt;
     this.reportGenerated = false;
     this.state.setLedger(this.ledger.snapshot());
     await this.safeAppend(createJournalEvent({ traceId: createId("trace"), type: "EXPERIMENT_STARTED", aggregateType: "experiment", aggregateId: this.experiment.id, payload: this.experiment }));
@@ -294,12 +297,21 @@ export class EngineService {
       mcpRoleTokens: this.env.GROK_MCP_BEARER_TOKENS.split(",").map((entry) => entry.trim().split(":")[0] ?? "").filter(Boolean),
       mode,
       entryMarkets: [...this.entryQualified].map((marketId) => {
-        const asset = this.assetByMarket.get(marketId) ?? this.marketsById.get(marketId)?.asset ?? null;
+        const market = this.marketsById.get(marketId);
+        const asset = this.assetByMarket.get(marketId) ?? market?.asset ?? null;
         const blocked = asset ? this.referenceBlocked.get(asset) ?? null : null;
+        const up = market?.tokens.find((token) => token.outcome === "UP")?.tokenId ?? null;
+        const down = market?.tokens.find((token) => token.outcome === "DOWN")?.tokenId ?? null;
+        const monitored = Boolean(up && down && this.tokenIds.includes(up) && this.tokenIds.includes(down));
         return {
           marketId, asset, referenceRequired: this.referenceRequired.get(marketId) === true, blockedStatus: blocked,
+          yesTokenId: up, noTokenId: down, endDate: market?.endDate ?? null,
+          feeScheduleKnown: market?.feeSchedule != null,
+          binarySafe: market?.qualification.binary.safe === true
+            && market.qualification.binary.yesOutcome !== market.qualification.binary.noOutcome,
+          monitored,
         };
-      }),
+      }).filter((entry) => isGenuineEntryQualifiedMarket(entry) || this.entryQualified.has(entry.marketId)),
       reference: [...this.referenceRequired.keys()].map((marketId) => {
         const asset = this.assetByMarket.get(marketId);
         return { asset: asset ?? "unknown", status: this.referenceBlocked.get(asset ?? "") ?? (this.referenceRequired.get(marketId) ? "REQUIRED" : "OPTIONAL") };
@@ -603,8 +615,7 @@ export class EngineService {
         gitSha: process.env.GIT_SHA ?? process.env.FLY_IMAGE_REF ?? "unknown",
       });
     }
-    this.state.experimentId = this.experiment.id;
-    this.state.experimentStatus = this.experiment.status;
+    this.syncExperimentWindow();
   }
 
   private async onMarketSnapshot(snapshot: MarketSnapshot): Promise<void> {
@@ -947,10 +958,14 @@ export class EngineService {
       }));
     }
     if (Number(position.pairedQuantity) > 0 && Number(position.unpairedQuantity) === 0) {
-      this.record("HEDGE_COMPLETE", fill.traceId, fill.marketId, { positionId: position.id, pairedQuantity: position.pairedQuantity });
+      const unhedgedDurationMs = Math.max(0, this.nowFn().getTime() - new Date(position.openedAt).getTime());
+      this.record("HEDGE_COMPLETE", fill.traceId, fill.marketId, { positionId: position.id, pairedQuantity: position.pairedQuantity, unhedgedDurationMs });
       await this.safeAppend(createJournalEvent({
         traceId: fill.traceId, type: "HEDGE_COMPLETE", aggregateType: "position", aggregateId: position.id,
-        payload: { positionId: position.id, marketId: fill.marketId, pairedQuantity: position.pairedQuantity, experimentId: this.experiment?.id ?? null },
+        payload: {
+          positionId: position.id, marketId: fill.marketId, pairedQuantity: position.pairedQuantity,
+          unhedgedDurationMs, experimentId: this.experiment?.id ?? null,
+        },
       }));
     }
     await this.safeAppend(createJournalEvent({
@@ -1044,6 +1059,7 @@ export class EngineService {
     if (this.experiment.status === "RUNNING" || this.experiment.status === "ENTRY_CLOSED") {
       this.accrueInfrastructureCost(this.nowFn().getTime());
     }
+    this.pruneRuntimeBookkeeping();
     await this.pollFailedHedges();
     await this.maybeScheduledReview();
     await this.pollSettlements();
@@ -1052,16 +1068,21 @@ export class EngineService {
     const unresolved = [...this.ledger.positions.values()].filter((position) => Number(position.upQuantity) > 0 || Number(position.downQuantity) > 0).length;
     this.experiment = refreshExperiment(this.experiment, this.nowFn(), { openPositions: open, unresolvedCount: unresolved });
     if (this.experiment.status === "ENTRY_CLOSED" && (this.experiment.closePolicy ?? "observe_until_settlement") === "mark_to_market") {
-      await this.markToMarketClose(unresolved);
-      this.experiment = refreshExperiment(this.experiment, this.nowFn(), { openPositions: open, unresolvedCount: unresolved });
+      const marked = await this.markToMarketClose(unresolved);
+      this.experiment = refreshExperiment(this.experiment, this.nowFn(), {
+        openPositions: open, unresolvedCount: unresolved, markToMarketReady: marked,
+      });
     }
     if (this.experiment.status === "ENTRY_CLOSED") {
+      const policy = this.experiment.closePolicy ?? "observe_until_settlement";
       this.experiment = refreshExperiment(this.experiment, this.nowFn(), {
         openPositions: openPositionsRemain(this.ledger.positions.values()),
         unresolvedCount: [...this.ledger.positions.values()].filter((position) => Number(position.upQuantity) > 0 || Number(position.downQuantity) > 0).length,
+        markToMarketReady: policy === "mark_to_market" ? false : undefined,
       });
     }
     this.state.experimentStatus = this.experiment.status;
+    this.syncExperimentWindow();
     if (previous === "RUNNING" && this.experiment.status === "ENTRY_CLOSED") {
       await this.safeAppend(createJournalEvent({
         traceId: this.experiment.id, type: "EXPERIMENT_ENTRY_CLOSED", aggregateType: "experiment", aggregateId: this.experiment.id,
@@ -1155,19 +1176,25 @@ export class EngineService {
         marketId, asset, cashDelta: settled.cashDelta, realizedDelta: settled.realizedDelta,
         upPayoff: parsed.upPayoff, downPayoff: parsed.downPayoff, winner: parsed.winner,
         upQuantity: settled.position.upQuantity, downQuantity: settled.position.downQuantity,
+        feesUsd: settled.position.totalFees, grossOutcome: settled.grossOutcome, outcome: settled.outcome,
         experimentId: this.experiment?.id ?? null,
       },
     }));
     await this.safeAppend(createJournalEvent({
       traceId: settled.position.id, type: settled.outcome, aggregateType: "position", aggregateId: settled.position.id,
-      payload: { marketId, realizedDelta: settled.realizedDelta, experimentId: this.experiment?.id ?? null },
+      payload: { marketId, realizedDelta: settled.realizedDelta, feesUsd: settled.position.totalFees, grossOutcome: settled.grossOutcome, experimentId: this.experiment?.id ?? null },
     }));
     if (Number(settled.position.pairedQuantity) > 0) {
+      const metrics = calculatePairMetrics(settled.position);
+      const paired = Number(settled.position.pairedQuantity);
+      const grossLockedEdge = 1 - Number(settled.position.combinedPairCost);
+      const netRealizedEdge = paired > 0 ? Number(metrics.netPairEdge) / paired : Number(metrics.netPairEdge);
       await this.safeAppend(createJournalEvent({
         traceId: settled.position.id, type: "PAIR_REALIZED", aggregateType: "position", aggregateId: settled.position.id,
         payload: {
           marketId, pairedQuantity: settled.position.pairedQuantity, combinedPairCost: settled.position.combinedPairCost,
-          realizedEdge: 1 - Number(settled.position.combinedPairCost), experimentId: this.experiment?.id ?? null,
+          grossLockedEdge, netRealizedEdge, realizedEdge: netRealizedEdge,
+          fees: metrics.fees, experimentId: this.experiment?.id ?? null,
         },
       }));
     }
@@ -1188,15 +1215,18 @@ export class EngineService {
     this.settlementBackoff.set(marketId, now + nextDelay);
   }
 
-  private async markToMarketClose(unresolvedCount: number): Promise<void> {
+  private async markToMarketClose(unresolvedCount: number): Promise<boolean> {
     const prices: Record<string, { up: string; down: string }> = {};
     for (const position of this.ledger.positions.values()) {
       const pair = this.snapshots.get(position.marketId);
       const upQty = Number(position.upQuantity);
       const downQty = Number(position.downQuantity);
+      if (upQty <= 0 && downQty <= 0) continue;
       const upMark = upQty > 0 ? conservativeRealizableMark(pair?.UP) : position.averageUpCost;
       const downMark = downQty > 0 ? conservativeRealizableMark(pair?.DOWN) : position.averageDownCost;
-      if ((upQty > 0 && upMark === null) || (downQty > 0 && downMark === null)) continue;
+      if ((upQty > 0 && upMark === null) || (downQty > 0 && downMark === null)) {
+        return false;
+      }
       prices[position.marketId] = { up: upMark ?? position.averageUpCost, down: downMark ?? position.averageDownCost };
     }
     this.ledger.revalue(prices, this.nowFn().toISOString());
@@ -1209,36 +1239,98 @@ export class EngineService {
         source: "MARK_TO_MARKET", unresolvedPositionCount: unresolvedCount, markToMarket: true,
       },
     }));
+    return true;
   }
 
   private async writeFinalReport(): Promise<void> {
     if (!this.experiment || this.reportGenerated) return;
-    this.reportGenerated = true;
-    const events = await queryEventsPaged(this.journal, {
-      types: [...DECISION_EVENT_TYPES],
-      from: this.experiment.startedAt ? new Date(this.experiment.startedAt) : undefined,
-      to: this.experiment.completedAt ? new Date(this.experiment.completedAt) : this.nowFn(),
-    });
-    const unresolved = [...this.ledger.positions.values()].filter((position) => Number(position.upQuantity) > 0 || Number(position.downQuantity) > 0).length;
-    const summary = buildExperimentSummary(events, this.experiment.id, {
-      status: this.experiment.status,
-      closePolicy: this.experiment.closePolicy ?? "observe_until_settlement",
-      reportKind: "final",
-      unresolvedPositionCount: unresolved,
-      metricsScope: "complete",
-      complete: true,
-    });
-    await writeExperimentSummary(summary, process.env.REPORT_DIRECTORY ?? "reports");
-    await this.safeAppend(createJournalEvent({
-      traceId: this.experiment.id, type: "EXPERIMENT_REPORT_GENERATED", aggregateType: "experiment", aggregateId: this.experiment.id,
-      payload: {
-        reportDirectory: process.env.REPORT_DIRECTORY ?? "reports", reportKind: "final",
-        settlementPnlUsd: summary.settlementPnlUsd, unresolvedPositionCount: unresolved,
-        experimentId: this.experiment.id,
-      },
-    }));
-    this.record("EXPERIMENT_REPORT_GENERATED", this.experiment.id, null, { reportKind: "final", settlementPnlUsd: summary.settlementPnlUsd });
+    try {
+      const scan = await queryEventsPaged(this.journal, {
+        types: [...DECISION_EVENT_TYPES],
+        from: this.experiment.startedAt ? new Date(this.experiment.startedAt) : undefined,
+        to: this.experiment.completedAt ? new Date(this.experiment.completedAt) : this.nowFn(),
+      });
+      const events = filterCurrentExperimentEvents(scan.events, this.experiment);
+      const unresolved = [...this.ledger.positions.values()].filter((position) => Number(position.upQuantity) > 0 || Number(position.downQuantity) > 0).length;
+      const summary = buildExperimentSummary(events, this.experiment.id, {
+        status: this.experiment.status,
+        closePolicy: this.experiment.closePolicy ?? "observe_until_settlement",
+        reportKind: "final",
+        unresolvedPositionCount: unresolved,
+        metricsScope: "complete",
+        complete: scan.complete && !scan.truncated,
+        truncated: scan.truncated,
+        truncatedReason: scan.truncated ? "SCAN_CEILING" : null,
+      });
+      await writeExperimentSummary(summary, process.env.REPORT_DIRECTORY ?? "reports");
+      await this.journal.append(createJournalEvent({
+        traceId: this.experiment.id, type: "EXPERIMENT_REPORT_GENERATED", aggregateType: "experiment", aggregateId: this.experiment.id,
+        payload: {
+          reportDirectory: process.env.REPORT_DIRECTORY ?? "reports", reportKind: "final",
+          settlementPnlUsd: summary.settlementPnlUsd, unresolvedPositionCount: unresolved,
+          experimentId: this.experiment.id, complete: summary.complete, truncated: summary.truncated,
+        },
+      }));
+      this.reportGenerated = true;
+      this.record("EXPERIMENT_REPORT_GENERATED", this.experiment.id, null, { reportKind: "final", settlementPnlUsd: summary.settlementPnlUsd });
+    } catch (error) {
+      this.reportGenerated = false;
+      this.logger.error({ err: error }, "final experiment report generation failed");
+    }
   }
+
+  private syncExperimentWindow(): void {
+    this.state.experimentId = this.experiment?.id ?? null;
+    this.state.experimentStatus = this.experiment?.status ?? null;
+    this.state.experimentStartedAt = this.experiment?.startedAt ?? null;
+    this.state.experimentCompletedAt = this.experiment?.completedAt ?? null;
+  }
+
+  private pruneRuntimeBookkeeping(now = this.nowFn()): void {
+    const nowMs = now.getTime();
+    const signalCutoff = nowMs - 60_000;
+    while (this.signalReceivedTimes[0] !== undefined && this.signalReceivedTimes[0] < signalCutoff) this.signalReceivedTimes.shift();
+    this.executionErrors = this.executionErrors.filter((at) => nowMs - at < 3_600_000);
+    const cooldown = this.riskLimits.strategyCooldownMs;
+    for (const [key, at] of this.recentTrades) {
+      if (nowMs - at > cooldown) this.recentTrades.delete(key);
+    }
+    for (const [triggerId, trigger] of [...this.activeTriggers]) {
+      if (new Date(trigger.expiresAt).getTime() > nowMs) continue;
+      this.activeTriggers.delete(triggerId);
+      this.signalsByTrigger.delete(triggerId);
+      this.lastEvaluatedSignalCount.delete(triggerId);
+    }
+  }
+
+  runtimeBookkeepingForTest() {
+    return {
+      signalReceivedTimes: this.signalReceivedTimes.length,
+      executionErrors: this.executionErrors.length,
+      recentTrades: this.recentTrades.size,
+      activeTriggers: this.activeTriggers.size,
+      signalsByTrigger: this.signalsByTrigger.size,
+      lastEvaluatedSignalCount: this.lastEvaluatedSignalCount.size,
+    };
+  }
+
+  seedRuntimeBookkeepingForTest(input: {
+    signalReceivedTimes?: number[];
+    executionErrors?: number[];
+    recentTrades?: Array<[string, number]>;
+    trigger?: TriggerEvent;
+  }): void {
+    if (input.signalReceivedTimes) this.signalReceivedTimes.push(...input.signalReceivedTimes);
+    if (input.executionErrors) this.executionErrors.push(...input.executionErrors);
+    if (input.recentTrades) for (const [key, at] of input.recentTrades) this.recentTrades.set(key, at);
+    if (input.trigger) {
+      this.activeTriggers.set(input.trigger.id, input.trigger);
+      this.signalsByTrigger.set(input.trigger.id, new Map());
+      this.lastEvaluatedSignalCount.set(input.trigger.id, 1);
+    }
+  }
+
+  pruneRuntimeBookkeepingForTest(): void { this.pruneRuntimeBookkeeping(); }
 }
 
 export function parseEnv(env: NodeJS.ProcessEnv): EngineEnv { return engineEnvSchema.parse(env); }
@@ -1261,18 +1353,11 @@ export function collectMarketFeedAt(
   intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG",
   fallbackReceivedAt?: string | Date | null,
 ): Date | null {
-  const times: number[] = [];
-  if (intent === "HEDGE_SECOND_LEG") {
-    for (const snap of [pair?.UP, pair?.DOWN]) {
-      if (snap?.receivedAt) times.push(new Date(snap.receivedAt).getTime());
-    }
-  } else {
-    const snap = pair?.[outcome];
-    if (snap?.receivedAt) times.push(new Date(snap.receivedAt).getTime());
-  }
-  if (times.length === 0 && fallbackReceivedAt) return new Date(fallbackReceivedAt);
-  if (times.length === 0) return null;
-  return new Date(Math.min(...times));
+  const required = pair?.[outcome];
+  if (required?.receivedAt) return new Date(required.receivedAt);
+  if (intent === "HEDGE_SECOND_LEG" && fallbackReceivedAt) return new Date(fallbackReceivedAt);
+  if (fallbackReceivedAt) return new Date(fallbackReceivedAt);
+  return null;
 }
 
 export function projectableLegsFromPositions(

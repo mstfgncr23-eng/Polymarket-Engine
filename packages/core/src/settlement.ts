@@ -50,6 +50,19 @@ function mapToken(label: unknown, yesMapsTo: Outcome, noMapsTo: Outcome): Outcom
   return null;
 }
 
+type JsonField = { ok: true; value: unknown } | { ok: false; reason: "MALFORMED_RESOLUTION_JSON" };
+
+function parsePossiblyJsonEncoded(value: unknown): JsonField {
+  if (typeof value !== "string") return { ok: true, value };
+  const trimmed = value.trim();
+  if (!(trimmed.startsWith("[") || trimmed.startsWith("{"))) return { ok: true, value };
+  try {
+    return { ok: true, value: JSON.parse(trimmed) };
+  } catch {
+    return { ok: false, reason: "MALFORMED_RESOLUTION_JSON" };
+  }
+}
+
 function outcomeSlots(raw: Record<string, unknown>): { yesLabel: unknown; noLabel: unknown; yesPrice: unknown; noPrice: unknown } {
   const arrayPrices = Array.isArray(raw.outcomePrices) ? raw.outcomePrices : null;
   if (Array.isArray(raw.outcomes)) {
@@ -86,15 +99,18 @@ export function parsePublicBinaryResolution(
   const resolution = raw.resolution && typeof raw.resolution === "object" ? raw.resolution as Record<string, unknown> : {};
   const closed = state.closed === true || raw.closed === true;
   const uma = String(resolution.umaResolutionStatus ?? raw.umaResolutionStatus ?? "").toLowerCase() || null;
-  const slots = outcomeSlots(raw);
-  const yesPrice = binaryPayoff(slots.yesPrice);
-  const noPrice = binaryPayoff(slots.noPrice);
-  const yesOutcome = mapToken(slots.yesLabel, yesMapsTo, noMapsTo) ?? yesMapsTo;
-  const noOutcome = mapToken(slots.noLabel, yesMapsTo, noMapsTo) ?? noMapsTo;
   const unresolved = (reason: string): PublicBinaryResolution => ({
     status: "unresolved", winner: null, upPayoff: null, downPayoff: null,
     umaResolutionStatus: uma, closed, source: "public_polymarket", reason,
   });
+  const outcomesField = parsePossiblyJsonEncoded(raw.outcomes);
+  const pricesField = parsePossiblyJsonEncoded(raw.outcomePrices);
+  if (!outcomesField.ok || !pricesField.ok) return unresolved("MALFORMED_RESOLUTION_JSON");
+  const slots = outcomeSlots({ ...raw, outcomes: outcomesField.value, outcomePrices: pricesField.value });
+  const yesPrice = binaryPayoff(slots.yesPrice);
+  const noPrice = binaryPayoff(slots.noPrice);
+  const yesOutcome = mapToken(slots.yesLabel, yesMapsTo, noMapsTo) ?? yesMapsTo;
+  const noOutcome = mapToken(slots.noLabel, yesMapsTo, noMapsTo) ?? noMapsTo;
   if (!closed && !(uma && TERMINAL_UMA.has(uma))) return unresolved("NOT_TERMINAL");
   if (yesPrice === null || noPrice === null) return unresolved("PAYOFF_NOT_BINARY");
   if (yesPrice === noPrice) return unresolved("PAYOFF_NOT_BINARY");
@@ -129,8 +145,12 @@ export function settlementRealizedDelta(position: Position, upPayoff: "0" | "1",
   return decimal(proceeds.minus(cost));
 }
 
-export function classifySettledOutcome(realizedDelta: string): "POSITION_WIN" | "POSITION_LOSS" | "POSITION_BREAKEVEN" {
-  const value = d(realizedDelta);
+/** Win/loss is net of fees. Pass feesUsd=0 for the fee-exclusive gross classification. */
+export function classifySettledOutcome(
+  realizedDelta: string,
+  feesUsd: string | number = "0",
+): "POSITION_WIN" | "POSITION_LOSS" | "POSITION_BREAKEVEN" {
+  const value = d(realizedDelta).minus(feesUsd);
   if (value.gt(0)) return "POSITION_WIN";
   if (value.lt(0)) return "POSITION_LOSS";
   return "POSITION_BREAKEVEN";

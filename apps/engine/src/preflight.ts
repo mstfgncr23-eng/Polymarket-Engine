@@ -7,6 +7,23 @@ export interface PreflightEntryMarket {
   asset: string | null;
   referenceRequired: boolean;
   blockedStatus: string | null;
+  yesTokenId?: string | null;
+  noTokenId?: string | null;
+  endDate?: string | null;
+  feeScheduleKnown?: boolean;
+  binarySafe?: boolean;
+  monitored?: boolean;
+}
+
+export function isGenuineEntryQualifiedMarket(market: PreflightEntryMarket): boolean {
+  if (!market.binarySafe) return false;
+  if (!market.yesTokenId || !market.noTokenId || market.yesTokenId === market.noTokenId) return false;
+  if (!market.asset) return false;
+  if (!market.endDate) return false;
+  if (market.feeScheduleKnown !== true) return false;
+  if (market.monitored !== true) return false;
+  if (market.referenceRequired && isProviderBlocked(market.blockedStatus)) return false;
+  return true;
 }
 
 export interface PreflightResult {
@@ -44,9 +61,13 @@ export function evaluateExperimentPreflight(input: {
   if (input.env.TRADING_MODE !== "paper") blockers.push("TRADING_MODE_NOT_PAPER");
   if (!input.databaseUp) blockers.push("POSTGRES_UNHEALTHY");
   if (input.bootstrapFailed) blockers.push("UNRESOLVED_BOOTSTRAP_FAILURE");
-  const hasMarketPath = input.qualifiedOrManaged > 0 || input.tokenConfiguredPath === true;
-  if (!hasMarketPath) {
-    (grokPaper ? blockers : warnings).push("NO_QUALIFIED_OR_MANAGED_MARKETS");
+  const entries = input.entryMarkets ?? [];
+  const genuineEntries = entries.filter(isGenuineEntryQualifiedMarket);
+  if (grokPaper) {
+    if (genuineEntries.length === 0) blockers.push("NO_ENTRY_QUALIFIED_MARKET");
+  } else {
+    const hasMarketPath = genuineEntries.length > 0 || input.qualifiedOrManaged > 0 || input.tokenConfiguredPath === true;
+    if (!hasMarketPath) warnings.push("NO_QUALIFIED_OR_MANAGED_MARKETS");
   }
   const tokens = input.env.GROK_MCP_BEARER_TOKENS.split(",").map((entry) => entry.trim().split(":")[0]).filter(Boolean);
   const missingRoles = REQUIRED_ROLES.filter((role) => !tokens.includes(role));
@@ -62,12 +83,15 @@ export function evaluateExperimentPreflight(input: {
   }
   const blocked = input.reference.filter((item) => isProviderBlocked(item.status));
   if (blocked.length > 0) warnings.push("REFERENCE_PROVIDER_BLOCKED");
-  const entries = input.entryMarkets ?? [];
-  if (grokPaper && entries.length > 0) {
+  if (grokPaper && genuineEntries.length === 0 && entries.length > 0) {
     const tradable = entries.filter((entry) => !entry.referenceRequired || !isProviderBlocked(entry.blockedStatus));
     if (tradable.length === 0 && entries.some((entry) => entry.referenceRequired && isProviderBlocked(entry.blockedStatus))) {
       blockers.push("REFERENCE_REGION_BLOCKED");
     }
+  }
+  if (grokPaper && genuineEntries.length > 0) {
+    const tradable = genuineEntries.filter((entry) => !entry.referenceRequired || !isProviderBlocked(entry.blockedStatus));
+    if (tradable.length === 0) blockers.push("REFERENCE_REGION_BLOCKED");
   }
   return {
     ok: blockers.length === 0,
@@ -80,6 +104,8 @@ export function evaluateExperimentPreflight(input: {
       discoveryStatus: input.discoveryStatus,
       qualifiedOrManaged: input.qualifiedOrManaged,
       tokenConfiguredPath: input.tokenConfiguredPath === true,
+      genuineEntryQualified: genuineEntries.length,
+      manualTokensMonitorOnly: input.tokenConfiguredPath === true && genuineEntries.length === 0,
       activationProvider: input.env.GROK_ACTIVATION_PROVIDER,
       grokWakeValidated: false,
       grokResearchRequired: requireGrok,

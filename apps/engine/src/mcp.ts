@@ -14,7 +14,7 @@ import {
 } from "@pm/core";
 import { createJournalEvent, queryEventsPaged, type EventJournal } from "@pm/db";
 import type { EngineMetrics } from "./metrics.js";
-import { buildExperimentSummary } from "./report.js";
+import { buildExperimentSummary, filterCurrentExperimentEvents } from "./report.js";
 import type { EngineStateStore } from "./state.js";
 
 export interface McpConfig {
@@ -293,20 +293,31 @@ export function createGrokMcpServer(clientId: string, dependencies: McpDependenc
   }, async ({ scope }) => {
     const now = Date.now();
     const experimentId = dependencies.state.experimentId ?? "unknown";
+    const startedAt = dependencies.state.experimentStartedAt;
+    const completedAt = dependencies.state.experimentCompletedAt;
     if (
       strategyMetricsCache
       && strategyMetricsCache.scope === scope
       && strategyMetricsCache.experimentId === experimentId
       && now - strategyMetricsCache.at < 15_000
     ) return toolResult(strategyMetricsCache.value);
-    const events = scope === "complete"
-      ? await queryEventsPaged(dependencies.journal, { types: DECISION_EVENT_TYPES })
-      : await dependencies.journal.queryEvents({ types: DECISION_EVENT_TYPES, limit: 500 });
-    const summary = buildExperimentSummary(events, experimentId, {
+    const window = {
+      from: startedAt ? new Date(startedAt) : undefined,
+      to: completedAt ? new Date(completedAt) : undefined,
+    };
+    const scan = scope === "complete"
+      ? await queryEventsPaged(dependencies.journal, { types: DECISION_EVENT_TYPES, ...window })
+      : { events: await dependencies.journal.queryEvents({ types: DECISION_EVENT_TYPES, ...window, limit: 500, order: "desc" }), complete: true, truncated: false };
+    const scoped = filterCurrentExperimentEvents(scan.events, {
+      id: experimentId, startedAt, completedAt,
+    });
+    const summary = buildExperimentSummary(scoped, experimentId, {
       status: dependencies.state.experimentStatus ?? "unknown",
       reportKind: scope === "complete" ? "final" : "interim",
       metricsScope: scope,
-      complete: scope === "complete",
+      complete: scope === "complete" && scan.complete && Boolean(startedAt),
+      truncated: scan.truncated,
+      truncatedReason: scan.truncated ? "SCAN_CEILING" : null,
     });
     strategyMetricsCache = { at: now, scope, experimentId, value: summary };
     return toolResult(summary);

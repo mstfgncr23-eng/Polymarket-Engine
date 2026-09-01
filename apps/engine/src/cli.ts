@@ -13,7 +13,7 @@ import {
 } from "@pm/core";
 import { MemoryEventJournal, PostgresEventJournal, queryEventsPaged } from "@pm/db";
 import { PolymarketMarketDataAdapter, ReferenceFeedRegistry, createRestProbe } from "@pm/market-data";
-import { buildExperimentSummary, writeExperimentSummary } from "./report.js";
+import { buildExperimentSummary, filterCurrentExperimentEvents, writeExperimentSummary } from "./report.js";
 import { startRuntime } from "./runtime.js";
 
 const command = process.argv[2] ?? "help";
@@ -29,10 +29,17 @@ if (command === "experiment:start") {
     ? new PostgresEventJournal(process.env.DATABASE_URL, process.env.DB_MIGRATIONS_DIR ?? resolve(process.cwd(), "packages/db/migrations"))
     : new MemoryEventJournal();
   await journal.initialize();
+  const scan = await queryEventsPaged(journal, { types: DECISION_EVENT_TYPES });
+  const experimentId = process.env.EXPERIMENT_ID ?? "no-persisted-memory-experiment";
+  const scoped = filterCurrentExperimentEvents(scan.events, {
+    id: experimentId,
+    startedAt: process.env.EXPERIMENT_STARTED_AT ?? scan.events[0]?.occurredAt ?? null,
+    completedAt: process.env.EXPERIMENT_COMPLETED_AT ?? null,
+  });
   const summary = buildExperimentSummary(
-    await queryEventsPaged(journal, { types: DECISION_EVENT_TYPES }),
-    process.env.EXPERIMENT_ID ?? "no-persisted-memory-experiment",
-    { reportKind: "final", metricsScope: "complete", complete: true },
+    scoped,
+    experimentId,
+    { reportKind: "final", metricsScope: "complete", complete: scan.complete, truncated: scan.truncated, truncatedReason: scan.truncated ? "SCAN_CEILING" : null },
   );
   const paths = await writeExperimentSummary(summary, resolve(process.cwd(), "reports"));
   await journal.close();

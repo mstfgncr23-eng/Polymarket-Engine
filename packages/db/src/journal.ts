@@ -1,8 +1,11 @@
-import { and, desc, eq, gte, inArray, lte, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, lte, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/postgres-js";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
 import postgres from "postgres";
-import { createId, EVENT_PAGE_SIZE, journalEventSchema, type JournalEvent, type JournalQuery } from "@pm/core";
+import {
+  compareJournalEventOrder, createId, EVENT_PAGE_SIZE, EVENT_SCAN_CEILING, journalEventSchema,
+  sortJournalEventsChronologically, type JournalEvent, type JournalQuery,
+} from "@pm/core";
 import { engineCheckpoints, journalEvents, mcpIdempotencyKeys } from "./schema.js";
 
 export interface EngineCheckpoint {
@@ -56,9 +59,12 @@ export class MemoryEventJournal implements EventJournal {
     }
     if (query.from) rows = rows.filter((event) => new Date(event.occurredAt).getTime() >= query.from!.getTime());
     if (query.to) rows = rows.filter((event) => new Date(event.occurredAt).getTime() <= query.to!.getTime());
+    if (query.order === "asc") rows = [...rows].sort(compareJournalEventOrder);
+    if (query.order === "desc") rows = [...rows].sort(compareJournalEventOrder).reverse();
     const offset = query.offset ?? 0;
     const limit = query.limit ?? rows.length;
-    return structuredClone(rows.slice(offset, offset + limit));
+    const page = structuredClone(rows.slice(offset, offset + limit));
+    return query.order === "desc" ? page.reverse() : page;
   }
   async countByType(types?: readonly string[]): Promise<Record<string, number>> {
     const counts: Record<string, number> = {};
@@ -131,12 +137,17 @@ export class PostgresEventJournal implements EventJournal {
     }
     if (query.from) filters.push(gte(journalEvents.occurredAt, query.from));
     if (query.to) filters.push(lte(journalEvents.occurredAt, query.to));
+    const orderDesc = query.order !== "asc";
     const rows = await this.db.select().from(journalEvents)
       .where(filters.length > 0 ? and(...filters) : undefined)
-      .orderBy(desc(journalEvents.occurredAt))
+      .orderBy(
+        orderDesc ? desc(journalEvents.occurredAt) : asc(journalEvents.occurredAt),
+        orderDesc ? desc(journalEvents.id) : asc(journalEvents.id),
+      )
       .limit(Math.min(query.limit ?? 5_000, 20_000))
       .offset(query.offset ?? 0);
-    return rows.map(toJournalEvent).reverse();
+    const events = rows.map(toJournalEvent);
+    return orderDesc ? events.reverse() : events;
   }
   async countByType(types?: readonly string[]): Promise<Record<string, number>> {
     const filters = types && types.length > 0 ? [inArray(journalEvents.type, [...types])] : [];
@@ -170,25 +181,47 @@ function toJournalEvent(row: typeof journalEvents.$inferSelect): JournalEvent {
   return journalEventSchema.parse({ ...row, occurredAt: row.occurredAt.toISOString(), recordedAt: row.recordedAt.toISOString() });
 }
 
-export { EVENT_PAGE_SIZE };
+export { EVENT_PAGE_SIZE, EVENT_SCAN_CEILING };
+
+export interface PagedEventScan {
+  events: JournalEvent[];
+  complete: boolean;
+  truncated: boolean;
+  scanned: number;
+}
 
 export async function queryEventsPaged(
   journal: EventJournal,
   query: Omit<JournalQuery, "limit" | "offset">,
   pageSize = EVENT_PAGE_SIZE,
-): Promise<JournalEvent[]> {
+  ceiling = EVENT_SCAN_CEILING,
+): Promise<PagedEventScan> {
   const size = Math.max(1, Math.min(pageSize, 20_000));
+  const cap = Math.max(1, ceiling);
   const events: JournalEvent[] = [];
   let offset = 0;
+  let truncated = false;
   for (;;) {
-    const page = await journal.queryEvents({ ...query, limit: size, offset });
+    if (offset >= cap) {
+      truncated = true;
+      break;
+    }
+    const page = await journal.queryEvents({ ...query, limit: size, offset, order: query.order ?? "asc" });
     if (page.length === 0) break;
     events.push(...page);
     if (page.length < size) break;
     offset += page.length;
-    if (offset > 2_000_000) break;
+    if (offset >= cap) {
+      truncated = true;
+      break;
+    }
   }
-  return events;
+  return {
+    events: sortJournalEventsChronologically(events),
+    complete: !truncated,
+    truncated,
+    scanned: events.length,
+  };
 }
 
 export function createJournalEvent(input: {

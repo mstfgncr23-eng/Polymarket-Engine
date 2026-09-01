@@ -114,6 +114,7 @@ export class PaperLedger {
     cashDelta: string;
     realizedDelta: string;
     outcome: "POSITION_WIN" | "POSITION_LOSS" | "POSITION_BREAKEVEN";
+    grossOutcome: "POSITION_WIN" | "POSITION_LOSS" | "POSITION_BREAKEVEN";
   } | null {
     const position = this.positions.get(marketId);
     if (!position) return null;
@@ -130,7 +131,8 @@ export class PaperLedger {
     this.revalue({}, at.toISOString());
     return {
       position: structuredClone(position), cashDelta, realizedDelta,
-      outcome: classifySettledOutcome(realizedDelta),
+      outcome: classifySettledOutcome(realizedDelta, position.totalFees),
+      grossOutcome: classifySettledOutcome(realizedDelta, "0"),
     };
   }
 

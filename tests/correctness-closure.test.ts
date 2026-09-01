@@ -22,6 +22,7 @@ import { EngineService, collectMarketFeedAt } from "../apps/engine/src/engine.js
 import { buildExperimentSummary } from "../apps/engine/src/report.js";
 import { NoopGrokActivationBridge, SlackGrokActivationBridge } from "../apps/engine/src/activation/index.js";
 import { ALLOWED_MCP_READ_TOOLS, ALLOWED_MCP_WRITE_TOOLS, FORBIDDEN_MCP_TRADE_TOOLS } from "../apps/engine/src/mcp.js";
+import { startQualifiedEngine } from "./paper-engine-testkit.js";
 import { feeSchedule, fill, now, order, safeRisk, snapshot } from "./fixtures.js";
 
 const GROK_ROLES = [
@@ -218,8 +219,8 @@ describe("4 final report pagination over >8000 events", () => {
     const page = await journal.queryEvents({ types: ["RISK_EVALUATION"], limit: 8_000 });
     expect(page.length).toBe(8_000);
     const all = await queryEventsPaged(journal, { types: ["RISK_EVALUATION"] }, 500);
-    expect(all.length).toBe(8_001);
-    const summary = buildExperimentSummary(all, "exp-full", { reportKind: "final", metricsScope: "complete", complete: true });
+    expect(all.events.length).toBe(8_001);
+    const summary = buildExperimentSummary(all.events, "exp-full", { reportKind: "final", metricsScope: "complete", complete: all.complete });
     expect(summary.decisionAccountingEventCount).toBe(8_001);
     expect(summary.earliestOccurredAt).toBe(events[0]!.occurredAt);
     expect(summary.latestOccurredAt).toBe(events[8_000]!.occurredAt);
@@ -248,15 +249,7 @@ describe("5 experiment IDLE vs Grok paper activation policy", () => {
 
   it("IDLE 10h accrues zero experiment infra cost and does not wake Grok; 1h RUNNING accrues one hour", async () => {
     let nowMs = Date.parse("2026-09-01T00:00:00.000Z");
-    const journal = new MemoryEventJournal();
-    const env = engineEnvSchema.parse({
-      NODE_ENV: "test", JOURNAL_MODE: "memory", TRADING_MODE: "paper", POLYMARKET_TOKEN_IDS: "up,down",
-      ...grokPaperEnv(), ESTIMATED_INFRA_COST_PER_HOUR_USD: "1",
-    });
-    const engine = new EngineService(env, journal, { error: () => undefined }, {
-      market: pendingFeed() as never, now: () => new Date(nowMs), activation: new NoopGrokActivationBridge(),
-    });
-    await engine.start();
+    const { engine, journal } = await startQualifiedEngine({ ESTIMATED_INFRA_COST_PER_HOUR_USD: "1" }, () => new Date(nowMs));
     try {
       expect(engine.experimentManifest()?.status).toBe("IDLE");
       await engine.registerTriggerForResearch(futureTrigger());

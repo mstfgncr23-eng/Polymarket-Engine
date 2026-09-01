@@ -26,7 +26,25 @@ export interface JournalQuery {
   to?: Date;
   limit?: number;
   offset?: number;
+  /** asc = earliest first (required for multi-page scans). desc = newest-first window. */
+  order?: "asc" | "desc";
 }
 
 /** Bounded page size for full-experiment scans. Do not raise a silent truncation cap. */
 export const EVENT_PAGE_SIZE = 500;
+
+/** Safety ceiling for paged scans. Hitting it MUST mark the scan incomplete — never complete=true. */
+export const EVENT_SCAN_CEILING = 2_000_000;
+
+export function compareJournalEventOrder(
+  a: { occurredAt: string; id: string },
+  b: { occurredAt: string; id: string },
+): number {
+  const byTime = a.occurredAt.localeCompare(b.occurredAt);
+  if (byTime !== 0) return byTime;
+  return a.id.localeCompare(b.id);
+}
+
+export function sortJournalEventsChronologically<T extends { occurredAt: string; id: string }>(events: readonly T[]): T[] {
+  return [...events].sort(compareJournalEventOrder);
+}
