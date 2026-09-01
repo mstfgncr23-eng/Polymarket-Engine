@@ -78,6 +78,7 @@ export class EngineService {
   private readonly assetByMarket = new Map<string, string | null>();
   private readonly referenceRequired = new Map<string, boolean>();
   private tokenIds: string[] = [];
+  private marketLoopStarted = false;
   private experiment: ExperimentManifest | null = null;
   private checkpointSequence = 0;
   private lastTradeAt: Date | null = null;
@@ -126,25 +127,22 @@ export class EngineService {
     if (configuredTokens.length > 0) {
       configuredTokens.forEach((tokenId, index) => this.marketAdapter.registerManualToken(tokenId, tokenId, index % 2 === 0 ? "UP" : "DOWN"));
       this.tokenIds = configuredTokens;
+      this.marketAdapter.setTokenIds(this.tokenIds);
+      this.state.setDiscoveryStatus("MONITORING", this.tokenIds.length);
+      this.state.setDiscoveryLoopActive(false);
     } else {
+      this.state.setDiscoveryLoopActive(true);
       await this.refreshDiscovery();
     }
-    if (this.tokenIds.length === 0) throw new Error("NO_QUALIFIED_CRYPTO_MARKETS_FOUND");
-
-    void this.marketAdapter.run(this.tokenIds, {
-      onSnapshot: (snapshot) => this.onMarketSnapshot(snapshot),
-      onConnection: (event) => this.onConnection(event),
-      onError: (error) => this.onFeedError("polymarket", error),
-    }, this.abort.signal);
-
+    this.startMarketLoop();
     if (this.legacyBtcAdapter) {
       void this.legacyBtcAdapter.run({
         onTick: (tick) => this.onReferenceTick(tick.asset ? tick : { ...tick, asset: "BTC" }),
         onConnection: (event) => this.onConnection({ ...event, feed: event.feed === "reference" ? "btc" : event.feed, asset: event.asset ?? "BTC" }),
         onError: (error) => this.onFeedError("btc", error),
       }, this.abort.signal);
-    } else {
-      await this.startReferenceFeeds();
+    } else if (configuredTokens.length > 0) {
+      await this.reconcileReferenceFeeds();
     }
 
     this.maintenanceTimer = setInterval(() => { void this.maintainExperiment(); }, 60_000);
@@ -153,7 +151,12 @@ export class EngineService {
       this.discoveryTimer = setInterval(() => { void this.refreshDiscovery().catch((error) => this.logger.error({ err: error }, "discovery refresh failed")); }, this.env.DISCOVERY_INTERVAL_MS);
       this.discoveryTimer.unref();
     }
-    this.record("ENGINE_STARTED", this.experiment?.id ?? createId("engine"), null, { tokenIds: this.tokenIds.length, mode: "paper", activationProvider: this.env.GROK_ACTIVATION_PROVIDER }, null);
+    this.updateReady();
+    this.record("ENGINE_STARTED", this.experiment?.id ?? createId("engine"), null, {
+      tokenIds: this.tokenIds.length, mode: "paper", activationProvider: this.env.GROK_ACTIVATION_PROVIDER,
+      discoveryStatus: this.state.discoveryStatus, qualifiedMarkets: this.marketsById.size,
+      engineAlive: this.state.engineAlive(), marketMonitoring: this.state.marketMonitoring,
+    }, null);
   }
 
   async stop(): Promise<void> {
@@ -173,41 +176,116 @@ export class EngineService {
 
   noteMcpRequest(tool: string | null, triggerId?: string): void {
     if (triggerId) this.activation.noteMcp([triggerId]);
-    else if (tool === "get_recent_triggers") this.activation.noteMcp([]);
+    else this.activation.noteUnattributedMcp(tool);
     this.state.setActivationLatency(this.activation.snapshot());
+    this.state.setUnattributedMcp(this.activation.unattributedSnapshot());
+  }
+
+  /** Public so tests and the discovery timer can reconcile live subscriptions. */
+  async reconcileDiscovery(): Promise<void> { await this.refreshDiscovery(); }
+  subscribedTokenIds(): string[] { return [...this.tokenIds]; }
+  runningReferenceAssets(): string[] { return this.referenceRegistry.runningAssets(); }
+
+  private startMarketLoop(): void {
+    if (this.marketLoopStarted) return;
+    this.marketLoopStarted = true;
+    void this.marketAdapter.run(this.tokenIds, {
+      onSnapshot: (snapshot) => this.onMarketSnapshot(snapshot),
+      onConnection: (event) => this.onConnection(event),
+      onError: (error) => this.onFeedError("polymarket", error),
+    }, this.abort.signal).catch((error) => this.logger.error({ err: error }, "polymarket market loop stopped"));
   }
 
   private async refreshDiscovery(): Promise<void> {
+    this.state.setDiscoveryStatus("RECONCILING", this.marketsById.size);
     const report = await this.marketAdapter.discoverCryptoMarkets(
       splitList(this.env.POLYMARKET_MARKET_SLUGS),
       this.env.MAX_QUALIFIED_MARKETS,
       qualificationConfigSchema.parse({ maxQualifiedMarkets: this.env.MAX_QUALIFIED_MARKETS }),
     );
+    const previousMarketIds = new Set(this.marketsById.keys());
+    const previousAssets = new Set([...this.assetByMarket.values()].filter((asset): asset is string => Boolean(asset)));
+    const previousTokens = [...this.tokenIds];
+
+    this.marketsById.clear();
+    this.assetByMarket.clear();
+    this.referenceRequired.clear();
     for (const market of report.qualified) {
       this.marketsById.set(market.id, market);
       this.assetByMarket.set(market.id, market.asset);
     }
-    this.tokenIds = report.qualified.flatMap((market) => market.tokens.map((token) => token.tokenId));
-    this.marketAdapter.setTokenIds(this.tokenIds);
+    const nextTokens = uniqueStrings(report.qualified.flatMap((market) => market.tokens.map((token) => token.tokenId)));
+    const addedMarkets = report.qualified.filter((market) => !previousMarketIds.has(market.id)).map((market) => market.id);
+    const removedMarkets = [...previousMarketIds].filter((id) => !this.marketsById.has(id));
+    const unchangedMarkets = report.qualified.filter((market) => previousMarketIds.has(market.id)).map((market) => market.id);
+    const nextAssets = new Set([...this.assetByMarket.values()].filter((asset): asset is string => Boolean(asset)));
+    const addedAssets = [...nextAssets].filter((asset) => !previousAssets.has(asset));
+    const removedAssets = [...previousAssets].filter((asset) => !nextAssets.has(asset));
+
+    this.tokenIds = nextTokens;
+    this.marketAdapter.setTokenIds(nextTokens);
+    this.dropRemovedMarketState(removedMarkets, removedAssets);
     this.state.setDiscovery({
       qualified: report.qualified.map((market) => ({ marketId: market.id, slug: market.slug, asset: market.asset, tokens: market.tokens.map((token) => token.tokenId) })),
       rejected: report.rejected.slice(0, 100),
     });
+    this.state.setDiscoveryStatus(nextTokens.length > 0 ? "MONITORING" : "ZERO_QUALIFIED", this.marketsById.size);
+    this.updateReady();
+
     await this.safeAppend(createJournalEvent({
-      traceId: createId("trace"), type: "MARKETS_DISCOVERED", aggregateType: "engine", aggregateId: "market-discovery",
+      traceId: createId("trace"), type: "DISCOVERY_RECONCILED", aggregateType: "engine", aggregateId: "market-discovery",
       payload: {
         discovered: report.discovered.length, qualified: report.qualified.length,
+        addedMarkets, removedMarkets, unchangedMarkets, addedAssets, removedAssets,
+        previousTokens, nextTokens,
         markets: report.qualified.map((market) => ({ id: market.id, slug: market.slug, asset: market.asset, tokens: market.tokens })),
         rejected: report.rejected.slice(0, 50),
       },
     }));
+    this.record("DISCOVERY_RECONCILED", createId("trace"), null, {
+      qualified: report.qualified.length, addedMarkets, removedMarkets, addedAssets, removedAssets,
+    });
+    if (!this.legacyBtcAdapter) await this.reconcileReferenceFeeds();
   }
 
-  private async startReferenceFeeds(): Promise<void> {
-    const assets = [...new Set([...this.assetByMarket.values()].filter((asset): asset is string => Boolean(asset)))];
-    for (const asset of assets) {
-      const resolution = await this.referenceRegistry.resolve(asset);
+  private dropRemovedMarketState(removedMarkets: readonly string[], removedAssets: readonly string[]): void {
+    for (const marketId of removedMarkets) {
+      this.snapshots.delete(marketId);
+      this.triggerEngine.dropMarket(marketId);
+      for (const [tokenId, snapshot] of [...this.state.marketSnapshots.entries()]) {
+        if (snapshot.marketId === marketId) this.state.marketSnapshots.delete(tokenId);
+      }
+      for (const [orderId, resting] of [...this.restingOrders.entries()]) {
+        if (resting.order.marketId === marketId) this.restingOrders.delete(orderId);
+      }
+    }
+    for (const asset of removedAssets) {
+      this.triggerEngine.dropAsset(asset);
+      this.state.dropReference(asset);
+    }
+    for (const [triggerId, trigger] of [...this.activeTriggers]) {
+      if (!trigger.marketId || !removedMarkets.includes(trigger.marketId)) continue;
+      this.activeTriggers.delete(triggerId);
+      this.signalsByTrigger.delete(triggerId);
+      this.lastEvaluatedSignalCount.delete(triggerId);
+    }
+  }
+
+  private async reconcileReferenceFeeds(): Promise<void> {
+    const needed = new Set([...this.assetByMarket.values()].filter((asset): asset is string => Boolean(asset)));
+    for (const asset of this.referenceRegistry.runningAssets()) {
+      if (needed.has(asset)) continue;
+      this.referenceRegistry.stop(asset);
+      this.state.dropReference(asset);
+      await this.safeAppend(createJournalEvent({
+        traceId: createId("trace"), type: "REFERENCE_FEED_STOPPED", aggregateType: "reference", aggregateId: asset,
+        payload: { asset, reason: "NO_ACTIVE_MARKET" },
+      }));
+      this.record("REFERENCE_FEED_STOPPED", createId("trace"), null, { asset }, asset);
+    }
+    for (const asset of needed) {
       const markets = [...this.assetByMarket.entries()].filter(([, value]) => value === asset).map(([marketId]) => marketId);
+      const resolution = await this.referenceRegistry.resolve(asset);
       if (!resolution.supported) {
         for (const marketId of markets) this.referenceRequired.set(marketId, false);
         await this.safeAppend(createJournalEvent({
@@ -218,13 +296,21 @@ export class EngineService {
         continue;
       }
       for (const marketId of markets) this.referenceRequired.set(marketId, true);
-      const adapter = this.referenceRegistry.adapterFor(asset);
-      if (!adapter) continue;
-      void adapter.run({
+      const outcome = await this.referenceRegistry.ensureRunning(asset, {
         onTick: (tick) => this.onReferenceTick(tick),
         onConnection: (event) => this.onConnection(event),
         onError: (error) => this.onFeedError(`reference:${asset}`, error),
-      }, this.abort.signal).catch((error) => this.logger.error({ err: error, asset }, "reference feed stopped"));
+      }, this.abort.signal).catch((error) => {
+        this.logger.error({ err: error, asset }, "reference feed failed to start");
+        return "unsupported" as const;
+      });
+      if (outcome === "started") {
+        await this.safeAppend(createJournalEvent({
+          traceId: createId("trace"), type: "REFERENCE_FEED_STARTED", aggregateType: "reference", aggregateId: asset,
+          payload: { asset, symbol: resolution.symbol, sharedByMarkets: markets },
+        }));
+        this.record("REFERENCE_FEED_STARTED", createId("trace"), null, { asset, markets }, asset);
+      }
     }
   }
 
@@ -280,6 +366,7 @@ export class EngineService {
   }
 
   private async onMarketSnapshot(snapshot: MarketSnapshot): Promise<void> {
+    if (!this.tokenIds.includes(snapshot.tokenId)) return;
     const started = performance.now();
     this.metrics.marketMessages.inc();
     this.state.connections.polymarket.lastMessageAt = snapshot.receivedAt;
@@ -308,6 +395,7 @@ export class EngineService {
   }
 
   private async onReferenceTick(tick: ReferenceTick): Promise<void> {
+    if (this.usesDiscovery() && ![...this.assetByMarket.values()].includes(tick.asset)) return;
     this.state.noteReferenceTick(tick.asset, tick.receivedAt);
     if (tick.asset === "BTC") {
       this.state.lastBtcMessageAt = tick.receivedAt;
@@ -411,6 +499,7 @@ export class EngineService {
     this.signalReceivedTimes.push(now.getTime());
     this.state.addGrokSignal(signal);
     this.activation.noteSignal(trigger.id, now);
+    this.state.setActivationLatency(this.activation.snapshot());
     this.metrics.grokSignals.inc({ agent: signal.agentId, status: "accepted" });
     this.record(`${signal.agentId.toUpperCase()}_COMPLETE`, signal.traceId, trigger.marketId, { signalId: signal.signalId, clientId, confidence: submission.output.confidence, expiresAt: submission.output.expiresAt }, trigger.asset ?? null);
     await this.safeAppend(createJournalEvent({ traceId: signal.traceId, type: "GROK_SIGNAL_ACCEPTED", aggregateType: "grok_signal", aggregateId: signal.signalId, payload: signal }));
@@ -575,9 +664,12 @@ export class EngineService {
   }
 
   private updateReady(): void {
-    this.state.ready = !this.state.draining && this.state.database === "UP"
-      && this.state.connections.polymarket.state === "CONNECTED"
-      && this.state.connections.polymarket.lastMessageAt !== null;
+    this.state.ready = this.state.engineAlive();
+    this.state.setMarketMonitoring(this.tokenIds.length > 0 && this.state.connections.polymarket.state === "CONNECTED");
+  }
+
+  private usesDiscovery(): boolean {
+    return splitList(this.env.POLYMARKET_TOKEN_IDS).length === 0;
   }
 
   private record(type: string, traceId: string, marketId: string | null, detail: Record<string, unknown>, asset: string | null = null): void {
@@ -633,5 +725,6 @@ export class EngineService {
 
 export function parseEnv(env: NodeJS.ProcessEnv): EngineEnv { return engineEnvSchema.parse(env); }
 function splitList(value: string): string[] { return value.split(",").map((item) => item.trim()).filter(Boolean); }
+function uniqueStrings(values: readonly string[]): string[] { return [...new Set(values.filter(Boolean))]; }
 function dateOrNull(value: string | null | undefined): Date | null { return value ? new Date(value) : null; }
 function delay(ms: number): Promise<void> { return new Promise((resolve) => setTimeout(resolve, ms)); }

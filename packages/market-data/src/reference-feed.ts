@@ -134,6 +134,7 @@ export interface ReferenceResolution {
 export class ReferenceFeedRegistry {
   private readonly adapters = new Map<string, ReferencePriceFeedAdapter>();
   private readonly supported = new Map<string, ReferenceResolution>();
+  private readonly running = new Map<string, AbortController>();
 
   constructor(
     private readonly baseWsUrl: string,
@@ -175,6 +176,41 @@ export class ReferenceFeedRegistry {
     return adapter;
   }
 
+  async ensureRunning(
+    asset: string,
+    handlers: ReferenceFeedHandlers,
+    parentSignal: AbortSignal,
+  ): Promise<"started" | "already" | "unsupported"> {
+    if (this.running.has(asset)) return "already";
+    const resolution = await this.resolve(asset);
+    if (!resolution.supported) return "unsupported";
+    const adapter = this.adapterFor(asset);
+    if (!adapter) return "unsupported";
+    const child = new AbortController();
+    const onParentAbort = () => child.abort(parentSignal.reason);
+    if (parentSignal.aborted) {
+      child.abort(parentSignal.reason);
+      return "unsupported";
+    }
+    parentSignal.addEventListener("abort", onParentAbort, { once: true });
+    this.running.set(asset, child);
+    void adapter.run(handlers, child.signal).catch(() => undefined).finally(() => {
+      parentSignal.removeEventListener("abort", onParentAbort);
+      if (this.running.get(asset) === child) this.running.delete(asset);
+    });
+    return "started";
+  }
+
+  stop(asset: string): boolean {
+    const child = this.running.get(asset);
+    if (!child) return false;
+    this.running.delete(asset);
+    this.adapters.delete(asset);
+    child.abort("REFERENCE_ASSET_UNNEEDED");
+    return true;
+  }
+
+  runningAssets(): string[] { return [...this.running.keys()]; }
   assets(): string[] { return [...this.adapters.keys()]; }
 }
 

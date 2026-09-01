@@ -67,6 +67,14 @@ export class TriggerEngine {
     return this.ingestReference(tick.asset ? tick : { ...tick, asset: "BTC" });
   }
 
+  dropMarket(marketId: string): void {
+    this.markets.delete(marketId);
+  }
+
+  dropAsset(asset: string): void {
+    this.ticksByAsset.delete(asset);
+  }
+
   private emit(
     traceId: string, marketId: string | null, asset: string | null, sourceEventId: string,
     candidates: Array<{ kind: TriggerKind; score: number; severity: 1 | 2 | 3; evidence: Record<string, unknown>; source: TriggerSource }>,

@@ -36,7 +36,9 @@ Every important event carries a `traceId`. Journal/dashboard records also carry 
 
 ## Discovery and qualification
 
-On a timer (`DISCOVERY_INTERVAL_MS`, default 5 minutes) the engine lists open Polymarket markets (or optional `POLYMARKET_MARKET_SLUGS`) and runs `qualifyMarket`. There is **no BTC/ETH/SOL/XRP/DOGE allow-list**. Crypto classification uses category tags and `{ticker}-updown` slug patterns. Per market the engine records `marketId`, slug, title, underlying asset if identifiable, outcome token IDs, binary outcomes, expiry, fee metadata, liquidity, and spread.
+On a timer (`DISCOVERY_INTERVAL_MS`, default 5 minutes) the engine lists open Polymarket crypto-tagged events (or optional `POLYMARKET_MARKET_SLUGS`) and runs `qualifyMarket`. There is **no BTC/ETH/SOL/XRP/DOGE allow-list**. Crypto classification uses category tags and `{ticker}-updown` slug patterns. Per market the engine records `marketId`, slug, title, underlying asset if identifiable, outcome token IDs, binary outcomes, expiry, fee metadata, liquidity, and spread.
+
+Zero qualified markets at startup is valid. The engine stays up, keeps the database/health/dashboard available, and keeps scanning. When a market later qualifies, discovery reconciliation adds it: token IDs are applied immediately, the Polymarket stream is resubscribed if the client cannot mutate subscriptions in place, and the matching reference feed starts. Removed or expired markets stop being monitored; a reference feed stops when no remaining market needs that asset. Multiple markets that share one asset share one feed.
 
 Explicit reason codes (reject unless `QUALIFIED`):
 
@@ -65,7 +67,7 @@ State is isolated by `marketId` / `tokenId` / underlying asset: books, snapshots
 
 If a reference asset is unsupported, the engine does **not** crash. It journals `POLYMARKET_ONLY_MONITOR` / `REFERENCE_UNSUPPORTED` and continues Polymarket monitoring for that market. One asset’s disconnect is degraded/stale for that asset only. Reconnect uses bounded exponential backoff. Deprecated `BTC_WS_URL` / `BTC_SYMBOL` / `BtcWebSocketAdapter` still parse for old env/tests; the registry ignores them.
 
-`/ready` requires PostgreSQL plus a connected Polymarket stream with a first message. A failed reference feed does **not** keep the whole engine unready.
+`/ready` means the engine process is alive, not draining, and PostgreSQL is up. It does **not** require a qualifying market or a Polymarket WebSocket message. Zero currently qualifying markets is a scanner idle state (`discoveryStatus=ZERO_QUALIFIED`), not a crash: discovery continues on `DISCOVERY_INTERVAL_MS`, no market WS is opened until tokens exist, and no paper trade is fabricated. `/health` remains process-liveness. A failed reference feed does **not** keep the whole engine unready.
 
 ## Trigger and Grok Bot flow
 
@@ -99,7 +101,7 @@ Documented event triggers are Cursor-account integrations, examples Slack messag
 
 This engine implements `GrokActivationBridge` with `NoopGrokActivationBridge` (default) and `SlackGrokActivationBridge`. Slack is **wake-signal transport only** (minimal payload: `eventType, triggerId, traceId, marketId, asset, severity, triggerKind, createdAt, expiresAt, targetRoles`). Canonical research stays on MCP. Core trigger/consensus/risk code does not import Slack. A future official Grok webhook can replace the provider without rewriting the trigger engine.
 
-Bot-to-Bot fan-out is **not** used. Role-specific activation is preferred. Official docs do **not** prove that a programmatic Slack bot post (versus a human message) fires a Cursor-account routine. Adapter HTTP success is **not** an observed Grok wake. `firstMcpRequestAt` is the documented proxy for Bot wake because the product exposes no wake timestamp.
+Bot-to-Bot fan-out is **not** used. Role-specific activation is preferred. Official docs do **not** prove that a programmatic Slack bot post (versus a human message) fires a Cursor-account routine. Adapter HTTP success is **not** an observed Grok wake. `firstMcpRequestAt` is a **per-trigger** proxy and is assigned only when an MCP request carries that `triggerId` (for example `get_recent_triggers` with `triggerId`, or a write tool / structured submission). A generic `get_recent_triggers` poll is recorded as unattributed MCP activity and does **not** mark every pending trigger as woken.
 
 See [docs/GROK_BOT.md](docs/GROK_BOT.md) for operator steps.
 
@@ -265,9 +267,9 @@ fly deploy -a polymarket-dashboard -c fly.dashboard.toml --ha=false
 
 ## Recovery and operational behavior
 
-On SIGTERM the engine marks itself draining/not-ready, rejects new decisions, stops feed loops, accrues infrastructure cost, saves an experiment/ledger/position/resting-order/Grok-signal checkpoint, closes SSE/journal, and exits before Fly's kill timeout. On boot it migrates/checks PostgreSQL with bounded retry, restores the latest checkpoint, reconnects Polymarket plus per-asset reference feeds, and becomes ready only after DB plus the first Polymarket message.
+On SIGTERM the engine marks itself draining/not-ready, rejects new decisions, stops feed loops, accrues infrastructure cost, saves an experiment/ledger/position/resting-order/Grok-signal checkpoint, closes SSE/journal, and exits before Fly's kill timeout. On boot it migrates/checks PostgreSQL with bounded retry, restores the latest checkpoint, starts discovery (or manual tokens), reconnects Polymarket when tokens exist plus per-asset reference feeds those markets need, and becomes ready when the DB is up and the process is not draining.
 
-Health semantics: `/health` means the process is alive; `/ready` requires a non-draining engine, DB, a connected Polymarket stream, and an initial Polymarket message. Reference-feed failure is degraded for that asset and does not block readiness. Fly health-check failures alone do not restart a process; the always restart policy covers process exits.
+Health semantics: `/health` means the process is alive; `/ready` means engine alive (non-draining + database up). Readiness, discovery, and market monitoring are distinct: Fly `/ready` stays 200 with zero currently qualifying markets so a 24/7 scanner is not killed. `discoveryStatus` is `ZERO_QUALIFIED` | `RECONCILING` | `MONITORING`. `marketMonitoring` is true only while qualified tokens are subscribed and the Polymarket stream is connected. Reference-feed failure is degraded for that asset and does not block readiness. Fly health-check failures alone do not restart a process; the always restart policy covers process exits.
 
 ## Known limitations
 

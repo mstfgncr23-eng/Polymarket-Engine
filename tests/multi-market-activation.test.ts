@@ -265,15 +265,18 @@ describe("Grok activation 16-29", () => {
     expect(engine.ledger.positions.size).toBe(0);
   });
 
-  it("27 latency timestamps start at trigger creation; MCP request is a wake proxy", async () => {
+  it("27 generic MCP poll does not mark pending triggers as woken", async () => {
     const { engine } = await makeEngine();
     const event = trigger();
     await engine.registerTriggerForResearch(event);
     engine.noteMcpRequest("get_recent_triggers");
     const latency = engine.activation.snapshot().find((item) => item.triggerId === event.id);
     expect(latency?.triggerCreatedAt).toBe(event.createdAt);
-    expect(latency?.firstMcpRequestAt).toBeTruthy();
+    expect(latency?.firstMcpRequestAt).toBeNull();
     expect(latency?.firstAcceptedSignalAt).toBeNull();
+    expect(engine.activation.unattributedSnapshot().count).toBe(1);
+    expect(engine.activation.unattributedSnapshot().lastTool).toBe("get_recent_triggers");
+    expect(engine.state.snapshot().unattributedMcp.count).toBe(1);
   });
 
   it("28 does not silently extend trigger TTL", () => {

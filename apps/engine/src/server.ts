@@ -44,10 +44,11 @@ export async function createApiServer(input: {
   await app.register(sensible);
   await app.register(cors, { origin: input.dashboardOrigin, methods: ["GET"] });
 
-  app.get("/health", async () => ({ status: "ok", mode: "paper", draining: input.state.draining }));
+  app.get("/health", async () => ({ status: "ok", mode: "paper", draining: input.state.draining, engineAlive: input.state.engineAlive() }));
   app.get("/ready", async (_request, reply) => {
-    if (!input.state.ready || input.state.draining) return reply.code(503).send({ status: "not_ready", mode: "paper" });
-    return { status: "ready", mode: "paper" };
+    const body = input.state.readiness();
+    if (body.status !== "ready") return reply.code(503).send(body);
+    return body;
   });
   app.get("/metrics", async (_request, reply) => reply.type(input.metrics.registry.contentType).send(await input.metrics.registry.metrics()));
   const mcpHandler = createMcpHttpHandler(input.mcp, {

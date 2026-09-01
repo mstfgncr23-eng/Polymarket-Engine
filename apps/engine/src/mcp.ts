@@ -256,9 +256,14 @@ export function createGrokMcpServer(clientId: string, dependencies: McpDependenc
   }, async ({ tokenId }) => toolResult(dependencies.state.marketSnapshots.get(tokenId) ?? null));
 
   server.registerTool("get_recent_triggers", {
-    description: "Read recent deterministic triggers available for external research. Monitoring never waits for Grok.",
-    inputSchema: { limit: z.number().int().min(1).max(100).default(25) }, annotations: readOnly,
-  }, async ({ limit }) => toolResult(dependencies.state.recentTriggers.slice(0, limit)));
+    description: "Read recent deterministic triggers available for external research. Monitoring never waits for Grok. Optional triggerId attributes this MCP request to that trigger only.",
+    inputSchema: { limit: z.number().int().min(1).max(100).default(25), triggerId: z.string().min(1).max(160).optional() }, annotations: readOnly,
+  }, async ({ limit, triggerId }) => {
+    const items = triggerId
+      ? dependencies.state.recentTriggers.filter((item) => item.id === triggerId).slice(0, limit)
+      : dependencies.state.recentTriggers.slice(0, limit);
+    return toolResult(items);
+  });
 
   server.registerTool("get_positions", {
     description: "Read paper positions. This tool cannot modify positions or place orders.",
@@ -290,6 +295,8 @@ export function createGrokMcpServer(clientId: string, dependencies: McpDependenc
     const snapshot = dependencies.state.snapshot();
     return toolResult({
       engine: snapshot.engine, health: snapshot.health, grokActivity: snapshot.grokActivity, paperMode: snapshot.paperMode,
+      discoveryStatus: snapshot.engine.discoveryStatus, marketMonitoring: snapshot.engine.marketMonitoring,
+      qualifiedMarketCount: snapshot.engine.qualifiedMarketCount, unattributedMcp: snapshot.unattributedMcp,
     });
   });
 

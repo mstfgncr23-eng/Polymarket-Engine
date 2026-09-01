@@ -11,7 +11,7 @@ Continue the merged PR #1 engine. Do not rebuild. Paper only (`TRADING_MODE=pape
 - Generic `ReferencePriceFeedAdapter` + one WS per underlying asset that qualifying markets actually need.
 - `GrokActivationBridge` with Noop default + Slack wake-signal transport if Cursor-account Slack events can start routines. Core engine must not depend on Slack. Do not invent a Grok webhook. Do not call polling event-driven. Do not use Bot-to-Bot fan-out unless product behavior is validated (it is not; MCP cannot send those messages).
 - Role routing maps existing trigger families; do not wake all six on every event.
-- Activation is non-fatal. Adapter HTTP success is not an observed Grok wake. `firstMcpRequestAt` is the wake proxy.
+- Activation is non-fatal. Adapter HTTP success is not an observed Grok wake. `firstMcpRequestAt` is a per-trigger wake proxy assigned only when MCP carries that `triggerId`.
 
 ### Official Grok re-verification (2026-09-01)
 

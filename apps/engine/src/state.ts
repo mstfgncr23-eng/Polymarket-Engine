@@ -28,10 +28,43 @@ export interface ActivationRecord {
   at: string;
 }
 
+export type DiscoveryStatus = "ZERO_QUALIFIED" | "MONITORING" | "RECONCILING";
+
+export interface UnattributedMcpActivity {
+  lastAt: string | null;
+  count: number;
+  lastTool: string | null;
+}
+
+export interface EngineReadiness {
+  status: "ready" | "not_ready";
+  mode: "paper";
+  engineAlive: boolean;
+  draining: boolean;
+  database: "UP" | "DOWN";
+  discoveryStatus: DiscoveryStatus;
+  discoveryLoopActive: boolean;
+  marketMonitoring: boolean;
+  qualifiedMarketCount: number;
+  polymarketWs: ConnectionState["state"];
+}
+
 export interface DashboardSnapshot {
   paperMode: true;
   generatedAt: string;
-  engine: { ready: boolean; draining: boolean; uptimeSeconds: number; queueDepth: number; experimentId: string | null; experimentStatus: string | null };
+  engine: {
+    ready: boolean;
+    draining: boolean;
+    alive: boolean;
+    uptimeSeconds: number;
+    queueDepth: number;
+    experimentId: string | null;
+    experimentStatus: string | null;
+    discoveryStatus: DiscoveryStatus;
+    discoveryLoopActive: boolean;
+    marketMonitoring: boolean;
+    qualifiedMarketCount: number;
+  };
   balance: LedgerState;
   positions: Position[];
   latestAgents: Partial<Record<ExternalAgentRoleId, GrokSignalEnvelope>>;
@@ -43,14 +76,21 @@ export interface DashboardSnapshot {
   recentTriggers: TriggerEvent[];
   activations: ActivationRecord[];
   activationLatency: ActivationLatency[];
+  unattributedMcp: UnattributedMcpActivity;
   discovery: { qualified: Array<{ marketId: string; slug: string; asset: string | null; tokens: string[] }>; rejected: Array<{ id: string; slug: string; title: string; reasonCodes: QualificationReasonCode[] }> };
   health: {
+    engineAlive: boolean;
+    discoveryStatus: DiscoveryStatus;
+    discoveryLoopActive: boolean;
+    marketMonitoring: boolean;
+    qualifiedMarketCount: number;
     polymarketWs: ConnectionState;
     btcWs: ConnectionState;
     referenceFeeds: Array<{ asset: string; state: ConnectionState["state"]; lastMessageAt: string | null; reconnects: number }>;
     database: "UP" | "DOWN";
     eventLatencyMs: number | null;
     lastBtcMessageAt: string | null;
+    unattributedMcp: UnattributedMcpActivity;
   };
   equityHistory: Array<{ at: string; equity: string; drawdown: string }>;
 }
@@ -65,6 +105,10 @@ export class EngineStateStore {
   database: "UP" | "DOWN" = "DOWN";
   lastBtcMessageAt: string | null = null;
   eventLatencyMs: number | null = null;
+  discoveryStatus: DiscoveryStatus = "ZERO_QUALIFIED";
+  discoveryLoopActive = false;
+  marketMonitoring = false;
+  qualifiedMarketCount = 0;
   readonly connections: Record<"polymarket" | "btc", ConnectionState> = {
     polymarket: { state: "STOPPED", lastMessageAt: null, reconnects: 0 },
     btc: { state: "STOPPED", lastMessageAt: null, reconnects: 0 },
@@ -81,6 +125,7 @@ export class EngineStateStore {
   private discovery: DashboardSnapshot["discovery"] = { qualified: [], rejected: [] };
   private readonly activations: ActivationRecord[] = [];
   private activationLatency: ActivationLatency[] = [];
+  private unattributedMcp: UnattributedMcpActivity = { lastAt: null, count: 0, lastTool: null };
 
   constructor(private ledger: LedgerState, private readonly positions: Map<string, Position>) {}
 
@@ -109,6 +154,31 @@ export class EngineStateStore {
 
   setActivationLatency(items: ActivationLatency[]): void { this.activationLatency = structuredClone(items); }
   setDiscovery(discovery: DashboardSnapshot["discovery"]): void { this.discovery = structuredClone(discovery); }
+  setDiscoveryStatus(status: DiscoveryStatus, qualifiedMarketCount: number): void {
+    this.discoveryStatus = status;
+    this.qualifiedMarketCount = qualifiedMarketCount;
+  }
+  setDiscoveryLoopActive(active: boolean): void { this.discoveryLoopActive = active; }
+  setMarketMonitoring(monitoring: boolean): void { this.marketMonitoring = monitoring; }
+  setUnattributedMcp(activity: UnattributedMcpActivity): void { this.unattributedMcp = structuredClone(activity); }
+  dropReference(asset: string): void { this.reference.delete(asset); }
+  engineAlive(): boolean { return !this.draining && this.database === "UP"; }
+
+  readiness(): EngineReadiness {
+    const alive = this.engineAlive();
+    return {
+      status: alive ? "ready" : "not_ready",
+      mode: "paper",
+      engineAlive: alive,
+      draining: this.draining,
+      database: this.database,
+      discoveryStatus: this.discoveryStatus,
+      discoveryLoopActive: this.discoveryLoopActive,
+      marketMonitoring: this.marketMonitoring,
+      qualifiedMarketCount: this.qualifiedMarketCount,
+      polymarketWs: this.connections.polymarket.state,
+    };
+  }
 
   noteReferenceTick(asset: string, at: string): void {
     const current = this.reference.get(asset) ?? { state: "CONNECTED", lastMessageAt: null, reconnects: 0 };
@@ -140,9 +210,16 @@ export class EngineStateStore {
   }
 
   snapshot(): DashboardSnapshot {
+    const alive = this.engineAlive();
     return {
       paperMode: true, generatedAt: new Date().toISOString(),
-      engine: { ready: this.ready, draining: this.draining, uptimeSeconds: Math.floor((Date.now() - this.startedAt.getTime()) / 1000), queueDepth: this.queueDepth, experimentId: this.experimentId, experimentStatus: this.experimentStatus },
+      engine: {
+        ready: this.ready, draining: this.draining, alive,
+        uptimeSeconds: Math.floor((Date.now() - this.startedAt.getTime()) / 1000), queueDepth: this.queueDepth,
+        experimentId: this.experimentId, experimentStatus: this.experimentStatus,
+        discoveryStatus: this.discoveryStatus, discoveryLoopActive: this.discoveryLoopActive,
+        marketMonitoring: this.marketMonitoring, qualifiedMarketCount: this.qualifiedMarketCount,
+      },
       balance: structuredClone(this.ledger), positions: structuredClone([...this.positions.values()]),
       latestAgents: Object.fromEntries(this.latestAgents), consensus: structuredClone(this.latestConsensus), risk: structuredClone(this.latestRisk),
       scanner: [...this.marketSnapshots.values()].map((snapshot) => ({
@@ -153,12 +230,16 @@ export class EngineStateStore {
         lastMessageAt: snapshot.receivedAt,
       })),
       decisionFeed: structuredClone(this.feed), grokActivity: structuredClone(this.grokActivity), recentTriggers: structuredClone(this.recentTriggers),
-      activations: structuredClone(this.activations), activationLatency: structuredClone(this.activationLatency), discovery: structuredClone(this.discovery),
+      activations: structuredClone(this.activations), activationLatency: structuredClone(this.activationLatency),
+      unattributedMcp: structuredClone(this.unattributedMcp), discovery: structuredClone(this.discovery),
       health: {
+        engineAlive: alive, discoveryStatus: this.discoveryStatus, discoveryLoopActive: this.discoveryLoopActive,
+        marketMonitoring: this.marketMonitoring, qualifiedMarketCount: this.qualifiedMarketCount,
         polymarketWs: structuredClone(this.connections.polymarket),
         btcWs: structuredClone(this.connections.btc),
         referenceFeeds: [...this.reference.entries()].map(([asset, connection]) => ({ asset, state: connection.state, lastMessageAt: connection.lastMessageAt, reconnects: connection.reconnects })),
         database: this.database, eventLatencyMs: this.eventLatencyMs, lastBtcMessageAt: this.lastBtcMessageAt,
+        unattributedMcp: structuredClone(this.unattributedMcp),
       },
       equityHistory: structuredClone(this.equityHistory),
     };

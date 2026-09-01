@@ -120,7 +120,7 @@ A future official Grok webhook can replace the Slack provider without rewriting 
 4. Set engine secrets only: `GROK_ACTIVATION_PROVIDER=slack`, `SLACK_BOT_TOKEN`, `SLACK_CHANNEL_ID`. Never put these on the dashboard, in MCP responses, journal payloads, or browser env.
 5. Keep scheduled routines as a backup poll. If the cron interval is longer than `triggerTtlMs` (default 30s), most windows expire first. Do not silently raise TTL; measure `triggerCreatedAt → firstMcpRequestAt` (MCP is the documented proxy for Bot wake; the product exposes no wake timestamp).
 
-Latency timestamps persisted: `triggerCreatedAt`, `activationRequestedAt`, `activationSentAt`, `firstMcpRequestAt`, `firstAcceptedSignalAt`. `firstMcpRequestAt` is a proxy for wake, not a product-provided Bot-started-at field.
+Latency timestamps persisted: `triggerCreatedAt`, `activationRequestedAt`, `activationSentAt`, `firstMcpRequestAt`, `firstAcceptedSignalAt`. `firstMcpRequestAt` is a per-trigger proxy for wake, not a product-provided Bot-started-at field. It is assigned only when the MCP request can be deterministically associated with that `triggerId`. Generic `get_recent_triggers` polls without `triggerId` are recorded as unattributed MCP activity and do not stamp pending triggers.
 
 ### Role routing (do not wake all six)
 

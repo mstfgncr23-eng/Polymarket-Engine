@@ -20,6 +20,7 @@ export class GrokActivationCoordinator {
   private readonly lastByMarketAsset = new Map<string, { at: number; severity: number }>();
   private readonly recent: number[] = [];
   readonly latency = new Map<string, ActivationLatency>();
+  private readonly unattributedMcp: Array<{ at: string; tool: string | null }> = [];
 
   constructor(
     private readonly bridge: GrokActivationBridge,
@@ -81,14 +82,20 @@ export class GrokActivationCoordinator {
 
   noteMcp(triggerIds: readonly string[], at = new Date()): void {
     for (const triggerId of triggerIds) {
+      if (!triggerId) continue;
       const current = this.latency.get(triggerId);
       if (current && !current.firstMcpRequestAt) this.latency.set(triggerId, { ...current, firstMcpRequestAt: at.toISOString() });
     }
-    if (triggerIds.length === 0) {
-      for (const [id, current] of this.latency) {
-        if (!current.firstMcpRequestAt) this.latency.set(id, { ...current, firstMcpRequestAt: at.toISOString() });
-      }
-    }
+  }
+
+  noteUnattributedMcp(tool: string | null, at = new Date()): void {
+    this.unattributedMcp.push({ at: at.toISOString(), tool });
+    if (this.unattributedMcp.length > 200) this.unattributedMcp.splice(0, this.unattributedMcp.length - 200);
+  }
+
+  unattributedSnapshot(): { lastAt: string | null; count: number; lastTool: string | null } {
+    const last = this.unattributedMcp.at(-1);
+    return { lastAt: last?.at ?? null, count: this.unattributedMcp.length, lastTool: last?.tool ?? null };
   }
 
   noteSignal(triggerId: string, at = new Date()): void {

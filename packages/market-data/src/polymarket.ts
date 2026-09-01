@@ -58,6 +58,8 @@ export class PolymarketMarketDataAdapter {
   private sequence = 0;
   private lastTimestampByToken = new Map<string, number>();
   private tokenIds: string[] = [];
+  private closeCurrentStream: (() => void) | null = null;
+  private tokenWaiters: Array<() => void> = [];
 
   constructor(client: PublicClient = createPublicClient()) { this.client = client; }
 
@@ -141,27 +143,57 @@ export class PolymarketMarketDataAdapter {
     });
   }
 
-  setTokenIds(tokenIds: readonly string[]): void { this.tokenIds = [...tokenIds]; }
+  setTokenIds(tokenIds: readonly string[]): { changed: boolean; previous: string[]; next: string[] } {
+    const previous = [...this.tokenIds];
+    const next = uniqueStrings(tokenIds);
+    const changed = !sameStringSet(previous, next);
+    this.tokenIds = next;
+    if (next.length > 0) {
+      const waiters = this.tokenWaiters.splice(0);
+      for (const waiter of waiters) waiter();
+    }
+    if (changed) {
+      for (const tokenId of previous) {
+        if (next.includes(tokenId)) continue;
+        this.books.delete(tokenId);
+        this.lastTimestampByToken.delete(tokenId);
+      }
+      this.closeCurrentStream?.();
+    }
+    return { changed, previous, next };
+  }
 
   async run(tokenIds: readonly string[], handlers: PolymarketFeedHandlers, signal: AbortSignal): Promise<void> {
-    this.tokenIds = [...tokenIds];
+    this.setTokenIds(this.tokenIds.length > 0 ? this.tokenIds : tokenIds);
     const backoff = new ExponentialBackoff({ initialDelayMs: 500, maxDelayMs: 30_000, multiplier: 2, jitterRatio: 0.2 });
     let reconnectCount = 0;
     while (!signal.aborted) {
+      if (this.tokenIds.length === 0) {
+        await handlers.onConnection({ feed: "polymarket", state: "STOPPED", at: new Date().toISOString(), reconnectCount, message: "NO_QUALIFIED_TOKENS" });
+        try { await this.waitForTokens(signal); } catch { break; }
+        continue;
+      }
       await handlers.onConnection({ feed: "polymarket", state: "CONNECTING", at: new Date().toISOString(), reconnectCount });
+      let resubscribed = false;
       try {
-        const current = this.tokenIds.length > 0 ? this.tokenIds : [...tokenIds];
-        if (current.length === 0) throw new Error("NO_TOKEN_IDS");
-        const stream = await this.client.subscribe([{ topic: "market", tokenIds: [...current], customFeatureEnabled: true }]);
+        const current = [...this.tokenIds];
+        if (current.length === 0) continue;
+        const stream = await this.client.subscribe([{ topic: "market", tokenIds: current, customFeatureEnabled: true }]);
+        this.closeCurrentStream = () => { resubscribed = true; void stream.close(); };
         backoff.reset();
         await handlers.onConnection({ feed: "polymarket", state: "CONNECTED", at: new Date().toISOString(), reconnectCount });
         for await (const event of stream) {
           if (signal.aborted) { await stream.close(); break; }
           for (const snapshot of this.normalizeEvent(event)) await handlers.onSnapshot(snapshot);
         }
-        if (!signal.aborted) throw new Error("POLYMARKET_STREAM_ENDED");
-      } catch (error) {
+        this.closeCurrentStream = null;
         if (signal.aborted) break;
+        if (resubscribed || this.tokenIds.length === 0) continue;
+        throw new Error("POLYMARKET_STREAM_ENDED");
+      } catch (error) {
+        this.closeCurrentStream = null;
+        if (signal.aborted) break;
+        if (resubscribed) continue;
         reconnectCount += 1;
         const normalized = error instanceof Error ? error : new Error(String(error));
         await handlers.onError(normalized);
@@ -169,8 +201,24 @@ export class PolymarketMarketDataAdapter {
         await abortableDelay(backoff.nextDelay(), signal).catch(() => undefined);
       }
     }
+    this.closeCurrentStream = null;
     await this.client.closeSubscriptions();
     await handlers.onConnection({ feed: "polymarket", state: "STOPPED", at: new Date().toISOString(), reconnectCount });
+  }
+
+  private waitForTokens(signal: AbortSignal): Promise<void> {
+    if (this.tokenIds.length > 0) return Promise.resolve();
+    if (signal.aborted) return Promise.reject(signal.reason);
+    return new Promise((resolve, reject) => {
+      const finish = () => { cleanup(); resolve(); };
+      const onAbort = () => { cleanup(); reject(signal.reason); };
+      const cleanup = () => {
+        signal.removeEventListener("abort", onAbort);
+        this.tokenWaiters = this.tokenWaiters.filter((waiter) => waiter !== finish);
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      this.tokenWaiters.push(finish);
+    });
   }
 
   private normalizeEvent(event: unknown): MarketSnapshot[] {
@@ -179,7 +227,7 @@ export class PolymarketMarketDataAdapter {
     if (value.type === "book") {
       const tokenId = String(payload.tokenId ?? "");
       const market = this.marketsByToken.get(tokenId);
-      if (!tokenId || !market) return [];
+      if (!tokenId || !market || !this.tokenIds.includes(tokenId)) return [];
       const sourceMs = parseSourceTimestamp(payload.timestamp);
       this.assertTimestampOrder(tokenId, sourceMs);
       const state = {
@@ -195,7 +243,7 @@ export class PolymarketMarketDataAdapter {
       for (const change of changes) {
         const tokenId = String(change.tokenId ?? "");
         const state = this.books.get(tokenId);
-        if (!state) continue;
+        if (!state || !this.tokenIds.includes(tokenId)) continue;
         const sourceMs = parseSourceTimestamp(payload.timestamp);
         this.assertTimestampOrder(tokenId, sourceMs);
         const side = String(change.side);
@@ -327,6 +375,14 @@ function collectTags(value: Record<string, unknown>): string[] {
   return tags;
 }
 
+function uniqueStrings(values: readonly string[]): string[] {
+  return [...new Set(values.filter(Boolean))];
+}
+function sameStringSet(left: readonly string[], right: readonly string[]): boolean {
+  if (left.length !== right.length) return false;
+  const set = new Set(left);
+  return right.every((value) => set.has(value));
+}
 function asArray(value: unknown): unknown[] {
   return Array.isArray(value) ? value : [];
 }
