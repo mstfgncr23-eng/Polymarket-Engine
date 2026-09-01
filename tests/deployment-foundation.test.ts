@@ -254,7 +254,7 @@ describe("deployment foundation", () => {
     expect(source).toMatch(/process\.env\.VERCEL/);
     expect(source).toMatch(/standalone/);
     const vercelJson = JSON.parse(readFileSync(join(repoRoot, "apps/dashboard/vercel.json"), "utf8")) as {
-      installCommand?: string; buildCommand?: string;
+      framework?: string; installCommand?: string; buildCommand?: string;
     };
     expect(vercelJson.installCommand).toContain("pnpm install --frozen-lockfile");
     expect(vercelJson.buildCommand).toContain("pnpm --filter @pm/dashboard build");
