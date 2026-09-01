@@ -143,6 +143,8 @@ On Fly, set `DASHBOARD_ORIGIN` to the Vercel production origin (e.g. `https://<p
 2. Set **Root Directory** to `apps/dashboard`. `apps/dashboard/vercel.json` already has:
    - install: `cd ../.. && pnpm install --frozen-lockfile`
    - build: `cd ../.. && pnpm --filter @pm/dashboard build`
+
+   `next.config.ts` uses `output: "standalone"` only when `VERCEL` is unset (Fly `Dockerfile.dashboard`). On Vercel, Next tracing needs `next-server.js.nft.json`, which standalone omits.
 3. Add server env vars `ENGINE_INTERNAL_URL` and `ENGINE_READ_TOKEN` (Production + Preview as needed). Do not tick “Expose to the browser”.
 4. Deploy. Snapshot/events proxies return JSON `{ "error": "ENGINE_UNREACHABLE" }` with 503 when the engine cannot be reached. Successful `/api/engine/events` remains `text/event-stream`.
 5. Put the resulting production origin on Fly `DASHBOARD_ORIGIN` and redeploy or `fly secrets`/`fly machine` env as appropriate (`DASHBOARD_ORIGIN` is in `[env]` only if you add it; otherwise set via secrets or `flyctl machine update` — prefer `fly secrets` or toml `[env]` after the origin is known). For this PR, set it at deploy time once the Vercel URL exists:

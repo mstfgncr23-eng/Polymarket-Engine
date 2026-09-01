@@ -245,4 +245,15 @@ describe("deployment foundation", () => {
     expect(rls).not.toMatch(/CREATE POLICY/i);
     expect(rls).toMatch(/REVOKE ALL ON TABLE journal_events FROM anon, authenticated/);
   });
+
+  it("Next standalone output is for Fly/Docker, not Vercel", () => {
+    const source = readFileSync(join(repoRoot, "apps/dashboard/next.config.ts"), "utf8");
+    expect(source).toMatch(/process\.env\.VERCEL/);
+    expect(source).toMatch(/standalone/);
+    const vercelJson = JSON.parse(readFileSync(join(repoRoot, "apps/dashboard/vercel.json"), "utf8")) as {
+      installCommand?: string; buildCommand?: string;
+    };
+    expect(vercelJson.installCommand).toContain("pnpm install --frozen-lockfile");
+    expect(vercelJson.buildCommand).toContain("pnpm --filter @pm/dashboard build");
+  });
 });
