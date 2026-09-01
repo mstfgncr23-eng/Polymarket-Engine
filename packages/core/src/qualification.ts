@@ -62,7 +62,7 @@ export function isCryptoCategory(tags: readonly string[], slug: string, title: s
   return false;
 }
 
-function labeledOutcome(label: string | null | undefined): "UP" | "DOWN" | null {
+export function directionalOutcomeFromLabel(label: string | null | undefined): "UP" | "DOWN" | null {
   const value = (label ?? "").trim().toLowerCase();
   if (value === "up" || value === "higher") return "UP";
   if (value === "down" || value === "lower") return "DOWN";
@@ -73,8 +73,8 @@ export function normalizeBinarySemantics(input: QualificationMarketInput): Binar
   if (!input.yesTokenId || !input.noTokenId) {
     return { safe: false, yesOutcome: null, noOutcome: null, reason: "MISSING_TOKEN_IDS" };
   }
-  const yesFromLabel = labeledOutcome(input.yesLabel);
-  const noFromLabel = labeledOutcome(input.noLabel);
+  const yesFromLabel = directionalOutcomeFromLabel(input.yesLabel);
+  const noFromLabel = directionalOutcomeFromLabel(input.noLabel);
   if (yesFromLabel && noFromLabel && yesFromLabel !== noFromLabel) {
     return { safe: true, yesOutcome: yesFromLabel, noOutcome: noFromLabel, reason: "QUALIFIED" };
   }

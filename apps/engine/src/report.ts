@@ -5,7 +5,7 @@ import { d, renderExperimentSummaryMarkdown, type ExperimentSummary, type Journa
 export function buildExperimentSummary(
   events: readonly JournalEvent[],
   experimentId = "unknown",
-  extras: Partial<Pick<ExperimentSummary, "status" | "closePolicy" | "reportKind" | "unresolvedPositionCount">> = {},
+  extras: Partial<Pick<ExperimentSummary, "status" | "closePolicy" | "reportKind" | "unresolvedPositionCount" | "metricsScope" | "complete">> = {},
 ): ExperimentSummary {
   const byType = (type: string) => events.filter((event) => event.type === type);
   const fills = byType("PAPER_FILL").map((event) => event.payload as unknown as PaperFill & { asset?: string | null });
@@ -22,6 +22,20 @@ export function buildExperimentSummary(
   const completedPairs = positions.filter((position) => Number(position.pairedQuantity) > 0).length;
   const unhedged = positions.filter((position) => Number(position.unpairedQuantity) > 0);
   const makerFills = fills.filter((fill) => fill.liquidityRole === "MAKER").length;
+  const makerOrders = events.filter((event) => {
+    if (event.type === "PAPER_MAKER_RESERVED") return true;
+    if (event.type !== "PAPER_ORDER_CREATED") return false;
+    const payload = event.payload as { orderType?: unknown; type?: unknown };
+    return payload.orderType === "MAKER" || payload.type === "MAKER";
+  }).length;
+  const firstLegCount = byType("FIRST_LEG_FILLED").length;
+  const hedgeCompleteCount = byType("HEDGE_COMPLETE").length;
+  const failedHedgeCount = events.filter((event) => event.type === "FAILED_HEDGE" || (
+    event.type === "TRIGGER_EVENT" && (event.payload as { kind?: unknown }).kind === "FAILED_HEDGE"
+  )).length;
+  const occurred = events.map((event) => event.occurredAt).filter(Boolean).toSorted();
+  const extrasScope = extras.metricsScope ?? (extras.reportKind === "final" ? "complete" : "rolling");
+  const extrasComplete = extras.complete ?? extrasScope === "complete";
   const takerFills = fills.filter((fill) => fill.liquidityRole === "TAKER").length;
   const modelCounts: Record<string, number> = {};
   const modelCosts: Record<string, number> = {};
@@ -72,7 +86,7 @@ export function buildExperimentSummary(
     averagePairCost: pairCosts.length ? average(pairCosts) : null,
     averageLockedPairEdge: pairCosts.length ? average(pairCosts.map((cost) => 1 - cost)) : null,
     averageRealizedEdge: averageOrNull(byType("PAIR_REALIZED").map((event) => Number((event.payload as { realizedEdge?: unknown }).realizedEdge ?? 0))),
-    makerFillRate: rate(makerFills, byType("PAPER_MAKER_ORDER_CREATED").length), takerFillRate: rate(takerFills, byType("PAPER_TAKER_ORDER_CREATED").length || byType("PAPER_ORDER_CREATED").length),
+    makerFillRate: rate(makerFills, makerOrders || byType("PAPER_MAKER_ORDER_CREATED").length), takerFillRate: rate(takerFills, byType("PAPER_TAKER_ORDER_CREATED").length || byType("PAPER_ORDER_CREATED").length),
     modelInvocationCounts: modelCounts, modelCostByAgentUsd: modelCosts,
     performanceByAgentSignal: groupPayload(byType("AGENT_SIGNAL_ATTRIBUTION"), "agentId"),
     performanceByMarket: byMarket, performanceByAsset: byAsset,
@@ -87,8 +101,16 @@ export function buildExperimentSummary(
     performanceByHour: groupPayload(byType("HOURLY_PERFORMANCE"), "hour"),
     rejectedTradesThatWouldHaveWon: byType("REJECTED_TRADE_WOULD_HAVE_WON").length,
     acceptedTradesThatLost: byType("ACCEPTED_TRADE_LOST").length, failureStatistics,
-    hedgeFailureRate: rate(byType("FAILED_HEDGE").length, byType("FIRST_LEG_FILLED").length),
+    hedgeFailureRate: rate(failedHedgeCount, firstLegCount),
     executableOpportunityRate: rate(fills.length, risk.length),
+    metricsScope: extrasScope,
+    complete: extrasComplete,
+    earliestOccurredAt: occurred[0] ?? null,
+    latestOccurredAt: occurred.at(-1) ?? null,
+    decisionAccountingEventCount: events.length,
+    firstLegCount,
+    hedgeCompleteCount,
+    failedHedgeCount,
   };
 }
 
@@ -160,7 +182,7 @@ function attributeTrading(
     else row.vetoes += 1;
   }
   for (const row of Object.values(result)) {
-    row.netTradingPnlUsd = d(row.realizedPnlUsd).minus(row.feesUsd).minus(row.slippageUsd).toNumber();
+    row.netTradingPnlUsd = d(row.realizedPnlUsd).minus(row.feesUsd).toNumber();
   }
   return result;
 }

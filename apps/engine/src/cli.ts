@@ -11,7 +11,7 @@ import {
   marketSnapshotSchema,
   paperOrderSchema,
 } from "@pm/core";
-import { MemoryEventJournal, PostgresEventJournal } from "@pm/db";
+import { MemoryEventJournal, PostgresEventJournal, queryEventsPaged } from "@pm/db";
 import { PolymarketMarketDataAdapter, ReferenceFeedRegistry, createRestProbe } from "@pm/market-data";
 import { buildExperimentSummary, writeExperimentSummary } from "./report.js";
 import { startRuntime } from "./runtime.js";
@@ -30,9 +30,9 @@ if (command === "experiment:start") {
     : new MemoryEventJournal();
   await journal.initialize();
   const summary = buildExperimentSummary(
-    await journal.queryEvents({ types: DECISION_EVENT_TYPES, limit: 8_000 }),
+    await queryEventsPaged(journal, { types: DECISION_EVENT_TYPES }),
     process.env.EXPERIMENT_ID ?? "no-persisted-memory-experiment",
-    { reportKind: "final" },
+    { reportKind: "final", metricsScope: "complete", complete: true },
   );
   const paths = await writeExperimentSummary(summary, resolve(process.cwd(), "reports"));
   await journal.close();

@@ -75,7 +75,7 @@ describe("Grok MCP auth and tool policy", () => {
     expect(FORBIDDEN_MCP_TRADE_TOOLS.has("place_order")).toBe(true);
     expect([...ALLOWED_MCP_TOOLS]).toEqual(expect.arrayContaining([
       "get_markets", "get_market_snapshot", "get_orderbook", "get_recent_triggers", "get_positions",
-      "get_portfolio", "get_strategy_metrics", "get_recent_decisions", "get_system_health",
+      "get_portfolio", "get_strategy_metrics", "get_recent_decisions", "get_system_health", "get_reference_context",
       "submit_signal", "submit_analysis", "recommend_hedge", "recommend_veto",
     ]));
   });
@@ -177,6 +177,32 @@ describe("authenticated MCP HTTP", () => {
     } catch { json = text; }
     return { status: response.status, json, text };
   }
+
+  it("get_reference_context is authenticated, schema-validated, and read-only", async () => {
+    const ctx = await listen();
+    try {
+      expect((await rpc(ctx.url, {
+        jsonrpc: "2.0", id: 1, method: "tools/call",
+        params: { name: "get_reference_context", arguments: { asset: "BTC" } },
+      }, { authorization: "Bearer nope" })).status).toBe(401);
+      ctx.engine.state.noteReferenceTick("BTC", new Date().toISOString(), { symbol: "BTCUSDT", venue: "binance", price: "65000.1" });
+      const ok = await rpc(ctx.url, {
+        jsonrpc: "2.0", id: 2, method: "tools/call",
+        params: { name: "get_reference_context", arguments: { asset: "BTC" } },
+      });
+      expect(ok.status).toBe(200);
+      const text = JSON.stringify(ok.json);
+      expect(text).toContain("BTCUSDT");
+      expect(text).toContain("65000.1");
+      expect(text).not.toContain("place_order");
+      expect(text).not.toMatch(/"ticks":\s*\[/);
+      const missing = await rpc(ctx.url, {
+        jsonrpc: "2.0", id: 3, method: "tools/call",
+        params: { name: "get_reference_context", arguments: {} },
+      });
+      expect(JSON.stringify(missing.json)).toMatch(/invalid_type|required|error/i);
+    } finally { await ctx.server.close(); }
+  });
 
   it("rejects unauthorized, origin-invalid, GET, unconfigured, rate-limited, and forbidden trade tools", async () => {
     const configured = await listen();

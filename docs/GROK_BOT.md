@@ -58,7 +58,7 @@ Official Grok Bot attachment of connectors/MCP:
 3. On Cursor Teams, Grok Bot follows existing Cursor plugin and MCP policy (allowlist/denylist, whether members can add their own servers). MCP authentication is shared across Cursor + Grok Bot. ([Teams and enterprises](https://docs.x.ai/grok-bot/teams-and-enterprises))
 4. Each of the six role Bots must authenticate with **its own** bearer token whose `clientId` is that role ID. Send `Authorization: Bearer <token>` (token half only). Do not share one token.
 5. The engine lists only these tools (there is **no** `place_order` / wallet tool):
-   - Read: `get_markets`, `get_market_snapshot`, `get_orderbook`, `get_recent_triggers`, `get_positions`, `get_portfolio`, `get_strategy_metrics`, `get_recent_decisions`, `get_system_health`
+   - Read: `get_markets`, `get_market_snapshot`, `get_orderbook`, `get_recent_triggers`, `get_positions`, `get_portfolio`, `get_strategy_metrics`, `get_recent_decisions`, `get_system_health`, `get_reference_context`
    - Write: `submit_signal`, `submit_analysis`, `recommend_hedge`, `recommend_veto`
 6. Create six Grok Bots with the stable role IDs below. Each Bot must send `agentId` and `role` equal to its authenticated `clientId`, plus `timestamp`, `marketId`, `confidence`, `evidence`/`evidenceIds`, `expiresAt`, `reasonCodes`, and `traceId`/`correlationId`.
 7. Restrict writes per role using the allow-list above (engine-enforced even if the UI cannot). Scanners + supervisor: `submit_signal`. Fair probability: `submit_analysis`. Risk & hedge: `recommend_hedge` + `recommend_veto`.

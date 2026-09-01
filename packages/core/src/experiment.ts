@@ -144,6 +144,14 @@ export interface ExperimentSummary {
   failureStatistics: Record<string, number>;
   hedgeFailureRate: number;
   executableOpportunityRate: number;
+  metricsScope: "rolling" | "complete";
+  complete: boolean;
+  earliestOccurredAt: string | null;
+  latestOccurredAt: string | null;
+  decisionAccountingEventCount: number;
+  firstLegCount: number;
+  hedgeCompleteCount: number;
+  failedHedgeCount: number;
 }
 
 export interface MarketAssetAttribution {

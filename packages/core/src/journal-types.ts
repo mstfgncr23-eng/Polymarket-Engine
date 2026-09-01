@@ -27,3 +27,6 @@ export interface JournalQuery {
   limit?: number;
   offset?: number;
 }
+
+/** Bounded page size for full-experiment scans. Do not raise a silent truncation cap. */
+export const EVENT_PAGE_SIZE = 500;

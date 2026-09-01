@@ -27,6 +27,7 @@ import {
   makerReserveNotional,
   executableFairEdge,
   parsePublicBinaryResolution,
+  conservativeRealizableMark,
   DECISION_EVENT_TYPES,
   createIdleExperiment,
   experimentAllowsFirstLeg,
@@ -49,7 +50,7 @@ import {
   type TriggerEvent,
   type ActivationLatency,
 } from "@pm/core";
-import { createJournalEvent, type EventJournal } from "@pm/db";
+import { createJournalEvent, queryEventsPaged, type EventJournal } from "@pm/db";
 import {
   BtcWebSocketAdapter,
   PolymarketMarketDataAdapter,
@@ -210,7 +211,9 @@ export class EngineService {
     this.referenceRetryTimers.clear();
     if (this.maintenanceTimer) clearInterval(this.maintenanceTimer);
     if (this.discoveryTimer) clearInterval(this.discoveryTimer);
-    this.accrueInfrastructureCost();
+    if (this.experiment?.status === "RUNNING" || this.experiment?.status === "ENTRY_CLOSED") {
+      this.accrueInfrastructureCost();
+    }
     await this.checkpoint();
     this.sse.close();
     await this.journal.close();
@@ -239,7 +242,7 @@ export class EngineService {
   async tickMaintenance(): Promise<void> { await this.maintainExperiment(); }
   async applyObservedFill(fill: Parameters<PaperLedger["applyFill"]>[0]): Promise<void> { await this.applyFill(fill); }
   async restMakerForTest(order: PaperOrder, snapshot: MarketSnapshot): Promise<void> {
-    const notional = makerReserveNotional(order.quantity, order.requestedPrice);
+    const notional = makerReserveNotional(order.quantity, order.requestedPrice, snapshot.feeSchedule);
     this.ledger.reserve(notional, this.nowFn());
     this.makerReservations.set(order.id, notional);
     this.restingOrders.set(order.id, createRestingMakerOrder(order, snapshot));
@@ -254,13 +257,18 @@ export class EngineService {
     if (this.experiment?.status === "RUNNING" || this.experiment?.status === "ENTRY_CLOSED") {
       return { ok: false, blockers: ["EXPERIMENT_ALREADY_ACTIVE"], experiment: this.experiment };
     }
-    const preflight = this.preflight();
+    if (this.experiment?.status === "COMPLETED" || this.experiment?.status === "FAILED") {
+      return { ok: false, blockers: ["EXPERIMENT_ALREADY_COMPLETED"], experiment: this.experiment };
+    }
+    const preflight = this.preflight("48H_GROK_PAPER_EXPERIMENT");
     await this.safeAppend(createJournalEvent({
       traceId: createId("trace"), type: "EXPERIMENT_PREFLIGHT", aggregateType: "experiment", aggregateId: "preflight",
       payload: preflight as unknown as Record<string, unknown>,
     }));
     if (!preflight.ok) return { ...preflight, ok: false };
     const now = this.nowFn();
+    this.ledger.resetOperatingCostBaseline(now);
+    this.lastInfrastructureAccrualAt = now.getTime();
     this.experiment = startExperiment({
       id: this.experiment?.id, durationHours: this.env.EXPERIMENT_DURATION_HOURS, strategyVersion: this.strategy.version,
       riskConfiguration: this.riskLimits, modelConfiguration: { provider: "external_grok_bot_mcp", logicalRoles: 6, localModelExecution: false },
@@ -271,17 +279,27 @@ export class EngineService {
     this.state.experimentId = this.experiment.id;
     this.state.experimentStatus = this.experiment.status;
     this.reportGenerated = false;
+    this.state.setLedger(this.ledger.snapshot());
     await this.safeAppend(createJournalEvent({ traceId: createId("trace"), type: "EXPERIMENT_STARTED", aggregateType: "experiment", aggregateId: this.experiment.id, payload: this.experiment }));
     await this.checkpoint();
     this.record("EXPERIMENT_STARTED", this.experiment.id, null, { status: this.experiment.status });
     return { ok: true, experiment: this.experiment, preflight };
   }
 
-  preflight() {
+  preflight(mode: "MONITOR_ONLY" | "48H_GROK_PAPER_EXPERIMENT" = "MONITOR_ONLY") {
     return evaluateExperimentPreflight({
       env: this.env, databaseUp: this.state.database === "UP", discoveryStatus: this.state.discoveryStatus,
       qualifiedOrManaged: this.marketsById.size, bootstrapFailed: this.bootstrapFailed,
+      tokenConfiguredPath: this.tokenIds.length > 0,
       mcpRoleTokens: this.env.GROK_MCP_BEARER_TOKENS.split(",").map((entry) => entry.trim().split(":")[0] ?? "").filter(Boolean),
+      mode,
+      entryMarkets: [...this.entryQualified].map((marketId) => {
+        const asset = this.assetByMarket.get(marketId) ?? this.marketsById.get(marketId)?.asset ?? null;
+        const blocked = asset ? this.referenceBlocked.get(asset) ?? null : null;
+        return {
+          marketId, asset, referenceRequired: this.referenceRequired.get(marketId) === true, blockedStatus: blocked,
+        };
+      }),
       reference: [...this.referenceRequired.keys()].map((marketId) => {
         const asset = this.assetByMarket.get(marketId);
         return { asset: asset ?? "unknown", status: this.referenceBlocked.get(asset ?? "") ?? (this.referenceRequired.get(marketId) ? "REQUIRED" : "OPTIONAL") };
@@ -622,7 +640,9 @@ export class EngineService {
 
   private async onReferenceTick(tick: ReferenceTick): Promise<void> {
     if (this.usesDiscovery() && ![...this.assetByMarket.values()].includes(tick.asset)) return;
-    this.state.noteReferenceTick(tick.asset, tick.receivedAt);
+    this.state.noteReferenceTick(tick.asset, tick.receivedAt, {
+      symbol: tick.symbol, venue: tick.venue, price: tick.price,
+    });
     if (tick.asset === "BTC") {
       this.state.lastBtcMessageAt = tick.receivedAt;
       this.state.connections.btc.lastMessageAt = tick.receivedAt;
@@ -651,6 +671,25 @@ export class EngineService {
   }
 
   private async requestActivation(trigger: TriggerEvent): Promise<void> {
+    const status = this.experiment?.status ?? "IDLE";
+    if (status === "IDLE" || status === "COMPLETED" || status === "FAILED") {
+      this.activation.ensureLatency(trigger);
+      this.state.setActivationLatency(this.activation.snapshot());
+      await this.safeAppend(createJournalEvent({
+        traceId: trigger.traceId, type: "GROK_ACTIVATION_DECISION", aggregateType: "activation", aggregateId: trigger.id,
+        payload: { triggerId: trigger.id, marketId: trigger.marketId, asset: trigger.asset ?? null, reason: "EXPERIMENT_NOT_ACTIVE", activate: false },
+      }));
+      this.state.addActivation({ triggerId: trigger.id, reason: "EXPERIMENT_NOT_ACTIVE", at: this.nowFn().toISOString(), provider: this.env.GROK_ACTIVATION_PROVIDER, grokWakeObserved: false });
+      return;
+    }
+    if (status === "ENTRY_CLOSED" && !isRiskHedgeSettlementTrigger(trigger.kind)) {
+      await this.safeAppend(createJournalEvent({
+        traceId: trigger.traceId, type: "GROK_ACTIVATION_DECISION", aggregateType: "activation", aggregateId: trigger.id,
+        payload: { triggerId: trigger.id, marketId: trigger.marketId, asset: trigger.asset ?? null, reason: "ENTRY_CLOSED", activate: false },
+      }));
+      this.state.addActivation({ triggerId: trigger.id, reason: "ENTRY_CLOSED", at: this.nowFn().toISOString(), provider: this.env.GROK_ACTIVATION_PROVIDER, grokWakeObserved: false });
+      return;
+    }
     const decision = this.activation.decide(trigger);
     await this.safeAppend(createJournalEvent({
       traceId: trigger.traceId, type: "GROK_ACTIVATION_DECISION", aggregateType: "activation", aggregateId: trigger.id,
@@ -794,16 +833,24 @@ export class EngineService {
     }, new Date(trigger.expiresAt));
     const asset = trigger.asset ?? this.assetByMarket.get(candidate.marketId) ?? snapshot.asset ?? null;
     const exposure = computePaperExposures(this.ledger.positions.values(), candidate.marketId, this.assetByMarket, now.getTime());
-    const orderSize = Number(candidate.quantity) * Number(candidate.limitPrice);
-    const projected = projectPaperExposures(exposure, orderSize, candidate.intent);
+    const projected = projectPaperExposures({
+      current: exposure,
+      positions: projectableLegsFromPositions(this.ledger.positions.values(), this.assetByMarket),
+      candidate: {
+        marketId: candidate.marketId, outcome: candidate.outcome, quantity: candidate.quantity,
+        price: candidate.limitPrice, intent: candidate.intent, asset,
+      },
+      nowMs: now.getTime(),
+    });
     const referenceRequired = this.referenceRequired.get(candidate.marketId) === true;
     const referenceFeedAt = asset ? dateOrNull(this.state.referenceLastMessageAt(asset)) : null;
     const blocked = asset ? this.referenceBlocked.get(asset) : undefined;
+    const marketFeedAt = collectMarketFeedAt(this.snapshots.get(candidate.marketId), candidate.outcome, candidate.intent, snapshot.receivedAt);
     const decision = decidePaperOrder({
       candidate, consensus, snapshotAfterDecisionLatency: snapshot, limits: this.riskLimits, triggerId: trigger.id,
       signalExpiresAt: earliestSignalExpiry, orderType: this.env.PAPER_EXECUTION_STYLE,
       baseRisk: {
-        now, marketFeedAt: dateOrNull(this.state.connections.polymarket.lastMessageAt),
+        now, marketFeedAt,
         btcFeedAt: asset === "BTC" ? referenceFeedAt ?? dateOrNull(this.state.lastBtcMessageAt) : now,
         referenceFeedAt, referenceRequired, asset, assetExposureUsd: exposure.asset,
         databaseAvailable: await this.journal.healthCheck(), timestampDisorder: this.timestampDisorder, riskStateAvailable: true,
@@ -842,7 +889,7 @@ export class EngineService {
     this.recentTrades.set(duplicateKey, Date.now());
     try {
       if (order.orderType === "MAKER") {
-        const notional = makerReserveNotional(order.quantity, order.requestedPrice);
+        const notional = makerReserveNotional(order.quantity, order.requestedPrice, decisionSnapshot.feeSchedule);
         this.ledger.reserve(notional, this.nowFn());
         this.makerReservations.set(order.id, notional);
         this.state.setLedger(this.ledger.snapshot());
@@ -878,19 +925,34 @@ export class EngineService {
   private async applyFill(fill: Parameters<PaperLedger["applyFill"]>[0]): Promise<void> {
     const reserved = this.makerReservations.get(fill.orderId);
     if (reserved && fill.liquidityRole === "MAKER") {
-      const fillNotional = Number(fill.quantity) * Number(fill.fillPrice);
-      const next = Math.max(0, Number(reserved) - fillNotional);
-      this.ledger.release(Math.min(Number(reserved), fillNotional), this.nowFn());
+      const fillCost = Number(fill.quantity) * Number(fill.fillPrice) + Number(fill.feeUsd);
+      const next = Math.max(0, Number(reserved) - fillCost);
+      this.ledger.release(Math.min(Number(reserved), fillCost), this.nowFn());
       if (next > 0) this.makerReservations.set(fill.orderId, String(next));
       else this.makerReservations.delete(fill.orderId);
     }
+    const previous = this.ledger.positions.get(fill.marketId);
+    const wasEmpty = !previous || (Number(previous.upQuantity) === 0 && Number(previous.downQuantity) === 0);
     const position = this.ledger.applyFill(fill);
     this.state.setLedger(this.ledger.snapshot());
     this.metrics.paperFills.inc({ role: fill.liquidityRole });
     this.metrics.openPositions.set(this.ledger.positions.size);
     this.metrics.unhedgedPositions.set([...this.ledger.positions.values()].filter((item) => Number(item.unpairedQuantity) > 0).length);
     this.record("PAPER_FILL", fill.traceId, fill.marketId, { fillId: fill.id, orderId: fill.orderId, price: fill.fillPrice, quantity: fill.quantity, role: fill.liquidityRole });
-    if (Number(position.pairedQuantity) > 0 && Number(position.unpairedQuantity) === 0) this.record("HEDGE_COMPLETE", fill.traceId, fill.marketId, { positionId: position.id, pairedQuantity: position.pairedQuantity });
+    if (wasEmpty && fill.side === "BUY") {
+      this.record("FIRST_LEG_FILLED", fill.traceId, fill.marketId, { positionId: position.id, unpairedQuantity: position.unpairedQuantity });
+      await this.safeAppend(createJournalEvent({
+        traceId: fill.traceId, type: "FIRST_LEG_FILLED", aggregateType: "position", aggregateId: position.id,
+        payload: { positionId: position.id, marketId: fill.marketId, unpairedQuantity: position.unpairedQuantity, experimentId: this.experiment?.id ?? null },
+      }));
+    }
+    if (Number(position.pairedQuantity) > 0 && Number(position.unpairedQuantity) === 0) {
+      this.record("HEDGE_COMPLETE", fill.traceId, fill.marketId, { positionId: position.id, pairedQuantity: position.pairedQuantity });
+      await this.safeAppend(createJournalEvent({
+        traceId: fill.traceId, type: "HEDGE_COMPLETE", aggregateType: "position", aggregateId: position.id,
+        payload: { positionId: position.id, marketId: fill.marketId, pairedQuantity: position.pairedQuantity, experimentId: this.experiment?.id ?? null },
+      }));
+    }
     await this.safeAppend(createJournalEvent({
       traceId: fill.traceId, type: "PAPER_FILL", aggregateType: "paper_fill", aggregateId: fill.id,
       payload: { ...fill, asset: this.assetByMarket.get(fill.marketId) ?? null }, sourceEventId: fill.sourceMarketEventId,
@@ -979,7 +1041,9 @@ export class EngineService {
 
   private async maintainExperiment(): Promise<void> {
     if (!this.experiment) return;
-    this.accrueInfrastructureCost(this.nowFn().getTime());
+    if (this.experiment.status === "RUNNING" || this.experiment.status === "ENTRY_CLOSED") {
+      this.accrueInfrastructureCost(this.nowFn().getTime());
+    }
     await this.pollFailedHedges();
     await this.maybeScheduledReview();
     await this.pollSettlements();
@@ -1019,6 +1083,8 @@ export class EngineService {
   }
 
   private async maybeScheduledReview(): Promise<void> {
+    const status = this.experiment?.status;
+    if (status === "IDLE" || status === "COMPLETED" || status === "FAILED" || status == null) return;
     const triggers = this.triggerEngine.ingestScheduledReview(this.experiment?.id ?? createId("review"));
     for (const trigger of triggers) void this.processTrigger(trigger);
   }
@@ -1063,7 +1129,12 @@ export class EngineService {
       this.bumpSettlementBackoff(marketId);
       return;
     }
-    const parsed = parsePublicBinaryResolution(raw);
+    const binary = market.qualification.binary;
+    const parsed = parsePublicBinaryResolution(
+      raw,
+      binary.yesOutcome === "DOWN" || binary.yesOutcome === "UP" ? binary.yesOutcome : "UP",
+      binary.noOutcome === "DOWN" || binary.noOutcome === "UP" ? binary.noOutcome : "DOWN",
+    );
     if (parsed.status !== "resolved" || parsed.upPayoff === null || parsed.downPayoff === null || !parsed.winner) {
       this.bumpSettlementBackoff(marketId);
       return;
@@ -1119,11 +1190,14 @@ export class EngineService {
 
   private async markToMarketClose(unresolvedCount: number): Promise<void> {
     const prices: Record<string, { up: string; down: string }> = {};
-    for (const [marketId, pair] of this.snapshots) {
-      prices[marketId] = {
-        up: pair.UP?.asks[0]?.price ?? pair.UP?.lastTradePrice ?? pair.UP?.bids[0]?.price ?? "0",
-        down: pair.DOWN?.asks[0]?.price ?? pair.DOWN?.lastTradePrice ?? pair.DOWN?.bids[0]?.price ?? "0",
-      };
+    for (const position of this.ledger.positions.values()) {
+      const pair = this.snapshots.get(position.marketId);
+      const upQty = Number(position.upQuantity);
+      const downQty = Number(position.downQuantity);
+      const upMark = upQty > 0 ? conservativeRealizableMark(pair?.UP) : position.averageUpCost;
+      const downMark = downQty > 0 ? conservativeRealizableMark(pair?.DOWN) : position.averageDownCost;
+      if ((upQty > 0 && upMark === null) || (downQty > 0 && downMark === null)) continue;
+      prices[position.marketId] = { up: upMark ?? position.averageUpCost, down: downMark ?? position.averageDownCost };
     }
     this.ledger.revalue(prices, this.nowFn().toISOString());
     this.state.setLedger(this.ledger.snapshot());
@@ -1140,10 +1214,10 @@ export class EngineService {
   private async writeFinalReport(): Promise<void> {
     if (!this.experiment || this.reportGenerated) return;
     this.reportGenerated = true;
-    const events = await this.journal.queryEvents({
+    const events = await queryEventsPaged(this.journal, {
       types: [...DECISION_EVENT_TYPES],
       from: this.experiment.startedAt ? new Date(this.experiment.startedAt) : undefined,
-      limit: 8_000,
+      to: this.experiment.completedAt ? new Date(this.experiment.completedAt) : this.nowFn(),
     });
     const unresolved = [...this.ledger.positions.values()].filter((position) => Number(position.upQuantity) > 0 || Number(position.downQuantity) > 0).length;
     const summary = buildExperimentSummary(events, this.experiment.id, {
@@ -1151,6 +1225,8 @@ export class EngineService {
       closePolicy: this.experiment.closePolicy ?? "observe_until_settlement",
       reportKind: "final",
       unresolvedPositionCount: unresolved,
+      metricsScope: "complete",
+      complete: true,
     });
     await writeExperimentSummary(summary, process.env.REPORT_DIRECTORY ?? "reports");
     await this.safeAppend(createJournalEvent({
@@ -1170,3 +1246,48 @@ function splitList(value: string): string[] { return value.split(",").map((item)
 function uniqueStrings(values: readonly string[]): string[] { return [...new Set(values.filter(Boolean))]; }
 function dateOrNull(value: string | null | undefined): Date | null { return value ? new Date(value) : null; }
 function delay(ms: number): Promise<void> { return new Promise((resolve) => setTimeout(resolve, ms)); }
+
+const RISK_HEDGE_SETTLEMENT_KINDS = new Set([
+  "FAILED_HEDGE", "DIRECTIONAL_EXPOSURE", "NEARING_EXPIRY", "SCHEDULED_REVIEW",
+]);
+
+export function isRiskHedgeSettlementTrigger(kind: string): boolean {
+  return RISK_HEDGE_SETTLEMENT_KINDS.has(kind);
+}
+
+export function collectMarketFeedAt(
+  pair: Partial<Record<Outcome, MarketSnapshot>> | undefined,
+  outcome: Outcome,
+  intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG",
+  fallbackReceivedAt?: string | Date | null,
+): Date | null {
+  const times: number[] = [];
+  if (intent === "HEDGE_SECOND_LEG") {
+    for (const snap of [pair?.UP, pair?.DOWN]) {
+      if (snap?.receivedAt) times.push(new Date(snap.receivedAt).getTime());
+    }
+  } else {
+    const snap = pair?.[outcome];
+    if (snap?.receivedAt) times.push(new Date(snap.receivedAt).getTime());
+  }
+  if (times.length === 0 && fallbackReceivedAt) return new Date(fallbackReceivedAt);
+  if (times.length === 0) return null;
+  return new Date(Math.min(...times));
+}
+
+export function projectableLegsFromPositions(
+  positions: Iterable<Position>,
+  assetByMarket: ReadonlyMap<string, string | null>,
+): Array<{ marketId: string; outcome: Outcome; quantity: string; avgCost: string; asset: string | null }> {
+  const legs: Array<{ marketId: string; outcome: Outcome; quantity: string; avgCost: string; asset: string | null }> = [];
+  for (const position of positions) {
+    const asset = assetByMarket.get(position.marketId) ?? null;
+    if (Number(position.upQuantity) > 0) {
+      legs.push({ marketId: position.marketId, outcome: "UP", quantity: position.upQuantity, avgCost: position.averageUpCost, asset });
+    }
+    if (Number(position.downQuantity) > 0) {
+      legs.push({ marketId: position.marketId, outcome: "DOWN", quantity: position.downQuantity, avgCost: position.averageDownCost, asset });
+    }
+  }
+  return legs;
+}

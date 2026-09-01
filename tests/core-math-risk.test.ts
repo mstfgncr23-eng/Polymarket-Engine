@@ -7,6 +7,7 @@ describe("deterministic math and accounting", () => {
     const result = walkBook([{ price: "0.48", quantity: "5" }, { price: "0.50", quantity: "10" }], "10", "0.51");
     expect(result).toMatchObject({ filledQuantity: "10", vwap: "0.49", sufficientDepth: true, levelsConsumed: 2 });
     expect(calculateSlippageUsd("0.48", result.vwap, "10")).toBe("0.1");
+    expect(calculateSlippageUsd("0.50", "0.49", "10", "BUY")).toBe("0");
   });
 
   it("uses the market fee curve and taker-only maker rule", () => {

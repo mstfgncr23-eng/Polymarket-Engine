@@ -51,17 +51,24 @@ export class GrokActivationCoordinator {
 
   markRequested(trigger: TriggerEvent, request: GrokActivationRequest): void {
     const now = this.now();
+    this.ensureLatency(trigger, now.toISOString());
+    this.lastByMarketAsset.set(`${trigger.marketId ?? "none"}:${trigger.asset ?? "none"}:${trigger.kind}`, { at: now.getTime(), severity: trigger.severity });
+    this.recent.push(now.getTime());
+    for (const role of request.targetRoles) this.sent.set(activationIdempotencyKey(trigger.id, role), now.getTime());
+    this.prune();
+  }
+
+  /** Record a trigger for MCP attribution without requesting a Grok wake. */
+  ensureLatency(trigger: TriggerEvent, activationRequestedAt: string | null = null): void {
+    if (this.latency.has(trigger.id)) return;
     this.latency.set(trigger.id, {
       triggerId: trigger.id,
       triggerCreatedAt: trigger.createdAt,
-      activationRequestedAt: now.toISOString(),
+      activationRequestedAt,
       activationSentAt: null,
       firstMcpRequestAt: null,
       firstAcceptedSignalAt: null,
     });
-    this.lastByMarketAsset.set(`${trigger.marketId ?? "none"}:${trigger.asset ?? "none"}:${trigger.kind}`, { at: now.getTime(), severity: trigger.severity });
-    this.recent.push(now.getTime());
-    for (const role of request.targetRoles) this.sent.set(activationIdempotencyKey(trigger.id, role), now.getTime());
     this.prune();
   }
 

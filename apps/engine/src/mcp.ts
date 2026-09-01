@@ -12,7 +12,7 @@ import {
   GrokSignalValidationError,
   type GrokSignalSubmission,
 } from "@pm/core";
-import { createJournalEvent, type EventJournal } from "@pm/db";
+import { createJournalEvent, queryEventsPaged, type EventJournal } from "@pm/db";
 import type { EngineMetrics } from "./metrics.js";
 import { buildExperimentSummary } from "./report.js";
 import type { EngineStateStore } from "./state.js";
@@ -43,6 +43,7 @@ export const ALLOWED_MCP_READ_TOOLS = [
   "get_strategy_metrics",
   "get_recent_decisions",
   "get_system_health",
+  "get_reference_context",
 ] as const;
 
 export const ALLOWED_MCP_WRITE_TOOLS = [
@@ -54,7 +55,12 @@ export const ALLOWED_MCP_WRITE_TOOLS = [
 
 export const ALLOWED_MCP_TOOLS = new Set<string>([...ALLOWED_MCP_READ_TOOLS, ...ALLOWED_MCP_WRITE_TOOLS]);
 
-let strategyMetricsCache: { at: number; value: ReturnType<typeof buildExperimentSummary> } | null = null;
+let strategyMetricsCache: {
+  at: number;
+  scope: "rolling" | "complete";
+  experimentId: string;
+  value: ReturnType<typeof buildExperimentSummary>;
+} | null = null;
 
 export const FORBIDDEN_MCP_TRADE_TOOLS = new Set([
   "place_order", "submit_order", "create_order", "cancel_order", "replace_order",
@@ -282,20 +288,34 @@ export function createGrokMcpServer(clientId: string, dependencies: McpDependenc
   });
 
   server.registerTool("get_strategy_metrics", {
-    description: "Read journal-derived paper strategy and experiment performance.",
-    inputSchema: {}, annotations: readOnly,
-  }, async () => {
+    description: "Read journal-derived paper strategy and experiment performance. scope=rolling is a recent window; scope=complete paginates the full experiment.",
+    inputSchema: { scope: z.enum(["rolling", "complete"]).default("rolling") }, annotations: readOnly,
+  }, async ({ scope }) => {
     const now = Date.now();
-    if (strategyMetricsCache && now - strategyMetricsCache.at < 15_000) return toolResult(strategyMetricsCache.value);
     const experimentId = dependencies.state.experimentId ?? "unknown";
-    const events = await dependencies.journal.queryEvents({ types: DECISION_EVENT_TYPES, limit: 5_000 });
+    if (
+      strategyMetricsCache
+      && strategyMetricsCache.scope === scope
+      && strategyMetricsCache.experimentId === experimentId
+      && now - strategyMetricsCache.at < 15_000
+    ) return toolResult(strategyMetricsCache.value);
+    const events = scope === "complete"
+      ? await queryEventsPaged(dependencies.journal, { types: DECISION_EVENT_TYPES })
+      : await dependencies.journal.queryEvents({ types: DECISION_EVENT_TYPES, limit: 500 });
     const summary = buildExperimentSummary(events, experimentId, {
       status: dependencies.state.experimentStatus ?? "unknown",
-      reportKind: "interim",
+      reportKind: scope === "complete" ? "final" : "interim",
+      metricsScope: scope,
+      complete: scope === "complete",
     });
-    strategyMetricsCache = { at: now, value: summary };
+    strategyMetricsCache = { at: now, scope, experimentId, value: summary };
     return toolResult(summary);
   });
+
+  server.registerTool("get_reference_context", {
+    description: "Read bounded latest crypto reference context for one asset. Latest price, freshness, and recent move/volatility only. No tick stream and no trading capability.",
+    inputSchema: { asset: z.string().min(1).max(32) }, annotations: readOnly,
+  }, async ({ asset }) => toolResult(dependencies.state.getReferenceContext(asset)));
 
   server.registerTool("get_recent_decisions", {
     description: "Read the recent persisted decision feed (triggers, consensus, risk, paper fills).",

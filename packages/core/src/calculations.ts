@@ -74,12 +74,17 @@ export function calculateFee(
   return fee.toDecimalPlaces(5, Decimal.ROUND_HALF_UP).toFixed(5);
 }
 
+/** Adverse execution cost only. Price improvement is 0, never an absolute "cost". */
 export function calculateSlippageUsd(
   requestedPrice: Decimal.Value,
   fillPrice: Decimal.Value,
   quantity: Decimal.Value,
+  side: "BUY" | "SELL" = "BUY",
 ): string {
-  return decimal(d(fillPrice).minus(requestedPrice).abs().mul(quantity));
+  const delta = d(fillPrice).minus(requestedPrice);
+  const adverse = side === "SELL" ? delta.negated() : delta;
+  if (adverse.lte(0)) return decimal(0);
+  return decimal(adverse.mul(quantity));
 }
 
 export function orderBookLiquidityUsd(snapshot: MarketSnapshot, side: "BUY" | "SELL"): string {
@@ -132,7 +137,7 @@ export function calculatePairMetrics(position: Position): PairMetrics {
     settlementValue: decimal(settlement),
     fees: decimal(fees),
     slippage: decimal(slippage),
-    netPairEdge: decimal(settlement.minus(acquisition).minus(fees).minus(slippage)),
+    netPairEdge: decimal(settlement.minus(acquisition).minus(fees)),
   };
 }
 
@@ -145,5 +150,5 @@ export function calculateUnrealizedPnl(
     .plus(d(position.downQuantity).mul(currentDownPrice));
   const cost = d(position.upQuantity).mul(position.averageUpCost)
     .plus(d(position.downQuantity).mul(position.averageDownCost));
-  return decimal(currentValue.minus(cost).minus(position.totalFees).minus(position.totalSlippage));
+  return decimal(currentValue.minus(cost));
 }

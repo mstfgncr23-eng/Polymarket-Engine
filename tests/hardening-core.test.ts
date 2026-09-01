@@ -125,13 +125,31 @@ describe("F/G trigger families and six-role reachability", () => {
 });
 
 describe("H projected hedge risk", () => {
-  it("increases directional exposure on a first leg and reduces it on a hedge", () => {
-    const current = { market: "40", total: "40", directional: "40", unhedged: "40", unhedgedDurationMs: 10_000, asset: "40" };
-    const first = projectPaperExposures(current, 10, "OPEN_FIRST_LEG");
-    const hedge = projectPaperExposures(current, 10, "HEDGE_SECOND_LEG");
-    expect(Number(first.directional)).toBe(50);
-    expect(Number(hedge.directional)).toBe(30);
-    expect(Number(hedge.unhedged)).toBe(30);
+  it("projects unpaired quantity, not hedge notional dollars", () => {
+    const empty = { market: "0", total: "0", directional: "0", unhedged: "0", unhedgedDurationMs: 0, asset: "0" };
+    const full = projectPaperExposures({
+      current: empty,
+      positions: [{ marketId: "m", outcome: "UP", quantity: "10", avgCost: "0.90", asset: "BTC" }],
+      candidate: { marketId: "m", outcome: "DOWN", quantity: "10", price: "0.10", intent: "HEDGE_SECOND_LEG", asset: "BTC" },
+    });
+    expect(Number(full.unhedged)).toBe(0);
+    expect(Number(full.directional)).toBe(0);
+
+    const partial = projectPaperExposures({
+      current: empty,
+      positions: [{ marketId: "m", outcome: "UP", quantity: "10", avgCost: "0.90", asset: "BTC" }],
+      candidate: { marketId: "m", outcome: "DOWN", quantity: "6", price: "0.10", intent: "HEDGE_SECOND_LEG", asset: "BTC" },
+    });
+    expect(Number(partial.unhedged)).toBeCloseTo(4 * 0.90, 8);
+    expect(partial.unhedged).toBe(String(Number(partial.unhedged)));
+
+    const first = projectPaperExposures({
+      current: empty,
+      positions: [],
+      candidate: { marketId: "m", outcome: "UP", quantity: "10", price: "0.90", intent: "OPEN_FIRST_LEG", asset: "BTC" },
+    });
+    expect(Number(first.unhedged)).toBeCloseTo(9, 8);
+    expect(Number(first.directional)).toBeCloseTo(9, 8);
   });
 
   it("does not block a risk-reducing hedge solely because unhedged duration expired", () => {

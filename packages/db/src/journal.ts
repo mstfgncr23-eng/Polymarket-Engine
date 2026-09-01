@@ -2,7 +2,7 @@ import { and, desc, eq, gte, inArray, lte, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/postgres-js";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
 import postgres from "postgres";
-import { createId, journalEventSchema, type JournalEvent, type JournalQuery } from "@pm/core";
+import { createId, EVENT_PAGE_SIZE, journalEventSchema, type JournalEvent, type JournalQuery } from "@pm/core";
 import { engineCheckpoints, journalEvents, mcpIdempotencyKeys } from "./schema.js";
 
 export interface EngineCheckpoint {
@@ -168,6 +168,27 @@ export class PostgresEventJournal implements EventJournal {
 
 function toJournalEvent(row: typeof journalEvents.$inferSelect): JournalEvent {
   return journalEventSchema.parse({ ...row, occurredAt: row.occurredAt.toISOString(), recordedAt: row.recordedAt.toISOString() });
+}
+
+export { EVENT_PAGE_SIZE };
+
+export async function queryEventsPaged(
+  journal: EventJournal,
+  query: Omit<JournalQuery, "limit" | "offset">,
+  pageSize = EVENT_PAGE_SIZE,
+): Promise<JournalEvent[]> {
+  const size = Math.max(1, Math.min(pageSize, 20_000));
+  const events: JournalEvent[] = [];
+  let offset = 0;
+  for (;;) {
+    const page = await journal.queryEvents({ ...query, limit: size, offset });
+    if (page.length === 0) break;
+    events.push(...page);
+    if (page.length < size) break;
+    offset += page.length;
+    if (offset > 2_000_000) break;
+  }
+  return events;
 }
 
 export function createJournalEvent(input: {

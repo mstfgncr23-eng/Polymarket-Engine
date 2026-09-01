@@ -16,6 +16,7 @@ import {
   type ReferenceResolution,
 } from "@pm/market-data";
 import { EngineService } from "../apps/engine/src/engine.js";
+import { NoopGrokActivationBridge } from "../apps/engine/src/activation/index.js";
 import { EngineMetrics } from "../apps/engine/src/metrics.js";
 import { SseHub, createApiServer } from "../apps/engine/src/server.js";
 import { feeSchedule, fill, order, safeRisk, snapshot } from "./fixtures.js";
@@ -131,6 +132,20 @@ function pendingFeed() {
 }
 
 const logger = { error: () => undefined };
+
+const GROK_ROLES = [
+  "market_microstructure_scanner", "crypto_market_scanner", "news_x_intelligence_scanner",
+  "fair_probability_analyst", "risk_hedge_analyst", "strategy_supervisor",
+] as const;
+
+function grokPaperEnv() {
+  return {
+    GROK_ACTIVATION_PROVIDER: "slack",
+    SLACK_BOT_TOKEN: "xoxb-test-token",
+    SLACK_CHANNEL_ID: "C-TEST",
+    GROK_MCP_BEARER_TOKENS: GROK_ROLES.map((role) => `${role}:tok-${role}`).join(","),
+  };
+}
 const looseLimits = {
   maxOrderSizeUsd: 25, maxMarketExposureUsd: 200, maxAssetExposureUsd: 200, maxTotalExposureUsd: 300,
   maxDirectionalExposureUsd: 80, maxUnhedgedExposureUsd: 80, maxUnhedgedDurationMs: 60_000, maxDailyPaperLossUsd: 50,
@@ -141,8 +156,8 @@ const looseLimits = {
 describe("C experiment clock is explicit", () => {
   it("boots IDLE and does not auto-start the 48h experiment", async () => {
     const journal = new MemoryEventJournal();
-    const env = engineEnvSchema.parse({ NODE_ENV: "test", JOURNAL_MODE: "memory", TRADING_MODE: "paper", POLYMARKET_TOKEN_IDS: "up,down" });
-    const engine = new EngineService(env, journal, logger, { market: pendingFeed() as never });
+    const env = engineEnvSchema.parse({ NODE_ENV: "test", JOURNAL_MODE: "memory", TRADING_MODE: "paper", POLYMARKET_TOKEN_IDS: "up,down", ...grokPaperEnv() });
+    const engine = new EngineService(env, journal, logger, { market: pendingFeed() as never, activation: new NoopGrokActivationBridge() });
     await engine.start();
     try {
       expect(engine.experimentManifest()?.status).toBe("IDLE");
@@ -180,10 +195,10 @@ describe("A managed vs entry-qualified markets", () => {
     market.queue(report([btc]));
     const journal = new MemoryEventJournal();
     const env = engineEnvSchema.parse({
-      NODE_ENV: "test", JOURNAL_MODE: "memory", TRADING_MODE: "paper", GROK_ACTIVATION_PROVIDER: "noop",
+      NODE_ENV: "test", JOURNAL_MODE: "memory", TRADING_MODE: "paper", ...grokPaperEnv(),
       DISCOVERY_INTERVAL_MS: "3600000", MAX_QUALIFIED_MARKETS: "1",
     });
-    const engine = new EngineService(env, journal, logger, { market: market as never, referenceRegistry: new ScriptedReferenceRegistry() as never });
+    const engine = new EngineService(env, journal, logger, { market: market as never, referenceRegistry: new ScriptedReferenceRegistry() as never, activation: new NoopGrokActivationBridge() });
     await engine.start();
     try {
       expect(engine.entryQualifiedIds()).toContain("btc-mkt");
@@ -235,7 +250,7 @@ describe("B/D/R/T settlement, close policy, recovery, accelerated lifecycle", ()
     market.queue(report([btc, eth]));
     const journal = new MemoryEventJournal();
     const env = engineEnvSchema.parse({
-      NODE_ENV: "test", JOURNAL_MODE: "memory", TRADING_MODE: "paper", GROK_ACTIVATION_PROVIDER: "noop",
+      NODE_ENV: "test", JOURNAL_MODE: "memory", TRADING_MODE: "paper", ...grokPaperEnv(),
       EXPERIMENT_DURATION_HOURS: "48", EXPERIMENT_CLOSE_POLICY: "observe_until_settlement",
       SETTLEMENT_POLL_MS: "1", TELEMETRY_QUEUE_LIMIT: "8", DASHBOARD_SNAPSHOT_HZ: "4", ACTIVATION_MEMORY_LIMIT: "20",
       DISCOVERY_INTERVAL_MS: "3600000",
@@ -244,6 +259,7 @@ describe("B/D/R/T settlement, close policy, recovery, accelerated lifecycle", ()
       market: market as never, referenceRegistry: new ScriptedReferenceRegistry() as never,
       now: () => new Date(nowMs),
       resolutionFetcher: async (id) => resolutions.get(id) ?? null,
+      activation: new NoopGrokActivationBridge(),
     });
     await engine.start();
     try {
@@ -299,6 +315,10 @@ describe("B/D/R/T settlement, close policy, recovery, accelerated lifecycle", ()
       expect(reports.some((event) => event.type === "EXPERIMENT_COMPLETED")).toBe(true);
       expect(reports.some((event) => event.type === "EXPERIMENT_REPORT_GENERATED")).toBe(true);
       expect(engine.activationFootprint().latency).toBeLessThanOrEqual(20);
+      const restart = await engine.beginExperiment();
+      expect(restart.ok).toBe(false);
+      expect(restart.blockers).toEqual(expect.arrayContaining(["EXPERIMENT_ALREADY_COMPLETED"]));
+      expect(engine.experimentManifest()?.id).toBe(engine.experimentManifest()?.id);
     } finally {
       await engine.stop();
     }
@@ -308,10 +328,10 @@ describe("B/D/R/T settlement, close policy, recovery, accelerated lifecycle", ()
     let nowMs = Date.parse("2026-09-01T00:00:00.000Z");
     const journal = new MemoryEventJournal();
     const env = engineEnvSchema.parse({
-      NODE_ENV: "test", JOURNAL_MODE: "memory", TRADING_MODE: "paper", POLYMARKET_TOKEN_IDS: "up,down",
+      NODE_ENV: "test", JOURNAL_MODE: "memory", TRADING_MODE: "paper", POLYMARKET_TOKEN_IDS: "up,down", ...grokPaperEnv(),
       EXPERIMENT_CLOSE_POLICY: "mark_to_market", EXPERIMENT_DURATION_HOURS: "48",
     });
-    const engine = new EngineService(env, journal, logger, { market: pendingFeed() as never, now: () => new Date(nowMs) });
+    const engine = new EngineService(env, journal, logger, { market: pendingFeed() as never, now: () => new Date(nowMs), activation: new NoopGrokActivationBridge() });
     await engine.start();
     try {
       await engine.beginExperiment();
@@ -331,11 +351,11 @@ describe("B/D/R/T settlement, close policy, recovery, accelerated lifecycle", ()
   it("restores open position, resting maker, ENTRY_CLOSED experiment, and activation latency", async () => {
     const journal = new MemoryEventJournal();
     const env = engineEnvSchema.parse({
-      NODE_ENV: "test", JOURNAL_MODE: "memory", TRADING_MODE: "paper", POLYMARKET_TOKEN_IDS: "up,down",
+      NODE_ENV: "test", JOURNAL_MODE: "memory", TRADING_MODE: "paper", POLYMARKET_TOKEN_IDS: "up,down", ...grokPaperEnv(),
       EXPERIMENT_DURATION_HOURS: "48", EXPERIMENT_CLOSE_POLICY: "observe_until_settlement",
     });
     let nowMs = Date.parse("2026-09-01T00:00:00.000Z");
-    const first = new EngineService(env, journal, logger, { market: pendingFeed() as never, now: () => new Date(nowMs) });
+    const first = new EngineService(env, journal, logger, { market: pendingFeed() as never, now: () => new Date(nowMs), activation: new NoopGrokActivationBridge() });
     await first.start();
     await first.beginExperiment();
     await first.applyObservedFill(paperFill("btc-15m", "UP", "0.40"));

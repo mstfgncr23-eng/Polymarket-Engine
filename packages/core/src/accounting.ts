@@ -1,6 +1,6 @@
 import { Decimal } from "decimal.js";
-import { createId, type LedgerState, type PaperFill, type Position } from "./domain.js";
-import { d, decimal } from "./calculations.js";
+import { createId, type FeeSchedule, type LedgerState, type Outcome, type PaperFill, type Position } from "./domain.js";
+import { calculateFee, d, decimal } from "./calculations.js";
 import { classifySettledOutcome, settlementCashDelta, settlementRealizedDelta } from "./settlement.js";
 
 export class PaperLedger {
@@ -140,6 +140,12 @@ export class PaperLedger {
     this.revalue({}, at.toISOString());
   }
 
+  resetOperatingCostBaseline(at = new Date()): void {
+    this.state.aiCost = "0";
+    this.state.infrastructureCost = "0";
+    this.revalue({}, at.toISOString());
+  }
+
   revalue(prices: Record<string, { up: Decimal.Value; down: Decimal.Value }>, at = new Date().toISOString()): LedgerState {
     let value = d(0);
     let cost = d(0);
@@ -157,7 +163,7 @@ export class PaperLedger {
     }
     const unrealized = value.minus(cost);
     const gross = d(this.state.realizedPnl).plus(unrealized);
-    const netTrading = gross.minus(this.state.fees).minus(this.state.slippage);
+    const netTrading = gross.minus(this.state.fees);
     const economic = netTrading.minus(this.state.aiCost).minus(this.state.infrastructureCost);
     const equity = d(this.state.cash).plus(value);
     const high = Decimal.max(this.state.highWaterMark, equity);
@@ -195,32 +201,95 @@ export function computePaperExposures(
   };
 }
 
-export function projectPaperExposures(
-  current: ReturnType<typeof computePaperExposures>,
-  orderSizeUsd: number,
-  intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG",
-): ReturnType<typeof computePaperExposures> {
-  const size = Math.max(0, orderSizeUsd);
-  if (intent === "HEDGE_SECOND_LEG") {
-    return {
-      ...current,
-      directional: String(Math.max(0, Number(current.directional) - size)),
-      unhedged: String(Math.max(0, Number(current.unhedged) - size)),
-      market: String(Number(current.market) + size),
-      total: String(Number(current.total) + size),
-      asset: String(Number(current.asset) + size),
+export interface ProjectablePaperLeg {
+  marketId: string;
+  outcome: Outcome;
+  quantity: Decimal.Value;
+  avgCost: Decimal.Value;
+  asset?: string | null;
+}
+
+export interface PaperExposureProjectionInput {
+  current: ReturnType<typeof computePaperExposures>;
+  positions: readonly ProjectablePaperLeg[];
+  candidate: {
+    marketId: string;
+    outcome: Outcome;
+    quantity: Decimal.Value;
+    price: Decimal.Value;
+    intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG";
+    asset?: string | null;
+  };
+  nowMs?: number;
+}
+
+type ProjectedLeg = { qty: Decimal; cost: Decimal; asset: string | null };
+
+/** Quantity-based binary projection. Fully paired UP/DOWN qty has zero directional/unhedged residual. */
+export function projectPaperExposures(input: PaperExposureProjectionInput): ReturnType<typeof computePaperExposures> {
+  const books = new Map<string, { UP: ProjectedLeg; DOWN: ProjectedLeg }>();
+  const ensure = (marketId: string) => {
+    const existing = books.get(marketId);
+    if (existing) return existing;
+    const created = {
+      UP: { qty: d(0), cost: d(0), asset: null as string | null },
+      DOWN: { qty: d(0), cost: d(0), asset: null as string | null },
     };
+    books.set(marketId, created);
+    return created;
+  };
+  const add = (marketId: string, outcome: Outcome, quantity: Decimal.Value, price: Decimal.Value, asset?: string | null) => {
+    const book = ensure(marketId);
+    const leg = book[outcome];
+    const qty = d(quantity);
+    if (qty.lte(0)) return;
+    const next = leg.qty.plus(qty);
+    leg.cost = next.gt(0) ? leg.qty.mul(leg.cost).plus(qty.mul(price)).div(next) : d(0);
+    leg.qty = next;
+    if (asset) {
+      book.UP.asset = asset;
+      book.DOWN.asset = asset;
+    }
+  };
+  for (const position of input.positions) {
+    add(position.marketId, position.outcome, position.quantity, position.avgCost, position.asset);
   }
+  add(
+    input.candidate.marketId,
+    input.candidate.outcome,
+    input.candidate.quantity,
+    input.candidate.price,
+    input.candidate.asset,
+  );
+  const nowIso = new Date(input.nowMs ?? Date.now()).toISOString();
+  const projected: Position[] = [];
+  const assetByMarket = new Map<string, string | null>();
+  for (const [marketId, book] of books) {
+    const paired = Decimal.min(book.UP.qty, book.DOWN.qty);
+    const difference = book.UP.qty.minus(book.DOWN.qty);
+    const asset = book.UP.asset ?? book.DOWN.asset;
+    assetByMarket.set(marketId, asset);
+    projected.push({
+      id: `proj-${marketId}`, marketId,
+      upQuantity: decimal(book.UP.qty), downQuantity: decimal(book.DOWN.qty),
+      averageUpCost: decimal(book.UP.cost), averageDownCost: decimal(book.DOWN.cost),
+      pairedQuantity: decimal(paired),
+      unpairedOutcome: difference.gt(0) ? "UP" : difference.lt(0) ? "DOWN" : null,
+      unpairedQuantity: decimal(difference.abs()),
+      combinedPairCost: decimal(book.UP.cost.plus(book.DOWN.cost)),
+      totalFees: "0", totalSlippage: "0", openedAt: nowIso, updatedAt: nowIso,
+    });
+  }
+  const computed = computePaperExposures(projected, input.candidate.marketId, assetByMarket, input.nowMs);
+  const stillUnhedged = Number(computed.unhedged) > 0;
   return {
-    ...current,
-    market: String(Number(current.market) + size),
-    total: String(Number(current.total) + size),
-    directional: String(Number(current.directional) + size),
-    unhedged: String(Number(current.unhedged) + size),
-    asset: String(Number(current.asset) + size),
+    ...computed,
+    unhedgedDurationMs: stillUnhedged ? input.current.unhedgedDurationMs : 0,
   };
 }
 
-export function makerReserveNotional(quantity: string, price: string): string {
-  return decimal(d(quantity).mul(price));
+export function makerReserveNotional(quantity: string, price: string, schedule?: FeeSchedule | null): string {
+  const notional = d(quantity).mul(price);
+  const fee = schedule ? d(calculateFee(quantity, price, "MAKER", schedule)) : d(0);
+  return decimal(notional.plus(fee));
 }

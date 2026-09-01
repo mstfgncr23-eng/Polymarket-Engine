@@ -15,6 +15,8 @@ export interface SlackGrokActivationConfig {
   timeoutMs?: number;
   maxAttempts?: number;
   fetchImpl?: typeof fetch;
+  delayImpl?: (ms: number) => Promise<void>;
+  now?: () => number;
 }
 
 interface SlackPostResponse {
@@ -27,30 +29,26 @@ export class SlackGrokActivationBridge implements GrokActivationBridge {
   private readonly timeoutMs: number;
   private readonly maxAttempts: number;
   private readonly fetchImpl: typeof fetch;
+  private readonly delayImpl: (ms: number) => Promise<void>;
+  private readonly now: () => number;
 
   constructor(private readonly config: SlackGrokActivationConfig) {
     this.timeoutMs = config.timeoutMs ?? 5_000;
     this.maxAttempts = Math.max(1, Math.min(config.maxAttempts ?? 3, 4));
     this.fetchImpl = config.fetchImpl ?? fetch;
+    this.delayImpl = config.delayImpl ?? delay;
+    this.now = config.now ?? (() => Date.now());
   }
 
   async activate(request: GrokActivationRequest): Promise<GrokActivationResult[]> {
     const parsed = grokActivationRequestSchema.parse(request);
-    if (new Date(parsed.expiresAt).getTime() <= Date.now()) {
-      return parsed.targetRoles.map((targetRole) => ({
-        provider: this.provider, ok: false, skipped: true, targetRole,
-        requestedAt: new Date().toISOString(), sentAt: null, errorCode: "TRIGGER_EXPIRED",
-        httpStatus: null, grokWakeObserved: false, idempotencyKey: activationIdempotencyKey(parsed.triggerId, targetRole),
-      }));
+    if (this.expired(parsed.expiresAt)) {
+      return parsed.targetRoles.map((targetRole) => this.expiredResult(parsed.triggerId, targetRole));
     }
     const results: GrokActivationResult[] = [];
     for (const targetRole of parsed.targetRoles) {
-      if (new Date(parsed.expiresAt).getTime() <= Date.now()) {
-        results.push({
-          provider: this.provider, ok: false, skipped: true, targetRole,
-          requestedAt: new Date().toISOString(), sentAt: null, errorCode: "TRIGGER_EXPIRED",
-          httpStatus: null, grokWakeObserved: false, idempotencyKey: activationIdempotencyKey(parsed.triggerId, targetRole),
-        });
+      if (this.expired(parsed.expiresAt)) {
+        results.push(this.expiredResult(parsed.triggerId, targetRole));
         continue;
       }
       results.push(await this.postRole(parsed, targetRole));
@@ -58,8 +56,20 @@ export class SlackGrokActivationBridge implements GrokActivationBridge {
     return results;
   }
 
+  private expired(expiresAt: string): boolean {
+    return new Date(expiresAt).getTime() <= this.now();
+  }
+
+  private expiredResult(triggerId: string, targetRole: ExternalAgentRoleId): GrokActivationResult {
+    return {
+      provider: this.provider, ok: false, skipped: true, targetRole,
+      requestedAt: new Date(this.now()).toISOString(), sentAt: null, errorCode: "TRIGGER_EXPIRED",
+      httpStatus: null, grokWakeObserved: false, idempotencyKey: activationIdempotencyKey(triggerId, targetRole),
+    };
+  }
+
   private async postRole(request: GrokActivationRequest, targetRole: ExternalAgentRoleId): Promise<GrokActivationResult> {
-    const requestedAt = new Date().toISOString();
+    const requestedAt = new Date(this.now()).toISOString();
     const payload = {
       eventType: request.eventType,
       triggerId: request.triggerId,
@@ -87,6 +97,9 @@ export class SlackGrokActivationBridge implements GrokActivationBridge {
     let lastError = "SLACK_REQUEST_FAILED";
     let httpStatus: number | null = null;
     for (let attempt = 0; attempt < this.maxAttempts; attempt += 1) {
+      if (this.expired(request.expiresAt)) {
+        return this.expiredResult(request.triggerId, targetRole);
+      }
       try {
         const response = await this.fetchImpl(this.config.apiUrl, {
           method: "POST",
@@ -99,14 +112,20 @@ export class SlackGrokActivationBridge implements GrokActivationBridge {
         });
         httpStatus = response.status;
         const retryAfter = Number(response.headers.get("retry-after"));
-        if (Number.isFinite(retryAfter) && retryAfter > 0 && (response.status === 429 || response.status >= 500)) {
-          await delay(Math.min(30_000, retryAfter * 1000));
+        const retryable = Number.isFinite(retryAfter) && retryAfter > 0 && (response.status === 429 || response.status >= 500);
+        if (retryable) {
+          await this.delayImpl(Math.min(30_000, retryAfter * 1000));
+          if (this.expired(request.expiresAt)) {
+            return this.expiredResult(request.triggerId, targetRole);
+          }
+          lastError = slackErrorCode(`HTTP_${response.status}`);
+          continue;
         }
         const json = await response.json().catch(() => ({})) as SlackPostResponse;
         if (response.ok && json.ok === true) {
           return {
             provider: this.provider, ok: true, skipped: false, targetRole, requestedAt,
-            sentAt: new Date().toISOString(), errorCode: null, httpStatus,
+            sentAt: new Date(this.now()).toISOString(), errorCode: null, httpStatus,
             grokWakeObserved: false, idempotencyKey: activationIdempotencyKey(request.triggerId, targetRole),
           };
         }
@@ -115,7 +134,12 @@ export class SlackGrokActivationBridge implements GrokActivationBridge {
       } catch (error) {
         lastError = error instanceof Error && error.name === "TimeoutError" ? "SLACK_TIMEOUT" : "SLACK_NETWORK_ERROR";
       }
-      await delay(200 * 2 ** attempt);
+      if (attempt < this.maxAttempts - 1) {
+        await this.delayImpl(200 * 2 ** attempt);
+        if (this.expired(request.expiresAt)) {
+          return this.expiredResult(request.triggerId, targetRole);
+        }
+      }
     }
     return {
       provider: this.provider, ok: false, skipped: false, targetRole, requestedAt,

@@ -95,6 +95,18 @@ export interface DashboardSnapshot {
   equityHistory: Array<{ at: string; equity: string; drawdown: string }>;
 }
 
+export interface ReferenceContext {
+  asset: string;
+  symbol: string | null;
+  venue: string | null;
+  latestPrice: string | null;
+  lastMessageAt: string | null;
+  freshness: "fresh" | "stale" | "unknown";
+  freshnessMs: number | null;
+  recentMoveBps: number | null;
+  recentVolatilityBps: number | null;
+}
+
 export class EngineStateStore {
   readonly startedAt = new Date();
   ready = false;
@@ -126,6 +138,13 @@ export class EngineStateStore {
   private readonly activations: ActivationRecord[] = [];
   private activationLatency: ActivationLatency[] = [];
   private unattributedMcp: UnattributedMcpActivity = { lastAt: null, count: 0, lastTool: null };
+  private readonly referenceContext = new Map<string, {
+    symbol: string | null;
+    venue: string | null;
+    latestPrice: string | null;
+    lastMessageAt: string | null;
+    prices: Array<{ price: number; at: number }>;
+  }>();
 
   constructor(private ledger: LedgerState, private readonly positions: Map<string, Position>) {}
 
@@ -180,10 +199,55 @@ export class EngineStateStore {
     };
   }
 
-  noteReferenceTick(asset: string, at: string): void {
-    const current = this.reference.get(asset) ?? { state: "CONNECTED", lastMessageAt: null, reconnects: 0 };
+  noteReferenceTick(asset: string, at: string, meta?: { symbol?: string; venue?: string; price?: string }): void {
+    const current = this.reference.get(asset) ?? { state: "CONNECTED" as const, lastMessageAt: null, reconnects: 0 };
     current.lastMessageAt = at;
     this.reference.set(asset, current);
+    const bounded = this.referenceContext.get(asset) ?? {
+      symbol: null, venue: null, latestPrice: null, lastMessageAt: null, prices: [] as Array<{ price: number; at: number }>,
+    };
+    if (meta?.symbol) bounded.symbol = meta.symbol;
+    if (meta?.venue) bounded.venue = meta.venue;
+    if (meta?.price) bounded.latestPrice = meta.price;
+    bounded.lastMessageAt = at;
+    const price = meta?.price !== undefined ? Number(meta.price) : Number.NaN;
+    if (Number.isFinite(price)) {
+      bounded.prices.push({ price, at: new Date(at).getTime() });
+      if (bounded.prices.length > 8) bounded.prices.splice(0, bounded.prices.length - 8);
+    }
+    this.referenceContext.set(asset, bounded);
+  }
+
+  getReferenceContext(asset: string, nowMs = Date.now(), staleMs = 15_000): ReferenceContext {
+    const key = asset.trim().toUpperCase();
+    const bounded = this.referenceContext.get(key) ?? this.referenceContext.get(asset);
+    const lastMessageAt = bounded?.lastMessageAt ?? this.referenceLastMessageAt(key) ?? this.referenceLastMessageAt(asset);
+    const freshnessMs = lastMessageAt ? Math.max(0, nowMs - new Date(lastMessageAt).getTime()) : null;
+    const prices = bounded?.prices ?? [];
+    const first = prices[0];
+    const last = prices.at(-1);
+    const recentMoveBps = first && last && first.price !== 0
+      ? ((last.price - first.price) / first.price) * 10_000
+      : null;
+    let recentVolatilityBps: number | null = null;
+    if (prices.length >= 2) {
+      const mean = prices.reduce((sum, item) => sum + item.price, 0) / prices.length;
+      if (mean !== 0) {
+        const variance = prices.reduce((sum, item) => sum + (item.price - mean) ** 2, 0) / prices.length;
+        recentVolatilityBps = (Math.sqrt(variance) / mean) * 10_000;
+      }
+    }
+    return {
+      asset: key || asset,
+      symbol: bounded?.symbol ?? null,
+      venue: bounded?.venue ?? null,
+      latestPrice: bounded?.latestPrice ?? null,
+      lastMessageAt: lastMessageAt ?? null,
+      freshness: freshnessMs === null ? "unknown" : freshnessMs > staleMs ? "stale" : "fresh",
+      freshnessMs,
+      recentMoveBps,
+      recentVolatilityBps,
+    };
   }
 
   noteReferenceConnection(asset: string, state: ConnectionState["state"], reconnects: number): void {

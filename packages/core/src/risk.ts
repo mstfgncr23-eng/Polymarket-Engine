@@ -29,6 +29,8 @@ export interface RiskInput {
   projectedUnhedgedExposureUsd?: string;
   projectedAssetExposureUsd?: string;
   availableCashUsd?: string;
+  /** Fee-inclusive cash required for a BUY. Defaults to orderSizeUsd when omitted. */
+  requiredCashUsd?: string;
   referenceProviderBlocked?: boolean;
   marketEntryQualified?: boolean;
   availableLiquidityUsd: string;
@@ -88,7 +90,8 @@ export function evaluateRisk(input: RiskInput, limits: RiskLimits): RiskEvaluati
   if (!input.feeScheduleKnown) vetoes.push("UNKNOWN_FEE_SCHEDULE");
   if (!input.experimentEntryOpen) vetoes.push("EXPERIMENT_ENTRY_CLOSED");
   if (input.marketEntryQualified === false && !hedge) vetoes.push("MARKET_NOT_ENTRY_QUALIFIED");
-  if (input.availableCashUsd !== undefined && d(input.availableCashUsd).lt(input.orderSizeUsd)) vetoes.push("INSUFFICIENT_CASH");
+  const requiredCash = input.requiredCashUsd ?? input.orderSizeUsd;
+  if (input.availableCashUsd !== undefined && d(input.availableCashUsd).lt(requiredCash)) vetoes.push("INSUFFICIENT_CASH");
   if (input.executionErrorsLastHour >= limits.maxExecutionErrorsPerHour) vetoes.push("ABNORMAL_EXECUTION_ERRORS");
   if (input.externalRiskRecommendedVeto) vetoes.push("EXTERNAL_RISK_RECOMMENDED_VETO");
   if (input.shuttingDown) vetoes.push("SHUTTING_DOWN");
