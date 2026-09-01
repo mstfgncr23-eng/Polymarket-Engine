@@ -1,0 +1,19 @@
+{
+  "name": "@pm/core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "decimal.js": "10.6.0",
+    "zod": "4.5.4"
+  },
+  "devDependencies": {
+    "@types/node": "26.4.0",
+    "tsup": "8.5.1",
+    "typescript": "7.0.2"
+  }
+}

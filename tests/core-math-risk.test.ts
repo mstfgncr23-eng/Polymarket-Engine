@@ -1,0 +1,60 @@
+import { describe, expect, it } from "vitest";
+import { PaperLedger, buildConsensus, calculateFee, calculatePairMetrics, calculateSlippageUsd, calculateUnrealizedPnl, defaultConsensusConfig, evaluateRisk, fairProbabilityOutputSchema, riskLimitsSchema, walkBook } from "@pm/core";
+import { fill, feeSchedule, now, safeRisk } from "./fixtures.js";
+
+describe("deterministic math and accounting", () => {
+  it("walks depth and computes VWAP/slippage", () => {
+    const result = walkBook([{ price: "0.48", quantity: "5" }, { price: "0.50", quantity: "10" }], "10", "0.51");
+    expect(result).toMatchObject({ filledQuantity: "10", vwap: "0.49", sufficientDepth: true, levelsConsumed: 2 });
+    expect(calculateSlippageUsd("0.48", result.vwap, "10")).toBe("0.1");
+  });
+
+  it("uses the market fee curve and taker-only maker rule", () => {
+    expect(calculateFee("10", "0.5", "TAKER", feeSchedule)).toBe("0.17500");
+    expect(calculateFee("10", "0.5", "MAKER", feeSchedule)).toBe("0");
+  });
+
+  it("tracks a first leg, completed pair, unrealized and realized PnL", () => {
+    const ledger = new PaperLedger(1000, now);
+    let position = ledger.applyFill(fill("UP", "0.45"));
+    expect(position.unpairedQuantity).toBe("10");
+    position = ledger.applyFill(fill("DOWN", "0.48"));
+    expect(calculatePairMetrics(position)).toMatchObject({ pairedQuantity: "10", combinedAcquisitionCostPerPair: "0.93", netPairEdge: "0.7" });
+    expect(calculateUnrealizedPnl(position, "0.5", "0.5")).toBe("0.7");
+    ledger.applyFill(fill("UP", "0.55", "5", "SELL"));
+    expect(ledger.snapshot().realizedPnl).toBe("0.5");
+  });
+});
+
+describe("consensus and hard risk", () => {
+  it("weights fresh agents and reports disagreement without naive averaging", () => {
+    const expiresAt = new Date(now.getTime() + 60_000).toISOString();
+    const result = buildConsensus({ traceId: "trace", triggerId: "trigger", deterministicEdge: 0.04, now, config: defaultConsensusConfig, signals: [
+      { agentId: "fair_probability_analyst", direction: "UP", confidence: 0.9, expiresAt, evidenceIds: ["e1"] },
+      { agentId: "crypto_market_scanner", direction: "DOWN", confidence: 0.3, expiresAt, evidenceIds: ["e2"] },
+    ] });
+    expect(result.consensusDirection).toBe("UP");
+    expect(result.conflicts).toContain("DIRECTION_DISAGREEMENT");
+  });
+
+  it.each([
+    [{ marketFeedAt: new Date(now.getTime() - 20_000) }, "MARKET_FEED_STALE"],
+    [{ signalExpiresAt: now }, "SIGNAL_EXPIRED"],
+    [{ unhedgedExposureUsd: "49", orderSizeUsd: "5" }, "MAX_UNHEDGED_EXPOSURE"],
+    [{ databaseAvailable: false }, "DATABASE_UNAVAILABLE"],
+    [{ duplicateTrade: true }, "DUPLICATE_TRADE"],
+  ] as const)("vetoes unsafe state %#", (change, code) => {
+    expect(evaluateRisk(safeRisk(change), riskLimitsSchema.parse({})).vetoes).toContain(code);
+  });
+
+  it("enforces the external signal-rate veto", () => {
+    const limits = riskLimitsSchema.parse({ maxExternalSignalsPerMinute: 2 });
+    expect(evaluateRisk(safeRisk({ externalSignalsLastMinute: 2 }), limits).vetoes).toContain("MAXIMUM_EXTERNAL_SIGNAL_RATE");
+  });
+
+  it("rejects malicious model-shaped output before deterministic risk", () => {
+    const malicious = { direction: "UP", fairProbability: 3, marketProbability: 0.5, estimatedEdge: 99, confidence: 2, evidenceIds: [], expiresAt: "never", reasonCodes: [], placeLiveOrder: true };
+    expect(fairProbabilityOutputSchema.safeParse(malicious).success).toBe(false);
+    expect(evaluateRisk(safeRisk({ externalRiskRecommendedVeto: true }), riskLimitsSchema.parse({})).accepted).toBe(false);
+  });
+});
