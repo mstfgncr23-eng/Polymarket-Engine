@@ -258,5 +258,6 @@ describe("deployment foundation", () => {
     };
     expect(vercelJson.installCommand).toContain("pnpm install --frozen-lockfile");
     expect(vercelJson.buildCommand).toContain("pnpm --filter @pm/dashboard build");
+    expect(vercelJson.framework).toBe("nextjs");
   });
 });

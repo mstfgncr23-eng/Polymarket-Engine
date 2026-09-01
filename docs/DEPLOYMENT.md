@@ -157,32 +157,53 @@ Do not claim Binance/vision WS works from Fly FRA in this PR. HTTP 451/403 remai
 
 ## Vercel dashboard
 
-The Next.js app lives in `apps/dashboard`. Engine credentials must be **server-only**.
+Linked project (do not invent tokens; operator sets env in the Vercel dashboard):
 
-| Vercel env | Notes |
+| | |
 |---|---|
-| `ENGINE_INTERNAL_URL` | Server-only. Fly engine URL (public HTTPS or private Flycast if the dashboard were also on Fly). **Never** `NEXT_PUBLIC_ENGINE_INTERNAL_URL`. |
-| `ENGINE_READ_TOKEN` | Server-only. Same value as Fly `ENGINE_READ_TOKEN`. **Never** `NEXT_PUBLIC_ENGINE_READ_TOKEN`. |
+| Team | `mstfgncr23-8899s-projects` (`team_qYdYq9bYPuMa4hVH6N9i0Zrx`) |
+| Project | `polymarket-engine-dashboard` (`prj_m97M2KXYzyWxF1z8zjjVI0jCBMfQ`) |
+| Git | `mstfgncr23-eng/Polymarket-Engine` |
+| Production branch | `main` |
+| Root Directory | `apps/dashboard` |
 
-On Fly, set `DASHBOARD_ORIGIN` to the Vercel production origin (e.g. `https://<project>.vercel.app` or the custom domain). CORS allowlisting that origin is not auth.
+The Next.js app lives in `apps/dashboard`. Engine credentials must be **server-only**. There is **no production dashboard** until the operator sets those env vars. Git preview builds without them are expected to return `ENGINE_UNREACHABLE`.
 
-### Remaining Vercel operator steps
+### Required Vercel env (names only)
 
-1. Create/import a Vercel project for this GitHub repo.
-2. Set **Root Directory** to `apps/dashboard`. `apps/dashboard/vercel.json` already has:
-   - install: `cd ../.. && pnpm install --frozen-lockfile`
-   - build: `cd ../.. && pnpm --filter @pm/dashboard build`
+| Name | Where | Notes |
+|---|---|---|
+| `ENGINE_INTERNAL_URL` | Vercel **server** env | Fly engine URL. **Never** `NEXT_PUBLIC_ENGINE_INTERNAL_URL`. |
+| `ENGINE_READ_TOKEN` | Vercel **server** env | Same value as Fly `ENGINE_READ_TOKEN`. **Never** `NEXT_PUBLIC_ENGINE_READ_TOKEN`. |
 
-   `next.config.ts` uses `output: "standalone"` only when `VERCEL` is unset (Fly `Dockerfile.dashboard`). On Vercel, Next tracing needs `next-server.js.nft.json`, which standalone omits.
-3. Add server env vars `ENGINE_INTERNAL_URL` and `ENGINE_READ_TOKEN` (Production + Preview as needed). Do not tick “Expose to the browser”.
-4. Deploy. Snapshot/events proxies return JSON `{ "error": "ENGINE_UNREACHABLE" }` with 503 when the engine cannot be reached. Successful `/api/engine/events` remains `text/event-stream`.
-5. Put the resulting production origin on Fly `DASHBOARD_ORIGIN` and redeploy or `fly secrets`/`fly machine` env as appropriate (`DASHBOARD_ORIGIN` is in `[env]` only if you add it; otherwise set via secrets or `flyctl machine update` — prefer `fly secrets` or toml `[env]` after the origin is known). For this PR, set it at deploy time once the Vercel URL exists:
+Do not tick “Expose to the browser”. CORS on the engine is not auth.
+
+### Monorepo build
+
+`apps/dashboard/vercel.json` (used when Root Directory is `apps/dashboard`):
+
+```json
+{
+  "framework": "nextjs",
+  "installCommand": "cd ../.. && pnpm install --frozen-lockfile",
+  "buildCommand": "cd ../.. && pnpm --filter @pm/dashboard build"
+}
+```
+
+`next.config.ts` uses `output: "standalone"` only when `VERCEL` is unset (Fly `Dockerfile.dashboard`). On Vercel, Next tracing needs `next-server.js.nft.json`, which standalone omits.
+
+### Remaining operator steps
+
+1. Confirm Root Directory is `apps/dashboard`.
+2. Set server-only `ENGINE_INTERNAL_URL` and `ENGINE_READ_TOKEN` (Production, and Preview if you want previews to talk to an engine). Do **not** invent or commit values.
+3. After the **first production** dashboard deploy, copy that production origin (custom domain or `https://polymarket-engine-dashboard-mstfgncr23-8899s-projects.vercel.app`).
+4. Set Fly `DASHBOARD_ORIGIN` to that origin (not a secret, but set after the URL exists):
 
 ```bash
 fly secrets set -a polymarket-engine DASHBOARD_ORIGIN='https://<vercel-production-origin>'
 ```
 
-(`DASHBOARD_ORIGIN` is an origin URL, not a credential.)
+5. Snapshot/events proxies return JSON `{ "error": "ENGINE_UNREACHABLE" }` with 503 when the engine cannot be reached. Successful `/api/engine/events` remains `text/event-stream`.
 
 ## What this PR does not do
 
