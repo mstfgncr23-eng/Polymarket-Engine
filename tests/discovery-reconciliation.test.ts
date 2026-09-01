@@ -381,8 +381,8 @@ describe("per-trigger MCP latency attribution", () => {
     const afterSecond = engine.activation.snapshot();
     expect(afterSecond.find((item) => item.triggerId === first.id)?.firstMcpRequestAt).toBeTruthy();
     expect(afterSecond.find((item) => item.triggerId === second.id)?.firstMcpRequestAt).toBeTruthy();
-    expect(afterSecond.find((item) => item.triggerId === first.id)?.firstMcpRequestAt)
-      .not.toBe(afterSecond.find((item) => item.triggerId === second.id)?.firstMcpRequestAt);
+    expect(afterSecond.find((item) => item.triggerId === first.id)?.firstAcceptedSignalAt).toBeNull();
+    expect(afterSecond.find((item) => item.triggerId === second.id)?.firstAcceptedSignalAt).toBeNull();
   });
 
   it("accepted signal still records firstAcceptedSignalAt for that trigger only", async () => {

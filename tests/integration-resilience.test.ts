@@ -36,7 +36,11 @@ describe("resilience integration boundaries", () => {
   it("drains, checkpoints, and restores engine state across restart", async () => {
     const journal = new MemoryEventJournal();
     const env = engineEnvSchema.parse({ NODE_ENV: "test", JOURNAL_MODE: "memory", TRADING_MODE: "paper", POLYMARKET_TOKEN_IDS: "up,down" });
-    const pendingFeed = { registerManualToken: () => undefined, run: async (_ids: unknown, _handlers: unknown, signal: AbortSignal) => new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true })) };
+    const pendingFeed = {
+      registerManualToken: () => undefined,
+      setTokenIds: (tokenIds: readonly string[]) => ({ changed: false, previous: [...tokenIds], next: [...tokenIds] }),
+      run: async (_ids: unknown, _handlers: unknown, signal: AbortSignal) => new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true })),
+    };
     const pendingBtc = { run: async (_handlers: unknown, signal: AbortSignal) => new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true })) };
     const logger = { error: () => undefined };
     const first = new EngineService(env, journal, logger, { market: pendingFeed as never, btc: pendingBtc as never });
