@@ -9,6 +9,7 @@ import {
   evaluateRisk,
   grokSignalSubmissionSchema,
   parseGrokWritePayload,
+  GrokSignalValidationError,
   qualifyMarket,
   redactSecrets,
   rolesForTriggerKind,
@@ -92,7 +93,7 @@ describe("multi-market 1-15", () => {
     expect(qualifyMarket(marketInput({ liquidityUsd: "1" }), new Map()).reasonCodes).toContain("INSUFFICIENT_LIQUIDITY");
     expect(qualifyMarket(marketInput({ spread: 0.9 }), new Map()).reasonCodes).toContain("SPREAD_TOO_WIDE");
     expect(qualifyMarket(marketInput({ yesPrice: "2" }), new Map()).reasonCodes).toContain("INVALID_PRICE");
-    const seen = new Map([["yes-1:no-1", "other"]]);
+    const seen = new Map([["no-1:yes-1", "other"]]);
     expect(qualifyMarket(marketInput(), seen).reasonCodes).toContain("DUPLICATE_MARKET");
   });
 
@@ -304,7 +305,13 @@ describe("security regression 30-35", () => {
       agentId: "fair_probability_analyst", role: "fair_probability_analyst",
       output: { confidence: 0.8, evidenceIds: ["e"], expiresAt: future(), reasonCodes: ["X"], direction: "UP", fairProbability: 0.6, marketProbability: 0.5, estimatedEdge: 0.04 },
     });
-    expect(() => parseGrokWritePayload("submit_analysis", payload, "market_microstructure_scanner")).toThrow(/IDENTITY_CLIENT_MISMATCH/);
+    expect(() => parseGrokWritePayload("submit_analysis", payload, "market_microstructure_scanner")).toThrow(GrokSignalValidationError);
+    try {
+      parseGrokWritePayload("submit_analysis", payload, "market_microstructure_scanner");
+    } catch (error) {
+      expect(error).toBeInstanceOf(GrokSignalValidationError);
+      expect((error as GrokSignalValidationError).code).toBe("IDENTITY_CLIENT_MISMATCH");
+    }
   });
 
   it("32 scanners still cannot call recommend_veto", () => {
@@ -315,7 +322,13 @@ describe("security regression 30-35", () => {
       agentId: "risk_hedge_analyst", role: "risk_hedge_analyst",
       output: { confidence: 0.8, evidenceIds: ["e"], expiresAt: future(), reasonCodes: ["X"], recommendVeto: true, directionalExposureUsd: "1", unhedgedDurationMs: 0, pairedCost: null, adverseScenarios: [] },
     });
-    expect(() => parseGrokWritePayload("recommend_veto", payload, "market_microstructure_scanner")).toThrow(/IDENTITY_CLIENT_MISMATCH|WRITE_TOOL_FORBIDDEN/);
+    expect(() => parseGrokWritePayload("recommend_veto", payload, "market_microstructure_scanner")).toThrow(GrokSignalValidationError);
+    try {
+      parseGrokWritePayload("recommend_veto", payload, "market_microstructure_scanner");
+    } catch (error) {
+      expect(error).toBeInstanceOf(GrokSignalValidationError);
+      expect(["IDENTITY_CLIENT_MISMATCH", "WRITE_TOOL_FORBIDDEN"]).toContain((error as GrokSignalValidationError).code);
+    }
   });
 
   it("33 dashboard/journal redaction drops provider tokens", () => {

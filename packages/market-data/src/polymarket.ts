@@ -75,13 +75,7 @@ export class PolymarketMarketDataAdapter {
     if (slugs.length > 0) {
       for (const slug of slugs) rawMarkets.push(await this.client.fetchMarket({ slug }));
     } else {
-      const paginator = this.client.listMarkets({ closed: false, pageSize: 100 });
-      let pages = 0;
-      for await (const page of paginator) {
-        rawMarkets.push(...page.items);
-        pages += 1;
-        if (pages >= 8 || !page.hasMore) break;
-      }
+      rawMarkets.push(...await this.listCryptoEventMarkets());
     }
     const seen = new Map<string, string>();
     const discovered: DiscoveredMarket[] = [];
@@ -112,6 +106,27 @@ export class PolymarketMarketDataAdapter {
   async discoverBitcoinMarkets(slugs: readonly string[] = [], maxMarkets = 20): Promise<DiscoveredMarket[]> {
     const report = await this.discoverCryptoMarkets(slugs, maxMarkets);
     return report.qualified;
+  }
+
+  private async listCryptoEventMarkets(): Promise<unknown[]> {
+    const seen = new Set<string>();
+    const markets: unknown[] = [];
+    const paginator = this.client.listEvents({ closed: false, tagSlug: "crypto", pageSize: 50, relatedTags: true });
+    let pages = 0;
+    for await (const page of paginator) {
+      for (const event of page.items as Array<Record<string, unknown>>) {
+        const nested = Array.isArray(event.markets) ? event.markets as Array<Record<string, unknown>> : [];
+        for (const market of nested) {
+          const id = String(market.id ?? market.slug ?? "");
+          if (!id || seen.has(id)) continue;
+          seen.add(id);
+          markets.push({ ...market, event, tags: [...asArray(market.tags), ...asArray(event.tags)] });
+        }
+      }
+      pages += 1;
+      if (pages >= 8 || !page.hasMore || markets.length >= 400) break;
+    }
+    return markets;
   }
 
   registerManualToken(tokenId: string, marketId = tokenId, outcome: "UP" | "DOWN" = "UP", asset: string | null = null): void {
@@ -239,6 +254,8 @@ function toQualificationInput(raw: unknown): ParsedCandidate | null {
   }
   const state = value.state as Record<string, unknown> | undefined;
   const trading = value.trading as Record<string, unknown> | undefined;
+  const metrics = value.metrics as Record<string, unknown> | undefined;
+  const prices = value.prices as Record<string, unknown> | undefined;
   const rawFee = trading?.feeSchedule as Record<string, unknown> | null | undefined;
   const feesEnabled = trading?.feesEnabled === true || value.feesEnabled === true;
   const feeSchedule = feesEnabled && rawFee ? {
@@ -250,7 +267,8 @@ function toQualificationInput(raw: unknown): ParsedCandidate | null {
   const tags = collectTags(value);
   const yesPrice = nullableString(outcomes?.yes?.price) ?? firstPrice(value, 0);
   const noPrice = nullableString(outcomes?.no?.price) ?? firstPrice(value, 1);
-  const liquidity = nullableString(trading?.liquidity ?? value.liquidityNum ?? value.liquidity);
+  const liquidity = nullableString(metrics?.liquidityNum ?? metrics?.liquidity ?? trading?.liquidity ?? value.liquidityNum ?? value.liquidity);
+  const acceptingOrders = state?.acceptingOrders !== false && value.acceptingOrders !== false && state?.enableOrderBook !== false;
   return {
     feeSchedule,
     raw: value,
@@ -261,11 +279,11 @@ function toQualificationInput(raw: unknown): ParsedCandidate | null {
       tags,
       active: state?.active === true || value.active === true,
       closed: state?.closed === true || value.closed === true,
-      acceptingOrders: state?.acceptingOrders !== false && value.acceptingOrders !== false,
+      acceptingOrders,
       endDate: nullableString(state?.endDate ?? value.endDateIso ?? value.endDate),
       yesTokenId: yesToken ?? (Array.isArray(value.clobTokenIds) ? String((value.clobTokenIds as unknown[])[0]) : null),
       noTokenId: noToken ?? (Array.isArray(value.clobTokenIds) ? String((value.clobTokenIds as unknown[])[1]) : null),
-      yesPrice, noPrice, liquidityUsd: liquidity, spread: impliedSpread(yesPrice, noPrice) ?? numberOrNull(value.spread),
+      yesPrice, noPrice, liquidityUsd: liquidity, spread: numberOrNull(prices?.spread) ?? impliedSpread(yesPrice, noPrice) ?? numberOrNull(value.spread),
       feeSchedule, feesUnknown: feesEnabled && rawFee == null,
       yesLabel: outcomeLabel(value, 0, outcomes?.yes), noLabel: outcomeLabel(value, 1, outcomes?.no),
     },
@@ -309,6 +327,9 @@ function collectTags(value: Record<string, unknown>): string[] {
   return tags;
 }
 
+function asArray(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
+}
 function uniqueMarkets(markets: DiscoveredMarket[]): DiscoveredMarket[] {
   const map = new Map<string, DiscoveredMarket>();
   for (const market of markets) map.set(market.id, market);

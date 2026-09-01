@@ -67,7 +67,17 @@ if (command === "experiment:start") {
   const failures: string[] = [];
   const report = await market.discoverCryptoMarkets(configuredSlugs, 20)
     .catch((error) => { failures.push(`polymarket-discovery:${error instanceof Error ? error.message : String(error)}`); return { discovered: [], qualified: [], rejected: [] }; });
-  const tokenIds = report.qualified.flatMap((item) => item.tokens.map((token) => token.tokenId));
+  const qualifiedTokenIds = report.qualified.flatMap((item) => item.tokens.map((token) => token.tokenId));
+  let connectivityProbe = false;
+  let subscribeTokenIds = qualifiedTokenIds;
+  if (subscribeTokenIds.length === 0) {
+    const probe = report.discovered.filter((item) => item.active && item.tokens.every((token) => token.tokenId.length > 0)).slice(0, 6);
+    for (const item of probe) {
+      for (const token of item.tokens) market.registerManualToken(token.tokenId, item.id, token.outcome, item.asset);
+    }
+    subscribeTokenIds = probe.flatMap((item) => item.tokens.map((token) => token.tokenId));
+    connectivityProbe = subscribeTokenIds.length > 0;
+  }
   const assets = [...new Set(report.qualified.map((item) => item.asset).filter((item): item is string => Boolean(item)))];
   let polymarketMessages = 0;
   const referenceMessages: Record<string, number> = {};
@@ -77,7 +87,7 @@ if (command === "experiment:start") {
     const refCount = Object.values(referenceMessages).reduce((sum, value) => sum + value, 0);
     if (polymarketMessages > 0 && (assets.length === 0 || refCount > 0)) finish();
   };
-  if (tokenIds.length > 0) void market.run(tokenIds, { onSnapshot: () => { polymarketMessages += 1; check(); }, onConnection: () => undefined, onError: (error) => { failures.push(`polymarket:${error.message}`); } }, abort.signal);
+  if (subscribeTokenIds.length > 0) void market.run(subscribeTokenIds, { onSnapshot: () => { polymarketMessages += 1; check(); }, onConnection: () => undefined, onError: (error) => { failures.push(`polymarket:${error.message}`); } }, abort.signal);
   const restBase = process.env.REFERENCE_REST_BASE_URL ?? "https://api.binance.com";
   const wsBase = process.env.REFERENCE_WS_BASE_URL ?? "wss://data-stream.binance.vision/ws";
   const registry = new ReferenceFeedRegistry(wsBase, restBase, 15_000, undefined, createRestProbe(restBase));
@@ -100,13 +110,19 @@ if (command === "experiment:start") {
   await Promise.race([complete, new Promise<void>((resolve) => setTimeout(resolve, 25_000))]);
   abort.abort("smoke complete");
   const refCount = Object.values(referenceMessages).reduce((sum, value) => sum + value, 0);
+  const rejectReasons: Record<string, number> = {};
+  for (const item of report.rejected) {
+    for (const code of item.reasonCodes) rejectReasons[code] = (rejectReasons[code] ?? 0) + 1;
+  }
   const result = {
     ok: polymarketMessages > 0,
     discoveredMarkets: report.discovered.length,
     qualifiedMarkets: report.qualified.map((market) => ({ id: market.id, slug: market.slug, asset: market.asset, tokens: market.tokens.length })),
+    rejectedReasonCounts: rejectReasons,
     rejectedMarkets: report.rejected.slice(0, 25),
     assets,
-    tokenSubscriptions: tokenIds.length,
+    tokenSubscriptions: subscribeTokenIds.length,
+    connectivityProbe,
     referenceFeeds: referenceResolutions,
     polymarketMessages,
     referenceMessages,
