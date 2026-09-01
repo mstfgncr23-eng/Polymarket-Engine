@@ -22,7 +22,36 @@ Provisioned project (schema applied by the operator / MCP, not by inventing pass
 - Region: `eu-central-1`
 - Postgres 17
 
-Repo migrations in `packages/db/migrations/` (`0000_initial`, `0001_grok_mcp`, `0002_journal_query`, plus `0003_rls_lockdown`) match the PR #2 engine schema. `0003` enables **ROW LEVEL SECURITY with no anon/authenticated policies** and revokes Data API grants. The engine uses **direct Postgres**. Table owner / `postgres` bypasses RLS (do **not** `FORCE ROW LEVEL SECURITY`).
+### Applied schema (operator MCP, already done)
+
+These repo files were applied on `hkvtmaqvhpbcfbmboibh`. Do not invent connection passwords.
+
+| Migration | Status |
+|---|---|
+| `0000_initial.sql` | applied |
+| `0001_grok_mcp.sql` | applied |
+| `0002_journal_query.sql` | applied |
+
+All expected public engine tables exist with primary keys. Observed indexes include:
+
+- `journal_trace_idx`
+- `journal_aggregate_idx`
+- `journal_type_time_idx`
+- `journal_experiment_idx`
+- `checkpoint_sequence_idx`
+- `mcp_idempotency_scope_key_idx`
+
+`packages/db/migrations/0003_rls_lockdown.sql` is the portable Fly/local migrate-on-boot copy of RLS lockdown (ENABLE RLS, **no** policies, **no** FORCE). On the provisioned project, RLS is **already enabled** on all public engine tables with **no** policies — keep that. Do **not** add permissive `SELECT` policies. The engine uses **direct Postgres**. Table owner / `postgres` bypasses RLS.
+
+SQL comments in `0003` are `--` (PostgreSQL). `REVOKE` from `anon`/`authenticated` runs only when those roles exist so local `docker-compose` Postgres (no Supabase roles) can still migrate.
+
+### Advisors (expected)
+
+| Advisor | Level | Action |
+|---|---|---|
+| `rls_enabled_no_policy` | INFO | **Legitimate.** Direct-Postgres-only engine; Data API / `anon` / `authenticated` must stay denied. Do not add policies to silence the lint. |
+| Unused indexes | INFO | Expected on an empty database. Do not drop journal/checkpoint indexes. |
+| `mcp_idempotency_keys` has a unique index (`mcp_idempotency_scope_key_idx`) but no formal PRIMARY KEY | INFO | Style only. **Do not rewrite `0001_grok_mcp.sql`.** |
 
 ### `DATABASE_URL` strategy
 
