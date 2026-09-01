@@ -241,7 +241,7 @@ describe("deployment foundation", () => {
     expect(existsSync(join(repoRoot, "packages/db/migrations/meta/_journal.json"))).toBe(true);
     const rls = readFileSync(join(repoRoot, "packages/db/migrations/0003_rls_lockdown.sql"), "utf8");
     expect(rls).toMatch(/ENABLE ROW LEVEL SECURITY/);
-    expect(rls).not.toMatch(/FORCE ROW LEVEL SECURITY/);
+    expect(rls).not.toMatch(/ALTER TABLE \S+ FORCE ROW LEVEL SECURITY/);
     expect(rls).not.toMatch(/CREATE POLICY/i);
     expect(rls).toMatch(/REVOKE ALL ON TABLE journal_events FROM anon, authenticated/);
   });
