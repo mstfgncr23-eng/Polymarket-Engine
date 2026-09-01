@@ -109,6 +109,7 @@ export function assertProductionEngineEnv(env: EngineEnv): void {
   if (env.JOURNAL_MODE !== "postgres") throw new Error("IN_MEMORY_JOURNAL_FORBIDDEN_IN_PRODUCTION");
   if (!env.DATABASE_URL) throw new Error("DATABASE_URL_REQUIRED_FOR_POSTGRES_JOURNAL");
   if (!env.ENGINE_READ_TOKEN) throw new Error("ENGINE_READ_TOKEN_REQUIRED_IN_PRODUCTION");
+  if (!env.ENGINE_OPERATOR_TOKEN) throw new Error("ENGINE_OPERATOR_TOKEN_REQUIRED_IN_PRODUCTION");
 }
 
 export function parseEngineEnv(env: NodeJS.ProcessEnv): EngineEnv {

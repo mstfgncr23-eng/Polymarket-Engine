@@ -31,6 +31,7 @@ const productionBase = {
   JOURNAL_MODE: "postgres",
   DATABASE_URL: "postgres://postgres:REPLACE_ME@db.hkvtmaqvhpbcfbmboibh.supabase.co:5432/postgres",
   ENGINE_READ_TOKEN: "prod-read-token",
+  ENGINE_OPERATOR_TOKEN: "prod-operator-token",
 } as const;
 
 describe("deployment foundation", () => {
@@ -77,6 +78,10 @@ describe("deployment foundation", () => {
       expect((await required.inject({ method: "GET", url: "/api/dashboard" })).statusCode).toBe(401);
       expect((await required.inject({ method: "GET", url: "/api/dashboard", headers: { authorization: "Bearer prod-read-token" } })).statusCode).toBe(200);
       expect(() => parseEngineEnv({ NODE_ENV: "production", TRADING_MODE: "paper", JOURNAL_MODE: "postgres", DATABASE_URL: productionBase.DATABASE_URL })).toThrow(/ENGINE_READ_TOKEN_REQUIRED_IN_PRODUCTION/);
+      expect(() => parseEngineEnv({
+        NODE_ENV: "production", TRADING_MODE: "paper", JOURNAL_MODE: "postgres",
+        DATABASE_URL: productionBase.DATABASE_URL, ENGINE_READ_TOKEN: "prod-read-token",
+      })).toThrow(/ENGINE_OPERATOR_TOKEN_REQUIRED_IN_PRODUCTION/);
     } finally {
       await missing.close();
       await required.close();
@@ -93,6 +98,7 @@ describe("deployment foundation", () => {
       if (!/\.(ts|tsx|js|mjs|cjs|json|env|example)$/.test(file) && !file.endsWith("vercel.json")) continue;
       const source = readFileSync(file, "utf8");
       expect(source, file).not.toMatch(/NEXT_PUBLIC_ENGINE_READ_TOKEN/);
+      expect(source, file).not.toMatch(/NEXT_PUBLIC_ENGINE_OPERATOR_TOKEN/);
       expect(source, file).not.toMatch(/process\.env\.NEXT_PUBLIC_/);
     }
   });
@@ -234,6 +240,8 @@ describe("deployment foundation", () => {
     const dockerfile = readFileSync(join(repoRoot, "Dockerfile.engine"), "utf8");
     expect(dockerfile).toMatch(/COPY --from=build[^\n]*\/workspace\/packages\/db\/migrations \.\/packages\/db\/migrations/);
     expect(dockerfile).toMatch(/DB_MIGRATIONS_DIR=\/app\/packages\/db\/migrations/);
+    expect(dockerfile).toMatch(/REPORT_DIRECTORY=\/app\/reports/);
+    expect(dockerfile).toMatch(/mkdir -p \/app\/reports && chown engine:engine \/app\/reports/);
     expect(existsSync(join(repoRoot, "packages/db/migrations/0000_initial.sql"))).toBe(true);
     expect(existsSync(join(repoRoot, "packages/db/migrations/0001_grok_mcp.sql"))).toBe(true);
     expect(existsSync(join(repoRoot, "packages/db/migrations/0002_journal_query.sql"))).toBe(true);
@@ -259,5 +267,92 @@ describe("deployment foundation", () => {
     expect(vercelJson.installCommand).toContain("pnpm install --frozen-lockfile");
     expect(vercelJson.buildCommand).toContain("pnpm --filter @pm/dashboard build");
     expect(vercelJson.framework).toBe("nextjs");
+  });
+
+  it("operator token is exclusive; read token cannot start the experiment", async () => {
+    const journal = new MemoryEventJournal();
+    const env = engineEnvSchema.parse({ NODE_ENV: "test", JOURNAL_MODE: "memory", TRADING_MODE: "paper" });
+    const engine = new EngineService(env, journal, { error: () => undefined });
+    let started = 0;
+    const server = await createApiServer({
+      state: engine.state, journal, metrics: new EngineMetrics(), sse: new SseHub(),
+      dashboardOrigin: "http://localhost:3000", logger: false,
+      mcp: { bearerTokens: "", allowedOrigins: "https://grok.com", rateLimitPerMinute: 30 },
+      submitGrokSignal: async () => ({ status: "ignored" }),
+      startExperiment: async () => {
+        started += 1;
+        return { ok: true, stubbed: true };
+      },
+      engineReadToken: "read-token",
+      operatorToken: "operator-token",
+      nodeEnv: "production",
+    });
+    try {
+      expect((await server.inject({
+        method: "GET", url: "/api/dashboard", headers: { authorization: "Bearer read-token" },
+      })).statusCode).toBe(200);
+      expect((await server.inject({
+        method: "POST", url: "/api/operator/experiment/start", headers: { authorization: "Bearer read-token" },
+      })).statusCode).toBe(401);
+      expect(started).toBe(0);
+      const operator = await server.inject({
+        method: "POST", url: "/api/operator/experiment/start", headers: { authorization: "Bearer operator-token" },
+      });
+      expect(operator.statusCode).toBe(200);
+      expect(operator.json()).toMatchObject({ ok: true, stubbed: true });
+      expect(started).toBe(1);
+      const fallback = await createApiServer({
+        state: engine.state, journal, metrics: new EngineMetrics(), sse: new SseHub(),
+        dashboardOrigin: "http://localhost:3000", logger: false,
+        mcp: { bearerTokens: "", allowedOrigins: "https://grok.com", rateLimitPerMinute: 30 },
+        submitGrokSignal: async () => ({ status: "ignored" }),
+        startExperiment: async () => ({ ok: true }),
+        engineReadToken: "read-token",
+        nodeEnv: "production",
+      });
+      try {
+        expect((await fallback.inject({
+          method: "POST", url: "/api/operator/experiment/start", headers: { authorization: "Bearer read-token" },
+        })).statusCode).toBe(401);
+      } finally {
+        await fallback.close();
+      }
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("Fly workflow_dispatch requires operator-supplied fly_app", () => {
+    const workflow = readFileSync(join(repoRoot, ".github/workflows/fly-deploy.yml"), "utf8");
+    expect(workflow).toMatch(/workflow_dispatch:/);
+    expect(workflow).toMatch(/fly_app:/);
+    expect(workflow).toMatch(/required: true/);
+    expect(workflow).toMatch(/flyctl deploy --config fly\.engine\.toml --app "\$\{\{ inputs\.fly_app \}\}" --ha=false/);
+    const ci = readFileSync(join(repoRoot, ".github/workflows/ci.yml"), "utf8");
+    expect(ci).not.toMatch(/FLY_API_TOKEN/);
+    expect(ci).toMatch(/docker build -f Dockerfile\.engine/);
+    expect(ci).toMatch(/test -w \/app\/reports/);
+  });
+
+  it("Drizzle migrations are additive and safe against a pre-provisioned schema", () => {
+    const dir = join(repoRoot, "packages/db/migrations");
+    const files = ["0000_initial.sql", "0001_grok_mcp.sql", "0002_journal_query.sql", "0003_rls_lockdown.sql"];
+    const sql = files.map((name) => readFileSync(join(dir, name), "utf8")).join("\n");
+    expect(sql).not.toMatch(/\bDROP\s+TABLE\b/i);
+    expect(sql).not.toMatch(/\bDROP\s+SCHEMA\b/i);
+    expect(sql).not.toMatch(/\bDROP\s+DATABASE\b/i);
+    expect(sql).not.toMatch(/\bTRUNCATE\b/i);
+    expect(sql).not.toMatch(/\bDELETE\s+FROM\b/i);
+    expect(readFileSync(join(dir, "0000_initial.sql"), "utf8")).toMatch(/CREATE TABLE IF NOT EXISTS/);
+    expect(readFileSync(join(dir, "0001_grok_mcp.sql"), "utf8")).toMatch(/CREATE TABLE IF NOT EXISTS mcp_idempotency_keys/);
+    expect(readFileSync(join(dir, "0002_journal_query.sql"), "utf8")).toMatch(/CREATE INDEX IF NOT EXISTS/);
+    const rls = readFileSync(join(dir, "0003_rls_lockdown.sql"), "utf8");
+    expect(rls).toMatch(/ENABLE ROW LEVEL SECURITY/);
+    expect(rls).toMatch(/IF EXISTS \(SELECT 1 FROM pg_roles/);
+    expect(rls).toMatch(/Duplicate supabase_migrations rows named 0003_rls_lockdown are harmless/);
+    const journal = JSON.parse(readFileSync(join(dir, "meta/_journal.json"), "utf8")) as { entries: Array<{ tag: string }> };
+    expect(journal.entries.map((entry) => entry.tag)).toEqual([
+      "0000_initial", "0001_grok_mcp", "0002_journal_query", "0003_rls_lockdown",
+    ]);
   });
 });

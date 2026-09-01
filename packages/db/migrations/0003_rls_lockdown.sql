@@ -5,7 +5,9 @@
 -- policies — the engine does not use the Supabase Data API.
 --
 -- Idempotent: safe if RLS was already enabled during operator MCP apply.
--- REVOKE is skipped when anon/authenticated roles are absent (local docker-compose Postgres).
+-- Duplicate supabase_migrations rows named 0003_rls_lockdown are harmless provisioning
+-- history. Do not re-apply. Do not DROP. REVOKE is skipped when anon/authenticated
+-- roles are absent (local docker-compose Postgres).
 
 ALTER TABLE journal_events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE engine_checkpoints ENABLE ROW LEVEL SECURITY;

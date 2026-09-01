@@ -1,8 +1,14 @@
 name: Fly engine deploy
 
 # Manual only. Ordinary PR CI (.github/workflows/ci.yml) does not use FLY_API_TOKEN.
+# Do not assume fly.engine.toml app=. Operator must supply the owned Fly app name.
 on:
   workflow_dispatch:
+    inputs:
+      fly_app:
+        description: Operator-owned Fly app name (required; do not assume toml app=)
+        required: true
+        type: string
 
 jobs:
   deploy:
@@ -22,10 +28,10 @@ jobs:
       - run: pnpm build
       - uses: superfly/flyctl-actions/setup-flyctl@master
       - name: Validate Fly engine config
-        run: flyctl config validate -c fly.engine.toml
+        run: flyctl config validate -c fly.engine.toml --app "${{ inputs.fly_app }}"
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
       - name: Deploy engine (singleton paper machine)
-        run: flyctl deploy --config fly.engine.toml --ha=false
+        run: flyctl deploy --config fly.engine.toml --app "${{ inputs.fly_app }}" --ha=false
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

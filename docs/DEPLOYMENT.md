@@ -85,8 +85,8 @@ Set on the engine app. Values never belong in git, `fly.engine.toml`, logs, or t
 | Secret | First MONITOR_ONLY boot |
 |---|---|
 | `DATABASE_URL` | **required** |
-| `ENGINE_READ_TOKEN` | **required** in production (dashboard/history/events) |
-| `ENGINE_OPERATOR_TOKEN` | recommended (experiment start later); read token is accepted as fallback |
+| `ENGINE_READ_TOKEN` | **required** in production. Read-only: dashboard / history / SSE. Never on Vercel as `NEXT_PUBLIC_*`. |
+| `ENGINE_OPERATOR_TOKEN` | **required** in production. Exclusive authority for `POST /api/operator/experiment/start`. **Never** fall back to the read token. **Never** put on Vercel or in the browser. |
 | `METRICS_TOKEN` | optional private `/metrics` scrape |
 | `GROK_MCP_BEARER_TOKENS` | **later** — not required for MONITOR_ONLY |
 | Slack tokens | **not in this PR** |
@@ -103,20 +103,24 @@ fly secrets set -a polymarket-engine ENGINE_READ_TOKEN='<high-entropy>' ENGINE_O
 
 ## Fly deploy
 
-`fly.engine.toml` declares `app = "polymarket-engine"` as the **intended** name. The operator must own or create that app. Do not invent a different name in git. If the live app name differs, pass `--app` explicitly.
+`fly.engine.toml` may list `app = "polymarket-engine"` as a documented intended default. The operator must own or create **their** app. Do **not** assume that name at deploy time. Manual and GitHub Action deploys must pass `--app <operator-app>`.
 
-Topology (already in toml): `fra`, internal `8080`, `shared-cpu-1x`, `512mb`, `min_machines_running = 1`, `auto_stop_machines = "off"`. **No Fly Managed Postgres.**
+Topology (already in toml): `fra`, internal `8080`, `shared-cpu-1x`, `512mb`, `min_machines_running = 1`, `auto_stop_machines = "off"`. **No Fly Managed Postgres.** **No Fly volume** for reports.
 
 ```bash
 # Create only if the operator does not already own the app
-fly apps create polymarket-engine --org <org>
+fly apps create <operator-app> --org <org>
 
-fly deploy --config fly.engine.toml --app polymarket-engine --ha=false
-# equivalent when toml app= matches the owned app:
-# fly deploy --config fly.engine.toml --ha=false
+fly deploy --config fly.engine.toml --app <operator-app> --ha=false
 ```
 
-GitHub Action `.github/workflows/fly-deploy.yml` is **`workflow_dispatch` only**. It runs typecheck/test/build, `flyctl config validate -c fly.engine.toml`, then deploy. It needs repo secret `FLY_API_TOKEN`. Ordinary PR CI (`.github/workflows/ci.yml`) does **not** require that token and must stay green without Fly credentials.
+GitHub Action `.github/workflows/fly-deploy.yml` is **`workflow_dispatch` only** with a **required** `fly_app` input. It deploys with:
+
+```bash
+flyctl deploy --config fly.engine.toml --app "$FLY_APP" --ha=false
+```
+
+It needs repo secret `FLY_API_TOKEN`. Ordinary PR CI (`.github/workflows/ci.yml`) does **not** require that token and must stay green without Fly credentials.
 
 Singleton `--ha=false` avoids duplicate paper decisions. Horizontal engine scaling is unsafe until leader election exists.
 
@@ -132,16 +136,28 @@ Zero qualified markets is `discoveryStatus=ZERO_QUALIFIED`, not a crash. Fly mus
 
 ### Filesystem
 
-Fly disks are **not** durable canonical state. PostgreSQL is. `reports/` on the machine can be deleted; rebuild with `pnpm report` from the journal (`DATABASE_URL` + `EXPERIMENT_ID`).
+Fly disks are **not** durable canonical state. PostgreSQL is. The engine image creates `/app/reports` owned by user `engine` (`REPORT_DIRECTORY=/app/reports`) so final-report writes succeed without a Fly volume. That directory is **ephemeral**; rebuild with `pnpm report` from the journal (`DATABASE_URL` + `EXPERIMENT_ID`).
 
-Migrate-on-boot: `Dockerfile.engine` copies `packages/db/migrations` (SQL + `meta/_journal.json`) to `/app/packages/db/migrations` and sets `DB_MIGRATIONS_DIR`. Runtime `PostgresEventJournal.initialize()` runs Drizzle migrate.
+Migrate-on-boot: `Dockerfile.engine` copies `packages/db/migrations` (SQL + `meta/_journal.json`) to `/app/packages/db/migrations` and sets `DB_MIGRATIONS_DIR`. Runtime `PostgresEventJournal.initialize()` runs Drizzle migrate. SQL is additive (`CREATE IF NOT EXISTS`, idempotent `ENABLE ROW LEVEL SECURITY`, role-guarded `REVOKE`). Re-running against an already-provisioned schema does **not** DROP tables.
+
+### Supabase migration history
+
+Operator MCP history on `hkvtmaqvhpbcfbmboibh` currently includes:
+
+- `0000_initial`
+- `0001_grok_mcp`
+- `0002_journal_query`
+- `0003_rls_lockdown`
+- `0003_rls_lockdown` (duplicate external apply)
+
+The duplicate `0003_rls_lockdown` row is **harmless provisioning history**. Do **not** delete it. Do **not** re-apply `0003`. Do **not** mutate production schema for cleanup. Drizzle migrate-on-boot may also record its own `__drizzle_migrations` journal; re-executing the same idempotent SQL is safe.
 
 ## MONITOR_ONLY first-boot checklist
 
 1. Supabase project reachable; schema/migrations applied (including RLS lockdown; no Data API policies).
-2. `fly secrets` set: `DATABASE_URL`, `ENGINE_READ_TOKEN` (and operator token). **No** Grok/Slack required.
+2. `fly secrets` set: `DATABASE_URL`, `ENGINE_READ_TOKEN`, `ENGINE_OPERATOR_TOKEN`. **No** Grok/Slack required. Do not put the operator token on Vercel.
 3. `fly.engine.toml` still has `TRADING_MODE=paper` and `GROK_ACTIVATION_PROVIDER=noop`.
-4. `fly deploy --config fly.engine.toml --ha=false` (or the workflow_dispatch Action).
+4. `fly deploy --config fly.engine.toml --app <operator-app> --ha=false` (or workflow_dispatch with required `fly_app`).
 5. `GET https://<engine>/health` → 200.
 6. `GET https://<engine>/ready` → 200 when DB is up, even with zero qualified markets. 503 if Postgres is down (fail-closed).
 7. Confirm experiment stays `IDLE` (no `EXPERIMENT_STARTED` in the journal). Do **not** call `POST /api/operator/experiment/start` or `pnpm experiment:start`.
@@ -195,7 +211,7 @@ Do not tick “Expose to the browser”. CORS on the engine is not auth.
 ### Remaining operator steps
 
 1. Confirm Root Directory is `apps/dashboard`.
-2. Set server-only `ENGINE_INTERNAL_URL` and `ENGINE_READ_TOKEN` (Production, and Preview if you want previews to talk to an engine). Do **not** invent or commit values.
+2. Set server-only `ENGINE_INTERNAL_URL` and `ENGINE_READ_TOKEN` (Production, and Preview if you want previews to talk to an engine). Do **not** invent or commit values. Do **not** set `ENGINE_OPERATOR_TOKEN` on Vercel.
 3. After the **first production** dashboard deploy, copy that production origin (custom domain or `https://polymarket-engine-dashboard-mstfgncr23-8899s-projects.vercel.app`).
 4. Set Fly `DASHBOARD_ORIGIN` to that origin (not a secret, but set after the URL exists):
 
