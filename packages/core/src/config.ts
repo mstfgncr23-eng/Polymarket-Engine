@@ -50,7 +50,7 @@ export const engineEnvSchema = z.object({
   ENGINE_REGION: z.string().default("fra"),
   POLYMARKET_MARKET_SLUGS: z.string().default(""),
   POLYMARKET_TOKEN_IDS: z.string().default(""),
-  BTC_WS_URL: z.string().url().default("wss://stream.binance.com:9443/ws/btcusdt@aggTrade"),
+  BTC_WS_URL: z.string().url().default("wss://data-stream.binance.vision/ws/btcusdt@aggTrade"),
   BTC_SYMBOL: z.string().default("BTCUSDT"),
   GROK_MCP_BEARER_TOKENS: z.string().default(""),
   GROK_MCP_ALLOWED_ORIGINS: z.string().default("https://grok.com,https://x.ai"),

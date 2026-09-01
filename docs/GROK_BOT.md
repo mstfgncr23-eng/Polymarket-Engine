@@ -4,7 +4,7 @@ This engine hosts a Streamable HTTP MCP endpoint at `/mcp`. Grok Bots are **exte
 
 Official references used while implementing this path:
 
-- MCP Streamable HTTP (revision 2026-07-28): POST-only MCP endpoint, Origin validation, JSON or SSE responses, no protocol-level sessions.
+- MCP Streamable HTTP via `@modelcontextprotocol/sdk` 1.30 (negotiated protocol versions through 2025-11-25): POST-only MCP endpoint, Origin validation, JSON or SSE responses. The 2026-07-28 spec revision is documented; adopting it requires the MCP TypeScript SDK v2 opt-in, which is deferred so the existing Fastify transport is not rewritten.
 - xAI Remote MCP Tools: `server_url` must be Streamable HTTP or SSE; optional `authorization` is sent as `Authorization`.
 - Grok connectors: custom MCP connectors are added at [grok.com/connectors](https://grok.com/connectors).
 

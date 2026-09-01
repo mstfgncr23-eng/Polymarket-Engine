@@ -149,7 +149,7 @@ describe("authenticated MCP HTTP", () => {
         authorization: "Bearer super-secret-token",
         accept: "application/json, text/event-stream",
         "content-type": "application/json",
-        "mcp-protocol-version": "2026-07-28",
+        "mcp-protocol-version": "2025-11-25",
         ...headers,
       },
       body: JSON.stringify(body),

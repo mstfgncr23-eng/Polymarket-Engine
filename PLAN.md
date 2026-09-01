@@ -30,7 +30,7 @@
 - Grok Bots are external MCP clients; this repository does not create or provision xAI credentials and does not call an xAI inference API.
 - Initial machine-to-machine authentication uses operator-managed high-entropy bearer tokens supplied only to the engine as secrets. Token fingerprints—not raw tokens—are audited. OAuth-protected-resource discovery can be added later if the deployed Grok client requires delegated user authorization.
 - A single Fly engine Machine remains the supported topology; in-memory rate/idempotency caches are backed by durable journal checks where required but horizontally shared rate limits need Redis/PostgreSQL advisory coordination before scaling.
-- Docker/Fly CLIs and a real PostgreSQL instance are still unavailable locally; strict Fly, container, and real-DB fault tests remain explicit deployment gates.
+- Docker/Fly CLIs: Fly CLI can be installed, but `fly config validate --strict` requires a logged-in access token. Docker is not installed and `docker.io` is not available from apt in this environment. Strict Fly and container builds remain explicit deployment gates.
 
 ### Test strategy
 
@@ -53,7 +53,7 @@
 - This project will be created at `outputs/polymarket-research-engine` as a new pnpm/TypeScript monorepo.
 - Local tools observed: Node.js `v26.7.0` and pnpm `11.16.0`. Docker was not available on `PATH` during initial inspection. Fly CLI availability still needs an isolated check.
 - Official-documentation verification completed against current OpenAI Agents/Responses/model, Polymarket unified CLOB v2/WebSocket/fee/rate-limit, and Fly Machines lifecycle documentation before the corresponding adapters/configuration were finalized.
-- Implementation status (2026-09-01): strict typecheck passes, 20 tests pass, deterministic smoke passes, engine and standalone dashboard production builds pass. The public live smoke received 392 real BTC messages; Polymarket discovery timed out behind this host's TLS inspection/proxy, so no Polymarket stream result is claimed. Docker and Fly CLIs are not installed locally, so their validations remain operator steps.
+- Implementation status (2026-09-01, Grok MCP continuation): strict typecheck passes, 27 tests pass, deterministic smoke passes, engine and standalone dashboard production builds pass. Live smoke received 502 real Polymarket messages and 1 real BTC aggTrade on `data-stream.binance.vision`. `stream.binance.com` returns HTTP 451 from this host. Fly CLI is installed but `fly config validate --strict` requires login. Docker is not installed (`docker.io` package not available).
 
 ## Architecture
 
