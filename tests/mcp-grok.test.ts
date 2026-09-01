@@ -90,17 +90,18 @@ describe("Grok signal inbox", () => {
     expect(fairProbabilityOutputSchema.safeParse({ ...fairOutput(), fairProbability: 3, placeLiveOrder: true }).success).toBe(false);
 
     const stale = submission(trigger, "fair_probability_analyst", fairOutput({ expiresAt: new Date(Date.now() - 1_000).toISOString() }));
-    expect(await engine.submitGrokSignal(stale, "scanner")).toMatchObject({ status: "stale" });
+    expect(await engine.submitGrokSignal(stale, "fair_probability_analyst")).toMatchObject({ status: "stale" });
 
     const replay = submission(trigger, "market_microstructure_scanner", microstructureOutput(), { timestamp: new Date(Date.now() - 10 * 60_000).toISOString() });
-    expect(await engine.submitGrokSignal(replay, "scanner")).toMatchObject({ status: "replay_rejected" });
+    expect(await engine.submitGrokSignal(replay, "market_microstructure_scanner")).toMatchObject({ status: "replay_rejected" });
 
-    expect(await engine.submitGrokSignal(submission({ ...trigger, id: "missing" }, "fair_probability_analyst", fairOutput()), "scanner")).toMatchObject({ status: "unknown_trigger" });
+    expect(await engine.submitGrokSignal(submission({ ...trigger, id: "missing" }, "fair_probability_analyst", fairOutput()), "fair_probability_analyst")).toMatchObject({ status: "unknown_trigger" });
 
     const first = submission(trigger, "market_microstructure_scanner", microstructureOutput());
-    expect(await engine.submitGrokSignal(first, "scanner")).toMatchObject({ status: "accepted" });
-    expect(await engine.submitGrokSignal(first, "scanner")).toMatchObject({ status: "duplicate" });
+    expect(await engine.submitGrokSignal(first, "market_microstructure_scanner")).toMatchObject({ status: "accepted" });
+    expect(await engine.submitGrokSignal(first, "market_microstructure_scanner")).toMatchObject({ status: "duplicate" });
     expect(engine.ledger.positions.size).toBe(0);
+    expect(await engine.submitGrokSignal(submission(trigger, "fair_probability_analyst", fairOutput()), "market_microstructure_scanner")).toMatchObject({ status: "identity_mismatch" });
   });
 
   it("assembles consensus only after minimum fresh role evidence and does not invent orders without a live book", async () => {
@@ -108,9 +109,9 @@ describe("Grok signal inbox", () => {
     engine.state.marketSnapshots.set("up", snapshot({ marketId: "btc", tokenId: "up" }));
     const trigger = researchTrigger();
     await engine.registerTriggerForResearch(trigger);
-    await engine.submitGrokSignal(submission(trigger, "market_microstructure_scanner", microstructureOutput()), "scanner");
+    await engine.submitGrokSignal(submission(trigger, "market_microstructure_scanner", microstructureOutput()), "market_microstructure_scanner");
     expect(engine.state.latestConsensus).toBeNull();
-    await engine.submitGrokSignal(submission(trigger, "fair_probability_analyst", fairOutput()), "scanner");
+    await engine.submitGrokSignal(submission(trigger, "fair_probability_analyst", fairOutput()), "fair_probability_analyst");
     expect(engine.state.latestConsensus?.consensusDirection).toBe("UP");
     expect(engine.ledger.positions.size).toBe(0);
   });
@@ -118,16 +119,28 @@ describe("Grok signal inbox", () => {
   it("maps write tools onto the inbox and rejects role mismatches", () => {
     const trigger = researchTrigger();
     const analysis = submission(trigger, "fair_probability_analyst", fairOutput());
-    expect(parseGrokWritePayload("submit_analysis", analysis).agentId).toBe("fair_probability_analyst");
-    expect(() => parseGrokWritePayload("submit_analysis", submission(trigger, "market_microstructure_scanner", microstructureOutput()))).toThrow(GrokSignalValidationError);
-    expect(() => parseGrokWritePayload("recommend_veto", submission(trigger, "risk_hedge_analyst", riskOutput({ recommendVeto: false })))).toThrow(/VETO_RECOMMENDATION_REQUIRED/);
-    expect(parseGrokWritePayload("recommend_hedge", submission(trigger, "risk_hedge_analyst", riskOutput({ recommendVeto: false }))).agentId).toBe("risk_hedge_analyst");
+    expect(parseGrokWritePayload("submit_analysis", analysis, "fair_probability_analyst").agentId).toBe("fair_probability_analyst");
+    expect(() => parseGrokWritePayload("submit_analysis", submission(trigger, "market_microstructure_scanner", microstructureOutput()), "market_microstructure_scanner")).toThrow(GrokSignalValidationError);
+    expect(() => parseGrokWritePayload("recommend_veto", submission(trigger, "risk_hedge_analyst", riskOutput({ recommendVeto: false })), "risk_hedge_analyst")).toThrow(/VETO_RECOMMENDATION_REQUIRED/);
+    expect(parseGrokWritePayload("recommend_hedge", submission(trigger, "risk_hedge_analyst", riskOutput({ recommendVeto: false })), "risk_hedge_analyst").agentId).toBe("risk_hedge_analyst");
   });
 });
 
+const ROLE_TOKENS = [
+  "market_microstructure_scanner:scanner-secret",
+  "fair_probability_analyst:fair-secret",
+  "risk_hedge_analyst:risk-secret",
+  "strategy_supervisor:supervisor-secret",
+].join(",");
+
 describe("authenticated MCP HTTP", () => {
-  async function listen(tokens = "scanner:super-secret-token", rateLimitPerMinute = 30) {
-    const { journal, engine } = await testEngine();
+  async function listen(tokens = ROLE_TOKENS, rateLimitPerMinute = 30) {
+    const journal = new MemoryEventJournal();
+    const env = engineEnvSchema.parse({
+      NODE_ENV: "test", JOURNAL_MODE: "memory", TRADING_MODE: "paper", POLYMARKET_TOKEN_IDS: "up,down",
+      GROK_MCP_BEARER_TOKENS: tokens, GROK_MCP_RATE_LIMIT_PER_MINUTE: String(rateLimitPerMinute),
+    });
+    const engine = new EngineService(env, journal, { error: () => undefined });
     const trigger = researchTrigger();
     await engine.registerTriggerForResearch(trigger);
     const server = await createApiServer({
@@ -146,7 +159,7 @@ describe("authenticated MCP HTTP", () => {
     const response = await fetch(url, {
       method: "POST",
       headers: {
-        authorization: "Bearer super-secret-token",
+        authorization: "Bearer scanner-secret",
         accept: "application/json, text/event-stream",
         "content-type": "application/json",
         "mcp-protocol-version": "2025-11-25",
@@ -170,7 +183,7 @@ describe("authenticated MCP HTTP", () => {
     try {
       expect((await rpc(configured.url, { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }, { authorization: "Bearer nope" })).status).toBe(401);
       expect((await rpc(configured.url, { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }, { origin: "https://evil.example" })).status).toBe(403);
-      const get = await fetch(configured.url, { method: "GET", headers: { authorization: "Bearer super-secret-token" } });
+      const get = await fetch(configured.url, { method: "GET", headers: { authorization: "Bearer scanner-secret" } });
       expect(get.status).toBe(405);
       const forbidden = await rpc(configured.url, { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "place_order", arguments: { marketId: "btc" } } });
       expect(forbidden.status).toBe(200);
@@ -187,7 +200,7 @@ describe("authenticated MCP HTTP", () => {
       expect((await rpc(unconfigured.url, { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} })).status).toBe(503);
     } finally { await unconfigured.server.close(); }
 
-    const limited = await listen("scanner:super-secret-token", 1);
+    const limited = await listen(ROLE_TOKENS, 1);
     try {
       const first = await rpc(limited.url, { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "place_order", arguments: {} } });
       expect(first.status).toBe(200);
@@ -217,6 +230,61 @@ describe("authenticated MCP HTTP", () => {
         params: { name: "submit_signal", arguments: { ...payload, submissionId: createId("sub2"), output: { ...microstructureOutput(), confidence: 9, placeLiveOrder: true } } },
       });
       expect(JSON.stringify(malformed.json)).toMatch(/MALFORMED_SIGNAL|error/i);
+    } finally { await ctx.server.close(); }
+  });
+
+  it("scanner token cannot impersonate fair_probability_analyst", async () => {
+    const ctx = await listen();
+    try {
+      const impersonating = submission(ctx.trigger, "fair_probability_analyst", fairOutput());
+      const result = await rpc(ctx.url, {
+        jsonrpc: "2.0", id: 1, method: "tools/call",
+        params: { name: "submit_signal", arguments: impersonating },
+      });
+      expect(JSON.stringify(result.json)).toContain("IDENTITY_CLIENT_MISMATCH");
+      expect(ctx.engine.state.grokActivity.acceptedSignals).toBe(0);
+      expect(ctx.engine.state.latestAgents.size).toBe(0);
+    } finally { await ctx.server.close(); }
+  });
+
+  it("scanner token cannot recommend_veto", async () => {
+    const ctx = await listen();
+    try {
+      const veto = submission(ctx.trigger, "risk_hedge_analyst", riskOutput({ recommendVeto: true }));
+      const result = await rpc(ctx.url, {
+        jsonrpc: "2.0", id: 1, method: "tools/call",
+        params: { name: "recommend_veto", arguments: veto },
+      });
+      expect(result.json).toMatchObject({ error: { message: "WRITE_TOOL_FORBIDDEN" } });
+      expect(ctx.engine.state.grokActivity.acceptedSignals).toBe(0);
+    } finally { await ctx.server.close(); }
+  });
+
+  it("fair_probability token cannot submit as risk_hedge_analyst", async () => {
+    const ctx = await listen();
+    try {
+      const impersonating = submission(ctx.trigger, "risk_hedge_analyst", riskOutput({ recommendVeto: true }));
+      const result = await rpc(ctx.url, {
+        jsonrpc: "2.0", id: 1, method: "tools/call",
+        params: { name: "submit_analysis", arguments: impersonating },
+      }, { authorization: "Bearer fair-secret" });
+      expect(JSON.stringify(result.json)).toContain("IDENTITY_CLIENT_MISMATCH");
+      expect(ctx.engine.state.grokActivity.acceptedSignals).toBe(0);
+    } finally { await ctx.server.close(); }
+  });
+
+  it("correct token + correct role + correct tool succeeds", async () => {
+    const ctx = await listen();
+    try {
+      const payload = submission(ctx.trigger, "market_microstructure_scanner", microstructureOutput());
+      const result = await rpc(ctx.url, {
+        jsonrpc: "2.0", id: 1, method: "tools/call",
+        params: { name: "submit_signal", arguments: payload },
+      }, { authorization: "Bearer scanner-secret" });
+      expect(result.status).toBe(200);
+      expect(JSON.stringify(result.json)).toContain("accepted");
+      expect(ctx.engine.state.grokActivity.acceptedSignals).toBe(1);
+      expect(ctx.engine.state.latestAgents.get("market_microstructure_scanner")?.agentId).toBe("market_microstructure_scanner");
     } finally { await ctx.server.close(); }
   });
 });

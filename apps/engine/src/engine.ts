@@ -234,13 +234,18 @@ export class EngineService {
   }
 
   /** The only ingress for external Grok research; it cannot create orders directly. */
-  async submitGrokSignal(raw: GrokSignalSubmission, clientId: string): Promise<{ status: "accepted" | "duplicate" | "stale" | "unknown_trigger" | "trace_mismatch" | "market_mismatch" | "replay_rejected" | "malformed"; signalId?: string }> {
+  async submitGrokSignal(raw: GrokSignalSubmission, clientId: string): Promise<{ status: "accepted" | "duplicate" | "stale" | "unknown_trigger" | "trace_mismatch" | "market_mismatch" | "replay_rejected" | "malformed" | "identity_mismatch"; signalId?: string }> {
     let submission: GrokSignalSubmission;
     try { submission = grokSignalSubmissionSchema.parse(raw); }
     catch {
       this.state.recordGrokRejection("rejected");
       this.metrics.grokSignals.inc({ agent: "unknown", status: "malformed" });
       return { status: "malformed" };
+    }
+    if (submission.agentId !== submission.role || clientId !== submission.agentId) {
+      this.state.recordGrokRejection("rejected");
+      this.metrics.grokSignals.inc({ agent: submission.agentId, status: "identity_mismatch" });
+      return { status: "identity_mismatch" };
     }
     const now = new Date();
     const trigger = this.activeTriggers.get(submission.triggerId);

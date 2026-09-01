@@ -119,7 +119,7 @@ Dashboard: `http://localhost:3000`; engine liveness/readiness/metrics: `http://l
 | `POLYMARKET_MARKET_SLUGS` | Optional comma-separated explicit live markets |
 | `POLYMARKET_TOKEN_IDS` | Optional manual public token IDs; missing fee metadata will veto fills |
 | `BTC_WS_URL`, `BTC_SYMBOL` | Public BTC feed; defaults to Binance aggTrade on `data-stream.binance.vision` (the `stream.binance.com` host returns HTTP 451 from some regions) |
-| `GROK_MCP_BEARER_TOKENS` | Engine-only `clientId:token` list. Dashboard never receives it. Token fingerprints, not raw tokens, are audited. |
+| `GROK_MCP_BEARER_TOKENS` | Engine-only `roleId:token` list. `clientId` must be a Grok role ID and is bound to writes (`clientId === agentId === role`). Dashboard never receives it. Token fingerprints, not raw tokens, are audited. |
 | `GROK_MCP_ALLOWED_ORIGINS` | Allowed `Origin` values; missing Origin is allowed for server-side Grok clients. Default `https://grok.com,https://x.ai` |
 | `GROK_MCP_RATE_LIMIT_PER_MINUTE` | Per-client MCP request cap, default `60` |
 | `ESTIMATED_INFRA_COST_PER_HOUR_USD` | Accrued into economic PnL |

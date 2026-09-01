@@ -28,6 +28,8 @@
 ### Assumptions and open blockers
 
 - Grok Bots are external MCP clients; this repository does not create or provision xAI credentials and does not call an xAI inference API.
+- Write identity is bound server-side: authenticated `clientId` (the `GROK_MCP_BEARER_TOKENS` left-hand role ID) must equal `submission.agentId` and `submission.role`, and the write tool must be in that role’s allow-list. Tokens cannot impersonate another role.
+- Official Grok Bot docs (2026-09-01) do not document a custom inbound webhook that can wake a Bot from a Polymarket trigger. MCP `/mcp` is pull-only. Supported Bot starts are: human/`@` message, scheduled routines, or Cursor Slack/GitHub account-integration events. This engine implements none of those wake-ups (no Slack/GitHub posting, no xAI API). See `docs/GROK_BOT.md`.
 - Initial machine-to-machine authentication uses operator-managed high-entropy bearer tokens supplied only to the engine as secrets. Token fingerprints—not raw tokens—are audited. OAuth-protected-resource discovery can be added later if the deployed Grok client requires delegated user authorization.
 - A single Fly engine Machine remains the supported topology; in-memory rate/idempotency caches are backed by durable journal checks where required but horizontally shared rate limits need Redis/PostgreSQL advisory coordination before scaling.
 - Docker/Fly CLIs: Fly CLI can be installed, but `fly config validate --strict` requires a logged-in access token. Docker is not installed and `docker.io` is not available from apt in this environment. Strict Fly and container builds remain explicit deployment gates.
@@ -35,7 +37,7 @@
 ### Test strategy
 
 - Preserve all deterministic math, risk, execution, checkpoint/recovery, paper-only and dashboard build tests.
-- Add MCP protocol/auth tests, per-client rate-limit behavior, tool input/output schemas, redacted audit events, malformed role output, duplicate idempotency key, stale signal rejection, unavailable-Grok monitoring continuity, and forbidden/unknown trade tool rejection.
+- Add MCP protocol/auth tests, per-client rate-limit behavior, token-to-role identity binding and impersonation rejection, tool input/output schemas, redacted audit events, malformed role output, duplicate idempotency key, stale signal rejection, unavailable-Grok monitoring continuity, and forbidden/unknown trade tool rejection.
 - Acceptance remains: external text or malformed Grok data cannot become a paper order without schema validation, fresh consensus, deterministic calculations, and absolute risk approval.
 
 ### Fly deployment strategy

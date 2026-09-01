@@ -60,10 +60,44 @@ if (externalAgentRoleDefinitions.length !== 6 || new Set(externalAgentRoleDefini
 export const grokWriteToolNames = ["submit_signal", "submit_analysis", "recommend_hedge", "recommend_veto"] as const;
 export type GrokWriteToolName = (typeof grokWriteToolNames)[number];
 
+/** Authenticated MCP clientId must be this role ID; only these write tools are legal for that token. */
+export const grokRoleWriteTools = {
+  market_microstructure_scanner: ["submit_signal"],
+  crypto_market_scanner: ["submit_signal"],
+  news_x_intelligence_scanner: ["submit_signal"],
+  fair_probability_analyst: ["submit_analysis"],
+  risk_hedge_analyst: ["recommend_hedge", "recommend_veto"],
+  strategy_supervisor: ["submit_signal"],
+} as const satisfies Record<ExternalAgentRoleId, readonly GrokWriteToolName[]>;
+
 export class GrokSignalValidationError extends Error {
   constructor(readonly code: string, message = code) {
     super(message);
     this.name = "GrokSignalValidationError";
+  }
+}
+
+export function writeToolsForClient(clientId: string): readonly GrokWriteToolName[] {
+  const role = externalAgentRoleIdSchema.safeParse(clientId);
+  return role.success ? grokRoleWriteTools[role.data] : [];
+}
+
+export function clientMayCallWriteTool(clientId: string, tool: string): boolean {
+  return (writeToolsForClient(clientId) as readonly string[]).includes(tool);
+}
+
+export function assertGrokWriteAuthorization(clientId: string, tool: string, submission: GrokSignalSubmission): void {
+  if (submission.agentId !== submission.role) {
+    throw new GrokSignalValidationError("IDENTITY_ROLE_MISMATCH", "agentId and role must be identical");
+  }
+  if (clientId !== submission.agentId) {
+    throw new GrokSignalValidationError(
+      "IDENTITY_CLIENT_MISMATCH",
+      `authenticated clientId ${clientId} cannot submit as ${submission.agentId}`,
+    );
+  }
+  if (!clientMayCallWriteTool(clientId, tool)) {
+    throw new GrokSignalValidationError("WRITE_TOOL_FORBIDDEN", `${clientId} cannot call ${tool}`);
   }
 }
 
@@ -76,26 +110,19 @@ export function validateGrokSignalSubmission(value: unknown): GrokSignalSubmissi
 }
 
 /** Maps the four limited MCP write tools onto the same Zod-validated inbox payload. */
-export function parseGrokWritePayload(tool: string, raw: unknown): GrokSignalSubmission {
+export function parseGrokWritePayload(tool: string, raw: unknown, clientId: string): GrokSignalSubmission {
   if (!(grokWriteToolNames as readonly string[]).includes(tool)) {
     throw new GrokSignalValidationError("UNKNOWN_WRITE_TOOL", `Unsupported write tool: ${tool}`);
   }
   const parsed = grokSignalSubmissionSchema.safeParse(raw);
   if (!parsed.success) throw parsed.error;
   const submission = parsed.data;
-  if (tool === "submit_analysis" && submission.agentId !== "fair_probability_analyst") {
-    throw new GrokSignalValidationError("WRITE_TOOL_ROLE_MISMATCH", "submit_analysis requires fair_probability_analyst");
+  assertGrokWriteAuthorization(clientId, tool, submission);
+  if (tool === "recommend_veto" && submission.agentId === "risk_hedge_analyst" && submission.output.recommendVeto !== true) {
+    throw new GrokSignalValidationError("VETO_RECOMMENDATION_REQUIRED");
   }
-  if (tool === "recommend_veto" || tool === "recommend_hedge") {
-    if (submission.agentId !== "risk_hedge_analyst") {
-      throw new GrokSignalValidationError("WRITE_TOOL_ROLE_MISMATCH", `${tool} requires risk_hedge_analyst`);
-    }
-    if (tool === "recommend_veto" && submission.output.recommendVeto !== true) {
-      throw new GrokSignalValidationError("VETO_RECOMMENDATION_REQUIRED");
-    }
-    if (tool === "recommend_hedge" && submission.output.recommendVeto === true) {
-      throw new GrokSignalValidationError("HEDGE_TOOL_CANNOT_VETO");
-    }
+  if (tool === "recommend_hedge" && submission.agentId === "risk_hedge_analyst" && submission.output.recommendVeto === true) {
+    throw new GrokSignalValidationError("HEDGE_TOOL_CANNOT_VETO");
   }
   return submission;
 }

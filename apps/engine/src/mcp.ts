@@ -7,6 +7,7 @@ import {
   createId,
   grokSignalSubmissionSchema,
   parseGrokWritePayload,
+  clientMayCallWriteTool,
   GrokSignalValidationError,
   type GrokSignalSubmission,
 } from "@pm/core";
@@ -166,6 +167,21 @@ export function createMcpHttpHandler(config: McpConfig, dependencies: McpDepende
       return reply.header("Allow", "POST").code(405).send({ error: "METHOD_NOT_ALLOWED" });
     }
 
+    if (toolName && ALLOWED_MCP_WRITE_TOOLS.includes(toolName as (typeof ALLOWED_MCP_WRITE_TOOLS)[number]) && !clientMayCallWriteTool(auth.clientId, toolName)) {
+      dependencies.state.recordGrokRejection("rejected");
+      dependencies.metrics.mcpInteractions.inc({ status: "write_tool_forbidden", method });
+      await audit(dependencies.journal, {
+        clientId: auth.clientId, tokenFingerprint: auth.tokenFingerprint, method, tool: toolName, requestId,
+        status: "WRITE_TOOL_FORBIDDEN", rateLimitResult: "ok", durationMs: performance.now() - started,
+        payloadMeta: { argumentKeys: argumentKeys(request.body), agentId: auth.clientId },
+      });
+      return reply.code(200).send({
+        jsonrpc: "2.0",
+        id: requestId,
+        error: { code: -32601, message: "WRITE_TOOL_FORBIDDEN" },
+      });
+    }
+
     if (toolName && !ALLOWED_MCP_TOOLS.has(toolName)) {
       const forbidden = FORBIDDEN_MCP_TRADE_TOOLS.has(toolName) || looksLikeTradeTool(toolName);
       const status = forbidden ? "FORBIDDEN_TRADE_TOOL" : "UNKNOWN_TOOL";
@@ -276,7 +292,7 @@ export function createGrokMcpServer(clientId: string, dependencies: McpDependenc
 
   const writeHandler = (tool: (typeof ALLOWED_MCP_WRITE_TOOLS)[number]) => async (raw: Record<string, unknown>) => {
     try {
-      const submission = parseGrokWritePayload(tool, raw);
+      const submission = parseGrokWritePayload(tool, raw, clientId);
       const result = await dependencies.submitSignal(submission, clientId);
       return toolResult(result);
     } catch (error) {
