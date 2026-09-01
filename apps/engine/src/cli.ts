@@ -60,6 +60,22 @@ if (command === "experiment:start") {
   const ledger = new PaperLedger(1000, now);
   const position = ledger.applyFill(fill);
   console.log(JSON.stringify({ ok: true, traceId, consensus: consensus.consensusDirection, fillPrice: fill.fillPrice, feeUsd: fill.feeUsd, cash: ledger.snapshot().cash, position }, null, 2));
+} else if (command === "live-discovery-diag") {
+  const market = new PolymarketMarketDataAdapter();
+  const report = await market.discoverCryptoMarkets([], 40);
+  const closestDirectional = market.closestDirectional(report, 20);
+  console.log(JSON.stringify({
+    discoveredMarkets: report.discovered.length,
+    qualifiedMarkets: report.qualified.map((item) => ({
+      id: item.id, slug: item.slug, asset: item.asset, endDate: item.endDate, endDateSource: item.endDateSource,
+      remainingDurationMs: item.remainingDurationMs, tokens: item.tokens,
+    })),
+    closestDirectional,
+    rejectedReasonCounts: Object.fromEntries(report.rejected.flatMap((item) => item.reasonCodes).reduce((map, code) => {
+      map.set(code, (map.get(code) ?? 0) + 1);
+      return map;
+    }, new Map<string, number>())),
+  }, null, 2));
 } else if (command === "live-feed-smoke") {
   const abort = new AbortController();
   const market = new PolymarketMarketDataAdapter();
@@ -123,6 +139,7 @@ if (command === "experiment:start") {
     assets,
     tokenSubscriptions: subscribeTokenIds.length,
     connectivityProbe,
+    closestDirectional: market.closestDirectional(report, 20),
     referenceFeeds: referenceResolutions,
     polymarketMessages,
     referenceMessages,
@@ -132,5 +149,5 @@ if (command === "experiment:start") {
   console.log(JSON.stringify(result, null, 2));
   if (!result.ok) process.exitCode = 1;
 } else {
-  console.log("Usage: tsx src/cli.ts <smoke|live-feed-smoke|experiment:start|report>");
+  console.log("Usage: tsx src/cli.ts <smoke|live-feed-smoke|live-discovery-diag|experiment:start|report>");
 }

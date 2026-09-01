@@ -51,6 +51,10 @@ export function extractUnderlyingAsset(slug: string, title: string, tags: readon
   return null;
 }
 
+export function isDirectionalListing(slug: string, title: string): boolean {
+  return DIRECTIONAL_SLUG.test(slug) || DIRECTIONAL_TEXT.test(`${slug} ${title}`);
+}
+
 export function isCryptoCategory(tags: readonly string[], slug: string, title: string): boolean {
   if (tags.some((tag) => CRYPTO_CATEGORY_TAG.test(tag))) return true;
   if (DIRECTIONAL_SLUG.test(slug)) return true;

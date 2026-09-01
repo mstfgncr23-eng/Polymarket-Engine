@@ -78,6 +78,7 @@ export class EngineService {
   private readonly marketsById = new Map<string, DiscoveredMarket>();
   private readonly assetByMarket = new Map<string, string | null>();
   private readonly referenceRequired = new Map<string, boolean>();
+  private readonly referenceRetryTimers = new Map<string, NodeJS.Timeout>();
   private tokenIds: string[] = [];
   private marketLoopStarted = false;
   private experiment: ExperimentManifest | null = null;
@@ -166,6 +167,8 @@ export class EngineService {
     this.state.ready = false;
     this.record("ENGINE_DRAINING", this.experiment?.id ?? "engine", null, {});
     this.abort.abort("SIGTERM");
+    for (const timer of this.referenceRetryTimers.values()) clearTimeout(timer);
+    this.referenceRetryTimers.clear();
     if (this.maintenanceTimer) clearInterval(this.maintenanceTimer);
     if (this.discoveryTimer) clearInterval(this.discoveryTimer);
     this.accrueInfrastructureCost();
@@ -263,6 +266,7 @@ export class EngineService {
     for (const asset of removedAssets) {
       this.triggerEngine.dropAsset(asset);
       this.state.dropReference(asset);
+      this.clearReferenceRetry(asset);
     }
     for (const [triggerId, trigger] of [...this.activeTriggers]) {
       if (!trigger.marketId || !removedMarkets.includes(trigger.marketId)) continue;
@@ -303,8 +307,10 @@ export class EngineService {
           payload: { asset, reason: resolution.reason, status: resolution.status, detail: resolution.detail ?? null, retryAfterMs: resolution.retryAfterMs ?? null },
         }));
         this.record("REFERENCE_PROBE_TRANSIENT", createId("trace"), null, { asset, detail: resolution.detail ?? null }, asset);
+        this.scheduleReferenceRetry(asset, resolution.retryAfterMs);
         continue;
       }
+      this.clearReferenceRetry(asset);
       for (const marketId of markets) this.referenceRequired.set(marketId, true);
       const outcome = await this.referenceRegistry.ensureRunning(asset, {
         onTick: (tick) => this.onReferenceTick(tick),
@@ -322,6 +328,30 @@ export class EngineService {
         this.record("REFERENCE_FEED_STARTED", createId("trace"), null, { asset, markets }, asset);
       }
     }
+  }
+
+  private scheduleReferenceRetry(asset: string, retryAfterMs: number | undefined): void {
+    this.clearReferenceRetry(asset);
+    if (this.abort.signal.aborted) return;
+    if (![...this.assetByMarket.values()].includes(asset)) return;
+    const delayMs = Math.max(50, Math.min(retryAfterMs ?? 30_000, 60_000));
+    const timer = setTimeout(() => { void this.retryTransientReference(asset); }, delayMs);
+    timer.unref();
+    this.referenceRetryTimers.set(asset, timer);
+  }
+
+  private clearReferenceRetry(asset: string): void {
+    const timer = this.referenceRetryTimers.get(asset);
+    if (!timer) return;
+    clearTimeout(timer);
+    this.referenceRetryTimers.delete(asset);
+  }
+
+  private async retryTransientReference(asset: string): Promise<void> {
+    this.referenceRetryTimers.delete(asset);
+    if (this.abort.signal.aborted || this.state.draining) return;
+    if (![...this.assetByMarket.values()].includes(asset)) return;
+    await this.reconcileReferenceFeeds();
   }
 
   private async initializeJournalWithRetry(): Promise<void> {

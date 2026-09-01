@@ -2,9 +2,11 @@ import { createPublicClient } from "@polymarket/client";
 import {
   createId,
   impliedSpread,
+  isDirectionalListing,
   marketSnapshotSchema,
   qualifyMarket,
   qualificationConfigSchema,
+  type BinaryNormalization,
   type MarketSnapshot,
   type QualificationConfig,
   type QualificationReasonCode,
@@ -19,6 +21,8 @@ export interface DiscoveredMarket {
   title: string;
   asset: string | null;
   endDate: string | null;
+  endDateSource?: string;
+  remainingDurationMs?: number | null;
   active: boolean;
   tokens: Array<{ tokenId: string; outcome: "UP" | "DOWN"; price: string | null }>;
   feeSchedule: MarketSnapshot["feeSchedule"];
@@ -26,6 +30,22 @@ export interface DiscoveredMarket {
   spread: number | null;
   qualification: QualificationResult;
   raw: Record<string, unknown>;
+}
+
+export interface DirectionalMarketDiagnostic {
+  slug: string;
+  asset: string | null;
+  parsedEndDate: string | null;
+  endDateSource: string;
+  remainingDurationMs: number | null;
+  active: boolean;
+  closed: boolean;
+  acceptingOrders: boolean;
+  binary: BinaryNormalization;
+  liquidityUsd: string | null;
+  spread: number | null;
+  feeStatus: "known" | "unknown" | "zero";
+  reasonCodes: QualificationReasonCode[];
 }
 
 export interface FeedConnectionEvent {
@@ -77,7 +97,7 @@ export class PolymarketMarketDataAdapter {
     if (slugs.length > 0) {
       for (const slug of slugs) rawMarkets.push(await this.client.fetchMarket({ slug }));
     } else {
-      rawMarkets.push(...await this.listCryptoEventMarkets());
+      rawMarkets.push(...await this.listCryptoEventMarkets(now, config));
     }
     const seen = new Map<string, string>();
     const discovered: DiscoveredMarket[] = [];
@@ -89,7 +109,7 @@ export class PolymarketMarketDataAdapter {
         continue;
       }
       const result = qualifyMarket(candidate.input, seen, now, config);
-      const market = toDiscoveredMarket(candidate, result);
+      const market = toDiscoveredMarket(candidate, result, now);
       discovered.push(market);
       if (result.qualified) {
         const tokenKey = market.tokens.map((token) => token.tokenId).sort().join(":");
@@ -100,8 +120,13 @@ export class PolymarketMarketDataAdapter {
         rejected.push({ id: market.id, slug: market.slug, title: market.title, reasonCodes: result.reasonCodes });
       }
     }
+    discovered.sort((left, right) => (left.remainingDurationMs ?? Number.POSITIVE_INFINITY) - (right.remainingDurationMs ?? Number.POSITIVE_INFINITY));
     const qualified = discovered.filter((market) => market.qualification.qualified).slice(0, config.maxQualifiedMarkets);
     return { discovered, qualified, rejected };
+  }
+
+  closestDirectional(report: DiscoveryReport, limit = 20): DirectionalMarketDiagnostic[] {
+    return closestDirectionalDiagnostics(report, limit);
   }
 
   /** @deprecated Use discoverCryptoMarkets. */
@@ -110,10 +135,19 @@ export class PolymarketMarketDataAdapter {
     return report.qualified;
   }
 
-  private async listCryptoEventMarkets(): Promise<unknown[]> {
+  private async listCryptoEventMarkets(now: Date, config: QualificationConfig): Promise<unknown[]> {
     const seen = new Set<string>();
     const markets: unknown[] = [];
-    const paginator = this.client.listEvents({ closed: false, tagSlug: "crypto", pageSize: 50, relatedTags: true });
+    const paginator = this.client.listEvents({
+      closed: false,
+      tagSlug: "crypto",
+      relatedTags: true,
+      pageSize: 50,
+      order: "endDate",
+      ascending: true,
+      endDateMin: new Date(now.getTime() - Math.min(60_000, config.minRemainingDurationMs)),
+      endDateMax: new Date(now.getTime() + config.maxRemainingDurationMs),
+    });
     let pages = 0;
     for await (const page of paginator) {
       for (const event of page.items as Array<Record<string, unknown>>) {
@@ -126,14 +160,14 @@ export class PolymarketMarketDataAdapter {
         }
       }
       pages += 1;
-      if (pages >= 8 || !page.hasMore || markets.length >= 400) break;
+      if (pages >= 24 || !page.hasMore || markets.length >= 800) break;
     }
     return markets;
   }
 
   registerManualToken(tokenId: string, marketId = tokenId, outcome: "UP" | "DOWN" = "UP", asset: string | null = null): void {
     this.marketsByToken.set(tokenId, {
-      id: marketId, slug: marketId, question: marketId, title: marketId, asset, endDate: null, active: true,
+      id: marketId, slug: marketId, question: marketId, title: marketId, asset, endDate: null, endDateSource: "manual", remainingDurationMs: null, active: true,
       tokens: [{ tokenId, outcome, price: null }], feeSchedule: null, liquidityUsd: null, spread: null,
       qualification: {
         qualified: true, reasonCodes: ["QUALIFIED"], asset, crypto: true,
@@ -289,6 +323,7 @@ interface ParsedCandidate {
   input: Parameters<typeof qualifyMarket>[0];
   feeSchedule: MarketSnapshot["feeSchedule"];
   raw: Record<string, unknown>;
+  endDateSource: string;
 }
 
 function toQualificationInput(raw: unknown): ParsedCandidate | null {
@@ -304,7 +339,7 @@ function toQualificationInput(raw: unknown): ParsedCandidate | null {
   const trading = value.trading as Record<string, unknown> | undefined;
   const metrics = value.metrics as Record<string, unknown> | undefined;
   const prices = value.prices as Record<string, unknown> | undefined;
-  const rawFee = trading?.feeSchedule as Record<string, unknown> | null | undefined;
+  const rawFee = (trading?.feeSchedule ?? value.feeSchedule) as Record<string, unknown> | null | undefined;
   const feesEnabled = trading?.feesEnabled === true || value.feesEnabled === true;
   const feeSchedule = feesEnabled && rawFee ? {
     rate: String(rawFee.rate), exponent: Number(rawFee.exponent), takerOnly: Boolean(rawFee.takerOnly),
@@ -313,10 +348,13 @@ function toQualificationInput(raw: unknown): ParsedCandidate | null {
     rate: "0", exponent: 1, takerOnly: true, rebateRate: "0", source: "market_fee_schedule" as const, effectiveAt: new Date().toISOString(),
   };
   const tags = collectTags(value);
+  const configAsset = cryptoConfigAsset(value);
+  if (configAsset) tags.push(configAsset);
   const yesPrice = nullableString(outcomes?.yes?.price) ?? firstPrice(value, 0);
   const noPrice = nullableString(outcomes?.no?.price) ?? firstPrice(value, 1);
   const liquidity = nullableString(metrics?.liquidityNum ?? metrics?.liquidity ?? trading?.liquidity ?? value.liquidityNum ?? value.liquidity);
   const acceptingOrders = state?.acceptingOrders !== false && value.acceptingOrders !== false && state?.enableOrderBook !== false;
+  const resolvedEnd = resolveMarketEndDate(value);
   return {
     feeSchedule,
     raw: value,
@@ -328,23 +366,27 @@ function toQualificationInput(raw: unknown): ParsedCandidate | null {
       active: state?.active === true || value.active === true,
       closed: state?.closed === true || value.closed === true,
       acceptingOrders,
-      endDate: nullableString(state?.endDate ?? value.endDateIso ?? value.endDate),
+      endDate: resolvedEnd.iso,
       yesTokenId: yesToken ?? (Array.isArray(value.clobTokenIds) ? String((value.clobTokenIds as unknown[])[0]) : null),
       noTokenId: noToken ?? (Array.isArray(value.clobTokenIds) ? String((value.clobTokenIds as unknown[])[1]) : null),
       yesPrice, noPrice, liquidityUsd: liquidity, spread: numberOrNull(prices?.spread) ?? impliedSpread(yesPrice, noPrice) ?? numberOrNull(value.spread),
       feeSchedule, feesUnknown: feesEnabled && rawFee == null,
       yesLabel: outcomeLabel(value, 0, outcomes?.yes), noLabel: outcomeLabel(value, 1, outcomes?.no),
     },
+    endDateSource: resolvedEnd.source,
   };
 }
 
-function toDiscoveredMarket(candidate: ParsedCandidate, qualification: QualificationResult): DiscoveredMarket {
+function toDiscoveredMarket(candidate: ParsedCandidate, qualification: QualificationResult, now = new Date()): DiscoveredMarket {
   const input = candidate.input;
   const yesOutcome = qualification.binary.yesOutcome ?? "UP";
   const noOutcome = qualification.binary.noOutcome ?? "DOWN";
+  const remaining = input.endDate ? new Date(input.endDate).getTime() - now.getTime() : null;
   return {
     id: input.id, slug: input.slug, question: input.title, title: input.title, asset: qualification.asset,
-    endDate: input.endDate, active: input.active && !input.closed,
+    endDate: input.endDate, endDateSource: candidate.endDateSource,
+    remainingDurationMs: remaining !== null && Number.isFinite(remaining) ? remaining : null,
+    active: input.active && !input.closed,
     tokens: [
       { tokenId: input.yesTokenId ?? "", outcome: yesOutcome, price: input.yesPrice },
       { tokenId: input.noTokenId ?? "", outcome: noOutcome, price: input.noPrice },
@@ -434,4 +476,87 @@ function levelsToMap(value: unknown): Map<string, string> {
 function sortedLevels(map: Map<string, string>, order: "asc" | "desc") {
   return [...map.entries()].sort(([a], [b]) => order === "asc" ? Number(a) - Number(b) : Number(b) - Number(a))
     .map(([price, quantity]) => ({ price, quantity }));
+}
+
+const SLUG_WINDOW = /(?:^|-)([a-z0-9]{2,16})-updown-(\d+)([mh])-(\d{10,})(?:-|$)/i;
+
+export function resolveMarketEndDate(value: Record<string, unknown>): { iso: string | null; source: string } {
+  const event = value.event && typeof value.event === "object" ? value.event as Record<string, unknown> : undefined;
+  const state = value.state && typeof value.state === "object" ? value.state as Record<string, unknown> : undefined;
+  const eventState = event?.state && typeof event.state === "object" ? event.state as Record<string, unknown> : undefined;
+  const schedule = value.schedule && typeof value.schedule === "object" ? value.schedule as Record<string, unknown> : undefined;
+  const eventSchedule = event?.schedule && typeof event.schedule === "object" ? event.schedule as Record<string, unknown> : undefined;
+  const candidates: Array<[unknown, string]> = [
+    [state?.endDate, "state.endDate"],
+    [value.endDate, "endDate"],
+    [schedule?.endDate, "schedule.endDate"],
+    [eventState?.endDate, "event.state.endDate"],
+    [event?.endDate, "event.endDate"],
+    [eventSchedule?.endDate, "event.schedule.endDate"],
+  ];
+  for (const [raw, source] of candidates) {
+    const iso = coerceDateTime(raw);
+    if (iso) return { iso, source };
+  }
+  const slug = String(value.slug ?? event?.slug ?? "");
+  const fromSlug = endDateFromDirectionalSlug(slug);
+  if (fromSlug) return fromSlug;
+  return { iso: null, source: "missing" };
+}
+
+function coerceDateTime(value: unknown): string | null {
+  if (value instanceof Date && Number.isFinite(value.getTime())) return value.toISOString();
+  if (typeof value !== "string" || value.trim().length === 0) return null;
+  const text = value.trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(text)) return null;
+  const parsed = Date.parse(text);
+  if (!Number.isFinite(parsed)) return null;
+  return new Date(parsed).toISOString();
+}
+
+export function endDateFromDirectionalSlug(slug: string): { iso: string; source: "slug_window" } | null {
+  const match = slug.match(SLUG_WINDOW);
+  if (!match) return null;
+  const amount = Number(match[2]);
+  const unit = match[3]?.toLowerCase();
+  const startUnix = Number(match[4]);
+  if (!unit || !Number.isFinite(amount) || amount <= 0 || !Number.isFinite(startUnix)) return null;
+  const durationSeconds = unit === "h" ? amount * 3_600 : amount * 60;
+  if (durationSeconds <= 0 || startUnix % durationSeconds !== 0) return null;
+  return { iso: new Date((startUnix + durationSeconds) * 1_000).toISOString(), source: "slug_window" };
+}
+
+function cryptoConfigAsset(value: Record<string, unknown>): string | null {
+  const direct = value.cryptoMarketConfig;
+  const nested = value.event && typeof value.event === "object" ? (value.event as Record<string, unknown>).cryptoMarketConfig : undefined;
+  for (const raw of [direct, nested]) {
+    if (!raw || typeof raw !== "object") continue;
+    const asset = nullableString((raw as Record<string, unknown>).asset);
+    if (asset) return asset.toUpperCase();
+  }
+  return null;
+}
+
+export function closestDirectionalDiagnostics(report: DiscoveryReport, limit = 20): DirectionalMarketDiagnostic[] {
+  return report.discovered
+    .filter((market) => isDirectionalListing(market.slug, market.title) || isDirectionalListing(market.slug, market.question))
+    .toSorted((left, right) => (left.remainingDurationMs ?? Number.POSITIVE_INFINITY) - (right.remainingDurationMs ?? Number.POSITIVE_INFINITY))
+    .slice(0, limit)
+    .map((market) => ({
+      slug: market.slug,
+      asset: market.asset,
+      parsedEndDate: market.endDate,
+      endDateSource: market.endDateSource ?? "unknown",
+      remainingDurationMs: market.remainingDurationMs ?? null,
+      active: market.active,
+      closed: market.qualification.reasonCodes.includes("MARKET_CLOSED"),
+      acceptingOrders: market.active && !market.qualification.reasonCodes.includes("MARKET_INACTIVE"),
+      binary: market.qualification.binary,
+      liquidityUsd: market.liquidityUsd,
+      spread: market.spread,
+      feeStatus: market.qualification.reasonCodes.includes("UNKNOWN_FEE_SCHEDULE")
+        ? "unknown"
+        : market.feeSchedule && Number(market.feeSchedule.rate) === 0 ? "zero" : "known",
+      reasonCodes: market.qualification.reasonCodes,
+    }));
 }

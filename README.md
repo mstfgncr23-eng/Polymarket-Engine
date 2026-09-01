@@ -36,7 +36,11 @@ Every important event carries a `traceId`. Journal/dashboard records also carry 
 
 ## Discovery and qualification
 
-On a timer (`DISCOVERY_INTERVAL_MS`, default 5 minutes) the engine lists open Polymarket crypto-tagged events (or optional `POLYMARKET_MARKET_SLUGS`) and runs `qualifyMarket`. There is **no BTC/ETH/SOL/XRP/DOGE allow-list**. Crypto classification uses category tags and `{ticker}-updown` slug patterns. Per market the engine records `marketId`, slug, title, underlying asset if identifiable, outcome token IDs, binary outcomes, expiry, fee metadata, liquidity, and spread.
+On a timer (`DISCOVERY_INTERVAL_MS`, default 5 minutes) the engine lists open Polymarket crypto-tagged events through the official client `listEvents` (or optional `POLYMARKET_MARKET_SLUGS`) and runs `qualifyMarket`. Listing is **not** an unbounded crypto catalog scrape: it requests `order=endDate`, `ascending=true`, and `endDateMin`/`endDateMax` matching the qualification remaining-duration window so current and next short-duration Up/Down windows are actually returned. There is **no BTC/ETH/SOL/XRP/DOGE allow-list**. Crypto classification uses category tags and `{ticker}-updown` slug patterns. Per market the engine records `marketId`, slug, title, underlying asset if identifiable, outcome token IDs, binary outcomes, expiry, fee metadata, liquidity, and spread.
+
+Window expiry comes from the official client `market.state.endDate` (Gamma `endDate` datetime). `endDateIso` is a calendar date only and is never used as the tradable window. If that datetime is missing, a `{ticker}-updown-{tf}-{unix}` slug is used only when the unix suffix is aligned to the documented window length (the live 5m/15m series format). The engine does not invent UP/DOWN labels.
+
+`pnpm --filter @pm/engine exec tsx src/cli.ts live-discovery-diag` prints the closest 20 directional crypto markets by expiry with slug, asset, parsed endDate, remaining duration, book/fee flags, binary semantics, and qualification reason codes.
 
 Zero qualified markets at startup is valid. The engine stays up, keeps the database/health/dashboard available, and keeps scanning. Dynamically discovered markets **cannot qualify without a deterministic underlying asset**. The engine does not guess tickers. Manual `POLYMARKET_TOKEN_IDS` fixtures remain separately supported. Asset exposure is aggregated only among markets that share a known asset; unknown identity never silently falls back to per-market exposure.
 
@@ -68,7 +72,7 @@ State is isolated by `marketId` / `tokenId` / underlying asset: books, snapshots
 
 `ReferencePriceFeedAdapter` + `ReferenceFeedRegistry` share **one WebSocket per underlying asset**. Mapping is algorithmic (`BTC` → `BTCUSDT` is an example of `{ASSET}USDT`, not a closed list). “All crypto markets” means Polymarket crypto prediction markets first; reference feeds open **only** for assets those qualifying markets need.
 
-Reference symbol probes distinguish `SUPPORTED`, `UNSUPPORTED_DEFINITIVE`, and `TRANSIENT_FAILURE`. Timeouts, network errors, and HTTP 5xx/429 are transient: they are not permanently cached, they fail closed (`referenceRequired` stays true so paper execution cannot proceed without a live reference), and the next discovery cycle can recover without a process restart. Only a definitive unsupported listing (invalid/unlisted symbol) is cached as Polymarket-only (`referenceRequired=false`).
+Reference symbol probes distinguish `SUPPORTED`, `UNSUPPORTED_DEFINITIVE`, and `TRANSIENT_FAILURE`. Timeouts, network errors, and HTTP 5xx/429 are transient: they are not permanently cached, they fail closed (`referenceRequired` stays true so paper execution cannot proceed without a live reference), and an independent bounded retry timer recovers the feed without waiting for the discovery interval or a process restart. Only a definitive unsupported listing (invalid/unlisted symbol) is cached as Polymarket-only (`referenceRequired=false`).
 
 `/ready` means the engine process is alive, not draining, and PostgreSQL is up. It does **not** require a qualifying market or a Polymarket WebSocket message. Zero currently qualifying markets is a scanner idle state (`discoveryStatus=ZERO_QUALIFIED`), not a crash: discovery continues on `DISCOVERY_INTERVAL_MS`, no market WS is opened until tokens exist, and no paper trade is fabricated. `/health` remains process-liveness. A failed reference feed does **not** keep the whole engine unready.
 
@@ -226,6 +230,7 @@ pnpm test                  # unit, integration-boundary, MCP/auth, malicious-out
 pnpm build                 # engine bundle + standalone Next dashboard
 pnpm smoke                 # deterministic fixture: consensus -> fill -> ledger
 pnpm smoke:live            # public Polymarket crypto discovery + reference feeds; no orders/agents
+pnpm --filter @pm/engine smoke:discovery  # closest 20 directional crypto markets by expiry
 pnpm report                # rebuild reports/48h-summary.{json,md} from DATABASE_URL journal
 ```
 
