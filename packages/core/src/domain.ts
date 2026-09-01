@@ -134,6 +134,7 @@ export const qualificationReasonCodeSchema = z.enum([
   "INVALID_PRICE",
   "STALE_FEED",
   "DUPLICATE_MARKET",
+  "UNKNOWN_UNDERLYING_ASSET",
   "REFERENCE_UNSUPPORTED",
   "REFERENCE_DEGRADED",
 ]);

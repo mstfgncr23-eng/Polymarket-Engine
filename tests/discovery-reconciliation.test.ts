@@ -111,10 +111,10 @@ class ScriptedReferenceRegistry {
   private readonly running = new Map<string, ReferenceFeedHandlers>();
 
   async resolve(asset: string): Promise<ReferenceResolution> {
-    return { asset, supported: true, symbol: `${asset}USDT`, url: `wss://example/${asset.toLowerCase()}`, reason: "RESOLVED" };
+    return { asset, supported: true, symbol: `${asset}USDT`, url: `wss://example/${asset.toLowerCase()}`, reason: "RESOLVED", status: "SUPPORTED" };
   }
   adapterFor(): null { return null; }
-  async ensureRunning(asset: string, handlers: ReferenceFeedHandlers, _signal: AbortSignal): Promise<"started" | "already" | "unsupported"> {
+  async ensureRunning(asset: string, handlers: ReferenceFeedHandlers, _signal: AbortSignal): Promise<"started" | "already" | "unsupported" | "transient"> {
     if (this.running.has(asset)) return "already";
     if (this.failNext.has(asset)) {
       this.failNext.delete(asset);

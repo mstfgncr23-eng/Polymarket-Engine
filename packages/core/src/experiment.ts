@@ -60,8 +60,23 @@ export interface ExperimentSummary {
   modelInvocationCounts: Record<string, number>;
   modelCostByAgentUsd: Record<string, number>;
   performanceByAgentSignal: Record<string, unknown>;
-  performanceByMarket: Record<string, unknown>;
-  performanceByAsset: Record<string, unknown>;
+  /** Real trading attribution from fills/risk — not journal event volume. */
+  performanceByMarket: Record<string, MarketAssetAttribution>;
+  performanceByAsset: Record<string, MarketAssetAttribution>;
+  eventCountByMarket: Record<string, number>;
+  eventCountByAsset: Record<string, number>;
+  pnlByMarket: Record<string, number>;
+  pnlByAsset: Record<string, number>;
+  fillsByMarket: Record<string, number>;
+  fillsByAsset: Record<string, number>;
+  feesByMarket: Record<string, number>;
+  feesByAsset: Record<string, number>;
+  slippageByMarket: Record<string, number>;
+  slippageByAsset: Record<string, number>;
+  opportunitiesByMarket: Record<string, number>;
+  opportunitiesByAsset: Record<string, number>;
+  vetoesByMarket: Record<string, number>;
+  vetoesByAsset: Record<string, number>;
   performanceByMarketRegime: Record<string, unknown>;
   performanceByHour: Record<string, unknown>;
   rejectedTradesThatWouldHaveWon: number;
@@ -69,6 +84,17 @@ export interface ExperimentSummary {
   failureStatistics: Record<string, number>;
   hedgeFailureRate: number;
   executableOpportunityRate: number;
+}
+
+export interface MarketAssetAttribution {
+  realizedPnlUsd: number;
+  feesUsd: number;
+  slippageUsd: number;
+  netTradingPnlUsd: number;
+  fills: number;
+  opportunities: number;
+  accepted: number;
+  vetoes: number;
 }
 
 export function renderExperimentSummaryMarkdown(summary: ExperimentSummary): string {
@@ -101,8 +127,12 @@ Generated: ${summary.generatedAt}
 - Maximum directional exposure: $${summary.maximumDirectionalExposureUsd.toFixed(2)}
 - Average unhedged duration: ${summary.averageUnhedgedDurationMs.toFixed(0)} ms
 - Grok Bot signals: ${JSON.stringify(summary.modelInvocationCounts)}
-- By market: ${JSON.stringify(summary.performanceByMarket)}
-- By asset: ${JSON.stringify(summary.performanceByAsset)}
+- PnL by market: ${JSON.stringify(summary.pnlByMarket)}
+- PnL by asset: ${JSON.stringify(summary.pnlByAsset)}
+- Fills by market / asset: ${JSON.stringify(summary.fillsByMarket)} / ${JSON.stringify(summary.fillsByAsset)}
+- Fees / slippage by market: ${JSON.stringify(summary.feesByMarket)} / ${JSON.stringify(summary.slippageByMarket)}
+- Opportunities / vetoes by market: ${JSON.stringify(summary.opportunitiesByMarket)} / ${JSON.stringify(summary.vetoesByMarket)}
+- Event counts (activity, not PnL) by market / asset: ${JSON.stringify(summary.eventCountByMarket)} / ${JSON.stringify(summary.eventCountByAsset)}
 - OpenAI token cost: $0 (runtime inference is not billed here)
 - Failures: ${JSON.stringify(summary.failureStatistics)}
 

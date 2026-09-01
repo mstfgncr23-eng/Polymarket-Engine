@@ -123,48 +123,90 @@ export function parseBinanceAggTrade(raw: unknown, symbol = "BTCUSDT", asset?: s
   });
 }
 
+export type ReferenceSupportStatus = "SUPPORTED" | "UNSUPPORTED_DEFINITIVE" | "TRANSIENT_FAILURE";
+
+export type ReferenceProbeOutcome = {
+  kind: "supported" | "unsupported_definitive" | "transient_failure";
+  detail: string;
+};
+
 export interface ReferenceResolution {
   asset: string;
   supported: boolean;
+  status: ReferenceSupportStatus;
   symbol: string | null;
   url: string | null;
-  reason: "RESOLVED" | "REFERENCE_UNSUPPORTED";
+  reason: "RESOLVED" | "REFERENCE_UNSUPPORTED" | "REFERENCE_PROBE_TRANSIENT";
+  detail?: string;
+  retryAfterMs?: number;
+}
+
+interface CachedResolution {
+  resolution: ReferenceResolution;
+  retryAfter: number;
+}
+
+export interface ReferenceRegistryOptions {
+  negativeCacheTtlMs?: number;
+  now?: () => number;
 }
 
 export class ReferenceFeedRegistry {
   private readonly adapters = new Map<string, ReferencePriceFeedAdapter>();
-  private readonly supported = new Map<string, ReferenceResolution>();
+  private readonly cache = new Map<string, CachedResolution>();
   private readonly running = new Map<string, AbortController>();
+  private readonly transientBackoff = new Map<string, ExponentialBackoff>();
+  private readonly now: () => number;
+  private readonly negativeCacheTtlMs: number;
 
   constructor(
     private readonly baseWsUrl: string,
     private readonly restBaseUrl: string,
     private readonly staleTimeoutMs = 15_000,
     private readonly factory?: WebSocketFactory,
-    private readonly probe: (symbol: string) => Promise<boolean> = (symbol) => defaultBinanceSpotProbe(symbol, restBaseUrl),
-  ) {}
+    private readonly probe: (symbol: string) => Promise<ReferenceProbeOutcome> = (symbol) => defaultBinanceSpotProbe(symbol, restBaseUrl),
+    options: ReferenceRegistryOptions = {},
+  ) {
+    this.now = options.now ?? Date.now;
+    this.negativeCacheTtlMs = options.negativeCacheTtlMs ?? 30_000;
+  }
 
   async resolve(asset: string): Promise<ReferenceResolution> {
-    const existing = this.supported.get(asset);
-    if (existing) return existing;
+    const cached = this.cache.get(asset);
+    if (cached && this.isReusable(cached)) return cached.resolution;
     let symbol: string;
     try { symbol = toBinanceSpotSymbol(asset); }
     catch {
-      const failed = { asset, supported: false, symbol: null, url: null, reason: "REFERENCE_UNSUPPORTED" as const };
-      this.supported.set(asset, failed);
-      return failed;
+      return this.remember(asset, {
+        asset, supported: false, status: "UNSUPPORTED_DEFINITIVE", symbol: null, url: null,
+        reason: "REFERENCE_UNSUPPORTED", detail: "invalid_asset",
+      });
     }
-    const ok = await this.probe(symbol);
-    const url = ok ? referenceStreamUrl(this.baseWsUrl, symbol) : null;
-    const resolved: ReferenceResolution = ok
-      ? { asset, supported: true, symbol, url, reason: "RESOLVED" }
-      : { asset, supported: false, symbol, url: null, reason: "REFERENCE_UNSUPPORTED" };
-    this.supported.set(asset, resolved);
-    return resolved;
+    const outcome = await this.probe(symbol);
+    if (outcome.kind === "supported") {
+      this.transientBackoff.get(asset)?.reset();
+      return this.remember(asset, {
+        asset, supported: true, status: "SUPPORTED", symbol, url: referenceStreamUrl(this.baseWsUrl, symbol),
+        reason: "RESOLVED", detail: outcome.detail,
+      });
+    }
+    if (outcome.kind === "unsupported_definitive") {
+      return this.remember(asset, {
+        asset, supported: false, status: "UNSUPPORTED_DEFINITIVE", symbol, url: null,
+        reason: "REFERENCE_UNSUPPORTED", detail: outcome.detail,
+      });
+    }
+    const backoff = this.transientBackoff.get(asset) ?? new ExponentialBackoff({ initialDelayMs: 1_000, maxDelayMs: 60_000, multiplier: 2, jitterRatio: 0 });
+    this.transientBackoff.set(asset, backoff);
+    const retryAfterMs = this.negativeCacheTtlMs <= 0 ? 0 : Math.max(this.negativeCacheTtlMs, backoff.nextDelay());
+    return this.remember(asset, {
+      asset, supported: false, status: "TRANSIENT_FAILURE", symbol, url: null,
+      reason: "REFERENCE_PROBE_TRANSIENT", detail: outcome.detail, retryAfterMs,
+    }, this.now() + retryAfterMs);
   }
 
   adapterFor(asset: string): ReferencePriceFeedAdapter | null {
-    const resolution = this.supported.get(asset);
+    const resolution = this.cache.get(asset)?.resolution;
     if (!resolution?.supported || !resolution.url || !resolution.symbol) return null;
     const existing = this.adapters.get(asset);
     if (existing) return existing;
@@ -180,17 +222,18 @@ export class ReferenceFeedRegistry {
     asset: string,
     handlers: ReferenceFeedHandlers,
     parentSignal: AbortSignal,
-  ): Promise<"started" | "already" | "unsupported"> {
+  ): Promise<"started" | "already" | "unsupported" | "transient"> {
     if (this.running.has(asset)) return "already";
     const resolution = await this.resolve(asset);
-    if (!resolution.supported) return "unsupported";
+    if (resolution.status === "TRANSIENT_FAILURE") return "transient";
+    if (resolution.status !== "SUPPORTED") return "unsupported";
     const adapter = this.adapterFor(asset);
     if (!adapter) return "unsupported";
     const child = new AbortController();
     const onParentAbort = () => child.abort(parentSignal.reason);
     if (parentSignal.aborted) {
       child.abort(parentSignal.reason);
-      return "unsupported";
+      return "transient";
     }
     parentSignal.addEventListener("abort", onParentAbort, { once: true });
     this.running.set(asset, child);
@@ -212,22 +255,56 @@ export class ReferenceFeedRegistry {
 
   runningAssets(): string[] { return [...this.running.keys()]; }
   assets(): string[] { return [...this.adapters.keys()]; }
+
+  private isReusable(entry: CachedResolution): boolean {
+    if (entry.resolution.status === "SUPPORTED" || entry.resolution.status === "UNSUPPORTED_DEFINITIVE") return true;
+    return this.now() < entry.retryAfter;
+  }
+
+  private remember(asset: string, resolution: ReferenceResolution, retryAfter = Number.POSITIVE_INFINITY): ReferenceResolution {
+    this.cache.set(asset, { resolution, retryAfter });
+    return resolution;
+  }
 }
 
-async function defaultBinanceSpotProbe(symbol: string, restBaseUrl = "https://api.binance.com"): Promise<boolean> {
+export function classifyBinanceExchangeInfo(input: { ok: boolean; status: number; body: unknown; symbol?: string }): ReferenceProbeOutcome {
+  if (input.status === 408 || input.status === 429 || input.status >= 500) {
+    return { kind: "transient_failure", detail: `http_${input.status}` };
+  }
+  if (!input.ok) {
+    const code = input.body && typeof input.body === "object" ? (input.body as { code?: unknown }).code : undefined;
+    if (input.status === 400 && (code === -1121 || code === -1122)) {
+      return { kind: "unsupported_definitive", detail: "invalid_symbol" };
+    }
+    return { kind: "transient_failure", detail: `http_${input.status}` };
+  }
+  const body = input.body as { symbols?: Array<{ status?: string; symbol?: string }> } | null;
+  const match = input.symbol
+    ? body?.symbols?.find((item) => item.symbol === input.symbol)
+    : body?.symbols?.[0];
+  if (!match) return { kind: "unsupported_definitive", detail: "symbol_not_listed" };
+  if (match.status === "TRADING") return { kind: "supported", detail: "trading" };
+  return { kind: "transient_failure", detail: `status_${match.status ?? "unknown"}` };
+}
+
+async function defaultBinanceSpotProbe(symbol: string, restBaseUrl = "https://api.binance.com"): Promise<ReferenceProbeOutcome> {
   try {
     const response = await fetch(`${restBaseUrl.replace(/\/$/, "")}/api/v3/exchangeInfo?symbol=${encodeURIComponent(symbol)}`, {
       signal: AbortSignal.timeout(5_000),
     });
-    if (!response.ok) return false;
-    const body = await response.json() as { symbols?: Array<{ status?: string; symbol?: string }> };
-    const match = body.symbols?.find((item) => item.symbol === symbol);
-    return match?.status === "TRADING";
-  } catch {
-    return false;
+    let body: unknown = null;
+    try { body = await response.json(); } catch { body = null; }
+    return classifyBinanceExchangeInfo({ ok: response.ok, status: response.status, body, symbol });
+  } catch (error) {
+    const name = error instanceof Error ? error.name : "";
+    const message = error instanceof Error ? error.message : String(error);
+    if (name === "TimeoutError" || name === "AbortError" || /timeout/i.test(message)) {
+      return { kind: "transient_failure", detail: "timeout" };
+    }
+    return { kind: "transient_failure", detail: "network" };
   }
 }
 
-export function createRestProbe(restBaseUrl: string): (symbol: string) => Promise<boolean> {
+export function createRestProbe(restBaseUrl: string): (symbol: string) => Promise<ReferenceProbeOutcome> {
   return (symbol) => defaultBinanceSpotProbe(symbol, restBaseUrl);
 }

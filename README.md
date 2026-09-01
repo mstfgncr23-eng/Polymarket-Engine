@@ -38,7 +38,9 @@ Every important event carries a `traceId`. Journal/dashboard records also carry 
 
 On a timer (`DISCOVERY_INTERVAL_MS`, default 5 minutes) the engine lists open Polymarket crypto-tagged events (or optional `POLYMARKET_MARKET_SLUGS`) and runs `qualifyMarket`. There is **no BTC/ETH/SOL/XRP/DOGE allow-list**. Crypto classification uses category tags and `{ticker}-updown` slug patterns. Per market the engine records `marketId`, slug, title, underlying asset if identifiable, outcome token IDs, binary outcomes, expiry, fee metadata, liquidity, and spread.
 
-Zero qualified markets at startup is valid. The engine stays up, keeps the database/health/dashboard available, and keeps scanning. When a market later qualifies, discovery reconciliation adds it: token IDs are applied immediately, the Polymarket stream is resubscribed if the client cannot mutate subscriptions in place, and the matching reference feed starts. Removed or expired markets stop being monitored; a reference feed stops when no remaining market needs that asset. Multiple markets that share one asset share one feed.
+Zero qualified markets at startup is valid. The engine stays up, keeps the database/health/dashboard available, and keeps scanning. Dynamically discovered markets **cannot qualify without a deterministic underlying asset**. The engine does not guess tickers. Manual `POLYMARKET_TOKEN_IDS` fixtures remain separately supported. Asset exposure is aggregated only among markets that share a known asset; unknown identity never silently falls back to per-market exposure.
+
+When a market later qualifies, discovery reconciliation adds it: token IDs are applied immediately, the Polymarket stream is resubscribed if the client cannot mutate subscriptions in place, and the matching reference feed starts. Removed or expired markets stop being monitored; a reference feed stops when no remaining market needs that asset. Multiple markets that share one asset share one feed.
 
 Explicit reason codes (reject unless `QUALIFIED`):
 
@@ -53,9 +55,10 @@ Explicit reason codes (reject unless `QUALIFIED`):
 | `INSUFFICIENT_LIQUIDITY` / `SPREAD_TOO_WIDE` | Listing liquidity/spread fails thresholds (book depth is a runtime risk/execution check) |
 | `UNKNOWN_FEE_SCHEDULE` | Fees enabled but metadata missing; paper fills cannot be modeled |
 | `INVALID_PRICE` | Outcome prices outside `[0, 1]` |
+| `UNKNOWN_UNDERLYING_ASSET` | Dynamic discovery cannot identify a deterministic underlying asset; the market is rejected rather than guessing |
 | `DUPLICATE_MARKET` | Same token pair already qualified |
 | `STALE_FEED` | Reserved; live feed freshness is enforced at risk time (`MARKET_FEED_STALE`, `REFERENCE_FEED_STALE`, `BTC_FEED_STALE`) |
-| `REFERENCE_UNSUPPORTED` | External reference venue has no tradable spot symbol; market may still be Polymarket-only monitored |
+| `REFERENCE_UNSUPPORTED` | External reference venue has no tradable spot symbol (definitive); market may still be Polymarket-only monitored |
 
 Binary UP/DOWN is used only when outcome labels are clearly Up/Down (or Higher/Lower), or when the market is an explicit directional up/down listing with Yes/No or unlabeled outcomes (Polymarket crypto updown convention: Yes→UP, No→DOWN). Other binaries are skipped.
 
@@ -65,7 +68,7 @@ State is isolated by `marketId` / `tokenId` / underlying asset: books, snapshots
 
 `ReferencePriceFeedAdapter` + `ReferenceFeedRegistry` share **one WebSocket per underlying asset**. Mapping is algorithmic (`BTC` → `BTCUSDT` is an example of `{ASSET}USDT`, not a closed list). “All crypto markets” means Polymarket crypto prediction markets first; reference feeds open **only** for assets those qualifying markets need.
 
-If a reference asset is unsupported, the engine does **not** crash. It journals `POLYMARKET_ONLY_MONITOR` / `REFERENCE_UNSUPPORTED` and continues Polymarket monitoring for that market. One asset’s disconnect is degraded/stale for that asset only. Reconnect uses bounded exponential backoff. Deprecated `BTC_WS_URL` / `BTC_SYMBOL` / `BtcWebSocketAdapter` still parse for old env/tests; the registry ignores them.
+Reference symbol probes distinguish `SUPPORTED`, `UNSUPPORTED_DEFINITIVE`, and `TRANSIENT_FAILURE`. Timeouts, network errors, and HTTP 5xx/429 are transient: they are not permanently cached, they fail closed (`referenceRequired` stays true so paper execution cannot proceed without a live reference), and the next discovery cycle can recover without a process restart. Only a definitive unsupported listing (invalid/unlisted symbol) is cached as Polymarket-only (`referenceRequired=false`).
 
 `/ready` means the engine process is alive, not draining, and PostgreSQL is up. It does **not** require a qualifying market or a Polymarket WebSocket message. Zero currently qualifying markets is a scanner idle state (`discoveryStatus=ZERO_QUALIFIED`), not a crash: discovery continues on `DISCOVERY_INTERVAL_MS`, no market WS is opened until tokens exist, and no paper trade is fabricated. `/health` remains process-liveness. A failed reference feed does **not** keep the whole engine unready.
 
@@ -237,7 +240,7 @@ Tests cover pair/PnL math, fee curve, slippage/VWAP, exposure/accounting, consen
 5. At the deadline the engine changes the manifest to `ENTRY_CLOSED`, stops opening new positions, checkpoints, retains raw data, and writes both summary files. Existing positions remain observed per policy.
 6. Rebuild the report at any time with `DATABASE_URL=... EXPERIMENT_ID=... pnpm report`.
 
-The report includes opportunities, accepts/rejects, orders/fills and rates, maker/taker split, completed/incomplete pairs, win/loss events, PnL/cost layers, drawdown/exposure, hedge duration/failures, pair/edge statistics, per-role Grok signal counts, regime/hour attribution, counterfactual event counts, and errors. Metrics without observed attribution events remain empty/zero rather than fabricated.
+The report includes opportunities, accepts/rejects, orders/fills and rates, maker/taker split, completed/incomplete pairs, win/loss events, PnL/cost layers, drawdown/exposure, hedge duration/failures, pair/edge statistics, per-role Grok signal counts, regime/hour attribution, counterfactual event counts, and errors. Trading attribution (`pnlByMarket` / `pnlByAsset`, fills, fees, slippage, opportunities, vetoes) is computed from fills and risk events. `eventCountByMarket` / `eventCountByAsset` are activity volume, not profitability — a noisy market is not treated as more profitable because it generated more journal events. Metrics without observed attribution events remain empty/zero rather than fabricated.
 
 ## Fly.io: two independent apps
 

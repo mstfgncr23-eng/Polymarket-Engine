@@ -97,6 +97,7 @@ export function qualifyMarket(
   const binary = normalizeBinarySemantics(input);
 
   if (!crypto) reasonCodes.push("NOT_CRYPTO");
+  if (config.requireUnderlyingAsset && !asset) reasonCodes.push("UNKNOWN_UNDERLYING_ASSET");
   if (input.closed || !input.active) reasonCodes.push(input.closed ? "MARKET_CLOSED" : "MARKET_INACTIVE");
   if (!input.acceptingOrders) reasonCodes.push("MARKET_INACTIVE");
   if (!input.yesTokenId || !input.noTokenId) reasonCodes.push("MISSING_TOKEN_IDS");

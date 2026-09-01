@@ -46,6 +46,7 @@ export const qualificationConfigSchema = z.object({
   maxSpread: z.number().min(0).max(1).default(0.12),
   maxQualifiedMarkets: z.number().int().positive().default(40),
   allowPolymarketOnlyIfReferenceUnsupported: z.boolean().default(true),
+  requireUnderlyingAsset: z.boolean().default(true),
 });
 export type QualificationConfig = z.infer<typeof qualificationConfigSchema>;
 

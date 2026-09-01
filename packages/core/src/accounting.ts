@@ -143,3 +143,28 @@ export class PaperLedger {
     return this.snapshot();
   }
 }
+
+/** Per-market / per-asset paper exposure. Unknown assets never inherit another market's book. */
+export function computePaperExposures(
+  positions: Iterable<Position>,
+  marketId: string,
+  assetByMarket: ReadonlyMap<string, string | null>,
+  nowMs = Date.now(),
+): { market: string; total: string; directional: string; unhedged: string; unhedgedDurationMs: number; asset: string } {
+  const list = [...positions];
+  let total = 0; let directional = 0; let market = 0; let duration = 0; let asset = 0;
+  const assetKey = assetByMarket.get(marketId) ?? null;
+  for (const position of list) {
+    const value = Number(position.upQuantity) * Number(position.averageUpCost) + Number(position.downQuantity) * Number(position.averageDownCost);
+    const unhedged = Number(position.unpairedQuantity) * Number(position.unpairedOutcome === "UP" ? position.averageUpCost : position.averageDownCost);
+    total += value; directional += unhedged;
+    if (position.marketId === marketId) { market = value; if (unhedged > 0) duration = nowMs - new Date(position.openedAt).getTime(); }
+    if (assetKey && assetByMarket.get(position.marketId) === assetKey) asset += value;
+  }
+  const selected = list.find((position) => position.marketId === marketId);
+  const unhedged = selected ? Number(selected.unpairedQuantity) * Number(selected.unpairedOutcome === "UP" ? selected.averageUpCost : selected.averageDownCost) : 0;
+  return {
+    market: String(market), total: String(total), directional: String(directional), unhedged: String(unhedged),
+    unhedgedDurationMs: Math.max(0, duration), asset: String(asset),
+  };
+}

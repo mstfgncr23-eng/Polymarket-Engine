@@ -56,7 +56,7 @@ export function evaluateRisk(input: RiskInput, limits: RiskLimits): RiskEvaluati
   if (d(input.drawdownUsd).gte(limits.maxDrawdownUsd)) vetoes.push("MAX_DRAWDOWN");
   if (d(input.orderSizeUsd).gt(limits.maxOrderSizeUsd)) vetoes.push("MAX_ORDER_SIZE");
   if (d(input.marketExposureUsd).plus(input.orderSizeUsd).gt(limits.maxMarketExposureUsd)) vetoes.push("MAX_MARKET_EXPOSURE");
-  if (d(input.assetExposureUsd ?? input.marketExposureUsd).plus(input.orderSizeUsd).gt(limits.maxAssetExposureUsd)) vetoes.push("MAX_ASSET_EXPOSURE");
+  if (d(input.assetExposureUsd ?? "0").plus(input.orderSizeUsd).gt(limits.maxAssetExposureUsd)) vetoes.push("MAX_ASSET_EXPOSURE");
   if (d(input.totalExposureUsd).plus(input.orderSizeUsd).gt(limits.maxTotalExposureUsd)) vetoes.push("MAX_TOTAL_EXPOSURE");
   if (d(input.directionalExposureUsd).plus(input.orderSizeUsd).gt(limits.maxDirectionalExposureUsd)) vetoes.push("MAX_DIRECTIONAL_EXPOSURE");
   if (d(input.unhedgedExposureUsd).plus(input.orderSizeUsd).gt(limits.maxUnhedgedExposureUsd)) vetoes.push("MAX_UNHEDGED_EXPOSURE");
@@ -79,7 +79,7 @@ export function evaluateRisk(input: RiskInput, limits: RiskLimits): RiskEvaluati
   const utilization = {
     orderSize: ratio(input.orderSizeUsd, limits.maxOrderSizeUsd),
     marketExposure: ratio(d(input.marketExposureUsd).plus(input.orderSizeUsd), limits.maxMarketExposureUsd),
-    assetExposure: ratio(d(input.assetExposureUsd ?? input.marketExposureUsd).plus(input.orderSizeUsd), limits.maxAssetExposureUsd),
+    assetExposure: ratio(d(input.assetExposureUsd ?? "0").plus(input.orderSizeUsd), limits.maxAssetExposureUsd),
     totalExposure: ratio(d(input.totalExposureUsd).plus(input.orderSizeUsd), limits.maxTotalExposureUsd),
     directionalExposure: ratio(d(input.directionalExposureUsd).plus(input.orderSizeUsd), limits.maxDirectionalExposureUsd),
     unhedgedExposure: ratio(d(input.unhedgedExposureUsd).plus(input.orderSizeUsd), limits.maxUnhedgedExposureUsd),

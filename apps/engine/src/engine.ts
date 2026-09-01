@@ -22,6 +22,7 @@ import {
   grokSignalSubmissionSchema,
   grokSignalEnvelopeSchema,
   triggerEventSchema,
+  computePaperExposures,
   type ExternalAgentRoleId,
   type Direction,
   type GrokActivationBridge,
@@ -286,13 +287,22 @@ export class EngineService {
     for (const asset of needed) {
       const markets = [...this.assetByMarket.entries()].filter(([, value]) => value === asset).map(([marketId]) => marketId);
       const resolution = await this.referenceRegistry.resolve(asset);
-      if (!resolution.supported) {
+      if (resolution.status === "UNSUPPORTED_DEFINITIVE") {
         for (const marketId of markets) this.referenceRequired.set(marketId, false);
         await this.safeAppend(createJournalEvent({
           traceId: createId("trace"), type: "REFERENCE_UNSUPPORTED", aggregateType: "reference", aggregateId: asset,
-          payload: { asset, reason: resolution.reason, choice: "POLYMARKET_ONLY_MONITOR" },
+          payload: { asset, reason: resolution.reason, status: resolution.status, detail: resolution.detail ?? null, choice: "POLYMARKET_ONLY_MONITOR" },
         }));
         this.record("REFERENCE_UNSUPPORTED", createId("trace"), null, { asset, choice: "POLYMARKET_ONLY_MONITOR" }, asset);
+        continue;
+      }
+      if (resolution.status === "TRANSIENT_FAILURE") {
+        for (const marketId of markets) this.referenceRequired.set(marketId, true);
+        await this.safeAppend(createJournalEvent({
+          traceId: createId("trace"), type: "REFERENCE_PROBE_TRANSIENT", aggregateType: "reference", aggregateId: asset,
+          payload: { asset, reason: resolution.reason, status: resolution.status, detail: resolution.detail ?? null, retryAfterMs: resolution.retryAfterMs ?? null },
+        }));
+        this.record("REFERENCE_PROBE_TRANSIENT", createId("trace"), null, { asset, detail: resolution.detail ?? null }, asset);
         continue;
       }
       for (const marketId of markets) this.referenceRequired.set(marketId, true);
@@ -302,7 +312,7 @@ export class EngineService {
         onError: (error) => this.onFeedError(`reference:${asset}`, error),
       }, this.abort.signal).catch((error) => {
         this.logger.error({ err: error, asset }, "reference feed failed to start");
-        return "unsupported" as const;
+        return "transient" as const;
       });
       if (outcome === "started") {
         await this.safeAppend(createJournalEvent({
@@ -552,8 +562,8 @@ export class EngineService {
       const expiresAt = (item.output as { expiresAt?: string }).expiresAt;
       return expiresAt && new Date(expiresAt).getTime() < earliest.getTime() ? new Date(expiresAt) : earliest;
     }, new Date(trigger.expiresAt));
-    const exposure = this.exposure(candidate.marketId);
     const asset = trigger.asset ?? this.assetByMarket.get(candidate.marketId) ?? snapshot.asset ?? null;
+    const exposure = computePaperExposures(this.ledger.positions.values(), candidate.marketId, this.assetByMarket);
     const referenceRequired = this.referenceRequired.get(candidate.marketId) === true;
     const referenceFeedAt = asset ? dateOrNull(this.state.referenceLastMessageAt(asset)) : null;
     const decision = decidePaperOrder({
@@ -616,24 +626,12 @@ export class EngineService {
     this.metrics.unhedgedPositions.set([...this.ledger.positions.values()].filter((item) => Number(item.unpairedQuantity) > 0).length);
     this.record("PAPER_FILL", fill.traceId, fill.marketId, { fillId: fill.id, orderId: fill.orderId, price: fill.fillPrice, quantity: fill.quantity, role: fill.liquidityRole });
     if (Number(position.pairedQuantity) > 0 && Number(position.unpairedQuantity) === 0) this.record("HEDGE_COMPLETE", fill.traceId, fill.marketId, { positionId: position.id, pairedQuantity: position.pairedQuantity });
-    await this.safeAppend(createJournalEvent({ traceId: fill.traceId, type: "PAPER_FILL", aggregateType: "paper_fill", aggregateId: fill.id, payload: fill, sourceEventId: fill.sourceMarketEventId }));
+    await this.safeAppend(createJournalEvent({
+      traceId: fill.traceId, type: "PAPER_FILL", aggregateType: "paper_fill", aggregateId: fill.id,
+      payload: { ...fill, asset: this.assetByMarket.get(fill.marketId) ?? null }, sourceEventId: fill.sourceMarketEventId,
+    }));
     await this.safeAppend(createJournalEvent({ traceId: fill.traceId, type: "POSITION_UPDATED", aggregateType: "position", aggregateId: position.id, payload: position, sourceEventId: fill.id }));
     await this.safeAppend(createJournalEvent({ traceId: fill.traceId, type: "PNL_SNAPSHOT", aggregateType: "ledger", aggregateId: this.experiment?.id ?? "paper", payload: this.ledger.snapshot(), sourceEventId: fill.id }));
-  }
-
-  private exposure(marketId: string): { market: string; total: string; directional: string; unhedged: string; unhedgedDurationMs: number; asset: string } {
-    let total = 0; let directional = 0; let market = 0; let duration = 0; let asset = 0;
-    const assetKey = this.assetByMarket.get(marketId) ?? null;
-    for (const position of this.ledger.positions.values()) {
-      const value = Number(position.upQuantity) * Number(position.averageUpCost) + Number(position.downQuantity) * Number(position.averageDownCost);
-      const unhedged = Number(position.unpairedQuantity) * Number(position.unpairedOutcome === "UP" ? position.averageUpCost : position.averageDownCost);
-      total += value; directional += unhedged;
-      if (position.marketId === marketId) { market = value; if (unhedged > 0) duration = Date.now() - new Date(position.openedAt).getTime(); }
-      if (assetKey && this.assetByMarket.get(position.marketId) === assetKey) asset += value;
-    }
-    const selected = this.ledger.positions.get(marketId);
-    const unhedged = selected ? Number(selected.unpairedQuantity) * Number(selected.unpairedOutcome === "UP" ? selected.averageUpCost : selected.averageDownCost) : 0;
-    return { market: String(market), total: String(total), directional: String(directional), unhedged: String(unhedged), unhedgedDurationMs: Math.max(0, duration), asset: String(asset || market) };
   }
 
   private async onConnection(event: FeedConnectionEvent): Promise<void> {
