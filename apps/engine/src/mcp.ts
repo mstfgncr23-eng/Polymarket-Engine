@@ -5,15 +5,16 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { z } from "zod";
 import {
   createId,
+  DECISION_EVENT_TYPES,
   grokSignalSubmissionSchema,
   parseGrokWritePayload,
   clientMayCallWriteTool,
   GrokSignalValidationError,
   type GrokSignalSubmission,
 } from "@pm/core";
-import { createJournalEvent, type EventJournal } from "@pm/db";
+import { createJournalEvent, queryEventsPaged, type EventJournal } from "@pm/db";
 import type { EngineMetrics } from "./metrics.js";
-import { buildExperimentSummary } from "./report.js";
+import { buildExperimentSummary, filterCurrentExperimentEvents } from "./report.js";
 import type { EngineStateStore } from "./state.js";
 
 export interface McpConfig {
@@ -27,6 +28,7 @@ export interface McpDependencies {
   journal: EventJournal;
   metrics: EngineMetrics;
   submitSignal(signal: GrokSignalSubmission, clientId: string): Promise<Record<string, unknown>>;
+  noteMcpRequest?(tool: string | null, triggerId?: string): void;
 }
 
 type AuthResult = { ok: true; clientId: string; tokenFingerprint: string } | { ok: false; status: 401 | 503; reason: string; tokenFingerprint: string | null };
@@ -41,6 +43,7 @@ export const ALLOWED_MCP_READ_TOOLS = [
   "get_strategy_metrics",
   "get_recent_decisions",
   "get_system_health",
+  "get_reference_context",
 ] as const;
 
 export const ALLOWED_MCP_WRITE_TOOLS = [
@@ -51,6 +54,13 @@ export const ALLOWED_MCP_WRITE_TOOLS = [
 ] as const;
 
 export const ALLOWED_MCP_TOOLS = new Set<string>([...ALLOWED_MCP_READ_TOOLS, ...ALLOWED_MCP_WRITE_TOOLS]);
+
+let strategyMetricsCache: {
+  at: number;
+  scope: "rolling" | "complete";
+  experimentId: string;
+  value: ReturnType<typeof buildExperimentSummary>;
+} | null = null;
 
 export const FORBIDDEN_MCP_TRADE_TOOLS = new Set([
   "place_order", "submit_order", "create_order", "cancel_order", "replace_order",
@@ -66,6 +76,7 @@ const grokWriteInputShape = {
   correlationId: z.string().min(1).max(160),
   marketId: z.string().min(1).max(160),
   timestamp: z.string().min(1),
+  asset: z.string().min(1).nullable().optional(),
   agentId: z.enum([
     "market_microstructure_scanner",
     "crypto_market_scanner",
@@ -200,6 +211,7 @@ export function createMcpHttpHandler(config: McpConfig, dependencies: McpDepende
     }
 
     const server = createGrokMcpServer(auth.clientId, dependencies);
+    dependencies.noteMcpRequest?.(toolName, extractTriggerId(request.body));
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
     try {
       await server.connect(transport);
@@ -253,9 +265,14 @@ export function createGrokMcpServer(clientId: string, dependencies: McpDependenc
   }, async ({ tokenId }) => toolResult(dependencies.state.marketSnapshots.get(tokenId) ?? null));
 
   server.registerTool("get_recent_triggers", {
-    description: "Read recent deterministic triggers available for external research. Monitoring never waits for Grok.",
-    inputSchema: { limit: z.number().int().min(1).max(100).default(25) }, annotations: readOnly,
-  }, async ({ limit }) => toolResult(dependencies.state.recentTriggers.slice(0, limit)));
+    description: "Read recent deterministic triggers available for external research. Monitoring never waits for Grok. Optional triggerId attributes this MCP request to that trigger only.",
+    inputSchema: { limit: z.number().int().min(1).max(100).default(25), triggerId: z.string().min(1).max(160).optional() }, annotations: readOnly,
+  }, async ({ limit, triggerId }) => {
+    const items = triggerId
+      ? dependencies.state.recentTriggers.filter((item) => item.id === triggerId).slice(0, limit)
+      : dependencies.state.recentTriggers.slice(0, limit);
+    return toolResult(items);
+  });
 
   server.registerTool("get_positions", {
     description: "Read paper positions. This tool cannot modify positions or place orders.",
@@ -271,9 +288,45 @@ export function createGrokMcpServer(clientId: string, dependencies: McpDependenc
   });
 
   server.registerTool("get_strategy_metrics", {
-    description: "Read journal-derived paper strategy and experiment performance.",
-    inputSchema: {}, annotations: readOnly,
-  }, async () => toolResult(buildExperimentSummary(await dependencies.journal.readAll(), dependencies.state.experimentId ?? "unknown")));
+    description: "Read journal-derived paper strategy and experiment performance. scope=rolling is a recent window; scope=complete paginates the full experiment.",
+    inputSchema: { scope: z.enum(["rolling", "complete"]).default("rolling") }, annotations: readOnly,
+  }, async ({ scope }) => {
+    const now = Date.now();
+    const experimentId = dependencies.state.experimentId ?? "unknown";
+    const startedAt = dependencies.state.experimentStartedAt;
+    const completedAt = dependencies.state.experimentCompletedAt;
+    if (
+      strategyMetricsCache
+      && strategyMetricsCache.scope === scope
+      && strategyMetricsCache.experimentId === experimentId
+      && now - strategyMetricsCache.at < 15_000
+    ) return toolResult(strategyMetricsCache.value);
+    const window = {
+      from: startedAt ? new Date(startedAt) : undefined,
+      to: completedAt ? new Date(completedAt) : undefined,
+    };
+    const scan = scope === "complete"
+      ? await queryEventsPaged(dependencies.journal, { types: DECISION_EVENT_TYPES, ...window })
+      : { events: await dependencies.journal.queryEvents({ types: DECISION_EVENT_TYPES, ...window, limit: 500, order: "desc" }), complete: true, truncated: false };
+    const scoped = filterCurrentExperimentEvents(scan.events, {
+      id: experimentId, startedAt, completedAt,
+    });
+    const summary = buildExperimentSummary(scoped, experimentId, {
+      status: dependencies.state.experimentStatus ?? "unknown",
+      reportKind: scope === "complete" ? "final" : "interim",
+      metricsScope: scope,
+      complete: scope === "complete" && scan.complete && Boolean(startedAt),
+      truncated: scan.truncated,
+      truncatedReason: scan.truncated ? "SCAN_CEILING" : null,
+    });
+    strategyMetricsCache = { at: now, scope, experimentId, value: summary };
+    return toolResult(summary);
+  });
+
+  server.registerTool("get_reference_context", {
+    description: "Read bounded latest crypto reference context for one asset. Latest price, freshness, and recent move/volatility only. No tick stream and no trading capability.",
+    inputSchema: { asset: z.string().min(1).max(32) }, annotations: readOnly,
+  }, async ({ asset }) => toolResult(dependencies.state.getReferenceContext(asset)));
 
   server.registerTool("get_recent_decisions", {
     description: "Read the recent persisted decision feed (triggers, consensus, risk, paper fills).",
@@ -287,6 +340,8 @@ export function createGrokMcpServer(clientId: string, dependencies: McpDependenc
     const snapshot = dependencies.state.snapshot();
     return toolResult({
       engine: snapshot.engine, health: snapshot.health, grokActivity: snapshot.grokActivity, paperMode: snapshot.paperMode,
+      discoveryStatus: snapshot.engine.discoveryStatus, marketMonitoring: snapshot.engine.marketMonitoring,
+      qualifiedMarketCount: snapshot.engine.qualifiedMarketCount, unattributedMcp: snapshot.unattributedMcp,
     });
   });
 
@@ -329,9 +384,9 @@ export function createGrokMcpServer(clientId: string, dependencies: McpDependenc
 }
 
 function uniqueMarkets(state: EngineStateStore) {
-  const markets = new Map<string, { marketId: string; outcomes: Array<{ tokenId: string; outcome: string }> }>();
+  const markets = new Map<string, { marketId: string; asset: string | null; outcomes: Array<{ tokenId: string; outcome: string }> }>();
   for (const snapshot of state.marketSnapshots.values()) {
-    const existing = markets.get(snapshot.marketId) ?? { marketId: snapshot.marketId, outcomes: [] };
+    const existing = markets.get(snapshot.marketId) ?? { marketId: snapshot.marketId, asset: snapshot.asset ?? null, outcomes: [] };
     if (!existing.outcomes.some((item) => item.tokenId === snapshot.tokenId)) {
       existing.outcomes.push({ tokenId: snapshot.tokenId, outcome: snapshot.outcome });
     }
@@ -365,6 +420,12 @@ function extractToolName(body: unknown): string | null {
   return typeof name === "string" ? name : null;
 }
 
+function extractTriggerId(body: unknown): string | undefined {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return undefined;
+  const args = (body as { params?: { arguments?: Record<string, unknown> } }).params?.arguments;
+  return typeof args?.triggerId === "string" ? args.triggerId : undefined;
+}
+
 function extractRpcId(body: unknown): string | number | null {
   if (!body || typeof body !== "object" || Array.isArray(body)) return null;
   const id = (body as { id?: unknown }).id;
@@ -392,6 +453,7 @@ function submissionAuditMeta(body: unknown): { idempotencyId?: string; traceId?:
       agentId: typeof args?.agentId === "string" ? args.agentId : null,
       role: typeof args?.role === "string" ? args.role : null,
       marketId: typeof args?.marketId === "string" ? args.marketId : null,
+      asset: typeof args?.asset === "string" ? args.asset : null,
       schemaValid: meta.success,
     },
   };

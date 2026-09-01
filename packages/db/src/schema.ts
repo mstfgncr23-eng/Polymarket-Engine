@@ -91,7 +91,7 @@ export const journalEvents = pgTable("journal_events", {
   type: text("type").notNull(), aggregateType: text("aggregate_type").notNull(), aggregateId: text("aggregate_id").notNull(),
   payload: jsonb("payload").notNull(), occurredAt: timestamp("occurred_at", { withTimezone: true }).notNull(),
   recordedAt: timestamp("recorded_at", { withTimezone: true }).notNull().defaultNow(), sourceEventId: text("source_event_id"),
-}, (table) => [index("journal_trace_idx").on(table.traceId), index("journal_aggregate_idx").on(table.aggregateType, table.aggregateId, table.occurredAt)]);
+}, (table) => [index("journal_trace_idx").on(table.traceId), index("journal_aggregate_idx").on(table.aggregateType, table.aggregateId, table.occurredAt), index("journal_type_time_idx").on(table.type, table.occurredAt)]);
 
 export const engineCheckpoints = pgTable("engine_checkpoints", {
   id: text("id").primaryKey(), experimentId: text("experiment_id"), sequence: integer("sequence").notNull(),

@@ -10,6 +10,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "smoke": "tsx src/cli.ts smoke",
     "smoke:live": "tsx src/cli.ts live-feed-smoke",
+    "smoke:discovery": "tsx src/cli.ts live-discovery-diag",
     "experiment:start": "tsx src/cli.ts experiment:start",
     "report": "tsx src/cli.ts report"
   },

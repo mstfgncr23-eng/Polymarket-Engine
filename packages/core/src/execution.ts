@@ -20,7 +20,7 @@ export function executePaperTaker(input: TakerExecutionInput): PaperFill {
     marketId: input.order.marketId, tokenId: input.order.tokenId, outcome: input.order.outcome,
     side: input.order.side, requestedPrice: input.order.requestedPrice, fillPrice: walk.vwap,
     quantity: walk.filledQuantity, liquidityRole: "TAKER", latencyMs: input.measuredLatencyMs,
-    slippageUsd: calculateSlippageUsd(input.order.requestedPrice, walk.vwap, walk.filledQuantity),
+    slippageUsd: calculateSlippageUsd(input.order.requestedPrice, walk.vwap, walk.filledQuantity, input.order.side),
     feeUsd: fee, timestamp: input.snapshotAfterLatency.receivedAt,
     sourceMarketEventId: input.snapshotAfterLatency.eventId, fillConfidence: 1,
     fillModel: "paper-taker-v2:latency-snapshot-depth-walk-vwap",

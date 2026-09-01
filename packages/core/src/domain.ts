@@ -34,6 +34,7 @@ export const feeScheduleSchema = z.object({
   source: z.enum(["market_fee_schedule", "clob_fee_endpoint", "configured_test_fixture"]),
   effectiveAt: timestampSchema,
 });
+export type FeeSchedule = z.infer<typeof feeScheduleSchema>;
 
 export const marketSnapshotSchema = z.object({
   eventId: idSchema,
@@ -41,6 +42,7 @@ export const marketSnapshotSchema = z.object({
   marketId: idSchema,
   tokenId: idSchema,
   outcome: outcomeSchema,
+  asset: z.string().min(1).nullable().optional(),
   bids: z.array(bookLevelSchema),
   asks: z.array(bookLevelSchema),
   lastTradePrice: decimalStringSchema.nullable(),
@@ -54,23 +56,31 @@ export const marketSnapshotSchema = z.object({
 });
 export type MarketSnapshot = z.infer<typeof marketSnapshotSchema>;
 
-export const btcTickSchema = z.object({
+export const referenceTickSchema = z.object({
   eventId: idSchema,
   traceId: idSchema,
+  asset: z.string().min(1),
   symbol: z.string().min(1),
+  venue: z.string().min(1).default("binance"),
   price: decimalStringSchema,
   quantity: decimalStringSchema,
   sourceTimestamp: timestampSchema,
   receivedAt: timestampSchema,
   tradeId: z.string(),
 });
-export type BtcTick = z.infer<typeof btcTickSchema>;
+export type ReferenceTick = z.infer<typeof referenceTickSchema>;
+/** @deprecated Use ReferenceTick. Kept so existing BTC fixtures/parsers keep compiling. */
+export const btcTickSchema = referenceTickSchema;
+export type BtcTick = ReferenceTick;
 
 export const severitySchema = z.union([z.literal(0), z.literal(1), z.literal(2), z.literal(3)]);
 export const triggerKindSchema = z.enum([
   "BTC_RAPID_MOVE",
   "BTC_VOLATILITY_SPIKE",
   "BTC_VOLUME_SPIKE",
+  "CRYPTO_REFERENCE_RAPID_MOVE",
+  "CRYPTO_REFERENCE_VOLATILITY_SPIKE",
+  "CRYPTO_REFERENCE_VOLUME_SPIKE",
   "BOOK_IMBALANCE",
   "SPREAD_CHANGE",
   "DEPTH_CHANGE",
@@ -78,26 +88,57 @@ export const triggerKindSchema = z.enum([
   "PAIR_COST_OPPORTUNITY",
   "EDGE_CHANGE",
   "NEARING_EXPIRY",
+  "NEWS_INFORMATION",
   "FAILED_HEDGE",
   "DIRECTIONAL_EXPOSURE",
   "LOSS_CLUSTER",
+  "SEVERE_DISAGREEMENT",
+  "REGIME_ESCALATION",
   "SCHEDULED_REVIEW",
 ]);
+
+export const triggerSourceSchema = z.enum(["polymarket", "reference", "news", "risk", "system"]);
 
 export const triggerEventSchema = z.object({
   id: idSchema,
   traceId: idSchema,
   marketId: idSchema.nullable(),
+  asset: z.string().min(1).nullable().optional(),
+  source: triggerSourceSchema.optional(),
   kind: triggerKindSchema,
   severity: severitySchema,
   score: z.number().nonnegative(),
   dedupeKey: z.string(),
   evidence: z.record(z.string(), z.unknown()),
   sourceEventIds: z.array(idSchema),
+  evidenceIds: z.array(idSchema).optional(),
   createdAt: timestampSchema,
   expiresAt: timestampSchema,
 });
 export type TriggerEvent = z.infer<typeof triggerEventSchema>;
+export type TriggerKind = z.infer<typeof triggerKindSchema>;
+export type TriggerSource = z.infer<typeof triggerSourceSchema>;
+
+export const qualificationReasonCodeSchema = z.enum([
+  "QUALIFIED",
+  "NOT_CRYPTO",
+  "MARKET_CLOSED",
+  "MARKET_INACTIVE",
+  "UNSUPPORTED_STRUCTURE",
+  "UNSUPPORTED_BINARY_SEMANTICS",
+  "MISSING_TOKEN_IDS",
+  "DURATION_OUT_OF_RANGE",
+  "INSUFFICIENT_LIQUIDITY",
+  "SPREAD_TOO_WIDE",
+  "UNKNOWN_FEE_SCHEDULE",
+  "INVALID_PRICE",
+  "STALE_FEED",
+  "DUPLICATE_MARKET",
+  "UNKNOWN_UNDERLYING_ASSET",
+  "REFERENCE_UNSUPPORTED",
+  "REFERENCE_DEGRADED",
+]);
+export type QualificationReasonCode = z.infer<typeof qualificationReasonCodeSchema>;
 
 export const externalAgentRoleIdSchema = z.enum([
   "market_microstructure_scanner",
@@ -191,6 +232,7 @@ const grokSubmissionMeta = {
   traceId: idSchema,
   correlationId: idSchema,
   marketId: idSchema,
+  asset: z.string().min(1).nullable().optional(),
   timestamp: timestampSchema,
 };
 
@@ -211,6 +253,7 @@ export const grokSignalEnvelopeSchema = z.object({
   triggerId: idSchema,
   correlationId: idSchema,
   marketId: idSchema,
+  asset: z.string().min(1).nullable().optional(),
   agentId: externalAgentRoleIdSchema,
   role: externalAgentRoleIdSchema,
   provider: z.literal("grok_bot_mcp"),
@@ -240,6 +283,8 @@ export type ConsensusDecision = z.infer<typeof consensusDecisionSchema>;
 export const riskReasonCodeSchema = z.enum([
   "MARKET_FEED_STALE",
   "BTC_FEED_STALE",
+  "REFERENCE_FEED_STALE",
+  "MAX_ASSET_EXPOSURE",
   "DATABASE_UNAVAILABLE",
   "EVENT_TIMESTAMP_DISORDER",
   "RISK_STATE_UNAVAILABLE",
@@ -265,6 +310,9 @@ export const riskReasonCodeSchema = z.enum([
   "ABNORMAL_EXECUTION_ERRORS",
   "EXTERNAL_RISK_RECOMMENDED_VETO",
   "SHUTTING_DOWN",
+  "INSUFFICIENT_CASH",
+  "MARKET_NOT_ENTRY_QUALIFIED",
+  "REFERENCE_PROVIDER_BLOCKED",
 ]);
 export type RiskReasonCode = z.infer<typeof riskReasonCodeSchema>;
 
@@ -357,9 +405,14 @@ export const ledgerStateSchema = z.object({
 });
 export type LedgerState = z.infer<typeof ledgerStateSchema>;
 
+export const experimentStatusSchema = z.enum(["IDLE", "CREATED", "RUNNING", "ENTRY_CLOSED", "COMPLETED", "FAILED"]);
+export type ExperimentStatus = z.infer<typeof experimentStatusSchema>;
+export const experimentClosePolicySchema = z.enum(["observe_until_settlement", "mark_to_market"]);
+export type ExperimentClosePolicy = z.infer<typeof experimentClosePolicySchema>;
+
 export const experimentManifestSchema = z.object({
   id: idSchema,
-  status: z.enum(["CREATED", "RUNNING", "ENTRY_CLOSED", "COMPLETED", "FAILED"]),
+  status: experimentStatusSchema,
   durationHours: z.number().positive(),
   strategyVersion: z.string(),
   riskConfiguration: z.record(z.string(), z.unknown()),
@@ -367,9 +420,12 @@ export const experimentManifestSchema = z.object({
   startingBalance: decimalStringSchema,
   systemVersion: z.string(),
   gitSha: z.string(),
-  startedAt: timestampSchema,
-  entryClosesAt: timestampSchema,
+  closePolicy: experimentClosePolicySchema.default("observe_until_settlement"),
+  startedAt: timestampSchema.nullable(),
+  entryClosesAt: timestampSchema.nullable(),
   completedAt: timestampSchema.nullable(),
+  unresolvedPositionCount: z.number().int().nonnegative().default(0),
+  markToMarketAt: timestampSchema.nullable().optional(),
 });
 export type ExperimentManifest = z.infer<typeof experimentManifestSchema>;
 

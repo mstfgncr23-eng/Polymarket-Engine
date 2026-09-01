@@ -3,6 +3,7 @@ import { z } from "zod";
 export const riskLimitsSchema = z.object({
   maxOrderSizeUsd: z.number().positive().default(25),
   maxMarketExposureUsd: z.number().positive().default(100),
+  maxAssetExposureUsd: z.number().positive().default(150),
   maxTotalExposureUsd: z.number().positive().default(300),
   maxDirectionalExposureUsd: z.number().positive().default(75),
   maxUnhedgedExposureUsd: z.number().positive().default(50),
@@ -25,6 +26,7 @@ export const triggerConfigSchema = z.object({
   cooldownMs: z.number().int().nonnegative().default(10_000),
   triggerTtlMs: z.number().int().positive().default(30_000),
   btcRapidMoveBps: z.number().positive().default(15),
+  referenceRapidMoveBps: z.number().positive().default(15),
   volatilitySpikeBps: z.number().positive().default(25),
   volumeSpikeMultiplier: z.number().positive().default(3),
   imbalanceThreshold: z.number().min(0).max(1).default(0.65),
@@ -32,8 +34,25 @@ export const triggerConfigSchema = z.object({
   depthChangeThreshold: z.number().min(0).default(0.4),
   pairCostThreshold: z.number().min(0).max(2).default(0.985),
   expiryWarningMs: z.number().int().positive().default(3_600_000),
+  maxActivationsPerMinute: z.number().int().positive().default(12),
+  activationSeveritySuppression: z.number().int().min(0).max(3).default(1),
+  scheduledReviewIntervalMs: z.number().int().positive().default(900_000),
+  newsSeverityThreshold: z.number().int().min(1).max(3).default(2),
+  failedHedgeDurationMs: z.number().int().positive().default(300_000),
+  disagreementAgreementMax: z.number().min(0).max(1).default(0.45),
 });
 export type TriggerConfig = z.infer<typeof triggerConfigSchema>;
+
+export const qualificationConfigSchema = z.object({
+  minRemainingDurationMs: z.number().int().nonnegative().default(120_000),
+  maxRemainingDurationMs: z.number().int().positive().default(48 * 3_600_000),
+  minLiquidityUsd: z.number().nonnegative().default(50),
+  maxSpread: z.number().min(0).max(1).default(0.12),
+  maxQualifiedMarkets: z.number().int().positive().default(40),
+  allowPolymarketOnlyIfReferenceUnsupported: z.boolean().default(true),
+  requireUnderlyingAsset: z.boolean().default(true),
+});
+export type QualificationConfig = z.infer<typeof qualificationConfigSchema>;
 
 export const engineEnvSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
@@ -50,13 +69,37 @@ export const engineEnvSchema = z.object({
   ENGINE_REGION: z.string().default("fra"),
   POLYMARKET_MARKET_SLUGS: z.string().default(""),
   POLYMARKET_TOKEN_IDS: z.string().default(""),
-  BTC_WS_URL: z.string().url().default("wss://data-stream.binance.vision/ws/btcusdt@aggTrade"),
-  BTC_SYMBOL: z.string().default("BTCUSDT"),
+  REFERENCE_WS_BASE_URL: z.string().url().default("wss://data-stream.binance.vision/ws"),
+  REFERENCE_REST_BASE_URL: z.string().url().default("https://api.binance.com"),
+  /** @deprecated BTC-only leftover; ignored by multi-asset registry. Accepted so old env files still parse. */
+  BTC_WS_URL: z.string().url().optional(),
+  /** @deprecated BTC-only leftover; ignored by multi-asset registry. */
+  BTC_SYMBOL: z.string().optional(),
   GROK_MCP_BEARER_TOKENS: z.string().default(""),
   GROK_MCP_ALLOWED_ORIGINS: z.string().default("https://grok.com,https://x.ai"),
   GROK_MCP_RATE_LIMIT_PER_MINUTE: z.coerce.number().int().positive().default(60),
+  GROK_ACTIVATION_PROVIDER: z.enum(["noop", "slack"]).default("noop"),
+  SLACK_BOT_TOKEN: z.string().optional(),
+  SLACK_CHANNEL_ID: z.string().optional(),
+  SLACK_API_URL: z.string().url().default("https://slack.com/api/chat.postMessage"),
+  DISCOVERY_INTERVAL_MS: z.coerce.number().int().positive().default(300_000),
+  MAX_QUALIFIED_MARKETS: z.coerce.number().int().positive().default(40),
   ESTIMATED_INFRA_COST_PER_HOUR_USD: z.coerce.number().nonnegative().default(0.08),
   DASHBOARD_ORIGIN: z.string().url().default("http://localhost:3000"),
+  ENGINE_READ_TOKEN: z.string().min(8).optional(),
+  ENGINE_OPERATOR_TOKEN: z.string().min(8).optional(),
+  METRICS_TOKEN: z.string().min(8).optional(),
+  EXPERIMENT_REQUIRES_GROK: z.preprocess(
+    (value) => value === true || value === "true" || value === "1",
+    z.boolean(),
+  ).default(false),
+  SETTLEMENT_POLL_MS: z.coerce.number().int().positive().default(15_000),
+  SCHEDULED_REVIEW_INTERVAL_MS: z.coerce.number().int().positive().default(900_000),
+  TELEMETRY_QUEUE_LIMIT: z.coerce.number().int().positive().default(2_000),
+  TELEMETRY_BATCH_SIZE: z.coerce.number().int().positive().default(50),
+  DASHBOARD_SNAPSHOT_HZ: z.coerce.number().positive().default(4),
+  ACTIVATION_FANOUT: z.coerce.number().int().positive().default(3),
+  ACTIVATION_MEMORY_LIMIT: z.coerce.number().int().positive().default(500),
 });
 export type EngineEnv = z.infer<typeof engineEnvSchema>;
 

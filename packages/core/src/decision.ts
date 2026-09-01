@@ -34,12 +34,17 @@ export function decidePaperOrder(input: {
   const schedule = input.snapshotAfterDecisionLatency.feeSchedule;
   const executableNow = orderType === "MAKER" ? bestBid !== undefined : walk.sufficientDepth;
   const executionPrice = orderType === "MAKER" ? makerPrice : walk.vwap;
-  const fee = executableNow && schedule ? calculateFee(input.candidate.quantity, executionPrice, orderType, schedule) : null;
-  const slippage = executableNow ? orderType === "MAKER" ? "0" : calculateSlippageUsd(input.candidate.limitPrice, walk.vwap, walk.filledQuantity) : null;
+  const fee = schedule ? calculateFee(input.candidate.quantity, executionPrice, orderType, schedule) : null;
+  const slippage = executableNow
+    ? orderType === "MAKER"
+      ? "0"
+      : calculateSlippageUsd(input.candidate.limitPrice, walk.vwap, walk.filledQuantity, input.candidate.side)
+    : null;
   const notional = orderType === "MAKER" ? d(input.candidate.quantity).mul(makerPrice) : walk.sufficientDepth ? d(walk.notional) : d(input.candidate.quantity).mul(input.candidate.limitPrice);
   const netEdge = input.candidate.rawExpectedEdge
     - (fee ? d(fee).div(notional).toNumber() : 1)
     - (slippage ? d(slippage).div(notional).toNumber() : 1);
+  const requiredCashUsd = d(notional).plus(fee ?? 0).toFixed();
   const marketSpread = bestBid && bestAsk ? Number(d(bestAsk.price).minus(bestBid.price)) : Number.POSITIVE_INFINITY;
   const risk = evaluateRisk({
     ...input.baseRisk, traceId: input.consensus.traceId,
@@ -47,6 +52,7 @@ export function decidePaperOrder(input: {
     expectedEdge: netEdge, spread: marketSpread, signalConfidence: input.consensus.consensusConfidence,
     signalExpiresAt: input.signalExpiresAt,
     feeScheduleKnown: schedule !== null, orderSizeUsd: notional.toFixed(),
+    requiredCashUsd,
   }, input.limits);
   if (!executableNow && !risk.vetoes.includes("INSUFFICIENT_DEPTH")) {
     risk.vetoes.push("INSUFFICIENT_DEPTH");

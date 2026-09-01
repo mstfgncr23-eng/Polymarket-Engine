@@ -24,32 +24,32 @@ export const externalAgentRoleDefinitions = [
   {
     id: "market_microstructure_scanner", name: "Market Microstructure Scanner",
     schema: marketMicrostructureOutputSchema,
-    instructions: "Analyze supplied order books and market snapshots. Submit structured research only; never place or approve an order.",
+    instructions: "Analyze supplied order books and market snapshots for the specified marketId and underlying asset only. Do not mix evidence from other markets or assets. Submit structured research only; never place or approve an order.",
   },
   {
     id: "crypto_market_scanner", name: "Crypto Market Scanner",
     schema: cryptoMarketOutputSchema,
-    instructions: "Analyze supplied crypto market state and submit structured research only; never place or approve an order.",
+    instructions: "Analyze supplied crypto reference and Polymarket state for the specified underlying asset only. Do not mix BTC evidence into ETH (or any other asset). Submit structured research only; never place or approve an order.",
   },
   {
     id: "news_x_intelligence_scanner", name: "News/X Intelligence Scanner",
     schema: newsXIntelligenceOutputSchema,
-    instructions: "Classify relevant, sourced news/X intelligence and submit structured research only; never place or approve an order.",
+    instructions: "Classify relevant, sourced news/X intelligence for the specified marketId/asset only. Submit structured research only; never place or approve an order.",
   },
   {
     id: "fair_probability_analyst", name: "Market/Fair Probability Analyst",
     schema: fairProbabilityOutputSchema,
-    instructions: "Estimate fair probability and edge from supplied evidence. Submit a recommendation only; never place or approve an order.",
+    instructions: "Estimate fair probability and edge from supplied evidence for one marketId/asset. Do not blend another market's book or signals. Submit a recommendation only; never place or approve an order.",
   },
   {
     id: "risk_hedge_analyst", name: "Risk & Hedge Analyst",
     schema: riskHedgeOutputSchema,
-    instructions: "Assess inventory and hedge risk. You may recommend a veto, but cannot approve risk or place an order.",
+    instructions: "Assess inventory and hedge risk for the specified market and the total paper portfolio. You may recommend a veto, but cannot approve risk or place an order.",
   },
   {
     id: "strategy_supervisor", name: "Strategy Supervisor",
     schema: strategySupervisorOutputSchema,
-    instructions: "Diagnose strategy behavior. Parameter changes must remain PROPOSED and can never be activated through MCP.",
+    instructions: "Diagnose strategy behavior across markets. Parameter changes must remain PROPOSED and can never be activated through MCP. Never place or approve an order.",
   },
 ] as const satisfies readonly ExternalRoleDefinition<z.ZodType>[];
 

@@ -15,6 +15,7 @@ export class EngineMetrics {
   readonly eventLatency = new Histogram({ name: "event_processing_latency", help: "Event processing latency seconds", buckets: [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5], registers: [this.registry] });
   readonly mcpLatency = new Histogram({ name: "grok_mcp_latency_seconds", help: "Grok MCP request latency seconds", labelNames: ["method"], buckets: [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5], registers: [this.registry] });
   readonly queueDepth = new Gauge({ name: "engine_queue_depth", help: "Pending decision count", registers: [this.registry] });
+  readonly activations = new Counter({ name: "grok_activation_total", help: "Grok activation adapter attempts (not observed Bot wakes)", labelNames: ["provider", "status"], registers: [this.registry] });
 
   constructor() { collectDefaultMetrics({ register: this.registry, prefix: "polymarket_" }); }
 }

@@ -1,6 +1,7 @@
 import { Decimal } from "decimal.js";
-import { createId, type LedgerState, type PaperFill, type Position } from "./domain.js";
-import { d, decimal } from "./calculations.js";
+import { createId, type FeeSchedule, type LedgerState, type Outcome, type PaperFill, type Position } from "./domain.js";
+import { calculateFee, d, decimal } from "./calculations.js";
+import { classifySettledOutcome, settlementCashDelta, settlementRealizedDelta } from "./settlement.js";
 
 export class PaperLedger {
   readonly positions = new Map<string, Position>();
@@ -108,9 +109,42 @@ export class PaperLedger {
     return structuredClone(next);
   }
 
+  settlePosition(marketId: string, upPayoff: "0" | "1", downPayoff: "0" | "1", at = new Date()): {
+    position: Position;
+    cashDelta: string;
+    realizedDelta: string;
+    outcome: "POSITION_WIN" | "POSITION_LOSS" | "POSITION_BREAKEVEN";
+    grossOutcome: "POSITION_WIN" | "POSITION_LOSS" | "POSITION_BREAKEVEN";
+  } | null {
+    const position = this.positions.get(marketId);
+    if (!position) return null;
+    if (d(position.upQuantity).eq(0) && d(position.downQuantity).eq(0)) {
+      this.positions.delete(marketId);
+      return null;
+    }
+    const cashDelta = settlementCashDelta(position, upPayoff, downPayoff);
+    const realizedDelta = settlementRealizedDelta(position, upPayoff, downPayoff);
+    this.state.cash = decimal(d(this.state.cash).plus(cashDelta));
+    this.state.realizedPnl = decimal(d(this.state.realizedPnl).plus(realizedDelta));
+    this.positions.delete(marketId);
+    this.state.updatedAt = at.toISOString();
+    this.revalue({}, at.toISOString());
+    return {
+      position: structuredClone(position), cashDelta, realizedDelta,
+      outcome: classifySettledOutcome(realizedDelta, position.totalFees),
+      grossOutcome: classifySettledOutcome(realizedDelta, "0"),
+    };
+  }
+
   addOperatingCosts(aiCost: Decimal.Value, infrastructureCost: Decimal.Value, at = new Date()): void {
     this.state.aiCost = decimal(d(this.state.aiCost).plus(aiCost));
     this.state.infrastructureCost = decimal(d(this.state.infrastructureCost).plus(infrastructureCost));
+    this.revalue({}, at.toISOString());
+  }
+
+  resetOperatingCostBaseline(at = new Date()): void {
+    this.state.aiCost = "0";
+    this.state.infrastructureCost = "0";
     this.revalue({}, at.toISOString());
   }
 
@@ -131,7 +165,7 @@ export class PaperLedger {
     }
     const unrealized = value.minus(cost);
     const gross = d(this.state.realizedPnl).plus(unrealized);
-    const netTrading = gross.minus(this.state.fees).minus(this.state.slippage);
+    const netTrading = gross.minus(this.state.fees);
     const economic = netTrading.minus(this.state.aiCost).minus(this.state.infrastructureCost);
     const equity = d(this.state.cash).plus(value);
     const high = Decimal.max(this.state.highWaterMark, equity);
@@ -142,4 +176,122 @@ export class PaperLedger {
     };
     return this.snapshot();
   }
+}
+
+/** Per-market / per-asset paper exposure. Unknown assets never inherit another market's book. */
+export function computePaperExposures(
+  positions: Iterable<Position>,
+  marketId: string,
+  assetByMarket: ReadonlyMap<string, string | null>,
+  nowMs = Date.now(),
+): { market: string; total: string; directional: string; unhedged: string; unhedgedDurationMs: number; asset: string } {
+  const list = [...positions];
+  let total = 0; let directional = 0; let market = 0; let duration = 0; let asset = 0;
+  const assetKey = assetByMarket.get(marketId) ?? null;
+  for (const position of list) {
+    const value = Number(position.upQuantity) * Number(position.averageUpCost) + Number(position.downQuantity) * Number(position.averageDownCost);
+    const unhedged = Number(position.unpairedQuantity) * Number(position.unpairedOutcome === "UP" ? position.averageUpCost : position.averageDownCost);
+    total += value; directional += unhedged;
+    if (position.marketId === marketId) { market = value; if (unhedged > 0) duration = nowMs - new Date(position.openedAt).getTime(); }
+    if (assetKey && assetByMarket.get(position.marketId) === assetKey) asset += value;
+  }
+  const selected = list.find((position) => position.marketId === marketId);
+  const unhedged = selected ? Number(selected.unpairedQuantity) * Number(selected.unpairedOutcome === "UP" ? selected.averageUpCost : selected.averageDownCost) : 0;
+  return {
+    market: String(market), total: String(total), directional: String(directional), unhedged: String(unhedged),
+    unhedgedDurationMs: Math.max(0, duration), asset: String(asset),
+  };
+}
+
+export interface ProjectablePaperLeg {
+  marketId: string;
+  outcome: Outcome;
+  quantity: Decimal.Value;
+  avgCost: Decimal.Value;
+  asset?: string | null;
+}
+
+export interface PaperExposureProjectionInput {
+  current: ReturnType<typeof computePaperExposures>;
+  positions: readonly ProjectablePaperLeg[];
+  candidate: {
+    marketId: string;
+    outcome: Outcome;
+    quantity: Decimal.Value;
+    price: Decimal.Value;
+    intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG";
+    asset?: string | null;
+  };
+  nowMs?: number;
+}
+
+type ProjectedLeg = { qty: Decimal; cost: Decimal; asset: string | null };
+
+/** Quantity-based binary projection. Fully paired UP/DOWN qty has zero directional/unhedged residual. */
+export function projectPaperExposures(input: PaperExposureProjectionInput): ReturnType<typeof computePaperExposures> {
+  const books = new Map<string, { UP: ProjectedLeg; DOWN: ProjectedLeg }>();
+  const ensure = (marketId: string) => {
+    const existing = books.get(marketId);
+    if (existing) return existing;
+    const created = {
+      UP: { qty: d(0), cost: d(0), asset: null as string | null },
+      DOWN: { qty: d(0), cost: d(0), asset: null as string | null },
+    };
+    books.set(marketId, created);
+    return created;
+  };
+  const add = (marketId: string, outcome: Outcome, quantity: Decimal.Value, price: Decimal.Value, asset?: string | null) => {
+    const book = ensure(marketId);
+    const leg = book[outcome];
+    const qty = d(quantity);
+    if (qty.lte(0)) return;
+    const next = leg.qty.plus(qty);
+    leg.cost = next.gt(0) ? leg.qty.mul(leg.cost).plus(qty.mul(price)).div(next) : d(0);
+    leg.qty = next;
+    if (asset) {
+      book.UP.asset = asset;
+      book.DOWN.asset = asset;
+    }
+  };
+  for (const position of input.positions) {
+    add(position.marketId, position.outcome, position.quantity, position.avgCost, position.asset);
+  }
+  add(
+    input.candidate.marketId,
+    input.candidate.outcome,
+    input.candidate.quantity,
+    input.candidate.price,
+    input.candidate.asset,
+  );
+  const nowIso = new Date(input.nowMs ?? Date.now()).toISOString();
+  const projected: Position[] = [];
+  const assetByMarket = new Map<string, string | null>();
+  for (const [marketId, book] of books) {
+    const paired = Decimal.min(book.UP.qty, book.DOWN.qty);
+    const difference = book.UP.qty.minus(book.DOWN.qty);
+    const asset = book.UP.asset ?? book.DOWN.asset;
+    assetByMarket.set(marketId, asset);
+    projected.push({
+      id: `proj-${marketId}`, marketId,
+      upQuantity: decimal(book.UP.qty), downQuantity: decimal(book.DOWN.qty),
+      averageUpCost: decimal(book.UP.cost), averageDownCost: decimal(book.DOWN.cost),
+      pairedQuantity: decimal(paired),
+      unpairedOutcome: difference.gt(0) ? "UP" : difference.lt(0) ? "DOWN" : null,
+      unpairedQuantity: decimal(difference.abs()),
+      combinedPairCost: decimal(book.UP.cost.plus(book.DOWN.cost)),
+      totalFees: "0", totalSlippage: "0", openedAt: nowIso, updatedAt: nowIso,
+    });
+  }
+  const computed = computePaperExposures(projected, input.candidate.marketId, assetByMarket, input.nowMs);
+  const stillUnhedged = Number(computed.unhedged) > 0;
+  return {
+    ...computed,
+    unhedgedDurationMs: stillUnhedged ? input.current.unhedgedDurationMs : 0,
+  };
+}
+
+export function makerReserveNotional(quantity: string, price: string, schedule?: FeeSchedule | null): string {
+  const notional = d(quantity).mul(price);
+  const fee = schedule ? d(calculateFee(quantity, price, "MAKER", schedule)) : d(0);
+  return decimal(notional.plus(fee));
 }

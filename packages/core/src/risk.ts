@@ -7,6 +7,10 @@ export interface RiskInput {
   now: Date;
   marketFeedAt: Date | null;
   btcFeedAt: Date | null;
+  referenceFeedAt?: Date | null;
+  referenceRequired?: boolean;
+  asset?: string | null;
+  assetExposureUsd?: string;
   databaseAvailable: boolean;
   timestampDisorder: boolean;
   riskStateAvailable: boolean;
@@ -18,6 +22,17 @@ export interface RiskInput {
   directionalExposureUsd: string;
   unhedgedExposureUsd: string;
   unhedgedDurationMs: number;
+  intent?: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG";
+  projectedMarketExposureUsd?: string;
+  projectedTotalExposureUsd?: string;
+  projectedDirectionalExposureUsd?: string;
+  projectedUnhedgedExposureUsd?: string;
+  projectedAssetExposureUsd?: string;
+  availableCashUsd?: string;
+  /** Fee-inclusive cash required for a BUY. Defaults to orderSizeUsd when omitted. */
+  requiredCashUsd?: string;
+  referenceProviderBlocked?: boolean;
+  marketEntryQualified?: boolean;
   availableLiquidityUsd: string;
   expectedEdge: number;
   spread: number;
@@ -36,19 +51,34 @@ export interface RiskInput {
 export function evaluateRisk(input: RiskInput, limits: RiskLimits): RiskEvaluation {
   const vetoes: RiskReasonCode[] = [];
   const age = (value: Date | null) => value ? input.now.getTime() - value.getTime() : Number.POSITIVE_INFINITY;
+  const hedge = input.intent === "HEDGE_SECOND_LEG";
+  const marketExposure = input.projectedMarketExposureUsd ?? (hedge ? input.marketExposureUsd : d(input.marketExposureUsd).plus(input.orderSizeUsd).toFixed());
+  const assetExposure = input.projectedAssetExposureUsd ?? (hedge ? (input.assetExposureUsd ?? "0") : d(input.assetExposureUsd ?? "0").plus(input.orderSizeUsd).toFixed());
+  const totalExposure = input.projectedTotalExposureUsd ?? (hedge ? input.totalExposureUsd : d(input.totalExposureUsd).plus(input.orderSizeUsd).toFixed());
+  const directionalExposure = input.projectedDirectionalExposureUsd ?? (hedge ? input.directionalExposureUsd : d(input.directionalExposureUsd).plus(input.orderSizeUsd).toFixed());
+  const unhedgedExposure = input.projectedUnhedgedExposureUsd ?? (hedge ? input.unhedgedExposureUsd : d(input.unhedgedExposureUsd).plus(input.orderSizeUsd).toFixed());
   if (age(input.marketFeedAt) > limits.staleFeedTimeoutMs) vetoes.push("MARKET_FEED_STALE");
-  if (age(input.btcFeedAt) > limits.staleFeedTimeoutMs) vetoes.push("BTC_FEED_STALE");
+  if (input.referenceProviderBlocked === true) vetoes.push("REFERENCE_PROVIDER_BLOCKED");
+  if (input.referenceRequired === true) {
+    if (age(input.referenceFeedAt ?? null) > limits.staleFeedTimeoutMs) {
+      vetoes.push("REFERENCE_FEED_STALE");
+      if ((input.asset ?? "BTC") === "BTC") vetoes.push("BTC_FEED_STALE");
+    }
+  } else if (input.referenceRequired !== false && age(input.btcFeedAt) > limits.staleFeedTimeoutMs) {
+    vetoes.push("BTC_FEED_STALE");
+  }
   if (!input.databaseAvailable) vetoes.push("DATABASE_UNAVAILABLE");
   if (input.timestampDisorder) vetoes.push("EVENT_TIMESTAMP_DISORDER");
   if (!input.riskStateAvailable) vetoes.push("RISK_STATE_UNAVAILABLE");
   if (d(input.dailyPnlUsd).lte(d(limits.maxDailyPaperLossUsd).negated())) vetoes.push("DAILY_LOSS_LIMIT");
   if (d(input.drawdownUsd).gte(limits.maxDrawdownUsd)) vetoes.push("MAX_DRAWDOWN");
   if (d(input.orderSizeUsd).gt(limits.maxOrderSizeUsd)) vetoes.push("MAX_ORDER_SIZE");
-  if (d(input.marketExposureUsd).plus(input.orderSizeUsd).gt(limits.maxMarketExposureUsd)) vetoes.push("MAX_MARKET_EXPOSURE");
-  if (d(input.totalExposureUsd).plus(input.orderSizeUsd).gt(limits.maxTotalExposureUsd)) vetoes.push("MAX_TOTAL_EXPOSURE");
-  if (d(input.directionalExposureUsd).plus(input.orderSizeUsd).gt(limits.maxDirectionalExposureUsd)) vetoes.push("MAX_DIRECTIONAL_EXPOSURE");
-  if (d(input.unhedgedExposureUsd).plus(input.orderSizeUsd).gt(limits.maxUnhedgedExposureUsd)) vetoes.push("MAX_UNHEDGED_EXPOSURE");
-  if (input.unhedgedDurationMs > limits.maxUnhedgedDurationMs) vetoes.push("MAX_UNHEDGED_DURATION");
+  if (d(marketExposure).gt(limits.maxMarketExposureUsd)) vetoes.push("MAX_MARKET_EXPOSURE");
+  if (d(assetExposure).gt(limits.maxAssetExposureUsd)) vetoes.push("MAX_ASSET_EXPOSURE");
+  if (d(totalExposure).gt(limits.maxTotalExposureUsd)) vetoes.push("MAX_TOTAL_EXPOSURE");
+  if (d(directionalExposure).gt(limits.maxDirectionalExposureUsd)) vetoes.push("MAX_DIRECTIONAL_EXPOSURE");
+  if (d(unhedgedExposure).gt(limits.maxUnhedgedExposureUsd)) vetoes.push("MAX_UNHEDGED_EXPOSURE");
+  if (!hedge && input.unhedgedDurationMs > limits.maxUnhedgedDurationMs) vetoes.push("MAX_UNHEDGED_DURATION");
   if (d(input.availableLiquidityUsd).lt(limits.minLiquidityUsd)) vetoes.push("MINIMUM_LIQUIDITY");
   if (input.expectedEdge < limits.minExpectedEdge) vetoes.push("MINIMUM_EXPECTED_EDGE");
   if (input.spread > limits.maxSpread) vetoes.push("MAXIMUM_SPREAD");
@@ -59,6 +89,9 @@ export function evaluateRisk(input: RiskInput, limits: RiskLimits): RiskEvaluati
   if (input.duplicateTrade) vetoes.push("DUPLICATE_TRADE");
   if (!input.feeScheduleKnown) vetoes.push("UNKNOWN_FEE_SCHEDULE");
   if (!input.experimentEntryOpen) vetoes.push("EXPERIMENT_ENTRY_CLOSED");
+  if (input.marketEntryQualified === false && !hedge) vetoes.push("MARKET_NOT_ENTRY_QUALIFIED");
+  const requiredCash = input.requiredCashUsd ?? input.orderSizeUsd;
+  if (input.availableCashUsd !== undefined && d(input.availableCashUsd).lt(requiredCash)) vetoes.push("INSUFFICIENT_CASH");
   if (input.executionErrorsLastHour >= limits.maxExecutionErrorsPerHour) vetoes.push("ABNORMAL_EXECUTION_ERRORS");
   if (input.externalRiskRecommendedVeto) vetoes.push("EXTERNAL_RISK_RECOMMENDED_VETO");
   if (input.shuttingDown) vetoes.push("SHUTTING_DOWN");
@@ -66,10 +99,11 @@ export function evaluateRisk(input: RiskInput, limits: RiskLimits): RiskEvaluati
   const unique = [...new Set(vetoes)];
   const utilization = {
     orderSize: ratio(input.orderSizeUsd, limits.maxOrderSizeUsd),
-    marketExposure: ratio(d(input.marketExposureUsd).plus(input.orderSizeUsd), limits.maxMarketExposureUsd),
-    totalExposure: ratio(d(input.totalExposureUsd).plus(input.orderSizeUsd), limits.maxTotalExposureUsd),
-    directionalExposure: ratio(d(input.directionalExposureUsd).plus(input.orderSizeUsd), limits.maxDirectionalExposureUsd),
-    unhedgedExposure: ratio(d(input.unhedgedExposureUsd).plus(input.orderSizeUsd), limits.maxUnhedgedExposureUsd),
+    marketExposure: ratio(marketExposure, limits.maxMarketExposureUsd),
+    assetExposure: ratio(assetExposure, limits.maxAssetExposureUsd),
+    totalExposure: ratio(totalExposure, limits.maxTotalExposureUsd),
+    directionalExposure: ratio(directionalExposure, limits.maxDirectionalExposureUsd),
+    unhedgedExposure: ratio(unhedgedExposure, limits.maxUnhedgedExposureUsd),
     drawdown: ratio(input.drawdownUsd, limits.maxDrawdownUsd),
     externalSignalRate: input.externalSignalsLastMinute / limits.maxExternalSignalsPerMinute,
   };
