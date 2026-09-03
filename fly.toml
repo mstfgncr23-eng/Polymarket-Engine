@@ -1,0 +1,49 @@
+# fly.toml app configuration file generated for mstfgncr-polymarket-engine on 2026-09-03T15:24:34Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'mstfgncr-polymarket-engine'
+kill_signal = 'SIGTERM'
+kill_timeout = '1m0s'
+primary_region = 'fra'
+
+[build]
+  dockerfile = 'Dockerfile.engine'
+
+[env]
+  ENGINE_REGION = 'fra'
+  GROK_ACTIVATION_PROVIDER = 'noop'
+  GROK_MCP_ALLOWED_ORIGINS = 'https://grok.com,https://x.ai'
+  NODE_ENV = 'production'
+  PORT = '8080'
+  TRADING_MODE = 'paper'
+
+[http_service]
+  auto_start_machines = true
+  auto_stop_machines = false
+  checks = [{ grace_period = '20s', interval = '15s', method = 'GET', path = '/ready', timeout = '3s' }, { grace_period = '10s', interval = '30s', method = 'GET', path = '/health', timeout = '3s' }]
+  force_https = true
+  internal_port = 8080
+  min_machines_running = 1
+  processes = ['app']
+
+[[metrics]]
+  path = '/metrics'
+  port = 8080
+
+[[restart]]
+  policy = 'always'
+  retries = 10
+
+[[vm]]
+  memory = '512mb'
+  size = 'shared-cpu-1x'
+
+[[vm]]
+  cpu_kind = 'shared'
+  cpus = 2
+  memory = '512mb'
+  memory_mb = 512
+  processes = ['app']
+  size = 'shared-cpu-2x'
