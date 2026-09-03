@@ -120,6 +120,7 @@ export class EngineService {
   private lastScheduledReviewAt = 0;
   private lastAnomalyJournalAt = 0;
   private reportGenerated = false;
+  private discoveryInFlight = 0;
 
   constructor(
     readonly env: EngineEnv,
@@ -135,14 +136,17 @@ export class EngineService {
     },
   ) {
     this.env = env;
-    this.sse = new SseHub(env.DASHBOARD_SNAPSHOT_HZ);
+    this.sse = new SseHub(env.DASHBOARD_SNAPSHOT_HZ, this.metrics);
     this.nowFn = adapters?.now ?? (() => new Date());
     this.ledger = new PaperLedger(env.PAPER_START_BALANCE, this.nowFn());
     this.state = new EngineStateStore(this.ledger.snapshot(), this.ledger.positions);
     this.triggerConfig = triggerConfigSchema.parse({ scheduledReviewIntervalMs: env.SCHEDULED_REVIEW_INTERVAL_MS });
-    this.triggerEngine = new TriggerEngine(this.triggerConfig, this.nowFn);
+    this.triggerEngine = new TriggerEngine(this.triggerConfig, this.nowFn, this.metrics.triggerObserver());
     this.riskLimits = riskLimitsSchema.parse({ maxExternalSignalsPerMinute: env.GROK_MCP_RATE_LIMIT_PER_MINUTE });
     this.marketAdapter = adapters?.market ?? new PolymarketMarketDataAdapter();
+    if (this.marketAdapter instanceof PolymarketMarketDataAdapter) {
+      this.marketAdapter.setNormalizeObserver(this.metrics.normalizeObserver());
+    }
     this.legacyBtcAdapter = adapters?.btc ?? null;
     this.referenceRegistry = adapters?.referenceRegistry ?? new ReferenceFeedRegistry(
       env.REFERENCE_WS_BASE_URL, env.REFERENCE_REST_BASE_URL, this.riskLimits.staleFeedTimeoutMs, undefined,
@@ -151,7 +155,7 @@ export class EngineService {
     this.resolutionFetcher = adapters?.resolutionFetcher ?? ((id) => this.marketAdapter.fetchPublicMarket(id));
     this.writer = new BoundedJournalWriter(journal, (up) => { this.state.database = up ? "UP" : "DOWN"; }, logger, {
       queueLimit: env.TELEMETRY_QUEUE_LIMIT, batchSize: env.TELEMETRY_BATCH_SIZE, sampleEvery: 20, maxConcurrent: 2,
-    });
+    }, this.metrics);
     this.activation = new GrokActivationCoordinator(
       adapters?.activation ?? createGrokActivationBridge(env),
       {
@@ -333,6 +337,12 @@ export class EngineService {
   }
 
   private async refreshDiscovery(): Promise<void> {
+    if (this.discoveryInFlight > 0) this.metrics.discoveryRefreshOverlap.inc();
+    this.discoveryInFlight += 1;
+    this.metrics.discoveryRefreshInFlight.set(this.discoveryInFlight);
+    this.metrics.discoveryRefreshAttempts.inc();
+    const started = performance.now();
+    try {
     this.state.setDiscoveryStatus("RECONCILING", this.marketsById.size);
     const report = await this.marketAdapter.discoverCryptoMarkets(
       splitList(this.env.POLYMARKET_MARKET_SLUGS),
@@ -397,6 +407,13 @@ export class EngineService {
       qualified: report.qualified.length, managed: this.managedMarketIds.size, addedMarkets, removedMarkets, addedAssets, removedAssets,
     });
     if (!this.legacyBtcAdapter) await this.reconcileReferenceFeeds();
+    this.metrics.discoveryMarketsInspected.observe(report.discovered.length);
+    this.metrics.discoveryQualified.observe(report.qualified.length);
+    } finally {
+      this.metrics.discoveryRefreshDuration.observe((performance.now() - started) / 1000);
+      this.discoveryInFlight = Math.max(0, this.discoveryInFlight - 1);
+      this.metrics.discoveryRefreshInFlight.set(this.discoveryInFlight);
+    }
   }
 
   private obligationMarketIds(): Set<string> {
@@ -654,6 +671,8 @@ export class EngineService {
 
   private async onReferenceTick(tick: ReferenceTick): Promise<void> {
     if (this.usesDiscovery() && ![...this.assetByMarket.values()].includes(tick.asset)) return;
+    this.metrics.referenceTicks.inc();
+    const started = performance.now();
     this.state.noteReferenceTick(tick.asset, tick.receivedAt, {
       symbol: tick.symbol, venue: tick.venue, price: tick.price,
     });
@@ -664,9 +683,13 @@ export class EngineService {
     this.updateReady();
     await this.writer.persist(createJournalEvent({ traceId: tick.traceId, type: "REFERENCE_TICK", aggregateType: "reference", aggregateId: tick.asset, payload: tick, occurredAt: new Date(tick.sourceTimestamp), sourceEventId: tick.eventId }));
     for (const trigger of this.triggerEngine.ingestReference(tick)) void this.processTrigger(trigger);
+    this.metrics.referenceTickProcessingDuration.observe((performance.now() - started) / 1000);
   }
 
   private async processTrigger(trigger: TriggerEvent): Promise<void> {
+    this.metrics.noteProcessTriggerStart();
+    const started = performance.now();
+    try {
     if (this.state.draining) return;
     this.state.queueDepth += 1;
     this.metrics.queueDepth.set(this.state.queueDepth);
@@ -682,11 +705,15 @@ export class EngineService {
       this.state.queueDepth -= 1;
       this.metrics.queueDepth.set(this.state.queueDepth);
     }
+    } finally {
+      this.metrics.noteProcessTriggerEnd(started);
+    }
   }
 
   private async requestActivation(trigger: TriggerEvent): Promise<void> {
     const status = this.experiment?.status ?? "IDLE";
     if (status === "IDLE" || status === "COMPLETED" || status === "FAILED") {
+      const bookkeepingStarted = performance.now();
       this.activation.ensureLatency(trigger);
       this.state.setActivationLatency(this.activation.snapshot());
       await this.safeAppend(createJournalEvent({
@@ -694,6 +721,7 @@ export class EngineService {
         payload: { triggerId: trigger.id, marketId: trigger.marketId, asset: trigger.asset ?? null, reason: "EXPERIMENT_NOT_ACTIVE", activate: false },
       }));
       this.state.addActivation({ triggerId: trigger.id, reason: "EXPERIMENT_NOT_ACTIVE", at: this.nowFn().toISOString(), provider: this.env.GROK_ACTIVATION_PROVIDER, grokWakeObserved: false });
+      this.metrics.idleActivationBookkeepingDuration.observe((performance.now() - bookkeepingStarted) / 1000);
       return;
     }
     if (status === "ENTRY_CLOSED" && !isRiskHedgeSettlementTrigger(trigger.kind)) {
@@ -1056,8 +1084,16 @@ export class EngineService {
   }
 
   private async safeAppend(event: ReturnType<typeof createJournalEvent>): Promise<void> {
-    try { await this.journal.append(event); this.state.database = "UP"; }
-    catch (error) { this.state.database = "DOWN"; this.updateReady(); this.logger.error({ err: error, traceId: event.traceId }, "journal append failed"); }
+    try {
+      await this.metrics.observeDirectJournal(event.type, async () => {
+        await this.journal.append(event);
+        this.state.database = "UP";
+      });
+    } catch (error) {
+      this.state.database = "DOWN";
+      this.updateReady();
+      this.logger.error({ err: error, traceId: event.traceId }, "journal append failed");
+    }
   }
 
   private async checkpoint(): Promise<void> {

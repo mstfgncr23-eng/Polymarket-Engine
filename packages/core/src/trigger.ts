@@ -4,6 +4,14 @@ import type { TriggerConfig } from "./config.js";
 
 interface BookState { snapshot: MarketSnapshot; emitted: Map<string, number>; }
 
+/** Optional emit observer. Must not change cooldown, debounce, or emit semantics. */
+export interface TriggerEmitObserver {
+  onCandidates(count: number): void;
+  onEmitted(kind: TriggerKind, severity: 0 | 1 | 2 | 3): void;
+  onSuppressed(kind: TriggerKind, severity: 0 | 1 | 2 | 3): void;
+  onReferenceWindow?(length: number): void;
+}
+
 export class TriggerEngine {
   private readonly books = new Map<string, BookState>();
   private readonly pair = new Map<string, Partial<Record<Outcome, MarketSnapshot>>>();
@@ -12,7 +20,11 @@ export class TriggerEngine {
   private readonly emittedByMarket = new Map<string, Map<string, number>>();
   private lastScheduledReviewAt = 0;
 
-  constructor(private readonly config: TriggerConfig, private readonly now: () => Date = () => new Date()) {}
+  constructor(
+    private readonly config: TriggerConfig,
+    private readonly now: () => Date = () => new Date(),
+    private readonly observer?: TriggerEmitObserver,
+  ) {}
 
   noteMarketWindow(marketId: string, asset: string | null, endDate: string | null): void {
     this.windows.set(marketId, { asset, endDate });
@@ -74,6 +86,7 @@ export class TriggerEngine {
     const cutoff = new Date(tick.sourceTimestamp).getTime() - 60_000;
     while (ticks[0] && new Date(ticks[0].sourceTimestamp).getTime() < cutoff) ticks.shift();
     this.ticksByAsset.set(asset, ticks);
+    this.observer?.onReferenceWindow?.(ticks.length);
     const first = ticks[0];
     if (!first) return [];
     const moveBps = d(tick.price).minus(first.price).div(first.price).mul(10_000).toNumber();
@@ -162,16 +175,21 @@ export class TriggerEngine {
   ): TriggerEvent[] {
     const now = this.now();
     const result: TriggerEvent[] = [];
+    if (candidates.length > 0) this.observer?.onCandidates(candidates.length);
     for (const candidate of candidates) {
       const dedupeKey = `${marketId ?? "none"}:${asset ?? "none"}:${candidate.kind}:${Math.floor(candidate.score * 10)}`;
       const last = emitted.get(dedupeKey) ?? 0;
-      if (now.getTime() - last < this.config.cooldownMs) continue;
+      if (now.getTime() - last < this.config.cooldownMs) {
+        this.observer?.onSuppressed(candidate.kind, candidate.severity);
+        continue;
+      }
       emitted.set(dedupeKey, now.getTime());
       result.push({
         id: createId("trigger"), traceId, marketId, asset, source: candidate.source, kind: candidate.kind, severity: candidate.severity,
         score: candidate.score, dedupeKey, evidence: candidate.evidence, sourceEventIds: [sourceEventId], evidenceIds: [sourceEventId],
         createdAt: now.toISOString(), expiresAt: new Date(now.getTime() + this.config.triggerTtlMs).toISOString(),
       });
+      this.observer?.onEmitted(candidate.kind, candidate.severity);
     }
     return result;
   }

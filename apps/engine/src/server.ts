@@ -16,15 +16,20 @@ export class SseHub {
   private snapshotTimer: NodeJS.Timeout | null = null;
   private pendingSnapshot: unknown = null;
   private snapshotBroadcasts = 0;
-  constructor(private readonly snapshotHz = 4) {}
+  constructor(private readonly snapshotHz = 4, private readonly metrics?: EngineMetrics) {}
 
   add(subscriber: Subscriber): () => void {
     this.subscribers.add(subscriber);
-    return () => this.subscribers.delete(subscriber);
+    this.metrics?.sseSubscribers.set(this.subscribers.size);
+    return () => {
+      this.subscribers.delete(subscriber);
+      this.metrics?.sseSubscribers.set(this.subscribers.size);
+    };
   }
 
   publish(type: string, data: unknown): void {
     if (type === "snapshot") {
+      if (this.subscribers.size === 0) this.metrics?.sseSnapshotsScheduledZeroSubscribers.inc();
       this.pendingSnapshot = data;
       if (this.snapshotTimer) return;
       const delay = Math.max(50, Math.floor(1000 / Math.max(0.5, this.snapshotHz)));
@@ -33,7 +38,7 @@ export class SseHub {
         const payload = this.pendingSnapshot;
         this.pendingSnapshot = null;
         if (payload !== null && payload !== undefined) {
-          const resolved = typeof payload === "function" ? (payload as () => unknown)() : payload;
+          const resolved = this.resolveSnapshot(payload);
           this.frame("snapshot", resolved);
           this.snapshotBroadcasts += 1;
         }
@@ -50,11 +55,29 @@ export class SseHub {
     if (this.snapshotTimer) clearTimeout(this.snapshotTimer);
     for (const subscriber of this.subscribers) subscriber.end();
     this.subscribers.clear();
+    this.metrics?.sseSubscribers.set(0);
+  }
+
+  private resolveSnapshot(payload: unknown): unknown {
+    if (typeof payload !== "function") return payload;
+    const started = performance.now();
+    const resolved = (payload as () => unknown)();
+    this.metrics?.sseSnapshotBuildDuration.observe((performance.now() - started) / 1000);
+    return resolved;
   }
 
   private frame(type: string, data: unknown): void {
-    const encoded = `id: ${++this.sequence}\nevent: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
-    for (const subscriber of this.subscribers) subscriber.write(encoded);
+    const serializeStarted = performance.now();
+    const json = JSON.stringify(data);
+    if (type === "snapshot") {
+      this.metrics?.sseSnapshotSerializeDuration.observe((performance.now() - serializeStarted) / 1000);
+      this.metrics?.sseSnapshotPayloadBytes.observe(Buffer.byteLength(json));
+      this.metrics?.sseSnapshotBroadcasts.inc();
+    }
+    const encoded = `id: ${++this.sequence}\nevent: ${type}\ndata: ${json}\n\n`;
+    for (const subscriber of this.subscribers) {
+      if (subscriber.write(encoded) === false) this.metrics?.sseSubscriberBackpressure.inc();
+    }
   }
 }
 
@@ -153,7 +176,15 @@ export async function createApiServer(input: {
       "Content-Type": "text/event-stream", "Cache-Control": "no-cache, no-transform",
       Connection: "keep-alive", "X-Accel-Buffering": "no", "Access-Control-Allow-Origin": input.dashboardOrigin,
     });
-    reply.raw.write(`event: snapshot\ndata: ${JSON.stringify(input.state.snapshot())}\n\n`);
+    const buildStarted = performance.now();
+    const snapshot = input.state.snapshot();
+    input.metrics.sseSnapshotBuildDuration.observe((performance.now() - buildStarted) / 1000);
+    const serializeStarted = performance.now();
+    const json = JSON.stringify(snapshot);
+    input.metrics.sseSnapshotSerializeDuration.observe((performance.now() - serializeStarted) / 1000);
+    input.metrics.sseSnapshotPayloadBytes.observe(Buffer.byteLength(json));
+    input.metrics.sseSnapshotBroadcasts.inc();
+    if (reply.raw.write(`event: snapshot\ndata: ${json}\n\n`) === false) input.metrics.sseSubscriberBackpressure.inc();
     const remove = input.sse.add(reply.raw);
     const keepalive = setInterval(() => reply.raw.write(": keepalive\n\n"), 15_000);
     request.raw.on("close", () => { clearInterval(keepalive); remove(); });

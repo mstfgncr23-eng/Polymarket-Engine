@@ -1,5 +1,6 @@
 import { isTelemetryEventType, type JournalEvent } from "@pm/core";
 import { createJournalEvent, type EventJournal } from "@pm/db";
+import type { EngineMetrics } from "./metrics.js";
 
 export interface TelemetryStats {
   queued: number;
@@ -25,6 +26,7 @@ export class BoundedJournalWriter {
     private readonly options: { queueLimit: number; batchSize: number; sampleEvery: number; maxConcurrent: number } = {
       queueLimit: 2_000, batchSize: 50, sampleEvery: 20, maxConcurrent: 2,
     },
+    private readonly metrics?: EngineMetrics,
   ) {}
 
   stats(): TelemetryStats {
@@ -44,8 +46,10 @@ export class BoundedJournalWriter {
     if (this.queue.length >= this.options.queueLimit) {
       this.queue.shift();
       this.dropped += 1;
+      this.metrics?.telemetryEventsDropped.inc();
     }
     this.queue.push(event);
+    this.metrics?.telemetryQueueDepth.set(this.queue.length);
     void this.flush();
   }
 
@@ -58,7 +62,10 @@ export class BoundedJournalWriter {
     if (this.pendingWrites >= this.options.maxConcurrent) return;
     this.flushing = true;
     const batch = this.queue.splice(0, this.options.batchSize);
+    this.metrics?.telemetryQueueDepth.set(this.queue.length);
+    this.metrics?.telemetryBatchSize.observe(batch.length);
     this.pendingWrites += 1;
+    const started = performance.now();
     try {
       await this.journal.appendMany(batch);
       this.flushed += batch.length;
@@ -66,8 +73,11 @@ export class BoundedJournalWriter {
     } catch (error) {
       this.onDatabase(false);
       this.dropped += batch.length;
+      this.metrics?.telemetryEventsDropped.inc(batch.length);
+      this.metrics?.telemetryBatchFailures.inc();
       this.logger.error({ err: error, count: batch.length }, "telemetry batch failed");
     } finally {
+      this.metrics?.telemetryBatchFlushDuration.observe((performance.now() - started) / 1000);
       this.pendingWrites -= 1;
       this.flushing = false;
       if (this.queue.length > 0) void this.flush();
@@ -75,12 +85,24 @@ export class BoundedJournalWriter {
   }
 
   private async writeDecision(event: JournalEvent): Promise<void> {
+    const write = async () => {
+      try {
+        await this.journal.append(event);
+        this.onDatabase(true);
+      } catch (error) {
+        this.onDatabase(false);
+        this.logger.error({ err: error, traceId: event.traceId, type: event.type }, "journal append failed");
+        throw error;
+      }
+    };
+    if (!this.metrics) {
+      await write().catch(() => undefined);
+      return;
+    }
     try {
-      await this.journal.append(event);
-      this.onDatabase(true);
-    } catch (error) {
-      this.onDatabase(false);
-      this.logger.error({ err: error, traceId: event.traceId, type: event.type }, "journal append failed");
+      await this.metrics.observeDirectJournal(event.type, write);
+    } catch {
+      // Persistence semantics unchanged: decision write failures are logged, not retried.
     }
   }
 }
