@@ -1,9 +1,11 @@
 import { createPublicClient } from "@polymarket/client";
 import {
+  bookLevelSchema,
   createId,
+  decimalStringSchema,
+  feeScheduleSchema,
   impliedSpread,
   isDirectionalListing,
-  marketSnapshotSchema,
   qualifyMarket,
   qualificationConfigSchema,
   type BinaryNormalization,
@@ -96,10 +98,31 @@ export interface DiscoveryReport {
 
 type PublicClient = ReturnType<typeof createPublicClient>;
 
+interface BookLevel {
+  price: string;
+  quantity: string;
+}
+
+interface BookState {
+  marketId: string;
+  bids: Map<string, string>;
+  asks: Map<string, string>;
+  bidLevels: BookLevel[];
+  askLevels: BookLevel[];
+  publishedBids: readonly BookLevel[] | null;
+  publishedAsks: readonly BookLevel[] | null;
+  bidsDirty: boolean;
+  asksDirty: boolean;
+  levelsValid: boolean;
+  lastTradePrice: string | null;
+  timestamp: string;
+  hash: string | null;
+}
+
 export class PolymarketMarketDataAdapter {
   private readonly client: PublicClient;
   private readonly marketsByToken = new Map<string, DiscoveredMarket>();
-  private readonly books = new Map<string, { marketId: string; bids: Map<string, string>; asks: Map<string, string>; lastTradePrice: string | null; timestamp: string; hash: string | null }>();
+  private readonly books = new Map<string, BookState>();
   private sequence = 0;
   private lastTimestampByToken = new Map<string, number>();
   private tokenIds: string[] = [];
@@ -131,6 +154,11 @@ export class PolymarketMarketDataAdapter {
     return state ? { bids: new Map(state.bids), asks: new Map(state.asks), timestamp: state.timestamp } : undefined;
   }
   activeStreamCount(): number { return this.activeStreams; }
+
+  /** Same normalize path as the live feed. Intended for replay/equivalence tests. */
+  normalizeSourceEvent(event: unknown, handlers: Pick<PolymarketFeedHandlers, "onAnomaly"> = {}): MarketSnapshot[] {
+    return this.normalizeEvent(event, handlers);
+  }
 
   async discoverCryptoMarkets(
     slugs: readonly string[] = [],
@@ -351,7 +379,7 @@ export class PolymarketMarketDataAdapter {
     });
   }
 
-  private normalizeEvent(event: unknown, handlers: PolymarketFeedHandlers): MarketSnapshot[] {
+  private normalizeEvent(event: unknown, handlers: Pick<PolymarketFeedHandlers, "onAnomaly">): MarketSnapshot[] {
     const value = event as { type?: string; payload?: Record<string, unknown> };
     const payload = value.payload ?? {};
     if (value.type === "book") {
@@ -361,9 +389,22 @@ export class PolymarketMarketDataAdapter {
       const sourceMs = parseSourceTimestamp(payload.timestamp);
       if (!this.acceptTimestamp(tokenId, sourceMs, handlers)) return [];
       const acceptedMs = sourceMs as number;
-      const state = {
-        marketId: String(payload.market ?? market.id), bids: levelsToMap(payload.bids), asks: levelsToMap(payload.asks),
-        lastTradePrice: nullableString(payload.lastTradePrice), timestamp: new Date(acceptedMs).toISOString(), hash: nullableString(payload.hash),
+      const bids = levelsToMap(payload.bids);
+      const asks = levelsToMap(payload.asks);
+      const state: BookState = {
+        marketId: String(payload.market ?? market.id),
+        bids,
+        asks,
+        bidLevels: sortedFrozenLevels(bids, "desc"),
+        askLevels: sortedFrozenLevels(asks, "asc"),
+        publishedBids: null,
+        publishedAsks: null,
+        bidsDirty: true,
+        asksDirty: true,
+        levelsValid: false,
+        lastTradePrice: nullableString(payload.lastTradePrice),
+        timestamp: new Date(acceptedMs).toISOString(),
+        hash: nullableString(payload.hash),
       };
       this.books.set(tokenId, state);
       return [this.toSnapshot(tokenId, state, payload)];
@@ -379,13 +420,22 @@ export class PolymarketMarketDataAdapter {
         if (!this.acceptTimestamp(tokenId, sourceMs, handlers)) continue;
         const acceptedMs = sourceMs as number;
         const side = String(change.side);
-        const target = side === "BUY" ? state.bids : state.asks;
         const price = String(change.price ?? "");
         const size = String(change.size ?? "0");
-        if (Number(size) <= 0) target.delete(price); else target.set(price, size);
+        const changed = side === "BUY"
+          ? applyLevelChange(state.bids, state.bidLevels, price, size, "desc")
+          : applyLevelChange(state.asks, state.askLevels, price, size, "asc");
+        if (changed) {
+          if (side === "BUY") {
+            state.bidsDirty = true;
+          } else {
+            state.asksDirty = true;
+          }
+        }
         state.timestamp = new Date(acceptedMs).toISOString();
         state.hash = nullableString(change.hash) ?? state.hash;
-        snapshots.push(this.toSnapshot(tokenId, state, payload));
+        const changedLevel = Number(size) <= 0 ? null : { price, quantity: size };
+        snapshots.push(this.toSnapshot(tokenId, state, payload, changedLevel));
       }
       this.normalizeObserver?.onPriceChangeEvent(changes.length, snapshots.length);
       return snapshots;
@@ -398,7 +448,7 @@ export class PolymarketMarketDataAdapter {
     return [];
   }
 
-  private acceptTimestamp(tokenId: string, sourceMs: number | null, handlers: PolymarketFeedHandlers): boolean {
+  private acceptTimestamp(tokenId: string, sourceMs: number | null, handlers: Pick<PolymarketFeedHandlers, "onAnomaly">): boolean {
     if (sourceMs === null) {
       this.noteAnomaly(handlers, {
         kind: "malformed", tokenId, incomingMs: null, lastAcceptedMs: this.lastTimestampByToken.get(tokenId) ?? null,
@@ -417,7 +467,7 @@ export class PolymarketMarketDataAdapter {
     return true;
   }
 
-  private noteAnomaly(handlers: PolymarketFeedHandlers, partial: Omit<PolymarketFeedAnomaly, "sampled" | "totalDropped" | "at">): void {
+  private noteAnomaly(handlers: Pick<PolymarketFeedHandlers, "onAnomaly">, partial: Omit<PolymarketFeedAnomaly, "sampled" | "totalDropped" | "at">): void {
     const sampled = this.anomalySampler.observe(partial);
     const anomaly: PolymarketFeedAnomaly = {
       ...partial,
@@ -429,18 +479,49 @@ export class PolymarketMarketDataAdapter {
     handlers.onAnomaly?.(anomaly);
   }
 
-  private toSnapshot(tokenId: string, state: NonNullable<ReturnType<PolymarketMarketDataAdapter["books"]["get"]>>, raw: Record<string, unknown>): MarketSnapshot {
+  private toSnapshot(
+    tokenId: string,
+    state: BookState,
+    raw: Record<string, unknown>,
+    changedLevel?: BookLevel | null,
+  ): MarketSnapshot {
     const started = performance.now();
     const market = this.marketsByToken.get(tokenId);
     if (!market) throw new Error("UNKNOWN_TOKEN");
     const token = market.tokens.find((item) => item.tokenId === tokenId);
-    const snapshot = marketSnapshotSchema.parse({
-      eventId: createId("poly"), traceId: createId("trace"), marketId: market.id, tokenId,
-      outcome: token?.outcome ?? "UP", asset: market.asset, bids: sortedLevels(state.bids, "desc"), asks: sortedLevels(state.asks, "asc"),
-      lastTradePrice: state.lastTradePrice, tickSize: nullableString(raw.tickSize), minOrderSize: nullableString(raw.minOrderSize),
-      feeSchedule: market.feeSchedule, sourceTimestamp: state.timestamp, receivedAt: new Date().toISOString(),
-      sequence: ++this.sequence, hash: state.hash,
-    });
+    const bids = publishSide(state, "bids");
+    const asks = publishSide(state, "asks");
+    const tickSize = nullableString(raw.tickSize);
+    const minOrderSize = nullableString(raw.minOrderSize);
+    try {
+      validateNormalizedBook(state, changedLevel);
+      assertDecimalString(state.lastTradePrice);
+      assertDecimalString(tickSize);
+      assertDecimalString(minOrderSize);
+      if (market.feeSchedule != null) feeScheduleSchema.parse(market.feeSchedule);
+      state.levelsValid = true;
+    } catch (error) {
+      state.levelsValid = false;
+      throw error;
+    }
+    const snapshot: MarketSnapshot = {
+      eventId: createId("poly"),
+      traceId: createId("trace"),
+      marketId: market.id,
+      tokenId,
+      outcome: token?.outcome ?? "UP",
+      asset: market.asset,
+      bids,
+      asks,
+      lastTradePrice: state.lastTradePrice,
+      tickSize,
+      minOrderSize,
+      feeSchedule: market.feeSchedule,
+      sourceTimestamp: state.timestamp,
+      receivedAt: new Date().toISOString(),
+      sequence: ++this.sequence,
+      hash: state.hash,
+    };
     this.normalizeObserver?.onNormalizedSnapshot({
       durationSeconds: (performance.now() - started) / 1000,
       bidLevels: state.bids.size,
@@ -664,9 +745,105 @@ function levelsToMap(value: unknown): Map<string, string> {
   for (const level of value as Array<Record<string, unknown>>) result.set(String(level.price), String(level.size ?? level.quantity));
   return result;
 }
-function sortedLevels(map: Map<string, string>, order: "asc" | "desc") {
-  return [...map.entries()].sort(([a], [b]) => order === "asc" ? Number(a) - Number(b) : Number(b) - Number(a))
-    .map(([price, quantity]) => ({ price, quantity }));
+
+function freezeLevel(price: string, quantity: string): BookLevel {
+  return Object.freeze({ price, quantity });
+}
+
+function sortedFrozenLevels(map: Map<string, string>, order: "asc" | "desc"): BookLevel[] {
+  return [...map.entries()]
+    .sort(([left], [right]) => order === "asc" ? Number(left) - Number(right) : Number(right) - Number(left))
+    .map(([price, quantity]) => freezeLevel(price, quantity));
+}
+
+function findExactPriceIndex(levels: readonly BookLevel[], price: string, order: "asc" | "desc"): number {
+  const numeric = Number(price);
+  let lo = 0;
+  let hi = levels.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    const midPrice = Number(levels[mid]!.price);
+    if (order === "desc" ? midPrice > numeric : midPrice < numeric) lo = mid + 1;
+    else hi = mid;
+  }
+  for (let index = lo; index < levels.length && Number(levels[index]!.price) === numeric; index += 1) {
+    if (levels[index]!.price === price) return index;
+  }
+  return -1;
+}
+
+function insertIndex(levels: readonly BookLevel[], price: string, order: "asc" | "desc"): number {
+  const numeric = Number(price);
+  let lo = 0;
+  let hi = levels.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    const midPrice = Number(levels[mid]!.price);
+    if (order === "desc" ? midPrice >= numeric : midPrice <= numeric) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+function applyLevelChange(
+  map: Map<string, string>,
+  levels: BookLevel[],
+  price: string,
+  size: string,
+  order: "asc" | "desc",
+): boolean {
+  if (Number(size) <= 0) {
+    if (!map.has(price)) return false;
+    map.delete(price);
+    const index = findExactPriceIndex(levels, price, order);
+    if (index >= 0) levels.splice(index, 1);
+    return true;
+  }
+  const existing = findExactPriceIndex(levels, price, order);
+  if (existing >= 0) {
+    map.set(price, size);
+    levels[existing] = freezeLevel(price, size);
+    return true;
+  }
+  map.set(price, size);
+  levels.splice(insertIndex(levels, price, order), 0, freezeLevel(price, size));
+  return true;
+}
+
+function publishSide(state: BookState, side: "bids" | "asks"): BookLevel[] {
+  if (side === "bids") {
+    if (!state.bidsDirty && state.publishedBids) return state.publishedBids as BookLevel[];
+    const published = Object.freeze(state.bidLevels.slice()) as BookLevel[];
+    state.publishedBids = published;
+    state.bidsDirty = false;
+    return published;
+  }
+  if (!state.asksDirty && state.publishedAsks) return state.publishedAsks as BookLevel[];
+  const published = Object.freeze(state.askLevels.slice()) as BookLevel[];
+  state.publishedAsks = published;
+  state.asksDirty = false;
+  return published;
+}
+
+const DECIMAL_RE = /^-?\d+(?:\.\d+)?$/;
+
+function assertBookLevel(level: BookLevel): void {
+  if (DECIMAL_RE.test(level.price) && DECIMAL_RE.test(level.quantity) && Number(level.quantity) >= 0) return;
+  bookLevelSchema.parse(level);
+}
+
+function assertDecimalString(value: string | null): void {
+  if (value == null || DECIMAL_RE.test(value)) return;
+  decimalStringSchema.parse(value);
+}
+
+function validateNormalizedBook(state: BookState, changedLevel?: BookLevel | null): void {
+  if (!state.levelsValid) {
+    for (const level of state.bidLevels) assertBookLevel(level);
+    for (const level of state.askLevels) assertBookLevel(level);
+    return;
+  }
+  if (changedLevel) assertBookLevel(changedLevel);
 }
 
 const SLUG_WINDOW = /(?:^|-)([a-z0-9]{2,16})-updown-(\d+)([mh])-(\d{10,})(?:-|$)/i;

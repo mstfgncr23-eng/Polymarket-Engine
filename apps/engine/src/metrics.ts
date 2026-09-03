@@ -91,7 +91,7 @@ export class EngineMetrics {
   });
   readonly marketNormalizationDuration = new Histogram({
     name: "market_normalization_duration_seconds",
-    help: "Time to convert one book state into a MarketSnapshot including sort",
+    help: "Time to convert one book state into a MarketSnapshot",
     buckets: DURATION_BUCKETS,
     registers: [this.registry],
   });
