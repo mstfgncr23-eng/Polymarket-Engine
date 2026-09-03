@@ -82,6 +82,12 @@ export interface PolymarketFeedHandlers {
   onAnomaly?(anomaly: PolymarketFeedAnomaly): void;
 }
 
+/** Optional normalize observer. Must not change book/price_change semantics. */
+export interface MarketNormalizeObserver {
+  onNormalizedSnapshot(input: { durationSeconds: number; bidLevels: number; askLevels: number }): void;
+  onPriceChangeEvent(entriesInPayload: number, processed: number): void;
+}
+
 export interface DiscoveryReport {
   discovered: DiscoveredMarket[];
   qualified: DiscoveredMarket[];
@@ -103,8 +109,11 @@ export class PolymarketMarketDataAdapter {
   private activeStreams = 0;
   private readonly anomalySampler = new BoundedAnomalySampler();
   private lastAnomaly: PolymarketFeedAnomaly | null = null;
+  private normalizeObserver: MarketNormalizeObserver | null = null;
 
   constructor(client: PublicClient = createPublicClient()) { this.client = client; }
+
+  setNormalizeObserver(observer: MarketNormalizeObserver | null): void { this.normalizeObserver = observer; }
 
   getMarket(tokenId: string): DiscoveredMarket | undefined { return this.marketsByToken.get(tokenId); }
   getMarkets(): DiscoveredMarket[] { return uniqueMarkets([...this.marketsByToken.values()]); }
@@ -378,6 +387,7 @@ export class PolymarketMarketDataAdapter {
         state.hash = nullableString(change.hash) ?? state.hash;
         snapshots.push(this.toSnapshot(tokenId, state, payload));
       }
+      this.normalizeObserver?.onPriceChangeEvent(changes.length, snapshots.length);
       return snapshots;
     }
     if (value.type === "last_trade_price") {
@@ -420,16 +430,23 @@ export class PolymarketMarketDataAdapter {
   }
 
   private toSnapshot(tokenId: string, state: NonNullable<ReturnType<PolymarketMarketDataAdapter["books"]["get"]>>, raw: Record<string, unknown>): MarketSnapshot {
+    const started = performance.now();
     const market = this.marketsByToken.get(tokenId);
     if (!market) throw new Error("UNKNOWN_TOKEN");
     const token = market.tokens.find((item) => item.tokenId === tokenId);
-    return marketSnapshotSchema.parse({
+    const snapshot = marketSnapshotSchema.parse({
       eventId: createId("poly"), traceId: createId("trace"), marketId: market.id, tokenId,
       outcome: token?.outcome ?? "UP", asset: market.asset, bids: sortedLevels(state.bids, "desc"), asks: sortedLevels(state.asks, "asc"),
       lastTradePrice: state.lastTradePrice, tickSize: nullableString(raw.tickSize), minOrderSize: nullableString(raw.minOrderSize),
       feeSchedule: market.feeSchedule, sourceTimestamp: state.timestamp, receivedAt: new Date().toISOString(),
       sequence: ++this.sequence, hash: state.hash,
     });
+    this.normalizeObserver?.onNormalizedSnapshot({
+      durationSeconds: (performance.now() - started) / 1000,
+      bidLevels: state.bids.size,
+      askLevels: state.asks.size,
+    });
+    return snapshot;
   }
 }
 
