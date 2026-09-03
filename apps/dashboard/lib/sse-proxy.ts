@@ -1,7 +1,10 @@
 import { engineInternalUrl, engineReadHeaders, engineUnreachableResponse } from "./engine";
 
-/** Default SSE proxy lifetime. Leaves a 60s margin under Vercel's observed 300s runtime kill. */
+/** Default SSE proxy lifetime. Covers Fly connect + streaming, with margin under Vercel's ~300s kill. */
 export const DEFAULT_SSE_PROXY_MAX_MS = 240_000;
+
+/** Hard cap for env/override. Must stay below the observed 300s Vercel runtime kill. */
+export const SSE_PROXY_HARD_CAP_MS = 270_000;
 
 const SSE_DOWNSTREAM_HEADERS = {
   "content-type": "text/event-stream",
@@ -10,12 +13,17 @@ const SSE_DOWNSTREAM_HEADERS = {
   "x-accel-buffering": "no",
 } as const;
 
+function clampSseProxyMaxMs(value: number): number {
+  if (!Number.isFinite(value) || value <= 0) return DEFAULT_SSE_PROXY_MAX_MS;
+  return Math.min(Math.floor(value), SSE_PROXY_HARD_CAP_MS);
+}
+
 export function resolveSseProxyMaxMs(env: NodeJS.ProcessEnv = process.env, override?: number): number {
-  if (typeof override === "number" && Number.isFinite(override) && override > 0) return override;
+  if (typeof override === "number") return clampSseProxyMaxMs(override);
   const raw = env.SSE_PROXY_MAX_MS;
   if (raw) {
     const parsed = Number(raw);
-    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    if (Number.isFinite(parsed) && parsed > 0) return clampSseProxyMaxMs(parsed);
   }
   return DEFAULT_SSE_PROXY_MAX_MS;
 }
@@ -26,8 +34,8 @@ export interface ProxyEngineSseOptions {
 }
 
 /**
- * Authenticated Fly `/events` proxy with a deterministic downstream lifetime.
- * Closes the stream and aborts the upstream reader before Vercel runtime termination.
+ * Authenticated Fly `/events` proxy with a deterministic lifetime that starts before
+ * the upstream fetch (DNS/TLS/headers + streaming) and pull-driven backpressure.
  */
 export async function proxyEngineSse(request: Request, options: ProxyEngineSseOptions = {}): Promise<Response> {
   const maxMs = resolveSseProxyMaxMs(process.env, options.maxMs);
@@ -36,7 +44,27 @@ export async function proxyEngineSse(request: Request, options: ProxyEngineSseOp
   const signal = AbortSignal.any([request.signal, rotation.signal]);
   let timer: ReturnType<typeof setTimeout> | undefined;
   let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  let upstreamBody: ReadableStream<Uint8Array> | undefined;
+  let downstream: ReadableStreamDefaultController<Uint8Array> | undefined;
+  let closed = false;
   let cleaned = false;
+
+  const closeDownstream = (comment?: string) => {
+    if (closed || !downstream) return;
+    closed = true;
+    if (comment) {
+      try {
+        downstream.enqueue(new TextEncoder().encode(`: ${comment}\n\n`));
+      } catch {
+        // controller already closed
+      }
+    }
+    try {
+      downstream.close();
+    } catch {
+      // controller already closed
+    }
+  };
 
   const onClientAbort = () => {
     cleanup();
@@ -52,9 +80,10 @@ export async function proxyEngineSse(request: Request, options: ProxyEngineSseOp
     request.signal.removeEventListener("abort", onClientAbort);
     const pendingReader = reader;
     reader = undefined;
-    // Cancel the upstream reader before aborting fetch so the source `cancel()`
-    // algorithm runs instead of losing it to an already-errored stream.
+    const pendingBody = upstreamBody;
+    upstreamBody = undefined;
     void pendingReader?.cancel("sse-proxy-cleanup").catch(() => undefined);
+    if (!pendingReader) void pendingBody?.cancel("sse-proxy-cleanup").catch(() => undefined);
     if (!rotation.signal.aborted) rotation.abort();
   };
 
@@ -63,6 +92,12 @@ export async function proxyEngineSse(request: Request, options: ProxyEngineSseOp
     return engineUnreachableResponse();
   }
   request.signal.addEventListener("abort", onClientAbort);
+
+  timer = setTimeout(() => {
+    console.info(JSON.stringify({ component: "dashboard-sse-proxy", event: "rotate", maxMs }));
+    closeDownstream("sse-proxy-rotation");
+    cleanup();
+  }, maxMs);
 
   try {
     const upstream = await doFetch(`${engineInternalUrl()}/events`, {
@@ -73,48 +108,44 @@ export async function proxyEngineSse(request: Request, options: ProxyEngineSseOp
       cache: "no-store",
       signal,
     });
-    if (!upstream.ok || !upstream.body) {
+    if (!upstream.ok || !upstream.body || signal.aborted) {
       cleanup();
       return engineUnreachableResponse();
     }
 
-    const body = upstream.body;
+    upstreamBody = upstream.body;
     const stream = new ReadableStream<Uint8Array>({
-      async start(controller) {
-        let closed = false;
-        const closeDownstream = (comment?: string) => {
-          if (closed) return;
-          closed = true;
-          if (comment) {
-            try {
-              controller.enqueue(new TextEncoder().encode(`: ${comment}\n\n`));
-            } catch {
-              // controller already closed
-            }
-          }
-          try {
-            controller.close();
-          } catch {
-            // controller already closed
-          }
-        };
-
-        reader = body.getReader();
-        timer = setTimeout(() => {
-          console.info(JSON.stringify({ component: "dashboard-sse-proxy", event: "rotate", maxMs }));
+      start(controller) {
+        downstream = controller;
+        if (signal.aborted) {
           closeDownstream("sse-proxy-rotation");
           cleanup();
-        }, maxMs);
-
+        }
+      },
+      async pull(controller) {
+        if (closed || signal.aborted) {
+          closeDownstream(signal.aborted ? "sse-proxy-rotation" : undefined);
+          cleanup();
+          return;
+        }
         try {
-          while (!signal.aborted && !closed) {
-            const { done, value } = await reader.read();
-            if (done || closed) break;
-            if (value) controller.enqueue(value);
+          reader ??= upstreamBody?.getReader();
+          if (!reader) {
+            closeDownstream();
+            cleanup();
+            return;
           }
-          closeDownstream();
+          const { done, value } = await reader.read();
+          if (closed) return;
+          if (done) {
+            closeDownstream();
+            cleanup();
+            return;
+          }
+          if (value) controller.enqueue(value);
         } catch {
-          if (signal.aborted) closeDownstream();
+          if (closed) return;
+          if (signal.aborted) closeDownstream("sse-proxy-rotation");
           else {
             closed = true;
             try {
@@ -123,14 +154,13 @@ export async function proxyEngineSse(request: Request, options: ProxyEngineSseOp
               // controller already closed
             }
           }
-        } finally {
           cleanup();
         }
       },
       cancel() {
         cleanup();
       },
-    });
+    }, { highWaterMark: 1 });
 
     return new Response(stream, {
       headers: {

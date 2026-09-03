@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { GET as eventsProxy } from "../apps/dashboard/app/api/engine/events/route.js";
 import { GET as snapshotProxy } from "../apps/dashboard/app/api/engine/snapshot/route.js";
 import { startEngineLiveTransport, type EngineEventSource, type StreamStatus } from "../apps/dashboard/lib/live-transport.js";
-import { DEFAULT_SSE_PROXY_MAX_MS, proxyEngineSse, resolveSseProxyMaxMs } from "../apps/dashboard/lib/sse-proxy.js";
+import { DEFAULT_SSE_PROXY_MAX_MS, SSE_PROXY_HARD_CAP_MS, proxyEngineSse, resolveSseProxyMaxMs } from "../apps/dashboard/lib/sse-proxy.js";
 import type { DashboardSnapshot } from "../apps/dashboard/lib/types.js";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -150,7 +150,10 @@ describe("dashboard SSE transport hardening", () => {
     vi.stubEnv("SSE_PROXY_MAX_MS", "40");
     expect(resolveSseProxyMaxMs()).toBe(40);
     expect(DEFAULT_SSE_PROXY_MAX_MS).toBe(240_000);
-    expect(DEFAULT_SSE_PROXY_MAX_MS).toBeLessThan(300_000);
+    expect(SSE_PROXY_HARD_CAP_MS).toBe(270_000);
+    expect(SSE_PROXY_HARD_CAP_MS).toBeLessThan(300_000);
+    expect(resolveSseProxyMaxMs({ SSE_PROXY_MAX_MS: "400000" })).toBe(SSE_PROXY_HARD_CAP_MS);
+    expect(resolveSseProxyMaxMs({}, 500_000)).toBe(SSE_PROXY_HARD_CAP_MS);
 
     let cancelled = false;
     const fetchImpl = vi.fn(async (_url: string, init?: RequestInit) => new Response(
@@ -363,5 +366,92 @@ describe("dashboard SSE transport hardening", () => {
     const eventsRoute = readFileSync(join(repoRoot, "apps/dashboard/app/api/engine/events/route.ts"), "utf8");
     expect(eventsRoute).not.toMatch(/maxDuration/);
     expect(existsSync(join(repoRoot, "fly.engine.toml"))).toBe(true);
+  });
+
+  it("upstream fetch stall before headers is aborted by the pre-fetch deadline", async () => {
+    vi.stubEnv("ENGINE_INTERNAL_URL", "http://engine.internal:8080");
+    vi.stubEnv("ENGINE_READ_TOKEN", TOKEN);
+    let fetchSignal: AbortSignal | undefined;
+    const fetchImpl = vi.fn(async (_url: string, init?: RequestInit) => {
+      fetchSignal = init?.signal ?? undefined;
+      await new Promise<Response>((_resolve, reject) => {
+        const fail = () => reject(new DOMException("Aborted", "AbortError"));
+        if (fetchSignal?.aborted) fail();
+        else fetchSignal?.addEventListener("abort", fail, { once: true });
+      });
+    });
+    const started = Date.now();
+    const response = await proxyEngineSse(new Request("http://dashboard.local/api/engine/events"), {
+      maxMs: 40,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    const elapsed = Date.now() - started;
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({ error: "ENGINE_UNREACHABLE" });
+    expect(fetchSignal?.aborted).toBe(true);
+    expect(elapsed).toBeGreaterThanOrEqual(25);
+    expect(elapsed).toBeLessThan(300);
+    expect(elapsed).toBeLessThan(SSE_PROXY_HARD_CAP_MS);
+  });
+
+  it("stale snapshot recovery does not overwrite a newer SSE snapshot after reconnect", async () => {
+    MockEventSource.instances = [];
+    const snapshots: DashboardSnapshot[] = [];
+    const stale = snapshotFixture("1500");
+    const newer = snapshotFixture("2000");
+    const recovery = Promise.withResolvers<Response>();
+    let fetches = 0;
+    const fetchImpl = vi.fn(async () => {
+      fetches += 1;
+      return recovery.promise;
+    });
+    const transport = startEngineLiveTransport({
+      onStatus: () => undefined,
+      onSnapshot: (snapshot) => snapshots.push(snapshot),
+    }, { eventSourceCtor: MockEventSource, fetchImpl: fetchImpl as unknown as typeof fetch });
+    const source = MockEventSource.instances[0]!;
+    source.emitError();
+    source.emitError();
+    await Promise.resolve();
+    expect(fetches).toBe(1);
+    source.emitOpen();
+    source.emitSnapshot(newer);
+    recovery.resolve(Response.json(stale));
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(snapshots).toEqual([newer]);
+    expect(snapshots.map((row) => row.balance.equity)).not.toContain("1500");
+    transport.close();
+  });
+
+  it("slow downstream does not eagerly drain the upstream SSE", async () => {
+    vi.stubEnv("ENGINE_INTERNAL_URL", "http://engine.internal:8080");
+    vi.stubEnv("ENGINE_READ_TOKEN", TOKEN);
+    let upstreamPulls = 0;
+    const fetchImpl = vi.fn(async (_url: string, init?: RequestInit) => {
+      const stream = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          upstreamPulls += 1;
+          if (upstreamPulls > 40) {
+            controller.close();
+            return;
+          }
+          controller.enqueue(encoder.encode(`data: ${upstreamPulls}\n\n`));
+        },
+      });
+      return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
+    });
+    const response = await proxyEngineSse(new Request("http://dashboard.local/api/engine/events"), {
+      maxMs: 2_000,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(upstreamPulls).toBeGreaterThanOrEqual(1);
+    expect(upstreamPulls).toBeLessThanOrEqual(2);
+    const reader = response.body!.getReader();
+    const first = await reader.read();
+    expect(first.done).toBe(false);
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(upstreamPulls).toBeLessThanOrEqual(3);
+    await reader.cancel();
   });
 });

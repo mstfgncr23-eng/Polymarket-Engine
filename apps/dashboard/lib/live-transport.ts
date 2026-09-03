@@ -30,6 +30,7 @@ function asSnapshot(value: unknown): DashboardSnapshot | null {
 /**
  * Single EventSource to `/api/engine/events` plus one bounded snapshot recovery per disconnect.
  * Relies on native EventSource reconnect; does not open a second source or poll.
+ * Recovery is scoped to a generation so a late response cannot overwrite a newer SSE snapshot.
  */
 export function startEngineLiveTransport(
   handlers: LiveTransportHandlers,
@@ -41,28 +42,39 @@ export function startEngineLiveTransport(
   const doFetch = options.fetchImpl ?? fetch;
 
   let disposed = false;
-  let recovering = false;
-  let recoveryAttempted = false;
+  let generation = 0;
+  let recoveredGeneration = -1;
+  let recoveryAbort: AbortController | undefined;
   const source = new EventSourceImpl(eventsUrl);
 
+  const invalidateRecovery = () => {
+    generation += 1;
+    const pending = recoveryAbort;
+    recoveryAbort = undefined;
+    pending?.abort();
+  };
+
   const recoverSnapshot = () => {
-    if (disposed || recovering || recoveryAttempted) return;
-    recovering = true;
-    recoveryAttempted = true;
-    void doFetch(snapshotUrl, { cache: "no-store" })
+    if (disposed || recoveryAbort || recoveredGeneration === generation) return;
+    recoveredGeneration = generation;
+    const myGeneration = generation;
+    const abort = new AbortController();
+    recoveryAbort = abort;
+    void doFetch(snapshotUrl, { cache: "no-store", signal: abort.signal })
       .then(async (response) => (response.ok ? asSnapshot(await response.json()) : null))
       .then((snapshot) => {
-        if (!disposed && snapshot) handlers.onSnapshot(snapshot);
+        if (disposed || myGeneration !== generation || abort.signal.aborted) return;
+        if (snapshot) handlers.onSnapshot(snapshot);
       })
       .catch(() => undefined)
       .finally(() => {
-        recovering = false;
+        if (recoveryAbort === abort) recoveryAbort = undefined;
       });
   };
 
   source.onopen = () => {
     if (disposed) return;
-    recoveryAttempted = false;
+    invalidateRecovery();
     handlers.onStatus("LIVE");
   };
   source.onerror = () => {
@@ -78,6 +90,7 @@ export function startEngineLiveTransport(
         handlers.onStatus("DEGRADED");
         return;
       }
+      invalidateRecovery();
       handlers.onSnapshot(snapshot);
       handlers.onStatus("LIVE");
     } catch {
@@ -88,6 +101,7 @@ export function startEngineLiveTransport(
   return {
     close() {
       disposed = true;
+      invalidateRecovery();
       source.close();
     },
   };

@@ -203,6 +203,7 @@ describe("deployment foundation", () => {
     expect(live.status).toBe(200);
     expect(live.headers.get("content-type")).toBe("text/event-stream");
     expect(live.body).toBeTruthy();
+    await live.body?.cancel();
   });
 
   it("8 readiness does not require qualified markets", async () => {
