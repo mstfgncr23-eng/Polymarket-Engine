@@ -40,10 +40,18 @@ export interface ReferenceFeedOptions {
   venue?: string;
   staleTimeoutMs?: number;
   factory?: WebSocketFactory;
-  reconnect?: Partial<ReconnectOptions>;
+  reconnect?: ReferenceReconnectOptions;
 }
 
 const DEFAULT_RECONNECT: ReconnectOptions = { initialDelayMs: 500, maxDelayMs: 30_000, multiplier: 2, jitterRatio: 0.2 };
+
+/** Reset reconnect backoff only if a connection stayed open this long without close/error. */
+export const REFERENCE_STABLE_CONNECTION_MS = 5_000;
+
+export interface ReferenceReconnectOptions extends Partial<ReconnectOptions> {
+  /** Override of REFERENCE_STABLE_CONNECTION_MS. Not reset on `"open"`. */
+  stableAfterMs?: number;
+}
 
 export function formatReferenceClose(closed: Omit<ReferenceCloseEvent, "reconnectCount" | "asset"> & { reconnectCount?: number; asset?: string }): string {
   return `REFERENCE_CLOSE:kind=${closed.kind}:code=${closed.code ?? "none"}:wasClean=${closed.wasClean}:abort=${closed.abortInitiated}:reason=${closed.reason || ""}`;
@@ -74,6 +82,7 @@ export class ReferencePriceFeedAdapter {
   private readonly staleTimeoutMs: number;
   private readonly venue: string;
   private readonly reconnect: ReconnectOptions;
+  private readonly stableAfterMs: number;
   private inFlight = false;
 
   constructor(private readonly options: ReferenceFeedOptions) {
@@ -86,6 +95,7 @@ export class ReferencePriceFeedAdapter {
       multiplier: options.reconnect?.multiplier ?? DEFAULT_RECONNECT.multiplier,
       jitterRatio: options.reconnect?.jitterRatio ?? DEFAULT_RECONNECT.jitterRatio,
     };
+    this.stableAfterMs = options.reconnect?.stableAfterMs ?? REFERENCE_STABLE_CONNECTION_MS;
   }
 
   get asset(): string { return this.options.asset; }
@@ -136,6 +146,7 @@ export class ReferencePriceFeedAdapter {
       let abortInitiated = false;
       let sawError = false;
       let staleForced = false;
+      let openedAt: number | null = null;
       const staleTimer = setInterval(() => {
         if (connected && Date.now() - lastMessageAt > this.staleTimeoutMs) {
           staleForced = true;
@@ -148,6 +159,7 @@ export class ReferencePriceFeedAdapter {
         settled = true;
         clearInterval(staleTimer);
         signal.removeEventListener("abort", onAbort);
+        if (connected && openedAt != null && Date.now() - openedAt >= this.stableAfterMs) backoff.reset();
         const kind = classifyReferenceClose({
           abortInitiated, abortReason: signal.reason, code: input.code, reason: input.reason,
           wasClean: input.wasClean, sawError, staleForced,
@@ -157,15 +169,17 @@ export class ReferencePriceFeedAdapter {
           reconnectCount, asset: this.options.asset,
         });
       };
+      const requestClose = (code: number, reason: string) => {
+        try { socket.close(code, reason); } catch { finish({ code, reason, wasClean: abortInitiated }); }
+      };
       const onAbort = () => {
         abortInitiated = true;
-        try { socket.close(1000, "shutdown"); } catch { /* close adapters may be test doubles */ }
-        finish({ code: 1000, reason: "shutdown", wasClean: true });
+        requestClose(1000, "shutdown");
       };
       socket.addEventListener("open", () => {
         connected = true;
-        lastMessageAt = Date.now();
-        backoff.reset();
+        openedAt = Date.now();
+        lastMessageAt = openedAt;
         void handlers.onConnection(this.connection("CONNECTED", reconnectCount));
       });
       socket.addEventListener("message", (event) => {
@@ -175,12 +189,14 @@ export class ReferencePriceFeedAdapter {
       });
       socket.addEventListener("error", () => {
         sawError = true;
-        finish({ code: null, reason: "REFERENCE_WEBSOCKET_ERROR", wasClean: false });
+        requestClose(1011, "websocket error");
       }, { once: true });
       socket.addEventListener("close", (event) => {
         const close = event as Partial<CloseEvent>;
-        const code = typeof close.code === "number" ? close.code : null;
-        const reason = typeof close.reason === "string" ? close.reason : "";
+        const code = typeof close.code === "number" ? close.code : (sawError ? null : 1005);
+        const reason = typeof close.reason === "string" && close.reason.length > 0
+          ? close.reason
+          : sawError ? "REFERENCE_WEBSOCKET_ERROR" : "";
         const wasClean = close.wasClean === true;
         finish({ code, reason, wasClean });
       }, { once: true });
@@ -258,6 +274,7 @@ export class ReferenceFeedRegistry {
   private readonly cache = new Map<string, CachedResolution>();
   private readonly sessions = new Map<string, AssetSession>();
   private readonly chains = new Map<string, Promise<unknown>>();
+  private readonly stopEpoch = new Map<string, number>();
   private readonly transientBackoff = new Map<string, ExponentialBackoff>();
   private readonly now: () => number;
   private readonly negativeCacheTtlMs: number;
@@ -332,14 +349,17 @@ export class ReferenceFeedRegistry {
     asset: string,
     handlers: ReferenceFeedHandlers,
     parentSignal: AbortSignal,
-  ): Promise<"started" | "already" | "unsupported" | "transient"> {
+  ): Promise<"started" | "already" | "unsupported" | "transient" | "stopped"> {
     return this.enqueue(asset, async () => {
+      const epoch = this.stopEpoch.get(asset) ?? 0;
       const existing = this.sessions.get(asset);
       if (existing && !existing.controller.signal.aborted) return "already";
       if (existing) await existing.done;
+      if ((this.stopEpoch.get(asset) ?? 0) !== epoch) return "stopped";
       const raced = this.sessions.get(asset);
       if (raced && !raced.controller.signal.aborted) return "already";
       const resolution = await this.resolve(asset);
+      if ((this.stopEpoch.get(asset) ?? 0) !== epoch) return "stopped";
       if (resolution.status === "TRANSIENT_FAILURE") return "transient";
       if (resolution.status !== "SUPPORTED") return "unsupported";
       const adapter = this.adapterFor(asset);
@@ -347,9 +367,9 @@ export class ReferenceFeedRegistry {
       if (adapter.running) return "already";
       const child = new AbortController();
       const onParentAbort = () => child.abort(parentSignal.reason);
-      if (parentSignal.aborted) {
-        child.abort(parentSignal.reason);
-        return "transient";
+      if (parentSignal.aborted || (this.stopEpoch.get(asset) ?? 0) !== epoch) {
+        child.abort(parentSignal.aborted ? parentSignal.reason : "REFERENCE_ASSET_UNNEEDED");
+        return parentSignal.aborted ? "transient" : "stopped";
       }
       parentSignal.addEventListener("abort", onParentAbort, { once: true });
       let release!: () => void;
@@ -366,9 +386,10 @@ export class ReferenceFeedRegistry {
   }
 
   stop(asset: string): boolean {
+    this.stopEpoch.set(asset, (this.stopEpoch.get(asset) ?? 0) + 1);
+    this.adapters.delete(asset);
     const session = this.sessions.get(asset);
     if (!session || session.controller.signal.aborted) return false;
-    this.adapters.delete(asset);
     session.controller.abort("REFERENCE_ASSET_UNNEEDED");
     return true;
   }

@@ -1,8 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { PaperLedger, engineEnvSchema, evaluateRisk, riskLimitsSchema } from "@pm/core";
 import { MemoryEventJournal } from "@pm/db";
 import {
   PolymarketMarketDataAdapter,
+  REFERENCE_STABLE_CONNECTION_MS,
   ReferenceFeedRegistry,
   ReferencePriceFeedAdapter,
   classifyBinanceExchangeInfo,
@@ -129,6 +130,30 @@ class ScriptedSocket extends EventTarget implements WebSocketLike {
     if (this.readyState === 3) return;
     this.readyState = 3;
     dispatchSocketClose(this, code, reason, wasClean);
+  }
+}
+
+class DelayedCloseSocket extends EventTarget implements WebSocketLike {
+  readyState = 0;
+  private pending: { code?: number; reason?: string } | null = null;
+  constructor(private readonly onClosed?: () => void) { super(); }
+  close(code?: number, reason?: string): void {
+    if (this.readyState === 3) return;
+    this.readyState = 2;
+    this.pending = { code, reason };
+  }
+  open(): void {
+    this.readyState = 1;
+    this.dispatchEvent(new Event("open"));
+  }
+  error(): void { this.dispatchEvent(new Event("error")); }
+  completeClose(): void {
+    if (this.readyState === 3) return;
+    const pending = this.pending ?? { code: 1006, reason: "" };
+    this.readyState = 3;
+    this.pending = null;
+    this.onClosed?.();
+    dispatchSocketClose(this, pending.code ?? 1006, pending.reason ?? "", pending.code === 1000);
   }
 }
 
@@ -513,5 +538,167 @@ describe("I paper safety remains paper-only after feed stabilization", () => {
     } finally {
       await engine.stop();
     }
+  });
+});
+
+describe("reference-feed lifecycle closure", () => {
+  afterEach(() => { vi.useRealTimers(); });
+
+  it("documents the stable-connection backoff reset threshold", () => {
+    expect(REFERENCE_STABLE_CONNECTION_MS).toBe(5_000);
+  });
+
+  it("grows reconnect delay across consecutive short-lived open/close flaps and caps at maxDelay", async () => {
+    vi.useFakeTimers();
+    const createdAt: number[] = [];
+    const sockets: ScriptedSocket[] = [];
+    const factory = () => {
+      createdAt.push(Date.now());
+      const socket = new ScriptedSocket();
+      sockets.push(socket);
+      queueMicrotask(() => socket.open());
+      return socket;
+    };
+    const adapter = new ReferencePriceFeedAdapter({
+      asset: "XRP", symbol: "XRPUSDT", url: "wss://example/xrp", factory, staleTimeoutMs: 60_000,
+      reconnect: { initialDelayMs: 50, maxDelayMs: 200, multiplier: 2, jitterRatio: 0, stableAfterMs: 10_000 },
+    });
+    const abort = new AbortController();
+    const running = adapter.run(silentHandlers(), abort.signal);
+    const gaps: number[] = [];
+    for (let i = 0; i < 5; i += 1) {
+      await vi.advanceTimersByTimeAsync(0);
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(sockets.length).toBe(i + 1);
+      sockets[i]!.remoteClose(1006, "flap", false);
+      if (i === 4) break;
+      const expected = Math.min(200, 50 * 2 ** i);
+      const before = Date.now();
+      await vi.advanceTimersByTimeAsync(expected);
+      gaps.push(Date.now() - before);
+    }
+    expect(gaps).toEqual([50, 100, 200, 200]);
+    const createdGaps = createdAt.slice(1).map((at, index) => at - createdAt[index]!);
+    expect(createdGaps).toEqual([50, 100, 200, 200]);
+    abort.abort("test");
+    await vi.advanceTimersByTimeAsync(0);
+    await running;
+  });
+
+  it("resets backoff only after a connection stays open for stableAfterMs", async () => {
+    vi.useFakeTimers();
+    const createdAt: number[] = [];
+    const sockets: ScriptedSocket[] = [];
+    const factory = () => {
+      createdAt.push(Date.now());
+      const socket = new ScriptedSocket();
+      sockets.push(socket);
+      queueMicrotask(() => socket.open());
+      return socket;
+    };
+    const adapter = new ReferencePriceFeedAdapter({
+      asset: "SOL", symbol: "SOLUSDT", url: "wss://example/sol", factory, staleTimeoutMs: 60_000,
+      reconnect: { initialDelayMs: 50, maxDelayMs: 200, multiplier: 2, jitterRatio: 0, stableAfterMs: 30 },
+    });
+    const abort = new AbortController();
+    const running = adapter.run(silentHandlers(), abort.signal);
+    await vi.advanceTimersByTimeAsync(0);
+    await Promise.resolve();
+    sockets[0]!.remoteClose(1006, "short", false);
+    await vi.advanceTimersByTimeAsync(50);
+    await Promise.resolve();
+    expect(sockets.length).toBe(2);
+    await vi.advanceTimersByTimeAsync(30);
+    const stableClosedAt = Date.now();
+    sockets[1]!.remoteClose(1006, "stable-then-close", false);
+    await vi.advanceTimersByTimeAsync(49);
+    expect(sockets.length).toBe(2);
+    await vi.advanceTimersByTimeAsync(1);
+    await Promise.resolve();
+    expect(sockets.length).toBe(3);
+    expect(createdAt[1]! - createdAt[0]!).toBe(50);
+    expect(Date.now() - stableClosedAt).toBe(50);
+    abort.abort("test");
+    await vi.advanceTimersByTimeAsync(0);
+    await running;
+  });
+
+  it("does not open a new socket until the previous error socket has closed", async () => {
+    vi.useFakeTimers();
+    let live = 0;
+    let maxLive = 0;
+    const sockets: DelayedCloseSocket[] = [];
+    const factory = () => {
+      const socket = new DelayedCloseSocket(() => {
+        live = Math.max(0, live - 1);
+      });
+      live += 1;
+      maxLive = Math.max(maxLive, live);
+      sockets.push(socket);
+      queueMicrotask(() => socket.open());
+      return socket;
+    };
+    const adapter = new ReferencePriceFeedAdapter({
+      asset: "ETH", symbol: "ETHUSDT", url: "wss://example/eth", factory, staleTimeoutMs: 60_000,
+      reconnect: { initialDelayMs: 20, maxDelayMs: 20, jitterRatio: 0, stableAfterMs: 10_000 },
+    });
+    const abort = new AbortController();
+    const running = adapter.run(silentHandlers(), abort.signal);
+    await vi.advanceTimersByTimeAsync(0);
+    await Promise.resolve();
+    expect(sockets.length).toBe(1);
+    sockets[0]!.error();
+    await vi.advanceTimersByTimeAsync(5_000);
+    await Promise.resolve();
+    expect(sockets.length).toBe(1);
+    expect(live).toBe(1);
+    expect(maxLive).toBe(1);
+    sockets[0]!.completeClose();
+    await vi.advanceTimersByTimeAsync(20);
+    await Promise.resolve();
+    expect(sockets.length).toBe(2);
+    expect(maxLive).toBe(1);
+    expect(live).toBe(1);
+    abort.abort("test");
+    sockets.at(-1)?.completeClose();
+    await vi.advanceTimersByTimeAsync(0);
+    await running;
+  });
+
+  it("stop during an in-flight resolve does not start the feed", async () => {
+    let probes = 0;
+    let factoryCalls = 0;
+    let release!: (outcome: { kind: "supported"; detail: string }) => void;
+    const factory = () => {
+      factoryCalls += 1;
+      const socket = new ScriptedSocket();
+      queueMicrotask(() => socket.open());
+      return socket;
+    };
+    const registry = new ReferenceFeedRegistry(
+      "wss://example.invalid/ws", "https://example.invalid", 15_000, factory,
+      () => {
+        probes += 1;
+        return new Promise((resolve) => { release = resolve; });
+      },
+      { negativeCacheTtlMs: 0 },
+    );
+    const parent = new AbortController();
+    const pending = registry.ensureRunning("SOL", silentHandlers(), parent.signal);
+    await waitFor(() => probes === 1);
+    expect(registry.runningAssets()).toEqual([]);
+    registry.stop("SOL");
+    release({ kind: "supported", detail: "trading" });
+    expect(await pending).toBe("stopped");
+    expect(factoryCalls).toBe(0);
+    expect(registry.runningAssets()).toEqual([]);
+
+    const restarted = await registry.ensureRunning("SOL", silentHandlers(), parent.signal);
+    expect(restarted).toBe("started");
+    expect(factoryCalls).toBe(1);
+    expect(registry.runningAssets()).toEqual(["SOL"]);
+    registry.stop("SOL");
+    parent.abort("test");
   });
 });
