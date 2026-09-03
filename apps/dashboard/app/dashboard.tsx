@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { startEngineLiveTransport } from "../lib/live-transport";
 import type { DashboardSnapshot, GrokAgentSignal } from "../lib/types";
 
 const AGENTS = [
@@ -18,14 +19,19 @@ export default function Dashboard({ initial }: { initial: DashboardSnapshot | nu
 
   useEffect(() => {
     let disposed = false;
-    if (!initial) fetch("/api/engine/snapshot", { cache: "no-store" }).then((r) => r.ok ? r.json() : null).then((value) => { if (!disposed && value) setData(value as DashboardSnapshot); }).catch(() => undefined);
-    const source = new EventSource("/api/engine/events");
-    source.onopen = () => setStream("LIVE");
-    source.onerror = () => setStream("DEGRADED");
-    source.addEventListener("snapshot", (event) => {
-      try { setData(JSON.parse((event as MessageEvent<string>).data) as DashboardSnapshot); setStream("LIVE"); } catch { setStream("DEGRADED"); }
+    if (!initial) {
+      fetch("/api/engine/snapshot", { cache: "no-store" })
+        .then((r) => r.ok ? r.json() : null)
+        .then((value) => {
+          if (!disposed && value && typeof value === "object" && !("error" in value)) setData(value as DashboardSnapshot);
+        })
+        .catch(() => undefined);
+    }
+    const transport = startEngineLiveTransport({
+      onStatus: (status) => { if (!disposed) setStream(status); },
+      onSnapshot: (snapshot) => { if (!disposed) setData(snapshot); },
     });
-    return () => { disposed = true; source.close(); };
+    return () => { disposed = true; transport.close(); };
   }, [initial]);
 
   const equityPoints = useMemo(() => chartPoints(data?.equityHistory ?? []), [data?.equityHistory]);
