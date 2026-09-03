@@ -32,8 +32,11 @@ export class SseHub {
         this.snapshotTimer = null;
         const payload = this.pendingSnapshot;
         this.pendingSnapshot = null;
-        if (payload !== null) this.frame("snapshot", payload);
-        this.snapshotBroadcasts += 1;
+        if (payload !== null && payload !== undefined) {
+          const resolved = typeof payload === "function" ? (payload as () => unknown)() : payload;
+          this.frame("snapshot", resolved);
+          this.snapshotBroadcasts += 1;
+        }
       }, delay);
       this.snapshotTimer.unref?.();
       return;
@@ -88,6 +91,7 @@ export async function createApiServer(input: {
     return { ok: true as const };
   };
 
+  // In-memory only. Do not add I/O, discovery, journal, or feed work here — Fly health checks are 3s.
   app.get("/health", async () => ({ status: "ok", mode: "paper", draining: input.state.draining, engineAlive: input.state.engineAlive() }));
   app.get("/ready", async (_request, reply) => {
     const body = input.state.readiness();

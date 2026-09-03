@@ -59,6 +59,7 @@ import {
   createRestProbe,
   type DiscoveredMarket,
   type FeedConnectionEvent,
+  type PolymarketFeedAnomaly,
 } from "@pm/market-data";
 import { EngineMetrics } from "./metrics.js";
 import { SseHub } from "./server.js";
@@ -117,6 +118,7 @@ export class EngineService {
   private discoveryTimer: NodeJS.Timeout | null = null;
   private lastInfrastructureAccrualAt = Date.now();
   private lastScheduledReviewAt = 0;
+  private lastAnomalyJournalAt = 0;
   private reportGenerated = false;
 
   constructor(
@@ -326,6 +328,7 @@ export class EngineService {
       onSnapshot: (snapshot) => this.onMarketSnapshot(snapshot),
       onConnection: (event) => this.onConnection(event),
       onError: (error) => this.onFeedError("polymarket", error),
+      onAnomaly: (anomaly) => this.onPolymarketAnomaly(anomaly),
     }, this.abort.signal).catch((error) => this.logger.error({ err: error }, "polymarket market loop stopped"));
   }
 
@@ -994,14 +997,41 @@ export class EngineService {
         connection.state = event.state;
         connection.reconnects = event.reconnectCount;
       }
-      this.metrics.wsReconnects.inc({ feed: "reference" }, 0);
+      if (event.state === "DISCONNECTED") {
+        const kind = /kind=([a-z_]+)/.exec(event.message ?? "")?.[1] ?? "unknown";
+        this.metrics.referenceCloses.inc({ kind });
+        if (event.reconnectCount > 0) this.metrics.wsReconnects.inc({ feed: "reference" });
+      }
     }
     this.updateReady();
     this.record(`WS_${event.state}`, createId("trace"), null, { feed: event.feed, asset: event.asset ?? null, reconnects: event.reconnectCount, message: event.message }, event.asset ?? null);
   }
 
+  private onPolymarketAnomaly(anomaly: PolymarketFeedAnomaly): void {
+    if (anomaly.kind === "stale") {
+      this.metrics.staleEventsDropped.inc();
+      if (anomaly.regressionMs != null) this.metrics.staleEventRegression.observe(anomaly.regressionMs);
+    } else {
+      this.metrics.malformedMarketEvents.inc();
+    }
+    if (!anomaly.sampled) return;
+    const now = Date.now();
+    if (now - this.lastAnomalyJournalAt < 5_000) return;
+    this.lastAnomalyJournalAt = now;
+    this.logger.error({
+      tokenId: anomaly.tokenId, kind: anomaly.kind, regressionMs: anomaly.regressionMs,
+      incomingMs: anomaly.incomingMs, lastAcceptedMs: anomaly.lastAcceptedMs, totalDropped: anomaly.totalDropped,
+    }, "polymarket event dropped without reconnect");
+    void this.safeAppend(createJournalEvent({
+      traceId: createId("trace"), type: "SYSTEM_HEALTH_EVENT", aggregateType: "feed", aggregateId: "polymarket",
+      payload: {
+        status: "TIMESTAMP_ANOMALY", kind: anomaly.kind, tokenId: anomaly.tokenId,
+        regressionMs: anomaly.regressionMs, totalDropped: anomaly.totalDropped, reconnect: false,
+      },
+    }));
+  }
+
   private async onFeedError(feed: string, error: Error): Promise<void> {
-    if (error.message.includes("EVENT_TIMESTAMP_DISORDER")) this.timestampDisorder = true;
     this.logger.error({ err: { name: error.name, message: error.message }, feed }, "market feed error");
     await this.safeAppend(createJournalEvent({ traceId: createId("trace"), type: "SYSTEM_HEALTH_EVENT", aggregateType: "feed", aggregateId: feed, payload: { status: "ERROR", message: error.message } }));
   }
@@ -1022,7 +1052,7 @@ export class EngineService {
       this.state.record(item);
       this.sse.publish("decision", item);
     }
-    this.sse.publish("snapshot", this.state.snapshot());
+    this.sse.publish("snapshot", () => this.state.snapshot());
   }
 
   private async safeAppend(event: ReturnType<typeof createJournalEvent>): Promise<void> {

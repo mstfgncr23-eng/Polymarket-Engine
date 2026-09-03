@@ -1,5 +1,5 @@
 import { createId, referenceStreamUrl, referenceTickSchema, toBinanceSpotSymbol, type ReferenceTick } from "@pm/core";
-import { abortableDelay, ExponentialBackoff } from "./reconnect.js";
+import { abortableDelay, ExponentialBackoff, type ReconnectOptions } from "./reconnect.js";
 import type { FeedConnectionEvent } from "./polymarket.js";
 
 export interface ReferenceFeedHandlers {
@@ -15,6 +15,24 @@ export interface WebSocketLike extends EventTarget {
 
 export type WebSocketFactory = (url: string) => WebSocketLike;
 
+export type ReferenceCloseKind =
+  | "operator_shutdown"
+  | "asset_unneeded"
+  | "clean_remote_close"
+  | "network_error"
+  | "stale_feed"
+  | "websocket_error";
+
+export interface ReferenceCloseEvent {
+  kind: ReferenceCloseKind;
+  code: number | null;
+  reason: string;
+  wasClean: boolean;
+  abortInitiated: boolean;
+  reconnectCount: number;
+  asset: string;
+}
+
 export interface ReferenceFeedOptions {
   asset: string;
   symbol: string;
@@ -22,40 +40,90 @@ export interface ReferenceFeedOptions {
   venue?: string;
   staleTimeoutMs?: number;
   factory?: WebSocketFactory;
+  reconnect?: ReferenceReconnectOptions;
+}
+
+const DEFAULT_RECONNECT: ReconnectOptions = { initialDelayMs: 500, maxDelayMs: 30_000, multiplier: 2, jitterRatio: 0.2 };
+
+/** Reset reconnect backoff only if a connection stayed open this long without close/error. */
+export const REFERENCE_STABLE_CONNECTION_MS = 5_000;
+
+export interface ReferenceReconnectOptions extends Partial<ReconnectOptions> {
+  /** Override of REFERENCE_STABLE_CONNECTION_MS. Not reset on `"open"`. */
+  stableAfterMs?: number;
+}
+
+export function formatReferenceClose(closed: Omit<ReferenceCloseEvent, "reconnectCount" | "asset"> & { reconnectCount?: number; asset?: string }): string {
+  return `REFERENCE_CLOSE:kind=${closed.kind}:code=${closed.code ?? "none"}:wasClean=${closed.wasClean}:abort=${closed.abortInitiated}:reason=${closed.reason || ""}`;
+}
+
+export function classifyReferenceClose(input: {
+  abortInitiated: boolean;
+  abortReason: unknown;
+  code: number | null;
+  reason: string;
+  wasClean: boolean;
+  sawError: boolean;
+  staleForced: boolean;
+}): ReferenceCloseKind {
+  if (input.abortInitiated) {
+    const reason = `${input.abortReason ?? ""} ${input.reason}`.trim();
+    if (reason.includes("REFERENCE_ASSET_UNNEEDED")) return "asset_unneeded";
+    return "operator_shutdown";
+  }
+  if (input.staleForced || input.code === 4000 || input.reason === "stale feed") return "stale_feed";
+  if (input.sawError) return "websocket_error";
+  if (input.wasClean && (input.code === 1000 || input.code === 1001)) return "clean_remote_close";
+  return "network_error";
 }
 
 export class ReferencePriceFeedAdapter {
   private readonly factory: WebSocketFactory;
   private readonly staleTimeoutMs: number;
   private readonly venue: string;
+  private readonly reconnect: ReconnectOptions;
+  private readonly stableAfterMs: number;
+  private inFlight = false;
 
   constructor(private readonly options: ReferenceFeedOptions) {
     this.factory = options.factory ?? ((url) => new WebSocket(url));
     this.staleTimeoutMs = options.staleTimeoutMs ?? 15_000;
     this.venue = options.venue ?? "binance";
+    this.reconnect = {
+      initialDelayMs: options.reconnect?.initialDelayMs ?? DEFAULT_RECONNECT.initialDelayMs,
+      maxDelayMs: options.reconnect?.maxDelayMs ?? DEFAULT_RECONNECT.maxDelayMs,
+      multiplier: options.reconnect?.multiplier ?? DEFAULT_RECONNECT.multiplier,
+      jitterRatio: options.reconnect?.jitterRatio ?? DEFAULT_RECONNECT.jitterRatio,
+    };
+    this.stableAfterMs = options.reconnect?.stableAfterMs ?? REFERENCE_STABLE_CONNECTION_MS;
   }
 
   get asset(): string { return this.options.asset; }
   get symbol(): string { return this.options.symbol; }
+  get running(): boolean { return this.inFlight; }
 
   async run(handlers: ReferenceFeedHandlers, signal: AbortSignal): Promise<void> {
-    const backoff = new ExponentialBackoff({ initialDelayMs: 500, maxDelayMs: 30_000, multiplier: 2, jitterRatio: 0.2 });
+    if (this.inFlight) throw new Error(`REFERENCE_FEED_ALREADY_RUNNING:${this.options.asset}`);
+    this.inFlight = true;
+    const backoff = new ExponentialBackoff(this.reconnect);
     let reconnectCount = 0;
-    while (!signal.aborted) {
-      await handlers.onConnection(this.connection("CONNECTING", reconnectCount));
-      try {
-        await this.runConnection(handlers, signal, reconnectCount);
-        if (!signal.aborted) throw new Error("REFERENCE_STREAM_ENDED");
-      } catch (error) {
-        if (signal.aborted) break;
+    try {
+      while (!signal.aborted) {
+        await handlers.onConnection(this.connection("CONNECTING", reconnectCount));
+        const closed = await this.runConnection(handlers, signal, reconnectCount, backoff);
+        if (signal.aborted || closed.kind === "operator_shutdown" || closed.kind === "asset_unneeded") break;
         reconnectCount += 1;
-        const normalized = error instanceof Error ? error : new Error(String(error));
-        await handlers.onError(normalized);
-        await handlers.onConnection(this.connection("DISCONNECTED", reconnectCount, normalized.message));
+        const message = formatReferenceClose({ ...closed, reconnectCount, asset: this.options.asset });
+        if (closed.kind === "network_error" || closed.kind === "websocket_error" || closed.kind === "stale_feed") {
+          await handlers.onError(new Error(message));
+        }
+        await handlers.onConnection(this.connection("DISCONNECTED", reconnectCount, message));
         await abortableDelay(backoff.nextDelay(), signal).catch(() => undefined);
       }
+      await handlers.onConnection(this.connection("STOPPED", reconnectCount));
+    } finally {
+      this.inFlight = false;
     }
-    await handlers.onConnection(this.connection("STOPPED", reconnectCount));
   }
 
   private connection(state: FeedConnectionEvent["state"], reconnectCount: number, message?: string): FeedConnectionEvent {
@@ -64,21 +132,54 @@ export class ReferencePriceFeedAdapter {
       : { feed: "reference", asset: this.options.asset, state, at: new Date().toISOString(), reconnectCount };
   }
 
-  private runConnection(handlers: ReferenceFeedHandlers, signal: AbortSignal, reconnectCount: number): Promise<void> {
-    return new Promise((resolve, reject) => {
+  private runConnection(
+    handlers: ReferenceFeedHandlers,
+    signal: AbortSignal,
+    reconnectCount: number,
+    backoff: ExponentialBackoff,
+  ): Promise<Omit<ReferenceCloseEvent, "reconnectCount" | "asset"> & { reconnectCount: number; asset: string }> {
+    return new Promise((resolve) => {
       const socket = this.factory(this.options.url);
       let lastMessageAt = Date.now();
       let connected = false;
+      let settled = false;
+      let abortInitiated = false;
+      let sawError = false;
+      let staleForced = false;
+      let openedAt: number | null = null;
       const staleTimer = setInterval(() => {
         if (connected && Date.now() - lastMessageAt > this.staleTimeoutMs) {
+          staleForced = true;
           void handlers.onConnection(this.connection("STALE", reconnectCount));
-          socket.close(4000, "stale feed");
+          try { socket.close(4000, "stale feed"); } catch { /* ignore */ }
         }
       }, Math.max(500, Math.floor(this.staleTimeoutMs / 2)));
-      const cleanup = () => clearInterval(staleTimer);
+      const finish = (input: { code: number | null; reason: string; wasClean: boolean }) => {
+        if (settled) return;
+        settled = true;
+        clearInterval(staleTimer);
+        signal.removeEventListener("abort", onAbort);
+        if (connected && openedAt != null && Date.now() - openedAt >= this.stableAfterMs) backoff.reset();
+        const kind = classifyReferenceClose({
+          abortInitiated, abortReason: signal.reason, code: input.code, reason: input.reason,
+          wasClean: input.wasClean, sawError, staleForced,
+        });
+        resolve({
+          kind, code: input.code, reason: input.reason, wasClean: input.wasClean, abortInitiated,
+          reconnectCount, asset: this.options.asset,
+        });
+      };
+      const requestClose = (code: number, reason: string) => {
+        try { socket.close(code, reason); } catch { finish({ code, reason, wasClean: abortInitiated }); }
+      };
+      const onAbort = () => {
+        abortInitiated = true;
+        requestClose(1000, "shutdown");
+      };
       socket.addEventListener("open", () => {
         connected = true;
-        lastMessageAt = Date.now();
+        openedAt = Date.now();
+        lastMessageAt = openedAt;
         void handlers.onConnection(this.connection("CONNECTED", reconnectCount));
       });
       socket.addEventListener("message", (event) => {
@@ -86,9 +187,21 @@ export class ReferencePriceFeedAdapter {
         try { void handlers.onTick(parseBinanceAggTrade((event as MessageEvent).data, this.options.symbol, this.options.asset, this.venue)); }
         catch (error) { void handlers.onError(error instanceof Error ? error : new Error(String(error))); }
       });
-      socket.addEventListener("error", () => { cleanup(); reject(new Error("REFERENCE_WEBSOCKET_ERROR")); }, { once: true });
-      socket.addEventListener("close", () => { cleanup(); resolve(); }, { once: true });
-      signal.addEventListener("abort", () => { cleanup(); socket.close(1000, "shutdown"); resolve(); }, { once: true });
+      socket.addEventListener("error", () => {
+        sawError = true;
+        requestClose(1011, "websocket error");
+      }, { once: true });
+      socket.addEventListener("close", (event) => {
+        const close = event as Partial<CloseEvent>;
+        const code = typeof close.code === "number" ? close.code : (sawError ? null : 1005);
+        const reason = typeof close.reason === "string" && close.reason.length > 0
+          ? close.reason
+          : sawError ? "REFERENCE_WEBSOCKET_ERROR" : "";
+        const wasClean = close.wasClean === true;
+        finish({ code, reason, wasClean });
+      }, { once: true });
+      if (signal.aborted) onAbort();
+      else signal.addEventListener("abort", onAbort, { once: true });
     });
   }
 }
@@ -151,10 +264,17 @@ export interface ReferenceRegistryOptions {
   now?: () => number;
 }
 
+interface AssetSession {
+  controller: AbortController;
+  done: Promise<void>;
+}
+
 export class ReferenceFeedRegistry {
   private readonly adapters = new Map<string, ReferencePriceFeedAdapter>();
   private readonly cache = new Map<string, CachedResolution>();
-  private readonly running = new Map<string, AbortController>();
+  private readonly sessions = new Map<string, AssetSession>();
+  private readonly chains = new Map<string, Promise<unknown>>();
+  private readonly stopEpoch = new Map<string, number>();
   private readonly transientBackoff = new Map<string, ExponentialBackoff>();
   private readonly now: () => number;
   private readonly negativeCacheTtlMs: number;
@@ -229,39 +349,63 @@ export class ReferenceFeedRegistry {
     asset: string,
     handlers: ReferenceFeedHandlers,
     parentSignal: AbortSignal,
-  ): Promise<"started" | "already" | "unsupported" | "transient"> {
-    if (this.running.has(asset)) return "already";
-    const resolution = await this.resolve(asset);
-    if (resolution.status === "TRANSIENT_FAILURE") return "transient";
-    if (resolution.status !== "SUPPORTED") return "unsupported";
-    const adapter = this.adapterFor(asset);
-    if (!adapter) return "unsupported";
-    const child = new AbortController();
-    const onParentAbort = () => child.abort(parentSignal.reason);
-    if (parentSignal.aborted) {
-      child.abort(parentSignal.reason);
-      return "transient";
-    }
-    parentSignal.addEventListener("abort", onParentAbort, { once: true });
-    this.running.set(asset, child);
-    void adapter.run(handlers, child.signal).catch(() => undefined).finally(() => {
-      parentSignal.removeEventListener("abort", onParentAbort);
-      if (this.running.get(asset) === child) this.running.delete(asset);
+  ): Promise<"started" | "already" | "unsupported" | "transient" | "stopped"> {
+    return this.enqueue(asset, async () => {
+      const epoch = this.stopEpoch.get(asset) ?? 0;
+      const existing = this.sessions.get(asset);
+      if (existing && !existing.controller.signal.aborted) return "already";
+      if (existing) await existing.done;
+      if ((this.stopEpoch.get(asset) ?? 0) !== epoch) return "stopped";
+      const raced = this.sessions.get(asset);
+      if (raced && !raced.controller.signal.aborted) return "already";
+      const resolution = await this.resolve(asset);
+      if ((this.stopEpoch.get(asset) ?? 0) !== epoch) return "stopped";
+      if (resolution.status === "TRANSIENT_FAILURE") return "transient";
+      if (resolution.status !== "SUPPORTED") return "unsupported";
+      const adapter = this.adapterFor(asset);
+      if (!adapter) return "unsupported";
+      if (adapter.running) return "already";
+      const child = new AbortController();
+      const onParentAbort = () => child.abort(parentSignal.reason);
+      if (parentSignal.aborted || (this.stopEpoch.get(asset) ?? 0) !== epoch) {
+        child.abort(parentSignal.aborted ? parentSignal.reason : "REFERENCE_ASSET_UNNEEDED");
+        return parentSignal.aborted ? "transient" : "stopped";
+      }
+      parentSignal.addEventListener("abort", onParentAbort, { once: true });
+      let release!: () => void;
+      const done = new Promise<void>((resolve) => { release = resolve; });
+      const session: AssetSession = { controller: child, done };
+      this.sessions.set(asset, session);
+      void adapter.run(handlers, child.signal).catch(() => undefined).finally(() => {
+        parentSignal.removeEventListener("abort", onParentAbort);
+        if (this.sessions.get(asset) === session) this.sessions.delete(asset);
+        release();
+      });
+      return "started";
     });
-    return "started";
   }
 
   stop(asset: string): boolean {
-    const child = this.running.get(asset);
-    if (!child) return false;
-    this.running.delete(asset);
+    this.stopEpoch.set(asset, (this.stopEpoch.get(asset) ?? 0) + 1);
     this.adapters.delete(asset);
-    child.abort("REFERENCE_ASSET_UNNEEDED");
+    const session = this.sessions.get(asset);
+    if (!session || session.controller.signal.aborted) return false;
+    session.controller.abort("REFERENCE_ASSET_UNNEEDED");
     return true;
   }
 
-  runningAssets(): string[] { return [...this.running.keys()]; }
+  runningAssets(): string[] {
+    return [...this.sessions.entries()].filter(([, session]) => !session.controller.signal.aborted).map(([asset]) => asset);
+  }
+  sessionAssets(): string[] { return [...this.sessions.keys()]; }
   assets(): string[] { return [...this.adapters.keys()]; }
+
+  private enqueue<T>(asset: string, fn: () => Promise<T>): Promise<T> {
+    const previous = this.chains.get(asset) ?? Promise.resolve();
+    const next = previous.then(fn, fn);
+    this.chains.set(asset, next.then(() => undefined, () => undefined));
+    return next;
+  }
 
   private isReusable(entry: CachedResolution): boolean {
     if (entry.resolution.status === "SUPPORTED" || entry.resolution.status === "UNSUPPORTED_DEFINITIVE") return true;
