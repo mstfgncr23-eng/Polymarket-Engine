@@ -30,10 +30,10 @@ import {
 } from "./paper-engine-testkit.js";
 import { order, snapshot } from "./fixtures.js";
 
-function metricValue(metrics: EngineMetrics, name: string, labels?: Record<string, string>): number {
+async function metricValue(metrics: EngineMetrics, name: string, labels?: Record<string, string>): Promise<number> {
   const item = metrics.registry.getSingleMetric(name);
   if (!item) return 0;
-  const data = item.get();
+  const data = await item.get();
   const points = data.values.filter((point) => {
     if (point.metricName?.endsWith("_bucket") || point.metricName?.endsWith("_sum")) return false;
     if (labels) return Object.entries(labels).every(([key, value]) => point.labels[key] === value);
@@ -47,10 +47,11 @@ function metricValue(metrics: EngineMetrics, name: string, labels?: Record<strin
   }, 0);
 }
 
-function histogramCount(metrics: EngineMetrics, name: string): number {
+async function histogramCount(metrics: EngineMetrics, name: string): Promise<number> {
   const item = metrics.registry.getSingleMetric(name);
   if (!item) return 0;
-  return item.get().values.filter((point) => point.metricName === `${name}_count`).reduce((sum, point) => sum + point.value, 0);
+  const data = await item.get();
+  return data.values.filter((point) => point.metricName === `${name}_count`).reduce((sum, point) => sum + point.value, 0);
 }
 
 function expositionLabelNames(text: string): string[] {
@@ -87,9 +88,9 @@ function researchTrigger(overrides: Partial<TriggerEvent> = {}): TriggerEvent {
   };
 }
 
-async function waitFor(predicate: () => boolean, timeoutMs = 1_500): Promise<void> {
+async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 1_500): Promise<void> {
   const started = Date.now();
-  while (!predicate()) {
+  while (!(await predicate())) {
     if (Date.now() - started > timeoutMs) throw new Error("waitFor timeout");
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
@@ -202,17 +203,17 @@ describe("hot-path instrumentation labels", () => {
 });
 
 describe("SSE instrumentation does not change snapshot behavior", () => {
-  it("increments and decrements the subscriber gauge", () => {
+  it("increments and decrements the subscriber gauge", async () => {
     const metrics = new EngineMetrics();
     const hub = new SseHub(20, metrics);
-    expect(metricValue(metrics, "sse_subscribers")).toBe(0);
+    expect(await metricValue(metrics, "sse_subscribers")).toBe(0);
     const removeA = hub.add({ write: () => true, end: () => undefined });
     const removeB = hub.add({ write: () => true, end: () => undefined });
-    expect(metricValue(metrics, "sse_subscribers")).toBe(2);
+    expect(await metricValue(metrics, "sse_subscribers")).toBe(2);
     removeA();
-    expect(metricValue(metrics, "sse_subscribers")).toBe(1);
+    expect(await metricValue(metrics, "sse_subscribers")).toBe(1);
     removeB();
-    expect(metricValue(metrics, "sse_subscribers")).toBe(0);
+    expect(await metricValue(metrics, "sse_subscribers")).toBe(0);
   });
 
   it("counts zero-subscriber snapshot scheduling but still builds and serializes", async () => {
@@ -223,13 +224,13 @@ describe("SSE instrumentation does not change snapshot behavior", () => {
       built += 1;
       return { paperMode: true, queueDepth: 0 };
     });
-    expect(metricValue(metrics, "sse_snapshots_scheduled_zero_subscribers_total")).toBe(1);
+    expect(await metricValue(metrics, "sse_snapshots_scheduled_zero_subscribers_total")).toBe(1);
     await waitFor(() => built === 1);
     expect(built).toBe(1);
-    expect(metricValue(metrics, "sse_snapshot_broadcasts_total")).toBe(1);
-    expect(histogramCount(metrics, "sse_snapshot_build_duration_seconds")).toBe(1);
-    expect(histogramCount(metrics, "sse_snapshot_serialize_duration_seconds")).toBe(1);
-    expect(histogramCount(metrics, "sse_snapshot_payload_bytes")).toBe(1);
+    expect(await metricValue(metrics, "sse_snapshot_broadcasts_total")).toBe(1);
+    expect(await histogramCount(metrics, "sse_snapshot_build_duration_seconds")).toBe(1);
+    expect(await histogramCount(metrics, "sse_snapshot_serialize_duration_seconds")).toBe(1);
+    expect(await histogramCount(metrics, "sse_snapshot_payload_bytes")).toBe(1);
   });
 
   it("counts write(false) backpressure without changing the frame or handling it", async () => {
@@ -247,7 +248,7 @@ describe("SSE instrumentation does not change snapshot behavior", () => {
     expect(writes).toHaveLength(1);
     expect(writes[0]).toMatch(/^id: 1\nevent: decision\ndata: /);
     expect(writes[0]).toContain("must-not-become-a-label");
-    expect(metricValue(metrics, "sse_subscriber_backpressure_total")).toBe(1);
+    expect(await metricValue(metrics, "sse_subscriber_backpressure_total")).toBe(1);
     expect(await metrics.registry.metrics()).not.toMatch(/marketId="/);
   });
 });
@@ -274,19 +275,19 @@ describe("processTrigger and journal in-flight gauges return to zero", () => {
       let release!: () => void;
       gate = new Promise((resolve) => { release = resolve; });
       const pending = engine.registerTriggerForResearch(researchTrigger());
-      await waitFor(() => metricValue(engine.metrics, "process_trigger_in_flight") === 1);
-      expect(metricValue(engine.metrics, "process_trigger_in_flight_peak")).toBeGreaterThanOrEqual(1);
+      await waitFor(async () => (await metricValue(engine.metrics, "process_trigger_in_flight")) === 1);
+      expect(await metricValue(engine.metrics, "process_trigger_in_flight_peak")).toBeGreaterThanOrEqual(1);
       release();
       await pending;
-      expect(metricValue(engine.metrics, "process_trigger_in_flight")).toBe(0);
-      expect(histogramCount(engine.metrics, "process_trigger_duration_seconds")).toBeGreaterThanOrEqual(1);
-      expect(histogramCount(engine.metrics, "idle_activation_latency_bookkeeping_duration_seconds")).toBeGreaterThanOrEqual(1);
+      expect(await metricValue(engine.metrics, "process_trigger_in_flight")).toBe(0);
+      expect(await histogramCount(engine.metrics, "process_trigger_duration_seconds")).toBeGreaterThanOrEqual(1);
+      expect(await histogramCount(engine.metrics, "idle_activation_latency_bookkeeping_duration_seconds")).toBeGreaterThanOrEqual(1);
 
       journal.append = async () => { throw new Error("JOURNAL_DOWN"); };
       await engine.registerTriggerForResearch(researchTrigger({ id: createId("trigger") }));
-      expect(metricValue(engine.metrics, "process_trigger_in_flight")).toBe(0);
-      expect(metricValue(engine.metrics, "journal_direct_in_flight")).toBe(0);
-      expect(metricValue(engine.metrics, "journal_direct_failures_total", { class: "trigger" })).toBeGreaterThanOrEqual(1);
+      expect(await metricValue(engine.metrics, "process_trigger_in_flight")).toBe(0);
+      expect(await metricValue(engine.metrics, "journal_direct_in_flight")).toBe(0);
+      expect(await metricValue(engine.metrics, "journal_direct_failures_total", { class: "trigger" })).toBeGreaterThanOrEqual(1);
     } finally {
       await engine.stop();
     }
@@ -306,8 +307,8 @@ describe("processTrigger and journal in-flight gauges return to zero", () => {
       traceId: createId("trace"), type: "TRIGGER_EVENT", aggregateType: "trigger", aggregateId: "t1",
       payload: { ok: true },
     }));
-    expect(metricValue(metrics, "journal_direct_in_flight")).toBe(0);
-    expect(metricValue(metrics, "journal_direct_writes_total", { class: "trigger" })).toBe(1);
+    expect(await metricValue(metrics, "journal_direct_in_flight")).toBe(0);
+    expect(await metricValue(metrics, "journal_direct_writes_total", { class: "trigger" })).toBe(1);
     expect(appends).toBe(1);
 
     journal.append = async () => {
@@ -320,8 +321,8 @@ describe("processTrigger and journal in-flight gauges return to zero", () => {
       payload: { ok: false },
     }));
     expect(appends).toBe(before + 1);
-    expect(metricValue(metrics, "journal_direct_in_flight")).toBe(0);
-    expect(metricValue(metrics, "journal_direct_failures_total", { class: "trigger" })).toBe(1);
+    expect(await metricValue(metrics, "journal_direct_in_flight")).toBe(0);
+    expect(await metricValue(metrics, "journal_direct_failures_total", { class: "trigger" })).toBe(1);
   });
 });
 
@@ -340,16 +341,16 @@ describe("discovery overlap is observed and not prevented", () => {
       referenceRegistry: new ScriptedReferenceRegistry() as never,
     });
     const starting = engine.start();
-    await waitFor(() => metricValue(engine.metrics, "discovery_refresh_in_flight") === 1);
+    await waitFor(async () => (await metricValue(engine.metrics, "discovery_refresh_in_flight")) === 1);
     const second = engine.reconcileDiscovery();
-    await waitFor(() => metricValue(engine.metrics, "discovery_refresh_overlap_total") >= 1);
-    expect(metricValue(engine.metrics, "discovery_refresh_in_flight")).toBe(2);
+    await waitFor(async () => (await metricValue(engine.metrics, "discovery_refresh_overlap_total")) >= 1);
+    expect(await metricValue(engine.metrics, "discovery_refresh_in_flight")).toBe(2);
     release();
     await Promise.all([starting, second]);
     expect(market.completed).toBe(2);
-    expect(metricValue(engine.metrics, "discovery_refresh_in_flight")).toBe(0);
-    expect(metricValue(engine.metrics, "discovery_refresh_attempts_total")).toBe(2);
-    expect(histogramCount(engine.metrics, "discovery_refresh_duration_seconds")).toBe(2);
+    expect(await metricValue(engine.metrics, "discovery_refresh_in_flight")).toBe(0);
+    expect(await metricValue(engine.metrics, "discovery_refresh_attempts_total")).toBe(2);
+    expect(await histogramCount(engine.metrics, "discovery_refresh_duration_seconds")).toBe(2);
     await engine.stop();
   });
 });
@@ -448,17 +449,17 @@ describe("market normalization and trigger/reference/telemetry metrics", () => {
       },
     });
     await waitFor(() => snapshots.length === 3);
-    expect(metricValue(metrics, "normalized_market_snapshots_total")).toBe(3);
-    expect(metricValue(metrics, "price_change_entries_total")).toBe(2);
-    expect(histogramCount(metrics, "price_change_entries_per_event")).toBe(1);
-    expect(histogramCount(metrics, "market_book_bid_levels")).toBe(3);
-    expect(histogramCount(metrics, "market_book_ask_levels")).toBe(3);
-    expect(histogramCount(metrics, "market_normalization_duration_seconds")).toBe(3);
+    expect(await metricValue(metrics, "normalized_market_snapshots_total")).toBe(3);
+    expect(await metricValue(metrics, "price_change_entries_total")).toBe(2);
+    expect(await histogramCount(metrics, "price_change_entries_per_event")).toBe(1);
+    expect(await histogramCount(metrics, "market_book_bid_levels")).toBe(3);
+    expect(await histogramCount(metrics, "market_book_ask_levels")).toBe(3);
+    expect(await histogramCount(metrics, "market_normalization_duration_seconds")).toBe(3);
     controller.abort();
     await running;
   });
 
-  it("records trigger candidates, emissions, suppressions, and reference window length", () => {
+  it("records trigger candidates, emissions, suppressions, and reference window length", async () => {
     const metrics = new EngineMetrics();
     const engine = new TriggerEngine(
       triggerConfigSchema.parse({ cooldownMs: 60_000, imbalanceThreshold: 0.5, referenceRapidMoveBps: 1, btcRapidMoveBps: 1 }),
@@ -468,14 +469,14 @@ describe("market normalization and trigger/reference/telemetry metrics", () => {
     const book = snapshot({ bids: [{ price: "0.47", quantity: "100" }], asks: [{ price: "0.48", quantity: "1" }] });
     expect(engine.ingestMarket(book).length).toBeGreaterThan(0);
     expect(engine.ingestMarket({ ...book, eventId: createId("market"), sequence: 2 }).length).toBe(0);
-    expect(metricValue(metrics, "trigger_candidates_total")).toBeGreaterThan(0);
-    expect(metricValue(metrics, "triggers_emitted_total")).toBeGreaterThan(0);
-    expect(metricValue(metrics, "triggers_suppressed_total")).toBeGreaterThan(0);
+    expect(await metricValue(metrics, "trigger_candidates_total")).toBeGreaterThan(0);
+    expect(await metricValue(metrics, "triggers_emitted_total")).toBeGreaterThan(0);
+    expect(await metricValue(metrics, "triggers_suppressed_total")).toBeGreaterThan(0);
     engine.ingestReference({
       eventId: createId("ref"), traceId: createId("trace"), asset: "BTC", symbol: "BTCUSDT", venue: "binance",
       price: "100", quantity: "1", sourceTimestamp: new Date().toISOString(), receivedAt: new Date().toISOString(), tradeId: "1",
     });
-    expect(histogramCount(metrics, "reference_window_length")).toBe(1);
+    expect(await histogramCount(metrics, "reference_window_length")).toBe(1);
   });
 
   it("records telemetry queue depth, drops, flush duration, failures, and batch size", async () => {
@@ -489,10 +490,10 @@ describe("market normalization and trigger/reference/telemetry metrics", () => {
     await writer.persist(createJournalEvent({ traceId: createId("trace"), type: "MARKET_SNAPSHOT", aggregateType: "market", aggregateId: "m", payload: {} }));
     await writer.persist(createJournalEvent({ traceId: createId("trace"), type: "MARKET_SNAPSHOT", aggregateType: "market", aggregateId: "m", payload: {} }));
     await writer.flush();
-    expect(metricValue(metrics, "telemetry_events_dropped_total")).toBeGreaterThan(0);
-    expect(metricValue(metrics, "telemetry_batch_failures_total")).toBeGreaterThan(0);
-    expect(histogramCount(metrics, "telemetry_batch_size")).toBeGreaterThan(0);
-    expect(histogramCount(metrics, "telemetry_batch_flush_duration_seconds")).toBeGreaterThan(0);
-    expect(metricValue(metrics, "telemetry_queue_depth")).toBeGreaterThanOrEqual(0);
+    expect(await metricValue(metrics, "telemetry_events_dropped_total")).toBeGreaterThan(0);
+    expect(await metricValue(metrics, "telemetry_batch_failures_total")).toBeGreaterThan(0);
+    expect(await histogramCount(metrics, "telemetry_batch_size")).toBeGreaterThan(0);
+    expect(await histogramCount(metrics, "telemetry_batch_flush_duration_seconds")).toBeGreaterThan(0);
+    expect(await metricValue(metrics, "telemetry_queue_depth")).toBeGreaterThanOrEqual(0);
   });
 });
