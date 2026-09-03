@@ -57,10 +57,29 @@ export interface FeedConnectionEvent {
   message?: string;
 }
 
+export interface PolymarketFeedAnomaly {
+  kind: "stale" | "malformed";
+  tokenId: string;
+  incomingMs: number | null;
+  lastAcceptedMs: number | null;
+  regressionMs: number | null;
+  totalDropped: number;
+  sampled: boolean;
+  at: string;
+}
+
+export interface PolymarketTimestampStats {
+  staleDropped: number;
+  malformedDropped: number;
+  diagnosticsEmitted: number;
+  lastAnomaly: PolymarketFeedAnomaly | null;
+}
+
 export interface PolymarketFeedHandlers {
   onSnapshot(snapshot: MarketSnapshot): Promise<void> | void;
   onConnection(event: FeedConnectionEvent): Promise<void> | void;
   onError(error: Error): Promise<void> | void;
+  onAnomaly?(anomaly: PolymarketFeedAnomaly): void;
 }
 
 export interface DiscoveryReport {
@@ -80,11 +99,29 @@ export class PolymarketMarketDataAdapter {
   private tokenIds: string[] = [];
   private closeCurrentStream: (() => void) | null = null;
   private tokenWaiters: Array<() => void> = [];
+  private streamGeneration = 0;
+  private activeStreams = 0;
+  private readonly anomalySampler = new BoundedAnomalySampler();
+  private lastAnomaly: PolymarketFeedAnomaly | null = null;
 
   constructor(client: PublicClient = createPublicClient()) { this.client = client; }
 
   getMarket(tokenId: string): DiscoveredMarket | undefined { return this.marketsByToken.get(tokenId); }
   getMarkets(): DiscoveredMarket[] { return uniqueMarkets([...this.marketsByToken.values()]); }
+  timestampStats(): PolymarketTimestampStats {
+    return {
+      staleDropped: this.anomalySampler.staleDropped,
+      malformedDropped: this.anomalySampler.malformedDropped,
+      diagnosticsEmitted: this.anomalySampler.diagnosticsEmitted,
+      lastAnomaly: this.lastAnomaly,
+    };
+  }
+  lastAcceptedTimestamp(tokenId: string): number | undefined { return this.lastTimestampByToken.get(tokenId); }
+  bookState(tokenId: string): { bids: Map<string, string>; asks: Map<string, string>; timestamp: string } | undefined {
+    const state = this.books.get(tokenId);
+    return state ? { bids: new Map(state.bids), asks: new Map(state.asks), timestamp: state.timestamp } : undefined;
+  }
+  activeStreamCount(): number { return this.activeStreams; }
 
   async discoverCryptoMarkets(
     slugs: readonly string[] = [],
@@ -202,6 +239,7 @@ export class PolymarketMarketDataAdapter {
         if (next.includes(tokenId)) continue;
         this.books.delete(tokenId);
         this.lastTimestampByToken.delete(tokenId);
+        this.anomalySampler.forget(tokenId);
       }
       this.closeCurrentStream?.();
     }
@@ -212,43 +250,81 @@ export class PolymarketMarketDataAdapter {
     this.setTokenIds(this.tokenIds.length > 0 ? this.tokenIds : tokenIds);
     const backoff = new ExponentialBackoff({ initialDelayMs: 500, maxDelayMs: 30_000, multiplier: 2, jitterRatio: 0.2 });
     let reconnectCount = 0;
-    while (!signal.aborted) {
-      if (this.tokenIds.length === 0) {
-        await handlers.onConnection({ feed: "polymarket", state: "STOPPED", at: new Date().toISOString(), reconnectCount, message: "NO_QUALIFIED_TOKENS" });
-        try { await this.waitForTokens(signal); } catch { break; }
-        continue;
-      }
-      await handlers.onConnection({ feed: "polymarket", state: "CONNECTING", at: new Date().toISOString(), reconnectCount });
-      let resubscribed = false;
-      try {
-        const current = [...this.tokenIds];
-        if (current.length === 0) continue;
-        const stream = await this.client.subscribe([{ topic: "market", tokenIds: current, customFeatureEnabled: true }]);
-        this.closeCurrentStream = () => { resubscribed = true; void stream.close(); };
-        backoff.reset();
-        await handlers.onConnection({ feed: "polymarket", state: "CONNECTED", at: new Date().toISOString(), reconnectCount });
-        for await (const event of stream) {
-          if (signal.aborted) { await stream.close(); break; }
-          for (const snapshot of this.normalizeEvent(event)) await handlers.onSnapshot(snapshot);
-        }
-        this.closeCurrentStream = null;
-        if (signal.aborted) break;
-        if (resubscribed || this.tokenIds.length === 0) continue;
-        throw new Error("POLYMARKET_STREAM_ENDED");
-      } catch (error) {
-        this.closeCurrentStream = null;
-        if (signal.aborted) break;
-        if (resubscribed) continue;
-        reconnectCount += 1;
-        const normalized = error instanceof Error ? error : new Error(String(error));
-        await handlers.onError(normalized);
-        await handlers.onConnection({ feed: "polymarket", state: "DISCONNECTED", at: new Date().toISOString(), reconnectCount, message: normalized.message });
-        await abortableDelay(backoff.nextDelay(), signal).catch(() => undefined);
-      }
+    const onAbort = () => { this.closeCurrentStream?.(); };
+    if (signal.aborted) {
+      await handlers.onConnection({ feed: "polymarket", state: "STOPPED", at: new Date().toISOString(), reconnectCount });
+      return;
     }
-    this.closeCurrentStream = null;
-    await this.client.closeSubscriptions();
-    await handlers.onConnection({ feed: "polymarket", state: "STOPPED", at: new Date().toISOString(), reconnectCount });
+    signal.addEventListener("abort", onAbort);
+    try {
+      while (!signal.aborted) {
+        if (this.tokenIds.length === 0) {
+          await handlers.onConnection({ feed: "polymarket", state: "STOPPED", at: new Date().toISOString(), reconnectCount, message: "NO_QUALIFIED_TOKENS" });
+          try { await this.waitForTokens(signal); } catch { break; }
+          continue;
+        }
+        await handlers.onConnection({ feed: "polymarket", state: "CONNECTING", at: new Date().toISOString(), reconnectCount });
+        let resubscribed = false;
+        const generation = ++this.streamGeneration;
+        try {
+          const current = [...this.tokenIds];
+          if (current.length === 0) continue;
+          const stream = await this.client.subscribe([{ topic: "market", tokenIds: current, customFeatureEnabled: true }]);
+          this.activeStreams += 1;
+          this.closeCurrentStream = () => {
+            resubscribed = true;
+            void stream.close();
+          };
+          if (signal.aborted) this.closeCurrentStream();
+          try {
+            backoff.reset();
+            await handlers.onConnection({ feed: "polymarket", state: "CONNECTED", at: new Date().toISOString(), reconnectCount });
+            for await (const event of stream) {
+              if (signal.aborted) { await stream.close(); break; }
+              if (resubscribed || generation !== this.streamGeneration) break;
+              try {
+                for (const snapshot of this.normalizeEvent(event, handlers)) {
+                  if (resubscribed || generation !== this.streamGeneration) break;
+                  await handlers.onSnapshot(snapshot);
+                }
+              } catch (error) {
+                const normalized = error instanceof Error ? error : new Error(String(error));
+                if (isTimestampDisorderError(normalized)) {
+                  this.noteAnomaly(handlers, timestampDisorderAnomaly(normalized));
+                  continue;
+                }
+                await handlers.onError(normalized);
+              }
+            }
+          } finally {
+            this.closeCurrentStream = null;
+            this.activeStreams = Math.max(0, this.activeStreams - 1);
+          }
+          if (signal.aborted) break;
+          if (resubscribed || this.tokenIds.length === 0 || generation !== this.streamGeneration) continue;
+          throw new Error("POLYMARKET_STREAM_ENDED");
+        } catch (error) {
+          this.closeCurrentStream = null;
+          if (signal.aborted) break;
+          if (resubscribed || generation !== this.streamGeneration) continue;
+          const normalized = error instanceof Error ? error : new Error(String(error));
+          if (isTimestampDisorderError(normalized)) {
+            this.noteAnomaly(handlers, timestampDisorderAnomaly(normalized));
+            continue;
+          }
+          reconnectCount += 1;
+          await handlers.onError(normalized);
+          await handlers.onConnection({ feed: "polymarket", state: "DISCONNECTED", at: new Date().toISOString(), reconnectCount, message: normalized.message });
+          await abortableDelay(backoff.nextDelay(), signal).catch(() => undefined);
+        }
+      }
+      this.closeCurrentStream = null;
+      this.activeStreams = 0;
+      await this.client.closeSubscriptions();
+      await handlers.onConnection({ feed: "polymarket", state: "STOPPED", at: new Date().toISOString(), reconnectCount });
+    } finally {
+      signal.removeEventListener("abort", onAbort);
+    }
   }
 
   private waitForTokens(signal: AbortSignal): Promise<void> {
@@ -266,7 +342,7 @@ export class PolymarketMarketDataAdapter {
     });
   }
 
-  private normalizeEvent(event: unknown): MarketSnapshot[] {
+  private normalizeEvent(event: unknown, handlers: PolymarketFeedHandlers): MarketSnapshot[] {
     const value = event as { type?: string; payload?: Record<string, unknown> };
     const payload = value.payload ?? {};
     if (value.type === "book") {
@@ -274,10 +350,11 @@ export class PolymarketMarketDataAdapter {
       const market = this.marketsByToken.get(tokenId);
       if (!tokenId || !market || !this.tokenIds.includes(tokenId)) return [];
       const sourceMs = parseSourceTimestamp(payload.timestamp);
-      this.assertTimestampOrder(tokenId, sourceMs);
+      if (!this.acceptTimestamp(tokenId, sourceMs, handlers)) return [];
+      const acceptedMs = sourceMs as number;
       const state = {
         marketId: String(payload.market ?? market.id), bids: levelsToMap(payload.bids), asks: levelsToMap(payload.asks),
-        lastTradePrice: nullableString(payload.lastTradePrice), timestamp: new Date(sourceMs).toISOString(), hash: nullableString(payload.hash),
+        lastTradePrice: nullableString(payload.lastTradePrice), timestamp: new Date(acceptedMs).toISOString(), hash: nullableString(payload.hash),
       };
       this.books.set(tokenId, state);
       return [this.toSnapshot(tokenId, state, payload)];
@@ -290,13 +367,14 @@ export class PolymarketMarketDataAdapter {
         const state = this.books.get(tokenId);
         if (!state || !this.tokenIds.includes(tokenId)) continue;
         const sourceMs = parseSourceTimestamp(payload.timestamp);
-        this.assertTimestampOrder(tokenId, sourceMs);
+        if (!this.acceptTimestamp(tokenId, sourceMs, handlers)) continue;
+        const acceptedMs = sourceMs as number;
         const side = String(change.side);
         const target = side === "BUY" ? state.bids : state.asks;
         const price = String(change.price ?? "");
         const size = String(change.size ?? "0");
         if (Number(size) <= 0) target.delete(price); else target.set(price, size);
-        state.timestamp = new Date(sourceMs).toISOString();
+        state.timestamp = new Date(acceptedMs).toISOString();
         state.hash = nullableString(change.hash) ?? state.hash;
         snapshots.push(this.toSnapshot(tokenId, state, payload));
       }
@@ -310,10 +388,35 @@ export class PolymarketMarketDataAdapter {
     return [];
   }
 
-  private assertTimestampOrder(tokenId: string, sourceMs: number): void {
+  private acceptTimestamp(tokenId: string, sourceMs: number | null, handlers: PolymarketFeedHandlers): boolean {
+    if (sourceMs === null) {
+      this.noteAnomaly(handlers, {
+        kind: "malformed", tokenId, incomingMs: null, lastAcceptedMs: this.lastTimestampByToken.get(tokenId) ?? null,
+        regressionMs: null,
+      });
+      return false;
+    }
     const previous = this.lastTimestampByToken.get(tokenId);
-    if (previous !== undefined && sourceMs < previous) throw new Error(`EVENT_TIMESTAMP_DISORDER:${tokenId}:${sourceMs}<${previous}`);
+    if (previous !== undefined && sourceMs < previous) {
+      this.noteAnomaly(handlers, {
+        kind: "stale", tokenId, incomingMs: sourceMs, lastAcceptedMs: previous, regressionMs: previous - sourceMs,
+      });
+      return false;
+    }
     this.lastTimestampByToken.set(tokenId, sourceMs);
+    return true;
+  }
+
+  private noteAnomaly(handlers: PolymarketFeedHandlers, partial: Omit<PolymarketFeedAnomaly, "sampled" | "totalDropped" | "at">): void {
+    const sampled = this.anomalySampler.observe(partial);
+    const anomaly: PolymarketFeedAnomaly = {
+      ...partial,
+      sampled,
+      totalDropped: this.anomalySampler.totalDropped,
+      at: new Date().toISOString(),
+    };
+    this.lastAnomaly = anomaly;
+    handlers.onAnomaly?.(anomaly);
   }
 
   private toSnapshot(tokenId: string, state: NonNullable<ReturnType<PolymarketMarketDataAdapter["books"]["get"]>>, raw: Record<string, unknown>): MarketSnapshot {
@@ -474,9 +577,69 @@ function firstPrice(value: Record<string, unknown>, index: number): string | nul
   }
   return null;
 }
-function parseSourceTimestamp(value: unknown): number {
+function parseSourceTimestamp(value: unknown): number | null {
+  if (value === undefined || value === null || value === "") return null;
   const parsed = Number(value);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : Date.now();
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+const TIMESTAMP_DISORDER_RE = /^EVENT_TIMESTAMP_DISORDER:([^:]+):(\d+)<(\d+)$/;
+
+function isTimestampDisorderError(error: Error): boolean {
+  return error.message.startsWith("EVENT_TIMESTAMP_DISORDER:");
+}
+
+function timestampDisorderAnomaly(error: Error): Omit<PolymarketFeedAnomaly, "sampled" | "totalDropped" | "at"> {
+  const match = error.message.match(TIMESTAMP_DISORDER_RE);
+  const tokenId = match?.[1] ?? "unknown";
+  const incomingMs = match ? Number(match[2]) : null;
+  const lastAcceptedMs = match ? Number(match[3]) : null;
+  return {
+    kind: "stale",
+    tokenId,
+    incomingMs: Number.isFinite(incomingMs) ? incomingMs : null,
+    lastAcceptedMs: Number.isFinite(lastAcceptedMs) ? lastAcceptedMs : null,
+    regressionMs: incomingMs != null && lastAcceptedMs != null && Number.isFinite(incomingMs) && Number.isFinite(lastAcceptedMs)
+      ? lastAcceptedMs - incomingMs
+      : null,
+  };
+}
+
+class BoundedAnomalySampler {
+  staleDropped = 0;
+  malformedDropped = 0;
+  diagnosticsEmitted = 0;
+  private readonly perToken = new Map<string, number>();
+  private lastEmitAt = 0;
+  private readonly firstN = 3;
+  private readonly everyN = 250;
+  private readonly minIntervalMs = 5_000;
+  private readonly maxTokenKeys = 256;
+
+  get totalDropped(): number { return this.staleDropped + this.malformedDropped; }
+
+  observe(partial: Omit<PolymarketFeedAnomaly, "sampled" | "totalDropped" | "at">): boolean {
+    if (partial.kind === "stale") this.staleDropped += 1;
+    else this.malformedDropped += 1;
+    const count = (this.perToken.get(partial.tokenId) ?? 0) + 1;
+    if (this.perToken.size >= this.maxTokenKeys && !this.perToken.has(partial.tokenId)) {
+      const first = this.perToken.keys().next().value;
+      if (first !== undefined) this.perToken.delete(first);
+    }
+    this.perToken.set(partial.tokenId, count);
+    const large = (partial.regressionMs ?? 0) >= 1_000 || partial.kind === "malformed";
+    const now = Date.now();
+    const emit = count <= this.firstN
+      || this.totalDropped % this.everyN === 0
+      || (large && now - this.lastEmitAt >= this.minIntervalMs)
+      || now - this.lastEmitAt >= this.minIntervalMs * 6;
+    if (!emit) return false;
+    this.lastEmitAt = now;
+    this.diagnosticsEmitted += 1;
+    return true;
+  }
+
+  forget(tokenId: string): void { this.perToken.delete(tokenId); }
 }
 function levelsToMap(value: unknown): Map<string, string> {
   const result = new Map<string, string>();
