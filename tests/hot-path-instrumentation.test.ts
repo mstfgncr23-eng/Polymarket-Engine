@@ -455,8 +455,57 @@ describe("market normalization and trigger/reference/telemetry metrics", () => {
     expect(await histogramCount(metrics, "market_book_bid_levels")).toBe(3);
     expect(await histogramCount(metrics, "market_book_ask_levels")).toBe(3);
     expect(await histogramCount(metrics, "market_normalization_duration_seconds")).toBe(3);
+    expect(await histogramCount(metrics, "market_normalization_duration_seconds")).toBe(snapshots.length);
     controller.abort();
     await running;
+  });
+
+  it("records exactly one normalization duration observation per emitted snapshot", async () => {
+    const metrics = new EngineMetrics();
+    const durations: number[] = [];
+    const inner = metrics.normalizeObserver();
+    const adapter = new PolymarketMarketDataAdapter(new FakePolymarketClient() as never);
+    adapter.setNormalizeObserver({
+      onNormalizedSnapshot: (input) => {
+        durations.push(input.durationSeconds);
+        inner.onNormalizedSnapshot(input);
+      },
+      onPriceChangeEvent: (entries, processed) => inner.onPriceChangeEvent(entries, processed),
+    });
+    adapter.registerManualToken("tok-up", "mkt", "UP", "BTC");
+    adapter.setTokenIds(["tok-up"]);
+    const snapshots = [
+      ...adapter.normalizeSourceEvent({
+        type: "book",
+        payload: {
+          tokenId: "tok-up", market: "mkt", timestamp: 1_000,
+          bids: [{ price: "0.40", size: "1" }], asks: [{ price: "0.60", size: "3" }],
+        },
+      }),
+      ...adapter.normalizeSourceEvent({
+        type: "price_change",
+        payload: {
+          timestamp: 1_001,
+          priceChanges: [
+            { tokenId: "tok-up", side: "BUY", price: "0.41", size: "4" },
+            { tokenId: "tok-up", side: "SELL", price: "0.59", size: "1" },
+          ],
+        },
+      }),
+      ...adapter.normalizeSourceEvent({
+        type: "price_change",
+        payload: { timestamp: 999, priceChanges: [{ tokenId: "tok-up", side: "BUY", price: "0.10", size: "9" }] },
+      }),
+    ];
+    expect(snapshots).toHaveLength(3);
+    expect(durations).toHaveLength(3);
+    expect(durations.length).toBe(snapshots.length);
+    expect(durations.every((value) => value >= 0)).toBe(true);
+    expect(await metricValue(metrics, "normalized_market_snapshots_total")).toBe(3);
+    expect(await metricValue(metrics, "price_change_entries_total")).toBe(2);
+    expect(await histogramCount(metrics, "price_change_entries_per_event")).toBe(2);
+    expect(await histogramCount(metrics, "market_normalization_duration_seconds")).toBe(3);
+    expect(await histogramCount(metrics, "market_normalization_duration_seconds")).toBe(snapshots.length);
   });
 
   it("records trigger candidates, emissions, suppressions, and reference window length", async () => {
