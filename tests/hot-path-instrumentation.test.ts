@@ -216,7 +216,7 @@ describe("SSE instrumentation does not change snapshot behavior", () => {
     expect(await metricValue(metrics, "sse_subscribers")).toBe(0);
   });
 
-  it("counts zero-subscriber snapshot scheduling but still builds and serializes", async () => {
+  it("skips zero-subscriber snapshot publishes without building or serializing", async () => {
     const metrics = new EngineMetrics();
     const hub = new SseHub(20, metrics);
     let built = 0;
@@ -224,13 +224,18 @@ describe("SSE instrumentation does not change snapshot behavior", () => {
       built += 1;
       return { paperMode: true, queueDepth: 0 };
     });
-    expect(await metricValue(metrics, "sse_snapshots_scheduled_zero_subscribers_total")).toBe(1);
-    await waitFor(() => built === 1);
-    expect(built).toBe(1);
-    expect(await metricValue(metrics, "sse_snapshot_broadcasts_total")).toBe(1);
-    expect(await histogramCount(metrics, "sse_snapshot_build_duration_seconds")).toBe(1);
-    expect(await histogramCount(metrics, "sse_snapshot_serialize_duration_seconds")).toBe(1);
-    expect(await histogramCount(metrics, "sse_snapshot_payload_bytes")).toBe(1);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(built).toBe(0);
+    expect(hub.snapshotBroadcastCount()).toBe(0);
+    expect(await metricValue(metrics, "sse_snapshots_skipped_zero_subscribers_total")).toBe(1);
+    expect(await metricValue(metrics, "sse_snapshots_scheduled_zero_subscribers_total")).toBe(0);
+    expect(await metricValue(metrics, "sse_snapshot_broadcasts_total")).toBe(0);
+    expect(await histogramCount(metrics, "sse_snapshot_build_duration_seconds")).toBe(0);
+    expect(await histogramCount(metrics, "sse_snapshot_serialize_duration_seconds")).toBe(0);
+    expect(await histogramCount(metrics, "sse_snapshot_payload_bytes")).toBe(0);
+    const text = await metrics.registry.metrics();
+    expect(text).toMatch(/sse_snapshots_scheduled_zero_subscribers_total/);
+    expect(text).toMatch(/sse_snapshots_skipped_zero_subscribers_total/);
   });
 
   it("counts write(false) backpressure without changing the frame or handling it", async () => {
@@ -372,7 +377,7 @@ describe("existing paper / SSE / discovery / journal semantics remain unchanged"
     }
   });
 
-  it("keeps SSE frame format and still performs snapshot work with zero subscribers", async () => {
+  it("keeps SSE frame format and skips snapshot work with zero subscribers", async () => {
     const hub = new SseHub(20);
     const writes: string[] = [];
     hub.add({ write: (chunk) => { writes.push(chunk); return true; }, end: () => undefined });
@@ -384,9 +389,9 @@ describe("existing paper / SSE / discovery / journal semantics remain unchanged"
       built += 1;
       return { n: 1 };
     });
-    await waitFor(() => built === 1);
-    expect(built).toBe(1);
-    expect(empty.snapshotBroadcastCount()).toBe(1);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(built).toBe(0);
+    expect(empty.snapshotBroadcastCount()).toBe(0);
   });
 
   it("keeps discovery applying the latest report when refreshes overlap", async () => {
