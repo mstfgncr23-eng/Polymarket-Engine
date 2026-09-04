@@ -9,6 +9,7 @@ import {
 import {
   CheckpointFenceError,
   DURABLE_MUTATION_LOCK_ID,
+  DurableCursorBehindError,
   durableTransitionInputSchema,
   hashDurablePayload,
   IdempotencyConflictError,
@@ -36,8 +37,9 @@ export interface EventJournal {
   queryEvents(query: JournalQuery): Promise<JournalEvent[]>;
   countByType(types?: readonly string[]): Promise<Record<string, number>>;
   claimIdempotency(scope: string, key: string): Promise<boolean>;
-  commitDurableTransition(input: DurableTransitionInput): Promise<DurableCommitResult>;
+  commitDurableTransition(input: DurableTransitionInput, expectedPreviousSequence: number): Promise<DurableCommitResult>;
   readDurableTransitionsAfter(sequence: number, limit: number): Promise<DurableTransition[]>;
+  readDurableByOperationKey(operationKey: string): Promise<DurableTransition | null>;
   latestDurableSequence(): Promise<number>;
   saveCheckpoint(checkpoint: Omit<EngineCheckpoint, "id" | "createdAt">): Promise<EngineCheckpoint>;
   loadLatestCheckpoint(): Promise<EngineCheckpoint | null>;
@@ -98,12 +100,16 @@ export class MemoryEventJournal implements EventJournal {
     this.idempotencyKeys.add(composite);
     return true;
   }
-  async commitDurableTransition(input: DurableTransitionInput): Promise<DurableCommitResult> {
-    return this.withDurableLock(() => this.commitDurableTransitionUnlocked(input));
+  async commitDurableTransition(input: DurableTransitionInput, expectedPreviousSequence: number): Promise<DurableCommitResult> {
+    return this.withDurableLock(() => this.commitDurableTransitionUnlocked(input, expectedPreviousSequence));
   }
   async readDurableTransitionsAfter(sequence: number, limit: number): Promise<DurableTransition[]> {
     const cap = Math.max(1, Math.min(limit, 10_000));
     return structuredClone(this.durableRows.filter((row) => row.sequence > sequence).slice(0, cap));
+  }
+  async readDurableByOperationKey(operationKey: string): Promise<DurableTransition | null> {
+    const existing = this.durableByKey.get(operationKey);
+    return existing ? structuredClone(existing) : null;
   }
   async latestDurableSequence(): Promise<number> {
     return this.durableRows.length === 0 ? 0 : this.durableRows[this.durableRows.length - 1]!.sequence;
@@ -139,7 +145,7 @@ export class MemoryEventJournal implements EventJournal {
     }
   }
 
-  private commitDurableTransitionUnlocked(input: DurableTransitionInput): DurableCommitResult {
+  private commitDurableTransitionUnlocked(input: DurableTransitionInput, expectedPreviousSequence: number): DurableCommitResult {
     const parsed = durableTransitionInputSchema.parse(input);
     const payloadHash = hashDurablePayload(parsed.payload);
     const existing = this.durableByKey.get(parsed.operationKey);
@@ -152,9 +158,20 @@ export class MemoryEventJournal implements EventJournal {
       ) {
         throw new IdempotencyConflictError(parsed.operationKey, existing.type, parsed.type);
       }
-      return { sequence: existing.sequence, operationKey: parsed.operationKey, inserted: false, existing: true };
+      return {
+        sequence: existing.sequence,
+        operationKey: parsed.operationKey,
+        inserted: false,
+        existing: true,
+        transition: structuredClone(existing),
+      };
+    }
+    const latest = this.durableRows.length === 0 ? 0 : this.durableRows[this.durableRows.length - 1]!.sequence;
+    if (latest !== expectedPreviousSequence) {
+      throw new DurableCursorBehindError(expectedPreviousSequence, latest);
     }
     const now = new Date();
+    const occurredAt = parsed.occurredAt ?? now;
     const row: DurableTransition = {
       sequence: this.nextDurableSequence,
       operationKey: parsed.operationKey,
@@ -163,13 +180,19 @@ export class MemoryEventJournal implements EventJournal {
       aggregateId: parsed.aggregateId,
       payloadHash,
       payload: structuredClone(parsed.payload),
-      occurredAt: (parsed.occurredAt ?? now).toISOString(),
+      occurredAt: occurredAt.toISOString(),
       recordedAt: now.toISOString(),
     };
     this.nextDurableSequence += 1;
     this.durableRows.push(row);
     this.durableByKey.set(parsed.operationKey, row);
-    return { sequence: row.sequence, operationKey: parsed.operationKey, inserted: true, existing: false };
+    return {
+      sequence: row.sequence,
+      operationKey: parsed.operationKey,
+      inserted: true,
+      existing: false,
+      transition: structuredClone(row),
+    };
   }
 }
 
@@ -241,7 +264,7 @@ export class PostgresEventJournal implements EventJournal {
       .onConflictDoNothing({ target: [mcpIdempotencyKeys.scope, mcpIdempotencyKeys.key] }).returning({ key: mcpIdempotencyKeys.key });
     return rows.length === 1;
   }
-  async commitDurableTransition(input: DurableTransitionInput): Promise<DurableCommitResult> {
+  async commitDurableTransition(input: DurableTransitionInput, expectedPreviousSequence: number): Promise<DurableCommitResult> {
     const parsed = durableTransitionInputSchema.parse(input);
     const payloadHash = hashDurablePayload(parsed.payload);
     const occurredAt = parsed.occurredAt ?? new Date();
@@ -259,7 +282,20 @@ export class PostgresEventJournal implements EventJournal {
         ) {
           throw new IdempotencyConflictError(parsed.operationKey, existing.type, parsed.type);
         }
-        return { sequence: Number(existing.sequence), operationKey: parsed.operationKey, inserted: false, existing: true };
+        return {
+          sequence: Number(existing.sequence),
+          operationKey: parsed.operationKey,
+          inserted: false,
+          existing: true,
+          transition: toDurableTransition(existing),
+        };
+      }
+      const latestRows = await tx.select({
+        max: sql<number>`coalesce(max(${durableTransitions.sequence}), 0)`,
+      }).from(durableTransitions);
+      const latest = Number(latestRows[0]?.max ?? 0);
+      if (latest !== expectedPreviousSequence) {
+        throw new DurableCursorBehindError(expectedPreviousSequence, latest);
       }
       const inserted = await tx.insert(durableTransitions).values({
         operationKey: parsed.operationKey,
@@ -269,10 +305,17 @@ export class PostgresEventJournal implements EventJournal {
         payloadHash,
         payload: parsed.payload,
         occurredAt,
-      }).returning({ sequence: durableTransitions.sequence });
-      const sequence = inserted[0]?.sequence;
-      if (sequence == null) throw new Error("DURABLE_TRANSITION_INSERT_FAILED");
-      return { sequence: Number(sequence), operationKey: parsed.operationKey, inserted: true, existing: false };
+      }).returning();
+      const row = inserted[0];
+      if (!row) throw new Error("DURABLE_TRANSITION_INSERT_FAILED");
+      const transition = toDurableTransition(row);
+      return {
+        sequence: transition.sequence,
+        operationKey: parsed.operationKey,
+        inserted: true,
+        existing: false,
+        transition,
+      };
     });
   }
   async readDurableTransitionsAfter(sequence: number, limit: number): Promise<DurableTransition[]> {
@@ -282,6 +325,12 @@ export class PostgresEventJournal implements EventJournal {
       .orderBy(asc(durableTransitions.sequence))
       .limit(cap);
     return rows.map(toDurableTransition);
+  }
+  async readDurableByOperationKey(operationKey: string): Promise<DurableTransition | null> {
+    const rows = await this.db.select().from(durableTransitions)
+      .where(eq(durableTransitions.operationKey, operationKey)).limit(1);
+    const row = rows[0];
+    return row ? toDurableTransition(row) : null;
   }
   async latestDurableSequence(): Promise<number> {
     const rows = await this.db.select({
@@ -398,4 +447,4 @@ export function createJournalEvent(input: {
   };
 }
 
-export { CheckpointFenceError, IdempotencyConflictError };
+export { CheckpointFenceError, DurableCursorBehindError, IdempotencyConflictError };

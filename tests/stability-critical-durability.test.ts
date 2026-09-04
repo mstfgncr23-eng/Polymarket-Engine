@@ -8,13 +8,15 @@ import {
 } from "@pm/core";
 import {
   CHECKPOINT_SCHEMA_VERSION,
+  DurableCursorBehindError,
   IdempotencyConflictError,
   MemoryEventJournal,
+  derivedAuditEventId,
   hashDurablePayload,
 } from "@pm/db";
 import { EngineService } from "../apps/engine/src/engine.js";
 import { CrashInjectedError, type CrashInjectionPoint } from "../apps/engine/src/crash-injection.js";
-import { RecoveryFailClosedError } from "../apps/engine/src/recovery.js";
+import { CRITICAL_AUDIT_TYPES, RecoveryFailClosedError } from "../apps/engine/src/recovery.js";
 import { NoopGrokActivationBridge } from "../apps/engine/src/activation/index.js";
 import { fill, order, snapshot } from "./fixtures.js";
 import {
@@ -74,31 +76,39 @@ async function startPaper(journal: MemoryEventJournal, options: {
 }
 
 function criticalSnapshot(engine: EngineService) {
+  const experiment = engine.experimentManifest();
   return {
     ledger: engine.ledger.snapshot(),
     positions: [...engine.ledger.positions.values()].map((item) => structuredClone(item)).sort((a, b) => a.marketId.localeCompare(b.marketId)),
-    resting: engine.restingOrderCount(),
+    restingOrders: [...engine.restingOrdersForTest().values()]
+      .map((item) => structuredClone(item))
+      .sort((a, b) => a.order.id.localeCompare(b.order.id)),
+    makerReservations: Object.fromEntries([...engine.makerReservationsForTest().entries()].sort(([a], [b]) => a.localeCompare(b))),
+    settledMarkets: [...engine.settledMarketsForTest()].sort(),
     reserved: engine.reservedCash(),
-    settled: [...engine.ledger.positions.values()].length,
-    experiment: engine.experimentManifest() ? {
-      id: engine.experimentManifest()!.id,
-      status: engine.experimentManifest()!.status,
-      closePolicy: engine.experimentManifest()!.closePolicy,
+    experiment: experiment ? {
+      id: experiment.id,
+      status: experiment.status,
+      closePolicy: experiment.closePolicy,
+      startedAt: experiment.startedAt,
+      entryClosesAt: experiment.entryClosesAt,
+      completedAt: experiment.completedAt,
+      markToMarketAt: experiment.markToMarketAt ?? null,
     } : null,
     cursor: engine.lastAppliedDurableCursorForTest(),
+    derivedAuditCursor: engine.derivedAuditCursorForTest(),
   };
 }
 
-async function auditCounts(journal: MemoryEventJournal) {
-  const types = [
-    "PAPER_FILL", "PAPER_MAKER_RESERVED", "PAPER_MAKER_RELEASED", "PAPER_ORDER_CANCELLED",
-    "FIRST_LEG_FILLED", "HEDGE_COMPLETE", "POSITION_SETTLED",
-    "EXPERIMENT_STARTED", "EXPERIMENT_ENTRY_CLOSED", "EXPERIMENT_COMPLETED",
-  ];
-  const events = await journal.queryEvents({ types });
+async function reportCriticalAudit(journal: MemoryEventJournal) {
+  const events = await journal.queryEvents({ types: [...CRITICAL_AUDIT_TYPES] });
+  const derived = events
+    .filter((event) => event.id.startsWith("derived:"))
+    .map((event) => ({ id: event.id, type: event.type, payload: event.payload }))
+    .sort((a, b) => a.id.localeCompare(b.id));
   const counts: Record<string, number> = {};
-  for (const type of types) counts[type] = events.filter((event) => event.type === type).length;
-  return counts;
+  for (const type of CRITICAL_AUDIT_TYPES) counts[type] = derived.filter((event) => event.type === type).length;
+  return { derived, counts };
 }
 
 function makerFill(orderId: string, quantity: string, extra: Partial<PaperFill> = {}): PaperFill {
@@ -114,23 +124,25 @@ describe("durable journal API", () => {
     const journal = new MemoryEventJournal();
     const first = await journal.commitDurableTransition({
       operationKey: "fill:a", type: "PAPER_FILL", aggregateType: "paper_fill", aggregateId: "a",
-      payload: { n: 1 },
-    });
+      payload: { n: 1 }, occurredAt: new Date("2026-09-01T00:00:00.000Z"),
+    }, 0);
     expect(first).toMatchObject({ sequence: 1, inserted: true, existing: false });
+    expect(first.transition.occurredAt).toBe("2026-09-01T00:00:00.000Z");
     const again = await journal.commitDurableTransition({
       operationKey: "fill:a", type: "PAPER_FILL", aggregateType: "paper_fill", aggregateId: "a",
       payload: { n: 1 },
-    });
+    }, 0);
     expect(again).toMatchObject({ sequence: 1, inserted: false, existing: true });
+    expect(again.transition.occurredAt).toBe("2026-09-01T00:00:00.000Z");
     const second = await journal.commitDurableTransition({
       operationKey: "fill:b", type: "PAPER_FILL", aggregateType: "paper_fill", aggregateId: "b",
       payload: { n: 2 },
-    });
+    }, 1);
     expect(second.sequence).toBe(2);
     const page = await journal.readDurableTransitionsAfter(0, 10);
     expect(page.map((row) => row.sequence)).toEqual([1, 2]);
     expect(await journal.latestDurableSequence()).toBe(2);
-    expect(hashDurablePayload({ n: 1 })).toBe(hashDurablePayload({ n: 1 }));
+    expect(hashDurablePayload({ n: 1, derivedAudit: [{ extra: true }] })).toBe(hashDurablePayload({ n: 1 }));
   });
 
   it("hard-fails same-key different payload", async () => {
@@ -138,11 +150,29 @@ describe("durable journal API", () => {
     await journal.commitDurableTransition({
       operationKey: "fill:a", type: "PAPER_FILL", aggregateType: "paper_fill", aggregateId: "a",
       payload: { n: 1 },
-    });
+    }, 0);
     await expect(journal.commitDurableTransition({
       operationKey: "fill:a", type: "PAPER_FILL", aggregateType: "paper_fill", aggregateId: "a",
       payload: { n: 2 },
-    })).rejects.toBeInstanceOf(IdempotencyConflictError);
+    }, 1)).rejects.toBeInstanceOf(IdempotencyConflictError);
+  });
+
+  it("refuses insert when expected previous sequence is behind latest", async () => {
+    const journal = new MemoryEventJournal();
+    await journal.commitDurableTransition({
+      operationKey: "fill:a", type: "PAPER_FILL", aggregateType: "paper_fill", aggregateId: "a",
+      payload: { n: 1 },
+    }, 0);
+    await expect(journal.commitDurableTransition({
+      operationKey: "fill:b", type: "PAPER_FILL", aggregateType: "paper_fill", aggregateId: "b",
+      payload: { n: 2 },
+    }, 0)).rejects.toBeInstanceOf(DurableCursorBehindError);
+    expect(await journal.latestDurableSequence()).toBe(1);
+    const inserted = await journal.commitDurableTransition({
+      operationKey: "fill:b", type: "PAPER_FILL", aggregateType: "paper_fill", aggregateId: "b",
+      payload: { n: 2 },
+    }, 1);
+    expect(inserted.sequence).toBe(2);
   });
 });
 
@@ -204,16 +234,22 @@ describe("A-T critical durability matrix", () => {
     expect(Number(engine.reservedCash())).toBe(0);
     await engine.stop();
     const mid = await startPaper(journal);
-    await mid.engine.restMakerForTest(maker, snapshot({ marketId: "btc-mkt", tokenId: "btc-up" }));
-    expect(Number(mid.engine.reservedCash())).toBeCloseTo(4.7, 8);
+    mid.engine.setCrashInjectionForTest("AFTER_DURABLE_COMMIT_BEFORE_APPLY");
+    await expect(mid.engine.restMakerForTest(maker, snapshot({ marketId: "btc-mkt", tokenId: "btc-up" }))).rejects.toBeInstanceOf(CrashInjectedError);
+    expect(Number(mid.engine.reservedCash())).toBe(0);
+    const reservedRow = (await journal.readDurableTransitionsAfter(0, 20)).find((row) => row.type === "PAPER_MAKER_RESERVED");
+    expect(reservedRow).toBeDefined();
     await mid.engine.stop();
     const recovered = await startPaper(journal);
     expect(Number(recovered.engine.reservedCash())).toBeCloseTo(4.7, 8);
     expect(recovered.engine.restingOrderCount()).toBe(1);
+    expect(recovered.engine.ledger.snapshot().updatedAt).toBe(reservedRow!.occurredAt);
+    await recovered.engine.restMakerForTest(maker, snapshot({ marketId: "btc-mkt", tokenId: "btc-up" }));
+    expect(Number(recovered.engine.reservedCash())).toBeCloseTo(4.7, 8);
     await recovered.engine.stop();
   });
 
-  it("D maker partial fill keeps remaining reservation", async () => {
+  it("D maker partial fill keeps remaining reservation and exact resting remaining", async () => {
     const journal = new MemoryEventJournal();
     const { engine } = await startPaper(journal);
     const maker = order("MAKER", { id: "order_maker_partial", quantity: "10", requestedPrice: "0.47", marketId: "btc-mkt", tokenId: "btc-up" });
@@ -225,6 +261,7 @@ describe("A-T critical durability matrix", () => {
     expect(recovered.engine.ledger.positions.get("btc-mkt")?.upQuantity).toBe("4");
     expect(Number(recovered.engine.reservedCash())).toBeGreaterThan(0);
     expect(Number(recovered.engine.reservedCash())).toBeLessThan(4.7);
+    expect(recovered.engine.restingOrdersForTest().get("order_maker_partial")?.remaining).toBe("6");
     await recovered.engine.stop();
   });
 
@@ -240,6 +277,8 @@ describe("A-T critical durability matrix", () => {
     const recovered = await startPaper(journal);
     expect(Number(recovered.engine.reservedCash())).toBe(0);
     expect(recovered.engine.restingOrderCount()).toBe(0);
+    const cancelRow = (await journal.readDurableTransitionsAfter(0, 20)).find((row) => row.type === "PAPER_ORDER_CANCELLED");
+    expect(recovered.engine.ledger.snapshot().updatedAt).toBe(cancelRow?.occurredAt);
     await recovered.engine.cancelMakerForTest("order_maker_release");
     expect(Number(recovered.engine.reservedCash())).toBe(0);
     await recovered.engine.stop();
@@ -353,6 +392,25 @@ describe("A-T critical durability matrix", () => {
     await engine.stop();
   });
 
+  it("L2 same fill id with changed fee/slippage/orderId conflicts via payload hash", async () => {
+    const journal = new MemoryEventJournal();
+    const { engine } = await startPaper(journal);
+    const buy = paperFill("btc-mkt", "UP", "0.40", { id: "fill_hash_conflict", feeUsd: "0.01", slippageUsd: "0", orderId: "order_orig" });
+    await engine.applyObservedFill(buy);
+    await expect(engine.applyObservedFill({ ...buy, feeUsd: "0.02" })).rejects.toBeInstanceOf(IdempotencyConflictError);
+    expect(engine.integrityFault()).toBe(true);
+    await engine.stop();
+
+    const second = await startPaper(journal);
+    await expect(second.engine.applyObservedFill({ ...buy, slippageUsd: "0.05" })).rejects.toBeInstanceOf(IdempotencyConflictError);
+    await second.engine.stop();
+
+    const third = await startPaper(journal);
+    await expect(third.engine.applyObservedFill({ ...buy, orderId: "order_changed" })).rejects.toBeInstanceOf(IdempotencyConflictError);
+    expect(third.engine.ledger.positions.get("btc-mkt")?.upQuantity).toBe("10");
+    await third.engine.stop();
+  });
+
   it("M legacy empty IDLE baseline upgrades", async () => {
     const journal = new MemoryEventJournal();
     await journal.saveCheckpoint({
@@ -462,15 +520,188 @@ describe("A-T critical durability matrix", () => {
     expect(recovered.engine.ledger.positions.get("btc-mkt")?.upQuantity).toBe("10");
     await recovered.engine.stop();
   });
+
+  it("U settlement AFTER_APPLY_BEFORE_DERIVED_AUDIT repairs resolution/win/pair/pnl audit", async () => {
+    let nowMs = Date.parse("2026-09-01T00:00:00.000Z");
+    const journal = new MemoryEventJournal();
+    const resolutions = new Map<string, Record<string, unknown>>([
+      ["btc-mkt", {
+        state: { closed: true },
+        resolution: { umaResolutionStatus: "settled" },
+        outcomes: { yes: { label: "Up", price: "1" }, no: { label: "Down", price: "0" } },
+      }],
+    ]);
+    const first = await startPaper(journal, { now: () => new Date(nowMs), resolutions, endDate: new Date(nowMs + 60_000).toISOString() });
+    expect((await first.engine.beginExperiment()).ok).toBe(true);
+    await first.engine.applyObservedFill(paperFill("btc-mkt", "UP", "0.40"));
+    await first.engine.applyObservedFill(paperFill("btc-mkt", "DOWN", "0.48"));
+    nowMs += 120_000;
+    first.engine.setCrashInjectionForTest("AFTER_APPLY_BEFORE_DERIVED_AUDIT", {
+      operationKey: `settlement:btc-mkt:${first.engine.experimentManifest()!.id}`,
+    });
+    await expect(first.engine.tickMaintenance()).rejects.toBeInstanceOf(CrashInjectedError);
+    await first.engine.stop();
+    const recovered = await startPaper(journal, { now: () => new Date(nowMs), resolutions, endDate: new Date(nowMs - 60_000).toISOString() });
+    expect(recovered.engine.ledger.positions.has("btc-mkt")).toBe(false);
+    expect(recovered.engine.settledMarketsForTest().has("btc-mkt")).toBe(true);
+    const audit = await reportCriticalAudit(journal);
+    expect(audit.counts.MARKET_RESOLUTION_OBSERVED).toBeGreaterThanOrEqual(1);
+    expect(audit.counts.POSITION_SETTLED).toBeGreaterThanOrEqual(1);
+    expect(audit.counts.PAIR_REALIZED).toBeGreaterThanOrEqual(1);
+    expect(audit.derived.some((event) => event.type === "PNL_SNAPSHOT" && event.payload.source === "SETTLEMENT")).toBe(true);
+    expect(["POSITION_WIN", "POSITION_LOSS", "POSITION_BREAKEVEN"].some((type) => (audit.counts[type] ?? 0) > 0)).toBe(true);
+    await recovered.engine.stop();
+  });
+
+  it("V MTM crash after commit and after apply does not double-apply or false-conflict", async () => {
+    let nowMs = Date.parse("2026-09-01T00:00:00.000Z");
+    const journal = new MemoryEventJournal();
+    const first = await startPaper(journal, {
+      now: () => new Date(nowMs),
+      env: { EXPERIMENT_CLOSE_POLICY: "mark_to_market", ESTIMATED_INFRA_COST_PER_HOUR_USD: "0" },
+    });
+    expect((await first.engine.beginExperiment()).ok).toBe(true);
+    await first.engine.applyObservedFill(paperFill("btc-mkt", "UP", "0.40"));
+    await first.market.emitSnapshot(snapshot({ marketId: "btc-mkt", tokenId: "btc-up", outcome: "UP" }));
+    await first.market.emitSnapshot(snapshot({ marketId: "btc-mkt", tokenId: "btc-down", outcome: "DOWN" }));
+    nowMs += 48 * 3_600_000 + 1;
+    const mtmKey = `mtm:${first.engine.experimentManifest()!.id}`;
+    first.engine.setCrashInjectionForTest("AFTER_DURABLE_COMMIT_BEFORE_APPLY", { operationKey: mtmKey });
+    await expect(first.engine.tickMaintenance()).rejects.toBeInstanceOf(CrashInjectedError);
+    const equityAfterCommit = first.engine.ledger.snapshot().equity;
+    await first.engine.stop();
+
+    const mid = await startPaper(journal, {
+      now: () => new Date(nowMs),
+      env: { EXPERIMENT_CLOSE_POLICY: "mark_to_market", ESTIMATED_INFRA_COST_PER_HOUR_USD: "0" },
+    });
+    expect(mid.engine.ledger.snapshot().equity).not.toBe(equityAfterCommit);
+    await mid.market.emitSnapshot(snapshot({ marketId: "btc-mkt", tokenId: "btc-up", outcome: "UP" }));
+    await mid.market.emitSnapshot(snapshot({ marketId: "btc-mkt", tokenId: "btc-down", outcome: "DOWN" }));
+    mid.engine.setCrashInjectionForTest("AFTER_APPLY_BEFORE_DERIVED_AUDIT", { operationKey: mtmKey });
+    await expect(mid.engine.tickMaintenance()).rejects.toBeInstanceOf(CrashInjectedError);
+    const markedEquity = mid.engine.ledger.snapshot().equity;
+    await mid.engine.stop();
+
+    const recovered = await startPaper(journal, {
+      now: () => new Date(nowMs),
+      env: { EXPERIMENT_CLOSE_POLICY: "mark_to_market", ESTIMATED_INFRA_COST_PER_HOUR_USD: "0" },
+    });
+    expect(recovered.engine.ledger.snapshot().equity).toBe(markedEquity);
+    await recovered.market.emitSnapshot(snapshot({ marketId: "btc-mkt", tokenId: "btc-up", outcome: "UP" }));
+    await recovered.market.emitSnapshot(snapshot({ marketId: "btc-mkt", tokenId: "btc-down", outcome: "DOWN" }));
+    await recovered.engine.tickMaintenance();
+    expect(recovered.engine.integrityFault()).toBe(false);
+    expect(recovered.engine.ledger.snapshot().equity).toBe(markedEquity);
+    expect(recovered.engine.experimentManifest()?.status).toBe("COMPLETED");
+    const audit = await reportCriticalAudit(journal);
+    expect(audit.derived.some((event) => event.type === "PNL_SNAPSHOT" && event.payload.source === "MARK_TO_MARKET")).toBe(true);
+    await recovered.engine.stop();
+  });
+
+  it("W experiment COMPLETED AFTER_DURABLE_COMMIT_BEFORE_APPLY retains committed timestamps", async () => {
+    let nowMs = Date.parse("2026-09-01T00:00:00.000Z");
+    const journal = new MemoryEventJournal();
+    const first = await startPaper(journal, { now: () => new Date(nowMs) });
+    expect((await first.engine.beginExperiment()).ok).toBe(true);
+    const experimentId = first.engine.experimentManifest()!.id;
+    nowMs += 48 * 3_600_000 + 1;
+    first.engine.setCrashInjectionForTest("AFTER_DURABLE_COMMIT_BEFORE_APPLY", { operationKey: `experiment:${experimentId}:completed` });
+    await expect(first.engine.tickMaintenance()).rejects.toBeInstanceOf(CrashInjectedError);
+    expect(first.engine.experimentManifest()?.status).toBe("ENTRY_CLOSED");
+    const completedRow = (await journal.readDurableTransitionsAfter(0, 20)).find((row) => row.type === "EXPERIMENT_COMPLETED");
+    expect(completedRow).toBeDefined();
+    const committed = (completedRow!.payload.experiment as { completedAt?: string }).completedAt;
+    await first.engine.stop();
+    nowMs += 60_000;
+    const recovered = await startPaper(journal, { now: () => new Date(nowMs) });
+    expect(recovered.engine.experimentManifest()?.status).toBe("COMPLETED");
+    expect(recovered.engine.experimentManifest()?.completedAt).toBe(committed);
+    await recovered.engine.tickMaintenance();
+    expect(recovered.engine.experimentManifest()?.completedAt).toBe(committed);
+    expect(recovered.engine.integrityFault()).toBe(false);
+    await recovered.engine.stop();
+  });
+
+  it("X two engines sharing a journal cannot skip a foreign durable transition", async () => {
+    const journal = new MemoryEventJournal();
+    const a = await startPaper(journal);
+    expect((await a.engine.beginExperiment()).ok).toBe(true);
+    await a.engine.applyObservedFill(paperFill("btc-mkt", "UP", "0.40", { id: "fill_engine_a" }));
+    const cursorBeforeB = a.engine.lastAppliedDurableCursorForTest();
+    const b = await startPaper(journal);
+    await b.engine.applyObservedFill(paperFill("btc-mkt", "DOWN", "0.48", { id: "fill_engine_b" }));
+    expect(await journal.latestDurableSequence()).toBe(cursorBeforeB + 1);
+    expect(a.engine.lastAppliedDurableCursorForTest()).toBe(cursorBeforeB);
+    await a.engine.applyObservedFill(paperFill("alt-mkt", "UP", "0.40", { id: "fill_engine_a_next" }));
+    expect(a.engine.lastAppliedDurableCursorForTest()).toBe(cursorBeforeB + 2);
+    expect(a.engine.ledger.positions.get("btc-mkt")?.downQuantity).toBe("10");
+    expect(a.engine.ledger.positions.get("alt-mkt")?.upQuantity).toBe("10");
+    const sequences = (await journal.readDurableTransitionsAfter(cursorBeforeB - 1, 10)).map((row) => row.operationKey);
+    expect(sequences).toContain("fill:fill_engine_b");
+    expect(sequences.indexOf("fill:fill_engine_b")).toBeLessThan(sequences.indexOf("fill:fill_engine_a_next"));
+    await a.engine.stop();
+    await b.engine.stop();
+  });
+
+  it("Y derived fill audit is not rebuilt from later hedge state", async () => {
+    const journal = new MemoryEventJournal();
+    const { engine } = await startPaper(journal);
+    const first = paperFill("btc-mkt", "UP", "0.40", { id: "fill_hist_first" });
+    const hedge = paperFill("btc-mkt", "DOWN", "0.48", { id: "fill_hist_hedge" });
+    await engine.applyObservedFill(first);
+    await engine.applyObservedFill(hedge);
+    engine.setCrashInjectionForTest("AFTER_APPLY_BEFORE_DERIVED_AUDIT");
+    await expect(engine.applyObservedFill(paperFill("alt-mkt", "UP", "0.40", { id: "fill_hist_tail" }))).rejects.toBeInstanceOf(CrashInjectedError);
+    await engine.stop();
+    const recovered = await startPaper(journal);
+    const firstUpdated = (await journal.queryEvents({ types: ["POSITION_UPDATED"] }))
+      .find((event) => event.id === derivedAuditEventId("POSITION_UPDATED", "fill_hist_first"));
+    expect(firstUpdated?.payload.downQuantity).toBe("0");
+    expect(firstUpdated?.payload.upQuantity).toBe("10");
+    const firstPnl = (await journal.queryEvents({ types: ["PNL_SNAPSHOT"] }))
+      .find((event) => event.id === derivedAuditEventId("PNL_SNAPSHOT", "fill_hist_first"));
+    const hedgePnl = (await journal.queryEvents({ types: ["PNL_SNAPSHOT"] }))
+      .find((event) => event.id === derivedAuditEventId("PNL_SNAPSHOT", "fill_hist_hedge"));
+    expect(firstPnl?.payload.cash).not.toEqual(hedgePnl?.payload.cash);
+    expect(recovered.engine.ledger.positions.get("btc-mkt")?.downQuantity).toBe("10");
+    await recovered.engine.stop();
+  });
+
+  it("Z malformed checkpoint becomes RecoveryFailClosedError and is counted", async () => {
+    const journal = new MemoryEventJournal();
+    await journal.saveCheckpoint({
+      experimentId: "exp_schema_bad",
+      sequence: 1,
+      payload: {
+        schemaVersion: CHECKPOINT_SCHEMA_VERSION,
+        durableCursor: 0,
+        ledger: { cash: "not-a-decimal" },
+        positions: [],
+        experiment: { ...idleExperiment(), id: "exp_schema_bad" },
+      },
+    });
+    const market = new ScriptedMarketAdapter();
+    market.queue(discoveryReport([qualified("btc-mkt", "BTC", "btc-up", "btc-down")]));
+    const env = qualifiedPaperEnv({ ESTIMATED_INFRA_COST_PER_HOUR_USD: "0" });
+    const engine = new EngineService(env, journal, logger, {
+      market: market as never,
+      referenceRegistry: new ScriptedReferenceRegistry() as never,
+      activation: new NoopGrokActivationBridge(),
+    });
+    await expect(engine.start()).rejects.toBeInstanceOf(RecoveryFailClosedError);
+    const metric = await engine.metrics.recoveryFailures.get();
+    expect(metric.values.some((item) => item.labels.reason === "malformed" && item.value >= 1)).toBe(true);
+  });
 });
 
 describe("golden equivalence control vs crashed", () => {
-  async function runGolden(crashAt: CrashInjectionPoint | null) {
+  async function runGolden(multiCrash: boolean) {
     let nowMs = Date.parse("2026-09-01T00:00:00.000Z");
     const journal = new MemoryEventJournal();
     const resolutions = new Map<string, Record<string, unknown>>();
     const market = new ScriptedMarketAdapter();
-    const end = new Date(nowMs + 90 * 24 * 3_600_000).toISOString();
+    const end = new Date(nowMs + 60 * 60_000).toISOString();
     market.queue(discoveryReport([qualified("btc-mkt", "BTC", "btc-up", "btc-down", end)]));
     const env = qualifiedPaperEnv({ ESTIMATED_INFRA_COST_PER_HOUR_USD: "0", EXPERIMENT_DURATION_HOURS: "48" });
     const make = async () => {
@@ -484,57 +715,98 @@ describe("golden equivalence control vs crashed", () => {
       return engine;
     };
     let engine = await make();
-    const maybeCrash = async (point: CrashInjectionPoint, work: () => Promise<void>) => {
-      if (crashAt !== point) {
+    const crashAndResume = async (point: CrashInjectionPoint, operationKey: string | undefined, work: () => Promise<void>) => {
+      if (!multiCrash) {
         await work();
         return;
       }
-      engine.setCrashInjectionForTest(point);
-      await expect(work()).rejects.toBeInstanceOf(CrashInjectedError);
+      engine.setCrashInjectionForTest(point, operationKey ? { operationKey } : undefined);
+      try {
+        await work();
+        return;
+      } catch (error) {
+        expect(error).toBeInstanceOf(CrashInjectedError);
+      }
+      await engine.stop();
       engine = await make();
       await work();
     };
-    await maybeCrash("AFTER_DURABLE_COMMIT_BEFORE_APPLY", async () => {
+    await crashAndResume("AFTER_DURABLE_COMMIT_BEFORE_APPLY", undefined, async () => {
       if (engine.experimentManifest()?.status === "RUNNING") return;
       const started = await engine.beginExperiment();
       if (!started.ok) throw new Error("begin failed");
     });
     const maker: PaperOrder = order("MAKER", {
-      id: "order_golden_maker", quantity: "10", requestedPrice: "0.47", marketId: "btc-mkt", tokenId: "btc-up",
+      id: "order_golden_maker", traceId: "trace_golden_maker", triggerId: "trigger_golden_maker",
+      quantity: "10", requestedPrice: "0.47", marketId: "btc-mkt", tokenId: "btc-up",
     });
-    await maybeCrash("AFTER_APPLY_BEFORE_DERIVED_AUDIT", async () => {
+    await crashAndResume("AFTER_DURABLE_COMMIT_BEFORE_APPLY", "maker:order_golden_maker:reserve", async () => {
+      if (engine.restingOrdersForTest().has("order_golden_maker")) return;
       await engine.restMakerForTest(maker, snapshot({ marketId: "btc-mkt", tokenId: "btc-up" }));
     });
-    await engine.applyObservedFill(makerFill("order_golden_maker", "4", { id: "fill_golden_partial" }));
-    await engine.applyObservedFill(paperFill("btc-mkt", "UP", "0.40", { id: "fill_golden_first" }));
-    await engine.applyObservedFill(paperFill("btc-mkt", "DOWN", "0.48", { id: "fill_golden_hedge" }));
-    await engine.cancelMakerForTest("order_golden_maker", "RELEASE_REMAINING");
-    nowMs += 90 * 24 * 3_600_000 + 1;
+    await crashAndResume("AFTER_APPLY_BEFORE_DERIVED_AUDIT", "fill:fill_golden_partial", async () => {
+      if (engine.ledger.positions.get("btc-mkt")?.upQuantity === "4" || Number(engine.ledger.positions.get("btc-mkt")?.upQuantity ?? 0) >= 4) return;
+      await engine.applyObservedFill(makerFill("order_golden_maker", "4", {
+        id: "fill_golden_partial", traceId: "trace_golden_partial", sourceMarketEventId: "event_golden_partial",
+      }));
+    });
+    await engine.applyObservedFill(paperFill("btc-mkt", "UP", "0.40", {
+      id: "fill_golden_first", orderId: "order_golden_first", traceId: "trace_golden_first", sourceMarketEventId: "event_golden_first",
+    }));
+    await engine.applyObservedFill(paperFill("btc-mkt", "DOWN", "0.48", {
+      id: "fill_golden_hedge", orderId: "order_golden_hedge", traceId: "trace_golden_hedge", sourceMarketEventId: "event_golden_hedge",
+    }));
+    await crashAndResume("AFTER_DURABLE_COMMIT_BEFORE_APPLY", "maker:order_golden_maker:cancel", async () => {
+      if (!engine.restingOrdersForTest().has("order_golden_maker") && !engine.makerReservationsForTest().has("order_golden_maker")) return;
+      await engine.cancelMakerForTest("order_golden_maker", "RELEASE_REMAINING");
+    });
+    nowMs += 60 * 60_000 + 1;
     resolutions.set("btc-mkt", {
       state: { closed: true },
       resolution: { umaResolutionStatus: "settled" },
       outcomes: { yes: { label: "Up", price: "1" }, no: { label: "Down", price: "0" } },
     });
-    await engine.tickMaintenance();
+    await crashAndResume("AFTER_APPLY_BEFORE_DERIVED_AUDIT", `settlement:btc-mkt:${engine.experimentManifest()!.id}`, async () => {
+      await engine.tickMaintenance();
+    });
     nowMs += 48 * 3_600_000 + 1;
-    await engine.tickMaintenance();
+    await crashAndResume("AFTER_DURABLE_COMMIT_BEFORE_APPLY", `experiment:${engine.experimentManifest()!.id}:completed`, async () => {
+      await engine.tickMaintenance();
+    });
     const snap = criticalSnapshot(engine);
-    const counts = await auditCounts(journal);
+    const audit = await reportCriticalAudit(journal);
     await engine.stop();
-    return { snap, counts, cursor: snap.cursor };
+    return { snap, audit };
   }
 
-  it("control and crashed engines match ledger/experiment/cursor/audit counts", async () => {
-    const control = await runGolden(null);
-    const crashed = await runGolden("AFTER_DURABLE_COMMIT_BEFORE_APPLY");
-    expect(crashed.snap.ledger).toEqual(control.snap.ledger);
-    expect(crashed.snap.positions).toEqual(control.snap.positions);
-    expect(crashed.snap.reserved).toEqual(control.snap.reserved);
-    expect(crashed.snap.resting).toEqual(control.snap.resting);
-    expect(crashed.snap.experiment?.status).toEqual(control.snap.experiment?.status);
-    expect(crashed.snap.experiment?.closePolicy).toEqual(control.snap.experiment?.closePolicy);
-    expect(crashed.snap.cursor).toEqual(control.snap.cursor);
-    expect(crashed.counts).toEqual(control.counts);
+  function normalizeGolden<T>(value: T, experimentId: string | undefined): T {
+    if (!experimentId) return value;
+    const rewrite = (item: unknown): unknown => {
+      if (typeof item === "string") return item.includes(experimentId) ? item.replaceAll(experimentId, "EXPERIMENT") : item;
+      if (Array.isArray(item)) return item.map(rewrite);
+      if (item && typeof item === "object") {
+        return Object.fromEntries(Object.entries(item).map(([key, nested]) => [key, rewrite(nested)]));
+      }
+      return item;
+    };
+    return rewrite(value) as T;
+  }
+
+  it("control and multi-restart golden engines match deep ledger/resting/reservations/audit payloads", async () => {
+    const rawControl = await runGolden(false);
+    const rawCrashed = await runGolden(true);
+    const controlNorm = normalizeGolden(rawControl, rawControl.snap.experiment?.id);
+    const crashedNorm = normalizeGolden(rawCrashed, rawCrashed.snap.experiment?.id);
+    expect(crashedNorm.snap.ledger).toEqual(controlNorm.snap.ledger);
+    expect(crashedNorm.snap.positions).toEqual(controlNorm.snap.positions);
+    expect(crashedNorm.snap.restingOrders).toEqual(controlNorm.snap.restingOrders);
+    expect(crashedNorm.snap.makerReservations).toEqual(controlNorm.snap.makerReservations);
+    expect(crashedNorm.snap.settledMarkets).toEqual(controlNorm.snap.settledMarkets);
+    expect(crashedNorm.snap.reserved).toEqual(controlNorm.snap.reserved);
+    expect(crashedNorm.snap.experiment).toEqual(controlNorm.snap.experiment);
+    expect(crashedNorm.snap.cursor).toEqual(controlNorm.snap.cursor);
+    expect(crashedNorm.audit.counts).toEqual(controlNorm.audit.counts);
+    expect(crashedNorm.audit.derived).toEqual(controlNorm.audit.derived);
   });
 });
 

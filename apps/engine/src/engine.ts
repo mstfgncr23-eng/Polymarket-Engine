@@ -22,7 +22,6 @@ import {
   grokSignalSubmissionSchema,
   grokSignalEnvelopeSchema,
   triggerEventSchema,
-  paperFillSchema,
   calculatePairMetrics,
   computePaperExposures,
   projectPaperExposures,
@@ -60,7 +59,9 @@ import {
   CheckpointFenceError,
   createJournalEvent,
   derivedAuditEventId,
+  DurableCursorBehindError,
   IdempotencyConflictError,
+  MAX_DURABLE_CURSOR_CONVERGENCE_ATTEMPTS,
   queryEventsPaged,
   type DurableCommitResult,
   type DurableTransition,
@@ -88,11 +89,18 @@ import { DurableMutationGate } from "./durable-gate.js";
 import {
   applyDurableTransition,
   assessLegacyCheckpointSafety,
+  cloneRecoverableState,
+  durableIdentityConflicts,
   isLegacyCheckpointPayload,
+  normalizeRecoveryError,
+  parseCheckpointDerivedAuditCursor,
   parseCheckpointDurableCursor,
+  parseDerivedAudit,
+  plannedDurableTransition,
   RecoveryFailClosedError,
   stablePositionId,
   validatePostReplayInvariants,
+  type DerivedAuditRecord,
   type RecoverableEngineState,
 } from "./recovery.js";
 import {
@@ -152,10 +160,10 @@ export class EngineService {
   private experiment: ExperimentManifest | null = null;
   private checkpointSequence = 0;
   private lastAppliedDurableCursor = 0;
+  private derivedAuditCursor = 0;
   private readonly durableGate = new DurableMutationGate();
   private readonly crashInjector = new CrashInjector();
   private recoveryPageSize = 256;
-  private readonly appliedOperationKeys = new Set<string>();
   private lastTradeAt: Date | null = null;
   private executionErrors: number[] = [];
   private timestampDisorder = false;
@@ -368,12 +376,19 @@ export class EngineService {
     this.recoveryPageSize = Math.max(1, size);
   }
   lastAppliedDurableCursorForTest(): number { return this.lastAppliedDurableCursor; }
+  derivedAuditCursorForTest(): number { return this.derivedAuditCursor; }
+  restingOrdersForTest() { return new Map(this.restingOrders); }
+  makerReservationsForTest() { return new Map(this.makerReservations); }
+  settledMarketsForTest() { return new Set(this.settledMarkets); }
   async latestDurableSequenceForTest(): Promise<number> { return this.journal.latestDurableSequence(); }
   async readDurableAfterForTest(sequence: number, limit: number) {
     return this.journal.readDurableTransitionsAfter(sequence, limit);
   }
-  async commitDurableForTest(input: Parameters<EventJournal["commitDurableTransition"]>[0]) {
-    return this.journal.commitDurableTransition(input);
+  async commitDurableForTest(
+    input: Parameters<EventJournal["commitDurableTransition"]>[0],
+    expectedPreviousSequence?: number,
+  ) {
+    return this.journal.commitDurableTransition(input, expectedPreviousSequence ?? this.lastAppliedDurableCursor);
   }
   async checkpointForTest(): Promise<void> {
     await this.checkpoint();
@@ -412,15 +427,14 @@ export class EngineService {
       type: "EXPERIMENT_STARTED",
       aggregateType: "experiment",
       aggregateId: next.id,
-      payload: { experiment: next },
+      occurredAt: now,
+      buildPayload: () => ({
+        experiment: next,
+        derivedAudit: [this.experimentDerivedAudit("EXPERIMENT_STARTED", next)],
+      }),
       checkpoint: true,
-      derived: async () => {
+      afterApply: async () => {
         this.reportGenerated = false;
-        await this.safeAppend(createJournalEvent({
-          id: derivedAuditEventId("EXPERIMENT_STARTED", next.id),
-          traceId: next.id, type: "EXPERIMENT_STARTED", aggregateType: "experiment", aggregateId: next.id,
-          payload: next,
-        }));
         this.record("EXPERIMENT_STARTED", next.id, null, { status: next.status });
       },
     });
@@ -752,10 +766,27 @@ export class EngineService {
   }
 
   private applyCommitted(transition: DurableTransition): void {
+    if (transition.sequence <= this.lastAppliedDurableCursor) return;
+    if (transition.sequence !== this.lastAppliedDurableCursor + 1) {
+      throw new RecoveryFailClosedError(
+        "cursor_fence",
+        `apply gap lastApplied=${this.lastAppliedDurableCursor} incoming=${transition.sequence}`,
+      );
+    }
     const bag = this.recoverableBag();
     applyDurableTransition(bag, transition);
     this.adoptRecoveredBag(bag);
-    this.appliedOperationKeys.add(transition.operationKey);
+    this.lastAppliedDurableCursor = transition.sequence;
+    this.metrics.durableTransitionLastAppliedSequence.set(this.lastAppliedDurableCursor);
+  }
+
+  private failClosedIntegrity(error: unknown): void {
+    this.overload.markIntegrityFault();
+    this.state.overloadState = "FAIL_CLOSED";
+    this.updateReady();
+    if (!(error instanceof IdempotencyConflictError) && !(error instanceof DurableCursorBehindError) && !(error instanceof RecoveryFailClosedError)) {
+      this.state.database = "DOWN";
+    }
   }
 
   private async commitAuthoritative(input: {
@@ -763,64 +794,95 @@ export class EngineService {
     type: string;
     aggregateType: string;
     aggregateId: string;
-    payload: Record<string, unknown>;
-    derived?: () => Promise<void>;
+    buildPayload: (occurredAt: Date) => Record<string, unknown>;
+    occurredAt?: Date;
+    afterApply?: (transition: DurableTransition) => Promise<void>;
     checkpoint?: boolean;
   }): Promise<DurableCommitResult> {
     return this.durableGate.run(async () => {
-      this.crashInjector.maybeCrash("BEFORE_DURABLE_COMMIT", input.operationKey);
-      let commit: DurableCommitResult;
-      try {
-        commit = await this.journal.commitDurableTransition({
-          operationKey: input.operationKey,
-          type: input.type,
-          aggregateType: input.aggregateType,
-          aggregateId: input.aggregateId,
-          payload: input.payload,
-        });
-        this.metrics.noteDurableCommit(input.type, commit.inserted);
-      } catch (error) {
-        if (error instanceof CrashInjectedError) throw error;
-        if (error instanceof IdempotencyConflictError) {
-          this.metrics.noteDurableConflict(input.type);
-          this.overload.markIntegrityFault();
-          this.state.overloadState = "FAIL_CLOSED";
-          this.updateReady();
+      const occurredAt = input.occurredAt ?? this.nowFn();
+      let lastError: unknown;
+      for (let attempt = 0; attempt < MAX_DURABLE_CURSOR_CONVERGENCE_ATTEMPTS; attempt += 1) {
+        this.crashInjector.maybeCrash("BEFORE_DURABLE_COMMIT", input.operationKey);
+        let commit: DurableCommitResult;
+        try {
+          const payload = await this.resolveDurablePayload(input, occurredAt);
+          commit = await this.journal.commitDurableTransition({
+            operationKey: input.operationKey,
+            type: input.type,
+            aggregateType: input.aggregateType,
+            aggregateId: input.aggregateId,
+            payload,
+            occurredAt,
+          }, this.lastAppliedDurableCursor);
+          this.metrics.noteDurableCommit(input.type, commit.inserted);
+        } catch (error) {
+          lastError = error;
+          if (error instanceof CrashInjectedError) throw error;
+          if (error instanceof DurableCursorBehindError) {
+            await this.replayDurableTail(this.lastAppliedDurableCursor);
+            const latest = await this.journal.latestDurableSequence();
+            const report = validatePostReplayInvariants(this.recoverableBag(), this.lastAppliedDurableCursor, latest);
+            if (!report.ok) {
+              const closed = new RecoveryFailClosedError("invariant", report.reasons.join(","));
+              this.failClosedIntegrity(closed);
+              throw closed;
+            }
+            continue;
+          }
+          if (error instanceof IdempotencyConflictError) {
+            this.metrics.noteDurableConflict(input.type);
+            this.failClosedIntegrity(error);
+            throw error;
+          }
+          this.metrics.noteDurableCommitFailure(input.type);
+          this.failClosedIntegrity(error);
           throw error;
         }
-        this.metrics.noteDurableCommitFailure(input.type);
-        this.overload.markIntegrityFault();
-        this.state.overloadState = "FAIL_CLOSED";
-        this.state.database = "DOWN";
-        this.updateReady();
-        throw error;
+        this.crashInjector.maybeCrash("AFTER_DURABLE_COMMIT_BEFORE_APPLY", input.operationKey);
+        if (commit.transition.sequence > this.lastAppliedDurableCursor + 1) {
+          await this.replayDurableTail(this.lastAppliedDurableCursor);
+        }
+        this.applyCommitted(commit.transition);
+        this.crashInjector.maybeCrash("AFTER_APPLY_BEFORE_DERIVED_AUDIT", input.operationKey);
+        await this.emitStoredDerivedAudit(commit.transition);
+        if (input.afterApply) await input.afterApply(commit.transition);
+        this.crashInjector.maybeCrash("AFTER_DERIVED_AUDIT_BEFORE_CHECKPOINT", input.operationKey);
+        if (input.checkpoint) await this.checkpointInsideGate();
+        this.crashInjector.maybeCrash("AFTER_CHECKPOINT", input.operationKey);
+        return commit;
       }
-      this.crashInjector.maybeCrash("AFTER_DURABLE_COMMIT_BEFORE_APPLY", input.operationKey);
-      if (this.lastAppliedDurableCursor < commit.sequence) {
-        this.applyCommitted({
-          sequence: commit.sequence,
-          operationKey: input.operationKey,
-          type: input.type,
-          aggregateType: input.aggregateType,
-          aggregateId: input.aggregateId,
-          payloadHash: "",
-          payload: input.payload,
-          occurredAt: this.nowFn().toISOString(),
-          recordedAt: this.nowFn().toISOString(),
-        });
-        this.lastAppliedDurableCursor = commit.sequence;
-        this.appliedOperationKeys.add(input.operationKey);
-        this.metrics.durableTransitionLastAppliedSequence.set(this.lastAppliedDurableCursor);
-      } else {
-        this.appliedOperationKeys.add(input.operationKey);
-      }
-      this.crashInjector.maybeCrash("AFTER_APPLY_BEFORE_DERIVED_AUDIT", input.operationKey);
-      if (input.derived) await input.derived();
-      this.crashInjector.maybeCrash("AFTER_DERIVED_AUDIT_BEFORE_CHECKPOINT", input.operationKey);
-      if (input.checkpoint) await this.checkpointInsideGate();
-      this.crashInjector.maybeCrash("AFTER_CHECKPOINT", input.operationKey);
-      return commit;
+      const closed = new RecoveryFailClosedError(
+        "cursor_fence",
+        lastError instanceof Error ? lastError.message : "durable cursor failed to converge",
+      );
+      this.failClosedIntegrity(closed);
+      throw closed;
     });
+  }
+
+  private async resolveDurablePayload(
+    input: {
+      operationKey: string;
+      type: string;
+      aggregateType: string;
+      aggregateId: string;
+      buildPayload: (occurredAt: Date) => Record<string, unknown>;
+    },
+    occurredAt: Date,
+  ): Promise<Record<string, unknown>> {
+    const computed = input.buildPayload(occurredAt);
+    const existing = await this.journal.readDurableByOperationKey(input.operationKey);
+    if (!existing) return computed;
+    if (
+      existing.type !== input.type
+      || existing.aggregateType !== input.aggregateType
+      || existing.aggregateId !== input.aggregateId
+      || durableIdentityConflicts(input.type, existing.payload, computed)
+    ) {
+      throw new IdempotencyConflictError(input.operationKey, existing.type, input.type);
+    }
+    return existing.payload;
   }
 
   private async restoreAndRecover(): Promise<void> {
@@ -847,6 +909,7 @@ export class EngineService {
           const cursor = parseCheckpointDurableCursor(payload);
           if (cursor == null) throw new RecoveryFailClosedError("malformed", "checkpoint missing durable cursor");
           this.lastAppliedDurableCursor = cursor;
+          this.derivedAuditCursor = parseCheckpointDerivedAuditCursor(payload);
           this.checkpointSequence = checkpoint.sequence;
         }
         await this.replayDurableTail(this.lastAppliedDurableCursor);
@@ -887,17 +950,13 @@ export class EngineService {
       }
       this.syncExperimentWindow();
     } catch (error) {
-      if (error instanceof RecoveryFailClosedError) {
-        this.metrics.noteRecoveryFailure(error.reason);
-        this.overload.markIntegrityFault();
-        this.state.overloadState = "FAIL_CLOSED";
-        this.updateReady();
-      } else if (error instanceof IdempotencyConflictError) {
-        this.metrics.noteRecoveryFailure("conflict");
-        this.overload.markIntegrityFault();
-        this.state.overloadState = "FAIL_CLOSED";
-      }
-      throw error;
+      if (error instanceof CrashInjectedError) throw error;
+      const normalized = normalizeRecoveryError(error);
+      this.metrics.noteRecoveryFailure(normalized.reason);
+      this.overload.markIntegrityFault();
+      this.state.overloadState = "FAIL_CLOSED";
+      this.updateReady();
+      throw normalized;
     } finally {
       this.metrics.recoveryDuration.observe((performance.now() - started) / 1000);
     }
@@ -951,17 +1010,20 @@ export class EngineService {
     if (typeof payload.lastInfrastructureAccrualAt === "number") {
       this.lastInfrastructureAccrualAt = payload.lastInfrastructureAccrualAt;
     }
+    if (typeof payload.derivedAuditCursor === "number") {
+      this.derivedAuditCursor = parseCheckpointDerivedAuditCursor(payload);
+    }
     return { positions: positions.length, restingOrders: resting.length, activeTriggers: triggers.length, grokSignals: signals.length };
   }
 
   private async repairAllDerivedAudit(): Promise<void> {
-    let cursor = 0;
+    let cursor = this.derivedAuditCursor;
     for (;;) {
       const page = await this.journal.readDurableTransitionsAfter(cursor, this.recoveryPageSize);
       if (page.length === 0) break;
       for (const row of page) {
-        this.appliedOperationKeys.add(row.operationKey);
-        await this.repairDerivedAudit(row);
+        if (row.sequence > this.lastAppliedDurableCursor) return;
+        await this.emitStoredDerivedAudit(row);
         cursor = row.sequence;
       }
       if (page.length < this.recoveryPageSize) break;
@@ -978,84 +1040,51 @@ export class EngineService {
           throw new RecoveryFailClosedError("cursor_fence", `non-monotonic replay ${row.sequence} <= ${cursor}`);
         }
         this.applyCommitted(row);
-        this.lastAppliedDurableCursor = row.sequence;
         this.metrics.noteRecoveryReplay(row.type);
-        await this.repairDerivedAudit(row);
+        await this.emitStoredDerivedAudit(row);
         cursor = row.sequence;
       }
       if (page.length < this.recoveryPageSize) break;
     }
   }
 
-  private async repairDerivedAudit(row: DurableTransition): Promise<void> {
-    if (row.type === "PAPER_FILL") {
-      const fill = paperFillFromPayload(row.payload);
-      if (fill) await this.writeFillDerivedAudit(fill, Boolean(row.payload.wasEmpty));
-      return;
-    }
-    if (row.type === "PAPER_MAKER_RESERVED") {
+  private async emitStoredDerivedAudit(row: DurableTransition): Promise<void> {
+    const records = parseDerivedAudit(row.payload);
+    const occurredAt = new Date(row.occurredAt);
+    for (const record of records) {
       await this.safeAppend(createJournalEvent({
-        id: derivedAuditEventId("PAPER_MAKER_RESERVED", String(row.payload.orderId ?? row.aggregateId)),
-        traceId: row.aggregateId, type: "PAPER_MAKER_RESERVED", aggregateType: "paper_order", aggregateId: String(row.payload.orderId ?? row.aggregateId),
-        payload: { orderId: row.payload.orderId, reserved: row.payload.reserved, experimentId: this.experiment?.id ?? null },
-      }));
-      return;
-    }
-    if (row.type === "EXPERIMENT_STARTED" || row.type === "EXPERIMENT_ENTRY_CLOSED" || row.type === "EXPERIMENT_COMPLETED") {
-      const experiment = (row.payload.experiment ?? row.payload) as Record<string, unknown>;
-      const id = String(experiment.id ?? row.aggregateId);
-      await this.safeAppend(createJournalEvent({
-        id: derivedAuditEventId(row.type, id),
-        traceId: id, type: row.type, aggregateType: "experiment", aggregateId: id,
-        payload: { ...experiment, experimentId: id },
+        id: record.id,
+        traceId: record.traceId,
+        type: record.type,
+        aggregateType: record.aggregateType,
+        aggregateId: record.aggregateId,
+        payload: record.payload,
+        sourceEventId: record.sourceEventId,
+        occurredAt,
       }));
     }
+    this.derivedAuditCursor = Math.max(this.derivedAuditCursor, row.sequence);
   }
 
-  private async writeFillDerivedAudit(fill: Parameters<PaperLedger["applyFill"]>[0], wasEmpty: boolean, live = false): Promise<void> {
-    const position = this.ledger.positions.get(fill.marketId);
-    if (live) {
-      this.record("PAPER_FILL", fill.traceId, fill.marketId, { fillId: fill.id, orderId: fill.orderId, price: fill.fillPrice, quantity: fill.quantity, role: fill.liquidityRole });
-      this.metrics.paperFills.inc({ role: fill.liquidityRole });
-    }
-    if (wasEmpty && fill.side === "BUY" && position) {
-      this.record("FIRST_LEG_FILLED", fill.traceId, fill.marketId, { positionId: position.id, unpairedQuantity: position.unpairedQuantity });
-      await this.safeAppend(createJournalEvent({
-        id: derivedAuditEventId("FIRST_LEG_FILLED", fill.id),
-        traceId: fill.traceId, type: "FIRST_LEG_FILLED", aggregateType: "position", aggregateId: position.id,
-        payload: { positionId: position.id, marketId: fill.marketId, unpairedQuantity: position.unpairedQuantity, experimentId: this.experiment?.id ?? null },
-      }));
-    }
-    if (position && Number(position.pairedQuantity) > 0 && Number(position.unpairedQuantity) === 0) {
-      const unhedgedDurationMs = Math.max(0, this.nowFn().getTime() - new Date(position.openedAt).getTime());
-      this.record("HEDGE_COMPLETE", fill.traceId, fill.marketId, { positionId: position.id, pairedQuantity: position.pairedQuantity, unhedgedDurationMs });
-      await this.safeAppend(createJournalEvent({
-        id: derivedAuditEventId("HEDGE_COMPLETE", fill.id),
-        traceId: fill.traceId, type: "HEDGE_COMPLETE", aggregateType: "position", aggregateId: position.id,
-        payload: {
-          positionId: position.id, marketId: fill.marketId, pairedQuantity: position.pairedQuantity,
-          unhedgedDurationMs, experimentId: this.experiment?.id ?? null,
-        },
-      }));
-    }
-    await this.safeAppend(createJournalEvent({
-      id: derivedAuditEventId("PAPER_FILL", fill.id),
-      traceId: fill.traceId, type: "PAPER_FILL", aggregateType: "paper_fill", aggregateId: fill.id,
-      payload: { ...fill, asset: this.assetByMarket.get(fill.marketId) ?? null }, sourceEventId: fill.sourceMarketEventId,
-    }));
-    if (position) {
-      await this.safeAppend(createJournalEvent({
-        id: derivedAuditEventId("POSITION_UPDATED", fill.id),
-        traceId: fill.traceId, type: "POSITION_UPDATED", aggregateType: "position", aggregateId: position.id,
-        payload: position, sourceEventId: fill.id,
-      }));
-    }
-    await this.safeAppend(createJournalEvent({
-      id: derivedAuditEventId("PNL_SNAPSHOT", fill.id),
-      traceId: fill.traceId, type: "PNL_SNAPSHOT", aggregateType: "ledger",
-      aggregateId: this.experiment?.id ?? "paper",
-      payload: { ...this.ledger.snapshot(), experimentId: this.experiment?.id ?? null },
-    }));
+  private experimentDerivedAudit(type: "EXPERIMENT_STARTED" | "EXPERIMENT_ENTRY_CLOSED" | "EXPERIMENT_COMPLETED", experiment: ExperimentManifest): DerivedAuditRecord {
+    return {
+      id: derivedAuditEventId(type, experiment.id),
+      type,
+      aggregateType: "experiment",
+      aggregateId: experiment.id,
+      traceId: experiment.id,
+      payload: { ...experiment, experimentId: experiment.id },
+    };
+  }
+
+  private projectDerivedAudit(
+    input: { operationKey: string; type: string; aggregateType: string; aggregateId: string; payload: Record<string, unknown> },
+    occurredAt: Date,
+    build: (projected: RecoverableEngineState) => DerivedAuditRecord[],
+  ): DerivedAuditRecord[] {
+    const projected = cloneRecoverableState(this.recoverableBag());
+    applyDurableTransition(projected, plannedDurableTransition(input, occurredAt, this.lastAppliedDurableCursor + 1));
+    return build(projected);
   }
 
   private async restoreExperimentState(): Promise<void> {
@@ -1435,32 +1464,46 @@ export class EngineService {
   }
 
   private async reserveMaker(order: PaperOrder, snapshot: MarketSnapshot): Promise<void> {
-    if (this.appliedOperationKeys.has(`maker:${order.id}:reserve`)) return;
     const notional = makerReserveNotional(order.quantity, order.requestedPrice, snapshot.feeSchedule);
-    if (this.ledger.availableCash().lt(notional)) throw new Error("INSUFFICIENT_CASH");
+    if (this.ledger.availableCash().lt(notional) && !(await this.journal.readDurableByOperationKey(`maker:${order.id}:reserve`))) {
+      throw new Error("INSUFFICIENT_CASH");
+    }
     const resting = createRestingMakerOrder(order, snapshot);
+    const auth = { orderId: order.id, reserved: notional, resting };
     await this.commitAuthoritative({
       operationKey: `maker:${order.id}:reserve`,
       type: "PAPER_MAKER_RESERVED",
       aggregateType: "paper_order",
       aggregateId: order.id,
-      payload: { orderId: order.id, reserved: notional, resting },
-      derived: async () => {
-        await this.safeAppend(createJournalEvent({
-          id: derivedAuditEventId("PAPER_MAKER_RESERVED", order.id),
-          traceId: order.traceId, type: "PAPER_MAKER_RESERVED", aggregateType: "paper_order", aggregateId: order.id,
-          payload: { orderId: order.id, reserved: notional, experimentId: this.experiment?.id ?? null },
-        }));
-      },
+      buildPayload: (occurredAt) => ({
+        ...auth,
+        derivedAudit: [
+          {
+            id: derivedAuditEventId("PAPER_ORDER_CREATED", order.id),
+            type: "PAPER_ORDER_CREATED",
+            aggregateType: "paper_order",
+            aggregateId: order.id,
+            traceId: order.traceId,
+            payload: { ...order, intent: "OPEN_FIRST_LEG" },
+          },
+          {
+            id: derivedAuditEventId("PAPER_MAKER_RESERVED", order.id),
+            type: "PAPER_MAKER_RESERVED",
+            aggregateType: "paper_order",
+            aggregateId: order.id,
+            traceId: order.traceId,
+            payload: { orderId: order.id, reserved: notional, experimentId: this.experiment?.id ?? null, updatedAt: occurredAt.toISOString() },
+          },
+        ],
+      }),
     });
   }
 
   private async releaseMaker(orderId: string, options: { filledNotional?: string; cancel?: boolean; reason?: string } = {}): Promise<void> {
     const operationKey = options.cancel ? `maker:${orderId}:cancel` : `maker:${orderId}:release`;
-    if (this.appliedOperationKeys.has(operationKey)) return;
     const reserved = this.makerReservations.get(orderId);
-    if (!reserved && !options.cancel) return;
-    if (!reserved && options.cancel && !this.restingOrders.has(orderId)) return;
+    if (!reserved && !options.cancel && !(await this.journal.readDurableByOperationKey(operationKey))) return;
+    if (!reserved && options.cancel && !this.restingOrders.has(orderId) && !(await this.journal.readDurableByOperationKey(operationKey))) return;
     const remaining = reserved ? Math.max(0, Number(reserved) - Number(options.filledNotional ?? 0)) : 0;
     const type = options.cancel ? "PAPER_ORDER_CANCELLED" : "PAPER_MAKER_RELEASED";
     await this.commitAuthoritative({
@@ -1468,46 +1511,38 @@ export class EngineService {
       type,
       aggregateType: "paper_order",
       aggregateId: orderId,
-      payload: { orderId, released: String(remaining), cancel: options.cancel === true, reason: options.reason },
-      derived: async () => {
-        await this.safeAppend(createJournalEvent({
+      buildPayload: (occurredAt) => ({
+        orderId, released: String(remaining), cancel: options.cancel === true, reason: options.reason,
+        derivedAudit: [{
           id: derivedAuditEventId(type, orderId),
-          traceId: orderId, type, aggregateType: "paper_order", aggregateId: orderId,
-          payload: { orderId, released: String(remaining), reason: options.reason ?? null, experimentId: this.experiment?.id ?? null },
-        }));
+          type,
+          aggregateType: "paper_order",
+          aggregateId: orderId,
+          traceId: orderId,
+          payload: {
+            orderId, released: String(remaining), reason: options.reason ?? null,
+            experimentId: this.experiment?.id ?? null, updatedAt: occurredAt.toISOString(),
+          },
+        }],
+      }),
+      afterApply: async () => {
         if (options.cancel) this.record("PAPER_ORDER_CANCELLED", orderId, null, { orderId, reason: options.reason ?? null });
       },
     });
   }
 
-  private async assertExistingFillMatches(fill: Parameters<PaperLedger["applyFill"]>[0]): Promise<void> {
-    const rows = await this.journal.readDurableTransitionsAfter(0, 10_000);
-    const existing = rows.find((row) => row.operationKey === `fill:${fill.id}`);
-    if (!existing) return;
-    const existingFill = paperFillFromPayload(existing.payload);
-    if (!existingFill) {
-      throw new IdempotencyConflictError(`fill:${fill.id}`, existing.type, "PAPER_FILL");
-    }
-    if (
-      existingFill.quantity !== fill.quantity
-      || existingFill.fillPrice !== fill.fillPrice
-      || existingFill.marketId !== fill.marketId
-      || existingFill.outcome !== fill.outcome
-      || existingFill.side !== fill.side
-    ) {
-      this.metrics.noteDurableConflict("PAPER_FILL");
-      this.overload.markIntegrityFault();
-      this.state.overloadState = "FAIL_CLOSED";
-      this.updateReady();
-      throw new IdempotencyConflictError(`fill:${fill.id}`, "PAPER_FILL", "PAPER_FILL");
-    }
+  private computeMakerRestingAfter(
+    fill: Parameters<PaperLedger["applyFill"]>[0],
+    extras: { restingAfter?: RestingPaperOrder | null },
+  ): RestingPaperOrder | null {
+    if (extras.restingAfter !== undefined) return extras.restingAfter;
+    const current = this.restingOrders.get(fill.orderId) ?? null;
+    if (!current || fill.liquidityRole !== "MAKER") return current;
+    const remaining = Math.max(0, Number(current.remaining) - Number(fill.quantity));
+    return { ...current, remaining: String(remaining) };
   }
 
   private async applyFill(fill: Parameters<PaperLedger["applyFill"]>[0], extras: { restingAfter?: RestingPaperOrder | null } = {}): Promise<void> {
-    if (this.appliedOperationKeys.has(`fill:${fill.id}`)) {
-      await this.assertExistingFillMatches(fill);
-      return;
-    }
     const reserved = this.makerReservations.get(fill.orderId);
     let reservationAfter: string | null = reserved ?? null;
     if (reserved && fill.liquidityRole === "MAKER") {
@@ -1518,17 +1553,26 @@ export class EngineService {
     const previous = this.ledger.positions.get(fill.marketId);
     const wasEmpty = !previous || (Number(previous.upQuantity) === 0 && Number(previous.downQuantity) === 0);
     const positionId = previous?.id ?? stablePositionId(fill.marketId);
-    const restingAfter = extras.restingAfter === undefined ? this.restingOrders.get(fill.orderId) ?? null : extras.restingAfter;
+    const restingAfter = this.computeMakerRestingAfter(fill, extras);
     await this.commitAuthoritative({
       operationKey: `fill:${fill.id}`,
       type: "PAPER_FILL",
       aggregateType: "paper_fill",
       aggregateId: fill.id,
-      payload: {
-        fill, positionId, reservationAfter, restingAfter, wasEmpty,
+      buildPayload: (occurredAt) => {
+        const auth = { fill, positionId, reservationAfter, restingAfter, wasEmpty };
+        return {
+          ...auth,
+          derivedAudit: this.projectDerivedAudit(
+            { operationKey: `fill:${fill.id}`, type: "PAPER_FILL", aggregateType: "paper_fill", aggregateId: fill.id, payload: auth },
+            occurredAt,
+            (projected) => this.buildFillDerivedAudit(fill, wasEmpty, projected, occurredAt),
+          ),
+        };
       },
-      derived: async () => {
-        await this.writeFillDerivedAudit(fill, wasEmpty, true);
+      afterApply: async () => {
+        this.record("PAPER_FILL", fill.traceId, fill.marketId, { fillId: fill.id, orderId: fill.orderId, price: fill.fillPrice, quantity: fill.quantity, role: fill.liquidityRole });
+        this.metrics.paperFills.inc({ role: fill.liquidityRole });
         const position = this.ledger.positions.get(fill.marketId);
         if (position) {
           for (const trigger of this.triggerEngine.ingestPosition(position, fill.traceId, this.assetByMarket.get(fill.marketId) ?? null)) {
@@ -1537,6 +1581,69 @@ export class EngineService {
         }
       },
     });
+  }
+
+  private buildFillDerivedAudit(
+    fill: Parameters<PaperLedger["applyFill"]>[0],
+    wasEmpty: boolean,
+    projected: RecoverableEngineState,
+    occurredAt: Date,
+  ): DerivedAuditRecord[] {
+    const position = projected.ledger.positions.get(fill.marketId);
+    const experimentId = projected.experiment?.id ?? this.experiment?.id ?? null;
+    const records: DerivedAuditRecord[] = [{
+      id: derivedAuditEventId("PAPER_FILL", fill.id),
+      type: "PAPER_FILL",
+      aggregateType: "paper_fill",
+      aggregateId: fill.id,
+      traceId: fill.traceId,
+      payload: { ...fill, asset: this.assetByMarket.get(fill.marketId) ?? null },
+      sourceEventId: fill.sourceMarketEventId,
+    }];
+    if (wasEmpty && fill.side === "BUY" && position) {
+      records.push({
+        id: derivedAuditEventId("FIRST_LEG_FILLED", fill.id),
+        type: "FIRST_LEG_FILLED",
+        aggregateType: "position",
+        aggregateId: position.id,
+        traceId: fill.traceId,
+        payload: { positionId: position.id, marketId: fill.marketId, unpairedQuantity: position.unpairedQuantity, experimentId },
+      });
+    }
+    if (position && Number(position.pairedQuantity) > 0 && Number(position.unpairedQuantity) === 0) {
+      const unhedgedDurationMs = Math.max(0, occurredAt.getTime() - new Date(position.openedAt).getTime());
+      records.push({
+        id: derivedAuditEventId("HEDGE_COMPLETE", fill.id),
+        type: "HEDGE_COMPLETE",
+        aggregateType: "position",
+        aggregateId: position.id,
+        traceId: fill.traceId,
+        payload: {
+          positionId: position.id, marketId: fill.marketId, pairedQuantity: position.pairedQuantity,
+          unhedgedDurationMs, experimentId,
+        },
+      });
+    }
+    if (position) {
+      records.push({
+        id: derivedAuditEventId("POSITION_UPDATED", fill.id),
+        type: "POSITION_UPDATED",
+        aggregateType: "position",
+        aggregateId: position.id,
+        traceId: fill.traceId,
+        payload: structuredClone(position),
+        sourceEventId: fill.id,
+      });
+    }
+    records.push({
+      id: derivedAuditEventId("PNL_SNAPSHOT", fill.id),
+      type: "PNL_SNAPSHOT",
+      aggregateType: "ledger",
+      aggregateId: experimentId ?? "paper",
+      traceId: fill.traceId,
+      payload: { ...projected.ledger.snapshot(), experimentId, source: "FILL", fillId: fill.id },
+    });
+    return records;
   }
 
   private async onConnection(event: FeedConnectionEvent): Promise<void> {
@@ -1673,6 +1780,7 @@ export class EngineService {
           settledMarkets: [...this.settledMarkets],
           marketMetadata: [...this.marketsById.values()].map((market) => ({ ...market, raw: {} })),
           lastInfrastructureAccrualAt: this.lastInfrastructureAccrualAt,
+          derivedAuditCursor: this.derivedAuditCursor,
         },
       });
       this.metrics.checkpointWrites.inc({ status: "success" });
@@ -1695,18 +1803,33 @@ export class EngineService {
       this.lastInfrastructureAccrualAt = now;
       return;
     }
-    const accruedAt = new Date(now).toISOString();
+    const occurredAt = new Date(now);
+    const accruedAt = occurredAt.toISOString();
+    const aggregateId = this.experiment?.id ?? "paper";
+    const previousAccrualKey = this.lastInfrastructureAccrualAt;
+    const auth = {
+      aiCost: "0",
+      infrastructureCost: String(amount),
+      accruedAt,
+      accrualKey: now,
+    };
     await this.commitAuthoritative({
-      operationKey: `infra:${this.experiment?.id ?? "paper"}:${this.lastInfrastructureAccrualAt}`,
+      operationKey: `infra:${aggregateId}:${previousAccrualKey}`,
       type: "INFRASTRUCTURE_COST_ACCRUED",
       aggregateType: "ledger",
-      aggregateId: this.experiment?.id ?? "paper",
-      payload: {
-        aiCost: "0",
-        infrastructureCost: String(amount),
-        accruedAt,
-        accrualKey: now,
-      },
+      aggregateId,
+      occurredAt,
+      buildPayload: () => ({
+        ...auth,
+        derivedAudit: [{
+          id: derivedAuditEventId("INFRASTRUCTURE_COST_ACCRUED", `${aggregateId}:${auth.accrualKey}`),
+          type: "INFRASTRUCTURE_COST_ACCRUED",
+          aggregateType: "ledger",
+          aggregateId,
+          traceId: aggregateId,
+          payload: { ...auth, experimentId: this.experiment?.id ?? null },
+        }],
+      }),
     });
   }
 
@@ -1810,74 +1933,130 @@ export class EngineService {
     const positionBefore = this.ledger.positions.get(marketId);
     const upPayoff = parsed.upPayoff;
     const downPayoff = parsed.downPayoff;
+    const asset = this.assetByMarket.get(marketId) ?? market.asset;
+    const experimentId = this.experiment?.id ?? null;
     await this.commitAuthoritative({
       operationKey: `settlement:${marketId}:${this.experiment?.id ?? "paper"}`,
       type: "POSITION_SETTLED",
       aggregateType: "position",
       aggregateId: positionBefore?.id ?? marketId,
-      payload: {
-        marketId,
-        upPayoff,
-        downPayoff,
-        settledAt: settledAt.toISOString(),
-        winner: parsed.winner,
-        slug: market.slug,
+      occurredAt: settledAt,
+      buildPayload: (occurredAt) => {
+        const auth = {
+          marketId,
+          upPayoff,
+          downPayoff,
+          settledAt: occurredAt.toISOString(),
+          winner: parsed.winner,
+          slug: market.slug,
+          resolution: parsed,
+        };
+        return {
+          ...auth,
+          derivedAudit: this.buildSettlementDerivedAudit({
+            marketId, asset, experimentId, parsed, positionBefore, upPayoff, downPayoff, occurredAt, auth,
+          }),
+        };
       },
-      derived: async () => {
+      afterApply: async () => {
         this.settlementBackoff.delete(marketId);
-        const asset = this.assetByMarket.get(marketId) ?? market.asset;
-        await this.safeAppend(createJournalEvent({
-          id: derivedAuditEventId("MARKET_RESOLUTION_OBSERVED", marketId),
-          traceId: this.experiment?.id ?? createId("trace"), type: "MARKET_RESOLUTION_OBSERVED", aggregateType: "market", aggregateId: marketId,
-          payload: { ...parsed, marketId, slug: market.slug, experimentId: this.experiment?.id ?? null },
-        }));
         if (!positionBefore) return;
-        const snapshot = this.ledger.snapshot();
-        const cashDelta = settlementCashDelta(positionBefore, upPayoff, downPayoff);
         const realizedDelta = settlementRealizedDelta(positionBefore, upPayoff, downPayoff);
         const outcome = classifySettledOutcome(realizedDelta, positionBefore.totalFees);
-        const grossOutcome = classifySettledOutcome(realizedDelta, "0");
-        await this.safeAppend(createJournalEvent({
-          id: derivedAuditEventId("POSITION_SETTLED", marketId),
-          traceId: positionBefore.id, type: "POSITION_SETTLED", aggregateType: "position", aggregateId: positionBefore.id,
-          payload: {
-            marketId, asset, cashDelta, realizedDelta,
-            upPayoff: parsed.upPayoff, downPayoff: parsed.downPayoff, winner: parsed.winner,
-            upQuantity: positionBefore.upQuantity, downQuantity: positionBefore.downQuantity,
-            feesUsd: positionBefore.totalFees, grossOutcome, outcome,
-            experimentId: this.experiment?.id ?? null,
-          },
-        }));
-        await this.safeAppend(createJournalEvent({
-          id: derivedAuditEventId(outcome, marketId),
-          traceId: positionBefore.id, type: outcome, aggregateType: "position", aggregateId: positionBefore.id,
-          payload: { marketId, realizedDelta, feesUsd: positionBefore.totalFees, grossOutcome, experimentId: this.experiment?.id ?? null },
-        }));
-        if (Number(positionBefore.pairedQuantity) > 0) {
-          const metrics = calculatePairMetrics(positionBefore);
-          const paired = Number(positionBefore.pairedQuantity);
-          const grossLockedEdge = 1 - Number(positionBefore.combinedPairCost);
-          const netRealizedEdge = paired > 0 ? Number(metrics.netPairEdge) / paired : Number(metrics.netPairEdge);
-          await this.safeAppend(createJournalEvent({
-            id: derivedAuditEventId("PAIR_REALIZED", marketId),
-            traceId: positionBefore.id, type: "PAIR_REALIZED", aggregateType: "position", aggregateId: positionBefore.id,
-            payload: {
-              marketId, pairedQuantity: positionBefore.pairedQuantity, combinedPairCost: positionBefore.combinedPairCost,
-              grossLockedEdge, netRealizedEdge, realizedEdge: netRealizedEdge,
-              fees: metrics.fees, experimentId: this.experiment?.id ?? null,
-            },
-          }));
-        }
-        await this.safeAppend(createJournalEvent({
-          id: derivedAuditEventId("PNL_SNAPSHOT", `settlement:${marketId}`),
-          traceId: this.experiment?.id ?? "paper", type: "PNL_SNAPSHOT", aggregateType: "ledger",
-          aggregateId: this.experiment?.id ?? "paper",
-          payload: { ...snapshot, experimentId: this.experiment?.id ?? null, source: "SETTLEMENT" },
-        }));
         this.record("POSITION_SETTLED", positionBefore.id, marketId, { outcome, realizedDelta }, asset);
         this.metrics.openPositions.set(this.ledger.positions.size);
       },
     });
+  }
+
+  private buildSettlementDerivedAudit(input: {
+    marketId: string;
+    asset: string | null | undefined;
+    experimentId: string | null;
+    parsed: ReturnType<typeof parsePublicBinaryResolution>;
+    positionBefore: Position | undefined;
+    upPayoff: "0" | "1";
+    downPayoff: "0" | "1";
+    occurredAt: Date;
+    auth: Record<string, unknown>;
+  }): DerivedAuditRecord[] {
+    const { marketId, asset, experimentId, parsed, positionBefore, upPayoff, downPayoff, occurredAt, auth } = input;
+    const records: DerivedAuditRecord[] = [{
+      id: derivedAuditEventId("MARKET_RESOLUTION_OBSERVED", marketId),
+      type: "MARKET_RESOLUTION_OBSERVED",
+      aggregateType: "market",
+      aggregateId: marketId,
+      traceId: experimentId ?? marketId,
+      payload: { ...parsed, marketId, slug: auth.slug, experimentId },
+    }];
+    const projected = this.projectDerivedAudit(
+      {
+        operationKey: `settlement:${marketId}:${experimentId ?? "paper"}`,
+        type: "POSITION_SETTLED",
+        aggregateType: "position",
+        aggregateId: positionBefore?.id ?? marketId,
+        payload: auth,
+      },
+      occurredAt,
+      (state) => {
+        const extra: DerivedAuditRecord[] = [];
+        if (positionBefore) {
+          const cashDelta = settlementCashDelta(positionBefore, upPayoff, downPayoff);
+          const realizedDelta = settlementRealizedDelta(positionBefore, upPayoff, downPayoff);
+          const outcome = classifySettledOutcome(realizedDelta, positionBefore.totalFees);
+          const grossOutcome = classifySettledOutcome(realizedDelta, "0");
+          extra.push({
+            id: derivedAuditEventId("POSITION_SETTLED", marketId),
+            type: "POSITION_SETTLED",
+            aggregateType: "position",
+            aggregateId: positionBefore.id,
+            traceId: positionBefore.id,
+            payload: {
+              marketId, asset, cashDelta, realizedDelta,
+              upPayoff, downPayoff, winner: parsed.winner,
+              upQuantity: positionBefore.upQuantity, downQuantity: positionBefore.downQuantity,
+              feesUsd: positionBefore.totalFees, grossOutcome, outcome, experimentId,
+            },
+          });
+          extra.push({
+            id: derivedAuditEventId(outcome, marketId),
+            type: outcome,
+            aggregateType: "position",
+            aggregateId: positionBefore.id,
+            traceId: positionBefore.id,
+            payload: { marketId, realizedDelta, feesUsd: positionBefore.totalFees, grossOutcome, experimentId },
+          });
+          if (Number(positionBefore.pairedQuantity) > 0) {
+            const metrics = calculatePairMetrics(positionBefore);
+            const paired = Number(positionBefore.pairedQuantity);
+            const grossLockedEdge = 1 - Number(positionBefore.combinedPairCost);
+            const netRealizedEdge = paired > 0 ? Number(metrics.netPairEdge) / paired : Number(metrics.netPairEdge);
+            extra.push({
+              id: derivedAuditEventId("PAIR_REALIZED", marketId),
+              type: "PAIR_REALIZED",
+              aggregateType: "position",
+              aggregateId: positionBefore.id,
+              traceId: positionBefore.id,
+              payload: {
+                marketId, pairedQuantity: positionBefore.pairedQuantity, combinedPairCost: positionBefore.combinedPairCost,
+                grossLockedEdge, netRealizedEdge, realizedEdge: netRealizedEdge,
+                fees: metrics.fees, experimentId,
+              },
+            });
+          }
+        }
+        extra.push({
+          id: derivedAuditEventId("PNL_SNAPSHOT", `settlement:${marketId}`),
+          type: "PNL_SNAPSHOT",
+          aggregateType: "ledger",
+          aggregateId: experimentId ?? "paper",
+          traceId: experimentId ?? "paper",
+          payload: { ...state.ledger.snapshot(), experimentId, source: "SETTLEMENT", marketId },
+        });
+        return extra;
+      },
+    );
+    return [...records, ...projected];
   }
 
   private bumpSettlementBackoff(marketId: string): void {
@@ -1902,23 +2081,44 @@ export class EngineService {
       }
       prices[position.marketId] = { up: upMark ?? position.averageUpCost, down: downMark ?? position.averageDownCost };
     }
-    const markedAt = this.nowFn().toISOString();
+    const occurredAt = this.nowFn();
+    const aggregateId = this.experiment?.id ?? "paper";
     await this.commitAuthoritative({
-      operationKey: `mtm:${this.experiment?.id ?? "paper"}`,
+      operationKey: `mtm:${aggregateId}`,
       type: "LEDGER_MARK_TO_MARKET",
       aggregateType: "ledger",
-      aggregateId: this.experiment?.id ?? "paper",
-      payload: { prices, markedAt, unresolvedPositionCount: unresolvedCount },
-      derived: async () => {
-        await this.safeAppend(createJournalEvent({
-          id: derivedAuditEventId("PNL_SNAPSHOT", `mtm:${this.experiment?.id ?? "paper"}`),
-          traceId: this.experiment?.id ?? "paper", type: "PNL_SNAPSHOT", aggregateType: "ledger",
-          aggregateId: this.experiment?.id ?? "paper",
-          payload: {
-            ...this.ledger.snapshot(), experimentId: this.experiment?.id ?? null,
-            source: "MARK_TO_MARKET", unresolvedPositionCount: unresolvedCount, markToMarket: true,
-          },
-        }));
+      aggregateId,
+      occurredAt,
+      buildPayload: (at) => {
+        const auth = { prices, markedAt: at.toISOString(), unresolvedPositionCount: unresolvedCount };
+        return {
+          ...auth,
+          derivedAudit: this.projectDerivedAudit(
+            { operationKey: `mtm:${aggregateId}`, type: "LEDGER_MARK_TO_MARKET", aggregateType: "ledger", aggregateId, payload: auth },
+            at,
+            (projected) => [
+              {
+                id: derivedAuditEventId("LEDGER_MARK_TO_MARKET", aggregateId),
+                type: "LEDGER_MARK_TO_MARKET",
+                aggregateType: "ledger",
+                aggregateId,
+                traceId: aggregateId,
+                payload: { ...auth, experimentId: this.experiment?.id ?? null },
+              },
+              {
+                id: derivedAuditEventId("PNL_SNAPSHOT", `mtm:${aggregateId}`),
+                type: "PNL_SNAPSHOT",
+                aggregateType: "ledger",
+                aggregateId,
+                traceId: aggregateId,
+                payload: {
+                  ...projected.ledger.snapshot(), experimentId: this.experiment?.id ?? null,
+                  source: "MARK_TO_MARKET", unresolvedPositionCount: unresolvedCount, markToMarket: true,
+                },
+              },
+            ],
+          ),
+        };
       },
     });
     return true;
@@ -1928,12 +2128,6 @@ export class EngineService {
     const type = next.status === "ENTRY_CLOSED" ? "EXPERIMENT_ENTRY_CLOSED"
       : next.status === "COMPLETED" ? "EXPERIMENT_COMPLETED"
       : null;
-    const operationKey = type == null ? null : `experiment:${next.id}:${next.status === "ENTRY_CLOSED" ? "entry_closed" : "completed"}`;
-    if (operationKey && this.appliedOperationKeys.has(operationKey)) {
-      this.experiment = next;
-      this.syncExperimentWindow();
-      return;
-    }
     if (!type) {
       this.experiment = next;
       this.syncExperimentWindow();
@@ -1944,15 +2138,11 @@ export class EngineService {
       type,
       aggregateType: "experiment",
       aggregateId: next.id,
-      payload: { experiment: next },
+      buildPayload: () => ({
+        experiment: next,
+        derivedAudit: [this.experimentDerivedAudit(type, next)],
+      }),
       checkpoint: true,
-      derived: async () => {
-        await this.safeAppend(createJournalEvent({
-          id: derivedAuditEventId(type, next.id),
-          traceId: next.id, type, aggregateType: "experiment", aggregateId: next.id,
-          payload: { ...next, experimentId: next.id },
-        }));
-      },
     });
   }
 
@@ -2118,12 +2308,6 @@ function splitList(value: string): string[] { return value.split(",").map((item)
 function uniqueStrings(values: readonly string[]): string[] { return [...new Set(values.filter(Boolean))]; }
 function dateOrNull(value: string | null | undefined): Date | null { return value ? new Date(value) : null; }
 function delay(ms: number): Promise<void> { return new Promise((resolve) => setTimeout(resolve, ms)); }
-
-function paperFillFromPayload(payload: Record<string, unknown>): Parameters<PaperLedger["applyFill"]>[0] | null {
-  const raw = payload.fill ?? payload;
-  const parsed = paperFillSchema.safeParse(raw);
-  return parsed.success ? parsed.data : null;
-}
 
 export function isRiskHedgeSettlementTrigger(kind: string): boolean {
   return isRiskHedgeSettlementKind(kind);

@@ -56,7 +56,11 @@ export interface DurableCommitResult {
   operationKey: string;
   inserted: boolean;
   existing: boolean;
+  transition: DurableTransition;
 }
+
+/** Bounded live retries while catching up to a foreign durable tail. */
+export const MAX_DURABLE_CURSOR_CONVERGENCE_ATTEMPTS = 8;
 
 export class IdempotencyConflictError extends Error {
   readonly code = "IDEMPOTENCY_CONFLICT";
@@ -67,6 +71,17 @@ export class IdempotencyConflictError extends Error {
   ) {
     super(`IDEMPOTENCY_CONFLICT: key=${operationKey} existingType=${existingType} incomingType=${incomingType}`);
     this.name = "IdempotencyConflictError";
+  }
+}
+
+export class DurableCursorBehindError extends Error {
+  readonly code = "DURABLE_CURSOR_BEHIND";
+  constructor(
+    readonly expectedPreviousSequence: number,
+    readonly latestCommitted: number,
+  ) {
+    super(`DURABLE_CURSOR_BEHIND: expected previous ${expectedPreviousSequence} but latest committed is ${latestCommitted}`);
+    this.name = "DurableCursorBehindError";
   }
 }
 
@@ -89,8 +104,13 @@ export function canonicalJson(value: unknown): string {
   return `{${keys.map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`).join(",")}}`;
 }
 
+export function authoritativeDurablePayload(payload: Record<string, unknown>): Record<string, unknown> {
+  const { derivedAudit: _derivedAudit, ...authoritative } = payload;
+  return authoritative;
+}
+
 export function hashDurablePayload(payload: Record<string, unknown>): string {
-  return createHash("sha256").update(canonicalJson(payload)).digest("hex");
+  return createHash("sha256").update(canonicalJson(authoritativeDurablePayload(payload))).digest("hex");
 }
 
 export function derivedAuditEventId(kind: string, authorityId: string): string {

@@ -2,21 +2,24 @@ import {
   experimentManifestSchema,
   ledgerStateSchema,
   paperFillSchema,
+  PaperLedger,
   positionSchema,
   restingPaperOrderSchema,
   type ExperimentManifest,
   type LedgerState,
   type PaperFill,
-  type PaperLedger,
   type Position,
   type RestingPaperOrder,
 } from "@pm/core";
 import {
   CHECKPOINT_SCHEMA_VERSION,
+  CheckpointFenceError,
+  hashDurablePayload,
+  IdempotencyConflictError,
   isDurableTransitionType,
   type DurableTransition,
 } from "@pm/db";
-import { z } from "zod";
+import { z, ZodError } from "zod";
 
 /**
  * MUTATION INVENTORY (Step 2 — replay-authoritative vs derived)
@@ -66,6 +69,123 @@ export class RecoveryFailClosedError extends Error {
   constructor(readonly reason: RecoveryFailureReason, message: string) {
     super(`RECOVERY_FAIL_CLOSED:${reason}: ${message}`);
     this.name = "RecoveryFailClosedError";
+  }
+}
+
+export function normalizeRecoveryError(error: unknown): RecoveryFailClosedError {
+  if (error instanceof RecoveryFailClosedError) return error;
+  if (error instanceof IdempotencyConflictError) {
+    return new RecoveryFailClosedError("conflict", error.message);
+  }
+  if (error instanceof CheckpointFenceError) {
+    return new RecoveryFailClosedError("cursor_fence", error.message);
+  }
+  if (error instanceof ZodError) {
+    return new RecoveryFailClosedError("malformed", error.issues.map((issue) => issue.message).join(";") || "schema");
+  }
+  return new RecoveryFailClosedError("malformed", error instanceof Error ? error.message : String(error));
+}
+
+export interface DerivedAuditRecord {
+  id: string;
+  type: string;
+  aggregateType: string;
+  aggregateId: string;
+  traceId: string;
+  payload: Record<string, unknown>;
+  sourceEventId?: string | null;
+}
+
+const derivedAuditRecordSchema = z.object({
+  id: z.string().min(1).max(160),
+  type: z.string().min(1).max(80),
+  aggregateType: z.string().min(1).max(80),
+  aggregateId: z.string().min(1).max(160),
+  traceId: z.string().min(1).max(160),
+  payload: z.record(z.string(), z.unknown()),
+  sourceEventId: z.string().max(160).nullable().optional(),
+});
+
+export function parseDerivedAudit(payload: Record<string, unknown>): DerivedAuditRecord[] {
+  if (!Object.prototype.hasOwnProperty.call(payload, "derivedAudit") || payload.derivedAudit == null) {
+    throw new RecoveryFailClosedError("malformed", "durable payload missing derivedAudit");
+  }
+  const parsed = z.array(derivedAuditRecordSchema).safeParse(payload.derivedAudit);
+  if (!parsed.success) {
+    throw new RecoveryFailClosedError("malformed", `derivedAudit schema: ${parsed.error.message}`);
+  }
+  return parsed.data;
+}
+
+export function cloneRecoverableState(state: RecoverableEngineState): RecoverableEngineState {
+  const snapshot = state.ledger.snapshot();
+  const ledger = new PaperLedger(snapshot.startingBalance, new Date(snapshot.updatedAt));
+  ledger.restore(snapshot, [...state.ledger.positions.values()]);
+  return {
+    ledger,
+    experiment: state.experiment ? structuredClone(state.experiment) : null,
+    restingOrders: new Map([...state.restingOrders.entries()].map(([id, order]) => [id, structuredClone(order)])),
+    makerReservations: new Map(state.makerReservations),
+    settledMarkets: new Set(state.settledMarkets),
+    lastInfrastructureAccrualAt: state.lastInfrastructureAccrualAt,
+  };
+}
+
+export function plannedDurableTransition(
+  input: {
+    operationKey: string;
+    type: string;
+    aggregateType: string;
+    aggregateId: string;
+    payload: Record<string, unknown>;
+  },
+  occurredAt: Date,
+  sequence: number,
+): DurableTransition {
+  return {
+    sequence,
+    operationKey: input.operationKey,
+    type: input.type,
+    aggregateType: input.aggregateType,
+    aggregateId: input.aggregateId,
+    payloadHash: "",
+    payload: input.payload,
+    occurredAt: occurredAt.toISOString(),
+    recordedAt: occurredAt.toISOString(),
+  };
+}
+
+export function durableIdentityConflicts(
+  type: string,
+  existing: Record<string, unknown>,
+  incoming: Record<string, unknown>,
+): boolean {
+  const pick = (row: Record<string, unknown>, keys: readonly string[]): Record<string, unknown> => (
+    Object.fromEntries(keys.map((key) => [key, row[key] ?? null]))
+  );
+  switch (type) {
+    case "PAPER_FILL":
+      return hashDurablePayload({ fill: existing.fill ?? null }) !== hashDurablePayload({ fill: incoming.fill ?? null });
+    case "PAPER_MAKER_RESERVED":
+      return hashDurablePayload(pick(existing, ["orderId", "reserved", "resting"]))
+        !== hashDurablePayload(pick(incoming, ["orderId", "reserved", "resting"]));
+    case "PAPER_MAKER_RELEASED":
+    case "PAPER_ORDER_CANCELLED":
+      return hashDurablePayload(pick(existing, ["orderId", "cancel", "reason"]))
+        !== hashDurablePayload(pick(incoming, ["orderId", "cancel", "reason"]));
+    case "POSITION_SETTLED":
+      return hashDurablePayload(pick(existing, ["marketId", "upPayoff", "downPayoff", "winner"]))
+        !== hashDurablePayload(pick(incoming, ["marketId", "upPayoff", "downPayoff", "winner"]));
+    case "INFRASTRUCTURE_COST_ACCRUED":
+      return hashDurablePayload(pick(existing, ["aiCost", "infrastructureCost", "accrualKey"]))
+        !== hashDurablePayload(pick(incoming, ["aiCost", "infrastructureCost", "accrualKey"]));
+    case "EXPERIMENT_STARTED":
+    case "EXPERIMENT_ENTRY_CLOSED":
+    case "EXPERIMENT_COMPLETED":
+    case "LEDGER_MARK_TO_MARKET":
+      return false;
+    default:
+      return hashDurablePayload(existing) !== hashDurablePayload(incoming);
   }
 }
 
@@ -292,16 +412,33 @@ export function parseCheckpointDurableCursor(payload: Record<string, unknown>): 
     : null;
 }
 
+export function parseCheckpointDerivedAuditCursor(payload: Record<string, unknown>): number {
+  return typeof payload.derivedAuditCursor === "number"
+    && Number.isInteger(payload.derivedAuditCursor)
+    && payload.derivedAuditCursor >= 0
+    ? payload.derivedAuditCursor
+    : 0;
+}
+
 export const CRITICAL_AUDIT_TYPES = [
   "PAPER_FILL",
   "PAPER_MAKER_RESERVED",
   "PAPER_MAKER_RELEASED",
   "PAPER_ORDER_CANCELLED",
+  "PAPER_ORDER_CREATED",
   "FIRST_LEG_FILLED",
   "HEDGE_COMPLETE",
+  "POSITION_UPDATED",
   "POSITION_SETTLED",
+  "POSITION_WIN",
+  "POSITION_LOSS",
+  "POSITION_BREAKEVEN",
+  "PAIR_REALIZED",
+  "MARKET_RESOLUTION_OBSERVED",
   "EXPERIMENT_STARTED",
   "EXPERIMENT_ENTRY_CLOSED",
   "EXPERIMENT_COMPLETED",
+  "LEDGER_MARK_TO_MARKET",
+  "INFRASTRUCTURE_COST_ACCRUED",
   "PNL_SNAPSHOT",
 ] as const;
