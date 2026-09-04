@@ -24,12 +24,17 @@ export class SseHub {
     return () => {
       this.subscribers.delete(subscriber);
       this.metrics?.sseSubscribers.set(this.subscribers.size);
+      if (this.subscribers.size === 0) this.dropPendingSnapshot();
     };
   }
 
   publish(type: string, data: unknown): void {
     if (type === "snapshot") {
-      if (this.subscribers.size === 0) this.metrics?.sseSnapshotsScheduledZeroSubscribers.inc();
+      if (this.subscribers.size === 0) {
+        this.metrics?.sseSnapshotsSkippedZeroSubscribers.inc();
+        this.dropPendingSnapshot();
+        return;
+      }
       this.pendingSnapshot = data;
       if (this.snapshotTimer) return;
       const delay = Math.max(50, Math.floor(1000 / Math.max(0.5, this.snapshotHz)));
@@ -37,11 +42,11 @@ export class SseHub {
         this.snapshotTimer = null;
         const payload = this.pendingSnapshot;
         this.pendingSnapshot = null;
-        if (payload !== null && payload !== undefined) {
-          const resolved = this.resolveSnapshot(payload);
-          this.frame("snapshot", resolved);
-          this.snapshotBroadcasts += 1;
-        }
+        if (this.subscribers.size === 0 || payload === null || payload === undefined) return;
+        const resolved = this.resolveSnapshot(payload);
+        if (this.subscribers.size === 0) return;
+        this.frame("snapshot", resolved);
+        this.snapshotBroadcasts += 1;
       }, delay);
       this.snapshotTimer.unref?.();
       return;
@@ -52,10 +57,18 @@ export class SseHub {
   snapshotBroadcastCount(): number { return this.snapshotBroadcasts; }
 
   close(): void {
-    if (this.snapshotTimer) clearTimeout(this.snapshotTimer);
+    this.dropPendingSnapshot();
     for (const subscriber of this.subscribers) subscriber.end();
     this.subscribers.clear();
     this.metrics?.sseSubscribers.set(0);
+  }
+
+  private dropPendingSnapshot(): void {
+    if (this.snapshotTimer) {
+      clearTimeout(this.snapshotTimer);
+      this.snapshotTimer = null;
+    }
+    this.pendingSnapshot = null;
   }
 
   private resolveSnapshot(payload: unknown): unknown {

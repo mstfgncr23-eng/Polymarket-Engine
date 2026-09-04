@@ -121,12 +121,17 @@ export class EngineMetrics {
   });
   readonly sseSnapshotBroadcasts = new Counter({
     name: "sse_snapshot_broadcasts_total",
-    help: "SSE snapshot frames actually encoded and written (including zero-subscriber frames)",
+    help: "SSE snapshot frames actually encoded and written",
     registers: [this.registry],
   });
   readonly sseSnapshotsScheduledZeroSubscribers = new Counter({
     name: "sse_snapshots_scheduled_zero_subscribers_total",
     help: "Snapshot publishes scheduled while no SSE subscribers were connected",
+    registers: [this.registry],
+  });
+  readonly sseSnapshotsSkippedZeroSubscribers = new Counter({
+    name: "sse_snapshots_skipped_zero_subscribers_total",
+    help: "Snapshot publish attempts skipped before scheduling/building because there were zero subscribers",
     registers: [this.registry],
   });
   readonly sseSubscriberBackpressure = new Counter({
