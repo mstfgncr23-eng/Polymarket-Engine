@@ -1,6 +1,7 @@
 import { performance } from "node:perf_hooks";
 import { Counter, Gauge, Histogram, Registry, collectDefaultMetrics } from "prom-client";
 import { triggerKindSchema, type TriggerEmitObserver } from "@pm/core";
+import { REJECTION_REASONS, WORK_LANES, type RejectionReason, type WorkLane } from "./runtime-supervisor.js";
 
 export const JOURNAL_METRIC_CLASSES = ["trigger", "activation", "consensus", "execution", "system"] as const;
 export type JournalMetricClass = (typeof JOURNAL_METRIC_CLASSES)[number];
@@ -159,7 +160,7 @@ export class EngineMetrics {
   });
   readonly processTriggerInFlight = new Gauge({
     name: "process_trigger_in_flight",
-    help: "Current concurrent processTrigger() invocations (application-level, unbounded by design)",
+    help: "Current concurrent processTrigger() invocations (bounded by RuntimeSupervisor workers)",
     registers: [this.registry],
   });
   readonly processTriggerInFlightPeak = new Gauge({
@@ -225,7 +226,7 @@ export class EngineMetrics {
 
   readonly discoveryRefreshAttempts = new Counter({
     name: "discovery_refresh_attempts_total",
-    help: "Discovery refresh attempts (overlaps are allowed and counted separately)",
+    help: "Discovery refresh attempts (single-flight; dirty reruns count as additional attempts)",
     registers: [this.registry],
   });
   readonly discoveryRefreshDuration = new Histogram({
@@ -236,12 +237,92 @@ export class EngineMetrics {
   });
   readonly discoveryRefreshInFlight = new Gauge({
     name: "discovery_refresh_in_flight",
-    help: "Currently running discovery refreshes (overlap is not prevented)",
+    help: "Currently running discovery refreshes (single-flight: 0 or 1)",
     registers: [this.registry],
   });
   readonly discoveryRefreshOverlap = new Counter({
     name: "discovery_refresh_overlap_total",
-    help: "Discovery refreshes started while another refresh was already in flight",
+    help: "Discovery refreshes started while another refresh was already in flight (regression: should stay 0 after single-flight)",
+    registers: [this.registry],
+  });
+  readonly discoverySingleflightCoalesced = new Counter({
+    name: "discovery_singleflight_coalesced_total",
+    help: "Discovery refresh requests collapsed onto the in-flight run plus at most one dirty rerun",
+    registers: [this.registry],
+  });
+  readonly discoverySingleflightDirty = new Gauge({
+    name: "discovery_singleflight_dirty",
+    help: "Discovery dirty/pending-rerun bit (0 or 1)",
+    registers: [this.registry],
+  });
+  readonly maintenanceSingleflightCoalesced = new Counter({
+    name: "maintenance_singleflight_coalesced_total",
+    help: "Maintenance ticks collapsed onto the in-flight run plus at most one dirty rerun",
+    registers: [this.registry],
+  });
+  readonly maintenanceSingleflightDirty = new Gauge({
+    name: "maintenance_singleflight_dirty",
+    help: "Maintenance dirty/pending-rerun bit (0 or 1)",
+    registers: [this.registry],
+  });
+
+  readonly runtimeWorkQueueDepth = new Gauge({
+    name: "runtime_work_queue_depth",
+    help: "Admitted trigger work waiting for a RuntimeSupervisor worker",
+    labelNames: ["lane"],
+    registers: [this.registry],
+  });
+  readonly runtimeWorkInFlight = new Gauge({
+    name: "runtime_work_in_flight",
+    help: "Trigger work currently executing on a RuntimeSupervisor worker",
+    labelNames: ["lane"],
+    registers: [this.registry],
+  });
+  readonly runtimeWorkRejected = new Counter({
+    name: "runtime_work_rejected_total",
+    help: "Trigger work rejected by admission/overload policy (finite lane and reason labels)",
+    labelNames: ["lane", "reason"],
+    registers: [this.registry],
+  });
+  readonly runtimeWorkOldestAge = new Gauge({
+    name: "runtime_work_oldest_age_seconds",
+    help: "Age of the oldest queued trigger work item per lane",
+    labelNames: ["lane"],
+    registers: [this.registry],
+  });
+  readonly runtimeWorkQueueBytes = new Gauge({
+    name: "runtime_work_queue_bytes",
+    help: "Conservative queued trigger byte estimate per lane",
+    labelNames: ["lane"],
+    registers: [this.registry],
+  });
+
+  readonly journalDirectWaiting = new Gauge({
+    name: "journal_direct_waiting",
+    help: "Direct journal appends waiting in the application admission queue (not PG pool waiters)",
+    registers: [this.registry],
+  });
+  readonly journalDirectActive = new Gauge({
+    name: "journal_direct_active",
+    help: "Direct journal appends admitted and currently executing (capped below PG pool max)",
+    registers: [this.registry],
+  });
+  readonly journalDirectAdmissionRejected = new Counter({
+    name: "journal_direct_admission_rejected_total",
+    help: "Direct journal appends rejected by application admission before a PG waiter is created",
+    labelNames: ["class"],
+    registers: [this.registry],
+  });
+  readonly journalDirectQueueOldestAge = new Gauge({
+    name: "journal_direct_queue_oldest_age_seconds",
+    help: "Age of the oldest waiting direct journal admission",
+    registers: [this.registry],
+  });
+
+  readonly sseSlowClientDisconnects = new Counter({
+    name: "sse_slow_client_disconnects_total",
+    help: "SSE subscribers disconnected for slow-client backpressure (finite reasons, no per-client labels)",
+    labelNames: ["reason"],
     registers: [this.registry],
   });
   readonly discoveryMarketsInspected = new Histogram({
@@ -301,7 +382,28 @@ export class EngineMetrics {
   private processTriggerPeakCount = 0;
   private journalDirectInFlightCount = 0;
 
-  constructor() { collectDefaultMetrics({ register: this.registry, prefix: "polymarket_" }); }
+  constructor() {
+    collectDefaultMetrics({ register: this.registry, prefix: "polymarket_" });
+    for (const lane of WORK_LANES) {
+      this.runtimeWorkQueueDepth.set({ lane }, 0);
+      this.runtimeWorkInFlight.set({ lane }, 0);
+      this.runtimeWorkOldestAge.set({ lane }, 0);
+      this.runtimeWorkQueueBytes.set({ lane }, 0);
+      for (const reason of REJECTION_REASONS) this.runtimeWorkRejected.inc({ lane, reason }, 0);
+    }
+    for (const journalClass of JOURNAL_METRIC_CLASSES) {
+      this.journalDirectWrites.inc({ class: journalClass }, 0);
+      this.journalDirectFailures.inc({ class: journalClass }, 0);
+      this.journalDirectAdmissionRejected.inc({ class: journalClass }, 0);
+    }
+    this.sseSlowClientDisconnects.inc({ reason: "byte_threshold" }, 0);
+    this.sseSlowClientDisconnects.inc({ reason: "persistent_backpressure" }, 0);
+    this.discoverySingleflightDirty.set(0);
+    this.maintenanceSingleflightDirty.set(0);
+    this.journalDirectWaiting.set(0);
+    this.journalDirectActive.set(0);
+    this.journalDirectQueueOldestAge.set(0);
+  }
 
   triggerObserver(): TriggerEmitObserver {
     return {
@@ -359,5 +461,24 @@ export class EngineMetrics {
       this.journalDirectInFlightCount = Math.max(0, this.journalDirectInFlightCount - 1);
       this.journalDirectInFlight.set(this.journalDirectInFlightCount);
     }
+  }
+
+  runtimeWorkMetrics() {
+    return {
+      setQueueDepth: (lane: WorkLane, value: number) => this.runtimeWorkQueueDepth.set({ lane }, value),
+      setInFlight: (lane: WorkLane, value: number) => this.runtimeWorkInFlight.set({ lane }, value),
+      setQueueBytes: (lane: WorkLane, value: number) => this.runtimeWorkQueueBytes.set({ lane }, value),
+      setOldestAge: (lane: WorkLane, seconds: number) => this.runtimeWorkOldestAge.set({ lane }, seconds),
+      incRejected: (lane: WorkLane, reason: RejectionReason) => this.runtimeWorkRejected.inc({ lane, reason }),
+    };
+  }
+
+  journalAdmissionMetrics() {
+    return {
+      setWaiting: (value: number) => this.journalDirectWaiting.set(value),
+      setActive: (value: number) => this.journalDirectActive.set(value),
+      setOldestAge: (seconds: number) => this.journalDirectQueueOldestAge.set(seconds),
+      incRejected: (journalClass: string) => this.journalDirectAdmissionRejected.inc({ class: journalClass }),
+    };
   }
 }

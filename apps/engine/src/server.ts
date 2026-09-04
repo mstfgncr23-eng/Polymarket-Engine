@@ -8,10 +8,20 @@ import type { EngineMetrics } from "./metrics.js";
 import type { DashboardSnapshot, EngineStateStore } from "./state.js";
 import { createMcpHttpHandler, type McpConfig } from "./mcp.js";
 
-type Subscriber = { write(chunk: string): boolean; end(): void };
+import { FiniteSemaphore, RUNTIME_BOUNDS } from "./runtime-supervisor.js";
+
+type Subscriber = { write(chunk: string): boolean; end(): void; writableLength?: number };
+type SlowClientReason = "byte_threshold" | "persistent_backpressure";
+
+interface TrackedClient {
+  subscriber: Subscriber;
+  bytes: number;
+  consecutiveFalse: number;
+}
 
 export class SseHub {
   private readonly subscribers = new Set<Subscriber>();
+  private readonly tracked = new Map<Subscriber, TrackedClient>();
   private sequence = 0;
   private snapshotTimer: NodeJS.Timeout | null = null;
   private pendingSnapshot: unknown = null;
@@ -20,12 +30,17 @@ export class SseHub {
 
   add(subscriber: Subscriber): () => void {
     this.subscribers.add(subscriber);
+    this.tracked.set(subscriber, { subscriber, bytes: 0, consecutiveFalse: 0 });
     this.metrics?.sseSubscribers.set(this.subscribers.size);
-    return () => {
-      this.subscribers.delete(subscriber);
-      this.metrics?.sseSubscribers.set(this.subscribers.size);
-      if (this.subscribers.size === 0) this.dropPendingSnapshot();
-    };
+    return () => this.remove(subscriber);
+  }
+
+  private remove(subscriber: Subscriber, reason?: SlowClientReason): void {
+    if (!this.subscribers.delete(subscriber)) return;
+    this.tracked.delete(subscriber);
+    this.metrics?.sseSubscribers.set(this.subscribers.size);
+    if (reason) this.metrics?.sseSlowClientDisconnects.inc({ reason });
+    if (this.subscribers.size === 0) this.dropPendingSnapshot();
   }
 
   publish(type: string, data: unknown): void {
@@ -60,6 +75,7 @@ export class SseHub {
     this.dropPendingSnapshot();
     for (const subscriber of this.subscribers) subscriber.end();
     this.subscribers.clear();
+    this.tracked.clear();
     this.metrics?.sseSubscribers.set(0);
   }
 
@@ -88,8 +104,37 @@ export class SseHub {
       this.metrics?.sseSnapshotBroadcasts.inc();
     }
     const encoded = `id: ${++this.sequence}\nevent: ${type}\ndata: ${json}\n\n`;
-    for (const subscriber of this.subscribers) {
-      if (subscriber.write(encoded) === false) this.metrics?.sseSubscriberBackpressure.inc();
+    for (const subscriber of [...this.subscribers]) this.writeToSubscriber(subscriber, encoded);
+  }
+
+  private writeToSubscriber(subscriber: Subscriber, encoded: string): void {
+    const state = this.tracked.get(subscriber) ?? { subscriber, bytes: 0, consecutiveFalse: 0 };
+    this.tracked.set(subscriber, state);
+    let ok = true;
+    try {
+      ok = subscriber.write(encoded);
+    } catch {
+      try { subscriber.end(); } catch { /* already closed */ }
+      this.remove(subscriber, "persistent_backpressure");
+      return;
+    }
+    const reported = typeof subscriber.writableLength === "number" ? subscriber.writableLength : null;
+    if (ok) {
+      state.consecutiveFalse = 0;
+      state.bytes = reported ?? 0;
+    } else {
+      state.consecutiveFalse += 1;
+      this.metrics?.sseSubscriberBackpressure.inc();
+      state.bytes = reported ?? state.bytes + Buffer.byteLength(encoded);
+    }
+    if (state.bytes >= RUNTIME_BOUNDS.sse.byteThreshold) {
+      try { subscriber.end(); } catch { /* already closed */ }
+      this.remove(subscriber, "byte_threshold");
+      return;
+    }
+    if (state.consecutiveFalse >= RUNTIME_BOUNDS.sse.persistentBackpressure) {
+      try { subscriber.end(); } catch { /* already closed */ }
+      this.remove(subscriber, "persistent_backpressure");
     }
   }
 }
@@ -113,6 +158,7 @@ export async function createApiServer(input: {
   const app = Fastify({ logger: input.logger });
   await app.register(sensible);
   await app.register(cors, { origin: input.dashboardOrigin, methods: ["GET", "POST"] });
+  const heavyRead = new FiniteSemaphore(RUNTIME_BOUNDS.heavyRead.concurrency, RUNTIME_BOUNDS.heavyRead.waiting, "HEAVY_READ_BUSY");
 
   const protect = (request: FastifyRequest, token: string | undefined, productionRequired: boolean) => {
     if (!token) {
@@ -142,6 +188,7 @@ export async function createApiServer(input: {
   const mcpHandler = createMcpHttpHandler(input.mcp, {
     state: input.state, journal: input.journal, metrics: input.metrics, submitSignal: input.submitGrokSignal,
     noteMcpRequest: input.noteMcpRequest,
+    heavyRead: (work) => heavyRead.run(work),
   });
   app.route({ method: ["GET", "POST", "DELETE"], url: "/mcp", handler: mcpHandler });
 
@@ -164,12 +211,22 @@ export async function createApiServer(input: {
   app.get<{ Params: { traceId: string } }>("/api/traces/:traceId", async (request, reply) => {
     const denied = await requireRead(request, reply);
     if (denied) return denied;
-    return { traceId: request.params.traceId, events: await input.journal.readTrace(request.params.traceId) };
+    try {
+      return { traceId: request.params.traceId, events: await heavyRead.run(() => input.journal.readTrace(request.params.traceId)) };
+    } catch (error) {
+      if (error instanceof Error && error.message === "HEAVY_READ_BUSY") return reply.code(503).send({ error: "HEAVY_READ_BUSY" });
+      throw error;
+    }
   });
   app.get("/api/history/decisions", async (request, reply) => {
     const denied = await requireRead(request, reply);
     if (denied) return denied;
-    return { events: await input.journal.queryEvents({ types: DECISION_EVENT_TYPES, limit: 500 }) };
+    try {
+      return { events: await heavyRead.run(() => input.journal.queryEvents({ types: DECISION_EVENT_TYPES, limit: 500 })) };
+    } catch (error) {
+      if (error instanceof Error && error.message === "HEAVY_READ_BUSY") return reply.code(503).send({ error: "HEAVY_READ_BUSY" });
+      throw error;
+    }
   });
   app.post("/api/operator/experiment/start", async (request, reply) => {
     if (!input.operatorToken) return reply.code(401).send({ error: "ENGINE_OPERATOR_UNAUTHORIZED" });

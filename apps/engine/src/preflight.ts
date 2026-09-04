@@ -53,6 +53,7 @@ export function evaluateExperimentPreflight(input: {
   mcpRoleTokens: string[];
   bootstrapFailed: boolean;
   mode?: ExperimentActivationMode;
+  overloadFailClosed?: boolean;
 }): PreflightResult {
   const mode = input.mode ?? "MONITOR_ONLY";
   const grokPaper = mode === "48H_GROK_PAPER_EXPERIMENT";
@@ -60,6 +61,7 @@ export function evaluateExperimentPreflight(input: {
   const warnings: string[] = [];
   if (input.env.TRADING_MODE !== "paper") blockers.push("TRADING_MODE_NOT_PAPER");
   if (!input.databaseUp) blockers.push("POSTGRES_UNHEALTHY");
+  if (input.overloadFailClosed) blockers.push("OVERLOAD_FAIL_CLOSED");
   if (input.bootstrapFailed) blockers.push("UNRESOLVED_BOOTSTRAP_FAILURE");
   const entries = input.entryMarkets ?? [];
   const genuineEntries = entries.filter(isGenuineEntryQualifiedMarket);
@@ -110,6 +112,7 @@ export function evaluateExperimentPreflight(input: {
       grokWakeValidated: false,
       grokResearchRequired: requireGrok,
       experimentMode: mode,
+      overloadFailClosed: input.overloadFailClosed === true,
       mcpRoles: tokens,
       missingRoles,
       reference: input.reference,

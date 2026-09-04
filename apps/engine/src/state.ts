@@ -36,6 +36,8 @@ export interface UnattributedMcpActivity {
   lastTool: string | null;
 }
 
+export type OverloadState = "NORMAL" | "DEGRADED" | "FAIL_CLOSED";
+
 export interface EngineReadiness {
   status: "ready" | "not_ready";
   mode: "paper";
@@ -47,6 +49,10 @@ export interface EngineReadiness {
   marketMonitoring: boolean;
   qualifiedMarketCount: number;
   polymarketWs: ConnectionState["state"];
+  overloadState: OverloadState;
+  journalDegraded: boolean;
+  telemetryDegraded: boolean;
+  newPaperEntryAllowed: boolean;
 }
 
 export interface DashboardSnapshot {
@@ -64,6 +70,10 @@ export interface DashboardSnapshot {
     discoveryLoopActive: boolean;
     marketMonitoring: boolean;
     qualifiedMarketCount: number;
+    overloadState: OverloadState;
+    journalDegraded: boolean;
+    telemetryDegraded: boolean;
+    newPaperEntryAllowed: boolean;
   };
   balance: LedgerState;
   positions: Position[];
@@ -88,6 +98,9 @@ export interface DashboardSnapshot {
     btcWs: ConnectionState;
     referenceFeeds: Array<{ asset: string; state: ConnectionState["state"]; lastMessageAt: string | null; reconnects: number }>;
     database: "UP" | "DOWN";
+    journalDegraded: boolean;
+    telemetryDegraded: boolean;
+    overloadState: OverloadState;
     eventLatencyMs: number | null;
     lastBtcMessageAt: string | null;
     unattributedMcp: UnattributedMcpActivity;
@@ -117,6 +130,9 @@ export class EngineStateStore {
   experimentStartedAt: string | null = null;
   experimentCompletedAt: string | null = null;
   database: "UP" | "DOWN" = "DOWN";
+  journalDegraded = false;
+  telemetryDegraded = false;
+  overloadState: OverloadState = "NORMAL";
   lastBtcMessageAt: string | null = null;
   eventLatencyMs: number | null = null;
   discoveryStatus: DiscoveryStatus = "ZERO_QUALIFIED";
@@ -184,6 +200,9 @@ export class EngineStateStore {
   setUnattributedMcp(activity: UnattributedMcpActivity): void { this.unattributedMcp = structuredClone(activity); }
   dropReference(asset: string): void { this.reference.delete(asset); }
   engineAlive(): boolean { return !this.draining && this.database === "UP"; }
+  newPaperEntryAllowed(): boolean {
+    return this.engineAlive() && this.overloadState !== "FAIL_CLOSED";
+  }
 
   readiness(): EngineReadiness {
     const alive = this.engineAlive();
@@ -198,6 +217,10 @@ export class EngineStateStore {
       marketMonitoring: this.marketMonitoring,
       qualifiedMarketCount: this.qualifiedMarketCount,
       polymarketWs: this.connections.polymarket.state,
+      overloadState: this.overloadState,
+      journalDegraded: this.journalDegraded,
+      telemetryDegraded: this.telemetryDegraded,
+      newPaperEntryAllowed: this.newPaperEntryAllowed(),
     };
   }
 
@@ -285,6 +308,8 @@ export class EngineStateStore {
         experimentId: this.experimentId, experimentStatus: this.experimentStatus,
         discoveryStatus: this.discoveryStatus, discoveryLoopActive: this.discoveryLoopActive,
         marketMonitoring: this.marketMonitoring, qualifiedMarketCount: this.qualifiedMarketCount,
+        overloadState: this.overloadState, journalDegraded: this.journalDegraded,
+        telemetryDegraded: this.telemetryDegraded, newPaperEntryAllowed: this.newPaperEntryAllowed(),
       },
       balance: structuredClone(this.ledger), positions: structuredClone([...this.positions.values()]),
       latestAgents: Object.fromEntries(this.latestAgents), consensus: structuredClone(this.latestConsensus), risk: structuredClone(this.latestRisk),
@@ -304,7 +329,11 @@ export class EngineStateStore {
         polymarketWs: structuredClone(this.connections.polymarket),
         btcWs: structuredClone(this.connections.btc),
         referenceFeeds: [...this.reference.entries()].map(([asset, connection]) => ({ asset, state: connection.state, lastMessageAt: connection.lastMessageAt, reconnects: connection.reconnects })),
-        database: this.database, eventLatencyMs: this.eventLatencyMs, lastBtcMessageAt: this.lastBtcMessageAt,
+        database: this.database,
+        journalDegraded: this.journalDegraded,
+        telemetryDegraded: this.telemetryDegraded,
+        overloadState: this.overloadState,
+        eventLatencyMs: this.eventLatencyMs, lastBtcMessageAt: this.lastBtcMessageAt,
         unattributedMcp: structuredClone(this.unattributedMcp),
       },
       equityHistory: structuredClone(this.equityHistory),

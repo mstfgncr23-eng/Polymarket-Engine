@@ -23,7 +23,13 @@ export class BoundedJournalWriter {
     private readonly journal: EventJournal,
     private readonly onDatabase: (up: boolean) => void,
     private readonly logger: { error(bindings: object, message: string): void },
-    private readonly options: { queueLimit: number; batchSize: number; sampleEvery: number; maxConcurrent: number } = {
+    private readonly options: {
+      queueLimit: number;
+      batchSize: number;
+      sampleEvery: number;
+      maxConcurrent: number;
+      onTelemetryDegraded?: (degraded: boolean) => void;
+    } = {
       queueLimit: 2_000, batchSize: 50, sampleEvery: 20, maxConcurrent: 2,
     },
     private readonly metrics?: EngineMetrics,
@@ -69,9 +75,9 @@ export class BoundedJournalWriter {
     try {
       await this.journal.appendMany(batch);
       this.flushed += batch.length;
-      this.onDatabase(true);
+      this.options.onTelemetryDegraded?.(false);
     } catch (error) {
-      this.onDatabase(false);
+      this.options.onTelemetryDegraded?.(true);
       this.dropped += batch.length;
       this.metrics?.telemetryEventsDropped.inc(batch.length);
       this.metrics?.telemetryBatchFailures.inc();
