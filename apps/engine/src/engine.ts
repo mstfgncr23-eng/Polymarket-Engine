@@ -145,7 +145,9 @@ export class EngineService {
   private readonly shutdownJoinDeadlineMs: number;
   private lastShutdown: JoinResult | null = null;
   private lastJournalShutdown: JoinResult | null = null;
+  private lastShutdownCheckpointed = false;
   private maintenanceHold: Promise<void> | null = null;
+  private processTriggerHold: Promise<void> | null = null;
   private discoveryGenerationApplied = 0;
 
   constructor(
@@ -256,8 +258,8 @@ export class EngineService {
     if (this.state.draining) return;
     this.state.draining = true;
     this.state.ready = false;
+    this.lastShutdownCheckpointed = false;
     this.supervisor.closeAdmission();
-    this.journalAdmission.closeAdmission();
     this.record("ENGINE_DRAINING", this.experiment?.id ?? "engine", null, {});
     this.abort.abort("SIGTERM");
     for (const timer of this.referenceRetryTimers.values()) clearTimeout(timer);
@@ -270,16 +272,29 @@ export class EngineService {
       this.accrueInfrastructureCost();
     }
     const deadline = this.shutdownJoinDeadlineMs;
+    const started = Date.now();
     this.lastShutdown = await this.supervisor.join(deadline);
-    this.lastJournalShutdown = await this.journalAdmission.join(deadline);
-    if (this.lastShutdown.drained && this.lastJournalShutdown.drained && this.state.database === "UP") {
+    this.journalAdmission.closeAdmission();
+    const remaining = Math.max(0, deadline - (Date.now() - started));
+    this.lastJournalShutdown = await this.journalAdmission.join(remaining);
+    const cleanDrain = Boolean(
+      this.lastShutdown.drained
+      && this.lastJournalShutdown.drained
+      && !this.lastShutdown.timedOut
+      && !this.lastJournalShutdown.timedOut
+      && this.state.database === "UP"
+      && !this.overload.hasIntegrityFault,
+    );
+    if (cleanDrain) {
       await this.checkpoint();
+      this.lastShutdownCheckpointed = true;
     }
     this.sse.close();
     await this.journal.close();
     this.record("ENGINE_STOPPED", this.experiment?.id ?? "engine", null, {
       unresolvedOwnedWork: (this.lastShutdown.unresolved ?? 0) + (this.lastJournalShutdown.unresolved ?? 0),
       shutdownTimedOut: this.lastShutdown.timedOut || this.lastJournalShutdown.timedOut,
+      checkpointed: this.lastShutdownCheckpointed,
     });
   }
 
@@ -770,7 +785,7 @@ export class EngineService {
       estimatedBytes: RUNTIME_BOUNDS.triggerByteEstimate,
       critical: lane === "p0",
       run: async (signal) => {
-        if (signal.aborted || this.state.draining) return;
+        if (signal.aborted) return;
         await this.processTrigger(trigger, signal);
       },
     });
@@ -793,8 +808,6 @@ export class EngineService {
       p0Queued: snap.lanes.p0.queued,
       p3Queued: snap.lanes.p3.queued,
       journalWaiting: this.journalAdmission.waitingCount,
-      journalAdmissionRejectedCritical: this.journalAdmission.criticalRejectionCount > 0
-        && this.journalAdmission.waitingCount >= RUNTIME_BOUNDS.journal.waiting,
       p0HardCapHit: snap.lanes.p0.queued >= RUNTIME_BOUNDS.trigger.p0.queueLimit,
       p3HardCapDuringRunning: (this.experiment?.status === "RUNNING")
         && snap.lanes.p3.queued >= RUNTIME_BOUNDS.trigger.p3.queueLimit,
@@ -817,7 +830,9 @@ export class EngineService {
     this.metrics.noteProcessTriggerStart();
     const started = performance.now();
     try {
-    if (this.state.draining || signal?.aborted) return;
+    if (signal?.aborted) return;
+    if (this.processTriggerHold) await this.processTriggerHold;
+    if (signal?.aborted) return;
     this.metrics.triggers.inc({ kind: trigger.kind, severity: String(trigger.severity) });
     this.record(`TRIGGER_LEVEL_${trigger.severity}`, trigger.traceId, trigger.marketId, { triggerId: trigger.id, kind: trigger.kind, asset: trigger.asset ?? null }, trigger.asset ?? null);
     await this.safeAppend(createJournalEvent({ traceId: trigger.traceId, type: "TRIGGER_EVENT", aggregateType: "trigger", aggregateId: trigger.id, payload: trigger, sourceEventId: trigger.sourceEventIds[0] ?? null }), signal);
@@ -1069,6 +1084,7 @@ export class EngineService {
       await this.applyFill(executePaperTaker({ order, snapshotAfterLatency: current, measuredLatencyMs: this.env.PAPER_EXECUTION_LATENCY_MS }));
       this.lastTradeAt = this.nowFn();
     } catch (error) {
+      if (this.overload.hasIntegrityFault || (error instanceof JournalAdmissionRejected && error.critical)) throw error;
       this.executionErrors.push(Date.now());
       this.record("PAPER_EXECUTION_ERROR", order.traceId, order.marketId, { orderId: order.id, message: error instanceof Error ? error.message : String(error) });
       await this.safeAppend(createJournalEvent({ traceId: order.traceId, type: "PAPER_EXECUTION_ERROR", aggregateType: "paper_order", aggregateId: order.id, payload: { message: error instanceof Error ? error.message : String(error) } }));
@@ -1085,7 +1101,7 @@ export class EngineService {
     void this.safeAppend(createJournalEvent({
       traceId: orderId, type: "PAPER_MAKER_RELEASED", aggregateType: "paper_order", aggregateId: orderId,
       payload: { orderId, released: String(remaining), experimentId: this.experiment?.id ?? null },
-    }));
+    })).catch(() => undefined);
   }
 
   private async applyFill(fill: Parameters<PaperLedger["applyFill"]>[0]): Promise<void> {
@@ -1220,6 +1236,18 @@ export class EngineService {
       }, signal);
       if (!critical) this.state.journalDegraded = false;
     } catch (error) {
+      if (critical) {
+        this.overload.markIntegrityFault();
+        this.state.overloadState = "FAIL_CLOSED";
+        if (!(error instanceof JournalAdmissionRejected)) this.state.database = "DOWN";
+        this.updateReady();
+        this.syncRuntimeState();
+        this.logger.error(
+          { err: error, traceId: event.traceId, admitted: !(error instanceof JournalAdmissionRejected) },
+          error instanceof JournalAdmissionRejected ? "critical journal admission rejected" : "critical journal append failed",
+        );
+        throw error;
+      }
       this.notePersistenceOutcome(event.type, false);
       this.updateReady();
       this.logger.error(
@@ -1537,30 +1565,45 @@ export class EngineService {
     return {
       active: this.journalAdmission.activeCount,
       waiting: this.journalAdmission.waitingCount,
+      criticalWaiting: this.journalAdmission.criticalWaitingCount,
+      noncriticalWaiting: this.journalAdmission.noncriticalWaitingCount,
       closed: this.journalAdmission.admissionClosed,
       criticalRejects: this.journalAdmission.criticalRejectionCount,
     };
   }
   overloadState() { return this.overload.state; }
-  lastShutdownResult() { return { work: this.lastShutdown, journal: this.lastJournalShutdown }; }
+  integrityFault() { return this.overload.hasIntegrityFault; }
+  lastShutdownResult() {
+    return { work: this.lastShutdown, journal: this.lastJournalShutdown, checkpointed: this.lastShutdownCheckpointed };
+  }
   discoveryFlightSnapshot() {
+    const coalescing = this.discoveryFlight.coalescingState();
     return {
       inFlight: this.discoveryFlight.inFlight,
       dirty: this.discoveryFlight.dirty,
       coalesced: this.discoveryFlight.coalesced,
       attempts: this.discoveryFlight.attempts,
       committed: this.discoveryFlight.committed,
+      retainedSharedCycles: coalescing.retainedSharedCycles,
+      retainedWaiters: coalescing.retainedWaiters,
     };
   }
   maintenanceFlightSnapshot() {
+    const coalescing = this.maintenanceFlight.coalescingState();
     return {
       inFlight: this.maintenanceFlight.inFlight,
       dirty: this.maintenanceFlight.dirty,
       coalesced: this.maintenanceFlight.coalesced,
       attempts: this.maintenanceFlight.attempts,
+      retainedSharedCycles: coalescing.retainedSharedCycles,
+      retainedWaiters: coalescing.retainedWaiters,
     };
   }
   setMaintenanceHoldForTest(hold: Promise<void> | null): void { this.maintenanceHold = hold; }
+  setProcessTriggerHoldForTest(hold: Promise<void> | null): void { this.processTriggerHold = hold; }
+  async persistEventForTest(event: ReturnType<typeof createJournalEvent>): Promise<void> {
+    await this.safeAppend(event);
+  }
   enqueueTriggerStormForTest(triggers: TriggerEvent[]): { admitted: number; rejected: number; reasons: Record<string, number> } {
     let admitted = 0;
     let rejected = 0;

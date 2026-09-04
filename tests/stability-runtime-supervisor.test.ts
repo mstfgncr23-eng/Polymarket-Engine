@@ -6,6 +6,7 @@ import { EngineMetrics } from "../apps/engine/src/metrics.js";
 import {
   DirectJournalAdmission,
   FiniteSemaphore,
+  JournalAdmissionRejected,
   OverloadLatch,
   RuntimeSupervisor,
   SingleFlight,
@@ -19,6 +20,7 @@ import {
   ScriptedMarketAdapter,
   ScriptedReferenceRegistry,
   discoveryReport,
+  paperFill,
   qualified,
   qualifiedPaperEnv,
   startQualifiedEngine,
@@ -186,7 +188,7 @@ describe("RuntimeSupervisor unit bounds", () => {
     for (let i = 0; i < 200; i += 1) {
       overflow.push(gate.run("trigger", false, work).then(() => "ok" as const, () => "rejected" as const));
     }
-    await waitFor(() => gate.waitingCount === RUNTIME_BOUNDS.journal.waiting);
+    await waitFor(() => gate.noncriticalWaitingCount === RUNTIME_BOUNDS.journal.noncriticalWaiting);
     expect(gate.activeCount).toBe(RUNTIME_BOUNDS.journal.active);
     release();
     const overflowResults = await Promise.all(overflow);
@@ -239,20 +241,33 @@ describe("RuntimeSupervisor unit bounds", () => {
     await Promise.all(waiting);
   });
 
-  it("overload latch uses hysteresis from FAIL_CLOSED back to NORMAL", () => {
+  it("overload latch uses hysteresis from transient FAIL_CLOSED back to NORMAL", () => {
     const latch = new OverloadLatch();
     expect(latch.recompute({
       p0Queued: 256, p3Queued: 0, journalWaiting: 0,
-      journalAdmissionRejectedCritical: false, p0HardCapHit: true, p3HardCapDuringRunning: false, reservedExhausted: true,
+      p0HardCapHit: true, p3HardCapDuringRunning: false, reservedExhausted: true,
     })).toBe("FAIL_CLOSED");
     expect(latch.recompute({
       p0Queued: 200, p3Queued: 0, journalWaiting: 0,
-      journalAdmissionRejectedCritical: false, p0HardCapHit: false, p3HardCapDuringRunning: false, reservedExhausted: false,
+      p0HardCapHit: false, p3HardCapDuringRunning: false, reservedExhausted: false,
     })).toBe("DEGRADED");
     expect(latch.recompute({
       p0Queued: 10, p3Queued: 10, journalWaiting: 0,
-      journalAdmissionRejectedCritical: false, p0HardCapHit: false, p3HardCapDuringRunning: false, reservedExhausted: false,
+      p0HardCapHit: false, p3HardCapDuringRunning: false, reservedExhausted: false,
     })).toBe("NORMAL");
+  });
+
+  it("critical integrity fault stays FAIL_CLOSED after queues drain", () => {
+    const latch = new OverloadLatch();
+    latch.markIntegrityFault();
+    expect(latch.state).toBe("FAIL_CLOSED");
+    expect(latch.hasIntegrityFault).toBe(true);
+    expect(latch.recompute({
+      p0Queued: 0, p3Queued: 0, journalWaiting: 0,
+      p0HardCapHit: false, p3HardCapDuringRunning: false, reservedExhausted: false,
+    })).toBe("FAIL_CLOSED");
+    latch.force("NORMAL");
+    expect(latch.state).toBe("FAIL_CLOSED");
   });
 });
 
@@ -335,7 +350,7 @@ describe("B queue drain after release", () => {
 });
 
 describe("C same-market ordering", () => {
-  it("preserves admission order for the same market across lanes", async () => {
+  it("preserves same-market P3 FIFO and never runs two same-key tasks concurrently", async () => {
     let release!: () => void;
     const hold = new Promise<void>((resolve) => { release = resolve; });
       const seen: string[] = [];
@@ -483,7 +498,10 @@ describe("H shutdown mid-work", () => {
     await engine.stop();
     expect(Date.now() - started).toBeLessThan(2_000);
     const shutdown = engine.lastShutdownResult();
-    expect(shutdown.work?.timedOut || (shutdown.work?.unresolved ?? 0) >= 0).toBe(true);
+    expect(shutdown.work?.timedOut).toBe(true);
+    expect(shutdown.work?.drained).toBe(false);
+    expect(shutdown.checkpointed).toBe(false);
+    expect((shutdown.work?.unresolved ?? 0) + (shutdown.journal?.unresolved ?? 0)).toBeGreaterThan(0);
     expect(engine.runtimeSupervisorSnapshot().closed).toBe(true);
     const after = engine.enqueueTriggerStormForTest([researchTrigger({ id: createId("trigger") })]);
     expect(after.admitted).toBe(0);
@@ -566,8 +584,13 @@ describe("J readiness distinction", () => {
         if (event.type.startsWith("EXPERIMENT_") || event.type.startsWith("PAPER_")) throw new Error("CRITICAL_DOWN");
         return original(event);
       };
-      await engine.restMakerForTest(order("MAKER", { marketId: "btc-mkt", tokenId: "btc-up" }), snapshot({ marketId: "btc-mkt", tokenId: "btc-up" }));
+      await expect(engine.restMakerForTest(
+        order("MAKER", { marketId: "btc-mkt", tokenId: "btc-up" }),
+        snapshot({ marketId: "btc-mkt", tokenId: "btc-up" }),
+      )).rejects.toThrow("CRITICAL_DOWN");
       expect(engine.state.database).toBe("DOWN");
+      expect(engine.integrityFault()).toBe(true);
+      expect(engine.overloadState()).toBe("FAIL_CLOSED");
       expect(engine.state.engineAlive()).toBe(false);
       const blocked = await engine.beginExperiment();
       expect(blocked.ok).toBe(false);
@@ -614,5 +637,313 @@ describe("normal-load trigger semantics remain journaled", () => {
     } finally {
       await engine.stop();
     }
+  });
+});
+
+describe("blocker 1 bounded failure history", () => {
+  it("keeps retained failure history at a fixed cap after 100k task failures", async () => {
+    const metrics = new EngineMetrics();
+    const supervisor = new RuntimeSupervisor(metrics.runtimeWorkMetrics());
+    const target = 100_000;
+    let submitted = 0;
+    while (submitted < target) {
+      const dones: Array<Promise<void>> = [];
+      while (submitted < target) {
+        const result = supervisor.admit({
+          id: `f${submitted}`, lane: "p3", key: `k${submitted % 8}`, estimatedBytes: 4, critical: false,
+          run: async () => { throw new Error("task_failed"); },
+        });
+        if (!result.admitted) break;
+        dones.push(result.done);
+        submitted += 1;
+      }
+      await Promise.all(dones);
+    }
+    expect(supervisor.totalFailureCount).toBe(target);
+    expect(supervisor.snapshot().retainedFailures).toBe(RUNTIME_BOUNDS.failureHistory);
+    expect(supervisor.observedFailures()).toHaveLength(RUNTIME_BOUNDS.failureHistory);
+    expect(supervisor.observedFailures().every((item) => item.message === "task_failed" && item.lane === "p3")).toBe(true);
+    expect(await metricValue(metrics, "runtime_work_failures_total", { lane: "p3" })).toBe(target);
+    const metric = metrics.registry.getSingleMetric("runtime_work_failures_total");
+    const data = await metric!.get();
+    for (const point of data.values) {
+      expect(Object.keys(point.labels).every((key) => key === "lane")).toBe(true);
+      expect(point.labels.lane === "p0" || point.labels.lane === "p3").toBe(true);
+    }
+  }, 20_000);
+});
+
+describe("blocker 2 SingleFlight O(1) coalescing", () => {
+  it("keeps internal coalescing state O(1) under a 100k concurrent trigger storm", async () => {
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => { release = resolve; });
+    let runs = 0;
+    let peak = 0;
+    let inFlight = 0;
+    const flight = new SingleFlight();
+    const task = async () => {
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      runs += 1;
+      await hold;
+      inFlight -= 1;
+    };
+    const first = flight.trigger(task);
+    await waitFor(() => flight.inFlight);
+    const rest = Array.from({ length: 100_000 }, () => flight.trigger(task));
+    const state = flight.coalescingState();
+    expect(state.retainedWaiters).toBe(0);
+    expect(state.retainedSharedCycles).toBe(1);
+    expect(state.dirty).toBe(true);
+    expect(flight.coalesced).toBe(100_000);
+    expect(peak).toBe(1);
+    release();
+    await Promise.all([first, ...rest]);
+    expect(runs).toBeLessThanOrEqual(2);
+    expect(peak).toBe(1);
+    expect(flight.coalescingState()).toEqual({ running: false, dirty: false, retainedSharedCycles: 0, retainedWaiters: 0 });
+  }, 20_000);
+});
+
+describe("blocker 3 same-key P0 vs P3", () => {
+  it("A: same-market P0 is not forced to wait for an entire queued P3 backlog", async () => {
+    const started: string[] = [];
+    let releaseFirst!: () => void;
+    const holdFirst = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const supervisor = new RuntimeSupervisor();
+    const make = (id: string, lane: "p0" | "p3") => supervisor.admit({
+      id, lane, key: "market:same", estimatedBytes: 8, critical: lane === "p0",
+      run: async () => {
+        started.push(id);
+        if (started.length === 1) await holdFirst;
+      },
+    });
+    const p3 = Array.from({ length: 80 }, (_, i) => make(`p3-${i}`, "p3"));
+    await waitFor(() => started[0] === "p3-0");
+    expect(started).toEqual(["p3-0"]);
+    const p0 = make("p0-hedge", "p0");
+    expect(p0.admitted).toBe(true);
+    releaseFirst();
+    await p0.done;
+    expect(started.indexOf("p0-hedge")).toBe(1);
+    expect(started.indexOf("p0-hedge")).toBeLessThan(started.indexOf("p3-1"));
+    await Promise.all(p3.map((item) => item.done));
+  });
+
+  it("B: same-key P0 and P3 never run concurrently", async () => {
+    const supervisor = new RuntimeSupervisor();
+    let inflight = 0;
+    let peak = 0;
+    let releaseP3!: () => void;
+    const holdP3 = new Promise<void>((resolve) => { releaseP3 = resolve; });
+    const p3 = supervisor.admit({
+      id: "p3", lane: "p3", key: "market:k", estimatedBytes: 8, critical: false,
+      run: async () => {
+        inflight += 1;
+        peak = Math.max(peak, inflight);
+        await holdP3;
+        inflight -= 1;
+      },
+    });
+    await waitFor(() => inflight === 1);
+    const p0 = supervisor.admit({
+      id: "p0", lane: "p0", key: "market:k", estimatedBytes: 8, critical: true,
+      run: async () => {
+        inflight += 1;
+        peak = Math.max(peak, inflight);
+        inflight -= 1;
+      },
+    });
+    await Promise.resolve();
+    expect(peak).toBe(1);
+    expect(inflight).toBe(1);
+    expect(supervisor.snapshot().lanes.p0.inFlight).toBe(0);
+    expect(supervisor.snapshot().lanes.p0.queued).toBe(1);
+    releaseP3();
+    await Promise.all([p3.done, p0.done]);
+    expect(peak).toBe(1);
+  });
+
+  it("C: different-market P0 uses reserved capacity during a P3 storm", async () => {
+    const supervisor = new RuntimeSupervisor();
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => { release = resolve; });
+    const p3 = Array.from({ length: 200 }, (_, i) => supervisor.admit({
+      id: `p3-${i}`, lane: "p3", key: `market:p3-${i}`, estimatedBytes: 8, critical: false,
+      run: () => hold,
+    }));
+    await waitFor(() => supervisor.snapshot().lanes.p3.inFlight === RUNTIME_BOUNDS.trigger.p3.concurrency);
+    expect(supervisor.criticalReservedAvailable()).toBe(true);
+    const p0 = supervisor.admit({
+      id: "p0-other", lane: "p0", key: "market:p0-other", estimatedBytes: 8, critical: true,
+      run: () => hold,
+    });
+    await waitFor(() => supervisor.snapshot().lanes.p0.inFlight === 1);
+    expect(p0.admitted).toBe(true);
+    expect(supervisor.snapshot().lanes.p3.inFlight).toBe(RUNTIME_BOUNDS.trigger.p3.concurrency);
+    expect(supervisor.snapshot().lanes.p0.inFlight).toBe(1);
+    release();
+    await Promise.all([...p3.map((item) => item.done), p0.done]);
+  });
+});
+
+describe("blocker 4-6 journal reservation, integrity, shutdown", () => {
+  it("noncritical journal saturation still admits reserved critical work", async () => {
+    const gate = new DirectJournalAdmission();
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => { release = resolve; });
+    const work = () => hold;
+    const noncritical: Array<Promise<unknown>> = [];
+    for (let i = 0; i < RUNTIME_BOUNDS.journal.active + RUNTIME_BOUNDS.journal.noncriticalWaiting + 10; i += 1) {
+      noncritical.push(gate.run("trigger", false, work).catch((error) => error));
+    }
+    await waitFor(() => gate.noncriticalWaitingCount === RUNTIME_BOUNDS.journal.noncriticalWaiting);
+    expect(gate.activeCount).toBe(RUNTIME_BOUNDS.journal.active);
+    await expect(gate.run("trigger", false, work)).rejects.toBeInstanceOf(JournalAdmissionRejected);
+    const critical = gate.run("execution", true, work);
+    await waitFor(() => gate.criticalWaitingCount === 1);
+    expect(gate.criticalRejectionCount).toBe(0);
+    release();
+    await critical;
+    await Promise.all(noncritical);
+  });
+
+  it("engine noncritical backlog cannot reject a later critical fill", async () => {
+    const { engine, journal } = await startNoopEngine();
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => { release = resolve; });
+    const original = journal.append.bind(journal);
+    const pending: Array<Promise<unknown>> = [];
+    try {
+      journal.append = async (event) => {
+        await hold;
+        return original(event);
+      };
+      for (let i = 0; i < RUNTIME_BOUNDS.journal.active + RUNTIME_BOUNDS.journal.noncriticalWaiting; i += 1) {
+        pending.push(engine.persistEventForTest(createJournalEvent({
+          traceId: createId("trace"), type: "TRIGGER_EVENT", aggregateType: "trigger", aggregateId: createId("trigger"), payload: {},
+        })).catch((error) => error));
+      }
+      await waitFor(() => engine.journalAdmissionSnapshot().noncriticalWaiting === RUNTIME_BOUNDS.journal.noncriticalWaiting);
+      expect(engine.journalAdmissionSnapshot().active).toBe(RUNTIME_BOUNDS.journal.active);
+      const critical = engine.persistEventForTest(createJournalEvent({
+        traceId: createId("trace"), type: "PAPER_FILL", aggregateType: "paper_fill", aggregateId: createId("fill"), payload: {},
+      }));
+      await waitFor(() => engine.journalAdmissionSnapshot().criticalWaiting === 1);
+      expect(engine.journalAdmissionSnapshot().criticalRejects).toBe(0);
+      release();
+      await critical;
+      await Promise.all(pending);
+      expect(engine.integrityFault()).toBe(false);
+    } finally {
+      release();
+      await engine.stop();
+    }
+  }, 15_000);
+
+  it("fill/risk/settlement critical admission rejection propagates and stays FAIL_CLOSED after drain", async () => {
+    const { engine, journal } = await startNoopEngine();
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => { release = resolve; });
+    const original = journal.append.bind(journal);
+    const pending: Array<Promise<unknown>> = [];
+    try {
+      journal.append = async (event) => {
+        await hold;
+        return original(event);
+      };
+      for (let i = 0; i < RUNTIME_BOUNDS.journal.active + RUNTIME_BOUNDS.journal.criticalWaiting; i += 1) {
+        pending.push(engine.persistEventForTest(createJournalEvent({
+          traceId: createId("trace"), type: "RISK_EVALUATION", aggregateType: "risk", aggregateId: createId("risk"), payload: {},
+        })).catch((error) => error));
+      }
+      await waitFor(() => engine.journalAdmissionSnapshot().criticalWaiting === RUNTIME_BOUNDS.journal.criticalWaiting);
+      await expect(engine.applyObservedFill(paperFill("btc-mkt", "UP"))).rejects.toBeInstanceOf(JournalAdmissionRejected);
+      await expect(engine.persistEventForTest(createJournalEvent({
+        traceId: createId("trace"), type: "RISK_EVALUATION", aggregateType: "risk", aggregateId: createId("risk"), payload: {},
+      }))).rejects.toBeInstanceOf(JournalAdmissionRejected);
+      await expect(engine.persistEventForTest(createJournalEvent({
+        traceId: createId("trace"), type: "POSITION_SETTLED", aggregateType: "position", aggregateId: createId("pos"), payload: {},
+      }))).rejects.toBeInstanceOf(JournalAdmissionRejected);
+      expect(engine.integrityFault()).toBe(true);
+      expect(engine.overloadState()).toBe("FAIL_CLOSED");
+      expect(engine.state.newPaperEntryAllowed()).toBe(false);
+      release();
+      await Promise.all(pending);
+      await waitFor(() => engine.journalAdmissionSnapshot().active === 0 && engine.journalAdmissionSnapshot().waiting === 0);
+      expect(engine.integrityFault()).toBe(true);
+      expect(engine.overloadState()).toBe("FAIL_CLOSED");
+      expect(engine.state.newPaperEntryAllowed()).toBe(false);
+      const blocked = await engine.beginExperiment();
+      expect(blocked.ok).toBe(false);
+      expect(blocked.blockers).toContain("OVERLOAD_FAIL_CLOSED");
+    } finally {
+      release();
+      await engine.stop();
+    }
+  }, 15_000);
+
+  it("ordinary telemetry/research degradation does not create a sticky integrity fault", async () => {
+    const { engine, journal } = await startNoopEngine();
+    const original = journal.append.bind(journal);
+    try {
+      journal.append = async (event) => {
+        if (event.type === "TRIGGER_EVENT" || event.type === "MARKET_SNAPSHOT") throw new Error("RESEARCH_DOWN");
+        return original(event);
+      };
+      await engine.persistEventForTest(createJournalEvent({
+        traceId: createId("trace"), type: "TRIGGER_EVENT", aggregateType: "trigger", aggregateId: createId("trigger"), payload: {},
+      }));
+      expect(engine.integrityFault()).toBe(false);
+      expect(engine.state.journalDegraded).toBe(true);
+      expect(engine.overloadState()).not.toBe("FAIL_CLOSED");
+      expect(engine.state.database).toBe("UP");
+      expect(engine.state.engineAlive()).toBe(true);
+    } finally {
+      await engine.stop();
+    }
+  });
+
+  it("admitted trigger can still journal after shutdown begins", async () => {
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => { release = resolve; });
+    const { engine, journal } = await startNoopEngine();
+    try {
+      engine.setProcessTriggerHoldForTest(hold);
+      const trigger = researchTrigger({ id: "drain-t", marketId: "drain-mkt" });
+      engine.enqueueTriggerStormForTest([trigger]);
+      await waitFor(() => engine.runtimeSupervisorSnapshot().totalInFlight >= 1);
+      expect(engine.journalAdmissionSnapshot().closed).toBe(false);
+      const stopping = engine.stop();
+      await waitFor(() => engine.state.draining);
+      expect(engine.journalAdmissionSnapshot().closed).toBe(false);
+      engine.setProcessTriggerHoldForTest(null);
+      release();
+      await stopping;
+      const events = await journal.queryEvents({ types: ["TRIGGER_EVENT"] });
+      expect(events.some((event) => event.payload.id === "drain-t")).toBe(true);
+      const shutdown = engine.lastShutdownResult();
+      expect(shutdown.work?.drained).toBe(true);
+      expect(shutdown.journal?.drained).toBe(true);
+      expect(shutdown.work?.timedOut).toBe(false);
+      expect(engine.journalAdmissionSnapshot().closed).toBe(true);
+    } finally {
+      engine.setProcessTriggerHoldForTest(null);
+      release();
+    }
+  }, 15_000);
+
+  it("normal graceful shutdown drains runtime then journal then checkpoints", async () => {
+    const { engine } = await startNoopEngine();
+    await engine.registerTriggerForResearch(researchTrigger());
+    await engine.stop();
+    const shutdown = engine.lastShutdownResult();
+    expect(shutdown.work?.drained).toBe(true);
+    expect(shutdown.journal?.drained).toBe(true);
+    expect(shutdown.work?.timedOut).toBe(false);
+    expect(shutdown.journal?.timedOut).toBe(false);
+    expect(shutdown.checkpointed).toBe(true);
+    expect(engine.journalAdmissionSnapshot().closed).toBe(true);
+    expect(engine.runtimeSupervisorSnapshot().closed).toBe(true);
   });
 });

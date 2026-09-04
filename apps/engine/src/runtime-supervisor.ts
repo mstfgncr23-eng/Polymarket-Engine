@@ -8,10 +8,32 @@
  *
  * Caps are architectural (finite active+queued work), not a CPU claim.
  *
- * Journal active concurrency is 4, below postgres.js pool max=10. Remaining
- * connections stay available for telemetry (maxConcurrent=2), healthCheck,
- * checkpoint, MCP/report reads (semaphore 2), and recovery. Direct journal
- * admission happens in-process BEFORE a waiter is created on the PG pool.
+ * Cross-lane same-key ordering (blocker 3):
+ * - At most one task per key is in-flight (P0 and P3 share the key lock).
+ * - Same-lane same-key work stays FIFO.
+ * - Per key, P0 and P3 wait on separate bounded queues. A later P0 is picked
+ *   before not-yet-started P3 on that key. Queued P3 has not mutated state, so
+ *   running a later P0 first is equivalent to P0 arriving before those P3 items
+ *   were admitted. Already-started same-key P3 always finishes first.
+ * - P3 is ordinary research (TRIGGER_EVENT / activation bookkeeping). This PR
+ *   does not change TriggerEngine cooldown/dedupe.
+ * - Unrelated keys are not serialized. Different-market P0 uses reserved P0
+ *   workers during a P3 storm.
+ *
+ * Direct journal admission (blocker 4):
+ * - Shared active concurrency remains 4, below postgres.js pool max=10.
+ * - Critical and noncritical have separate bounded waiting queues.
+ * - Free active slots prefer critical waiters; noncritical backlog cannot
+ *   consume the critical waiting cap. No unbounded priority queue.
+ *
+ * Shutdown (blocker 6): close NEW runtime-work admission first; keep journal
+ * admission OPEN until RuntimeSupervisor has drained or the join deadline is
+ * reached; then close NEW journal admission and drain journal work. Timeout
+ * does not claim a clean drain or checkpoint.
+ *
+ * Overload: transient pressure (queue high-water / hard-cap) may recover via
+ * hysteresis. Critical persistence failure is a sticky integrity fault and
+ * cannot auto-clear when queues drain.
  */
 
 export const WORK_LANES = ["p0", "p3"] as const;
@@ -36,11 +58,19 @@ export const RUNTIME_BOUNDS = {
   },
   /** Entire P0 lane is reserved critical capacity; P3 cannot consume these slots. */
   criticalReserved: { lane: "p0" as const, queueLimit: 256, concurrency: 4 },
-  journal: { active: 4, waiting: 128, highWater: 96 },
+  journal: {
+    active: 4,
+    waiting: 128,
+    highWater: 96,
+    criticalWaiting: 32,
+    noncriticalWaiting: 96,
+  },
   sse: { byteThreshold: 262_144, persistentBackpressure: 8 },
   shutdownJoinDeadlineMs: 5_000,
   heavyRead: { concurrency: 2, waiting: 16 },
   triggerByteEstimate: 2_048,
+  /** Hard cap on retained RuntimeSupervisor failure records (not a metric label). */
+  failureHistory: 32,
 } as const;
 
 export interface RuntimeWork {
@@ -76,6 +106,8 @@ export interface SupervisorSnapshot {
   totalQueued: number;
   totalInFlight: number;
   unresolved: number;
+  failureCount: number;
+  retainedFailures: number;
 }
 
 export interface JoinResult {
@@ -84,12 +116,20 @@ export interface JoinResult {
   timedOut: boolean;
 }
 
+export interface ObservedFailure {
+  at: number;
+  lane: WorkLane;
+  key: string;
+  message: string;
+}
+
 export interface RuntimeWorkMetrics {
   setQueueDepth(lane: WorkLane, value: number): void;
   setInFlight(lane: WorkLane, value: number): void;
   setQueueBytes(lane: WorkLane, value: number): void;
   setOldestAge(lane: WorkLane, seconds: number): void;
   incRejected(lane: WorkLane, reason: RejectionReason): void;
+  incFailed(lane: WorkLane): void;
 }
 
 interface QueuedWork {
@@ -98,6 +138,11 @@ interface QueuedWork {
   abort: AbortController;
   resolve: () => void;
   reject: (error: unknown) => void;
+}
+
+interface KeyQueues {
+  p0: QueuedWork[];
+  p3: QueuedWork[];
 }
 
 const RISK_HEDGE_SETTLEMENT_KINDS = new Set([
@@ -122,7 +167,7 @@ export function isIdleLikeStatus(status: ExperimentWorkStatus | null | undefined
   return status == null || status === "IDLE" || status === "COMPLETED" || status === "FAILED";
 }
 
-/** Persistence whose failure must not be treated as machine death. */
+/** Persistence whose failure must not be treated as a successful mutation. */
 export function isCriticalPersistenceType(type: string): boolean {
   return type.startsWith("PAPER_")
     || type.startsWith("POSITION_")
@@ -139,24 +184,33 @@ export function isCriticalPersistenceType(type: string): boolean {
 
 export class OverloadLatch {
   private current: OverloadState = "NORMAL";
+  private integrityFault = false;
 
   get state(): OverloadState { return this.current; }
+  get hasIntegrityFault(): boolean { return this.integrityFault; }
+
+  /**
+   * Sticky FAIL_CLOSED for critical persistence loss. Does not auto-clear when
+   * queue depth falls. Only an explicit process recovery/reset clears it.
+   */
+  markIntegrityFault(): void {
+    this.integrityFault = true;
+    this.current = "FAIL_CLOSED";
+  }
 
   recompute(input: {
     p0Queued: number;
     p3Queued: number;
     journalWaiting: number;
-    journalAdmissionRejectedCritical: boolean;
     p0HardCapHit: boolean;
     p3HardCapDuringRunning: boolean;
     reservedExhausted: boolean;
   }): OverloadState {
-    if (
-      input.p0HardCapHit
-      || input.reservedExhausted
-      || input.journalAdmissionRejectedCritical
-      || input.p3HardCapDuringRunning
-    ) {
+    if (this.integrityFault) {
+      this.current = "FAIL_CLOSED";
+      return this.current;
+    }
+    if (input.p0HardCapHit || input.reservedExhausted || input.p3HardCapDuringRunning) {
       this.current = "FAIL_CLOSED";
       return this.current;
     }
@@ -176,25 +230,38 @@ export class OverloadLatch {
     return this.current;
   }
 
-  force(state: OverloadState): void { this.current = state; }
+  force(state: OverloadState): void {
+    if (this.integrityFault) {
+      this.current = "FAIL_CLOSED";
+      return;
+    }
+    this.current = state;
+  }
 }
 
 /**
- * Bounded lanes + per-key FIFO serialization + global worker caps.
+ * Bounded lanes + per-key serialization + global worker caps.
  * Unrelated keys run in parallel up to lane concurrency. Same key never
- * has two in-flight tasks (across P0 and P3), so admitted same-market
- * order is preserved.
+ * has two in-flight tasks (across P0 and P3).
+ *
+ * Failure observability is a cumulative counter plus a hard-capped ring.
+ * No structure grows with process lifetime.
  */
 export class RuntimeSupervisor {
   private closed = false;
-  private readonly queuedByKey = new Map<string, QueuedWork[]>();
+  private readonly queuedByKey = new Map<string, KeyQueues>();
   private readonly busyKeys = new Set<string>();
   private readonly inflight = new Set<QueuedWork>();
   private readonly queuedCount: Record<WorkLane, number> = { p0: 0, p3: 0 };
   private readonly inFlightCount: Record<WorkLane, number> = { p0: 0, p3: 0 };
   private readonly queueBytes: Record<WorkLane, number> = { p0: 0, p3: 0 };
   private readonly oldestAt: Record<WorkLane, number | null> = { p0: null, p3: null };
-  private readonly failures: unknown[] = [];
+  private readonly recentFailures: Array<ObservedFailure | undefined> = Array.from(
+    { length: RUNTIME_BOUNDS.failureHistory },
+  );
+  private failureWrite = 0;
+  private failureRetained = 0;
+  private failureCount = 0;
   private lastP0HardCap = false;
   private lastP3HardCap = false;
 
@@ -205,6 +272,7 @@ export class RuntimeSupervisor {
 
   get admissionClosed(): boolean { return this.closed; }
   get lastHardCap(): { p0: boolean; p3: boolean } { return { p0: this.lastP0HardCap, p3: this.lastP3HardCap }; }
+  get totalFailureCount(): number { return this.failureCount; }
 
   snapshot(): SupervisorSnapshot {
     return {
@@ -217,6 +285,8 @@ export class RuntimeSupervisor {
       totalQueued: this.queuedCount.p0 + this.queuedCount.p3,
       totalInFlight: this.inFlightCount.p0 + this.inFlightCount.p3,
       unresolved: this.queuedCount.p0 + this.queuedCount.p3 + this.inFlightCount.p0 + this.inFlightCount.p3,
+      failureCount: this.failureCount,
+      retainedFailures: this.failureRetained,
     };
   }
 
@@ -246,9 +316,9 @@ export class RuntimeSupervisor {
     const item: QueuedWork = {
       work, enqueuedAt: Date.now(), abort: new AbortController(), resolve, reject,
     };
-    const queue = this.queuedByKey.get(work.key) ?? [];
-    queue.push(item);
-    this.queuedByKey.set(work.key, queue);
+    const queues = this.queuedByKey.get(work.key) ?? { p0: [], p3: [] };
+    queues[work.lane].push(item);
+    this.queuedByKey.set(work.key, queues);
     this.queuedCount[work.lane] += 1;
     this.queueBytes[work.lane] += work.estimatedBytes;
     if (this.oldestAt[work.lane] == null) this.oldestAt[work.lane] = item.enqueuedAt;
@@ -276,7 +346,16 @@ export class RuntimeSupervisor {
     return { drained: true, unresolved: 0, timedOut: false };
   }
 
-  observedFailures(): unknown[] { return [...this.failures]; }
+  observedFailures(): ObservedFailure[] {
+    const cap = RUNTIME_BOUNDS.failureHistory;
+    const out: ObservedFailure[] = [];
+    const start = this.failureCount > cap ? this.failureWrite % cap : 0;
+    for (let i = 0; i < this.failureRetained; i += 1) {
+      const item = this.recentFailures[(start + i) % cap];
+      if (item) out.push({ ...item });
+    }
+    return out;
+  }
 
   private unresolved(): number {
     return this.queuedCount.p0 + this.queuedCount.p3 + this.inFlightCount.p0 + this.inFlightCount.p3;
@@ -286,8 +365,8 @@ export class RuntimeSupervisor {
     for (const item of this.inflight) {
       item.abort.abort("shutdown_deadline");
     }
-    for (const [, queue] of this.queuedByKey) {
-      for (const item of queue) {
+    for (const queues of this.queuedByKey.values()) {
+      for (const item of [...queues.p0, ...queues.p3]) {
         this.queuedCount[item.work.lane] -= 1;
         this.queueBytes[item.work.lane] -= item.work.estimatedBytes;
         item.resolve();
@@ -311,47 +390,52 @@ export class RuntimeSupervisor {
     const preferP3 = this.inFlightCount.p3 < RUNTIME_BOUNDS.trigger.p3.concurrency;
     if (!preferP0 && !preferP3) return null;
 
-    let fallback: { key: string; item: QueuedWork } | null = null;
-    for (const [key, queue] of this.queuedByKey) {
+    let p3Fallback: { key: string; lane: "p3" } | null = null;
+    for (const [key, queues] of this.queuedByKey) {
       if (this.busyKeys.has(key)) continue;
-      const item = queue[0];
-      if (!item) continue;
-      const lane = item.work.lane;
-      if (lane === "p0" && !preferP0) continue;
-      if (lane === "p3" && !preferP3) continue;
-      if (lane === "p0") {
-        this.dequeueHead(key);
-        return item;
-      }
-      fallback ??= { key, item };
+      if (preferP0 && queues.p0.length > 0) return this.dequeue(key, "p0");
+      if (preferP3 && queues.p3.length > 0 && !p3Fallback) p3Fallback = { key, lane: "p3" };
     }
-    if (fallback) {
-      this.dequeueHead(fallback.key);
-      return fallback.item;
-    }
+    if (p3Fallback) return this.dequeue(p3Fallback.key, p3Fallback.lane);
     return null;
   }
 
-  private dequeueHead(key: string): void {
-    const queue = this.queuedByKey.get(key);
-    if (!queue) return;
-    const item = queue.shift();
-    if (!item) return;
-    this.queuedCount[item.work.lane] -= 1;
-    this.queueBytes[item.work.lane] -= item.work.estimatedBytes;
-    if (queue.length === 0) this.queuedByKey.delete(key);
-    this.refreshOldest(item.work.lane);
+  private dequeue(key: string, lane: WorkLane): QueuedWork | null {
+    const queues = this.queuedByKey.get(key);
+    if (!queues) return null;
+    const item = queues[lane].shift();
+    if (!item) return null;
+    this.queuedCount[lane] -= 1;
+    this.queueBytes[lane] -= item.work.estimatedBytes;
+    if (queues.p0.length === 0 && queues.p3.length === 0) this.queuedByKey.delete(key);
+    this.refreshOldest(lane);
+    return item;
   }
 
   private refreshOldest(lane: WorkLane): void {
     let oldest: number | null = null;
-    for (const queue of this.queuedByKey.values()) {
-      for (const item of queue) {
-        if (item.work.lane !== lane) continue;
+    for (const queues of this.queuedByKey.values()) {
+      for (const item of queues[lane]) {
         if (oldest == null || item.enqueuedAt < oldest) oldest = item.enqueuedAt;
       }
     }
     this.oldestAt[lane] = oldest;
+  }
+
+  private noteFailure(item: QueuedWork, error: unknown): void {
+    this.failureCount += 1;
+    this.metrics?.incFailed(item.work.lane);
+    const raw = error instanceof Error ? error.message : String(error);
+    const record: ObservedFailure = {
+      at: Date.now(),
+      lane: item.work.lane,
+      key: item.work.key,
+      message: raw.slice(0, 200),
+    };
+    const cap = RUNTIME_BOUNDS.failureHistory;
+    this.recentFailures[this.failureWrite % cap] = record;
+    this.failureWrite += 1;
+    this.failureRetained = Math.min(cap, this.failureRetained + 1);
   }
 
   private async runItem(item: QueuedWork): Promise<void> {
@@ -362,7 +446,7 @@ export class RuntimeSupervisor {
     try {
       await item.work.run(item.abort.signal);
     } catch (error) {
-      this.failures.push(error);
+      this.noteFailure(item, error);
     } finally {
       this.inflight.delete(item);
       this.busyKeys.delete(item.work.key);
@@ -429,17 +513,24 @@ interface JournalWaiter<T> {
 /**
  * Application-level direct-journal gate. Waiters here are JS promises, not
  * postgres.js pool waiters. No recursive retry.
+ *
+ * Shared active workers (4) + separate bounded critical/noncritical waiting.
+ * Noncritical research cannot fill the critical waiting cap. Pump prefers
+ * critical waiters. Total waiting ≤ 128; total active ≤ 4.
  */
 export class DirectJournalAdmission {
   private closed = false;
   private active = 0;
-  private readonly waiting: Array<JournalWaiter<unknown>> = [];
+  private readonly criticalWaiting: Array<JournalWaiter<unknown>> = [];
+  private readonly noncriticalWaiting: Array<JournalWaiter<unknown>> = [];
   private criticalRejects = 0;
   private oldestAt: number | null = null;
 
   constructor(private readonly metrics?: JournalAdmissionMetrics, private readonly onChange?: () => void) {}
 
-  get waitingCount(): number { return this.waiting.length; }
+  get waitingCount(): number { return this.criticalWaiting.length + this.noncriticalWaiting.length; }
+  get criticalWaitingCount(): number { return this.criticalWaiting.length; }
+  get noncriticalWaitingCount(): number { return this.noncriticalWaiting.length; }
   get activeCount(): number { return this.active; }
   get admissionClosed(): boolean { return this.closed; }
   get criticalRejectionCount(): number { return this.criticalRejects; }
@@ -448,40 +539,51 @@ export class DirectJournalAdmission {
 
   async run<T>(journalClass: string, critical: boolean, work: () => Promise<T>, signal?: AbortSignal): Promise<T> {
     if (this.closed || signal?.aborted) {
-      this.metrics?.incRejected(journalClass);
-      if (critical) this.criticalRejects += 1;
-      this.onChange?.();
-      throw new JournalAdmissionRejected(journalClass, critical, "JOURNAL_ADMISSION_CLOSED");
+      this.rejectNow(journalClass, critical, "JOURNAL_ADMISSION_CLOSED");
     }
-    if (this.active < RUNTIME_BOUNDS.journal.active) {
+    if (this.canStartNow(critical)) {
       return this.execute(work);
     }
-    if (this.waiting.length >= RUNTIME_BOUNDS.journal.waiting) {
-      this.metrics?.incRejected(journalClass);
-      if (critical) this.criticalRejects += 1;
-      this.publish();
-      throw new JournalAdmissionRejected(journalClass, critical);
+    const queue = critical ? this.criticalWaiting : this.noncriticalWaiting;
+    const limit = critical ? RUNTIME_BOUNDS.journal.criticalWaiting : RUNTIME_BOUNDS.journal.noncriticalWaiting;
+    if (queue.length >= limit) {
+      this.rejectNow(journalClass, critical);
     }
     return new Promise<T>((resolve, reject) => {
       const waiter: JournalWaiter<T> = {
         journalClass, critical, enqueuedAt: Date.now(), run: work, resolve, reject,
       };
-      this.waiting.push(waiter as JournalWaiter<unknown>);
+      queue.push(waiter as JournalWaiter<unknown>);
       if (this.oldestAt == null) this.oldestAt = waiter.enqueuedAt;
       this.publish();
+      this.pump();
     });
   }
 
   async join(deadlineMs: number): Promise<JoinResult> {
     const started = Date.now();
-    while (this.active + this.waiting.length > 0) {
+    while (this.active + this.waitingCount > 0) {
       if (Date.now() - started >= deadlineMs) {
         this.rejectWaiting("JOURNAL_ADMISSION_CLOSED");
-        return { drained: this.active === 0, unresolved: this.active + this.waiting.length, timedOut: true };
+        return { drained: this.active === 0, unresolved: this.active + this.waitingCount, timedOut: true };
       }
       await delay(5);
     }
     return { drained: true, unresolved: 0, timedOut: false };
+  }
+
+  private canStartNow(critical: boolean): boolean {
+    if (this.active >= RUNTIME_BOUNDS.journal.active) return false;
+    if (this.criticalWaiting.length > 0) return false;
+    if (critical) return true;
+    return this.noncriticalWaiting.length === 0;
+  }
+
+  private rejectNow(journalClass: string, critical: boolean, message?: string): never {
+    this.metrics?.incRejected(journalClass);
+    if (critical) this.criticalRejects += 1;
+    this.onChange?.();
+    throw new JournalAdmissionRejected(journalClass, critical, message);
   }
 
   private async execute<T>(work: () => Promise<T>): Promise<T> {
@@ -497,12 +599,12 @@ export class DirectJournalAdmission {
   }
 
   private pump(): void {
-    while (this.active < RUNTIME_BOUNDS.journal.active && this.waiting.length > 0) {
+    while (this.active < RUNTIME_BOUNDS.journal.active && this.waitingCount > 0) {
       if (this.closed) {
         this.rejectWaiting("JOURNAL_ADMISSION_CLOSED");
         return;
       }
-      const next = this.waiting.shift();
+      const next = this.criticalWaiting.shift() ?? this.noncriticalWaiting.shift();
       if (!next) return;
       this.refreshOldest();
       void this.execute(next.run).then(next.resolve, next.reject);
@@ -512,7 +614,7 @@ export class DirectJournalAdmission {
   }
 
   private rejectWaiting(message: string): void {
-    const leftover = this.waiting.splice(0);
+    const leftover = [...this.criticalWaiting.splice(0), ...this.noncriticalWaiting.splice(0)];
     this.oldestAt = null;
     for (const waiter of leftover) {
       this.metrics?.incRejected(waiter.journalClass);
@@ -523,22 +625,38 @@ export class DirectJournalAdmission {
   }
 
   private refreshOldest(): void {
-    this.oldestAt = this.waiting[0]?.enqueuedAt ?? null;
+    const criticalOldest = this.criticalWaiting[0]?.enqueuedAt;
+    const noncriticalOldest = this.noncriticalWaiting[0]?.enqueuedAt;
+    if (criticalOldest == null) this.oldestAt = noncriticalOldest ?? null;
+    else if (noncriticalOldest == null) this.oldestAt = criticalOldest;
+    else this.oldestAt = Math.min(criticalOldest, noncriticalOldest);
   }
 
   private publish(): void {
-    this.metrics?.setWaiting(this.waiting.length);
+    this.metrics?.setWaiting(this.waitingCount);
     this.metrics?.setActive(this.active);
     this.metrics?.setOldestAge(this.oldestAt == null ? 0 : Math.max(0, (Date.now() - this.oldestAt) / 1000));
     this.onChange?.();
   }
 }
 
+export interface SingleFlightCoalescingState {
+  running: boolean;
+  dirty: boolean;
+  retainedSharedCycles: number;
+  retainedWaiters: number;
+}
+
+/**
+ * One active execution + one dirty bit + one shared completion promise.
+ * Overlapping callers do not allocate an invocation-sized waiter array inside
+ * SingleFlight. They share the in-flight cycle promise (O(1) retained state).
+ */
 export class SingleFlight {
   private running = false;
   private generation = 0;
   private committedGeneration = 0;
-  private waiters: Array<{ resolve: () => void; reject: (error: unknown) => void }> = [];
+  private cycle: Promise<void> | null = null;
   dirty = false;
   coalesced = 0;
   attempts = 0;
@@ -556,20 +674,30 @@ export class SingleFlight {
   get currentGeneration(): number { return this.generation; }
   get inFlight(): boolean { return this.running; }
 
+  coalescingState(): SingleFlightCoalescingState {
+    return {
+      running: this.running,
+      dirty: this.dirty,
+      retainedSharedCycles: this.cycle == null ? 0 : 1,
+      retainedWaiters: 0,
+    };
+  }
+
   async trigger(task: (generation: number) => Promise<void>): Promise<void> {
-    if (this.running) {
+    if (this.cycle) {
       this.dirty = true;
       this.coalesced += 1;
       this.hooks?.onCoalesced?.();
       this.hooks?.onDirty?.(true);
-      return new Promise<void>((resolve, reject) => this.waiters.push({ resolve, reject }));
+      return this.cycle;
     }
-    return this.lead(task);
+    const cycle = this.execute(task);
+    this.cycle = cycle;
+    return cycle;
   }
 
-  private async lead(task: (generation: number) => Promise<void>): Promise<void> {
+  private async execute(task: (generation: number) => Promise<void>): Promise<void> {
     this.running = true;
-    let lastError: unknown;
     try {
       for (;;) {
         this.dirty = false;
@@ -581,9 +709,7 @@ export class SingleFlight {
         try {
           await task(generation);
           this.committedGeneration = generation;
-          lastError = undefined;
         } catch (error) {
-          lastError = error;
           if (!this.dirty) throw error;
         } finally {
           this.hooks?.onInFlight?.(0);
@@ -592,17 +718,8 @@ export class SingleFlight {
       }
     } finally {
       this.running = false;
-      const waiters = this.waiters.splice(0);
-      if (this.dirty) {
-        const next = this.lead(task);
-        for (const waiter of waiters) void next.then(waiter.resolve, waiter.reject);
-      } else {
-        this.hooks?.onDirty?.(false);
-        for (const waiter of waiters) {
-          if (lastError !== undefined) waiter.reject(lastError);
-          else waiter.resolve();
-        }
-      }
+      this.cycle = null;
+      this.hooks?.onDirty?.(false);
     }
   }
 }

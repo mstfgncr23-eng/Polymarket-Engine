@@ -296,6 +296,12 @@ export class EngineMetrics {
     labelNames: ["lane"],
     registers: [this.registry],
   });
+  readonly runtimeWorkFailures = new Counter({
+    name: "runtime_work_failures_total",
+    help: "RuntimeSupervisor task failures by lane (no error text in labels)",
+    labelNames: ["lane"],
+    registers: [this.registry],
+  });
 
   readonly journalDirectWaiting = new Gauge({
     name: "journal_direct_waiting",
@@ -389,6 +395,7 @@ export class EngineMetrics {
       this.runtimeWorkInFlight.set({ lane }, 0);
       this.runtimeWorkOldestAge.set({ lane }, 0);
       this.runtimeWorkQueueBytes.set({ lane }, 0);
+      this.runtimeWorkFailures.inc({ lane }, 0);
       for (const reason of REJECTION_REASONS) this.runtimeWorkRejected.inc({ lane, reason }, 0);
     }
     for (const journalClass of JOURNAL_METRIC_CLASSES) {
@@ -470,6 +477,7 @@ export class EngineMetrics {
       setQueueBytes: (lane: WorkLane, value: number) => this.runtimeWorkQueueBytes.set({ lane }, value),
       setOldestAge: (lane: WorkLane, seconds: number) => this.runtimeWorkOldestAge.set({ lane }, seconds),
       incRejected: (lane: WorkLane, reason: RejectionReason) => this.runtimeWorkRejected.inc({ lane, reason }),
+      incFailed: (lane: WorkLane) => this.runtimeWorkFailures.inc({ lane }),
     };
   }
 
