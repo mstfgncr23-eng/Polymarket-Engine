@@ -52,7 +52,7 @@ describe("Part 1 bookImbalance allocation-free + Number exact/fallback", () => {
       bids: [{ price: "0.4", quantity: "10" }, { price: "0.39", quantity: "5" }, { price: "0.38", quantity: "1" }],
       asks: [{ price: "0.5", quantity: "2" }, { price: "0.51", quantity: "2" }],
     });
-    expect(bookImbalance(snapshot)).toBeCloseTo((15 - 4) / 19, 12);
+    expect(bookImbalance(snapshot)).toBeCloseTo((16 - 4) / 20, 12);
   });
 
   it("uses Number only when every quantity is an exact IEEE value", () => {
@@ -74,7 +74,17 @@ describe("Part 1 bookImbalance allocation-free + Number exact/fallback", () => {
         asks: levels(6, 0.6, String(2 + (i % 5))),
       });
       const value = bookImbalance(snapshot);
-      expect(Number.isFinite(value)).toBe(true);
+      let bid = 0;
+      let ask = 0;
+      for (const level of snapshot.bids.slice(0, 5)) bid += Number(level.quantity);
+      for (const level of snapshot.asks.slice(0, 5)) ask += Number(level.quantity);
+      const naive = bid + ask === 0 ? 0 : (bid - ask) / (bid + ask);
+      if (qty === "0.1") {
+        expect(exactNumberQuantity(qty)).toBeNull();
+        expect(Number.isFinite(value)).toBe(true);
+      } else {
+        expect(value).toBeCloseTo(naive, 12);
+      }
       expect(Math.abs(value)).toBeLessThanOrEqual(1);
     }
   });

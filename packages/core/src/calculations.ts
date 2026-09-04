@@ -126,7 +126,26 @@ export function exactNumberQuantity(value: string): number | null {
   if (!DECIMAL_QTY_RE.test(value)) return null;
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) return null;
-  return d(value).eq(numeric) ? numeric : null;
+  // Decimal(number) uses Number#toString and hides binary error (0.1 → "0.1").
+  // Compare the decimal literal to the true IEEE value (21-digit precision).
+  const ieee = numeric.toPrecision(21);
+  if (/e/i.test(ieee)) return d(value).eq(d(ieee)) ? numeric : null;
+  return normalizeDecimalLiteral(value) === normalizeDecimalLiteral(ieee) ? numeric : null;
+}
+
+function normalizeDecimalLiteral(raw: string): string {
+  let text = raw;
+  let sign = "";
+  if (text.startsWith("-")) {
+    sign = "-";
+    text = text.slice(1);
+  }
+  const dot = text.indexOf(".");
+  let whole = dot === -1 ? text : text.slice(0, dot);
+  let frac = dot === -1 ? "" : text.slice(dot + 1);
+  whole = whole.replace(/^0+(?=\d)/, "");
+  frac = frac.replace(/0+$/, "");
+  return frac.length > 0 ? `${sign}${whole}.${frac}` : `${sign}${whole || "0"}`;
 }
 
 function tryNumberBookImbalance(snapshot: MarketSnapshot, bidN: number, askN: number): number | null {
