@@ -1,6 +1,7 @@
 import { performance } from "node:perf_hooks";
 import { Counter, Gauge, Histogram, Registry, collectDefaultMetrics } from "prom-client";
 import { triggerKindSchema, type TriggerEmitObserver } from "@pm/core";
+import { INGRESS_GAP_REASONS } from "@pm/market-data";
 import { DURABLE_METRIC_TYPES, type DurableMetricType } from "@pm/db";
 import { RECOVERY_FAILURE_REASONS, type RecoveryFailureReason } from "./recovery.js";
 import { REJECTION_REASONS, WORK_LANES, type RejectionReason, type WorkLane } from "./runtime-supervisor.js";
@@ -13,6 +14,7 @@ export const TRIGGER_SEVERITY_VALUES = ["0", "1", "2", "3"] as const;
 export const FORBIDDEN_METRIC_LABEL_NAMES = [
   "marketId", "tokenId", "traceId", "slug", "eventId", "market_id", "token_id", "trace_id",
   "operationKey", "positionId", "orderId", "fillId", "experimentId", "rawError",
+  "asset", "event_id", "token_id",
 ] as const;
 
 const DURATION_BUCKETS = [0.001, 0.005, 0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 1, 5];
@@ -226,6 +228,76 @@ export class EngineMetrics {
     name: "reference_window_length",
     help: "Retained reference-tick window length after ingest (no per-asset label; asset set is not closed)",
     buckets: LEVEL_BUCKETS,
+    registers: [this.registry],
+  });
+  readonly triggerMarketIngestDuration = new Histogram({
+    name: "trigger_market_ingest_duration_seconds",
+    help: "TriggerEngine.ingestMarket duration (one histogram for CPU attribution)",
+    buckets: DURATION_BUCKETS,
+    registers: [this.registry],
+  });
+  readonly triggerReferenceIngestDuration = new Histogram({
+    name: "trigger_reference_ingest_duration_seconds",
+    help: "TriggerEngine.ingestReference duration (one histogram for CPU attribution)",
+    buckets: DURATION_BUCKETS,
+    registers: [this.registry],
+  });
+  readonly triggerDedupeEntries = new Gauge({
+    name: "trigger_dedupe_entries",
+    help: "Retained trigger cooldown/dedupe entries (stable market+asset+kind scope)",
+    registers: [this.registry],
+  });
+  readonly marketIngressQueueDepth = new Gauge({
+    name: "market_ingress_queue_depth",
+    help: "Owned market ingress event-count depth",
+    registers: [this.registry],
+  });
+  readonly marketIngressQueueBytes = new Gauge({
+    name: "market_ingress_queue_bytes",
+    help: "Owned market ingress approximate queued bytes",
+    registers: [this.registry],
+  });
+  readonly marketIngressHighWater = new Gauge({
+    name: "market_ingress_high_water_total",
+    help: "High-water event count of the owned market ingress queue",
+    registers: [this.registry],
+  });
+  readonly marketIngressGap = new Counter({
+    name: "market_ingress_gap_total",
+    help: "Market ingress gaps that invalidate incremental books (finite reasons)",
+    labelNames: ["reason"],
+    registers: [this.registry],
+  });
+  readonly marketIngressResync = new Counter({
+    name: "market_ingress_resync_total",
+    help: "Successful full-book resyncs after a gap or await (finite reasons)",
+    labelNames: ["reason"],
+    registers: [this.registry],
+  });
+  readonly marketUnsynchronizedTokens = new Gauge({
+    name: "market_unsynchronized_tokens",
+    help: "Tokens not in SYNCED (AWAITING_BOOK or GAPPED)",
+    registers: [this.registry],
+  });
+  readonly referenceWindowEntries = new Gauge({
+    name: "reference_window_entries",
+    help: "Total retained reference-window ticks across assets",
+    registers: [this.registry],
+  });
+  readonly referenceWindowOverflow = new Counter({
+    name: "reference_window_overflow_total",
+    help: "Reference window overflows that mark the window GAPPED (finite reasons)",
+    labelNames: ["reason"],
+    registers: [this.registry],
+  });
+  readonly restingOrderTokenIndexEntries = new Gauge({
+    name: "resting_order_token_index_entries",
+    help: "Derived token→resting-order index mappings",
+    registers: [this.registry],
+  });
+  readonly assetMarketIndexEntries = new Gauge({
+    name: "asset_market_index_entries",
+    help: "Derived asset→market index mappings",
     registers: [this.registry],
   });
 
@@ -499,6 +571,20 @@ export class EngineMetrics {
     this.checkpointWrites.inc({ status: "failed" }, 0);
     this.durableTransitionLastAppliedSequence.set(0);
     this.checkpointDurableCursor.set(0);
+    for (const reason of INGRESS_GAP_REASONS) {
+      this.marketIngressGap.inc({ reason }, 0);
+      this.marketIngressResync.inc({ reason }, 0);
+    }
+    this.marketIngressResync.inc({ reason: "full_book" }, 0);
+    this.referenceWindowOverflow.inc({ reason: "reference_window_limit" }, 0);
+    this.triggerDedupeEntries.set(0);
+    this.marketIngressQueueDepth.set(0);
+    this.marketIngressQueueBytes.set(0);
+    this.marketIngressHighWater.set(0);
+    this.marketUnsynchronizedTokens.set(0);
+    this.referenceWindowEntries.set(0);
+    this.restingOrderTokenIndexEntries.set(0);
+    this.assetMarketIndexEntries.set(0);
   }
 
   noteDurableCommit(type: string, inserted: boolean): void {
@@ -533,7 +619,27 @@ export class EngineMetrics {
       onEmitted: (kind, severity) => this.triggersEmitted.inc({ kind, severity: String(severity) }),
       onSuppressed: (kind, severity) => this.triggersSuppressed.inc({ kind, severity: String(severity) }),
       onReferenceWindow: (length) => this.referenceWindowLength.observe(length),
+      onMarketIngest: (durationSeconds) => this.triggerMarketIngestDuration.observe(durationSeconds),
+      onReferenceIngest: (durationSeconds) => this.triggerReferenceIngestDuration.observe(durationSeconds),
+      onReferenceWindowOverflow: () => this.referenceWindowOverflow.inc({ reason: "reference_window_limit" }),
     };
+  }
+
+  noteIngressSnapshot(input: { depth: number; bytes: number; highWaterEvents: number }): void {
+    this.marketIngressQueueDepth.set(input.depth);
+    this.marketIngressQueueBytes.set(input.bytes);
+    this.marketIngressHighWater.set(input.highWaterEvents);
+  }
+
+  noteIngressGap(reason: string): void {
+    const bounded = (INGRESS_GAP_REASONS as readonly string[]).includes(reason) ? reason : "malformed";
+    this.marketIngressGap.inc({ reason: bounded });
+  }
+
+  noteIngressResync(reason: string): void {
+    const allowed = [...INGRESS_GAP_REASONS, "full_book"];
+    const bounded = allowed.includes(reason) ? reason : "full_book";
+    this.marketIngressResync.inc({ reason: bounded });
   }
 
   normalizeObserver(): MarketNormalizeObserver {

@@ -15,11 +15,21 @@ export interface ActivationDecision {
   request: GrokActivationRequest | null;
 }
 
+const SENT_TTL_MS = 3_600_000;
+const SCOPE_TTL_MS = 3_600_000;
+
 export class GrokActivationCoordinator {
   private readonly sent = new Map<string, number>();
+  private readonly sentOrder: string[] = [];
+  private sentHead = 0;
   private readonly lastByMarketAsset = new Map<string, { at: number; severity: number }>();
+  private readonly lastOrder: string[] = [];
+  private lastHead = 0;
   private readonly recent: number[] = [];
+  private recentHead = 0;
   readonly latency = new Map<string, ActivationLatency>();
+  private readonly latencyOrder: string[] = [];
+  private latencyHead = 0;
   private readonly unattributedMcp: Array<{ at: string; tool: string | null }> = [];
   private readonly retryAfterUntil = new Map<string, number>();
 
@@ -40,10 +50,8 @@ export class GrokActivationCoordinator {
     if (previous && now - previous.at < this.limits.cooldownMs && trigger.severity <= previous.severity && trigger.severity <= this.limits.suppressAtOrBelow) {
       return { activate: false, reason: "SEVERITY_SUPPRESSED", request };
     }
-    const recent = this.recent.filter((at) => now - at < 60_000);
-    this.recent.length = 0;
-    this.recent.push(...recent);
-    if (recent.length >= this.limits.maxPerMinute) return { activate: false, reason: "RATE_LIMITED", request };
+    this.trimRecent(now);
+    if (this.recentCount() >= this.limits.maxPerMinute) return { activate: false, reason: "RATE_LIMITED", request };
     const duplicate = request.targetRoles.every((role) => this.sent.has(activationIdempotencyKey(trigger.id, role)));
     if (duplicate) return { activate: false, reason: "DUPLICATE", request };
     return { activate: true, reason: "SEND", request };
@@ -51,10 +59,17 @@ export class GrokActivationCoordinator {
 
   markRequested(trigger: TriggerEvent, request: GrokActivationRequest): void {
     const now = this.now();
+    const nowMs = now.getTime();
     this.ensureLatency(trigger, now.toISOString());
-    this.lastByMarketAsset.set(`${trigger.marketId ?? "none"}:${trigger.asset ?? "none"}:${trigger.kind}`, { at: now.getTime(), severity: trigger.severity });
-    this.recent.push(now.getTime());
-    for (const role of request.targetRoles) this.sent.set(activationIdempotencyKey(trigger.id, role), now.getTime());
+    const scope = `${trigger.marketId ?? "none"}:${trigger.asset ?? "none"}:${trigger.kind}`;
+    if (!this.lastByMarketAsset.has(scope)) this.lastOrder.push(scope);
+    this.lastByMarketAsset.set(scope, { at: nowMs, severity: trigger.severity });
+    this.recent.push(nowMs);
+    for (const role of request.targetRoles) {
+      const key = activationIdempotencyKey(trigger.id, role);
+      if (!this.sent.has(key)) this.sentOrder.push(key);
+      this.sent.set(key, nowMs);
+    }
     this.prune();
   }
 
@@ -69,7 +84,8 @@ export class GrokActivationCoordinator {
       firstMcpRequestAt: null,
       firstAcceptedSignalAt: null,
     });
-    this.prune();
+    this.latencyOrder.push(trigger.id);
+    this.evictLatencyIfNeeded();
   }
 
   async dispatch(request: GrokActivationRequest): Promise<GrokActivationResult[]> {
@@ -137,8 +153,14 @@ export class GrokActivationCoordinator {
 
   restoreLatency(items: readonly ActivationLatency[]): void {
     this.latency.clear();
-    for (const item of items) this.latency.set(item.triggerId, structuredClone(item));
-    this.prune();
+    this.latencyOrder.length = 0;
+    this.latencyHead = 0;
+    const ordered = [...items].sort((a, b) => new Date(a.triggerCreatedAt).getTime() - new Date(b.triggerCreatedAt).getTime());
+    for (const item of ordered) {
+      this.latency.set(item.triggerId, structuredClone(item));
+      this.latencyOrder.push(item.triggerId);
+    }
+    this.evictLatencyIfNeeded();
   }
 
   noteMcp(triggerIds: readonly string[], at = new Date()): void {
@@ -171,20 +193,83 @@ export class GrokActivationCoordinator {
 
   footprint(): { sent: number; lastByMarketAsset: number; latency: number; recent: number } {
     this.prune();
-    return { sent: this.sent.size, lastByMarketAsset: this.lastByMarketAsset.size, latency: this.latency.size, recent: this.recent.length };
+    return { sent: this.sent.size, lastByMarketAsset: this.lastByMarketAsset.size, latency: this.latency.size, recent: this.recentCount() };
+  }
+
+  private evictLatencyIfNeeded(): void {
+    const limit = this.limits.memoryLimit ?? 500;
+    while (this.latency.size > limit && this.latencyHead < this.latencyOrder.length) {
+      const oldest = this.latencyOrder[this.latencyHead];
+      this.latencyOrder[this.latencyHead] = undefined as unknown as string;
+      this.latencyHead += 1;
+      if (oldest) this.latency.delete(oldest);
+    }
+    this.compact(this.latencyOrder, () => { this.latencyHead = 0; }, this.latencyHead, (head) => { this.latencyHead = head; });
   }
 
   private prune(): void {
     const now = this.now().getTime();
-    const limit = this.limits.memoryLimit ?? 500;
-    for (const [key, at] of this.sent) if (now - at > 3_600_000) this.sent.delete(key);
-    for (const [key, item] of this.lastByMarketAsset) if (now - item.at > 3_600_000) this.lastByMarketAsset.delete(key);
+    this.trimRecent(now);
+    this.expireOrdered(this.sent, this.sentOrder, () => this.sentHead, (head) => { this.sentHead = head; }, now, SENT_TTL_MS);
+    this.expireLastByMarket(now);
     for (const [role, until] of this.retryAfterUntil) if (until <= now) this.retryAfterUntil.delete(role);
-    const latencies = [...this.latency.entries()].sort((a, b) => new Date(a[1].triggerCreatedAt).getTime() - new Date(b[1].triggerCreatedAt).getTime());
-    while (latencies.length > limit) {
-      const oldest = latencies.shift();
-      if (oldest) this.latency.delete(oldest[0]);
+    this.evictLatencyIfNeeded();
+  }
+
+  private trimRecent(now: number): void {
+    while (this.recentHead < this.recent.length && now - (this.recent[this.recentHead] ?? 0) >= 60_000) {
+      this.recentHead += 1;
     }
+    if (this.recentHead >= 1_024) {
+      this.recent.splice(0, this.recentHead);
+      this.recentHead = 0;
+    }
+  }
+
+  private recentCount(): number {
+    return this.recent.length - this.recentHead;
+  }
+
+  private expireOrdered(
+    map: Map<string, number>,
+    order: string[],
+    getHead: () => number,
+    setHead: (head: number) => void,
+    now: number,
+    ttl: number,
+  ): void {
+    let head = getHead();
+    while (head < order.length) {
+      const key = order[head];
+      if (!key) { head += 1; continue; }
+      const at = map.get(key);
+      if (at !== undefined && now - at <= ttl) break;
+      if (at !== undefined && now - at > ttl) map.delete(key);
+      order[head] = undefined as unknown as string;
+      head += 1;
+    }
+    setHead(head);
+    this.compact(order, () => setHead(0), head, setHead);
+  }
+
+  private expireLastByMarket(now: number): void {
+    while (this.lastHead < this.lastOrder.length) {
+      const key = this.lastOrder[this.lastHead];
+      if (!key) { this.lastHead += 1; continue; }
+      const item = this.lastByMarketAsset.get(key);
+      if (item && now - item.at <= SCOPE_TTL_MS) break;
+      if (item && now - item.at > SCOPE_TTL_MS) this.lastByMarketAsset.delete(key);
+      this.lastOrder[this.lastHead] = undefined as unknown as string;
+      this.lastHead += 1;
+    }
+    this.compact(this.lastOrder, () => { this.lastHead = 0; }, this.lastHead, (head) => { this.lastHead = head; });
+  }
+
+  private compact(order: string[], resetHead: () => void, head: number, setHead: (head: number) => void): void {
+    if (head < 1_024) return;
+    order.splice(0, head);
+    setHead(0);
+    resetHead();
   }
 }
 

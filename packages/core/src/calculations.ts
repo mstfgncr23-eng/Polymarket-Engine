@@ -103,11 +103,47 @@ export function spread(snapshot: MarketSnapshot): string | null {
   return bid && ask ? decimal(d(ask.price).minus(bid.price)) : null;
 }
 
+const DECIMAL_QTY_RE = /^-?\d+(?:\.\d+)?$/;
+
+/**
+ * First-N-level imbalance without slice/reduce temps. Number fast path only
+ * when every visited quantity is an exact IEEE value (Decimal fallback otherwise).
+ */
 export function bookImbalance(snapshot: MarketSnapshot, levels = 5): number {
-  const bid = snapshot.bids.slice(0, levels).reduce((sum, level) => sum.plus(level.quantity), d(0));
-  const ask = snapshot.asks.slice(0, levels).reduce((sum, level) => sum.plus(level.quantity), d(0));
+  const bidN = Math.min(levels, snapshot.bids.length);
+  const askN = Math.min(levels, snapshot.asks.length);
+  const fast = tryNumberBookImbalance(snapshot, bidN, askN);
+  if (fast !== null) return fast;
+  let bid = d(0);
+  let ask = d(0);
+  for (let i = 0; i < bidN; i += 1) bid = bid.plus(snapshot.bids[i]!.quantity);
+  for (let i = 0; i < askN; i += 1) ask = ask.plus(snapshot.asks[i]!.quantity);
   const total = bid.plus(ask);
   return total.eq(0) ? 0 : bid.minus(ask).div(total).toNumber();
+}
+
+export function exactNumberQuantity(value: string): number | null {
+  if (!DECIMAL_QTY_RE.test(value)) return null;
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return null;
+  return d(value).eq(numeric) ? numeric : null;
+}
+
+function tryNumberBookImbalance(snapshot: MarketSnapshot, bidN: number, askN: number): number | null {
+  let bid = 0;
+  let ask = 0;
+  for (let i = 0; i < bidN; i += 1) {
+    const quantity = exactNumberQuantity(snapshot.bids[i]!.quantity);
+    if (quantity === null) return null;
+    bid += quantity;
+  }
+  for (let i = 0; i < askN; i += 1) {
+    const quantity = exactNumberQuantity(snapshot.asks[i]!.quantity);
+    if (quantity === null) return null;
+    ask += quantity;
+  }
+  const total = bid + ask;
+  return total === 0 ? 0 : (bid - ask) / total;
 }
 
 export interface PairMetrics {

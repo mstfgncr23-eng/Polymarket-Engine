@@ -62,6 +62,7 @@ export class ScriptedMarketAdapter {
   readonly reports: DiscoveryReport[] = [];
   tokenIds: string[] = [];
   handlers: PolymarketFeedHandlers | null = null;
+  private readonly sync = new Map<string, { state: "AWAITING_BOOK" | "SYNCED" | "GAPPED"; epoch: number }>();
   private tokenWaiters: Array<() => void> = [];
   private streamClosed: (() => void) | null = null;
   queue(next: DiscoveryReport): void { this.reports.push(next); }
@@ -109,7 +110,24 @@ export class ScriptedMarketAdapter {
       this.streamClosed = null;
     }
   }
-  async emitSnapshot(next: MarketSnapshot): Promise<void> { await this.handlers?.onSnapshot(next); }
+  async emitSnapshot(next: MarketSnapshot): Promise<void> {
+    if (!this.sync.has(next.tokenId)) this.sync.set(next.tokenId, { state: "SYNCED", epoch: 1 });
+    await this.handlers?.onSnapshot(next);
+  }
+  isTokenSynchronized(tokenId: string): boolean {
+    return (this.sync.get(tokenId)?.state ?? "SYNCED") === "SYNCED";
+  }
+  tokenEpoch(tokenId: string): number { return this.sync.get(tokenId)?.epoch ?? 1; }
+  tokenSyncState(tokenId: string): "AWAITING_BOOK" | "SYNCED" | "GAPPED" {
+    return this.sync.get(tokenId)?.state ?? "SYNCED";
+  }
+  unsynchronizedTokenCount(): number {
+    return [...this.sync.values()].filter((item) => item.state !== "SYNCED").length;
+  }
+  markTokenSync(tokenId: string, state: "AWAITING_BOOK" | "SYNCED" | "GAPPED", epoch?: number): void {
+    const current = this.sync.get(tokenId);
+    this.sync.set(tokenId, { state, epoch: epoch ?? (current?.epoch ?? 1) + (state === "GAPPED" || state === "AWAITING_BOOK" ? 1 : 0) });
+  }
 }
 
 export class ScriptedReferenceRegistry {

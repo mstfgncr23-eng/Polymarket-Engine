@@ -14,7 +14,16 @@ import {
   type QualificationReasonCode,
   type QualificationResult,
 } from "@pm/core";
+import { BoundedClobMarketTransport } from "./bounded-clob-market.js";
+import { BoundedIngressQueue, IngressOverflowError } from "./bounded-ingress.js";
+import {
+  CLOB_MARKET_WS_URL,
+  type IngressGapReason,
+  type IngressQueueSnapshot,
+  type TokenSyncState,
+} from "./ingress-bounds.js";
 import { abortableDelay, ExponentialBackoff } from "./reconnect.js";
+import { TokenSyncIndex } from "./token-sync.js";
 
 export interface DiscoveredMarket {
   id: string;
@@ -77,11 +86,25 @@ export interface PolymarketTimestampStats {
   lastAnomaly: PolymarketFeedAnomaly | null;
 }
 
+export interface MarketIngressGapEvent {
+  reason: IngressGapReason;
+  tokenCount: number;
+  epoch: number;
+}
+
+export interface MarketIngressResyncEvent {
+  reason: IngressGapReason | "full_book";
+  tokenId: string;
+  epoch: number;
+}
+
 export interface PolymarketFeedHandlers {
   onSnapshot(snapshot: MarketSnapshot): Promise<void> | void;
   onConnection(event: FeedConnectionEvent): Promise<void> | void;
   onError(error: Error): Promise<void> | void;
   onAnomaly?(anomaly: PolymarketFeedAnomaly): void;
+  onGap?(event: MarketIngressGapEvent): void;
+  onResync?(event: MarketIngressResyncEvent): void;
 }
 
 /** Optional normalize observer. Must not change book/price_change semantics. */
@@ -133,10 +156,37 @@ export class PolymarketMarketDataAdapter {
   private readonly anomalySampler = new BoundedAnomalySampler();
   private lastAnomaly: PolymarketFeedAnomaly | null = null;
   private normalizeObserver: MarketNormalizeObserver | null = null;
+  private readonly sync = new TokenSyncIndex();
+  readonly ingress: BoundedIngressQueue;
+  private readonly transport: BoundedClobMarketTransport;
+  private readonly useOwnedTransport: boolean;
+  private readonly injectedSubscribe: boolean;
 
-  constructor(client: PublicClient = createPublicClient()) { this.client = client; }
+  constructor(
+    client?: PublicClient,
+    options: { useSdkSubscribe?: boolean; ownedTransport?: boolean; marketWsUrl?: string; ingress?: BoundedIngressQueue } = {},
+  ) {
+    this.client = client ?? createPublicClient();
+    this.ingress = options.ingress ?? new BoundedIngressQueue();
+    this.transport = new BoundedClobMarketTransport({
+      url: options.marketWsUrl ?? CLOB_MARKET_WS_URL,
+      queue: this.ingress,
+    });
+    this.injectedSubscribe = client !== undefined;
+    this.useOwnedTransport = options.useSdkSubscribe === true
+      ? false
+      : (options.ownedTransport ?? client === undefined);
+  }
 
   setNormalizeObserver(observer: MarketNormalizeObserver | null): void { this.normalizeObserver = observer; }
+
+  isTokenSynchronized(tokenId: string): boolean { return this.sync.isSynchronized(tokenId); }
+  tokenSyncState(tokenId: string): TokenSyncState { return this.sync.stateOf(tokenId); }
+  tokenEpoch(tokenId: string): number { return this.sync.epochOf(tokenId); }
+  unsynchronizedTokenCount(): number { return this.sync.unsynchronizedCount(); }
+  tokenSyncEntryCount(): number { return this.sync.entryCount(); }
+  ingressSnapshot(): IngressQueueSnapshot { return this.ingress.snapshot(); }
+  usesOwnedBoundedTransport(): boolean { return this.useOwnedTransport; }
 
   getMarket(tokenId: string): DiscoveredMarket | undefined { return this.marketsByToken.get(tokenId); }
   getMarkets(): DiscoveredMarket[] { return uniqueMarkets([...this.marketsByToken.values()]); }
@@ -277,8 +327,12 @@ export class PolymarketMarketDataAdapter {
         this.books.delete(tokenId);
         this.lastTimestampByToken.delete(tokenId);
         this.anomalySampler.forget(tokenId);
+        this.sync.drop(tokenId);
       }
+      this.sync.retain(next);
       this.closeCurrentStream?.();
+    } else {
+      this.sync.retain(next);
     }
     return { changed, previous, next };
   }
@@ -306,7 +360,10 @@ export class PolymarketMarketDataAdapter {
         try {
           const current = [...this.tokenIds];
           if (current.length === 0) continue;
-          const stream = await this.client.subscribe([{ topic: "market", tokenIds: current, customFeatureEnabled: true }]);
+          this.beginStreamEpoch(current, reconnectCount > 0 ? "reconnect" : "explicit_resubscribe", handlers);
+          const stream = this.useOwnedTransport
+            ? await this.transport.subscribe(current, true)
+            : await this.client.subscribe([{ topic: "market", tokenIds: current, customFeatureEnabled: true }]);
           this.activeStreams += 1;
           this.closeCurrentStream = () => {
             resubscribed = true;
@@ -326,6 +383,11 @@ export class PolymarketMarketDataAdapter {
                 }
               } catch (error) {
                 const normalized = error instanceof Error ? error : new Error(String(error));
+                if (normalized instanceof IngressOverflowError) {
+                  this.gapAll(normalized.reason, handlers);
+                  await stream.close();
+                  break;
+                }
                 if (isTimestampDisorderError(normalized)) {
                   this.noteAnomaly(handlers, timestampDisorderAnomaly(normalized));
                   continue;
@@ -345,6 +407,13 @@ export class PolymarketMarketDataAdapter {
           if (signal.aborted) break;
           if (resubscribed || generation !== this.streamGeneration) continue;
           const normalized = error instanceof Error ? error : new Error(String(error));
+          if (normalized instanceof IngressOverflowError) {
+            this.gapAll(normalized.reason, handlers);
+            reconnectCount += 1;
+            await handlers.onConnection({ feed: "polymarket", state: "DISCONNECTED", at: new Date().toISOString(), reconnectCount, message: normalized.message });
+            await abortableDelay(backoff.nextDelay(), signal).catch(() => undefined);
+            continue;
+          }
           if (isTimestampDisorderError(normalized)) {
             this.noteAnomaly(handlers, timestampDisorderAnomaly(normalized));
             continue;
@@ -379,13 +448,39 @@ export class PolymarketMarketDataAdapter {
     });
   }
 
-  private normalizeEvent(event: unknown, handlers: Pick<PolymarketFeedHandlers, "onAnomaly">): MarketSnapshot[] {
+  beginStreamEpoch(tokenIds: readonly string[], reason: IngressGapReason, handlers?: Pick<PolymarketFeedHandlers, "onGap">): void {
+    const epoch = this.sync.beginEpoch(tokenIds, reason);
+    for (const tokenId of tokenIds) {
+      this.books.delete(tokenId);
+      this.lastTimestampByToken.delete(tokenId);
+    }
+    this.ingress.clear(reason);
+    handlers?.onGap?.({ reason, tokenCount: tokenIds.length, epoch });
+  }
+
+  gapAll(reason: IngressGapReason, handlers?: Pick<PolymarketFeedHandlers, "onGap">): void {
+    for (const tokenId of this.tokenIds) {
+      this.sync.markGapped(tokenId, reason);
+      this.books.delete(tokenId);
+    }
+    this.ingress.clear(reason);
+    handlers?.onGap?.({ reason, tokenCount: this.tokenIds.length, epoch: this.tokenIds[0] ? this.sync.epochOf(this.tokenIds[0]) : 0 });
+  }
+
+  markTokenGappedForTest(tokenId: string, reason: IngressGapReason = "explicit_resubscribe"): void {
+    this.sync.markGapped(tokenId, reason);
+    this.books.delete(tokenId);
+  }
+
+  private normalizeEvent(event: unknown, handlers: Pick<PolymarketFeedHandlers, "onAnomaly" | "onResync" | "onGap">): MarketSnapshot[] {
     const value = event as { type?: string; payload?: Record<string, unknown> };
     const payload = value.payload ?? {};
     if (value.type === "book") {
       const tokenId = String(payload.tokenId ?? "");
       const market = this.marketsByToken.get(tokenId);
       if (!tokenId || !market || !this.tokenIds.includes(tokenId)) return [];
+      const newEpochBook = this.sync.stateOf(tokenId) !== "SYNCED";
+      if (newEpochBook) this.lastTimestampByToken.delete(tokenId);
       const sourceMs = parseSourceTimestamp(payload.timestamp);
       if (!this.acceptTimestamp(tokenId, sourceMs, handlers)) return [];
       const acceptedMs = sourceMs as number;
@@ -408,6 +503,10 @@ export class PolymarketMarketDataAdapter {
         hash: nullableString(payload.hash),
       };
       this.books.set(tokenId, state);
+      const synced = this.sync.markSyncedFromBook(tokenId);
+      if (synced.wasResync) {
+        handlers.onResync?.({ reason: "full_book", tokenId, epoch: synced.epoch });
+      }
       return [this.toSnapshot(tokenId, state, payload, undefined, started)];
     }
     if (value.type === "price_change") {
@@ -415,6 +514,7 @@ export class PolymarketMarketDataAdapter {
       const snapshots: MarketSnapshot[] = [];
       for (const change of changes) {
         const tokenId = String(change.tokenId ?? "");
+        if (this.sync.stateOf(tokenId) !== "SYNCED") continue;
         const state = this.books.get(tokenId);
         if (!state || !this.tokenIds.includes(tokenId)) continue;
         const sourceMs = parseSourceTimestamp(payload.timestamp);
