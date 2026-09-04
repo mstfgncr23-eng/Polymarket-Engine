@@ -56,10 +56,10 @@ export class PaperLedger {
     return d(this.state.cash).minus(this.state.reservedCash);
   }
 
-  applyFill(fill: PaperFill): Position {
+  applyFill(fill: PaperFill, options?: { positionId?: string }): Position {
     const now = fill.timestamp;
     const previous = this.positions.get(fill.marketId) ?? {
-      id: createId("pos"), marketId: fill.marketId, upQuantity: "0", downQuantity: "0",
+      id: options?.positionId ?? createId("pos"), marketId: fill.marketId, upQuantity: "0", downQuantity: "0",
       averageUpCost: "0", averageDownCost: "0", pairedQuantity: "0", unpairedOutcome: null,
       unpairedQuantity: "0", combinedPairCost: "0", totalFees: "0", totalSlippage: "0",
       openedAt: now, updatedAt: now,

@@ -184,6 +184,8 @@ export function isCriticalPersistenceType(type: string): boolean {
     || type === "FIRST_LEG_FILLED"
     || type === "PAIR_REALIZED"
     || type === "MARKET_RESOLUTION_OBSERVED"
+    || type === "LEDGER_MARK_TO_MARKET"
+    || type === "INFRASTRUCTURE_COST_ACCRUED"
     || type === "STATE_RECOVERED";
 }
 

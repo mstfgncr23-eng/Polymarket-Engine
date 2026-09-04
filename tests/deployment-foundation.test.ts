@@ -337,7 +337,7 @@ describe("deployment foundation", () => {
 
   it("Drizzle migrations are additive and safe against a pre-provisioned schema", () => {
     const dir = join(repoRoot, "packages/db/migrations");
-    const files = ["0000_initial.sql", "0001_grok_mcp.sql", "0002_journal_query.sql", "0003_rls_lockdown.sql"];
+    const files = ["0000_initial.sql", "0001_grok_mcp.sql", "0002_journal_query.sql", "0003_rls_lockdown.sql", "0004_critical_replay.sql"];
     const sql = files.map((name) => readFileSync(join(dir, name), "utf8")).join("\n");
     expect(sql).not.toMatch(/\bDROP\s+TABLE\b/i);
     expect(sql).not.toMatch(/\bDROP\s+SCHEMA\b/i);
@@ -352,8 +352,9 @@ describe("deployment foundation", () => {
     expect(rls).toMatch(/IF EXISTS \(SELECT 1 FROM pg_roles/);
     expect(rls).toMatch(/Duplicate supabase_migrations rows named 0003_rls_lockdown are harmless/);
     const journal = JSON.parse(readFileSync(join(dir, "meta/_journal.json"), "utf8")) as { entries: Array<{ tag: string }> };
+    expect(readFileSync(join(dir, "0004_critical_replay.sql"), "utf8")).toMatch(/CREATE TABLE IF NOT EXISTS durable_transitions/);
     expect(journal.entries.map((entry) => entry.tag)).toEqual([
-      "0000_initial", "0001_grok_mcp", "0002_journal_query", "0003_rls_lockdown",
+      "0000_initial", "0001_grok_mcp", "0002_journal_query", "0003_rls_lockdown", "0004_critical_replay",
     ]);
   });
 });

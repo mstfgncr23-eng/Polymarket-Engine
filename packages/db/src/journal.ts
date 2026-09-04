@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gte, inArray, lte, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, lte, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/postgres-js";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
 import postgres from "postgres";
@@ -6,7 +6,18 @@ import {
   compareJournalEventOrder, createId, EVENT_PAGE_SIZE, EVENT_SCAN_CEILING, journalEventSchema,
   sortJournalEventsChronologically, type JournalEvent, type JournalQuery,
 } from "@pm/core";
-import { engineCheckpoints, journalEvents, mcpIdempotencyKeys } from "./schema.js";
+import {
+  CheckpointFenceError,
+  DURABLE_MUTATION_LOCK_ID,
+  DurableCursorBehindError,
+  durableTransitionInputSchema,
+  hashDurablePayload,
+  IdempotencyConflictError,
+  type DurableCommitResult,
+  type DurableTransition,
+  type DurableTransitionInput,
+} from "./durable.js";
+import { durableTransitions, engineCheckpoints, journalEvents, mcpIdempotencyKeys } from "./schema.js";
 
 export interface EngineCheckpoint {
   id: string;
@@ -26,6 +37,10 @@ export interface EventJournal {
   queryEvents(query: JournalQuery): Promise<JournalEvent[]>;
   countByType(types?: readonly string[]): Promise<Record<string, number>>;
   claimIdempotency(scope: string, key: string): Promise<boolean>;
+  commitDurableTransition(input: DurableTransitionInput, expectedPreviousSequence: number): Promise<DurableCommitResult>;
+  readDurableTransitionsAfter(sequence: number, limit: number): Promise<DurableTransition[]>;
+  readDurableByOperationKey(operationKey: string): Promise<DurableTransition | null>;
+  latestDurableSequence(): Promise<number>;
   saveCheckpoint(checkpoint: Omit<EngineCheckpoint, "id" | "createdAt">): Promise<EngineCheckpoint>;
   loadLatestCheckpoint(): Promise<EngineCheckpoint | null>;
   close(): Promise<void>;
@@ -35,13 +50,19 @@ export class MemoryEventJournal implements EventJournal {
   private readonly events: JournalEvent[] = [];
   private readonly checkpoints: EngineCheckpoint[] = [];
   private readonly idempotencyKeys = new Set<string>();
+  private readonly durableRows: DurableTransition[] = [];
+  private readonly durableByKey = new Map<string, DurableTransition>();
+  private durableChain = Promise.resolve();
   available = true;
+  failNextDurableInsert = false;
+  readonly failAppendTypes = new Set<string>();
 
   async initialize(): Promise<void> {}
   async healthCheck(): Promise<boolean> { return this.available; }
   async append(event: JournalEvent): Promise<void> {
     if (!this.available) throw new Error("DATABASE_UNAVAILABLE");
     const parsed = journalEventSchema.parse(event);
+    if (this.failAppendTypes.has(parsed.type)) throw new Error("JOURNAL_APPEND_FAILED");
     if (this.events.some((item) => item.id === parsed.id)) return;
     this.events.push(structuredClone(parsed));
   }
@@ -81,17 +102,103 @@ export class MemoryEventJournal implements EventJournal {
     this.idempotencyKeys.add(composite);
     return true;
   }
+  async commitDurableTransition(input: DurableTransitionInput, expectedPreviousSequence: number): Promise<DurableCommitResult> {
+    return this.withDurableLock(() => this.commitDurableTransitionUnlocked(input, expectedPreviousSequence));
+  }
+  async readDurableTransitionsAfter(sequence: number, limit: number): Promise<DurableTransition[]> {
+    const cap = Math.max(1, Math.min(limit, 10_000));
+    return structuredClone(this.durableRows.filter((row) => row.sequence > sequence).slice(0, cap));
+  }
+  async readDurableByOperationKey(operationKey: string): Promise<DurableTransition | null> {
+    const existing = this.durableByKey.get(operationKey);
+    return existing ? structuredClone(existing) : null;
+  }
+  async latestDurableSequence(): Promise<number> {
+    return this.durableRows.length === 0 ? 0 : this.durableRows[this.durableRows.length - 1]!.sequence;
+  }
   async saveCheckpoint(checkpoint: Omit<EngineCheckpoint, "id" | "createdAt">): Promise<EngineCheckpoint> {
-    if (!this.available) throw new Error("DATABASE_UNAVAILABLE");
-    const stored = { ...structuredClone(checkpoint), id: createId("checkpoint"), createdAt: new Date().toISOString() };
-    this.checkpoints.push(stored);
-    return structuredClone(stored);
+    return this.withDurableLock(() => {
+      const cursor = typeof checkpoint.payload.durableCursor === "number" ? checkpoint.payload.durableCursor : null;
+      if (cursor != null) {
+        const latest = this.durableRows.length === 0 ? 0 : this.durableRows[this.durableRows.length - 1]!.sequence;
+        if (cursor !== latest) throw new CheckpointFenceError(cursor, latest);
+      }
+      const stored = { ...structuredClone(checkpoint), id: createId("checkpoint"), createdAt: new Date().toISOString() };
+      this.checkpoints.push(stored);
+      return structuredClone(stored);
+    });
   }
   async loadLatestCheckpoint(): Promise<EngineCheckpoint | null> {
     const latest = this.checkpoints.toSorted((a, b) => b.sequence - a.sequence)[0];
     return latest ? structuredClone(latest) : null;
   }
   async close(): Promise<void> {}
+
+  private async withDurableLock<T>(work: () => T | Promise<T>): Promise<T> {
+    const previous = this.durableChain;
+    let release: () => void = () => undefined;
+    this.durableChain = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try {
+      if (!this.available) throw new Error("DATABASE_UNAVAILABLE");
+      return await work();
+    } finally {
+      release();
+    }
+  }
+
+  private commitDurableTransitionUnlocked(input: DurableTransitionInput, expectedPreviousSequence: number): DurableCommitResult {
+    const parsed = durableTransitionInputSchema.parse(input);
+    const payloadHash = hashDurablePayload(parsed.payload);
+    const existing = this.durableByKey.get(parsed.operationKey);
+    if (existing) {
+      if (
+        existing.type !== parsed.type
+        || existing.aggregateType !== parsed.aggregateType
+        || existing.aggregateId !== parsed.aggregateId
+        || existing.payloadHash !== payloadHash
+      ) {
+        throw new IdempotencyConflictError(parsed.operationKey, existing.type, parsed.type);
+      }
+      return {
+        sequence: existing.sequence,
+        operationKey: parsed.operationKey,
+        inserted: false,
+        existing: true,
+        transition: structuredClone(existing),
+      };
+    }
+    const latest = this.durableRows.length === 0 ? 0 : this.durableRows[this.durableRows.length - 1]!.sequence;
+    if (latest !== expectedPreviousSequence) {
+      throw new DurableCursorBehindError(expectedPreviousSequence, latest);
+    }
+    if (this.failNextDurableInsert) {
+      this.failNextDurableInsert = false;
+      throw new Error("DURABLE_INSERT_FAILED");
+    }
+    const now = new Date();
+    const occurredAt = parsed.occurredAt ?? now;
+    const row: DurableTransition = {
+      sequence: latest + 1,
+      operationKey: parsed.operationKey,
+      type: parsed.type,
+      aggregateType: parsed.aggregateType,
+      aggregateId: parsed.aggregateId,
+      payloadHash,
+      payload: structuredClone(parsed.payload),
+      occurredAt: occurredAt.toISOString(),
+      recordedAt: now.toISOString(),
+    };
+    this.durableRows.push(row);
+    this.durableByKey.set(parsed.operationKey, row);
+    return {
+      sequence: row.sequence,
+      operationKey: parsed.operationKey,
+      inserted: true,
+      existing: false,
+      transition: structuredClone(row),
+    };
+  }
 }
 
 export class PostgresEventJournal implements EventJournal {
@@ -162,12 +269,106 @@ export class PostgresEventJournal implements EventJournal {
       .onConflictDoNothing({ target: [mcpIdempotencyKeys.scope, mcpIdempotencyKeys.key] }).returning({ key: mcpIdempotencyKeys.key });
     return rows.length === 1;
   }
+  async commitDurableTransition(input: DurableTransitionInput, expectedPreviousSequence: number): Promise<DurableCommitResult> {
+    const parsed = durableTransitionInputSchema.parse(input);
+    const payloadHash = hashDurablePayload(parsed.payload);
+    const occurredAt = parsed.occurredAt ?? new Date();
+    return this.db.transaction(async (tx) => {
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(${DURABLE_MUTATION_LOCK_ID})`);
+      const existingRows = await tx.select().from(durableTransitions)
+        .where(eq(durableTransitions.operationKey, parsed.operationKey)).limit(1);
+      const existing = existingRows[0];
+      if (existing) {
+        if (
+          existing.type !== parsed.type
+          || existing.aggregateType !== parsed.aggregateType
+          || existing.aggregateId !== parsed.aggregateId
+          || existing.payloadHash !== payloadHash
+        ) {
+          throw new IdempotencyConflictError(parsed.operationKey, existing.type, parsed.type);
+        }
+        return {
+          sequence: Number(existing.sequence),
+          operationKey: parsed.operationKey,
+          inserted: false,
+          existing: true,
+          transition: toDurableTransition(existing),
+        };
+      }
+      const latestRows = await tx.select({
+        max: sql<number>`coalesce(max(${durableTransitions.sequence}), 0)`,
+      }).from(durableTransitions);
+      const latest = Number(latestRows[0]?.max ?? 0);
+      if (latest !== expectedPreviousSequence) {
+        throw new DurableCursorBehindError(expectedPreviousSequence, latest);
+      }
+      const inserted = await tx.insert(durableTransitions).values({
+        sequence: latest + 1,
+        operationKey: parsed.operationKey,
+        type: parsed.type,
+        aggregateType: parsed.aggregateType,
+        aggregateId: parsed.aggregateId,
+        payloadHash,
+        payload: parsed.payload,
+        occurredAt,
+      }).returning();
+      const row = inserted[0];
+      if (!row) throw new Error("DURABLE_TRANSITION_INSERT_FAILED");
+      const transition = toDurableTransition(row);
+      return {
+        sequence: transition.sequence,
+        operationKey: parsed.operationKey,
+        inserted: true,
+        existing: false,
+        transition,
+      };
+    });
+  }
+  async readDurableTransitionsAfter(sequence: number, limit: number): Promise<DurableTransition[]> {
+    const cap = Math.max(1, Math.min(limit, 10_000));
+    const rows = await this.db.select().from(durableTransitions)
+      .where(gt(durableTransitions.sequence, sequence))
+      .orderBy(asc(durableTransitions.sequence))
+      .limit(cap);
+    return rows.map(toDurableTransition);
+  }
+  async readDurableByOperationKey(operationKey: string): Promise<DurableTransition | null> {
+    const rows = await this.db.select().from(durableTransitions)
+      .where(eq(durableTransitions.operationKey, operationKey)).limit(1);
+    const row = rows[0];
+    return row ? toDurableTransition(row) : null;
+  }
+  async latestDurableSequence(): Promise<number> {
+    const rows = await this.db.select({
+      max: sql<number>`coalesce(max(${durableTransitions.sequence}), 0)`,
+    }).from(durableTransitions);
+    return Number(rows[0]?.max ?? 0);
+  }
   async saveCheckpoint(checkpoint: Omit<EngineCheckpoint, "id" | "createdAt">): Promise<EngineCheckpoint> {
     const id = createId("checkpoint");
-    const rows = await this.db.insert(engineCheckpoints).values({ id, ...checkpoint }).returning();
-    const row = rows[0];
-    if (!row) throw new Error("CHECKPOINT_WRITE_FAILED");
-    return { id: row.id, experimentId: row.experimentId, sequence: row.sequence, payload: row.payload as Record<string, unknown>, createdAt: row.createdAt.toISOString() };
+    const cursor = typeof checkpoint.payload.durableCursor === "number" ? checkpoint.payload.durableCursor : null;
+    const toCheckpoint = (row: typeof engineCheckpoints.$inferSelect): EngineCheckpoint => ({
+      id: row.id, experimentId: row.experimentId, sequence: row.sequence,
+      payload: row.payload as Record<string, unknown>, createdAt: row.createdAt.toISOString(),
+    });
+    if (cursor == null) {
+      const rows = await this.db.insert(engineCheckpoints).values({ id, ...checkpoint }).returning();
+      const row = rows[0];
+      if (!row) throw new Error("CHECKPOINT_WRITE_FAILED");
+      return toCheckpoint(row);
+    }
+    return this.db.transaction(async (tx) => {
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(${DURABLE_MUTATION_LOCK_ID})`);
+      const latestRows = await tx.select({
+        max: sql<number>`coalesce(max(${durableTransitions.sequence}), 0)`,
+      }).from(durableTransitions);
+      const latest = Number(latestRows[0]?.max ?? 0);
+      if (cursor !== latest) throw new CheckpointFenceError(cursor, latest);
+      const rows = await tx.insert(engineCheckpoints).values({ id, ...checkpoint }).returning();
+      const row = rows[0];
+      if (!row) throw new Error("CHECKPOINT_WRITE_FAILED");
+      return toCheckpoint(row);
+    });
   }
   async loadLatestCheckpoint(): Promise<EngineCheckpoint | null> {
     const rows = await this.db.select().from(engineCheckpoints).orderBy(desc(engineCheckpoints.sequence)).limit(1);
@@ -179,6 +380,20 @@ export class PostgresEventJournal implements EventJournal {
 
 function toJournalEvent(row: typeof journalEvents.$inferSelect): JournalEvent {
   return journalEventSchema.parse({ ...row, occurredAt: row.occurredAt.toISOString(), recordedAt: row.recordedAt.toISOString() });
+}
+
+function toDurableTransition(row: typeof durableTransitions.$inferSelect): DurableTransition {
+  return {
+    sequence: Number(row.sequence),
+    operationKey: row.operationKey,
+    type: row.type,
+    aggregateType: row.aggregateType,
+    aggregateId: row.aggregateId,
+    payloadHash: row.payloadHash,
+    payload: row.payload as Record<string, unknown>,
+    occurredAt: row.occurredAt.toISOString(),
+    recordedAt: row.recordedAt.toISOString(),
+  };
 }
 
 export { EVENT_PAGE_SIZE, EVENT_SCAN_CEILING };
@@ -225,14 +440,17 @@ export async function queryEventsPaged(
 }
 
 export function createJournalEvent(input: {
+  id?: string;
   traceId: string; correlationId?: string; type: string; aggregateType: string; aggregateId: string;
   payload: Record<string, unknown>; occurredAt?: Date; sourceEventId?: string | null;
 }): JournalEvent {
   const now = new Date();
   return {
-    id: createId("event"), traceId: input.traceId, correlationId: input.correlationId ?? input.traceId,
+    id: input.id ?? createId("event"), traceId: input.traceId, correlationId: input.correlationId ?? input.traceId,
     type: input.type, aggregateType: input.aggregateType, aggregateId: input.aggregateId,
     payload: input.payload, occurredAt: (input.occurredAt ?? now).toISOString(), recordedAt: now.toISOString(),
     sourceEventId: input.sourceEventId ?? null,
   };
 }
+
+export { CheckpointFenceError, DurableCursorBehindError, IdempotencyConflictError };

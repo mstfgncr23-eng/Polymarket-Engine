@@ -131,6 +131,7 @@ export class EngineStateStore {
   experimentCompletedAt: string | null = null;
   database: "UP" | "DOWN" = "DOWN";
   journalDegraded = false;
+  recoveryComplete = false;
   telemetryDegraded = false;
   overloadState: OverloadState = "NORMAL";
   lastBtcMessageAt: string | null = null;
@@ -201,7 +202,7 @@ export class EngineStateStore {
   dropReference(asset: string): void { this.reference.delete(asset); }
   engineAlive(): boolean { return !this.draining && this.database === "UP"; }
   newPaperEntryAllowed(): boolean {
-    return this.engineAlive() && this.overloadState !== "FAIL_CLOSED";
+    return this.engineAlive() && this.overloadState !== "FAIL_CLOSED" && this.recoveryComplete;
   }
 
   readiness(): EngineReadiness {

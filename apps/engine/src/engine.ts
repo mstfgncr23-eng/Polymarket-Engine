@@ -29,8 +29,13 @@ import {
   executableFairEdge,
   parsePublicBinaryResolution,
   conservativeRealizableMark,
+  classifySettledOutcome,
+  settlementCashDelta,
+  settlementRealizedDelta,
   DECISION_EVENT_TYPES,
   createIdleExperiment,
+  d,
+  decimal,
   experimentAllowsFirstLeg,
   experimentAllowsHedge,
   openPositionsRemain,
@@ -51,7 +56,18 @@ import {
   type TriggerEvent,
   type ActivationLatency,
 } from "@pm/core";
-import { createJournalEvent, queryEventsPaged, type EventJournal } from "@pm/db";
+import {
+  CHECKPOINT_SCHEMA_VERSION,
+  CheckpointFenceError,
+  createJournalEvent,
+  derivedAuditEventId,
+  DurableCursorBehindError,
+  IdempotencyConflictError,
+  queryEventsPaged,
+  type DurableCommitResult,
+  type DurableTransition,
+  type EventJournal,
+} from "@pm/db";
 import {
   BtcWebSocketAdapter,
   PolymarketMarketDataAdapter,
@@ -69,6 +85,25 @@ import { GrokActivationCoordinator, persistableActivation } from "./activation/c
 import { createGrokActivationBridge } from "./activation/index.js";
 import { BoundedJournalWriter } from "./journal-writer.js";
 import { evaluateExperimentPreflight, isGenuineEntryQualifiedMarket } from "./preflight.js";
+import { CrashInjectedError, CrashInjector, type CrashInjectionPoint } from "./crash-injection.js";
+import { DurableMutationGate } from "./durable-gate.js";
+import {
+  applyDurableTransition,
+  assessLegacyCheckpointSafety,
+  cloneRecoverableState,
+  durableIdentityConflicts,
+  isLegacyCheckpointPayload,
+  normalizeRecoveryError,
+  parseCheckpointDerivedAuditCursor,
+  parseCheckpointDurableCursor,
+  parseDerivedAudit,
+  plannedDurableTransition,
+  RecoveryFailClosedError,
+  stablePositionId,
+  validatePostReplayInvariants,
+  type DerivedAuditRecord,
+  type RecoverableEngineState,
+} from "./recovery.js";
 import {
   DirectJournalAdmission,
   FiniteSemaphore,
@@ -125,6 +160,11 @@ export class EngineService {
   private marketLoopStarted = false;
   private experiment: ExperimentManifest | null = null;
   private checkpointSequence = 0;
+  private lastAppliedDurableCursor = 0;
+  private derivedAuditCursor = 0;
+  private readonly durableGate = new DurableMutationGate();
+  private readonly crashInjector = new CrashInjector();
+  private recoveryPageSize = 256;
   private lastTradeAt: Date | null = null;
   private executionErrors: number[] = [];
   private timestampDisorder = false;
@@ -162,6 +202,7 @@ export class EngineService {
       now?: () => Date;
       resolutionFetcher?: (idOrSlug: string) => Promise<Record<string, unknown> | null>;
       shutdownJoinDeadlineMs?: number;
+      recoveryPageSize?: number;
     },
   ) {
     this.env = env;
@@ -182,6 +223,7 @@ export class EngineService {
       createRestProbe(env.REFERENCE_REST_BASE_URL),
     );
     this.resolutionFetcher = adapters?.resolutionFetcher ?? ((id) => this.marketAdapter.fetchPublicMarket(id));
+    if (adapters?.recoveryPageSize) this.recoveryPageSize = adapters.recoveryPageSize;
     this.writer = new BoundedJournalWriter(journal, (up) => {
       if (up) this.state.database = "UP";
       else this.notePersistenceOutcome("EXPERIMENT_STARTED", false);
@@ -217,7 +259,8 @@ export class EngineService {
     if (this.started) return;
     this.started = true;
     await this.initializeJournalWithRetry();
-    await this.restoreExperimentState();
+    await this.restoreAndRecover();
+    this.state.recoveryComplete = true;
     const configuredTokens = splitList(this.env.POLYMARKET_TOKEN_IDS);
     if (configuredTokens.length > 0) {
       configuredTokens.forEach((tokenId, index) => this.marketAdapter.registerManualToken(tokenId, tokenId, index % 2 === 0 ? "UP" : "DOWN"));
@@ -269,7 +312,7 @@ export class EngineService {
     if (this.discoveryTimer) clearInterval(this.discoveryTimer);
     this.discoveryTimer = null;
     if (this.experiment?.status === "RUNNING" || this.experiment?.status === "ENTRY_CLOSED") {
-      this.accrueInfrastructureCost();
+      await this.accrueInfrastructureCost();
     }
     const deadline = this.shutdownJoinDeadlineMs;
     const started = Date.now();
@@ -277,13 +320,15 @@ export class EngineService {
     this.journalAdmission.closeAdmission();
     const remaining = Math.max(0, deadline - (Date.now() - started));
     this.lastJournalShutdown = await this.journalAdmission.join(remaining);
+    const latestDurable = await this.journal.latestDurableSequence();
     const cleanDrain = Boolean(
       this.lastShutdown.drained
       && this.lastJournalShutdown.drained
       && !this.lastShutdown.timedOut
       && !this.lastJournalShutdown.timedOut
       && this.state.database === "UP"
-      && !this.overload.hasIntegrityFault,
+      && !this.overload.hasIntegrityFault
+      && this.lastAppliedDurableCursor === latestDurable,
     );
     if (cleanDrain) {
       await this.checkpoint();
@@ -319,16 +364,42 @@ export class EngineService {
   reservedCash() { return this.ledger.snapshot().reservedCash; }
   async tickMaintenance(): Promise<void> { await this.runMaintenance(); }
   async applyObservedFill(fill: Parameters<PaperLedger["applyFill"]>[0]): Promise<void> { await this.applyFill(fill); }
-  async restMakerForTest(order: PaperOrder, snapshot: MarketSnapshot): Promise<void> {
-    const notional = makerReserveNotional(order.quantity, order.requestedPrice, snapshot.feeSchedule);
-    this.ledger.reserve(notional, this.nowFn());
-    this.makerReservations.set(order.id, notional);
-    this.restingOrders.set(order.id, createRestingMakerOrder(order, snapshot));
-    this.state.setLedger(this.ledger.snapshot());
-    await this.safeAppend(createJournalEvent({
-      traceId: order.traceId, type: "PAPER_MAKER_RESERVED", aggregateType: "paper_order", aggregateId: order.id,
-      payload: { orderId: order.id, reserved: notional, experimentId: this.experiment?.id ?? null },
-    }));
+  async restMakerForTest(
+    order: PaperOrder,
+    snapshot: MarketSnapshot,
+    intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" = "OPEN_FIRST_LEG",
+  ): Promise<void> {
+    await this.reserveMaker(order, snapshot, intent);
+  }
+  async cancelMakerForTest(orderId: string, reason = "TEST_RELEASE"): Promise<void> {
+    await this.releaseMaker(orderId, { cancel: true, reason });
+  }
+  setCrashInjectionForTest(point: CrashInjectionPoint, options?: { times?: number; operationKey?: string }): void {
+    this.crashInjector.arm(point, options);
+  }
+  setRecoveryPageSizeForTest(size: number): void {
+    this.recoveryPageSize = Math.max(1, size);
+  }
+  lastAppliedDurableCursorForTest(): number { return this.lastAppliedDurableCursor; }
+  derivedAuditCursorForTest(): number { return this.derivedAuditCursor; }
+  restingOrdersForTest() { return new Map(this.restingOrders); }
+  makerReservationsForTest() { return new Map(this.makerReservations); }
+  settledMarketsForTest() { return new Set(this.settledMarkets); }
+  async latestDurableSequenceForTest(): Promise<number> { return this.journal.latestDurableSequence(); }
+  async readDurableAfterForTest(sequence: number, limit: number) {
+    return this.journal.readDurableTransitionsAfter(sequence, limit);
+  }
+  async commitDurableForTest(
+    input: Parameters<EventJournal["commitDurableTransition"]>[0],
+    expectedPreviousSequence?: number,
+  ) {
+    return this.journal.commitDurableTransition(input, expectedPreviousSequence ?? this.lastAppliedDurableCursor);
+  }
+  async checkpointForTest(): Promise<void> {
+    await this.checkpoint();
+  }
+  recoveryFailClosedForTest(): boolean {
+    return this.overload.hasIntegrityFault && this.overload.state === "FAIL_CLOSED";
   }
 
   async beginExperiment(): Promise<Record<string, unknown>> {
@@ -349,24 +420,29 @@ export class EngineService {
     }));
     if (!preflight.ok) return { ...preflight, ok: false };
     const now = this.nowFn();
-    this.ledger.resetOperatingCostBaseline(now);
-    this.lastInfrastructureAccrualAt = now.getTime();
-    this.experiment = startExperiment({
+    const next = startExperiment({
       id: this.experiment?.id, durationHours: this.env.EXPERIMENT_DURATION_HOURS, strategyVersion: this.strategy.version,
       riskConfiguration: this.riskLimits, modelConfiguration: { provider: "external_grok_bot_mcp", logicalRoles: 6, localModelExecution: false },
       startingBalance: this.ledger.snapshot().startingBalance, systemVersion: "0.1.0",
       gitSha: process.env.GIT_SHA ?? process.env.FLY_IMAGE_REF ?? "unknown", now,
       closePolicy: this.env.EXPERIMENT_CLOSE_POLICY,
     });
-    this.state.experimentId = this.experiment.id;
-    this.state.experimentStatus = this.experiment.status;
-    this.state.experimentStartedAt = this.experiment.startedAt;
-    this.state.experimentCompletedAt = this.experiment.completedAt;
-    this.reportGenerated = false;
-    this.state.setLedger(this.ledger.snapshot());
-    await this.safeAppend(createJournalEvent({ traceId: createId("trace"), type: "EXPERIMENT_STARTED", aggregateType: "experiment", aggregateId: this.experiment.id, payload: this.experiment }));
-    await this.checkpoint();
-    this.record("EXPERIMENT_STARTED", this.experiment.id, null, { status: this.experiment.status });
+    await this.commitAuthoritative({
+      operationKey: `experiment:${next.id}:started`,
+      type: "EXPERIMENT_STARTED",
+      aggregateType: "experiment",
+      aggregateId: next.id,
+      occurredAt: now,
+      buildPayload: () => ({
+        experiment: next,
+        derivedAudit: [this.experimentDerivedAudit("EXPERIMENT_STARTED", next)],
+      }),
+      checkpoint: true,
+      afterApply: async () => {
+        this.reportGenerated = false;
+        this.record("EXPERIMENT_STARTED", next.id, null, { status: next.status });
+      },
+    });
     return { ok: true, experiment: this.experiment, preflight };
   }
 
@@ -441,18 +517,24 @@ export class EngineService {
     const previousAssets = new Set([...this.assetByMarket.values()].filter((asset): asset is string => Boolean(asset)));
     const previousTokens = [...this.tokenIds];
     const obligations = this.obligationMarketIds();
-    this.entryQualified.clear();
-    for (const market of report.qualified) this.entryQualified.add(market.id);
+    const nextEntryQualified = new Set(report.qualified.map((market) => market.id));
 
     const nextMarkets = new Map<string, DiscoveredMarket>();
     for (const market of report.qualified) nextMarkets.set(market.id, market);
+    const openPositionMarkets = this.openPositionMarketIds();
     for (const id of obligations) {
       const fresh = report.discovered.find((item) => item.id === id) ?? report.qualified.find((item) => item.id === id);
       const previous = this.marketsById.get(id);
       if (fresh) nextMarkets.set(id, fresh);
-      else if (previous) nextMarkets.set(id, previous);
+      // Keep vanished markets only while an open position still needs settlement.
+      else if (previous && openPositionMarkets.has(id)) nextMarkets.set(id, previous);
     }
 
+    const vanishedMakerMarkets = this.vanishedRestingMarketIds(nextMarkets);
+    await this.cancelVanishedMakers(vanishedMakerMarkets);
+
+    this.entryQualified.clear();
+    for (const id of nextEntryQualified) this.entryQualified.add(id);
     this.marketsById.clear();
     this.assetByMarket.clear();
     this.managedMarketIds.clear();
@@ -506,15 +588,39 @@ export class EngineService {
     }
   }
 
-  private obligationMarketIds(): Set<string> {
+  private openPositionMarketIds(): Set<string> {
     const ids = new Set<string>();
     for (const position of this.ledger.positions.values()) {
-      if (Number(position.upQuantity) > 0 || Number(position.downQuantity) > 0) ids.add(position.marketId);
-    }
-    for (const resting of this.restingOrders.values()) {
-      if (Number(resting.remaining) > 0) ids.add(resting.order.marketId);
+      if (d(position.upQuantity).gt(0) || d(position.downQuantity).gt(0)) ids.add(position.marketId);
     }
     return ids;
+  }
+
+  private obligationMarketIds(): Set<string> {
+    const ids = this.openPositionMarketIds();
+    for (const resting of this.restingOrders.values()) {
+      if (d(resting.remaining).gt(0)) ids.add(resting.order.marketId);
+    }
+    return ids;
+  }
+
+  private vanishedRestingMarketIds(nextMarkets: ReadonlyMap<string, DiscoveredMarket>): string[] {
+    const vanished = new Set<string>();
+    for (const resting of this.restingOrders.values()) {
+      if (!d(resting.remaining).gt(0)) continue;
+      const marketId = resting.order.marketId;
+      if (!nextMarkets.has(marketId)) vanished.add(marketId);
+    }
+    return [...vanished];
+  }
+
+  private async cancelVanishedMakers(vanishedMarketIds: readonly string[]): Promise<void> {
+    if (vanishedMarketIds.length === 0) return;
+    const vanished = new Set(vanishedMarketIds);
+    for (const [orderId, resting] of [...this.restingOrders.entries()]) {
+      if (!vanished.has(resting.order.marketId)) continue;
+      await this.releaseMaker(orderId, { cancel: true, reason: "MARKET_REMOVED" });
+    }
   }
 
   private dropRemovedMarketState(removedMarkets: readonly string[], removedAssets: readonly string[]): void {
@@ -523,12 +629,6 @@ export class EngineService {
       this.triggerEngine.dropMarket(marketId);
       for (const [tokenId, snapshot] of [...this.state.marketSnapshots.entries()]) {
         if (snapshot.marketId === marketId) this.state.marketSnapshots.delete(tokenId);
-      }
-      for (const [orderId, resting] of [...this.restingOrders.entries()]) {
-        if (resting.order.marketId !== marketId) continue;
-        this.releaseMaker(orderId);
-        this.restingOrders.delete(orderId);
-        this.record("PAPER_ORDER_CANCELLED", resting.order.traceId, marketId, { orderId, reason: "MARKET_REMOVED" });
       }
     }
     for (const asset of removedAssets) {
@@ -669,66 +769,395 @@ export class EngineService {
     throw lastError instanceof Error ? lastError : new Error("DATABASE_UNAVAILABLE");
   }
 
-  private async restoreExperimentState(): Promise<void> {
-    const checkpoint = await this.journal.loadLatestCheckpoint();
-    if (checkpoint) {
-      const payload = checkpoint.payload as Record<string, unknown>;
-      const ledger = ledgerStateSchema.parse(payload.ledger);
-      const positions = Array.isArray(payload.positions) ? payload.positions.map((item) => positionSchema.parse(item)) : [];
-      this.ledger.restore(ledger, positions);
-      this.state.setLedger(this.ledger.snapshot());
-      this.experiment = payload.experiment ? experimentManifestSchema.parse(payload.experiment) : createIdleExperiment({
-        durationHours: this.env.EXPERIMENT_DURATION_HOURS, strategyVersion: this.strategy.version,
-        riskConfiguration: this.riskLimits, modelConfiguration: {}, startingBalance: this.ledger.snapshot().startingBalance,
-        systemVersion: "0.1.0", gitSha: "unknown",
-      });
-      const resting = Array.isArray(payload.restingOrders) ? payload.restingOrders.map((item) => restingPaperOrderSchema.parse(item)) : [];
-      for (const item of resting) this.restingOrders.set(item.order.id, item);
-      const reservations = payload.makerReservations && typeof payload.makerReservations === "object"
-        ? payload.makerReservations as Record<string, string> : {};
-      for (const [orderId, amount] of Object.entries(reservations)) this.makerReservations.set(orderId, amount);
-      const triggers = Array.isArray(payload.activeTriggers) ? payload.activeTriggers.map((item) => triggerEventSchema.parse(item)) : [];
-      for (const trigger of triggers) { this.activeTriggers.set(trigger.id, trigger); this.state.addTrigger(trigger); }
-      const signals = Array.isArray(payload.grokSignals) ? payload.grokSignals.map((item) => grokSignalEnvelopeSchema.parse(item)) : [];
-      for (const signal of signals) {
-        const byRole = this.signalsByTrigger.get(signal.triggerId) ?? new Map<ExternalAgentRoleId, GrokSignalEnvelope>();
-        byRole.set(signal.agentId, signal); this.signalsByTrigger.set(signal.triggerId, byRole); this.state.addGrokSignal(signal);
-      }
-      if (Array.isArray(payload.activationLatency)) this.activation.restoreLatency(payload.activationLatency as ActivationLatency[]);
-      this.state.setActivationLatency(this.activation.snapshot());
-      if (Array.isArray(payload.marketMetadata)) {
-        for (const raw of payload.marketMetadata as Array<Record<string, unknown>>) {
-          if (!raw || typeof raw.id !== "string") continue;
-          this.marketsById.set(raw.id, raw as unknown as DiscoveredMarket);
-          this.assetByMarket.set(raw.id, typeof raw.asset === "string" ? raw.asset : null);
-          if (raw.endDate) this.triggerEngine.noteMarketWindow(raw.id, typeof raw.asset === "string" ? raw.asset : null, String(raw.endDate));
-        }
-      }
-      if (Array.isArray(payload.managedMarkets)) {
-        for (const item of payload.managedMarkets) {
-          if (typeof item === "string") this.managedMarketIds.add(item);
-          else if (item && typeof item === "object" && typeof (item as { id?: unknown }).id === "string") {
-            this.managedMarketIds.add((item as { id: string }).id);
-          }
-        }
-      }
-      if (Array.isArray(payload.settledMarkets)) {
-        for (const id of payload.settledMarkets as string[]) this.settledMarkets.add(id);
-      }
-      this.checkpointSequence = checkpoint.sequence;
-      this.record("STATE_RECOVERED", this.experiment.id, null, { checkpointId: checkpoint.id, positions: positions.length, restingOrders: resting.length, activeTriggers: triggers.length, grokSignals: signals.length });
-    } else {
-      this.experiment = createIdleExperiment({
-        durationHours: this.env.EXPERIMENT_DURATION_HOURS, strategyVersion: this.strategy.version,
-        riskConfiguration: this.riskLimits, modelConfiguration: { provider: "external_grok_bot_mcp", logicalRoles: 6, localModelExecution: false },
-        startingBalance: this.ledger.snapshot().startingBalance, systemVersion: "0.1.0",
-        gitSha: process.env.GIT_SHA ?? process.env.FLY_IMAGE_REF ?? "unknown",
-      });
-    }
+  private recoverableBag(): RecoverableEngineState {
+    return {
+      ledger: this.ledger,
+      experiment: this.experiment,
+      restingOrders: this.restingOrders,
+      makerReservations: this.makerReservations,
+      settledMarkets: this.settledMarkets,
+      lastInfrastructureAccrualAt: this.lastInfrastructureAccrualAt,
+    };
+  }
+
+  private adoptRecoveredBag(bag: RecoverableEngineState): void {
+    this.experiment = bag.experiment;
+    this.lastInfrastructureAccrualAt = bag.lastInfrastructureAccrualAt;
+    this.syncRecoveredProjection();
+  }
+
+  private syncRecoveredProjection(): void {
+    this.state.setLedger(this.ledger.snapshot());
     this.syncExperimentWindow();
+    this.metrics.openPositions.set(this.ledger.positions.size);
+    this.metrics.unhedgedPositions.set([...this.ledger.positions.values()].filter((item) => Number(item.unpairedQuantity) > 0).length);
+    this.metrics.durableTransitionLastAppliedSequence.set(this.lastAppliedDurableCursor);
+  }
+
+  private applyCommitted(transition: DurableTransition): boolean {
+    if (transition.sequence <= this.lastAppliedDurableCursor) return false;
+    if (transition.sequence !== this.lastAppliedDurableCursor + 1) {
+      throw new RecoveryFailClosedError(
+        "cursor_fence",
+        `apply gap lastApplied=${this.lastAppliedDurableCursor} incoming=${transition.sequence}`,
+      );
+    }
+    const bag = this.recoverableBag();
+    applyDurableTransition(bag, transition);
+    this.adoptRecoveredBag(bag);
+    this.lastAppliedDurableCursor = transition.sequence;
+    this.metrics.durableTransitionLastAppliedSequence.set(this.lastAppliedDurableCursor);
+    return true;
+  }
+
+  private failClosedIntegrity(error: unknown): void {
+    this.overload.markIntegrityFault();
+    this.state.overloadState = "FAIL_CLOSED";
+    this.updateReady();
+    if (!(error instanceof IdempotencyConflictError) && !(error instanceof DurableCursorBehindError) && !(error instanceof RecoveryFailClosedError)) {
+      this.state.database = "DOWN";
+    }
+  }
+
+  private async commitAuthoritative(input: {
+    operationKey: string;
+    type: string;
+    aggregateType: string;
+    aggregateId: string;
+    buildPayload: (occurredAt: Date) => Record<string, unknown>;
+    occurredAt?: Date;
+    afterApply?: (transition: DurableTransition) => Promise<void>;
+    checkpoint?: boolean;
+  }): Promise<DurableCommitResult> {
+    return this.durableGate.run(async () => {
+      const occurredAt = input.occurredAt ?? this.nowFn();
+      this.crashInjector.maybeCrash("BEFORE_DURABLE_COMMIT", input.operationKey);
+      let commit: DurableCommitResult;
+      try {
+        const payload = await this.resolveDurablePayload(input, occurredAt);
+        commit = await this.journal.commitDurableTransition({
+          operationKey: input.operationKey,
+          type: input.type,
+          aggregateType: input.aggregateType,
+          aggregateId: input.aggregateId,
+          payload,
+          occurredAt,
+        }, this.lastAppliedDurableCursor);
+        this.metrics.noteDurableCommit(input.type, commit.inserted);
+      } catch (error) {
+        if (error instanceof CrashInjectedError) throw error;
+        if (error instanceof DurableCursorBehindError) {
+          commit = await this.catchUpOrRejectStalePlan(input.operationKey, input.type, error);
+        } else if (error instanceof IdempotencyConflictError) {
+          this.metrics.noteDurableConflict(input.type);
+          this.failClosedIntegrity(error);
+          throw error;
+        } else {
+          this.metrics.noteDurableCommitFailure(input.type);
+          this.failClosedIntegrity(error);
+          throw error;
+        }
+      }
+      this.crashInjector.maybeCrash("AFTER_DURABLE_COMMIT_BEFORE_APPLY", input.operationKey);
+      if (commit.transition.sequence > this.lastAppliedDurableCursor + 1) {
+        await this.replayDurableTail(this.lastAppliedDurableCursor);
+      }
+      const applied = this.applyCommitted(commit.transition);
+      this.crashInjector.maybeCrash("AFTER_APPLY_BEFORE_DERIVED_AUDIT", input.operationKey);
+      await this.emitStoredDerivedAudit(commit.transition);
+      if (applied && input.afterApply) await input.afterApply(commit.transition);
+      this.crashInjector.maybeCrash("AFTER_DERIVED_AUDIT_BEFORE_CHECKPOINT", input.operationKey);
+      if (input.checkpoint) await this.checkpointInsideGate();
+      this.crashInjector.maybeCrash("AFTER_CHECKPOINT", input.operationKey);
+      return commit;
+    });
+  }
+
+  private async catchUpOrRejectStalePlan(
+    operationKey: string,
+    type: string,
+    error: DurableCursorBehindError,
+  ): Promise<DurableCommitResult> {
+    await this.replayDurableTail(this.lastAppliedDurableCursor);
+    const latest = await this.journal.latestDurableSequence();
+    const report = validatePostReplayInvariants(this.recoverableBag(), this.lastAppliedDurableCursor, latest);
+    if (!report.ok) {
+      const closed = new RecoveryFailClosedError("invariant", report.reasons.join(","));
+      this.failClosedIntegrity(closed);
+      throw closed;
+    }
+    const existing = await this.journal.readDurableByOperationKey(operationKey);
+    if (existing) {
+      this.metrics.noteDurableCommit(type, false);
+      return {
+        sequence: existing.sequence,
+        operationKey,
+        inserted: false,
+        existing: true,
+        transition: existing,
+      };
+    }
+    const closed = new RecoveryFailClosedError(
+      "cursor_fence",
+      `stale_plan: ${operationKey} planned against cursor ${error.expectedPreviousSequence} after foreign commit to ${error.latestCommitted}`,
+    );
+    this.failClosedIntegrity(closed);
+    throw closed;
+  }
+
+  private async resolveDurablePayload(
+    input: {
+      operationKey: string;
+      type: string;
+      aggregateType: string;
+      aggregateId: string;
+      buildPayload: (occurredAt: Date) => Record<string, unknown>;
+    },
+    occurredAt: Date,
+  ): Promise<Record<string, unknown>> {
+    const computed = input.buildPayload(occurredAt);
+    const existing = await this.journal.readDurableByOperationKey(input.operationKey);
+    if (!existing) return computed;
+    if (
+      existing.type !== input.type
+      || existing.aggregateType !== input.aggregateType
+      || existing.aggregateId !== input.aggregateId
+      || durableIdentityConflicts(input.type, existing.payload, computed)
+    ) {
+      throw new IdempotencyConflictError(input.operationKey, existing.type, input.type);
+    }
+    return existing.payload;
+  }
+
+  private async restoreAndRecover(): Promise<void> {
+    const started = performance.now();
+    try {
+      const checkpoint = await this.journal.loadLatestCheckpoint();
+      if (checkpoint) {
+        const restored = this.hydrateCheckpointPayload(checkpoint.payload as Record<string, unknown>);
+        const payload = checkpoint.payload as Record<string, unknown>;
+        if (isLegacyCheckpointPayload(payload)) {
+          const safety = assessLegacyCheckpointSafety({
+            experiment: this.experiment,
+            positions: [...this.ledger.positions.values()],
+            restingOrders: [...this.restingOrders.values()],
+            makerReservations: Object.fromEntries(this.makerReservations),
+          });
+          if (!safety.safe) {
+            throw new RecoveryFailClosedError("legacy_unsafe", safety.detail);
+          }
+          this.lastAppliedDurableCursor = await this.journal.latestDurableSequence();
+          this.checkpointSequence = checkpoint.sequence;
+          await this.checkpointInsideGate();
+        } else {
+          const cursor = parseCheckpointDurableCursor(payload);
+          if (cursor == null) throw new RecoveryFailClosedError("malformed", "checkpoint missing durable cursor");
+          this.lastAppliedDurableCursor = cursor;
+          this.derivedAuditCursor = parseCheckpointDerivedAuditCursor(payload);
+          this.checkpointSequence = checkpoint.sequence;
+        }
+        await this.replayDurableTail(this.lastAppliedDurableCursor);
+        await this.repairAllDerivedAudit();
+        const latest = await this.journal.latestDurableSequence();
+        const report = validatePostReplayInvariants(this.recoverableBag(), this.lastAppliedDurableCursor, latest);
+        if (!report.ok) throw new RecoveryFailClosedError("invariant", report.reasons.join(","));
+        this.syncRecoveredProjection();
+        this.metrics.checkpointDurableCursor.set(this.lastAppliedDurableCursor);
+        const recoveredId = this.experiment?.id ?? checkpoint.experimentId ?? createId("engine");
+        await this.safeAppend(createJournalEvent({
+          traceId: recoveredId, type: "STATE_RECOVERED", aggregateType: "engine", aggregateId: recoveredId,
+          payload: {
+            checkpointId: checkpoint.id, positions: restored.positions, restingOrders: restored.restingOrders,
+            activeTriggers: restored.activeTriggers, grokSignals: restored.grokSignals,
+            durableCursor: this.lastAppliedDurableCursor,
+          },
+        }));
+        this.record("STATE_RECOVERED", recoveredId, null, {
+          checkpointId: checkpoint.id, positions: restored.positions, restingOrders: restored.restingOrders,
+          activeTriggers: restored.activeTriggers, grokSignals: restored.grokSignals,
+          durableCursor: this.lastAppliedDurableCursor,
+        });
+      } else {
+        this.experiment = createIdleExperiment({
+          durationHours: this.env.EXPERIMENT_DURATION_HOURS, strategyVersion: this.strategy.version,
+          riskConfiguration: this.riskLimits, modelConfiguration: { provider: "external_grok_bot_mcp", logicalRoles: 6, localModelExecution: false },
+          startingBalance: this.ledger.snapshot().startingBalance, systemVersion: "0.1.0",
+          gitSha: process.env.GIT_SHA ?? process.env.FLY_IMAGE_REF ?? "unknown",
+        });
+        this.lastAppliedDurableCursor = 0;
+        await this.replayDurableTail(0);
+        await this.repairAllDerivedAudit();
+        const latest = await this.journal.latestDurableSequence();
+        const report = validatePostReplayInvariants(this.recoverableBag(), this.lastAppliedDurableCursor, latest);
+        if (!report.ok) throw new RecoveryFailClosedError("invariant", report.reasons.join(","));
+        this.syncRecoveredProjection();
+      }
+      this.syncExperimentWindow();
+    } catch (error) {
+      if (error instanceof CrashInjectedError) throw error;
+      const normalized = normalizeRecoveryError(error);
+      this.metrics.noteRecoveryFailure(normalized.reason);
+      this.overload.markIntegrityFault();
+      this.state.overloadState = "FAIL_CLOSED";
+      this.updateReady();
+      throw normalized;
+    } finally {
+      this.metrics.recoveryDuration.observe((performance.now() - started) / 1000);
+    }
+  }
+
+  private hydrateCheckpointPayload(payload: Record<string, unknown>): {
+    positions: number; restingOrders: number; activeTriggers: number; grokSignals: number;
+  } {
+    const ledger = ledgerStateSchema.parse(payload.ledger);
+    const positions = Array.isArray(payload.positions) ? payload.positions.map((item) => positionSchema.parse(item)) : [];
+    this.ledger.restore(ledger, positions);
+    this.state.setLedger(this.ledger.snapshot());
+    this.experiment = payload.experiment ? experimentManifestSchema.parse(payload.experiment) : createIdleExperiment({
+      durationHours: this.env.EXPERIMENT_DURATION_HOURS, strategyVersion: this.strategy.version,
+      riskConfiguration: this.riskLimits, modelConfiguration: {}, startingBalance: this.ledger.snapshot().startingBalance,
+      systemVersion: "0.1.0", gitSha: "unknown",
+    });
+    const resting = Array.isArray(payload.restingOrders) ? payload.restingOrders.map((item) => restingPaperOrderSchema.parse(item)) : [];
+    for (const item of resting) this.restingOrders.set(item.order.id, item);
+    const reservations = payload.makerReservations && typeof payload.makerReservations === "object"
+      ? payload.makerReservations as Record<string, string> : {};
+    for (const [orderId, amount] of Object.entries(reservations)) this.makerReservations.set(orderId, amount);
+    const triggers = Array.isArray(payload.activeTriggers) ? payload.activeTriggers.map((item) => triggerEventSchema.parse(item)) : [];
+    for (const trigger of triggers) { this.activeTriggers.set(trigger.id, trigger); this.state.addTrigger(trigger); }
+    const signals = Array.isArray(payload.grokSignals) ? payload.grokSignals.map((item) => grokSignalEnvelopeSchema.parse(item)) : [];
+    for (const signal of signals) {
+      const byRole = this.signalsByTrigger.get(signal.triggerId) ?? new Map<ExternalAgentRoleId, GrokSignalEnvelope>();
+      byRole.set(signal.agentId, signal); this.signalsByTrigger.set(signal.triggerId, byRole); this.state.addGrokSignal(signal);
+    }
+    if (Array.isArray(payload.activationLatency)) this.activation.restoreLatency(payload.activationLatency as ActivationLatency[]);
+    this.state.setActivationLatency(this.activation.snapshot());
+    if (Array.isArray(payload.marketMetadata)) {
+      for (const raw of payload.marketMetadata as Array<Record<string, unknown>>) {
+        if (!raw || typeof raw.id !== "string") continue;
+        this.marketsById.set(raw.id, raw as unknown as DiscoveredMarket);
+        this.assetByMarket.set(raw.id, typeof raw.asset === "string" ? raw.asset : null);
+        if (raw.endDate) this.triggerEngine.noteMarketWindow(raw.id, typeof raw.asset === "string" ? raw.asset : null, String(raw.endDate));
+      }
+    }
+    if (Array.isArray(payload.managedMarkets)) {
+      for (const item of payload.managedMarkets) {
+        if (typeof item === "string") this.managedMarketIds.add(item);
+        else if (item && typeof item === "object" && typeof (item as { id?: unknown }).id === "string") {
+          this.managedMarketIds.add((item as { id: string }).id);
+        }
+      }
+    }
+    if (Array.isArray(payload.settledMarkets)) {
+      for (const id of payload.settledMarkets as string[]) this.settledMarkets.add(id);
+    }
+    if (typeof payload.lastInfrastructureAccrualAt === "number") {
+      this.lastInfrastructureAccrualAt = payload.lastInfrastructureAccrualAt;
+    }
+    if (typeof payload.derivedAuditCursor === "number") {
+      this.derivedAuditCursor = parseCheckpointDerivedAuditCursor(payload);
+    }
+    return { positions: positions.length, restingOrders: resting.length, activeTriggers: triggers.length, grokSignals: signals.length };
+  }
+
+  private async repairAllDerivedAudit(): Promise<void> {
+    let cursor = this.derivedAuditCursor;
+    for (;;) {
+      const page = await this.journal.readDurableTransitionsAfter(cursor, this.recoveryPageSize);
+      if (page.length === 0) break;
+      for (const row of page) {
+        if (row.sequence > this.lastAppliedDurableCursor) return;
+        await this.emitStoredDerivedAudit(row);
+        cursor = row.sequence;
+      }
+      if (page.length < this.recoveryPageSize) break;
+    }
+  }
+
+  private async replayDurableTail(after: number): Promise<void> {
+    let cursor = after;
+    for (;;) {
+      const page = await this.journal.readDurableTransitionsAfter(cursor, this.recoveryPageSize);
+      if (page.length === 0) break;
+      for (const row of page) {
+        if (row.sequence <= cursor) {
+          throw new RecoveryFailClosedError("cursor_fence", `non-monotonic replay ${row.sequence} <= ${cursor}`);
+        }
+        this.applyCommitted(row);
+        this.metrics.noteRecoveryReplay(row.type);
+        await this.emitStoredDerivedAudit(row);
+        cursor = row.sequence;
+      }
+      if (page.length < this.recoveryPageSize) break;
+    }
+  }
+
+  private async emitStoredDerivedAudit(row: DurableTransition): Promise<void> {
+    const records = parseDerivedAudit(row.payload);
+    const occurredAt = new Date(row.occurredAt);
+    for (const record of records) {
+      await this.appendAcknowledged(createJournalEvent({
+        id: record.id,
+        traceId: record.traceId,
+        type: record.type,
+        aggregateType: record.aggregateType,
+        aggregateId: record.aggregateId,
+        payload: record.payload,
+        sourceEventId: record.sourceEventId,
+        occurredAt,
+      }));
+    }
+    this.derivedAuditCursor = Math.max(this.derivedAuditCursor, row.sequence);
+  }
+
+  private async appendAcknowledged(event: ReturnType<typeof createJournalEvent>, signal?: AbortSignal): Promise<void> {
+    const journalClass = classifyJournalMetricClass(event.type);
+    try {
+      await this.journalAdmission.run(journalClass, true, async () => {
+        if (signal?.aborted) throw new JournalAdmissionRejected(journalClass, true, "JOURNAL_ADMISSION_CLOSED");
+        await this.metrics.observeDirectJournal(event.type, async () => {
+          await this.journal.append(event);
+          this.state.database = "UP";
+        });
+      }, signal);
+    } catch (error) {
+      if (error instanceof CrashInjectedError) throw error;
+      this.failClosedIntegrity(error);
+      this.logger.error(
+        { err: error, traceId: event.traceId, admitted: !(error instanceof JournalAdmissionRejected) },
+        error instanceof JournalAdmissionRejected ? "derived audit admission rejected" : "derived audit append failed",
+      );
+      throw error;
+    }
+  }
+
+  private experimentDerivedAudit(type: "EXPERIMENT_STARTED" | "EXPERIMENT_ENTRY_CLOSED" | "EXPERIMENT_COMPLETED", experiment: ExperimentManifest): DerivedAuditRecord {
+    return {
+      id: derivedAuditEventId(type, experiment.id),
+      type,
+      aggregateType: "experiment",
+      aggregateId: experiment.id,
+      traceId: experiment.id,
+      payload: { ...experiment, experimentId: experiment.id },
+    };
+  }
+
+  private projectDerivedAudit(
+    input: { operationKey: string; type: string; aggregateType: string; aggregateId: string; payload: Record<string, unknown> },
+    occurredAt: Date,
+    build: (projected: RecoverableEngineState) => DerivedAuditRecord[],
+  ): DerivedAuditRecord[] {
+    const projected = cloneRecoverableState(this.recoverableBag());
+    applyDurableTransition(projected, plannedDurableTransition(input, occurredAt, this.lastAppliedDurableCursor + 1));
+    return build(projected);
+  }
+
+  private async restoreExperimentState(): Promise<void> {
+    await this.restoreAndRecover();
   }
 
   private async onMarketSnapshot(snapshot: MarketSnapshot): Promise<void> {
+    if (!this.state.recoveryComplete) return;
     if (!this.tokenIds.includes(snapshot.tokenId)) return;
     const started = performance.now();
     this.metrics.marketMessages.inc();
@@ -746,9 +1175,12 @@ export class EngineService {
     for (const [orderId, resting] of this.restingOrders) {
       if (resting.order.tokenId !== snapshot.tokenId || !previous) continue;
       const evolved = evolveMakerOrder(resting, previous, snapshot);
-      this.restingOrders.set(orderId, evolved.resting);
-      if (evolved.fill) await this.applyFill(evolved.fill);
-      if (Number(evolved.resting.remaining) === 0) this.restingOrders.delete(orderId);
+      if (evolved.fill) {
+        await this.applyFill(evolved.fill, { restingAfter: evolved.resting });
+      } else {
+        this.restingOrders.set(orderId, evolved.resting);
+        if (Number(evolved.resting.remaining) === 0) this.restingOrders.delete(orderId);
+      }
     }
 
     const triggers = this.triggerEngine.ingestMarket(snapshot);
@@ -760,6 +1192,7 @@ export class EngineService {
   }
 
   private async onReferenceTick(tick: ReferenceTick): Promise<void> {
+    if (!this.state.recoveryComplete) return;
     if (this.usesDiscovery() && ![...this.assetByMarket.values()].includes(tick.asset)) return;
     this.metrics.referenceTicks.inc();
     const started = performance.now();
@@ -777,6 +1210,9 @@ export class EngineService {
   }
 
   private admitTrigger(trigger: TriggerEvent): AdmitResult {
+    if (this.started && !this.state.recoveryComplete) {
+      return { admitted: false, reason: "fail_closed", done: Promise.resolve() };
+    }
     const lane = triggerWorkLane(trigger.kind);
     const result = this.supervisor.admit({
       id: trigger.id,
@@ -982,8 +1418,10 @@ export class EngineService {
     const pair = this.snapshots.get(trigger.marketId ?? "");
     if (!pair) return;
     const position = this.ledger.positions.get(trigger.marketId ?? "") ?? null;
-    this.experiment = this.experiment ? refreshExperiment(this.experiment, this.nowFn(), { openPositions: openPositionsRemain(this.ledger.positions.values()) }) : null;
-    if (this.experiment) this.state.experimentStatus = this.experiment.status;
+    if (this.experiment) {
+      const next = refreshExperiment(this.experiment, this.nowFn(), { openPositions: openPositionsRemain(this.ledger.positions.values()) });
+      if (next.status !== this.experiment.status) await this.commitExperimentStatus(next);
+    }
     const candidate = this.strategy.evaluate({
       consensus, snapshots: { UP: pair.UP ?? null, DOWN: pair.DOWN ?? null }, position,
       maxOrderSizeUsd: this.riskLimits.maxOrderSizeUsd, minimumLockedPairEdge: this.riskLimits.minExpectedEdge,
@@ -1066,16 +1504,15 @@ export class EngineService {
   private async submitPaperOrder(order: PaperOrder, decisionSnapshot: MarketSnapshot, duplicateKey: string, intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" = "OPEN_FIRST_LEG"): Promise<void> {
     this.metrics.paperOrders.inc({ type: order.orderType });
     this.record("PAPER_ORDER_CREATED", order.traceId, order.marketId, { orderId: order.id, type: order.orderType, intent }, decisionSnapshot.asset ?? null);
-    await this.safeAppend(createJournalEvent({ traceId: order.traceId, type: "PAPER_ORDER_CREATED", aggregateType: "paper_order", aggregateId: order.id, payload: { ...order, intent } }));
+    await this.safeAppend(createJournalEvent({
+      id: derivedAuditEventId("PAPER_ORDER_CREATED", order.id),
+      traceId: order.traceId, type: "PAPER_ORDER_CREATED", aggregateType: "paper_order", aggregateId: order.id,
+      payload: { ...order, intent },
+    }));
     this.recentTrades.set(duplicateKey, Date.now());
     try {
       if (order.orderType === "MAKER") {
-        const notional = makerReserveNotional(order.quantity, order.requestedPrice, decisionSnapshot.feeSchedule);
-        this.ledger.reserve(notional, this.nowFn());
-        this.makerReservations.set(order.id, notional);
-        this.state.setLedger(this.ledger.snapshot());
-        this.restingOrders.set(order.id, createRestingMakerOrder(order, decisionSnapshot));
-        await this.safeAppend(createJournalEvent({ traceId: order.traceId, type: "PAPER_MAKER_RESERVED", aggregateType: "paper_order", aggregateId: order.id, payload: { orderId: order.id, reserved: notional } }));
+        await this.reserveMaker(order, decisionSnapshot, intent);
         return;
       }
       await delay(this.env.PAPER_EXECUTION_LATENCY_MS);
@@ -1084,70 +1521,199 @@ export class EngineService {
       await this.applyFill(executePaperTaker({ order, snapshotAfterLatency: current, measuredLatencyMs: this.env.PAPER_EXECUTION_LATENCY_MS }));
       this.lastTradeAt = this.nowFn();
     } catch (error) {
-      if (this.overload.hasIntegrityFault || (error instanceof JournalAdmissionRejected && error.critical)) throw error;
+      if (this.overload.hasIntegrityFault || error instanceof IdempotencyConflictError || error instanceof CrashInjectedError || (error instanceof JournalAdmissionRejected && error.critical)) throw error;
       this.executionErrors.push(Date.now());
       this.record("PAPER_EXECUTION_ERROR", order.traceId, order.marketId, { orderId: order.id, message: error instanceof Error ? error.message : String(error) });
       await this.safeAppend(createJournalEvent({ traceId: order.traceId, type: "PAPER_EXECUTION_ERROR", aggregateType: "paper_order", aggregateId: order.id, payload: { message: error instanceof Error ? error.message : String(error) } }));
     }
   }
 
-  private releaseMaker(orderId: string, filledNotional = "0"): void {
-    const reserved = this.makerReservations.get(orderId);
-    if (!reserved) return;
-    const remaining = Math.max(0, Number(reserved) - Number(filledNotional));
-    if (remaining > 0) this.ledger.release(remaining, this.nowFn());
-    this.makerReservations.delete(orderId);
-    this.state.setLedger(this.ledger.snapshot());
-    void this.safeAppend(createJournalEvent({
-      traceId: orderId, type: "PAPER_MAKER_RELEASED", aggregateType: "paper_order", aggregateId: orderId,
-      payload: { orderId, released: String(remaining), experimentId: this.experiment?.id ?? null },
-    })).catch(() => undefined);
+  private async reserveMaker(
+    order: PaperOrder,
+    snapshot: MarketSnapshot,
+    intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" = "OPEN_FIRST_LEG",
+  ): Promise<void> {
+    const notional = makerReserveNotional(order.quantity, order.requestedPrice, snapshot.feeSchedule);
+    if (this.ledger.availableCash().lt(notional) && !(await this.journal.readDurableByOperationKey(`maker:${order.id}:reserve`))) {
+      throw new Error("INSUFFICIENT_CASH");
+    }
+    const resting = createRestingMakerOrder(order, snapshot);
+    const auth = { orderId: order.id, reserved: notional, resting, intent };
+    await this.commitAuthoritative({
+      operationKey: `maker:${order.id}:reserve`,
+      type: "PAPER_MAKER_RESERVED",
+      aggregateType: "paper_order",
+      aggregateId: order.id,
+      buildPayload: (occurredAt) => ({
+        ...auth,
+        derivedAudit: [
+          {
+            id: derivedAuditEventId("PAPER_ORDER_CREATED", order.id),
+            type: "PAPER_ORDER_CREATED",
+            aggregateType: "paper_order",
+            aggregateId: order.id,
+            traceId: order.traceId,
+            payload: { ...order, intent },
+          },
+          {
+            id: derivedAuditEventId("PAPER_MAKER_RESERVED", order.id),
+            type: "PAPER_MAKER_RESERVED",
+            aggregateType: "paper_order",
+            aggregateId: order.id,
+            traceId: order.traceId,
+            payload: { orderId: order.id, reserved: notional, experimentId: this.experiment?.id ?? null, updatedAt: occurredAt.toISOString() },
+          },
+        ],
+      }),
+    });
   }
 
-  private async applyFill(fill: Parameters<PaperLedger["applyFill"]>[0]): Promise<void> {
+  private async releaseMaker(orderId: string, options: { filledNotional?: string; cancel?: boolean; reason?: string } = {}): Promise<void> {
+    const operationKey = options.cancel ? `maker:${orderId}:cancel` : `maker:${orderId}:release`;
+    const reserved = this.makerReservations.get(orderId);
+    if (!reserved && !options.cancel && !(await this.journal.readDurableByOperationKey(operationKey))) return;
+    if (!reserved && options.cancel && !this.restingOrders.has(orderId) && !(await this.journal.readDurableByOperationKey(operationKey))) return;
+    const leftover = reserved ? d(reserved).minus(options.filledNotional ?? 0) : d(0);
+    const released = leftover.gt(0) ? decimal(leftover) : "0";
+    const type = options.cancel ? "PAPER_ORDER_CANCELLED" : "PAPER_MAKER_RELEASED";
+    await this.commitAuthoritative({
+      operationKey,
+      type,
+      aggregateType: "paper_order",
+      aggregateId: orderId,
+      buildPayload: (occurredAt) => ({
+        orderId, released, cancel: options.cancel === true, reason: options.reason,
+        derivedAudit: [{
+          id: derivedAuditEventId(type, orderId),
+          type,
+          aggregateType: "paper_order",
+          aggregateId: orderId,
+          traceId: orderId,
+          payload: {
+            orderId, released, reason: options.reason ?? null,
+            experimentId: this.experiment?.id ?? null, updatedAt: occurredAt.toISOString(),
+          },
+        }],
+      }),
+      afterApply: async () => {
+        if (options.cancel) this.record("PAPER_ORDER_CANCELLED", orderId, null, { orderId, reason: options.reason ?? null });
+      },
+    });
+  }
+
+  private computeMakerRestingAfter(
+    fill: Parameters<PaperLedger["applyFill"]>[0],
+    extras: { restingAfter?: RestingPaperOrder | null },
+  ): RestingPaperOrder | null {
+    if (extras.restingAfter !== undefined) return extras.restingAfter;
+    const current = this.restingOrders.get(fill.orderId) ?? null;
+    if (!current || fill.liquidityRole !== "MAKER") return current;
+    const remaining = d(current.remaining).minus(fill.quantity);
+    return { ...current, remaining: remaining.gt(0) ? remaining.toFixed() : "0" };
+  }
+
+  private async applyFill(fill: Parameters<PaperLedger["applyFill"]>[0], extras: { restingAfter?: RestingPaperOrder | null } = {}): Promise<void> {
     const reserved = this.makerReservations.get(fill.orderId);
+    let reservationAfter: string | null = reserved ?? null;
     if (reserved && fill.liquidityRole === "MAKER") {
-      const fillCost = Number(fill.quantity) * Number(fill.fillPrice) + Number(fill.feeUsd);
-      const next = Math.max(0, Number(reserved) - fillCost);
-      this.ledger.release(Math.min(Number(reserved), fillCost), this.nowFn());
-      if (next > 0) this.makerReservations.set(fill.orderId, String(next));
-      else this.makerReservations.delete(fill.orderId);
+      const fillCost = d(fill.quantity).mul(fill.fillPrice).plus(fill.feeUsd);
+      const next = d(reserved).minus(fillCost);
+      reservationAfter = next.gt(0) ? decimal(next) : null;
     }
     const previous = this.ledger.positions.get(fill.marketId);
-    const wasEmpty = !previous || (Number(previous.upQuantity) === 0 && Number(previous.downQuantity) === 0);
-    const position = this.ledger.applyFill(fill);
-    this.state.setLedger(this.ledger.snapshot());
-    this.metrics.paperFills.inc({ role: fill.liquidityRole });
-    this.metrics.openPositions.set(this.ledger.positions.size);
-    this.metrics.unhedgedPositions.set([...this.ledger.positions.values()].filter((item) => Number(item.unpairedQuantity) > 0).length);
-    this.record("PAPER_FILL", fill.traceId, fill.marketId, { fillId: fill.id, orderId: fill.orderId, price: fill.fillPrice, quantity: fill.quantity, role: fill.liquidityRole });
-    if (wasEmpty && fill.side === "BUY") {
-      this.record("FIRST_LEG_FILLED", fill.traceId, fill.marketId, { positionId: position.id, unpairedQuantity: position.unpairedQuantity });
-      await this.safeAppend(createJournalEvent({
-        traceId: fill.traceId, type: "FIRST_LEG_FILLED", aggregateType: "position", aggregateId: position.id,
-        payload: { positionId: position.id, marketId: fill.marketId, unpairedQuantity: position.unpairedQuantity, experimentId: this.experiment?.id ?? null },
-      }));
+    const wasEmpty = !previous || (!d(previous.upQuantity).gt(0) && !d(previous.downQuantity).gt(0));
+    const positionId = previous?.id ?? stablePositionId(fill.marketId);
+    const restingAfter = this.computeMakerRestingAfter(fill, extras);
+    await this.commitAuthoritative({
+      operationKey: `fill:${fill.id}`,
+      type: "PAPER_FILL",
+      aggregateType: "paper_fill",
+      aggregateId: fill.id,
+      buildPayload: (occurredAt) => {
+        const auth = { fill, positionId, reservationAfter, restingAfter, wasEmpty };
+        return {
+          ...auth,
+          derivedAudit: this.projectDerivedAudit(
+            { operationKey: `fill:${fill.id}`, type: "PAPER_FILL", aggregateType: "paper_fill", aggregateId: fill.id, payload: auth },
+            occurredAt,
+            (projected) => this.buildFillDerivedAudit(fill, wasEmpty, projected, occurredAt),
+          ),
+        };
+      },
+      afterApply: async () => {
+        this.record("PAPER_FILL", fill.traceId, fill.marketId, { fillId: fill.id, orderId: fill.orderId, price: fill.fillPrice, quantity: fill.quantity, role: fill.liquidityRole });
+        this.metrics.paperFills.inc({ role: fill.liquidityRole });
+        const position = this.ledger.positions.get(fill.marketId);
+        if (position) {
+          for (const trigger of this.triggerEngine.ingestPosition(position, fill.traceId, this.assetByMarket.get(fill.marketId) ?? null)) {
+            this.admitTrigger(trigger);
+          }
+        }
+      },
+    });
+  }
+
+  private buildFillDerivedAudit(
+    fill: Parameters<PaperLedger["applyFill"]>[0],
+    wasEmpty: boolean,
+    projected: RecoverableEngineState,
+    occurredAt: Date,
+  ): DerivedAuditRecord[] {
+    const position = projected.ledger.positions.get(fill.marketId);
+    const experimentId = projected.experiment?.id ?? this.experiment?.id ?? null;
+    const records: DerivedAuditRecord[] = [{
+      id: derivedAuditEventId("PAPER_FILL", fill.id),
+      type: "PAPER_FILL",
+      aggregateType: "paper_fill",
+      aggregateId: fill.id,
+      traceId: fill.traceId,
+      payload: { ...fill, asset: this.assetByMarket.get(fill.marketId) ?? null },
+      sourceEventId: fill.sourceMarketEventId,
+    }];
+    if (wasEmpty && fill.side === "BUY" && position) {
+      records.push({
+        id: derivedAuditEventId("FIRST_LEG_FILLED", fill.id),
+        type: "FIRST_LEG_FILLED",
+        aggregateType: "position",
+        aggregateId: position.id,
+        traceId: fill.traceId,
+        payload: { positionId: position.id, marketId: fill.marketId, unpairedQuantity: position.unpairedQuantity, experimentId },
+      });
     }
-    if (Number(position.pairedQuantity) > 0 && Number(position.unpairedQuantity) === 0) {
-      const unhedgedDurationMs = Math.max(0, this.nowFn().getTime() - new Date(position.openedAt).getTime());
-      this.record("HEDGE_COMPLETE", fill.traceId, fill.marketId, { positionId: position.id, pairedQuantity: position.pairedQuantity, unhedgedDurationMs });
-      await this.safeAppend(createJournalEvent({
-        traceId: fill.traceId, type: "HEDGE_COMPLETE", aggregateType: "position", aggregateId: position.id,
+    if (position && Number(position.pairedQuantity) > 0 && Number(position.unpairedQuantity) === 0) {
+      const unhedgedDurationMs = Math.max(0, occurredAt.getTime() - new Date(position.openedAt).getTime());
+      records.push({
+        id: derivedAuditEventId("HEDGE_COMPLETE", fill.id),
+        type: "HEDGE_COMPLETE",
+        aggregateType: "position",
+        aggregateId: position.id,
+        traceId: fill.traceId,
         payload: {
           positionId: position.id, marketId: fill.marketId, pairedQuantity: position.pairedQuantity,
-          unhedgedDurationMs, experimentId: this.experiment?.id ?? null,
+          unhedgedDurationMs, experimentId,
         },
-      }));
+      });
     }
-    await this.safeAppend(createJournalEvent({
-      traceId: fill.traceId, type: "PAPER_FILL", aggregateType: "paper_fill", aggregateId: fill.id,
-      payload: { ...fill, asset: this.assetByMarket.get(fill.marketId) ?? null }, sourceEventId: fill.sourceMarketEventId,
-    }));
-    await this.safeAppend(createJournalEvent({ traceId: fill.traceId, type: "POSITION_UPDATED", aggregateType: "position", aggregateId: position.id, payload: position, sourceEventId: fill.id }));
-    await this.safeAppend(createJournalEvent({ traceId: fill.traceId, type: "PNL_SNAPSHOT", aggregateType: "ledger", aggregateId: this.experiment?.id ?? "paper", payload: { ...this.ledger.snapshot(), experimentId: this.experiment?.id ?? null } }));
-    for (const trigger of this.triggerEngine.ingestPosition(position, fill.traceId, this.assetByMarket.get(fill.marketId) ?? null)) {
-      this.admitTrigger(trigger);
+    if (position) {
+      records.push({
+        id: derivedAuditEventId("POSITION_UPDATED", fill.id),
+        type: "POSITION_UPDATED",
+        aggregateType: "position",
+        aggregateId: position.id,
+        traceId: fill.traceId,
+        payload: structuredClone(position),
+        sourceEventId: fill.id,
+      });
     }
+    records.push({
+      id: derivedAuditEventId("PNL_SNAPSHOT", fill.id),
+      type: "PNL_SNAPSHOT",
+      aggregateType: "ledger",
+      aggregateId: experimentId ?? "paper",
+      traceId: fill.traceId,
+      payload: { ...projected.ledger.snapshot(), experimentId, source: "FILL", fillId: fill.id },
+    });
+    return records;
   }
 
   private async onConnection(event: FeedConnectionEvent): Promise<void> {
@@ -1259,32 +1825,88 @@ export class EngineService {
 
   private async checkpoint(): Promise<void> {
     if (!this.experiment || this.state.database !== "UP") return;
-    await this.journal.saveCheckpoint({
-      experimentId: this.experiment.id, sequence: ++this.checkpointSequence,
-      payload: {
-        ledger: this.ledger.snapshot(), positions: [...this.ledger.positions.values()], experiment: this.experiment,
-        restingOrders: [...this.restingOrders.values()], activeTriggers: [...this.activeTriggers.values()],
-        grokSignals: [...this.signalsByTrigger.values()].flatMap((signals) => [...signals.values()]),
-        activationLatency: this.activation.snapshot(),
-        makerReservations: Object.fromEntries(this.makerReservations),
-        managedMarkets: [...this.obligationMarketIds()],
-        settledMarkets: [...this.settledMarkets],
-        marketMetadata: [...this.marketsById.values()].map((market) => ({ ...market, raw: {} })),
-      },
-    });
+    await this.durableGate.run(() => this.checkpointInsideGate());
   }
 
-  private accrueInfrastructureCost(now = Date.now()): void {
+  private async checkpointInsideGate(): Promise<void> {
+    if (!this.experiment || this.state.database !== "UP") return;
+    const latest = await this.journal.latestDurableSequence();
+    if (this.lastAppliedDurableCursor !== latest) {
+      this.metrics.checkpointWrites.inc({ status: "fence" });
+      throw new CheckpointFenceError(this.lastAppliedDurableCursor, latest);
+    }
+    try {
+      await this.journal.saveCheckpoint({
+        experimentId: this.experiment.id, sequence: ++this.checkpointSequence,
+        payload: {
+          schemaVersion: CHECKPOINT_SCHEMA_VERSION,
+          durableCursor: this.lastAppliedDurableCursor,
+          ledger: this.ledger.snapshot(), positions: [...this.ledger.positions.values()], experiment: this.experiment,
+          restingOrders: [...this.restingOrders.values()], activeTriggers: [...this.activeTriggers.values()],
+          grokSignals: [...this.signalsByTrigger.values()].flatMap((signals) => [...signals.values()]),
+          activationLatency: this.activation.snapshot(),
+          makerReservations: Object.fromEntries(this.makerReservations),
+          managedMarkets: [...this.obligationMarketIds()],
+          settledMarkets: [...this.settledMarkets],
+          marketMetadata: [...this.marketsById.values()].map((market) => ({ ...market, raw: {} })),
+          lastInfrastructureAccrualAt: this.lastInfrastructureAccrualAt,
+          derivedAuditCursor: this.derivedAuditCursor,
+        },
+      });
+      this.metrics.checkpointWrites.inc({ status: "success" });
+      this.metrics.checkpointDurableCursor.set(this.lastAppliedDurableCursor);
+    } catch (error) {
+      if (error instanceof CheckpointFenceError) {
+        this.metrics.checkpointWrites.inc({ status: "fence" });
+        throw error;
+      }
+      this.metrics.checkpointWrites.inc({ status: "failed" });
+      throw error;
+    }
+  }
+
+  private async accrueInfrastructureCost(now = Date.now()): Promise<void> {
     const elapsedHours = Math.max(0, now - this.lastInfrastructureAccrualAt) / 3_600_000;
-    if (elapsedHours > 0) this.ledger.addOperatingCosts(0, elapsedHours * this.env.ESTIMATED_INFRA_COST_PER_HOUR_USD, new Date(now));
-    this.lastInfrastructureAccrualAt = now;
-    this.state.setLedger(this.ledger.snapshot());
+    const amount = elapsedHours * this.env.ESTIMATED_INFRA_COST_PER_HOUR_USD;
+    if (elapsedHours <= 0) return;
+    if (amount <= 0) {
+      this.lastInfrastructureAccrualAt = now;
+      return;
+    }
+    const occurredAt = new Date(now);
+    const accruedAt = occurredAt.toISOString();
+    const aggregateId = this.experiment?.id ?? "paper";
+    const previousAccrualKey = this.lastInfrastructureAccrualAt;
+    const auth = {
+      aiCost: "0",
+      infrastructureCost: String(amount),
+      accruedAt,
+      accrualKey: now,
+    };
+    await this.commitAuthoritative({
+      operationKey: `infra:${aggregateId}:${previousAccrualKey}`,
+      type: "INFRASTRUCTURE_COST_ACCRUED",
+      aggregateType: "ledger",
+      aggregateId,
+      occurredAt,
+      buildPayload: () => ({
+        ...auth,
+        derivedAudit: [{
+          id: derivedAuditEventId("INFRASTRUCTURE_COST_ACCRUED", `${aggregateId}:${auth.accrualKey}`),
+          type: "INFRASTRUCTURE_COST_ACCRUED",
+          aggregateType: "ledger",
+          aggregateId,
+          traceId: aggregateId,
+          payload: { ...auth, experimentId: this.experiment?.id ?? null },
+        }],
+      }),
+    });
   }
 
   private async maintainExperiment(): Promise<void> {
     if (!this.experiment) return;
     if (this.experiment.status === "RUNNING" || this.experiment.status === "ENTRY_CLOSED") {
-      this.accrueInfrastructureCost(this.nowFn().getTime());
+      await this.accrueInfrastructureCost(this.nowFn().getTime());
     }
     this.pruneRuntimeBookkeeping();
     await this.pollFailedHedges();
@@ -1293,37 +1915,33 @@ export class EngineService {
     const previous = this.experiment.status;
     const open = openPositionsRemain(this.ledger.positions.values());
     const unresolved = [...this.ledger.positions.values()].filter((position) => Number(position.upQuantity) > 0 || Number(position.downQuantity) > 0).length;
-    this.experiment = refreshExperiment(this.experiment, this.nowFn(), { openPositions: open, unresolvedCount: unresolved });
-    if (this.experiment.status === "ENTRY_CLOSED" && (this.experiment.closePolicy ?? "observe_until_settlement") === "mark_to_market") {
+    let next = refreshExperiment(this.experiment, this.nowFn(), { openPositions: open, unresolvedCount: unresolved });
+    if (next.status === "ENTRY_CLOSED" && (next.closePolicy ?? "observe_until_settlement") === "mark_to_market") {
       const marked = await this.markToMarketClose(unresolved);
-      this.experiment = refreshExperiment(this.experiment, this.nowFn(), {
+      next = refreshExperiment(next, this.nowFn(), {
         openPositions: open, unresolvedCount: unresolved, markToMarketReady: marked,
       });
     }
-    if (this.experiment.status === "ENTRY_CLOSED") {
-      const policy = this.experiment.closePolicy ?? "observe_until_settlement";
-      this.experiment = refreshExperiment(this.experiment, this.nowFn(), {
+    if (next.status === "ENTRY_CLOSED") {
+      const policy = next.closePolicy ?? "observe_until_settlement";
+      next = refreshExperiment(next, this.nowFn(), {
         openPositions: openPositionsRemain(this.ledger.positions.values()),
         unresolvedCount: [...this.ledger.positions.values()].filter((position) => Number(position.upQuantity) > 0 || Number(position.downQuantity) > 0).length,
         markToMarketReady: policy === "mark_to_market" ? false : undefined,
       });
     }
-    this.state.experimentStatus = this.experiment.status;
+    if (previous === "RUNNING" && (next.status === "ENTRY_CLOSED" || next.status === "COMPLETED")) {
+      const closed: ExperimentManifest = {
+        ...next, status: "ENTRY_CLOSED", completedAt: null, markToMarketAt: null,
+      };
+      if (this.experiment.status !== "ENTRY_CLOSED") await this.commitExperimentStatus(closed);
+    }
+    if (next.status === "COMPLETED" && this.experiment?.status !== "COMPLETED") {
+      await this.commitExperimentStatus(next);
+    } else if (next.status === "ENTRY_CLOSED" && this.experiment?.status !== "ENTRY_CLOSED" && this.experiment?.status !== "COMPLETED") {
+      await this.commitExperimentStatus(next);
+    }
     this.syncExperimentWindow();
-    if (previous === "RUNNING" && this.experiment.status === "ENTRY_CLOSED") {
-      await this.safeAppend(createJournalEvent({
-        traceId: this.experiment.id, type: "EXPERIMENT_ENTRY_CLOSED", aggregateType: "experiment", aggregateId: this.experiment.id,
-        payload: { ...this.experiment, experimentId: this.experiment.id },
-      }));
-      await this.checkpoint();
-    }
-    if (previous !== "COMPLETED" && this.experiment.status === "COMPLETED") {
-      await this.safeAppend(createJournalEvent({
-        traceId: this.experiment.id, type: "EXPERIMENT_COMPLETED", aggregateType: "experiment", aggregateId: this.experiment.id,
-        payload: { ...this.experiment, experimentId: this.experiment.id },
-      }));
-      await this.checkpoint();
-    }
     const stillOpen = openPositionsRemain(this.ledger.positions.values());
     if (shouldWriteFinalReport(this.experiment, stillOpen) && !this.reportGenerated) {
       await this.writeFinalReport();
@@ -1351,13 +1969,7 @@ export class EngineService {
     for (const [orderId, resting] of [...this.restingOrders.entries()]) {
       const market = this.marketsById.get(resting.order.marketId);
       if (!market?.endDate || new Date(market.endDate).getTime() > now.getTime()) continue;
-      this.releaseMaker(orderId);
-      this.restingOrders.delete(orderId);
-      this.record("PAPER_ORDER_CANCELLED", resting.order.traceId, resting.order.marketId, { orderId, reason: "MARKET_EXPIRED" });
-      await this.safeAppend(createJournalEvent({
-        traceId: resting.order.traceId, type: "PAPER_ORDER_CANCELLED", aggregateType: "paper_order", aggregateId: orderId,
-        payload: { orderId, reason: "MARKET_EXPIRED", experimentId: this.experiment?.id ?? null },
-      }));
+      await this.releaseMaker(orderId, { cancel: true, reason: "MARKET_EXPIRED" });
     }
     for (const position of [...this.ledger.positions.values()]) {
       if (this.settledMarkets.has(position.marketId)) continue;
@@ -1387,51 +1999,134 @@ export class EngineService {
       this.bumpSettlementBackoff(marketId);
       return;
     }
-    await this.safeAppend(createJournalEvent({
-      traceId: this.experiment?.id ?? createId("trace"), type: "MARKET_RESOLUTION_OBSERVED", aggregateType: "market", aggregateId: marketId,
-      payload: { ...parsed, marketId, slug: market.slug, experimentId: this.experiment?.id ?? null },
-    }));
-    const settled = this.ledger.settlePosition(marketId, parsed.upPayoff, parsed.downPayoff, this.nowFn());
-    this.settledMarkets.add(marketId);
-    this.settlementBackoff.delete(marketId);
-    this.state.setLedger(this.ledger.snapshot());
-    if (!settled) return;
+    const settledAt = this.nowFn();
+    const positionBefore = this.ledger.positions.get(marketId);
+    const upPayoff = parsed.upPayoff;
+    const downPayoff = parsed.downPayoff;
     const asset = this.assetByMarket.get(marketId) ?? market.asset;
-    await this.safeAppend(createJournalEvent({
-      traceId: settled.position.id, type: "POSITION_SETTLED", aggregateType: "position", aggregateId: settled.position.id,
-      payload: {
-        marketId, asset, cashDelta: settled.cashDelta, realizedDelta: settled.realizedDelta,
-        upPayoff: parsed.upPayoff, downPayoff: parsed.downPayoff, winner: parsed.winner,
-        upQuantity: settled.position.upQuantity, downQuantity: settled.position.downQuantity,
-        feesUsd: settled.position.totalFees, grossOutcome: settled.grossOutcome, outcome: settled.outcome,
-        experimentId: this.experiment?.id ?? null,
+    const experimentId = this.experiment?.id ?? null;
+    await this.commitAuthoritative({
+      operationKey: `settlement:${marketId}:${this.experiment?.id ?? "paper"}`,
+      type: "POSITION_SETTLED",
+      aggregateType: "position",
+      aggregateId: positionBefore?.id ?? marketId,
+      occurredAt: settledAt,
+      buildPayload: (occurredAt) => {
+        const auth = {
+          marketId,
+          upPayoff,
+          downPayoff,
+          settledAt: occurredAt.toISOString(),
+          winner: parsed.winner,
+          slug: market.slug,
+          resolution: parsed,
+        };
+        return {
+          ...auth,
+          derivedAudit: this.buildSettlementDerivedAudit({
+            marketId, asset, experimentId, parsed, positionBefore, upPayoff, downPayoff, occurredAt, auth,
+          }),
+        };
       },
-    }));
-    await this.safeAppend(createJournalEvent({
-      traceId: settled.position.id, type: settled.outcome, aggregateType: "position", aggregateId: settled.position.id,
-      payload: { marketId, realizedDelta: settled.realizedDelta, feesUsd: settled.position.totalFees, grossOutcome: settled.grossOutcome, experimentId: this.experiment?.id ?? null },
-    }));
-    if (Number(settled.position.pairedQuantity) > 0) {
-      const metrics = calculatePairMetrics(settled.position);
-      const paired = Number(settled.position.pairedQuantity);
-      const grossLockedEdge = 1 - Number(settled.position.combinedPairCost);
-      const netRealizedEdge = paired > 0 ? Number(metrics.netPairEdge) / paired : Number(metrics.netPairEdge);
-      await this.safeAppend(createJournalEvent({
-        traceId: settled.position.id, type: "PAIR_REALIZED", aggregateType: "position", aggregateId: settled.position.id,
-        payload: {
-          marketId, pairedQuantity: settled.position.pairedQuantity, combinedPairCost: settled.position.combinedPairCost,
-          grossLockedEdge, netRealizedEdge, realizedEdge: netRealizedEdge,
-          fees: metrics.fees, experimentId: this.experiment?.id ?? null,
-        },
-      }));
-    }
-    await this.safeAppend(createJournalEvent({
-      traceId: this.experiment?.id ?? "paper", type: "PNL_SNAPSHOT", aggregateType: "ledger",
-      aggregateId: this.experiment?.id ?? "paper",
-      payload: { ...this.ledger.snapshot(), experimentId: this.experiment?.id ?? null, source: "SETTLEMENT" },
-    }));
-    this.record("POSITION_SETTLED", settled.position.id, marketId, { outcome: settled.outcome, realizedDelta: settled.realizedDelta }, asset);
-    this.metrics.openPositions.set(this.ledger.positions.size);
+      afterApply: async () => {
+        this.settlementBackoff.delete(marketId);
+        if (!positionBefore) return;
+        const realizedDelta = settlementRealizedDelta(positionBefore, upPayoff, downPayoff);
+        const outcome = classifySettledOutcome(realizedDelta, positionBefore.totalFees);
+        this.record("POSITION_SETTLED", positionBefore.id, marketId, { outcome, realizedDelta }, asset);
+        this.metrics.openPositions.set(this.ledger.positions.size);
+      },
+    });
+  }
+
+  private buildSettlementDerivedAudit(input: {
+    marketId: string;
+    asset: string | null | undefined;
+    experimentId: string | null;
+    parsed: ReturnType<typeof parsePublicBinaryResolution>;
+    positionBefore: Position | undefined;
+    upPayoff: "0" | "1";
+    downPayoff: "0" | "1";
+    occurredAt: Date;
+    auth: Record<string, unknown>;
+  }): DerivedAuditRecord[] {
+    const { marketId, asset, experimentId, parsed, positionBefore, upPayoff, downPayoff, occurredAt, auth } = input;
+    const records: DerivedAuditRecord[] = [{
+      id: derivedAuditEventId("MARKET_RESOLUTION_OBSERVED", marketId),
+      type: "MARKET_RESOLUTION_OBSERVED",
+      aggregateType: "market",
+      aggregateId: marketId,
+      traceId: experimentId ?? marketId,
+      payload: { ...parsed, marketId, slug: auth.slug, experimentId },
+    }];
+    const projected = this.projectDerivedAudit(
+      {
+        operationKey: `settlement:${marketId}:${experimentId ?? "paper"}`,
+        type: "POSITION_SETTLED",
+        aggregateType: "position",
+        aggregateId: positionBefore?.id ?? marketId,
+        payload: auth,
+      },
+      occurredAt,
+      (state) => {
+        const extra: DerivedAuditRecord[] = [];
+        if (positionBefore) {
+          const cashDelta = settlementCashDelta(positionBefore, upPayoff, downPayoff);
+          const realizedDelta = settlementRealizedDelta(positionBefore, upPayoff, downPayoff);
+          const outcome = classifySettledOutcome(realizedDelta, positionBefore.totalFees);
+          const grossOutcome = classifySettledOutcome(realizedDelta, "0");
+          extra.push({
+            id: derivedAuditEventId("POSITION_SETTLED", marketId),
+            type: "POSITION_SETTLED",
+            aggregateType: "position",
+            aggregateId: positionBefore.id,
+            traceId: positionBefore.id,
+            payload: {
+              marketId, asset, cashDelta, realizedDelta,
+              upPayoff, downPayoff, winner: parsed.winner,
+              upQuantity: positionBefore.upQuantity, downQuantity: positionBefore.downQuantity,
+              feesUsd: positionBefore.totalFees, grossOutcome, outcome, experimentId,
+            },
+          });
+          extra.push({
+            id: derivedAuditEventId(outcome, marketId),
+            type: outcome,
+            aggregateType: "position",
+            aggregateId: positionBefore.id,
+            traceId: positionBefore.id,
+            payload: { marketId, realizedDelta, feesUsd: positionBefore.totalFees, grossOutcome, experimentId },
+          });
+          if (Number(positionBefore.pairedQuantity) > 0) {
+            const metrics = calculatePairMetrics(positionBefore);
+            const paired = Number(positionBefore.pairedQuantity);
+            const grossLockedEdge = 1 - Number(positionBefore.combinedPairCost);
+            const netRealizedEdge = paired > 0 ? Number(metrics.netPairEdge) / paired : Number(metrics.netPairEdge);
+            extra.push({
+              id: derivedAuditEventId("PAIR_REALIZED", marketId),
+              type: "PAIR_REALIZED",
+              aggregateType: "position",
+              aggregateId: positionBefore.id,
+              traceId: positionBefore.id,
+              payload: {
+                marketId, pairedQuantity: positionBefore.pairedQuantity, combinedPairCost: positionBefore.combinedPairCost,
+                grossLockedEdge, netRealizedEdge, realizedEdge: netRealizedEdge,
+                fees: metrics.fees, experimentId,
+              },
+            });
+          }
+        }
+        extra.push({
+          id: derivedAuditEventId("PNL_SNAPSHOT", `settlement:${marketId}`),
+          type: "PNL_SNAPSHOT",
+          aggregateType: "ledger",
+          aggregateId: experimentId ?? "paper",
+          traceId: experimentId ?? "paper",
+          payload: { ...state.ledger.snapshot(), experimentId, source: "SETTLEMENT", marketId },
+        });
+        return extra;
+      },
+    );
+    return [...records, ...projected];
   }
 
   private bumpSettlementBackoff(marketId: string): void {
@@ -1456,17 +2151,69 @@ export class EngineService {
       }
       prices[position.marketId] = { up: upMark ?? position.averageUpCost, down: downMark ?? position.averageDownCost };
     }
-    this.ledger.revalue(prices, this.nowFn().toISOString());
-    this.state.setLedger(this.ledger.snapshot());
-    await this.safeAppend(createJournalEvent({
-      traceId: this.experiment?.id ?? "paper", type: "PNL_SNAPSHOT", aggregateType: "ledger",
-      aggregateId: this.experiment?.id ?? "paper",
-      payload: {
-        ...this.ledger.snapshot(), experimentId: this.experiment?.id ?? null,
-        source: "MARK_TO_MARKET", unresolvedPositionCount: unresolvedCount, markToMarket: true,
+    const occurredAt = this.nowFn();
+    const aggregateId = this.experiment?.id ?? "paper";
+    await this.commitAuthoritative({
+      operationKey: `mtm:${aggregateId}`,
+      type: "LEDGER_MARK_TO_MARKET",
+      aggregateType: "ledger",
+      aggregateId,
+      occurredAt,
+      buildPayload: (at) => {
+        const auth = { prices, markedAt: at.toISOString(), unresolvedPositionCount: unresolvedCount };
+        return {
+          ...auth,
+          derivedAudit: this.projectDerivedAudit(
+            { operationKey: `mtm:${aggregateId}`, type: "LEDGER_MARK_TO_MARKET", aggregateType: "ledger", aggregateId, payload: auth },
+            at,
+            (projected) => [
+              {
+                id: derivedAuditEventId("LEDGER_MARK_TO_MARKET", aggregateId),
+                type: "LEDGER_MARK_TO_MARKET",
+                aggregateType: "ledger",
+                aggregateId,
+                traceId: aggregateId,
+                payload: { ...auth, experimentId: this.experiment?.id ?? null },
+              },
+              {
+                id: derivedAuditEventId("PNL_SNAPSHOT", `mtm:${aggregateId}`),
+                type: "PNL_SNAPSHOT",
+                aggregateType: "ledger",
+                aggregateId,
+                traceId: aggregateId,
+                payload: {
+                  ...projected.ledger.snapshot(), experimentId: this.experiment?.id ?? null,
+                  source: "MARK_TO_MARKET", unresolvedPositionCount: unresolvedCount, markToMarket: true,
+                },
+              },
+            ],
+          ),
+        };
       },
-    }));
+    });
     return true;
+  }
+
+  private async commitExperimentStatus(next: ExperimentManifest): Promise<void> {
+    const type = next.status === "ENTRY_CLOSED" ? "EXPERIMENT_ENTRY_CLOSED"
+      : next.status === "COMPLETED" ? "EXPERIMENT_COMPLETED"
+      : null;
+    if (!type) {
+      this.experiment = next;
+      this.syncExperimentWindow();
+      return;
+    }
+    await this.commitAuthoritative({
+      operationKey: `experiment:${next.id}:${next.status === "ENTRY_CLOSED" ? "entry_closed" : "completed"}`,
+      type,
+      aggregateType: "experiment",
+      aggregateId: next.id,
+      buildPayload: () => ({
+        experiment: next,
+        derivedAudit: [this.experimentDerivedAudit(type, next)],
+      }),
+      checkpoint: true,
+    });
   }
 
   private async writeFinalReport(): Promise<void> {
