@@ -29,6 +29,7 @@ export interface McpDependencies {
   metrics: EngineMetrics;
   submitSignal(signal: GrokSignalSubmission, clientId: string): Promise<Record<string, unknown>>;
   noteMcpRequest?(tool: string | null, triggerId?: string): void;
+  heavyRead?<T>(work: () => Promise<T>): Promise<T>;
 }
 
 type AuthResult = { ok: true; clientId: string; tokenFingerprint: string } | { ok: false; status: 401 | 503; reason: string; tokenFingerprint: string | null };
@@ -306,8 +307,12 @@ export function createGrokMcpServer(clientId: string, dependencies: McpDependenc
       to: completedAt ? new Date(completedAt) : undefined,
     };
     const scan = scope === "complete"
-      ? await queryEventsPaged(dependencies.journal, { types: DECISION_EVENT_TYPES, ...window })
-      : { events: await dependencies.journal.queryEvents({ types: DECISION_EVENT_TYPES, ...window, limit: 500, order: "desc" }), complete: true, truncated: false };
+      ? await (dependencies.heavyRead
+        ? dependencies.heavyRead(() => queryEventsPaged(dependencies.journal, { types: DECISION_EVENT_TYPES, ...window }))
+        : queryEventsPaged(dependencies.journal, { types: DECISION_EVENT_TYPES, ...window }))
+      : { events: await (dependencies.heavyRead
+        ? dependencies.heavyRead(() => dependencies.journal.queryEvents({ types: DECISION_EVENT_TYPES, ...window, limit: 500, order: "desc" as const }))
+        : dependencies.journal.queryEvents({ types: DECISION_EVENT_TYPES, ...window, limit: 500, order: "desc" })), complete: true, truncated: false };
     const scoped = filterCurrentExperimentEvents(scan.events, {
       id: experimentId, startedAt, completedAt,
     });

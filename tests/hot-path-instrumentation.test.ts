@@ -331,8 +331,8 @@ describe("processTrigger and journal in-flight gauges return to zero", () => {
   });
 });
 
-describe("discovery overlap is observed and not prevented", () => {
-  it("increments overlap while both refreshes complete", async () => {
+describe("discovery single-flight coalesces concurrent refreshes", () => {
+  it("keeps concurrency at 1 and records coalesced+dirty instead of overlap", async () => {
     let release!: () => void;
     const hold = new Promise<void>((resolve) => { release = resolve; });
     const market = new DelayedDiscoveryAdapter();
@@ -348,8 +348,10 @@ describe("discovery overlap is observed and not prevented", () => {
     const starting = engine.start();
     await waitFor(async () => (await metricValue(engine.metrics, "discovery_refresh_in_flight")) === 1);
     const second = engine.reconcileDiscovery();
-    await waitFor(async () => (await metricValue(engine.metrics, "discovery_refresh_overlap_total")) >= 1);
-    expect(await metricValue(engine.metrics, "discovery_refresh_in_flight")).toBe(2);
+    await waitFor(async () => (await metricValue(engine.metrics, "discovery_singleflight_coalesced_total")) >= 1);
+    expect(await metricValue(engine.metrics, "discovery_refresh_in_flight")).toBe(1);
+    expect(await metricValue(engine.metrics, "discovery_refresh_overlap_total")).toBe(0);
+    expect(await metricValue(engine.metrics, "discovery_singleflight_dirty")).toBe(1);
     release();
     await Promise.all([starting, second]);
     expect(market.completed).toBe(2);

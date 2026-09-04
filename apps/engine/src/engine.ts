@@ -61,7 +61,7 @@ import {
   type FeedConnectionEvent,
   type PolymarketFeedAnomaly,
 } from "@pm/market-data";
-import { EngineMetrics } from "./metrics.js";
+import { EngineMetrics, classifyJournalMetricClass } from "./metrics.js";
 import { SseHub } from "./server.js";
 import { EngineStateStore } from "./state.js";
 import { buildExperimentSummary, filterCurrentExperimentEvents, writeExperimentSummary } from "./report.js";
@@ -69,6 +69,22 @@ import { GrokActivationCoordinator, persistableActivation } from "./activation/c
 import { createGrokActivationBridge } from "./activation/index.js";
 import { BoundedJournalWriter } from "./journal-writer.js";
 import { evaluateExperimentPreflight, isGenuineEntryQualifiedMarket } from "./preflight.js";
+import {
+  DirectJournalAdmission,
+  FiniteSemaphore,
+  JournalAdmissionRejected,
+  OverloadLatch,
+  RUNTIME_BOUNDS,
+  RuntimeSupervisor,
+  SingleFlight,
+  isCriticalPersistenceType,
+  isRiskHedgeSettlementKind,
+  remapTriggerRejection,
+  triggerWorkKey,
+  triggerWorkLane,
+  type AdmitResult,
+  type JoinResult,
+} from "./runtime-supervisor.js";
 
 export class EngineService {
   readonly metrics = new EngineMetrics();
@@ -120,7 +136,19 @@ export class EngineService {
   private lastScheduledReviewAt = 0;
   private lastAnomalyJournalAt = 0;
   private reportGenerated = false;
-  private discoveryInFlight = 0;
+  private readonly supervisor: RuntimeSupervisor;
+  private readonly journalAdmission: DirectJournalAdmission;
+  private readonly overload = new OverloadLatch();
+  private readonly discoveryFlight: SingleFlight;
+  private readonly maintenanceFlight: SingleFlight;
+  private readonly heavyRead: FiniteSemaphore;
+  private readonly shutdownJoinDeadlineMs: number;
+  private lastShutdown: JoinResult | null = null;
+  private lastJournalShutdown: JoinResult | null = null;
+  private lastShutdownCheckpointed = false;
+  private maintenanceHold: Promise<void> | null = null;
+  private processTriggerHold: Promise<void> | null = null;
+  private discoveryGenerationApplied = 0;
 
   constructor(
     readonly env: EngineEnv,
@@ -133,6 +161,7 @@ export class EngineService {
       referenceRegistry?: ReferenceFeedRegistry;
       now?: () => Date;
       resolutionFetcher?: (idOrSlug: string) => Promise<Record<string, unknown> | null>;
+      shutdownJoinDeadlineMs?: number;
     },
   ) {
     this.env = env;
@@ -153,9 +182,26 @@ export class EngineService {
       createRestProbe(env.REFERENCE_REST_BASE_URL),
     );
     this.resolutionFetcher = adapters?.resolutionFetcher ?? ((id) => this.marketAdapter.fetchPublicMarket(id));
-    this.writer = new BoundedJournalWriter(journal, (up) => { this.state.database = up ? "UP" : "DOWN"; }, logger, {
+    this.writer = new BoundedJournalWriter(journal, (up) => {
+      if (up) this.state.database = "UP";
+      else this.notePersistenceOutcome("EXPERIMENT_STARTED", false);
+    }, logger, {
       queueLimit: env.TELEMETRY_QUEUE_LIMIT, batchSize: env.TELEMETRY_BATCH_SIZE, sampleEvery: 20, maxConcurrent: 2,
+      onTelemetryDegraded: (degraded) => { this.state.telemetryDegraded = degraded; },
     }, this.metrics);
+    this.shutdownJoinDeadlineMs = adapters?.shutdownJoinDeadlineMs ?? RUNTIME_BOUNDS.shutdownJoinDeadlineMs;
+    this.supervisor = new RuntimeSupervisor(this.metrics.runtimeWorkMetrics(), () => this.syncRuntimeState());
+    this.journalAdmission = new DirectJournalAdmission(this.metrics.journalAdmissionMetrics(), () => this.syncRuntimeState());
+    this.heavyRead = new FiniteSemaphore(RUNTIME_BOUNDS.heavyRead.concurrency, RUNTIME_BOUNDS.heavyRead.waiting);
+    this.discoveryFlight = new SingleFlight({
+      onCoalesced: () => this.metrics.discoverySingleflightCoalesced.inc(),
+      onDirty: (dirty) => this.metrics.discoverySingleflightDirty.set(dirty ? 1 : 0),
+      onInFlight: (n) => this.metrics.discoveryRefreshInFlight.set(n),
+    });
+    this.maintenanceFlight = new SingleFlight({
+      onCoalesced: () => this.metrics.maintenanceSingleflightCoalesced.inc(),
+      onDirty: (dirty) => this.metrics.maintenanceSingleflightDirty.set(dirty ? 1 : 0),
+    });
     this.activation = new GrokActivationCoordinator(
       adapters?.activation ?? createGrokActivationBridge(env),
       {
@@ -181,7 +227,7 @@ export class EngineService {
       this.state.setDiscoveryLoopActive(false);
     } else {
       this.state.setDiscoveryLoopActive(true);
-      await this.refreshDiscovery();
+      await this.runDiscovery();
     }
     this.startMarketLoop();
     if (this.legacyBtcAdapter) {
@@ -194,10 +240,10 @@ export class EngineService {
       await this.reconcileReferenceFeeds();
     }
 
-    this.maintenanceTimer = setInterval(() => { void this.maintainExperiment(); }, 60_000);
+    this.maintenanceTimer = setInterval(() => { void this.runMaintenance(); }, 60_000);
     this.maintenanceTimer.unref();
     if (configuredTokens.length === 0) {
-      this.discoveryTimer = setInterval(() => { void this.refreshDiscovery().catch((error) => this.logger.error({ err: error }, "discovery refresh failed")); }, this.env.DISCOVERY_INTERVAL_MS);
+      this.discoveryTimer = setInterval(() => { void this.runDiscovery().catch((error) => this.logger.error({ err: error }, "discovery refresh failed")); }, this.env.DISCOVERY_INTERVAL_MS);
       this.discoveryTimer.unref();
     }
     this.updateReady();
@@ -212,19 +258,44 @@ export class EngineService {
     if (this.state.draining) return;
     this.state.draining = true;
     this.state.ready = false;
+    this.lastShutdownCheckpointed = false;
+    this.supervisor.closeAdmission();
     this.record("ENGINE_DRAINING", this.experiment?.id ?? "engine", null, {});
     this.abort.abort("SIGTERM");
     for (const timer of this.referenceRetryTimers.values()) clearTimeout(timer);
     this.referenceRetryTimers.clear();
     if (this.maintenanceTimer) clearInterval(this.maintenanceTimer);
+    this.maintenanceTimer = null;
     if (this.discoveryTimer) clearInterval(this.discoveryTimer);
+    this.discoveryTimer = null;
     if (this.experiment?.status === "RUNNING" || this.experiment?.status === "ENTRY_CLOSED") {
       this.accrueInfrastructureCost();
     }
-    await this.checkpoint();
+    const deadline = this.shutdownJoinDeadlineMs;
+    const started = Date.now();
+    this.lastShutdown = await this.supervisor.join(deadline);
+    this.journalAdmission.closeAdmission();
+    const remaining = Math.max(0, deadline - (Date.now() - started));
+    this.lastJournalShutdown = await this.journalAdmission.join(remaining);
+    const cleanDrain = Boolean(
+      this.lastShutdown.drained
+      && this.lastJournalShutdown.drained
+      && !this.lastShutdown.timedOut
+      && !this.lastJournalShutdown.timedOut
+      && this.state.database === "UP"
+      && !this.overload.hasIntegrityFault,
+    );
+    if (cleanDrain) {
+      await this.checkpoint();
+      this.lastShutdownCheckpointed = true;
+    }
     this.sse.close();
     await this.journal.close();
-    this.record("ENGINE_STOPPED", this.experiment?.id ?? "engine", null, {});
+    this.record("ENGINE_STOPPED", this.experiment?.id ?? "engine", null, {
+      unresolvedOwnedWork: (this.lastShutdown.unresolved ?? 0) + (this.lastJournalShutdown.unresolved ?? 0),
+      shutdownTimedOut: this.lastShutdown.timedOut || this.lastJournalShutdown.timedOut,
+      checkpointed: this.lastShutdownCheckpointed,
+    });
   }
 
   noteMcpRequest(tool: string | null, triggerId?: string): void {
@@ -235,7 +306,7 @@ export class EngineService {
   }
 
   /** Public so tests and the discovery timer can reconcile live subscriptions. */
-  async reconcileDiscovery(): Promise<void> { await this.refreshDiscovery(); }
+  async reconcileDiscovery(): Promise<void> { await this.runDiscovery(); }
   subscribedTokenIds(): string[] { return [...this.tokenIds]; }
   runningReferenceAssets(): string[] { return this.referenceRegistry.runningAssets(); }
   entryQualifiedIds(): string[] { return [...this.entryQualified]; }
@@ -246,7 +317,7 @@ export class EngineService {
   activationFootprint() { return this.activation.footprint(); }
   restingOrderCount() { return this.restingOrders.size; }
   reservedCash() { return this.ledger.snapshot().reservedCash; }
-  async tickMaintenance(): Promise<void> { await this.maintainExperiment(); }
+  async tickMaintenance(): Promise<void> { await this.runMaintenance(); }
   async applyObservedFill(fill: Parameters<PaperLedger["applyFill"]>[0]): Promise<void> { await this.applyFill(fill); }
   async restMakerForTest(order: PaperOrder, snapshot: MarketSnapshot): Promise<void> {
     const notional = makerReserveNotional(order.quantity, order.requestedPrice, snapshot.feeSchedule);
@@ -266,6 +337,10 @@ export class EngineService {
     }
     if (this.experiment?.status === "COMPLETED" || this.experiment?.status === "FAILED") {
       return { ok: false, blockers: ["EXPERIMENT_ALREADY_COMPLETED"], experiment: this.experiment };
+    }
+    if (!this.state.newPaperEntryAllowed() || this.overload.state === "FAIL_CLOSED") {
+      const preflight = this.preflight("48H_GROK_PAPER_EXPERIMENT");
+      return { ...preflight, ok: false, blockers: [...new Set([...preflight.blockers, "OVERLOAD_FAIL_CLOSED"])] };
     }
     const preflight = this.preflight("48H_GROK_PAPER_EXPERIMENT");
     await this.safeAppend(createJournalEvent({
@@ -302,6 +377,7 @@ export class EngineService {
       tokenConfiguredPath: this.tokenIds.length > 0,
       mcpRoleTokens: this.env.GROK_MCP_BEARER_TOKENS.split(",").map((entry) => entry.trim().split(":")[0] ?? "").filter(Boolean),
       mode,
+      overloadFailClosed: this.overload.state === "FAIL_CLOSED",
       entryMarkets: [...this.entryQualified].map((marketId) => {
         const market = this.marketsById.get(marketId);
         const asset = this.assetByMarket.get(marketId) ?? market?.asset ?? null;
@@ -336,12 +412,23 @@ export class EngineService {
     }, this.abort.signal).catch((error) => this.logger.error({ err: error }, "polymarket market loop stopped"));
   }
 
-  private async refreshDiscovery(): Promise<void> {
-    if (this.discoveryInFlight > 0) this.metrics.discoveryRefreshOverlap.inc();
-    this.discoveryInFlight += 1;
-    this.metrics.discoveryRefreshInFlight.set(this.discoveryInFlight);
+  private async runDiscovery(): Promise<void> {
+    await this.discoveryFlight.trigger(async (generation) => {
+      await this.refreshDiscovery(generation);
+    });
+  }
+
+  private async runMaintenance(): Promise<void> {
+    await this.maintenanceFlight.trigger(async () => {
+      if (this.maintenanceHold) await this.maintenanceHold;
+      await this.maintainExperiment();
+    });
+  }
+
+  private async refreshDiscovery(generation = this.discoveryFlight.currentGeneration): Promise<void> {
     this.metrics.discoveryRefreshAttempts.inc();
     const started = performance.now();
+    const previousStatus = this.state.discoveryStatus;
     try {
     this.state.setDiscoveryStatus("RECONCILING", this.marketsById.size);
     const report = await this.marketAdapter.discoverCryptoMarkets(
@@ -349,6 +436,7 @@ export class EngineService {
       this.env.MAX_QUALIFIED_MARKETS,
       qualificationConfigSchema.parse({ maxQualifiedMarkets: this.env.MAX_QUALIFIED_MARKETS }),
     );
+    if (generation < this.discoveryGenerationApplied) return;
     const previousMarketIds = new Set(this.marketsById.keys());
     const previousAssets = new Set([...this.assetByMarket.values()].filter((asset): asset is string => Boolean(asset)));
     const previousTokens = [...this.tokenIds];
@@ -409,10 +497,12 @@ export class EngineService {
     if (!this.legacyBtcAdapter) await this.reconcileReferenceFeeds();
     this.metrics.discoveryMarketsInspected.observe(report.discovered.length);
     this.metrics.discoveryQualified.observe(report.qualified.length);
+    this.discoveryGenerationApplied = generation;
+    } catch (error) {
+      this.state.setDiscoveryStatus(previousStatus, this.entryQualified.size);
+      throw error;
     } finally {
       this.metrics.discoveryRefreshDuration.observe((performance.now() - started) / 1000);
-      this.discoveryInFlight = Math.max(0, this.discoveryInFlight - 1);
-      this.metrics.discoveryRefreshInFlight.set(this.discoveryInFlight);
     }
   }
 
@@ -662,7 +752,7 @@ export class EngineService {
     }
 
     const triggers = this.triggerEngine.ingestMarket(snapshot);
-    for (const trigger of triggers) void this.processTrigger(trigger);
+    for (const trigger of triggers) this.admitTrigger(trigger);
     const window = this.marketsById.get(snapshot.marketId);
     if (window?.endDate) this.triggerEngine.noteMarketWindow(snapshot.marketId, snapshot.asset ?? window.asset, window.endDate);
     this.state.eventLatencyMs = performance.now() - started;
@@ -682,29 +772,74 @@ export class EngineService {
     }
     this.updateReady();
     await this.writer.persist(createJournalEvent({ traceId: tick.traceId, type: "REFERENCE_TICK", aggregateType: "reference", aggregateId: tick.asset, payload: tick, occurredAt: new Date(tick.sourceTimestamp), sourceEventId: tick.eventId }));
-    for (const trigger of this.triggerEngine.ingestReference(tick)) void this.processTrigger(trigger);
+    for (const trigger of this.triggerEngine.ingestReference(tick)) this.admitTrigger(trigger);
     this.metrics.referenceTickProcessingDuration.observe((performance.now() - started) / 1000);
   }
 
-  private async processTrigger(trigger: TriggerEvent): Promise<void> {
+  private admitTrigger(trigger: TriggerEvent): AdmitResult {
+    const lane = triggerWorkLane(trigger.kind);
+    const result = this.supervisor.admit({
+      id: trigger.id,
+      lane,
+      key: triggerWorkKey(trigger),
+      estimatedBytes: RUNTIME_BOUNDS.triggerByteEstimate,
+      critical: lane === "p0",
+      run: async (signal) => {
+        if (signal.aborted) return;
+        await this.processTrigger(trigger, signal);
+      },
+    });
+    if (!result.admitted) {
+      const reason = remapTriggerRejection(result.reason, { lane, experimentStatus: this.experiment?.status });
+      this.metrics.runtimeWorkRejected.inc({ lane, reason });
+      this.syncRuntimeState();
+      return { admitted: false, reason, done: result.done };
+    }
+    this.syncRuntimeState();
+    return result;
+  }
+
+  private syncRuntimeState(): void {
+    if (!this.supervisor || !this.journalAdmission) return;
+    const snap = this.supervisor.snapshot();
+    this.state.queueDepth = snap.totalQueued + snap.totalInFlight;
+    this.metrics.queueDepth.set(this.state.queueDepth);
+    this.state.overloadState = this.overload.recompute({
+      p0Queued: snap.lanes.p0.queued,
+      p3Queued: snap.lanes.p3.queued,
+      journalWaiting: this.journalAdmission.waitingCount,
+      p0HardCapHit: snap.lanes.p0.queued >= RUNTIME_BOUNDS.trigger.p0.queueLimit,
+      p3HardCapDuringRunning: (this.experiment?.status === "RUNNING")
+        && snap.lanes.p3.queued >= RUNTIME_BOUNDS.trigger.p3.queueLimit,
+      reservedExhausted: !this.supervisor.criticalReservedAvailable()
+        && snap.lanes.p0.queued >= RUNTIME_BOUNDS.trigger.p0.queueLimit,
+    });
+  }
+
+  private notePersistenceOutcome(type: string, up: boolean): void {
+    if (isCriticalPersistenceType(type)) {
+      this.state.database = up ? "UP" : "DOWN";
+      if (!up) this.updateReady();
+    } else {
+      this.state.journalDegraded = !up;
+    }
+    this.syncRuntimeState();
+  }
+
+  private async processTrigger(trigger: TriggerEvent, signal?: AbortSignal): Promise<void> {
     this.metrics.noteProcessTriggerStart();
     const started = performance.now();
     try {
-    if (this.state.draining) return;
-    this.state.queueDepth += 1;
-    this.metrics.queueDepth.set(this.state.queueDepth);
+    if (signal?.aborted) return;
+    if (this.processTriggerHold) await this.processTriggerHold;
+    if (signal?.aborted) return;
     this.metrics.triggers.inc({ kind: trigger.kind, severity: String(trigger.severity) });
     this.record(`TRIGGER_LEVEL_${trigger.severity}`, trigger.traceId, trigger.marketId, { triggerId: trigger.id, kind: trigger.kind, asset: trigger.asset ?? null }, trigger.asset ?? null);
-    await this.safeAppend(createJournalEvent({ traceId: trigger.traceId, type: "TRIGGER_EVENT", aggregateType: "trigger", aggregateId: trigger.id, payload: trigger, sourceEventId: trigger.sourceEventIds[0] ?? null }));
-    try {
-      this.activeTriggers.set(trigger.id, trigger);
-      this.state.addTrigger(trigger);
-      this.record("GROK_RESEARCH_AVAILABLE", trigger.traceId, trigger.marketId, { triggerId: trigger.id, expiresAt: trigger.expiresAt }, trigger.asset ?? null);
-      await this.requestActivation(trigger);
-    } finally {
-      this.state.queueDepth -= 1;
-      this.metrics.queueDepth.set(this.state.queueDepth);
-    }
+    await this.safeAppend(createJournalEvent({ traceId: trigger.traceId, type: "TRIGGER_EVENT", aggregateType: "trigger", aggregateId: trigger.id, payload: trigger, sourceEventId: trigger.sourceEventIds[0] ?? null }), signal);
+    this.activeTriggers.set(trigger.id, trigger);
+    this.state.addTrigger(trigger);
+    this.record("GROK_RESEARCH_AVAILABLE", trigger.traceId, trigger.marketId, { triggerId: trigger.id, expiresAt: trigger.expiresAt }, trigger.asset ?? null);
+    await this.requestActivation(trigger);
     } finally {
       this.metrics.noteProcessTriggerEnd(started);
     }
@@ -818,7 +953,10 @@ export class EngineService {
   }
 
   /** Public for deterministic trigger ingestion and focused integration tests. */
-  async registerTriggerForResearch(trigger: TriggerEvent): Promise<void> { await this.processTrigger(triggerEventSchema.parse(trigger)); }
+  async registerTriggerForResearch(trigger: TriggerEvent): Promise<void> {
+    const result = this.admitTrigger(triggerEventSchema.parse(trigger));
+    if (result.admitted) await result.done;
+  }
 
   private async evaluateExternalConsensus(trigger: TriggerEvent): Promise<void> {
     const outputs = [...(this.signalsByTrigger.get(trigger.id)?.values() ?? [])];
@@ -836,7 +974,7 @@ export class EngineService {
     this.state.latestConsensus = consensus;
     this.record("CONSENSUS_COMPLETE", trigger.traceId, trigger.marketId, { direction: consensus.consensusDirection, confidence: consensus.consensusConfidence, conflicts: consensus.conflicts, triggerId: trigger.id, estimatedEdgeIgnored: fair.estimatedEdge ?? null }, trigger.asset ?? null);
     await this.safeAppend(createJournalEvent({ traceId: trigger.traceId, type: "CONSENSUS_DECISION", aggregateType: "consensus", aggregateId: consensus.id, payload: { ...consensus, marketId: trigger.marketId, asset: trigger.asset ?? null } }));
-    for (const disagreement of this.triggerEngine.ingestConsensus(consensus, trigger.marketId, trigger.asset ?? null)) void this.processTrigger(disagreement);
+    for (const disagreement of this.triggerEngine.ingestConsensus(consensus, trigger.marketId, trigger.asset ?? null)) this.admitTrigger(disagreement);
     if (trigger.marketId) await this.evaluateTrade(trigger, consensus, outputs);
   }
 
@@ -851,6 +989,7 @@ export class EngineService {
       maxOrderSizeUsd: this.riskLimits.maxOrderSizeUsd, minimumLockedPairEdge: this.riskLimits.minExpectedEdge,
     });
     if (!candidate) return;
+    if (candidate.intent === "OPEN_FIRST_LEG" && this.overload.state === "FAIL_CLOSED") return;
     if (candidate.intent === "OPEN_FIRST_LEG" && !experimentAllowsFirstLeg(this.experiment)) return;
     if (candidate.intent === "OPEN_FIRST_LEG" && !this.entryQualified.has(candidate.marketId)) return;
     if (candidate.intent === "HEDGE_SECOND_LEG" && !experimentAllowsHedge(this.experiment)) return;
@@ -945,6 +1084,7 @@ export class EngineService {
       await this.applyFill(executePaperTaker({ order, snapshotAfterLatency: current, measuredLatencyMs: this.env.PAPER_EXECUTION_LATENCY_MS }));
       this.lastTradeAt = this.nowFn();
     } catch (error) {
+      if (this.overload.hasIntegrityFault || (error instanceof JournalAdmissionRejected && error.critical)) throw error;
       this.executionErrors.push(Date.now());
       this.record("PAPER_EXECUTION_ERROR", order.traceId, order.marketId, { orderId: order.id, message: error instanceof Error ? error.message : String(error) });
       await this.safeAppend(createJournalEvent({ traceId: order.traceId, type: "PAPER_EXECUTION_ERROR", aggregateType: "paper_order", aggregateId: order.id, payload: { message: error instanceof Error ? error.message : String(error) } }));
@@ -961,7 +1101,7 @@ export class EngineService {
     void this.safeAppend(createJournalEvent({
       traceId: orderId, type: "PAPER_MAKER_RELEASED", aggregateType: "paper_order", aggregateId: orderId,
       payload: { orderId, released: String(remaining), experimentId: this.experiment?.id ?? null },
-    }));
+    })).catch(() => undefined);
   }
 
   private async applyFill(fill: Parameters<PaperLedger["applyFill"]>[0]): Promise<void> {
@@ -1006,7 +1146,7 @@ export class EngineService {
     await this.safeAppend(createJournalEvent({ traceId: fill.traceId, type: "POSITION_UPDATED", aggregateType: "position", aggregateId: position.id, payload: position, sourceEventId: fill.id }));
     await this.safeAppend(createJournalEvent({ traceId: fill.traceId, type: "PNL_SNAPSHOT", aggregateType: "ledger", aggregateId: this.experiment?.id ?? "paper", payload: { ...this.ledger.snapshot(), experimentId: this.experiment?.id ?? null } }));
     for (const trigger of this.triggerEngine.ingestPosition(position, fill.traceId, this.assetByMarket.get(fill.marketId) ?? null)) {
-      void this.processTrigger(trigger);
+      this.admitTrigger(trigger);
     }
   }
 
@@ -1083,16 +1223,37 @@ export class EngineService {
     this.sse.publish("snapshot", () => this.state.snapshot());
   }
 
-  private async safeAppend(event: ReturnType<typeof createJournalEvent>): Promise<void> {
+  private async safeAppend(event: ReturnType<typeof createJournalEvent>, signal?: AbortSignal): Promise<void> {
+    const critical = isCriticalPersistenceType(event.type);
+    const journalClass = classifyJournalMetricClass(event.type);
     try {
-      await this.metrics.observeDirectJournal(event.type, async () => {
-        await this.journal.append(event);
-        this.state.database = "UP";
-      });
+      await this.journalAdmission.run(journalClass, critical, async () => {
+        if (signal?.aborted) throw new JournalAdmissionRejected(journalClass, critical, "JOURNAL_ADMISSION_CLOSED");
+        await this.metrics.observeDirectJournal(event.type, async () => {
+          await this.journal.append(event);
+          if (critical) this.state.database = "UP";
+        });
+      }, signal);
+      if (!critical) this.state.journalDegraded = false;
     } catch (error) {
-      this.state.database = "DOWN";
+      if (critical) {
+        this.overload.markIntegrityFault();
+        this.state.overloadState = "FAIL_CLOSED";
+        if (!(error instanceof JournalAdmissionRejected)) this.state.database = "DOWN";
+        this.updateReady();
+        this.syncRuntimeState();
+        this.logger.error(
+          { err: error, traceId: event.traceId, admitted: !(error instanceof JournalAdmissionRejected) },
+          error instanceof JournalAdmissionRejected ? "critical journal admission rejected" : "critical journal append failed",
+        );
+        throw error;
+      }
+      this.notePersistenceOutcome(event.type, false);
       this.updateReady();
-      this.logger.error({ err: error, traceId: event.traceId }, "journal append failed");
+      this.logger.error(
+        { err: error, traceId: event.traceId, admitted: !(error instanceof JournalAdmissionRejected) },
+        error instanceof JournalAdmissionRejected ? "journal admission rejected" : "journal append failed",
+      );
     }
   }
 
@@ -1173,14 +1334,14 @@ export class EngineService {
     const status = this.experiment?.status;
     if (status === "IDLE" || status === "COMPLETED" || status === "FAILED" || status == null) return;
     const triggers = this.triggerEngine.ingestScheduledReview(this.experiment?.id ?? createId("review"));
-    for (const trigger of triggers) void this.processTrigger(trigger);
+    for (const trigger of triggers) this.admitTrigger(trigger);
   }
 
   private async pollFailedHedges(): Promise<void> {
     for (const position of this.ledger.positions.values()) {
       if (Number(position.unpairedQuantity) <= 0) continue;
       for (const trigger of this.triggerEngine.ingestPosition(position, position.id, this.assetByMarket.get(position.marketId) ?? null)) {
-        void this.processTrigger(trigger);
+        this.admitTrigger(trigger);
       }
     }
   }
@@ -1310,13 +1471,14 @@ export class EngineService {
 
   private async writeFinalReport(): Promise<void> {
     if (!this.experiment || this.reportGenerated) return;
+    const experiment = this.experiment;
     try {
-      const scan = await queryEventsPaged(this.journal, {
+      const scan = await this.heavyRead.run(() => queryEventsPaged(this.journal, {
         types: [...DECISION_EVENT_TYPES],
-        from: this.experiment.startedAt ? new Date(this.experiment.startedAt) : undefined,
-        to: this.experiment.completedAt ? new Date(this.experiment.completedAt) : this.nowFn(),
-      });
-      const events = filterCurrentExperimentEvents(scan.events, this.experiment);
+        from: experiment.startedAt ? new Date(experiment.startedAt) : undefined,
+        to: experiment.completedAt ? new Date(experiment.completedAt) : this.nowFn(),
+      }));
+      const events = filterCurrentExperimentEvents(scan.events, experiment);
       const unresolved = [...this.ledger.positions.values()].filter((position) => Number(position.upQuantity) > 0 || Number(position.downQuantity) > 0).length;
       const summary = buildExperimentSummary(events, this.experiment.id, {
         status: this.experiment.status,
@@ -1397,20 +1559,81 @@ export class EngineService {
   }
 
   pruneRuntimeBookkeepingForTest(): void { this.pruneRuntimeBookkeeping(); }
+
+  runtimeSupervisorSnapshot() { return this.supervisor.snapshot(); }
+  journalAdmissionSnapshot() {
+    return {
+      active: this.journalAdmission.activeCount,
+      activeCritical: this.journalAdmission.activeCriticalCount,
+      activeNoncritical: this.journalAdmission.activeNoncriticalCount,
+      waiting: this.journalAdmission.waitingCount,
+      criticalWaiting: this.journalAdmission.criticalWaitingCount,
+      noncriticalWaiting: this.journalAdmission.noncriticalWaitingCount,
+      closed: this.journalAdmission.admissionClosed,
+      criticalRejects: this.journalAdmission.criticalRejectionCount,
+    };
+  }
+  overloadState() { return this.overload.state; }
+  integrityFault() { return this.overload.hasIntegrityFault; }
+  lastShutdownResult() {
+    return { work: this.lastShutdown, journal: this.lastJournalShutdown, checkpointed: this.lastShutdownCheckpointed };
+  }
+  discoveryFlightSnapshot() {
+    const coalescing = this.discoveryFlight.coalescingState();
+    return {
+      inFlight: this.discoveryFlight.inFlight,
+      dirty: this.discoveryFlight.dirty,
+      coalesced: this.discoveryFlight.coalesced,
+      attempts: this.discoveryFlight.attempts,
+      committed: this.discoveryFlight.committed,
+      retainedSharedCycles: coalescing.retainedSharedCycles,
+      retainedWaiters: coalescing.retainedWaiters,
+    };
+  }
+  maintenanceFlightSnapshot() {
+    const coalescing = this.maintenanceFlight.coalescingState();
+    return {
+      inFlight: this.maintenanceFlight.inFlight,
+      dirty: this.maintenanceFlight.dirty,
+      coalesced: this.maintenanceFlight.coalesced,
+      attempts: this.maintenanceFlight.attempts,
+      retainedSharedCycles: coalescing.retainedSharedCycles,
+      retainedWaiters: coalescing.retainedWaiters,
+    };
+  }
+  setMaintenanceHoldForTest(hold: Promise<void> | null): void { this.maintenanceHold = hold; }
+  setProcessTriggerHoldForTest(hold: Promise<void> | null): void { this.processTriggerHold = hold; }
+  async persistEventForTest(event: ReturnType<typeof createJournalEvent>): Promise<void> {
+    await this.safeAppend(event);
+  }
+  enqueueTriggerStormForTest(triggers: TriggerEvent[]): { admitted: number; rejected: number; reasons: Record<string, number> } {
+    let admitted = 0;
+    let rejected = 0;
+    const reasons: Record<string, number> = {};
+    for (const trigger of triggers) {
+      const result = this.admitTrigger(trigger);
+      if (result.admitted) admitted += 1;
+      else {
+        rejected += 1;
+        const reason = result.reason ?? "queue_full";
+        reasons[reason] = (reasons[reason] ?? 0) + 1;
+      }
+    }
+    return { admitted, rejected, reasons };
+  }
+  criticalReservedAvailable(): boolean { return this.supervisor.criticalReservedAvailable(); }
+  heavyReadStats() { return { active: this.heavyRead.activeCount, waiting: this.heavyRead.waitingCount }; }
 }
 
 export function parseEnv(env: NodeJS.ProcessEnv): EngineEnv { return parseEngineEnv(env); }
+export { RUNTIME_BOUNDS } from "./runtime-supervisor.js";
 function splitList(value: string): string[] { return value.split(",").map((item) => item.trim()).filter(Boolean); }
 function uniqueStrings(values: readonly string[]): string[] { return [...new Set(values.filter(Boolean))]; }
 function dateOrNull(value: string | null | undefined): Date | null { return value ? new Date(value) : null; }
 function delay(ms: number): Promise<void> { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
-const RISK_HEDGE_SETTLEMENT_KINDS = new Set([
-  "FAILED_HEDGE", "DIRECTIONAL_EXPOSURE", "NEARING_EXPIRY", "SCHEDULED_REVIEW",
-]);
-
 export function isRiskHedgeSettlementTrigger(kind: string): boolean {
-  return RISK_HEDGE_SETTLEMENT_KINDS.has(kind);
+  return isRiskHedgeSettlementKind(kind);
 }
 
 export function collectMarketFeedAt(
