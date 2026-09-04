@@ -1,4 +1,4 @@
-import { boolean, index, integer, jsonb, numeric, pgTable, text, timestamp, uniqueIndex } from "drizzle-orm/pg-core";
+import { bigint, boolean, index, integer, jsonb, numeric, pgTable, text, timestamp, uniqueIndex } from "drizzle-orm/pg-core";
 
 const tracedColumns = {
   id: text("id").primaryKey(),
@@ -102,3 +102,18 @@ export const mcpIdempotencyKeys = pgTable("mcp_idempotency_keys", {
   scope: text("scope").notNull(), key: text("key").notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (table) => [uniqueIndex("mcp_idempotency_scope_key_idx").on(table.scope, table.key)]);
+
+export const durableTransitions = pgTable("durable_transitions", {
+  sequence: bigint("sequence", { mode: "number" }).generatedAlwaysAsIdentity().primaryKey(),
+  operationKey: text("operation_key").notNull(),
+  type: text("type").notNull(),
+  aggregateType: text("aggregate_type").notNull(),
+  aggregateId: text("aggregate_id").notNull(),
+  payloadHash: text("payload_hash").notNull(),
+  payload: jsonb("payload").notNull(),
+  occurredAt: timestamp("occurred_at", { withTimezone: true }).notNull(),
+  recordedAt: timestamp("recorded_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  uniqueIndex("durable_transitions_operation_key_uidx").on(table.operationKey),
+  index("durable_transitions_sequence_idx").on(table.sequence),
+]);

@@ -1,6 +1,8 @@
 import { performance } from "node:perf_hooks";
 import { Counter, Gauge, Histogram, Registry, collectDefaultMetrics } from "prom-client";
 import { triggerKindSchema, type TriggerEmitObserver } from "@pm/core";
+import { DURABLE_METRIC_TYPES, type DurableMetricType } from "@pm/db";
+import { RECOVERY_FAILURE_REASONS, type RecoveryFailureReason } from "./recovery.js";
 import { REJECTION_REASONS, WORK_LANES, type RejectionReason, type WorkLane } from "./runtime-supervisor.js";
 
 export const JOURNAL_METRIC_CLASSES = ["trigger", "activation", "consensus", "execution", "system"] as const;
@@ -8,7 +10,10 @@ export type JournalMetricClass = (typeof JOURNAL_METRIC_CLASSES)[number];
 
 export const TRIGGER_KIND_VALUES = triggerKindSchema.options;
 export const TRIGGER_SEVERITY_VALUES = ["0", "1", "2", "3"] as const;
-export const FORBIDDEN_METRIC_LABEL_NAMES = ["marketId", "tokenId", "traceId", "slug", "eventId", "market_id", "token_id", "trace_id"] as const;
+export const FORBIDDEN_METRIC_LABEL_NAMES = [
+  "marketId", "tokenId", "traceId", "slug", "eventId", "market_id", "token_id", "trace_id",
+  "operationKey", "positionId", "orderId", "fillId", "experimentId", "rawError",
+] as const;
 
 const DURATION_BUCKETS = [0.001, 0.005, 0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 1, 5];
 const BYTE_BUCKETS = [1_000, 10_000, 50_000, 100_000, 250_000, 500_000, 1_000_000, 2_000_000];
@@ -393,6 +398,65 @@ export class EngineMetrics {
     registers: [this.registry],
   });
 
+  readonly durableTransitionCommits = new Counter({
+    name: "durable_transition_commits_total",
+    help: "Replay-authoritative durable transition inserts",
+    labelNames: ["type"],
+    registers: [this.registry],
+  });
+  readonly durableTransitionIdempotentHits = new Counter({
+    name: "durable_transition_idempotent_hits_total",
+    help: "Same-key same-payload durable commit hits",
+    labelNames: ["type"],
+    registers: [this.registry],
+  });
+  readonly durableTransitionConflicts = new Counter({
+    name: "durable_transition_conflicts_total",
+    help: "Same-key different-payload/type durable conflicts",
+    labelNames: ["type"],
+    registers: [this.registry],
+  });
+  readonly durableTransitionCommitFailures = new Counter({
+    name: "durable_transition_commit_failures_total",
+    help: "Durable transition commit failures (no retry tree)",
+    labelNames: ["type"],
+    registers: [this.registry],
+  });
+  readonly durableTransitionLastAppliedSequence = new Gauge({
+    name: "durable_transition_last_applied_sequence",
+    help: "Last applied durable commit sequence in this process",
+    registers: [this.registry],
+  });
+  readonly recoveryReplayedTransitions = new Counter({
+    name: "recovery_replayed_transitions_total",
+    help: "Durable transitions applied during startup journal-tail replay",
+    labelNames: ["type"],
+    registers: [this.registry],
+  });
+  readonly recoveryDuration = new Histogram({
+    name: "recovery_duration_seconds",
+    help: "Startup checkpoint restore plus journal-tail replay duration",
+    buckets: DURATION_BUCKETS,
+    registers: [this.registry],
+  });
+  readonly recoveryFailures = new Counter({
+    name: "recovery_failures_total",
+    help: "Startup recovery FAIL_CLOSED outcomes (finite reasons only)",
+    labelNames: ["reason"],
+    registers: [this.registry],
+  });
+  readonly checkpointDurableCursor = new Gauge({
+    name: "checkpoint_durable_cursor",
+    help: "Durable journal cursor stored on the latest successful checkpoint",
+    registers: [this.registry],
+  });
+  readonly checkpointWrites = new Counter({
+    name: "checkpoint_writes_total",
+    help: "Checkpoint write attempts by finite status",
+    labelNames: ["status"],
+    registers: [this.registry],
+  });
+
   private eventLoopUtilizationPrevious = performance.eventLoopUtilization();
   private processTriggerInFlightCount = 0;
   private processTriggerPeakCount = 0;
@@ -422,6 +486,45 @@ export class EngineMetrics {
     this.journalDirectActiveCritical.set(0);
     this.journalDirectActiveNoncritical.set(0);
     this.journalDirectQueueOldestAge.set(0);
+    for (const type of DURABLE_METRIC_TYPES) {
+      this.durableTransitionCommits.inc({ type }, 0);
+      this.durableTransitionIdempotentHits.inc({ type }, 0);
+      this.durableTransitionConflicts.inc({ type }, 0);
+      this.durableTransitionCommitFailures.inc({ type }, 0);
+      this.recoveryReplayedTransitions.inc({ type }, 0);
+    }
+    for (const reason of RECOVERY_FAILURE_REASONS) this.recoveryFailures.inc({ reason }, 0);
+    this.checkpointWrites.inc({ status: "success" }, 0);
+    this.checkpointWrites.inc({ status: "fence" }, 0);
+    this.checkpointWrites.inc({ status: "failed" }, 0);
+    this.durableTransitionLastAppliedSequence.set(0);
+    this.checkpointDurableCursor.set(0);
+  }
+
+  noteDurableCommit(type: string, inserted: boolean): void {
+    const label = { type: type as DurableMetricType };
+    const bounded = DURABLE_METRIC_TYPES.includes(label.type) ? label : { type: "other" as const };
+    if (inserted) this.durableTransitionCommits.inc(bounded);
+    else this.durableTransitionIdempotentHits.inc(bounded);
+  }
+
+  noteDurableConflict(type: string): void {
+    const bounded = DURABLE_METRIC_TYPES.includes(type as DurableMetricType) ? { type: type as DurableMetricType } : { type: "other" as const };
+    this.durableTransitionConflicts.inc(bounded);
+  }
+
+  noteDurableCommitFailure(type: string): void {
+    const bounded = DURABLE_METRIC_TYPES.includes(type as DurableMetricType) ? { type: type as DurableMetricType } : { type: "other" as const };
+    this.durableTransitionCommitFailures.inc(bounded);
+  }
+
+  noteRecoveryReplay(type: string): void {
+    const bounded = DURABLE_METRIC_TYPES.includes(type as DurableMetricType) ? { type: type as DurableMetricType } : { type: "other" as const };
+    this.recoveryReplayedTransitions.inc(bounded);
+  }
+
+  noteRecoveryFailure(reason: RecoveryFailureReason): void {
+    this.recoveryFailures.inc({ reason });
   }
 
   triggerObserver(): TriggerEmitObserver {
