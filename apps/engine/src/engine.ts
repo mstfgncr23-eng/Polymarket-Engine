@@ -155,6 +155,7 @@ export class EngineService {
   private readonly durableGate = new DurableMutationGate();
   private readonly crashInjector = new CrashInjector();
   private recoveryPageSize = 256;
+  private readonly appliedOperationKeys = new Set<string>();
   private lastTradeAt: Date | null = null;
   private executionErrors: number[] = [];
   private timestampDisorder = false;
@@ -754,6 +755,7 @@ export class EngineService {
     const bag = this.recoverableBag();
     applyDurableTransition(bag, transition);
     this.adoptRecoveredBag(bag);
+    this.appliedOperationKeys.add(transition.operationKey);
   }
 
   private async commitAuthoritative(input: {
@@ -807,7 +809,10 @@ export class EngineService {
           recordedAt: this.nowFn().toISOString(),
         });
         this.lastAppliedDurableCursor = commit.sequence;
+        this.appliedOperationKeys.add(input.operationKey);
         this.metrics.durableTransitionLastAppliedSequence.set(this.lastAppliedDurableCursor);
+      } else {
+        this.appliedOperationKeys.add(input.operationKey);
       }
       this.crashInjector.maybeCrash("AFTER_APPLY_BEFORE_DERIVED_AUDIT", input.operationKey);
       if (input.derived) await input.derived();
@@ -845,6 +850,7 @@ export class EngineService {
           this.checkpointSequence = checkpoint.sequence;
         }
         await this.replayDurableTail(this.lastAppliedDurableCursor);
+        await this.repairAllDerivedAudit();
         const latest = await this.journal.latestDurableSequence();
         const report = validatePostReplayInvariants(this.recoverableBag(), this.lastAppliedDurableCursor, latest);
         if (!report.ok) throw new RecoveryFailClosedError("invariant", report.reasons.join(","));
@@ -873,6 +879,7 @@ export class EngineService {
         });
         this.lastAppliedDurableCursor = 0;
         await this.replayDurableTail(0);
+        await this.repairAllDerivedAudit();
         const latest = await this.journal.latestDurableSequence();
         const report = validatePostReplayInvariants(this.recoverableBag(), this.lastAppliedDurableCursor, latest);
         if (!report.ok) throw new RecoveryFailClosedError("invariant", report.reasons.join(","));
@@ -945,6 +952,20 @@ export class EngineService {
       this.lastInfrastructureAccrualAt = payload.lastInfrastructureAccrualAt;
     }
     return { positions: positions.length, restingOrders: resting.length, activeTriggers: triggers.length, grokSignals: signals.length };
+  }
+
+  private async repairAllDerivedAudit(): Promise<void> {
+    let cursor = 0;
+    for (;;) {
+      const page = await this.journal.readDurableTransitionsAfter(cursor, this.recoveryPageSize);
+      if (page.length === 0) break;
+      for (const row of page) {
+        this.appliedOperationKeys.add(row.operationKey);
+        await this.repairDerivedAudit(row);
+        cursor = row.sequence;
+      }
+      if (page.length < this.recoveryPageSize) break;
+    }
   }
 
   private async replayDurableTail(after: number): Promise<void> {
@@ -1095,7 +1116,7 @@ export class EngineService {
   }
 
   private admitTrigger(trigger: TriggerEvent): AdmitResult {
-    if (!this.state.recoveryComplete) {
+    if (this.started && !this.state.recoveryComplete) {
       return { admitted: false, reason: "fail_closed", done: Promise.resolve() };
     }
     const lane = triggerWorkLane(trigger.kind);
@@ -1414,6 +1435,7 @@ export class EngineService {
   }
 
   private async reserveMaker(order: PaperOrder, snapshot: MarketSnapshot): Promise<void> {
+    if (this.appliedOperationKeys.has(`maker:${order.id}:reserve`)) return;
     const notional = makerReserveNotional(order.quantity, order.requestedPrice, snapshot.feeSchedule);
     if (this.ledger.availableCash().lt(notional)) throw new Error("INSUFFICIENT_CASH");
     const resting = createRestingMakerOrder(order, snapshot);
@@ -1434,12 +1456,15 @@ export class EngineService {
   }
 
   private async releaseMaker(orderId: string, options: { filledNotional?: string; cancel?: boolean; reason?: string } = {}): Promise<void> {
+    const operationKey = options.cancel ? `maker:${orderId}:cancel` : `maker:${orderId}:release`;
+    if (this.appliedOperationKeys.has(operationKey)) return;
     const reserved = this.makerReservations.get(orderId);
     if (!reserved && !options.cancel) return;
+    if (!reserved && options.cancel && !this.restingOrders.has(orderId)) return;
     const remaining = reserved ? Math.max(0, Number(reserved) - Number(options.filledNotional ?? 0)) : 0;
     const type = options.cancel ? "PAPER_ORDER_CANCELLED" : "PAPER_MAKER_RELEASED";
     await this.commitAuthoritative({
-      operationKey: options.cancel ? `maker:${orderId}:cancel` : `maker:${orderId}:release`,
+      operationKey,
       type,
       aggregateType: "paper_order",
       aggregateId: orderId,
@@ -1455,7 +1480,34 @@ export class EngineService {
     });
   }
 
+  private async assertExistingFillMatches(fill: Parameters<PaperLedger["applyFill"]>[0]): Promise<void> {
+    const rows = await this.journal.readDurableTransitionsAfter(0, 10_000);
+    const existing = rows.find((row) => row.operationKey === `fill:${fill.id}`);
+    if (!existing) return;
+    const existingFill = paperFillFromPayload(existing.payload);
+    if (!existingFill) {
+      throw new IdempotencyConflictError(`fill:${fill.id}`, existing.type, "PAPER_FILL");
+    }
+    if (
+      existingFill.quantity !== fill.quantity
+      || existingFill.fillPrice !== fill.fillPrice
+      || existingFill.marketId !== fill.marketId
+      || existingFill.outcome !== fill.outcome
+      || existingFill.side !== fill.side
+    ) {
+      this.metrics.noteDurableConflict("PAPER_FILL");
+      this.overload.markIntegrityFault();
+      this.state.overloadState = "FAIL_CLOSED";
+      this.updateReady();
+      throw new IdempotencyConflictError(`fill:${fill.id}`, "PAPER_FILL", "PAPER_FILL");
+    }
+  }
+
   private async applyFill(fill: Parameters<PaperLedger["applyFill"]>[0], extras: { restingAfter?: RestingPaperOrder | null } = {}): Promise<void> {
+    if (this.appliedOperationKeys.has(`fill:${fill.id}`)) {
+      await this.assertExistingFillMatches(fill);
+      return;
+    }
     const reserved = this.makerReservations.get(fill.orderId);
     let reservationAfter: string | null = reserved ?? null;
     if (reserved && fill.liquidityRole === "MAKER") {
@@ -1685,7 +1737,17 @@ export class EngineService {
         markToMarketReady: policy === "mark_to_market" ? false : undefined,
       });
     }
-    if (next.status !== previous) await this.commitExperimentStatus(next);
+    if (previous === "RUNNING" && (next.status === "ENTRY_CLOSED" || next.status === "COMPLETED")) {
+      const closed: ExperimentManifest = {
+        ...next, status: "ENTRY_CLOSED", completedAt: null, markToMarketAt: null,
+      };
+      if (this.experiment.status !== "ENTRY_CLOSED") await this.commitExperimentStatus(closed);
+    }
+    if (next.status === "COMPLETED" && this.experiment?.status !== "COMPLETED") {
+      await this.commitExperimentStatus(next);
+    } else if (next.status === "ENTRY_CLOSED" && this.experiment?.status !== "ENTRY_CLOSED" && this.experiment?.status !== "COMPLETED") {
+      await this.commitExperimentStatus(next);
+    }
     this.syncExperimentWindow();
     const stillOpen = openPositionsRemain(this.ledger.positions.values());
     if (shouldWriteFinalReport(this.experiment, stillOpen) && !this.reportGenerated) {
@@ -1866,6 +1928,12 @@ export class EngineService {
     const type = next.status === "ENTRY_CLOSED" ? "EXPERIMENT_ENTRY_CLOSED"
       : next.status === "COMPLETED" ? "EXPERIMENT_COMPLETED"
       : null;
+    const operationKey = type == null ? null : `experiment:${next.id}:${next.status === "ENTRY_CLOSED" ? "entry_closed" : "completed"}`;
+    if (operationKey && this.appliedOperationKeys.has(operationKey)) {
+      this.experiment = next;
+      this.syncExperimentWindow();
+      return;
+    }
     if (!type) {
       this.experiment = next;
       this.syncExperimentWindow();

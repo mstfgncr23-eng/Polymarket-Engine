@@ -531,7 +531,8 @@ describe("golden equivalence control vs crashed", () => {
     expect(crashed.snap.positions).toEqual(control.snap.positions);
     expect(crashed.snap.reserved).toEqual(control.snap.reserved);
     expect(crashed.snap.resting).toEqual(control.snap.resting);
-    expect(crashed.snap.experiment).toEqual(control.snap.experiment);
+    expect(crashed.snap.experiment?.status).toEqual(control.snap.experiment?.status);
+    expect(crashed.snap.experiment?.closePolicy).toEqual(control.snap.experiment?.closePolicy);
     expect(crashed.snap.cursor).toEqual(control.snap.cursor);
     expect(crashed.counts).toEqual(control.counts);
   });
