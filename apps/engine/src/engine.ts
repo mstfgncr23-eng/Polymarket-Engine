@@ -63,7 +63,6 @@ import {
   derivedAuditEventId,
   DurableCursorBehindError,
   IdempotencyConflictError,
-  MAX_DURABLE_CURSOR_CONVERGENCE_ATTEMPTS,
   queryEventsPaged,
   type DurableCommitResult,
   type DurableTransition,
@@ -518,8 +517,7 @@ export class EngineService {
     const previousAssets = new Set([...this.assetByMarket.values()].filter((asset): asset is string => Boolean(asset)));
     const previousTokens = [...this.tokenIds];
     const obligations = this.obligationMarketIds();
-    this.entryQualified.clear();
-    for (const market of report.qualified) this.entryQualified.add(market.id);
+    const nextEntryQualified = new Set(report.qualified.map((market) => market.id));
 
     const nextMarkets = new Map<string, DiscoveredMarket>();
     for (const market of report.qualified) nextMarkets.set(market.id, market);
@@ -529,11 +527,14 @@ export class EngineService {
       const previous = this.marketsById.get(id);
       if (fresh) nextMarkets.set(id, fresh);
       // Keep vanished markets only while an open position still needs settlement.
-      // Resting-only markets that left the universe must drop so MARKET_REMOVED
-      // can await the durable cancel instead of preserving the maker forever.
       else if (previous && openPositionMarkets.has(id)) nextMarkets.set(id, previous);
     }
 
+    const vanishedMakerMarkets = this.vanishedRestingMarketIds(nextMarkets);
+    await this.cancelVanishedMakers(vanishedMakerMarkets);
+
+    this.entryQualified.clear();
+    for (const id of nextEntryQualified) this.entryQualified.add(id);
     this.marketsById.clear();
     this.assetByMarket.clear();
     this.managedMarketIds.clear();
@@ -553,7 +554,7 @@ export class EngineService {
 
     this.tokenIds = nextTokens;
     this.marketAdapter.setTokenIds(nextTokens);
-    await this.dropRemovedMarketState(removedMarkets, removedAssets);
+    this.dropRemovedMarketState(removedMarkets, removedAssets);
     this.state.setDiscovery({
       qualified: report.qualified.map((market) => ({ marketId: market.id, slug: market.slug, asset: market.asset, tokens: market.tokens.map((token) => token.tokenId) })),
       rejected: report.rejected.slice(0, 100),
@@ -603,16 +604,31 @@ export class EngineService {
     return ids;
   }
 
-  private async dropRemovedMarketState(removedMarkets: readonly string[], removedAssets: readonly string[]): Promise<void> {
+  private vanishedRestingMarketIds(nextMarkets: ReadonlyMap<string, DiscoveredMarket>): string[] {
+    const vanished = new Set<string>();
+    for (const resting of this.restingOrders.values()) {
+      if (!d(resting.remaining).gt(0)) continue;
+      const marketId = resting.order.marketId;
+      if (!nextMarkets.has(marketId)) vanished.add(marketId);
+    }
+    return [...vanished];
+  }
+
+  private async cancelVanishedMakers(vanishedMarketIds: readonly string[]): Promise<void> {
+    if (vanishedMarketIds.length === 0) return;
+    const vanished = new Set(vanishedMarketIds);
+    for (const [orderId, resting] of [...this.restingOrders.entries()]) {
+      if (!vanished.has(resting.order.marketId)) continue;
+      await this.releaseMaker(orderId, { cancel: true, reason: "MARKET_REMOVED" });
+    }
+  }
+
+  private dropRemovedMarketState(removedMarkets: readonly string[], removedAssets: readonly string[]): void {
     for (const marketId of removedMarkets) {
       this.snapshots.delete(marketId);
       this.triggerEngine.dropMarket(marketId);
       for (const [tokenId, snapshot] of [...this.state.marketSnapshots.entries()]) {
         if (snapshot.marketId === marketId) this.state.marketSnapshots.delete(tokenId);
-      }
-      for (const [orderId, resting] of [...this.restingOrders.entries()]) {
-        if (resting.order.marketId !== marketId) continue;
-        await this.releaseMaker(orderId, { cancel: true, reason: "MARKET_REMOVED" });
       }
     }
     for (const asset of removedAssets) {
@@ -815,64 +831,78 @@ export class EngineService {
   }): Promise<DurableCommitResult> {
     return this.durableGate.run(async () => {
       const occurredAt = input.occurredAt ?? this.nowFn();
-      let lastError: unknown;
-      for (let attempt = 0; attempt < MAX_DURABLE_CURSOR_CONVERGENCE_ATTEMPTS; attempt += 1) {
-        this.crashInjector.maybeCrash("BEFORE_DURABLE_COMMIT", input.operationKey);
-        let commit: DurableCommitResult;
-        try {
-          const payload = await this.resolveDurablePayload(input, occurredAt);
-          commit = await this.journal.commitDurableTransition({
-            operationKey: input.operationKey,
-            type: input.type,
-            aggregateType: input.aggregateType,
-            aggregateId: input.aggregateId,
-            payload,
-            occurredAt,
-          }, this.lastAppliedDurableCursor);
-          this.metrics.noteDurableCommit(input.type, commit.inserted);
-        } catch (error) {
-          lastError = error;
-          if (error instanceof CrashInjectedError) throw error;
-          if (error instanceof DurableCursorBehindError) {
-            await this.replayDurableTail(this.lastAppliedDurableCursor);
-            const latest = await this.journal.latestDurableSequence();
-            const report = validatePostReplayInvariants(this.recoverableBag(), this.lastAppliedDurableCursor, latest);
-            if (!report.ok) {
-              const closed = new RecoveryFailClosedError("invariant", report.reasons.join(","));
-              this.failClosedIntegrity(closed);
-              throw closed;
-            }
-            continue;
-          }
-          if (error instanceof IdempotencyConflictError) {
-            this.metrics.noteDurableConflict(input.type);
-            this.failClosedIntegrity(error);
-            throw error;
-          }
+      this.crashInjector.maybeCrash("BEFORE_DURABLE_COMMIT", input.operationKey);
+      let commit: DurableCommitResult;
+      try {
+        const payload = await this.resolveDurablePayload(input, occurredAt);
+        commit = await this.journal.commitDurableTransition({
+          operationKey: input.operationKey,
+          type: input.type,
+          aggregateType: input.aggregateType,
+          aggregateId: input.aggregateId,
+          payload,
+          occurredAt,
+        }, this.lastAppliedDurableCursor);
+        this.metrics.noteDurableCommit(input.type, commit.inserted);
+      } catch (error) {
+        if (error instanceof CrashInjectedError) throw error;
+        if (error instanceof DurableCursorBehindError) {
+          commit = await this.catchUpOrRejectStalePlan(input.operationKey, input.type, error);
+        } else if (error instanceof IdempotencyConflictError) {
+          this.metrics.noteDurableConflict(input.type);
+          this.failClosedIntegrity(error);
+          throw error;
+        } else {
           this.metrics.noteDurableCommitFailure(input.type);
           this.failClosedIntegrity(error);
           throw error;
         }
-        this.crashInjector.maybeCrash("AFTER_DURABLE_COMMIT_BEFORE_APPLY", input.operationKey);
-        if (commit.transition.sequence > this.lastAppliedDurableCursor + 1) {
-          await this.replayDurableTail(this.lastAppliedDurableCursor);
-        }
-        const applied = this.applyCommitted(commit.transition);
-        this.crashInjector.maybeCrash("AFTER_APPLY_BEFORE_DERIVED_AUDIT", input.operationKey);
-        await this.emitStoredDerivedAudit(commit.transition);
-        if (applied && input.afterApply) await input.afterApply(commit.transition);
-        this.crashInjector.maybeCrash("AFTER_DERIVED_AUDIT_BEFORE_CHECKPOINT", input.operationKey);
-        if (input.checkpoint) await this.checkpointInsideGate();
-        this.crashInjector.maybeCrash("AFTER_CHECKPOINT", input.operationKey);
-        return commit;
       }
-      const closed = new RecoveryFailClosedError(
-        "cursor_fence",
-        lastError instanceof Error ? lastError.message : "durable cursor failed to converge",
-      );
+      this.crashInjector.maybeCrash("AFTER_DURABLE_COMMIT_BEFORE_APPLY", input.operationKey);
+      if (commit.transition.sequence > this.lastAppliedDurableCursor + 1) {
+        await this.replayDurableTail(this.lastAppliedDurableCursor);
+      }
+      const applied = this.applyCommitted(commit.transition);
+      this.crashInjector.maybeCrash("AFTER_APPLY_BEFORE_DERIVED_AUDIT", input.operationKey);
+      await this.emitStoredDerivedAudit(commit.transition);
+      if (applied && input.afterApply) await input.afterApply(commit.transition);
+      this.crashInjector.maybeCrash("AFTER_DERIVED_AUDIT_BEFORE_CHECKPOINT", input.operationKey);
+      if (input.checkpoint) await this.checkpointInsideGate();
+      this.crashInjector.maybeCrash("AFTER_CHECKPOINT", input.operationKey);
+      return commit;
+    });
+  }
+
+  private async catchUpOrRejectStalePlan(
+    operationKey: string,
+    type: string,
+    error: DurableCursorBehindError,
+  ): Promise<DurableCommitResult> {
+    await this.replayDurableTail(this.lastAppliedDurableCursor);
+    const latest = await this.journal.latestDurableSequence();
+    const report = validatePostReplayInvariants(this.recoverableBag(), this.lastAppliedDurableCursor, latest);
+    if (!report.ok) {
+      const closed = new RecoveryFailClosedError("invariant", report.reasons.join(","));
       this.failClosedIntegrity(closed);
       throw closed;
-    });
+    }
+    const existing = await this.journal.readDurableByOperationKey(operationKey);
+    if (existing) {
+      this.metrics.noteDurableCommit(type, false);
+      return {
+        sequence: existing.sequence,
+        operationKey,
+        inserted: false,
+        existing: true,
+        transition: existing,
+      };
+    }
+    const closed = new RecoveryFailClosedError(
+      "cursor_fence",
+      `stale_plan: ${operationKey} planned against cursor ${error.expectedPreviousSequence} after foreign commit to ${error.latestCommitted}`,
+    );
+    this.failClosedIntegrity(closed);
+    throw closed;
   }
 
   private async resolveDurablePayload(

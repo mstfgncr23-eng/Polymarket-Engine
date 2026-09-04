@@ -655,13 +655,55 @@ describe("A-T critical durability matrix", () => {
     await b.engine.applyObservedFill(paperFill("btc-mkt", "DOWN", "0.48", { id: "fill_engine_b" }));
     expect(await journal.latestDurableSequence()).toBe(cursorBeforeB + 1);
     expect(a.engine.lastAppliedDurableCursorForTest()).toBe(cursorBeforeB);
-    await a.engine.applyObservedFill(paperFill("alt-mkt", "UP", "0.40", { id: "fill_engine_a_next" }));
-    expect(a.engine.lastAppliedDurableCursorForTest()).toBe(cursorBeforeB + 2);
+    await expect(a.engine.applyObservedFill(paperFill("alt-mkt", "UP", "0.40", { id: "fill_engine_a_next" })))
+      .rejects.toMatchObject({ name: "RecoveryFailClosedError", reason: "cursor_fence" });
+    expect(a.engine.lastAppliedDurableCursorForTest()).toBe(cursorBeforeB + 1);
     expect(a.engine.ledger.positions.get("btc-mkt")?.downQuantity).toBe("10");
-    expect(a.engine.ledger.positions.get("alt-mkt")?.upQuantity).toBe("10");
+    expect(a.engine.ledger.positions.get("alt-mkt")).toBeUndefined();
+    expect(await journal.readDurableByOperationKey("fill:fill_engine_a_next")).toBeNull();
+    expect(a.engine.overloadState()).toBe("FAIL_CLOSED");
     const sequences = (await journal.readDurableTransitionsAfter(cursorBeforeB - 1, 10)).map((row) => row.operationKey);
     expect(sequences).toContain("fill:fill_engine_b");
-    expect(sequences.indexOf("fill:fill_engine_b")).toBeLessThan(sequences.indexOf("fill:fill_engine_a_next"));
+    expect(sequences).not.toContain("fill:fill_engine_a_next");
+    await a.engine.stop();
+    await b.engine.stop();
+  });
+
+  it("A stale planned maker reserve is not inserted after foreign cash-consuming catch-up", async () => {
+    const journal = new MemoryEventJournal();
+    const a = await startPaper(journal, { env: { PAPER_START_BALANCE: "8" } });
+    expect((await a.engine.beginExperiment()).ok).toBe(true);
+    const b = await startPaper(journal, { env: { PAPER_START_BALANCE: "8" } });
+    const foreign = order("MAKER", { id: "order_engine_b_cash", quantity: "10", requestedPrice: "0.47", marketId: "btc-mkt", tokenId: "btc-up" });
+    await b.engine.restMakerForTest(foreign, snapshot({ marketId: "btc-mkt", tokenId: "btc-up" }));
+    expect(Number(b.engine.reservedCash())).toBeGreaterThan(0);
+    const stale = order("MAKER", { id: "order_engine_a_stale", quantity: "10", requestedPrice: "0.47", marketId: "btc-mkt", tokenId: "btc-up" });
+    await expect(a.engine.restMakerForTest(stale, snapshot({ marketId: "btc-mkt", tokenId: "btc-up" })))
+      .rejects.toMatchObject({ name: "RecoveryFailClosedError", reason: "cursor_fence" });
+    expect(await journal.readDurableByOperationKey("maker:order_engine_a_stale:reserve")).toBeNull();
+    expect(a.engine.makerReservationsForTest().has("order_engine_b_cash")).toBe(true);
+    expect(a.engine.makerReservationsForTest().has("order_engine_a_stale")).toBe(false);
+    expect(a.engine.overloadState()).toBe("FAIL_CLOSED");
+    await a.engine.stop();
+    await b.engine.stop();
+  });
+
+  it("B stale engine applies an already-committed operation key exactly once", async () => {
+    const journal = new MemoryEventJournal();
+    const a = await startPaper(journal);
+    expect((await a.engine.beginExperiment()).ok).toBe(true);
+    const shared = order("MAKER", { id: "order_shared_reserve", quantity: "10", requestedPrice: "0.47", marketId: "btc-mkt", tokenId: "btc-up" });
+    const b = await startPaper(journal);
+    await b.engine.applyObservedFill(paperFill("btc-mkt", "UP", "0.40", { id: "fill_engine_b_ahead" }));
+    await b.engine.restMakerForTest(shared, snapshot({ marketId: "btc-mkt", tokenId: "btc-up" }));
+    const latestAfterB = await journal.latestDurableSequence();
+    await a.engine.restMakerForTest(shared, snapshot({ marketId: "btc-mkt", tokenId: "btc-up" }));
+    expect(await journal.latestDurableSequence()).toBe(latestAfterB);
+    expect((await journal.readDurableTransitionsAfter(0, 50)).filter((row) => row.operationKey === "maker:order_shared_reserve:reserve")).toHaveLength(1);
+    expect(a.engine.restingOrdersForTest().has("order_shared_reserve")).toBe(true);
+    expect(a.engine.makerReservationsForTest().has("order_shared_reserve")).toBe(true);
+    expect(a.engine.ledger.positions.get("btc-mkt")?.upQuantity).toBe("10");
+    expect(a.engine.overloadState()).not.toBe("FAIL_CLOSED");
     await a.engine.stop();
     await b.engine.stop();
   });
@@ -902,6 +944,65 @@ describe("A-T critical durability matrix", () => {
       .find((event) => event.id === derivedAuditEventId("PAPER_ORDER_CANCELLED", "order_market_removed"));
     expect(cancelled?.payload.reason).toBe("MARKET_REMOVED");
     await engine.stop();
+  });
+
+  it("MARKET_REMOVED cancel failure leaves previous discovery ownership intact", async () => {
+    const journal = new MemoryEventJournal();
+    const { engine, market } = await startPaper(journal);
+    const maker = order("MAKER", { id: "order_cancel_fail", quantity: "10", requestedPrice: "0.47", marketId: "btc-mkt", tokenId: "btc-up" });
+    await engine.restMakerForTest(maker, snapshot({ marketId: "btc-mkt", tokenId: "btc-up" }));
+    const tokensBefore = engine.subscribedTokenIds();
+    const marketsBefore = engine.monitoredMarketIds();
+    const reservedBefore = engine.reservedCash();
+    journal.failNextDurableInsert = true;
+    market.queue(discoveryReport([]));
+    await expect(engine.reconcileDiscovery()).rejects.toThrow("DURABLE_INSERT_FAILED");
+    expect(engine.monitoredMarketIds()).toEqual(marketsBefore);
+    expect(engine.subscribedTokenIds()).toEqual(tokensBefore);
+    expect(market.tokenIds).toEqual(tokensBefore);
+    expect(engine.entryQualifiedIds()).toEqual(["btc-mkt"]);
+    expect(engine.restingOrderCount()).toBe(1);
+    expect(engine.makerReservationsForTest().has("order_cancel_fail")).toBe(true);
+    expect(engine.reservedCash()).toBe(reservedBefore);
+    expect(await journal.readDurableByOperationKey("maker:order_cancel_fail:cancel")).toBeNull();
+    expect(engine.overloadState()).toBe("FAIL_CLOSED");
+    await engine.stop();
+  });
+
+  it("MARKET_REMOVED cancels a recovered resting maker even without checkpoint market metadata", async () => {
+    const journal = new MemoryEventJournal();
+    const first = await startPaper(journal);
+    const maker = order("MAKER", { id: "order_recovered_removed", quantity: "10", requestedPrice: "0.47", marketId: "btc-mkt", tokenId: "btc-up" });
+    await first.engine.restMakerForTest(maker, snapshot({ marketId: "btc-mkt", tokenId: "btc-up" }));
+    await first.engine.stop();
+    const checkpoint = await journal.loadLatestCheckpoint();
+    expect(checkpoint).toBeTruthy();
+    await journal.saveCheckpoint({
+      experimentId: checkpoint!.experimentId,
+      sequence: checkpoint!.sequence + 1,
+      payload: {
+        ...(checkpoint!.payload as Record<string, unknown>),
+        marketMetadata: [],
+      },
+    });
+    const market = new ScriptedMarketAdapter();
+    market.queue(discoveryReport([]));
+    const env = qualifiedPaperEnv({ ESTIMATED_INFRA_COST_PER_HOUR_USD: "0" });
+    const recovered = new EngineService(env, journal, logger, {
+      market: market as never,
+      referenceRegistry: new ScriptedReferenceRegistry() as never,
+      activation: new NoopGrokActivationBridge(),
+    });
+    await recovered.start();
+    expect(recovered.restingOrderCount()).toBe(0);
+    expect(recovered.makerReservationsForTest().size).toBe(0);
+    expect(Number(recovered.reservedCash())).toBe(0);
+    const cancelled = (await journal.queryEvents({ types: ["PAPER_ORDER_CANCELLED"] }))
+      .filter((event) => event.id === derivedAuditEventId("PAPER_ORDER_CANCELLED", "order_recovered_removed"));
+    expect(cancelled).toHaveLength(1);
+    expect(cancelled[0]?.payload.reason).toBe("MARKET_REMOVED");
+    expect((await journal.readDurableTransitionsAfter(0, 50)).filter((row) => row.operationKey === "maker:order_recovered_removed:cancel")).toHaveLength(1);
+    await recovered.stop();
   });
 
   it("maker reserve preserves OPEN_FIRST_LEG and HEDGE_SECOND_LEG in PAPER_ORDER_CREATED", async () => {
