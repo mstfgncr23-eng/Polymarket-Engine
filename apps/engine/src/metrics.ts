@@ -313,6 +313,16 @@ export class EngineMetrics {
     help: "Direct journal appends admitted and currently executing (capped below PG pool max)",
     registers: [this.registry],
   });
+  readonly journalDirectActiveCritical = new Gauge({
+    name: "journal_direct_active_critical",
+    help: "Critical direct journal appends currently executing",
+    registers: [this.registry],
+  });
+  readonly journalDirectActiveNoncritical = new Gauge({
+    name: "journal_direct_active_noncritical",
+    help: "Noncritical direct journal appends currently executing (capped below total active)",
+    registers: [this.registry],
+  });
   readonly journalDirectAdmissionRejected = new Counter({
     name: "journal_direct_admission_rejected_total",
     help: "Direct journal appends rejected by application admission before a PG waiter is created",
@@ -409,6 +419,8 @@ export class EngineMetrics {
     this.maintenanceSingleflightDirty.set(0);
     this.journalDirectWaiting.set(0);
     this.journalDirectActive.set(0);
+    this.journalDirectActiveCritical.set(0);
+    this.journalDirectActiveNoncritical.set(0);
     this.journalDirectQueueOldestAge.set(0);
   }
 
@@ -485,6 +497,8 @@ export class EngineMetrics {
     return {
       setWaiting: (value: number) => this.journalDirectWaiting.set(value),
       setActive: (value: number) => this.journalDirectActive.set(value),
+      setActiveCritical: (value: number) => this.journalDirectActiveCritical.set(value),
+      setActiveNoncritical: (value: number) => this.journalDirectActiveNoncritical.set(value),
       setOldestAge: (seconds: number) => this.journalDirectQueueOldestAge.set(seconds),
       incRejected: (journalClass: string) => this.journalDirectAdmissionRejected.inc({ class: journalClass }),
     };

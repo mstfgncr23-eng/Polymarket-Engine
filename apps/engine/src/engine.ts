@@ -1564,6 +1564,8 @@ export class EngineService {
   journalAdmissionSnapshot() {
     return {
       active: this.journalAdmission.activeCount,
+      activeCritical: this.journalAdmission.activeCriticalCount,
+      activeNoncritical: this.journalAdmission.activeNoncriticalCount,
       waiting: this.journalAdmission.waitingCount,
       criticalWaiting: this.journalAdmission.criticalWaitingCount,
       noncriticalWaiting: this.journalAdmission.noncriticalWaitingCount,

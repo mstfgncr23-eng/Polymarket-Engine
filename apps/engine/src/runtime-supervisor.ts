@@ -20,11 +20,14 @@
  * - Unrelated keys are not serialized. Different-market P0 uses reserved P0
  *   workers during a P3 storm.
  *
- * Direct journal admission (blocker 4):
+ * Direct journal admission (blocker 4 + active reserve):
  * - Shared active concurrency remains 4, below postgres.js pool max=10.
+ * - Noncritical active max is 3, so one execution slot is reserved for
+ *   critical persistence. Critical may use all 4. Already-running DB work
+ *   is never preempted.
  * - Critical and noncritical have separate bounded waiting queues.
  * - Free active slots prefer critical waiters; noncritical backlog cannot
- *   consume the critical waiting cap. No unbounded priority queue.
+ *   consume the critical waiting cap or the reserved active slot.
  *
  * Shutdown (blocker 6): close NEW runtime-work admission first; keep journal
  * admission OPEN until RuntimeSupervisor has drained or the join deadline is
@@ -60,6 +63,8 @@ export const RUNTIME_BOUNDS = {
   criticalReserved: { lane: "p0" as const, queueLimit: 256, concurrency: 4 },
   journal: {
     active: 4,
+    /** Leaves ≥1 of the 4 active slots for critical persistence. */
+    noncriticalActive: 3,
     waiting: 128,
     highWater: 96,
     criticalWaiting: 32,
@@ -486,6 +491,8 @@ export class RuntimeSupervisor {
 export interface JournalAdmissionMetrics {
   setWaiting(value: number): void;
   setActive(value: number): void;
+  setActiveCritical(value: number): void;
+  setActiveNoncritical(value: number): void;
   setOldestAge(seconds: number): void;
   incRejected(journalClass: string): void;
 }
@@ -512,15 +519,19 @@ interface JournalWaiter<T> {
 
 /**
  * Application-level direct-journal gate. Waiters here are JS promises, not
- * postgres.js pool waiters. No recursive retry.
+ * postgres.js pool waiters. No recursive retry. Already-running work is never
+ * preempted.
  *
- * Shared active workers (4) + separate bounded critical/noncritical waiting.
- * Noncritical research cannot fill the critical waiting cap. Pump prefers
- * critical waiters. Total waiting ≤ 128; total active ≤ 4.
+ * Shared active workers (4) + noncritical active cap (3) so one slot stays
+ * available for critical persistence. Critical may use all 4. Separate bounded
+ * waiting queues (32 / 96). Pump prefers critical waiters. Total waiting ≤ 128;
+ * total active ≤ 4; noncritical active ≤ 3.
  */
 export class DirectJournalAdmission {
   private closed = false;
   private active = 0;
+  private activeCritical = 0;
+  private activeNoncritical = 0;
   private readonly criticalWaiting: Array<JournalWaiter<unknown>> = [];
   private readonly noncriticalWaiting: Array<JournalWaiter<unknown>> = [];
   private criticalRejects = 0;
@@ -532,6 +543,8 @@ export class DirectJournalAdmission {
   get criticalWaitingCount(): number { return this.criticalWaiting.length; }
   get noncriticalWaitingCount(): number { return this.noncriticalWaiting.length; }
   get activeCount(): number { return this.active; }
+  get activeCriticalCount(): number { return this.activeCritical; }
+  get activeNoncriticalCount(): number { return this.activeNoncritical; }
   get admissionClosed(): boolean { return this.closed; }
   get criticalRejectionCount(): number { return this.criticalRejects; }
 
@@ -542,7 +555,7 @@ export class DirectJournalAdmission {
       this.rejectNow(journalClass, critical, "JOURNAL_ADMISSION_CLOSED");
     }
     if (this.canStartNow(critical)) {
-      return this.execute(work);
+      return this.execute(work, critical);
     }
     const queue = critical ? this.criticalWaiting : this.noncriticalWaiting;
     const limit = critical ? RUNTIME_BOUNDS.journal.criticalWaiting : RUNTIME_BOUNDS.journal.noncriticalWaiting;
@@ -572,8 +585,14 @@ export class DirectJournalAdmission {
     return { drained: true, unresolved: 0, timedOut: false };
   }
 
-  private canStartNow(critical: boolean): boolean {
+  private hasCapacity(critical: boolean): boolean {
     if (this.active >= RUNTIME_BOUNDS.journal.active) return false;
+    if (critical) return true;
+    return this.activeNoncritical < RUNTIME_BOUNDS.journal.noncriticalActive;
+  }
+
+  private canStartNow(critical: boolean): boolean {
+    if (!this.hasCapacity(critical)) return false;
     if (this.criticalWaiting.length > 0) return false;
     if (critical) return true;
     return this.noncriticalWaiting.length === 0;
@@ -586,28 +605,43 @@ export class DirectJournalAdmission {
     throw new JournalAdmissionRejected(journalClass, critical, message);
   }
 
-  private async execute<T>(work: () => Promise<T>): Promise<T> {
+  private async execute<T>(work: () => Promise<T>, critical: boolean): Promise<T> {
     this.active += 1;
+    if (critical) this.activeCritical += 1;
+    else this.activeNoncritical += 1;
     this.publish();
     try {
       return await work();
     } finally {
       this.active -= 1;
+      if (critical) this.activeCritical -= 1;
+      else this.activeNoncritical -= 1;
       this.publish();
       this.pump();
     }
   }
 
   private pump(): void {
-    while (this.active < RUNTIME_BOUNDS.journal.active && this.waitingCount > 0) {
+    for (;;) {
       if (this.closed) {
         this.rejectWaiting("JOURNAL_ADMISSION_CLOSED");
         return;
       }
-      const next = this.criticalWaiting.shift() ?? this.noncriticalWaiting.shift();
-      if (!next) return;
-      this.refreshOldest();
-      void this.execute(next.run).then(next.resolve, next.reject);
+      if (this.criticalWaiting.length > 0 && this.hasCapacity(true)) {
+        const next = this.criticalWaiting.shift();
+        if (!next) break;
+        this.refreshOldest();
+        void this.execute(next.run, true).then(next.resolve, next.reject);
+        continue;
+      }
+      if (this.noncriticalWaiting.length > 0 && this.hasCapacity(false)) {
+        const next = this.noncriticalWaiting.shift();
+        if (!next) break;
+        this.refreshOldest();
+        void this.execute(next.run, false).then(next.resolve, next.reject);
+        continue;
+      }
+      break;
     }
     this.refreshOldest();
     this.publish();
@@ -635,6 +669,8 @@ export class DirectJournalAdmission {
   private publish(): void {
     this.metrics?.setWaiting(this.waitingCount);
     this.metrics?.setActive(this.active);
+    this.metrics?.setActiveCritical(this.activeCritical);
+    this.metrics?.setActiveNoncritical(this.activeNoncritical);
     this.metrics?.setOldestAge(this.oldestAt == null ? 0 : Math.max(0, (Date.now() - this.oldestAt) / 1000));
     this.onChange?.();
   }

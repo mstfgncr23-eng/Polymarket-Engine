@@ -181,15 +181,17 @@ describe("RuntimeSupervisor unit bounds", () => {
     let started = 0;
     const work = () => { started += 1; return hold; };
     const running = Array.from({ length: 8 }, () => gate.run("trigger", false, work).catch(() => "rejected"));
-    await waitFor(() => gate.activeCount === RUNTIME_BOUNDS.journal.active);
+    await waitFor(() => gate.activeNoncriticalCount === RUNTIME_BOUNDS.journal.noncriticalActive);
     expect(gate.waitingCount).toBeLessThanOrEqual(RUNTIME_BOUNDS.journal.waiting);
-    expect(started).toBe(RUNTIME_BOUNDS.journal.active);
+    expect(gate.activeCount).toBeLessThanOrEqual(RUNTIME_BOUNDS.journal.active);
+    expect(started).toBe(RUNTIME_BOUNDS.journal.noncriticalActive);
     const overflow: Array<Promise<"ok" | "rejected">> = [];
     for (let i = 0; i < 200; i += 1) {
       overflow.push(gate.run("trigger", false, work).then(() => "ok" as const, () => "rejected" as const));
     }
     await waitFor(() => gate.noncriticalWaitingCount === RUNTIME_BOUNDS.journal.noncriticalWaiting);
-    expect(gate.activeCount).toBe(RUNTIME_BOUNDS.journal.active);
+    expect(gate.activeCount).toBe(RUNTIME_BOUNDS.journal.noncriticalActive);
+    expect(gate.activeNoncriticalCount).toBe(RUNTIME_BOUNDS.journal.noncriticalActive);
     release();
     const overflowResults = await Promise.all(overflow);
     expect(overflowResults.filter((item) => item === "rejected").length).toBeGreaterThan(0);
@@ -792,20 +794,60 @@ describe("blocker 4-6 journal reservation, integrity, shutdown", () => {
     const gate = new DirectJournalAdmission();
     let release!: () => void;
     const hold = new Promise<void>((resolve) => { release = resolve; });
+    let criticalStarted = 0;
     const work = () => hold;
     const noncritical: Array<Promise<unknown>> = [];
-    for (let i = 0; i < RUNTIME_BOUNDS.journal.active + RUNTIME_BOUNDS.journal.noncriticalWaiting + 10; i += 1) {
+    for (let i = 0; i < RUNTIME_BOUNDS.journal.noncriticalActive + RUNTIME_BOUNDS.journal.noncriticalWaiting + 10; i += 1) {
       noncritical.push(gate.run("trigger", false, work).catch((error) => error));
     }
     await waitFor(() => gate.noncriticalWaitingCount === RUNTIME_BOUNDS.journal.noncriticalWaiting);
-    expect(gate.activeCount).toBe(RUNTIME_BOUNDS.journal.active);
+    expect(gate.activeNoncriticalCount).toBe(RUNTIME_BOUNDS.journal.noncriticalActive);
+    expect(gate.activeCount).toBeLessThanOrEqual(RUNTIME_BOUNDS.journal.active);
     await expect(gate.run("trigger", false, work)).rejects.toBeInstanceOf(JournalAdmissionRejected);
-    const critical = gate.run("execution", true, work);
-    await waitFor(() => gate.criticalWaitingCount === 1);
+    const critical = gate.run("execution", true, () => { criticalStarted += 1; return hold; });
+    await waitFor(() => criticalStarted === 1);
+    expect(gate.criticalWaitingCount).toBe(0);
+    expect(gate.activeCriticalCount).toBe(1);
     expect(gate.criticalRejectionCount).toBe(0);
     release();
     await critical;
     await Promise.all(noncritical);
+  });
+
+  it("reserved active slot starts critical while blocked noncritical remain unresolved", async () => {
+    const gate = new DirectJournalAdmission();
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => { release = resolve; });
+    let noncriticalStarted = 0;
+    let criticalStarted = 0;
+    const noncriticalWork = () => { noncriticalStarted += 1; return hold; };
+    const criticalWork = () => { criticalStarted += 1; return hold; };
+    const blocked: Array<Promise<unknown>> = [];
+    for (let i = 0; i < RUNTIME_BOUNDS.journal.noncriticalActive; i += 1) {
+      blocked.push(gate.run("trigger", false, noncriticalWork));
+    }
+    await waitFor(() => noncriticalStarted === RUNTIME_BOUNDS.journal.noncriticalActive);
+    expect(gate.activeNoncriticalCount).toBe(RUNTIME_BOUNDS.journal.noncriticalActive);
+    expect(gate.activeCount).toBeLessThanOrEqual(RUNTIME_BOUNDS.journal.active);
+    const extraNoncritical = gate.run("trigger", false, noncriticalWork);
+    await waitFor(() => gate.noncriticalWaitingCount === 1);
+    expect(noncriticalStarted).toBe(RUNTIME_BOUNDS.journal.noncriticalActive);
+    const critical = gate.run("execution", true, criticalWork);
+    await waitFor(() => criticalStarted === 1);
+    expect(gate.activeCount).toBeLessThanOrEqual(RUNTIME_BOUNDS.journal.active);
+    expect(gate.activeNoncriticalCount).toBeLessThanOrEqual(RUNTIME_BOUNDS.journal.noncriticalActive);
+    expect(gate.activeCriticalCount).toBe(1);
+    expect(gate.activeCount).toBe(RUNTIME_BOUNDS.journal.noncriticalActive + 1);
+    expect(gate.criticalWaitingCount).toBe(0);
+    expect(noncriticalStarted).toBe(RUNTIME_BOUNDS.journal.noncriticalActive);
+    expect(gate.noncriticalWaitingCount).toBeLessThanOrEqual(RUNTIME_BOUNDS.journal.noncriticalWaiting);
+    expect(gate.waitingCount).toBeLessThanOrEqual(RUNTIME_BOUNDS.journal.waiting);
+    release();
+    await Promise.all([...blocked, extraNoncritical, critical]);
+    expect(gate.activeCount).toBe(0);
+    expect(gate.waitingCount).toBe(0);
+    expect(gate.activeCriticalCount).toBe(0);
+    expect(gate.activeNoncriticalCount).toBe(0);
   });
 
   it("engine noncritical backlog cannot reject a later critical fill", async () => {
@@ -819,17 +861,19 @@ describe("blocker 4-6 journal reservation, integrity, shutdown", () => {
         await hold;
         return original(event);
       };
-      for (let i = 0; i < RUNTIME_BOUNDS.journal.active + RUNTIME_BOUNDS.journal.noncriticalWaiting; i += 1) {
+      for (let i = 0; i < RUNTIME_BOUNDS.journal.noncriticalActive + RUNTIME_BOUNDS.journal.noncriticalWaiting; i += 1) {
         pending.push(engine.persistEventForTest(createJournalEvent({
           traceId: createId("trace"), type: "TRIGGER_EVENT", aggregateType: "trigger", aggregateId: createId("trigger"), payload: {},
         })).catch((error) => error));
       }
       await waitFor(() => engine.journalAdmissionSnapshot().noncriticalWaiting === RUNTIME_BOUNDS.journal.noncriticalWaiting);
-      expect(engine.journalAdmissionSnapshot().active).toBe(RUNTIME_BOUNDS.journal.active);
+      expect(engine.journalAdmissionSnapshot().activeNoncritical).toBe(RUNTIME_BOUNDS.journal.noncriticalActive);
+      expect(engine.journalAdmissionSnapshot().active).toBeLessThanOrEqual(RUNTIME_BOUNDS.journal.active);
       const critical = engine.persistEventForTest(createJournalEvent({
         traceId: createId("trace"), type: "PAPER_FILL", aggregateType: "paper_fill", aggregateId: createId("fill"), payload: {},
       }));
-      await waitFor(() => engine.journalAdmissionSnapshot().criticalWaiting === 1);
+      await waitFor(() => engine.journalAdmissionSnapshot().activeCritical === 1);
+      expect(engine.journalAdmissionSnapshot().criticalWaiting).toBe(0);
       expect(engine.journalAdmissionSnapshot().criticalRejects).toBe(0);
       release();
       await critical;
