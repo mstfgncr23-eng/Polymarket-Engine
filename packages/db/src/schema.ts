@@ -104,7 +104,7 @@ export const mcpIdempotencyKeys = pgTable("mcp_idempotency_keys", {
 }, (table) => [uniqueIndex("mcp_idempotency_scope_key_idx").on(table.scope, table.key)]);
 
 export const durableTransitions = pgTable("durable_transitions", {
-  sequence: bigint("sequence", { mode: "number" }).generatedAlwaysAsIdentity().primaryKey(),
+  sequence: bigint("sequence", { mode: "number" }).primaryKey(),
   operationKey: text("operation_key").notNull(),
   type: text("type").notNull(),
   aggregateType: text("aggregate_type").notNull(),

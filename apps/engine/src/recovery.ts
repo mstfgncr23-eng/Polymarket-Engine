@@ -1,4 +1,5 @@
 import {
+  d,
   experimentManifestSchema,
   ledgerStateSchema,
   paperFillSchema,
@@ -269,8 +270,8 @@ export function applyDurableTransition(state: RecoverableEngineState, transition
         const payload = releasePayloadSchema.parse(transition.payload);
         const reserved = state.makerReservations.get(payload.orderId);
         if (reserved) {
-          const remaining = Math.max(0, Number(reserved));
-          if (remaining > 0) state.ledger.release(remaining, new Date(transition.occurredAt));
+          const remaining = d(reserved);
+          if (remaining.gt(0)) state.ledger.release(remaining, new Date(transition.occurredAt));
           state.makerReservations.delete(payload.orderId);
         }
         if (transition.type === "PAPER_ORDER_CANCELLED" || payload.cancel) {
@@ -283,9 +284,9 @@ export function applyDurableTransition(state: RecoverableEngineState, transition
         applyFillReservation(state, payload.fill, payload.reservationAfter, new Date(transition.occurredAt));
         state.ledger.applyFill(payload.fill, { positionId: payload.positionId });
         if (payload.restingAfter) {
-          if (Number(payload.restingAfter.remaining) === 0) state.restingOrders.delete(payload.fill.orderId);
+          if (!d(payload.restingAfter.remaining).gt(0)) state.restingOrders.delete(payload.fill.orderId);
           else state.restingOrders.set(payload.fill.orderId, payload.restingAfter);
-        } else if (payload.fill.liquidityRole === "MAKER" && Number(state.restingOrders.get(payload.fill.orderId)?.remaining ?? 1) === 0) {
+        } else if (payload.fill.liquidityRole === "MAKER" && !d(state.restingOrders.get(payload.fill.orderId)?.remaining ?? 1).gt(0)) {
           state.restingOrders.delete(payload.fill.orderId);
         }
         return;
@@ -324,9 +325,10 @@ function applyFillReservation(
 ): void {
   const reserved = state.makerReservations.get(fill.orderId);
   if (!reserved || fill.liquidityRole !== "MAKER") return;
-  const fillCost = Number(fill.quantity) * Number(fill.fillPrice) + Number(fill.feeUsd);
-  state.ledger.release(Math.min(Number(reserved), fillCost), at);
-  if (reservationAfter && Number(reservationAfter) > 0) state.makerReservations.set(fill.orderId, reservationAfter);
+  const fillCost = d(fill.quantity).mul(fill.fillPrice).plus(fill.feeUsd);
+  const reservedAmount = d(reserved);
+  state.ledger.release(reservedAmount.lt(fillCost) ? reservedAmount : fillCost, at);
+  if (reservationAfter && d(reservationAfter).gt(0)) state.makerReservations.set(fill.orderId, reservationAfter);
   else state.makerReservations.delete(fill.orderId);
 }
 
@@ -348,23 +350,34 @@ export function validatePostReplayInvariants(
     reasons.push(`ledger_parse:${error instanceof Error ? error.message : String(error)}`);
     return { ok: false, reasons };
   }
-  const cash = Number(ledger.cash);
-  const reserved = Number(ledger.reservedCash);
-  if (!Number.isFinite(cash) || cash < 0) reasons.push("cash_invalid");
-  if (!Number.isFinite(reserved) || reserved < 0) reasons.push("reserved_invalid");
+  const cash = d(ledger.cash);
+  const reserved = d(ledger.reservedCash);
+  if (!cash.isFinite() || cash.lt(0)) reasons.push("cash_invalid");
+  if (!reserved.isFinite() || reserved.lt(0)) reasons.push("reserved_invalid");
   const seenPositions = new Set<string>();
   for (const position of state.ledger.positions.values()) {
     try { positionSchema.parse(position); }
     catch (error) { reasons.push(`position_parse:${error instanceof Error ? error.message : String(error)}`); }
     if (seenPositions.has(position.id)) reasons.push("duplicate_position_id");
     seenPositions.add(position.id);
-    if (state.settledMarkets.has(position.marketId) && (Number(position.upQuantity) > 0 || Number(position.downQuantity) > 0)) {
+    if (state.settledMarkets.has(position.marketId) && (d(position.upQuantity).gt(0) || d(position.downQuantity).gt(0))) {
       reasons.push("settled_and_open");
     }
   }
+  let reservationSum = d(0);
   for (const [orderId, amount] of state.makerReservations) {
-    if (!(Number(amount) > 0)) reasons.push(`reservation_nonpositive:${orderId}`);
+    const reservedAmount = d(amount);
+    if (!reservedAmount.isFinite() || !reservedAmount.gt(0)) reasons.push(`reservation_nonpositive:${orderId}`);
     if (!state.restingOrders.has(orderId)) reasons.push(`reservation_without_resting:${orderId}`);
+    reservationSum = reservationSum.plus(reservedAmount);
+  }
+  for (const [orderId, resting] of state.restingOrders) {
+    if (!d(resting.remaining).gt(0)) reasons.push(`resting_nonpositive:${orderId}`);
+    const reservedAmount = state.makerReservations.get(orderId);
+    if (reservedAmount == null || !d(reservedAmount).gt(0)) reasons.push(`resting_without_reservation:${orderId}`);
+  }
+  if (!reservationSum.eq(reserved)) {
+    reasons.push(`reserved_cash_mismatch:${reserved.toFixed()}!=${reservationSum.toFixed()}`);
   }
   const status = state.experiment?.status;
   if (status && !["IDLE", "CREATED", "RUNNING", "ENTRY_CLOSED", "COMPLETED", "FAILED"].includes(status)) {

@@ -34,6 +34,8 @@ import {
   settlementRealizedDelta,
   DECISION_EVENT_TYPES,
   createIdleExperiment,
+  d,
+  decimal,
   experimentAllowsFirstLeg,
   experimentAllowsHedge,
   openPositionsRemain,
@@ -363,8 +365,12 @@ export class EngineService {
   reservedCash() { return this.ledger.snapshot().reservedCash; }
   async tickMaintenance(): Promise<void> { await this.runMaintenance(); }
   async applyObservedFill(fill: Parameters<PaperLedger["applyFill"]>[0]): Promise<void> { await this.applyFill(fill); }
-  async restMakerForTest(order: PaperOrder, snapshot: MarketSnapshot): Promise<void> {
-    await this.reserveMaker(order, snapshot);
+  async restMakerForTest(
+    order: PaperOrder,
+    snapshot: MarketSnapshot,
+    intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" = "OPEN_FIRST_LEG",
+  ): Promise<void> {
+    await this.reserveMaker(order, snapshot, intent);
   }
   async cancelMakerForTest(orderId: string, reason = "TEST_RELEASE"): Promise<void> {
     await this.releaseMaker(orderId, { cancel: true, reason });
@@ -517,11 +523,15 @@ export class EngineService {
 
     const nextMarkets = new Map<string, DiscoveredMarket>();
     for (const market of report.qualified) nextMarkets.set(market.id, market);
+    const openPositionMarkets = this.openPositionMarketIds();
     for (const id of obligations) {
       const fresh = report.discovered.find((item) => item.id === id) ?? report.qualified.find((item) => item.id === id);
       const previous = this.marketsById.get(id);
       if (fresh) nextMarkets.set(id, fresh);
-      else if (previous) nextMarkets.set(id, previous);
+      // Keep vanished markets only while an open position still needs settlement.
+      // Resting-only markets that left the universe must drop so MARKET_REMOVED
+      // can await the durable cancel instead of preserving the maker forever.
+      else if (previous && openPositionMarkets.has(id)) nextMarkets.set(id, previous);
     }
 
     this.marketsById.clear();
@@ -543,7 +553,7 @@ export class EngineService {
 
     this.tokenIds = nextTokens;
     this.marketAdapter.setTokenIds(nextTokens);
-    this.dropRemovedMarketState(removedMarkets, removedAssets);
+    await this.dropRemovedMarketState(removedMarkets, removedAssets);
     this.state.setDiscovery({
       qualified: report.qualified.map((market) => ({ marketId: market.id, slug: market.slug, asset: market.asset, tokens: market.tokens.map((token) => token.tokenId) })),
       rejected: report.rejected.slice(0, 100),
@@ -577,18 +587,23 @@ export class EngineService {
     }
   }
 
-  private obligationMarketIds(): Set<string> {
+  private openPositionMarketIds(): Set<string> {
     const ids = new Set<string>();
     for (const position of this.ledger.positions.values()) {
-      if (Number(position.upQuantity) > 0 || Number(position.downQuantity) > 0) ids.add(position.marketId);
-    }
-    for (const resting of this.restingOrders.values()) {
-      if (Number(resting.remaining) > 0) ids.add(resting.order.marketId);
+      if (d(position.upQuantity).gt(0) || d(position.downQuantity).gt(0)) ids.add(position.marketId);
     }
     return ids;
   }
 
-  private dropRemovedMarketState(removedMarkets: readonly string[], removedAssets: readonly string[]): void {
+  private obligationMarketIds(): Set<string> {
+    const ids = this.openPositionMarketIds();
+    for (const resting of this.restingOrders.values()) {
+      if (d(resting.remaining).gt(0)) ids.add(resting.order.marketId);
+    }
+    return ids;
+  }
+
+  private async dropRemovedMarketState(removedMarkets: readonly string[], removedAssets: readonly string[]): Promise<void> {
     for (const marketId of removedMarkets) {
       this.snapshots.delete(marketId);
       this.triggerEngine.dropMarket(marketId);
@@ -597,9 +612,7 @@ export class EngineService {
       }
       for (const [orderId, resting] of [...this.restingOrders.entries()]) {
         if (resting.order.marketId !== marketId) continue;
-        this.releaseMaker(orderId);
-        this.restingOrders.delete(orderId);
-        this.record("PAPER_ORDER_CANCELLED", resting.order.traceId, marketId, { orderId, reason: "MARKET_REMOVED" });
+        await this.releaseMaker(orderId, { cancel: true, reason: "MARKET_REMOVED" });
       }
     }
     for (const asset of removedAssets) {
@@ -765,8 +778,8 @@ export class EngineService {
     this.metrics.durableTransitionLastAppliedSequence.set(this.lastAppliedDurableCursor);
   }
 
-  private applyCommitted(transition: DurableTransition): void {
-    if (transition.sequence <= this.lastAppliedDurableCursor) return;
+  private applyCommitted(transition: DurableTransition): boolean {
+    if (transition.sequence <= this.lastAppliedDurableCursor) return false;
     if (transition.sequence !== this.lastAppliedDurableCursor + 1) {
       throw new RecoveryFailClosedError(
         "cursor_fence",
@@ -778,6 +791,7 @@ export class EngineService {
     this.adoptRecoveredBag(bag);
     this.lastAppliedDurableCursor = transition.sequence;
     this.metrics.durableTransitionLastAppliedSequence.set(this.lastAppliedDurableCursor);
+    return true;
   }
 
   private failClosedIntegrity(error: unknown): void {
@@ -843,10 +857,10 @@ export class EngineService {
         if (commit.transition.sequence > this.lastAppliedDurableCursor + 1) {
           await this.replayDurableTail(this.lastAppliedDurableCursor);
         }
-        this.applyCommitted(commit.transition);
+        const applied = this.applyCommitted(commit.transition);
         this.crashInjector.maybeCrash("AFTER_APPLY_BEFORE_DERIVED_AUDIT", input.operationKey);
         await this.emitStoredDerivedAudit(commit.transition);
-        if (input.afterApply) await input.afterApply(commit.transition);
+        if (applied && input.afterApply) await input.afterApply(commit.transition);
         this.crashInjector.maybeCrash("AFTER_DERIVED_AUDIT_BEFORE_CHECKPOINT", input.operationKey);
         if (input.checkpoint) await this.checkpointInsideGate();
         this.crashInjector.maybeCrash("AFTER_CHECKPOINT", input.operationKey);
@@ -1052,7 +1066,7 @@ export class EngineService {
     const records = parseDerivedAudit(row.payload);
     const occurredAt = new Date(row.occurredAt);
     for (const record of records) {
-      await this.safeAppend(createJournalEvent({
+      await this.appendAcknowledged(createJournalEvent({
         id: record.id,
         traceId: record.traceId,
         type: record.type,
@@ -1064,6 +1078,27 @@ export class EngineService {
       }));
     }
     this.derivedAuditCursor = Math.max(this.derivedAuditCursor, row.sequence);
+  }
+
+  private async appendAcknowledged(event: ReturnType<typeof createJournalEvent>, signal?: AbortSignal): Promise<void> {
+    const journalClass = classifyJournalMetricClass(event.type);
+    try {
+      await this.journalAdmission.run(journalClass, true, async () => {
+        if (signal?.aborted) throw new JournalAdmissionRejected(journalClass, true, "JOURNAL_ADMISSION_CLOSED");
+        await this.metrics.observeDirectJournal(event.type, async () => {
+          await this.journal.append(event);
+          this.state.database = "UP";
+        });
+      }, signal);
+    } catch (error) {
+      if (error instanceof CrashInjectedError) throw error;
+      this.failClosedIntegrity(error);
+      this.logger.error(
+        { err: error, traceId: event.traceId, admitted: !(error instanceof JournalAdmissionRejected) },
+        error instanceof JournalAdmissionRejected ? "derived audit admission rejected" : "derived audit append failed",
+      );
+      throw error;
+    }
   }
 
   private experimentDerivedAudit(type: "EXPERIMENT_STARTED" | "EXPERIMENT_ENTRY_CLOSED" | "EXPERIMENT_COMPLETED", experiment: ExperimentManifest): DerivedAuditRecord {
@@ -1447,7 +1482,7 @@ export class EngineService {
     this.recentTrades.set(duplicateKey, Date.now());
     try {
       if (order.orderType === "MAKER") {
-        await this.reserveMaker(order, decisionSnapshot);
+        await this.reserveMaker(order, decisionSnapshot, intent);
         return;
       }
       await delay(this.env.PAPER_EXECUTION_LATENCY_MS);
@@ -1463,13 +1498,17 @@ export class EngineService {
     }
   }
 
-  private async reserveMaker(order: PaperOrder, snapshot: MarketSnapshot): Promise<void> {
+  private async reserveMaker(
+    order: PaperOrder,
+    snapshot: MarketSnapshot,
+    intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" = "OPEN_FIRST_LEG",
+  ): Promise<void> {
     const notional = makerReserveNotional(order.quantity, order.requestedPrice, snapshot.feeSchedule);
     if (this.ledger.availableCash().lt(notional) && !(await this.journal.readDurableByOperationKey(`maker:${order.id}:reserve`))) {
       throw new Error("INSUFFICIENT_CASH");
     }
     const resting = createRestingMakerOrder(order, snapshot);
-    const auth = { orderId: order.id, reserved: notional, resting };
+    const auth = { orderId: order.id, reserved: notional, resting, intent };
     await this.commitAuthoritative({
       operationKey: `maker:${order.id}:reserve`,
       type: "PAPER_MAKER_RESERVED",
@@ -1484,7 +1523,7 @@ export class EngineService {
             aggregateType: "paper_order",
             aggregateId: order.id,
             traceId: order.traceId,
-            payload: { ...order, intent: "OPEN_FIRST_LEG" },
+            payload: { ...order, intent },
           },
           {
             id: derivedAuditEventId("PAPER_MAKER_RESERVED", order.id),
@@ -1504,7 +1543,8 @@ export class EngineService {
     const reserved = this.makerReservations.get(orderId);
     if (!reserved && !options.cancel && !(await this.journal.readDurableByOperationKey(operationKey))) return;
     if (!reserved && options.cancel && !this.restingOrders.has(orderId) && !(await this.journal.readDurableByOperationKey(operationKey))) return;
-    const remaining = reserved ? Math.max(0, Number(reserved) - Number(options.filledNotional ?? 0)) : 0;
+    const leftover = reserved ? d(reserved).minus(options.filledNotional ?? 0) : d(0);
+    const released = leftover.gt(0) ? decimal(leftover) : "0";
     const type = options.cancel ? "PAPER_ORDER_CANCELLED" : "PAPER_MAKER_RELEASED";
     await this.commitAuthoritative({
       operationKey,
@@ -1512,7 +1552,7 @@ export class EngineService {
       aggregateType: "paper_order",
       aggregateId: orderId,
       buildPayload: (occurredAt) => ({
-        orderId, released: String(remaining), cancel: options.cancel === true, reason: options.reason,
+        orderId, released, cancel: options.cancel === true, reason: options.reason,
         derivedAudit: [{
           id: derivedAuditEventId(type, orderId),
           type,
@@ -1520,7 +1560,7 @@ export class EngineService {
           aggregateId: orderId,
           traceId: orderId,
           payload: {
-            orderId, released: String(remaining), reason: options.reason ?? null,
+            orderId, released, reason: options.reason ?? null,
             experimentId: this.experiment?.id ?? null, updatedAt: occurredAt.toISOString(),
           },
         }],
@@ -1538,20 +1578,20 @@ export class EngineService {
     if (extras.restingAfter !== undefined) return extras.restingAfter;
     const current = this.restingOrders.get(fill.orderId) ?? null;
     if (!current || fill.liquidityRole !== "MAKER") return current;
-    const remaining = Math.max(0, Number(current.remaining) - Number(fill.quantity));
-    return { ...current, remaining: String(remaining) };
+    const remaining = d(current.remaining).minus(fill.quantity);
+    return { ...current, remaining: remaining.gt(0) ? remaining.toFixed() : "0" };
   }
 
   private async applyFill(fill: Parameters<PaperLedger["applyFill"]>[0], extras: { restingAfter?: RestingPaperOrder | null } = {}): Promise<void> {
     const reserved = this.makerReservations.get(fill.orderId);
     let reservationAfter: string | null = reserved ?? null;
     if (reserved && fill.liquidityRole === "MAKER") {
-      const fillCost = Number(fill.quantity) * Number(fill.fillPrice) + Number(fill.feeUsd);
-      const next = Math.max(0, Number(reserved) - fillCost);
-      reservationAfter = next > 0 ? String(next) : null;
+      const fillCost = d(fill.quantity).mul(fill.fillPrice).plus(fill.feeUsd);
+      const next = d(reserved).minus(fillCost);
+      reservationAfter = next.gt(0) ? decimal(next) : null;
     }
     const previous = this.ledger.positions.get(fill.marketId);
-    const wasEmpty = !previous || (Number(previous.upQuantity) === 0 && Number(previous.downQuantity) === 0);
+    const wasEmpty = !previous || (!d(previous.upQuantity).gt(0) && !d(previous.downQuantity).gt(0));
     const positionId = previous?.id ?? stablePositionId(fill.marketId);
     const restingAfter = this.computeMakerRestingAfter(fill, extras);
     await this.commitAuthoritative({

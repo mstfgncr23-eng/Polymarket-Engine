@@ -1,14 +1,15 @@
 -- Replay-authoritative critical transitions.
 -- Dedicated table is the single recovery source: journal_events stays the
 -- concurrent audit/telemetry log (PR #12 admission unchanged). Sequences are
--- assigned only inside the durable-mutation advisory lock so a checkpoint
--- cursor cannot pass a lower-sequence uncommitted/unapplied transition.
+-- assigned explicitly inside the durable-mutation advisory lock
+-- (next = latest committed + 1) so a rolled-back insert cannot leave a
+-- PostgreSQL identity gap that recovery would treat as corruption.
 --
 -- Preserve RLS posture: engine PG access, RLS on, no public policies / no Data API.
 -- Do not FORCE RLS. Do not add anon/authenticated policies.
 
 CREATE TABLE IF NOT EXISTS durable_transitions (
-  sequence bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  sequence bigint PRIMARY KEY,
   operation_key text NOT NULL,
   type text NOT NULL,
   aggregate_type text NOT NULL,

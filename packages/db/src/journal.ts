@@ -52,15 +52,17 @@ export class MemoryEventJournal implements EventJournal {
   private readonly idempotencyKeys = new Set<string>();
   private readonly durableRows: DurableTransition[] = [];
   private readonly durableByKey = new Map<string, DurableTransition>();
-  private nextDurableSequence = 1;
   private durableChain = Promise.resolve();
   available = true;
+  failNextDurableInsert = false;
+  readonly failAppendTypes = new Set<string>();
 
   async initialize(): Promise<void> {}
   async healthCheck(): Promise<boolean> { return this.available; }
   async append(event: JournalEvent): Promise<void> {
     if (!this.available) throw new Error("DATABASE_UNAVAILABLE");
     const parsed = journalEventSchema.parse(event);
+    if (this.failAppendTypes.has(parsed.type)) throw new Error("JOURNAL_APPEND_FAILED");
     if (this.events.some((item) => item.id === parsed.id)) return;
     this.events.push(structuredClone(parsed));
   }
@@ -170,10 +172,14 @@ export class MemoryEventJournal implements EventJournal {
     if (latest !== expectedPreviousSequence) {
       throw new DurableCursorBehindError(expectedPreviousSequence, latest);
     }
+    if (this.failNextDurableInsert) {
+      this.failNextDurableInsert = false;
+      throw new Error("DURABLE_INSERT_FAILED");
+    }
     const now = new Date();
     const occurredAt = parsed.occurredAt ?? now;
     const row: DurableTransition = {
-      sequence: this.nextDurableSequence,
+      sequence: latest + 1,
       operationKey: parsed.operationKey,
       type: parsed.type,
       aggregateType: parsed.aggregateType,
@@ -183,7 +189,6 @@ export class MemoryEventJournal implements EventJournal {
       occurredAt: occurredAt.toISOString(),
       recordedAt: now.toISOString(),
     };
-    this.nextDurableSequence += 1;
     this.durableRows.push(row);
     this.durableByKey.set(parsed.operationKey, row);
     return {
@@ -298,6 +303,7 @@ export class PostgresEventJournal implements EventJournal {
         throw new DurableCursorBehindError(expectedPreviousSequence, latest);
       }
       const inserted = await tx.insert(durableTransitions).values({
+        sequence: latest + 1,
         operationKey: parsed.operationKey,
         type: parsed.type,
         aggregateType: parsed.aggregateType,
