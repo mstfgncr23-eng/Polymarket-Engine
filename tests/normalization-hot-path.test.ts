@@ -393,3 +393,68 @@ describe("trigger and paper execution equivalence on replayed snapshots", () => 
     expect(optimizedEvolved.fill?.fillPrice).toBe(referenceEvolved.fill?.fillPrice);
   });
 });
+
+describe("normalization duration is one observation per emitted snapshot", () => {
+  it("observes duration once per book and per accepted price_change, including incremental work, and not for stale drops", () => {
+    const adapter = createOptimized();
+    adapter.registerManualToken("tok-up", "mkt", "UP", "BTC");
+    adapter.setTokenIds(["tok-up"]);
+    const durations: number[] = [];
+    let priceChangeEvents = 0;
+    let priceChangeProcessed = 0;
+    adapter.setNormalizeObserver({
+      onNormalizedSnapshot: (input) => { durations.push(input.durationSeconds); },
+      onPriceChangeEvent: (entries, processed) => {
+        priceChangeEvents += 1;
+        priceChangeProcessed += processed;
+      },
+    });
+    const snapshots = [
+      ...adapter.normalizeSourceEvent(bookEvent("tok-up", 1_000, [{ price: "0.40", size: "10" }], [{ price: "0.60", size: "3" }])),
+      ...adapter.normalizeSourceEvent(priceChangeEvent(1_001, [
+        { tokenId: "tok-up", side: "BUY", price: "0.41", size: "4" },
+        { tokenId: "tok-up", side: "SELL", price: "0.59", size: "1" },
+      ])),
+      ...adapter.normalizeSourceEvent(priceChangeEvent(999, [{ tokenId: "tok-up", side: "BUY", price: "0.10", size: "9" }])),
+    ];
+    expect(snapshots).toHaveLength(3);
+    expect(durations).toHaveLength(snapshots.length);
+    expect(durations.every((value) => Number.isFinite(value) && value >= 0)).toBe(true);
+    expect(priceChangeEvents).toBe(2);
+    expect(priceChangeProcessed).toBe(2);
+  });
+});
+
+describe("feeSchedule snapshot isolation", () => {
+  it("keeps previously emitted feeSchedule unchanged after later market.feeSchedule mutation", () => {
+    const adapter = createOptimized();
+    adapter.registerManualToken("tok-up", "mkt", "UP", "BTC");
+    adapter.setTokenIds(["tok-up"]);
+    const market = adapter.getMarket("tok-up");
+    expect(market).toBeDefined();
+    const liveSchedule = {
+      rate: "0.07",
+      exponent: 1,
+      takerOnly: true,
+      rebateRate: "0.2",
+      source: "configured_test_fixture" as const,
+      effectiveAt: feeSchedule.effectiveAt,
+    };
+    market!.feeSchedule = liveSchedule;
+    const [first] = adapter.normalizeSourceEvent(bookEvent("tok-up", 1_000, [{ price: "0.40", size: "10" }], [{ price: "0.60", size: "3" }]));
+    expect(first!.feeSchedule?.rate).toBe("0.07");
+    expect(first!.feeSchedule).not.toBe(liveSchedule);
+
+    liveSchedule.rate = "0.99";
+    liveSchedule.rebateRate = "0.5";
+    expect(first!.feeSchedule?.rate).toBe("0.07");
+    expect(first!.feeSchedule?.rebateRate).toBe("0.2");
+
+    const [second] = adapter.normalizeSourceEvent(priceChangeEvent(1_001, [{ tokenId: "tok-up", side: "BUY", price: "0.41", size: "1" }]));
+    expect(first!.feeSchedule?.rate).toBe("0.07");
+    expect(second!.feeSchedule?.rate).toBe("0.99");
+    expect(second!.feeSchedule?.rebateRate).toBe("0.5");
+    expect(second!.feeSchedule).not.toBe(liveSchedule);
+    expect(second!.feeSchedule).not.toBe(first!.feeSchedule);
+  });
+});

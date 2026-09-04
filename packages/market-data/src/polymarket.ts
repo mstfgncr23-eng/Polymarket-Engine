@@ -391,6 +391,7 @@ export class PolymarketMarketDataAdapter {
       const acceptedMs = sourceMs as number;
       const bids = levelsToMap(payload.bids);
       const asks = levelsToMap(payload.asks);
+      const started = performance.now();
       const state: BookState = {
         marketId: String(payload.market ?? market.id),
         bids,
@@ -407,7 +408,7 @@ export class PolymarketMarketDataAdapter {
         hash: nullableString(payload.hash),
       };
       this.books.set(tokenId, state);
-      return [this.toSnapshot(tokenId, state, payload)];
+      return [this.toSnapshot(tokenId, state, payload, undefined, started)];
     }
     if (value.type === "price_change") {
       const changes = Array.isArray(payload.priceChanges) ? payload.priceChanges as Array<Record<string, unknown>> : [];
@@ -422,6 +423,7 @@ export class PolymarketMarketDataAdapter {
         const side = String(change.side);
         const price = String(change.price ?? "");
         const size = String(change.size ?? "0");
+        const started = performance.now();
         const changed = side === "BUY"
           ? applyLevelChange(state.bids, state.bidLevels, price, size, "desc")
           : applyLevelChange(state.asks, state.askLevels, price, size, "asc");
@@ -435,7 +437,7 @@ export class PolymarketMarketDataAdapter {
         state.timestamp = new Date(acceptedMs).toISOString();
         state.hash = nullableString(change.hash) ?? state.hash;
         const changedLevel = Number(size) <= 0 ? null : { price, quantity: size };
-        snapshots.push(this.toSnapshot(tokenId, state, payload, changedLevel));
+        snapshots.push(this.toSnapshot(tokenId, state, payload, changedLevel, started));
       }
       this.normalizeObserver?.onPriceChangeEvent(changes.length, snapshots.length);
       return snapshots;
@@ -484,8 +486,8 @@ export class PolymarketMarketDataAdapter {
     state: BookState,
     raw: Record<string, unknown>,
     changedLevel?: BookLevel | null,
+    started = performance.now(),
   ): MarketSnapshot {
-    const started = performance.now();
     const market = this.marketsByToken.get(tokenId);
     if (!market) throw new Error("UNKNOWN_TOKEN");
     const token = market.tokens.find((item) => item.tokenId === tokenId);
@@ -493,12 +495,13 @@ export class PolymarketMarketDataAdapter {
     const asks = publishSide(state, "asks");
     const tickSize = nullableString(raw.tickSize);
     const minOrderSize = nullableString(raw.minOrderSize);
+    let feeSchedule: MarketSnapshot["feeSchedule"] = null;
     try {
       validateNormalizedBook(state, changedLevel);
       assertDecimalString(state.lastTradePrice);
       assertDecimalString(tickSize);
       assertDecimalString(minOrderSize);
-      if (market.feeSchedule != null) feeScheduleSchema.parse(market.feeSchedule);
+      feeSchedule = market.feeSchedule == null ? null : feeScheduleSchema.parse(market.feeSchedule);
       state.levelsValid = true;
     } catch (error) {
       state.levelsValid = false;
@@ -516,7 +519,7 @@ export class PolymarketMarketDataAdapter {
       lastTradePrice: state.lastTradePrice,
       tickSize,
       minOrderSize,
-      feeSchedule: market.feeSchedule,
+      feeSchedule,
       sourceTimestamp: state.timestamp,
       receivedAt: new Date().toISOString(),
       sequence: ++this.sequence,
