@@ -785,6 +785,7 @@ export class EngineService {
   }
 
   private syncRuntimeState(): void {
+    if (!this.supervisor || !this.journalAdmission) return;
     const snap = this.supervisor.snapshot();
     this.state.queueDepth = snap.totalQueued + snap.totalInFlight;
     this.metrics.queueDepth.set(this.state.queueDepth);

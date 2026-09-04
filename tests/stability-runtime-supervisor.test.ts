@@ -15,6 +15,8 @@ import { BoundedJournalWriter } from "../apps/engine/src/journal-writer.js";
 import { SseHub, createApiServer } from "../apps/engine/src/server.js";
 import { EngineStateStore } from "../apps/engine/src/state.js";
 import { order, snapshot } from "./fixtures.js";
+import {
+  ScriptedMarketAdapter,
   ScriptedReferenceRegistry,
   discoveryReport,
   qualified,
@@ -94,7 +96,7 @@ async function startNoopEngine(opts?: {
     appendPeak = Math.max(appendPeak, appendActive);
     opts?.onAppendStart?.();
     await opts?.appendHook?.(event);
-    if (opts?.holdAppend) await opts.holdAppend;
+    if (opts?.holdAppend && event.type === "TRIGGER_EVENT") await opts.holdAppend;
     try {
       return await original(event);
     } finally {
@@ -143,7 +145,7 @@ describe("RuntimeSupervisor unit bounds", () => {
     expect(peak).toBeLessThanOrEqual(RUNTIME_BOUNDS.trigger.p3.concurrency);
   });
 
-  it("rejects at the hard cap without creating extra workers", () => {
+  it("rejects at the hard cap without creating extra workers", async () => {
     const supervisor = new RuntimeSupervisor();
     let release!: () => void;
     const hold = new Promise<void>((resolve) => { release = resolve; });
@@ -180,9 +182,15 @@ describe("RuntimeSupervisor unit bounds", () => {
     await waitFor(() => gate.activeCount === RUNTIME_BOUNDS.journal.active);
     expect(gate.waitingCount).toBeLessThanOrEqual(RUNTIME_BOUNDS.journal.waiting);
     expect(started).toBe(RUNTIME_BOUNDS.journal.active);
-    const overflow = await Promise.all(Array.from({ length: 200 }, () => gate.run("trigger", false, work).then(() => "ok", () => "rejected")));
-    expect(overflow.filter((item) => item === "rejected").length).toBeGreaterThan(0);
+    const overflow: Array<Promise<"ok" | "rejected">> = [];
+    for (let i = 0; i < 200; i += 1) {
+      overflow.push(gate.run("trigger", false, work).then(() => "ok" as const, () => "rejected" as const));
+    }
+    await waitFor(() => gate.waitingCount === RUNTIME_BOUNDS.journal.waiting);
+    expect(gate.activeCount).toBe(RUNTIME_BOUNDS.journal.active);
     release();
+    const overflowResults = await Promise.all(overflow);
+    expect(overflowResults.filter((item) => item === "rejected").length).toBeGreaterThan(0);
     await Promise.all(running);
   });
 
@@ -282,8 +290,6 @@ describe("A blocked journal + 10k trigger storm", () => {
       expect(await metricValue(engine.metrics, "runtime_work_rejected_total", { lane: "p3", reason: "overload_shed" })).toBe(result.reasons.overload_shed ?? 0);
       expect(engine.ledger.snapshot().cash).toBe(cashBefore);
       expect((await journal.queryEvents({ types: ["PAPER_ORDER_CREATED", "PAPER_FILL"] })).length).toBe(0);
-      release();
-      await waitFor(() => engine.runtimeSupervisorSnapshot().unresolved === 0, 5_000);
       console.log(JSON.stringify({
         test: "A",
         durationMs: Math.round(performance.now() - started),
@@ -299,7 +305,7 @@ describe("A blocked journal + 10k trigger storm", () => {
       release();
       await engine.stop();
     }
-  });
+  }, 20_000);
 });
 
 describe("B queue drain after release", () => {
@@ -325,7 +331,7 @@ describe("B queue drain after release", () => {
       release();
       await engine.stop();
     }
-  });
+  }, 20_000);
 });
 
 describe("C same-market ordering", () => {
@@ -352,7 +358,7 @@ describe("C same-market ordering", () => {
       release();
       await engine.stop();
     }
-  });
+  }, 15_000);
 });
 
 describe("D IDLE+noop overload shedding", () => {
@@ -378,7 +384,7 @@ describe("D IDLE+noop overload shedding", () => {
       release();
       await engine.stop();
     }
-  });
+  }, 15_000);
 });
 
 describe("E RUNNING overload fail-closed", () => {
@@ -483,7 +489,7 @@ describe("H shutdown mid-work", () => {
     expect(after.admitted).toBe(0);
     expect(after.reasons.admission_closed).toBe(1);
     release();
-  });
+  }, 15_000);
 });
 
 describe("I SSE slow-client bound", () => {

@@ -201,9 +201,7 @@ export class RuntimeSupervisor {
   constructor(
     private readonly metrics?: RuntimeWorkMetrics,
     private readonly onChange?: () => void,
-  ) {
-    this.publish();
-  }
+  ) {}
 
   get admissionClosed(): boolean { return this.closed; }
   get lastHardCap(): { p0: boolean; p3: boolean } { return { p0: this.lastP0HardCap, p3: this.lastP3HardCap }; }
@@ -439,9 +437,7 @@ export class DirectJournalAdmission {
   private criticalRejects = 0;
   private oldestAt: number | null = null;
 
-  constructor(private readonly metrics?: JournalAdmissionMetrics, private readonly onChange?: () => void) {
-    this.publish();
-  }
+  constructor(private readonly metrics?: JournalAdmissionMetrics, private readonly onChange?: () => void) {}
 
   get waitingCount(): number { return this.waiting.length; }
   get activeCount(): number { return this.active; }
