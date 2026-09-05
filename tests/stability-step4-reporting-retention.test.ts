@@ -669,8 +669,12 @@ describe("Step-4 acceptance: monitor-only and drain", () => {
     }
     const tail = eligible.slice(-4);
     const first = eligible[0]!;
-    expect(Math.max(...tail)).toBeLessThan(first * 3);
+    const hwm = Math.max(...eligible);
+    const plateau = Math.max(...tail);
+    expect(plateau).toBeLessThan(first * 3);
     expect(Math.max(...tail) - Math.min(...tail)).toBeLessThan(200);
+    expect(hwm).toBeLessThan(250);
+    expect(plateau).toBeLessThanOrEqual(120);
   });
 });
 

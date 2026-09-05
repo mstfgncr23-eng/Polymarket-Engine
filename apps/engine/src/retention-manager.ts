@@ -163,11 +163,15 @@ export class RetentionManager {
         const result = await work();
         lastBatchSize = result.deleted;
         lastBatchDurationMs = Date.now() - t0;
-        batchCount += 1;
-        totalDeleted += result.deleted;
-        deletedByClass[cls] = (deletedByClass[cls] ?? 0) + result.deleted;
-        this.metrics?.noteDeleted?.(cls, result.deleted);
-        this.metrics?.noteBatch?.(result.deleted, lastBatchDurationMs);
+        // Zero-delete probes exhaust that class; they must not consume the
+        // useful batch/row budget or an empty class starves a real backlog.
+        if (result.deleted > 0) {
+          batchCount += 1;
+          totalDeleted += result.deleted;
+          deletedByClass[cls] = (deletedByClass[cls] ?? 0) + result.deleted;
+          this.metrics?.noteDeleted?.(cls, result.deleted);
+          this.metrics?.noteBatch?.(result.deleted, lastBatchDurationMs);
+        }
         return result.deleted;
       };
 
