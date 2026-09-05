@@ -88,6 +88,8 @@ export class ScriptedBoundedStream implements BoundedMarketStream {
   pendingWaiterCount(): number { return this.waiters.length; }
   pingTimerActive(): boolean { return false; }
   streamGeneration(): number { return this.generation; }
+  /** False after remote end, fail, or close. `closed` alone is not enough — `endRemote` does not set it. */
+  get alive(): boolean { return !this.finalized && !this.closed; }
 
   push(event: unknown): { ok: true } | { ok: false; reason: "count_limit" | "byte_limit" } {
     if (this.closed || this.finalized) return { ok: true };

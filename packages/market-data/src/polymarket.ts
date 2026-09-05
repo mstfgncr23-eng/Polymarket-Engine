@@ -828,7 +828,7 @@ export class PolymarketMarketDataAdapter {
     let feeSchedule: MarketSnapshot["feeSchedule"] = null;
     try {
       this.assertSnapshotPublishable(tokenId, state, raw, changedLevel);
-      feeSchedule = market.feeSchedule == null ? null : market.feeSchedule;
+      feeSchedule = market.feeSchedule == null ? null : feeScheduleSchema.parse(market.feeSchedule);
       state.levelsValid = true;
     } catch (error) {
       state.levelsValid = false;

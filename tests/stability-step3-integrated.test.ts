@@ -763,9 +763,10 @@ describe("G+H+I — reference ingress, connect, timestamps", () => {
     }, abort.signal);
     await waitFor(() => sockets.length >= 2, 3_000);
     expect(sockets.length).toBeGreaterThanOrEqual(2);
-    expect(adapter.lastIngress).toBeNull();
     abort.abort(REFERENCE_WS_CONNECT_TIMEOUT);
     await running;
+    expect(adapter.lastIngress).toBeNull();
+    expect(adapter.running).toBe(false);
   });
 
   it("B: abort while CONNECTING + close-never-acks settles run promptly", async () => {
@@ -824,9 +825,10 @@ describe("G+H+I — reference ingress, connect, timestamps", () => {
     expect(ticks).not.toContain("999");
     expect(connections).not.toContain("CONNECTED");
     expect(first.liveListeners).toBe(0);
-    expect(adapter.lastIngress).toBeNull();
     abort.abort("test");
     await running;
+    expect(adapter.lastIngress).toBeNull();
+    expect(adapter.running).toBe(false);
   });
 
   it("STALE terminal initiation is one-shot while close never acks", async () => {
@@ -940,15 +942,17 @@ describe("J — market reconnect backoff is stability-gated", () => {
     await waitFor(() => adapter.reconnectDelays.length >= 2);
     const grown = adapter.reconnectDelays[1]!;
     expect(grown).toBeGreaterThan(adapter.reconnectDelays[0]! * 0.8);
+    const callsBeforeHold = transport.subscribeCalls;
+    const streamsBeforeHold = transport.streams.length;
     const held = transport.holdNextSubscribe();
-    await waitFor(() => transport.subscribeCalls >= 3);
+    await waitFor(() => transport.subscribeCalls > callsBeforeHold, 10_000);
     await new Promise((resolve) => setTimeout(resolve, 50));
     held.release();
-    await waitFor(() => transport.stream && !transport.current().closed);
+    await waitFor(() => transport.streams.length > streamsBeforeHold && transport.current().alive);
     expect(transport.push(liveBook("tok-up", 3_000)).ok).toBe(true);
     await waitFor(() => adapter.isTokenSynchronized("tok-up"));
     transport.current().endRemote();
-    await waitFor(() => adapter.reconnectDelays.length >= 3);
+    await waitFor(() => adapter.reconnectDelays.length >= 3, 10_000);
     expect(adapter.reconnectDelays[2]!).toBeGreaterThan(grown * 0.8);
     ac.abort();
     await running;
