@@ -103,7 +103,23 @@ export function spread(snapshot: MarketSnapshot): string | null {
   return bid && ask ? decimal(d(ask.price).minus(bid.price)) : null;
 }
 
+/**
+ * First-N-level imbalance without slice/reduce temps. Decimal accumulate then
+ * ratio→Number — same semantics as the original reduce. No Number-sum fast path
+ * (intermediate sums are not IEEE-exact even when each quantity is).
+ */
 export function bookImbalance(snapshot: MarketSnapshot, levels = 5): number {
+  const bidN = Math.min(levels, snapshot.bids.length);
+  const askN = Math.min(levels, snapshot.asks.length);
+  let bid = d(0);
+  let ask = d(0);
+  for (let i = 0; i < bidN; i += 1) bid = bid.plus(snapshot.bids[i]!.quantity);
+  for (let i = 0; i < askN; i += 1) ask = ask.plus(snapshot.asks[i]!.quantity);
+  const total = bid.plus(ask);
+  return total.eq(0) ? 0 : bid.minus(ask).div(total).toNumber();
+}
+
+export function bookImbalanceReference(snapshot: MarketSnapshot, levels = 5): number {
   const bid = snapshot.bids.slice(0, levels).reduce((sum, level) => sum.plus(level.quantity), d(0));
   const ask = snapshot.asks.slice(0, levels).reduce((sum, level) => sum.plus(level.quantity), d(0));
   const total = bid.plus(ask);

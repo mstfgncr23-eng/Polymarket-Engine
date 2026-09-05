@@ -1,6 +1,11 @@
 import { createId, referenceStreamUrl, referenceTickSchema, toBinanceSpotSymbol, type ReferenceTick } from "@pm/core";
+import { BoundedIngressQueue } from "./bounded-ingress.js";
+import { REFERENCE_INGRESS_BOUNDS } from "./ingress-bounds.js";
 import { abortableDelay, ExponentialBackoff, type ReconnectOptions } from "./reconnect.js";
 import type { FeedConnectionEvent } from "./polymarket.js";
+
+export const REFERENCE_WS_CONNECT_TIMEOUT = "REFERENCE_WS_CONNECT_TIMEOUT";
+export const REFERENCE_INGRESS_OVERFLOW = "REFERENCE_INGRESS_OVERFLOW";
 
 export interface ReferenceFeedHandlers {
   onTick(tick: ReferenceTick): Promise<void> | void;
@@ -51,7 +56,13 @@ export const REFERENCE_STABLE_CONNECTION_MS = 5_000;
 export interface ReferenceReconnectOptions extends Partial<ReconnectOptions> {
   /** Override of REFERENCE_STABLE_CONNECTION_MS. Not reset on `"open"`. */
   stableAfterMs?: number;
+  connectTimeoutMs?: number;
+  /** Finite deadline to settle after close() if the socket never emits `"close"`. */
+  closeWatchdogMs?: number;
 }
+
+/** Application-controlled settle deadline when a socket close is never acknowledged. */
+export const REFERENCE_CLOSE_WATCHDOG_MS = 2_000;
 
 export function formatReferenceClose(closed: Omit<ReferenceCloseEvent, "reconnectCount" | "asset"> & { reconnectCount?: number; asset?: string }): string {
   return `REFERENCE_CLOSE:kind=${closed.kind}:code=${closed.code ?? "none"}:wasClean=${closed.wasClean}:abort=${closed.abortInitiated}:reason=${closed.reason || ""}`;
@@ -83,7 +94,11 @@ export class ReferencePriceFeedAdapter {
   private readonly venue: string;
   private readonly reconnect: ReconnectOptions;
   private readonly stableAfterMs: number;
+  private readonly connectTimeoutMs: number;
+  private readonly closeWatchdogMs: number;
   private inFlight = false;
+  private sessionGeneration = 0;
+  lastIngress: BoundedIngressQueue | null = null;
 
   constructor(private readonly options: ReferenceFeedOptions) {
     this.factory = options.factory ?? ((url) => new WebSocket(url));
@@ -96,11 +111,14 @@ export class ReferencePriceFeedAdapter {
       jitterRatio: options.reconnect?.jitterRatio ?? DEFAULT_RECONNECT.jitterRatio,
     };
     this.stableAfterMs = options.reconnect?.stableAfterMs ?? REFERENCE_STABLE_CONNECTION_MS;
+    this.connectTimeoutMs = options.reconnect?.connectTimeoutMs ?? REFERENCE_INGRESS_BOUNDS.connectTimeoutMs;
+    this.closeWatchdogMs = options.reconnect?.closeWatchdogMs ?? REFERENCE_CLOSE_WATCHDOG_MS;
   }
 
   get asset(): string { return this.options.asset; }
   get symbol(): string { return this.options.symbol; }
   get running(): boolean { return this.inFlight; }
+  currentSessionGeneration(): number { return this.sessionGeneration; }
 
   async run(handlers: ReferenceFeedHandlers, signal: AbortSignal): Promise<void> {
     if (this.inFlight) throw new Error(`REFERENCE_FEED_ALREADY_RUNNING:${this.options.asset}`);
@@ -139,26 +157,40 @@ export class ReferencePriceFeedAdapter {
     backoff: ExponentialBackoff,
   ): Promise<Omit<ReferenceCloseEvent, "reconnectCount" | "asset"> & { reconnectCount: number; asset: string }> {
     return new Promise((resolve) => {
+      const generation = ++this.sessionGeneration;
       const socket = this.factory(this.options.url);
+      const ingress = new BoundedIngressQueue(REFERENCE_INGRESS_BOUNDS.maxEvents, REFERENCE_INGRESS_BOUNDS.maxBytes);
+      this.lastIngress = ingress;
       let lastMessageAt = Date.now();
       let connected = false;
       let settled = false;
       let abortInitiated = false;
       let sawError = false;
       let staleForced = false;
+      let overflowed = false;
+      let consumerRunning = false;
       let openedAt: number | null = null;
-      const staleTimer = setInterval(() => {
-        if (connected && Date.now() - lastMessageAt > this.staleTimeoutMs) {
-          staleForced = true;
-          void handlers.onConnection(this.connection("STALE", reconnectCount));
-          try { socket.close(4000, "stale feed"); } catch { /* ignore */ }
-        }
-      }, Math.max(500, Math.floor(this.staleTimeoutMs / 2)));
+      let closeWatchdog: ReturnType<typeof setTimeout> | null = null;
+      const listeners: Array<{ type: string; fn: EventListenerOrEventListenerObject }> = [];
+      const listen = (type: string, fn: EventListenerOrEventListenerObject, options?: AddEventListenerOptions) => {
+        socket.addEventListener(type, fn, options);
+        listeners.push({ type, fn });
+      };
       const finish = (input: { code: number | null; reason: string; wasClean: boolean }) => {
         if (settled) return;
         settled = true;
+        if (this.sessionGeneration === generation) this.sessionGeneration += 1;
         clearInterval(staleTimer);
+        clearTimeout(connectTimer);
+        if (closeWatchdog != null) {
+          clearTimeout(closeWatchdog);
+          closeWatchdog = null;
+        }
         signal.removeEventListener("abort", onAbort);
+        for (const { type, fn } of listeners) socket.removeEventListener(type, fn);
+        listeners.length = 0;
+        ingress.clear();
+        if (this.lastIngress === ingress) this.lastIngress = null;
         if (connected && openedAt != null && Date.now() - openedAt >= this.stableAfterMs) backoff.reset();
         const kind = classifyReferenceClose({
           abortInitiated, abortReason: signal.reason, code: input.code, reason: input.reason,
@@ -170,28 +202,99 @@ export class ReferencePriceFeedAdapter {
         });
       };
       const requestClose = (code: number, reason: string) => {
-        try { socket.close(code, reason); } catch { finish({ code, reason, wasClean: abortInitiated }); }
+        if (settled) return;
+        try {
+          socket.close(code, reason);
+        } catch {
+          finish({ code, reason, wasClean: abortInitiated });
+          return;
+        }
+        if (settled || closeWatchdog != null) return;
+        closeWatchdog = setTimeout(() => {
+          closeWatchdog = null;
+          finish({ code, reason, wasClean: abortInitiated });
+        }, this.closeWatchdogMs);
+        closeWatchdog.unref?.();
       };
+      const staleTimer = setInterval(() => {
+        if (settled || staleForced) return;
+        if (connected && Date.now() - lastMessageAt > this.staleTimeoutMs) {
+          staleForced = true;
+          void handlers.onConnection(this.connection("STALE", reconnectCount));
+          requestClose(4000, "stale feed");
+        }
+      }, Math.max(500, Math.floor(this.staleTimeoutMs / 2)));
+      const connectTimer = setTimeout(() => {
+        if (!connected && !settled) {
+          sawError = true;
+          requestClose(4001, REFERENCE_WS_CONNECT_TIMEOUT);
+        }
+      }, this.connectTimeoutMs);
+      connectTimer.unref?.();
       const onAbort = () => {
         abortInitiated = true;
         requestClose(1000, "shutdown");
       };
-      socket.addEventListener("open", () => {
+      const noteOverflow = () => {
+        if (overflowed || settled || generation !== this.sessionGeneration) return;
+        overflowed = true;
+        staleForced = true;
+        ingress.clear();
+        void handlers.onError(new Error(REFERENCE_INGRESS_OVERFLOW));
+        void handlers.onConnection(this.connection("STALE", reconnectCount, REFERENCE_INGRESS_OVERFLOW));
+        requestClose(4000, REFERENCE_INGRESS_OVERFLOW);
+      };
+      const consume = async () => {
+        if (consumerRunning) return;
+        consumerRunning = true;
+        try {
+          while (!settled && !overflowed && generation === this.sessionGeneration) {
+            const raw = ingress.dequeue();
+            if (raw === undefined) break;
+            try {
+              const tick = parseBinanceAggTrade(raw, this.options.symbol, this.options.asset, this.venue);
+              await handlers.onTick(tick);
+            } catch (error) {
+              await handlers.onError(error instanceof Error ? error : new Error(String(error)));
+            }
+          }
+        } finally {
+          consumerRunning = false;
+          if (!settled && !overflowed && generation === this.sessionGeneration && ingress.depth > 0) {
+            void consume();
+          }
+        }
+      };
+      listen("open", () => {
+        if (settled || generation !== this.sessionGeneration) return;
         connected = true;
         openedAt = Date.now();
         lastMessageAt = openedAt;
+        clearTimeout(connectTimer);
         void handlers.onConnection(this.connection("CONNECTED", reconnectCount));
       });
-      socket.addEventListener("message", (event) => {
+      listen("message", (event) => {
+        if (settled || overflowed || generation !== this.sessionGeneration) return;
         lastMessageAt = Date.now();
-        try { void handlers.onTick(parseBinanceAggTrade((event as MessageEvent).data, this.options.symbol, this.options.asset, this.venue)); }
-        catch (error) { void handlers.onError(error instanceof Error ? error : new Error(String(error))); }
+        const data = (event as MessageEvent).data;
+        const raw = typeof data === "string" ? data : data instanceof ArrayBuffer ? new TextDecoder().decode(data) : String(data ?? "");
+        if (raw.length > REFERENCE_INGRESS_BOUNDS.maxRawFrameBytes) {
+          ingress.noteOverflow("byte_limit");
+          noteOverflow();
+          return;
+        }
+        const result = ingress.tryEnqueueWeighted(raw, raw.length);
+        if (!result.ok) {
+          noteOverflow();
+          return;
+        }
+        void consume();
       });
-      socket.addEventListener("error", () => {
+      listen("error", () => {
         sawError = true;
         requestClose(1011, "websocket error");
       }, { once: true });
-      socket.addEventListener("close", (event) => {
+      listen("close", (event) => {
         const close = event as Partial<CloseEvent>;
         const code = typeof close.code === "number" ? close.code : (sawError ? null : 1005);
         const reason = typeof close.reason === "string" && close.reason.length > 0

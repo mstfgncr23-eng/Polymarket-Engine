@@ -55,6 +55,10 @@ import {
   type RestingPaperOrder,
   type TriggerEvent,
   type ActivationLatency,
+  AssetMarketIndex,
+  classifyTriggerProvenance,
+  isMarketDataDerivedTrigger,
+  type TriggerProvenance,
 } from "@pm/core";
 import {
   CHECKPOINT_SCHEMA_VERSION,
@@ -78,6 +82,7 @@ import {
   type PolymarketFeedAnomaly,
 } from "@pm/market-data";
 import { EngineMetrics, classifyJournalMetricClass } from "./metrics.js";
+import { RestingOrderTokenIndex } from "./resting-order-index.js";
 import { SseHub } from "./server.js";
 import { EngineStateStore } from "./state.js";
 import { buildExperimentSummary, filterCurrentExperimentEvents, writeExperimentSummary } from "./report.js";
@@ -143,6 +148,8 @@ export class EngineService {
   private readonly makerReservations = new Map<string, string>();
   private readonly recentTrades = new Map<string, number>();
   private readonly activeTriggers = new Map<string, TriggerEvent>();
+  private readonly triggerProvenance = new Map<string, TriggerProvenance>();
+  private readonly provenanceInvalid = new Set<string>();
   private readonly signalsByTrigger = new Map<string, Map<ExternalAgentRoleId, GrokSignalEnvelope>>();
   private readonly signalReceivedTimes: number[] = [];
   private readonly lastEvaluatedSignalCount = new Map<string, number>();
@@ -152,11 +159,20 @@ export class EngineService {
   private readonly settledMarkets = new Set<string>();
   private readonly settlementBackoff = new Map<string, number>();
   private readonly assetByMarket = new Map<string, string | null>();
+  private readonly assetIndex = new AssetMarketIndex();
+  private readonly restingIndex = new RestingOrderTokenIndex();
+  private readonly snapshotEpoch = new Map<string, number>();
+  private readonly referenceUnreliable = new Set<string>();
+  private readonly referenceEpoch = new Map<string, number>();
+  private readonly referenceLogicalGapped = new Set<string>();
+  private readonly referenceResyncInFlight = new Set<string>();
+  private readonly referenceResyncRequested = new Set<string>();
   private readonly referenceRequired = new Map<string, boolean>();
   private readonly referenceBlocked = new Map<string, string>();
   private readonly referenceRetryTimers = new Map<string, NodeJS.Timeout>();
   private readonly referenceRetryDeadlines = new Map<string, number>();
   private tokenIds: string[] = [];
+  private tokenIdSet = new Set<string>();
   private marketLoopStarted = false;
   private experiment: ExperimentManifest | null = null;
   private checkpointSequence = 0;
@@ -188,6 +204,9 @@ export class EngineService {
   private lastShutdownCheckpointed = false;
   private maintenanceHold: Promise<void> | null = null;
   private processTriggerHold: Promise<void> | null = null;
+  private triggerEventPersistHold: Promise<void> | null = null;
+  private referenceTelemetryHoldForTest: Promise<void> | null = null;
+  private lastAdmittedMarketEpochFence: ReadonlyMap<string, number> | null = null;
   private discoveryGenerationApplied = 0;
 
   constructor(
@@ -216,6 +235,9 @@ export class EngineService {
     this.marketAdapter = adapters?.market ?? new PolymarketMarketDataAdapter();
     if (this.marketAdapter instanceof PolymarketMarketDataAdapter) {
       this.marketAdapter.setNormalizeObserver(this.metrics.normalizeObserver());
+      this.marketAdapter.setIngressObserver({
+        onChange: (snapshot) => this.metrics.noteIngressSnapshot(snapshot),
+      });
     }
     this.legacyBtcAdapter = adapters?.btc ?? null;
     this.referenceRegistry = adapters?.referenceRegistry ?? new ReferenceFeedRegistry(
@@ -265,6 +287,7 @@ export class EngineService {
     if (configuredTokens.length > 0) {
       configuredTokens.forEach((tokenId, index) => this.marketAdapter.registerManualToken(tokenId, tokenId, index % 2 === 0 ? "UP" : "DOWN"));
       this.tokenIds = configuredTokens;
+      this.tokenIdSet = new Set(configuredTokens);
       this.marketAdapter.setTokenIds(this.tokenIds);
       this.state.setDiscoveryStatus("MONITORING", this.tokenIds.length);
       this.state.setDiscoveryLoopActive(false);
@@ -383,6 +406,27 @@ export class EngineService {
   lastAppliedDurableCursorForTest(): number { return this.lastAppliedDurableCursor; }
   derivedAuditCursorForTest(): number { return this.derivedAuditCursor; }
   restingOrdersForTest() { return new Map(this.restingOrders); }
+  restingOrderTokenIndexEntries(): number { return this.restingIndex.entryCount(); }
+  assetMarketIndexEntries(): number { return this.assetIndex.entryCount(); }
+  isTokenSynchronized(tokenId: string): boolean { return this.adapterTokenSynchronized(tokenId); }
+  isMarketSynchronized(marketId: string): boolean {
+    const discovered = this.marketsById.get(marketId)?.tokens.map((token) => token.tokenId) ?? [];
+    const pair = this.snapshots.get(marketId);
+    const tokens = uniqueStrings([
+      ...discovered,
+      pair?.UP?.tokenId,
+      pair?.DOWN?.tokenId,
+      ...[...this.state.marketSnapshots.values()].filter((item) => item.marketId === marketId).map((item) => item.tokenId),
+    ].filter((item): item is string => Boolean(item)));
+    if (tokens.length === 0) return this.marketAdapter.unsynchronizedTokenCount?.() === 0;
+    return tokens.every((tokenId) => this.adapterTokenSynchronized(tokenId));
+  }
+  unsynchronizedTokenCount(): number {
+    return typeof this.marketAdapter.unsynchronizedTokenCount === "function"
+      ? this.marketAdapter.unsynchronizedTokenCount()
+      : 0;
+  }
+  triggerDedupeEntryCount(): number { return this.triggerEngine.dedupeEntryCount(); }
   makerReservationsForTest() { return new Map(this.makerReservations); }
   settledMarketsForTest() { return new Set(this.settledMarkets); }
   async latestDurableSequenceForTest(): Promise<number> { return this.journal.latestDurableSequence(); }
@@ -485,6 +529,16 @@ export class EngineService {
       onConnection: (event) => this.onConnection(event),
       onError: (error) => this.onFeedError("polymarket", error),
       onAnomaly: (anomaly) => this.onPolymarketAnomaly(anomaly),
+      onGap: (event) => {
+        this.invalidateMarketProjections(event.tokenIds);
+        this.metrics.noteIngressGap(event.reason);
+        this.metrics.marketUnsynchronizedTokens.set(this.unsynchronizedTokenCount());
+        this.syncIngressMetrics();
+      },
+      onResync: (event) => {
+        this.metrics.noteIngressResync(event.reason);
+        this.metrics.marketUnsynchronizedTokens.set(this.unsynchronizedTokenCount());
+      },
     }, this.abort.signal).catch((error) => this.logger.error({ err: error }, "polymarket market loop stopped"));
   }
 
@@ -537,13 +591,16 @@ export class EngineService {
     for (const id of nextEntryQualified) this.entryQualified.add(id);
     this.marketsById.clear();
     this.assetByMarket.clear();
+    this.assetIndex.clear();
     this.managedMarketIds.clear();
     for (const [id, market] of nextMarkets) {
       this.marketsById.set(id, market);
       this.assetByMarket.set(id, market.asset);
+      if (market.asset) this.assetIndex.add(market.asset, id);
       if (obligations.has(id) || this.entryQualified.has(id)) this.managedMarketIds.add(id);
       if (market.endDate) this.triggerEngine.noteMarketWindow(id, market.asset, market.endDate);
     }
+    this.metrics.assetMarketIndexEntries.set(this.assetIndex.entryCount());
     const nextTokens = uniqueStrings([...this.marketsById.values()].flatMap((market) => market.tokens.map((token) => token.tokenId)));
     const addedMarkets = [...this.marketsById.keys()].filter((id) => !previousMarketIds.has(id));
     const removedMarkets = [...previousMarketIds].filter((id) => !this.marketsById.has(id));
@@ -553,6 +610,7 @@ export class EngineService {
     const removedAssets = [...previousAssets].filter((asset) => !nextAssets.has(asset));
 
     this.tokenIds = nextTokens;
+    this.tokenIdSet = new Set(nextTokens);
     this.marketAdapter.setTokenIds(nextTokens);
     this.dropRemovedMarketState(removedMarkets, removedAssets);
     this.state.setDiscovery({
@@ -627,20 +685,29 @@ export class EngineService {
     for (const marketId of removedMarkets) {
       this.snapshots.delete(marketId);
       this.triggerEngine.dropMarket(marketId);
+      this.assetIndex.removeMarket(marketId);
       for (const [tokenId, snapshot] of [...this.state.marketSnapshots.entries()]) {
-        if (snapshot.marketId === marketId) this.state.marketSnapshots.delete(tokenId);
+        if (snapshot.marketId === marketId) {
+          this.state.marketSnapshots.delete(tokenId);
+          this.snapshotEpoch.delete(tokenId);
+        }
       }
     }
     for (const asset of removedAssets) {
       this.triggerEngine.dropAsset(asset);
+      this.assetIndex.dropAsset(asset);
+      this.referenceUnreliable.delete(asset);
+      this.referenceEpoch.delete(asset);
+      this.referenceLogicalGapped.delete(asset);
+      this.referenceResyncRequested.delete(asset);
+      this.referenceResyncInFlight.delete(asset);
       this.state.dropReference(asset);
       this.clearReferenceRetry(asset);
     }
+    this.metrics.assetMarketIndexEntries.set(this.assetIndex.entryCount());
     for (const [triggerId, trigger] of [...this.activeTriggers]) {
       if (!trigger.marketId || !removedMarkets.includes(trigger.marketId)) continue;
-      this.activeTriggers.delete(triggerId);
-      this.signalsByTrigger.delete(triggerId);
-      this.lastEvaluatedSignalCount.delete(triggerId);
+      this.forgetTrigger(triggerId);
     }
   }
 
@@ -711,13 +778,40 @@ export class EngineService {
       this.logger.error({ err: error, asset }, "reference feed failed to start");
       return "transient" as const;
     });
-    if (outcome === "started") {
-      await this.safeAppend(createJournalEvent({
-        traceId: createId("trace"), type: "REFERENCE_FEED_STARTED", aggregateType: "reference", aggregateId: asset,
-        payload: { asset, symbol: resolution.symbol, sharedByMarkets: markets },
-      }));
-      this.record("REFERENCE_FEED_STARTED", createId("trace"), null, { asset, markets }, asset);
+    if (outcome === "started" || outcome === "already") {
+      if (outcome === "started") {
+        await this.safeAppend(createJournalEvent({
+          traceId: createId("trace"), type: "REFERENCE_FEED_STARTED", aggregateType: "reference", aggregateId: asset,
+          payload: { asset, symbol: resolution.symbol, sharedByMarkets: markets },
+        }));
+        this.record("REFERENCE_FEED_STARTED", createId("trace"), null, { asset, markets }, asset);
+      }
+      if (this.referenceUnreliable.has(asset) && this.assetStillNeeded(asset)) {
+        this.referenceResyncRequested.add(asset);
+      } else if (!this.assetStillNeeded(asset)) {
+        this.referenceResyncRequested.delete(asset);
+        try { this.referenceRegistry.stop(asset); } catch { /* scripted */ }
+      }
+      return;
     }
+    this.referenceResyncRequested.delete(asset);
+    if (outcome === "unsupported") {
+      return;
+    }
+    if ((outcome === "transient" || outcome === "stopped") && this.shouldRetryReferenceStart(asset)) {
+      this.scheduleReferenceRetry(asset, 50, 60_000);
+    }
+  }
+
+  private assetStillNeeded(asset: string): boolean {
+    return [...this.assetByMarket.values()].includes(asset);
+  }
+
+  private shouldRetryReferenceStart(asset: string): boolean {
+    return this.referenceUnreliable.has(asset)
+      && this.assetStillNeeded(asset)
+      && !this.abort.signal.aborted
+      && !this.state.draining;
   }
 
   private scheduleReferenceRetry(asset: string, retryAfterMs: number | undefined, maxDelayMs: number): void {
@@ -863,6 +957,7 @@ export class EngineService {
         await this.replayDurableTail(this.lastAppliedDurableCursor);
       }
       const applied = this.applyCommitted(commit.transition);
+      this.syncRestingIndexFromOrders();
       this.crashInjector.maybeCrash("AFTER_APPLY_BEFORE_DERIVED_AUDIT", input.operationKey);
       await this.emitStoredDerivedAudit(commit.transition);
       if (applied && input.afterApply) await input.afterApply(commit.transition);
@@ -1020,11 +1115,24 @@ export class EngineService {
     });
     const resting = Array.isArray(payload.restingOrders) ? payload.restingOrders.map((item) => restingPaperOrderSchema.parse(item)) : [];
     for (const item of resting) this.restingOrders.set(item.order.id, item);
+    this.syncRestingIndexFromOrders();
     const reservations = payload.makerReservations && typeof payload.makerReservations === "object"
       ? payload.makerReservations as Record<string, string> : {};
     for (const [orderId, amount] of Object.entries(reservations)) this.makerReservations.set(orderId, amount);
     const triggers = Array.isArray(payload.activeTriggers) ? payload.activeTriggers.map((item) => triggerEventSchema.parse(item)) : [];
-    for (const trigger of triggers) { this.activeTriggers.set(trigger.id, trigger); this.state.addTrigger(trigger); }
+    for (const trigger of triggers) {
+      this.activeTriggers.set(trigger.id, trigger);
+      this.state.addTrigger(trigger);
+      const plane = classifyTriggerProvenance(trigger);
+      if (plane === "MARKET" || plane === "REFERENCE") {
+        this.triggerProvenance.set(trigger.id, plane === "MARKET"
+          ? { kind: "MARKET", tokenEpochs: {} }
+          : { kind: "REFERENCE", asset: trigger.asset ?? "", epoch: -1 });
+        this.provenanceInvalid.add(trigger.id);
+      } else {
+        this.triggerProvenance.set(trigger.id, { kind: "NONE" });
+      }
+    }
     const signals = Array.isArray(payload.grokSignals) ? payload.grokSignals.map((item) => grokSignalEnvelopeSchema.parse(item)) : [];
     for (const signal of signals) {
       const byRole = this.signalsByTrigger.get(signal.triggerId) ?? new Map<ExternalAgentRoleId, GrokSignalEnvelope>();
@@ -1037,6 +1145,7 @@ export class EngineService {
         if (!raw || typeof raw.id !== "string") continue;
         this.marketsById.set(raw.id, raw as unknown as DiscoveredMarket);
         this.assetByMarket.set(raw.id, typeof raw.asset === "string" ? raw.asset : null);
+        if (typeof raw.asset === "string") this.assetIndex.add(raw.asset, raw.id);
         if (raw.endDate) this.triggerEngine.noteMarketWindow(raw.id, typeof raw.asset === "string" ? raw.asset : null, String(raw.endDate));
       }
     }
@@ -1090,6 +1199,7 @@ export class EngineService {
       }
       if (page.length < this.recoveryPageSize) break;
     }
+    this.syncRestingIndexFromOrders();
   }
 
   private async emitStoredDerivedAudit(row: DurableTransition): Promise<void> {
@@ -1158,44 +1268,90 @@ export class EngineService {
 
   private async onMarketSnapshot(snapshot: MarketSnapshot): Promise<void> {
     if (!this.state.recoveryComplete) return;
-    if (!this.tokenIds.includes(snapshot.tokenId)) return;
+    if (!this.tokenIdSet.has(snapshot.tokenId)) return;
     const started = performance.now();
     this.metrics.marketMessages.inc();
     this.state.connections.polymarket.lastMessageAt = snapshot.receivedAt;
+    const synchronized = this.adapterTokenSynchronized(snapshot.tokenId);
+    if (!synchronized) {
+      this.updateReady();
+      this.state.eventLatencyMs = performance.now() - started;
+      this.metrics.eventLatency.observe((performance.now() - started) / 1000);
+      return;
+    }
+    const epoch = this.adapterTokenEpoch(snapshot.tokenId);
+    const previousEpoch = this.snapshotEpoch.get(snapshot.tokenId);
+    const newTrustedEpoch = previousEpoch !== epoch;
+    if (newTrustedEpoch) {
+      const siblingId = this.siblingTokenId(snapshot.marketId, snapshot.outcome);
+      const siblingEpoch = siblingId ? this.snapshotEpoch.get(siblingId) : undefined;
+      if (siblingEpoch !== epoch) this.clearMarketPairProjections(snapshot.marketId);
+      this.snapshotEpoch.set(snapshot.tokenId, epoch);
+    }
     this.state.marketSnapshots.set(snapshot.tokenId, snapshot);
     const pair = this.snapshots.get(snapshot.marketId) ?? {};
     const previous = pair[snapshot.outcome];
     pair[snapshot.outcome] = snapshot;
     this.snapshots.set(snapshot.marketId, pair);
-    if (snapshot.asset) this.assetByMarket.set(snapshot.marketId, snapshot.asset);
+    if (snapshot.asset) {
+      this.assetByMarket.set(snapshot.marketId, snapshot.asset);
+      this.assetIndex.add(snapshot.asset, snapshot.marketId);
+      this.metrics.assetMarketIndexEntries.set(this.assetIndex.entryCount());
+    }
     this.updateReady();
     await this.writer.persist(createJournalEvent({ traceId: snapshot.traceId, type: "MARKET_SNAPSHOT", aggregateType: "market", aggregateId: snapshot.marketId, payload: snapshot, occurredAt: new Date(snapshot.sourceTimestamp), sourceEventId: snapshot.eventId }));
     this.record("MARKET_EVENT", snapshot.traceId, snapshot.marketId, { tokenId: snapshot.tokenId, outcome: snapshot.outcome, sequence: snapshot.sequence }, snapshot.asset ?? null);
 
-    for (const [orderId, resting] of this.restingOrders) {
-      if (resting.order.tokenId !== snapshot.tokenId || !previous) continue;
-      const evolved = evolveMakerOrder(resting, previous, snapshot);
-      if (evolved.fill) {
-        await this.applyFill(evolved.fill, { restingAfter: evolved.resting });
-      } else {
-        this.restingOrders.set(orderId, evolved.resting);
-        if (Number(evolved.resting.remaining) === 0) this.restingOrders.delete(orderId);
+    if (synchronized && previous) {
+      for (const orderId of this.restingIndex.orderIdsFor(snapshot.tokenId)) {
+        const resting = this.restingOrders.get(orderId);
+        if (!resting || resting.order.tokenId !== snapshot.tokenId) continue;
+        const evolved = evolveMakerOrder(resting, previous, snapshot);
+        if (evolved.fill) {
+          await this.applyFill(evolved.fill, { restingAfter: evolved.resting });
+        } else {
+          this.restingOrders.set(orderId, evolved.resting);
+          if (Number(evolved.resting.remaining) === 0) {
+            this.restingOrders.delete(orderId);
+            this.restingIndex.remove(orderId);
+          }
+        }
       }
+      this.metrics.restingOrderTokenIndexEntries.set(this.restingIndex.entryCount());
     }
 
-    const triggers = this.triggerEngine.ingestMarket(snapshot);
-    for (const trigger of triggers) this.admitTrigger(trigger);
+    if (synchronized) {
+      const triggers = this.triggerEngine.ingestMarket(snapshot);
+      for (const trigger of triggers) this.admitTrigger(trigger, this.provenanceForGenerated(trigger, "MARKET"));
+    }
     const window = this.marketsById.get(snapshot.marketId);
     if (window?.endDate) this.triggerEngine.noteMarketWindow(snapshot.marketId, snapshot.asset ?? window.asset, window.endDate);
+    this.metrics.triggerDedupeEntries.set(this.triggerEngine.dedupeEntryCount());
     this.state.eventLatencyMs = performance.now() - started;
     this.metrics.eventLatency.observe((performance.now() - started) / 1000);
   }
 
   private async onReferenceTick(tick: ReferenceTick): Promise<void> {
     if (!this.state.recoveryComplete) return;
-    if (this.usesDiscovery() && ![...this.assetByMarket.values()].includes(tick.asset)) return;
+    if (this.usesDiscovery() && !this.assetIndex.hasAsset(tick.asset)) return;
     this.metrics.referenceTicks.inc();
     const started = performance.now();
+    const admission = this.triggerEngine.admitReferenceTick(tick);
+    if (admission.overflow) {
+      this.noteReferenceLogicalLoss(tick.asset);
+      this.state.invalidateReferenceContext(tick.asset);
+      this.requestReferenceResync(tick.asset);
+      await this.persistReferenceTick(tick);
+      this.metrics.referenceWindowEntries.set(this.triggerEngine.referenceWindowTotalEntries());
+      this.metrics.referenceTickProcessingDuration.observe((performance.now() - started) / 1000);
+      return;
+    }
+    if (!admission.accepted) {
+      this.metrics.referenceWindowEntries.set(this.triggerEngine.referenceWindowTotalEntries());
+      this.metrics.referenceTickProcessingDuration.observe((performance.now() - started) / 1000);
+      return;
+    }
+    const wasUnreliable = this.referenceUnreliable.has(tick.asset);
     this.state.noteReferenceTick(tick.asset, tick.receivedAt, {
       symbol: tick.symbol, venue: tick.venue, price: tick.price,
     });
@@ -1204,25 +1360,50 @@ export class EngineService {
       this.state.connections.btc.lastMessageAt = tick.receivedAt;
     }
     this.updateReady();
-    await this.writer.persist(createJournalEvent({ traceId: tick.traceId, type: "REFERENCE_TICK", aggregateType: "reference", aggregateId: tick.asset, payload: tick, occurredAt: new Date(tick.sourceTimestamp), sourceEventId: tick.eventId }));
-    for (const trigger of this.triggerEngine.ingestReference(tick)) this.admitTrigger(trigger);
+    await this.persistReferenceTick(tick);
+    if (wasUnreliable) {
+      this.referenceUnreliable.delete(tick.asset);
+      this.referenceResyncRequested.delete(tick.asset);
+    }
+    this.metrics.referenceWindowEntries.set(this.triggerEngine.referenceWindowTotalEntries());
+    for (const trigger of admission.triggers) this.admitTrigger(trigger, this.provenanceForGenerated(trigger, "REFERENCE", tick.asset));
+    this.metrics.triggerDedupeEntries.set(this.triggerEngine.dedupeEntryCount());
     this.metrics.referenceTickProcessingDuration.observe((performance.now() - started) / 1000);
   }
 
-  private admitTrigger(trigger: TriggerEvent): AdmitResult {
+  private async persistReferenceTick(tick: ReferenceTick): Promise<void> {
+    if (this.referenceTelemetryHoldForTest) await this.referenceTelemetryHoldForTest;
+    await this.writer.persist(createJournalEvent({
+      traceId: tick.traceId, type: "REFERENCE_TICK", aggregateType: "reference", aggregateId: tick.asset,
+      payload: tick, occurredAt: new Date(tick.sourceTimestamp), sourceEventId: tick.eventId,
+    }));
+  }
+
+  private admitTrigger(trigger: TriggerEvent, provenance?: TriggerProvenance): AdmitResult {
     if (this.started && !this.state.recoveryComplete) {
       return { admitted: false, reason: "fail_closed", done: Promise.resolve() };
     }
+    const resolved = provenance ?? this.captureProvenance(trigger);
     const lane = triggerWorkLane(trigger.kind);
+    const marketEpochFence = resolved.kind === "MARKET" && Object.keys(resolved.tokenEpochs).length > 0
+      ? new Map(Object.entries(resolved.tokenEpochs))
+      : this.captureMarketEpochFence(trigger);
+    this.lastAdmittedMarketEpochFence = marketEpochFence;
     const result = this.supervisor.admit({
       id: trigger.id,
       lane,
       key: triggerWorkKey(trigger),
       estimatedBytes: RUNTIME_BOUNDS.triggerByteEstimate,
       critical: lane === "p0",
+      marketEpochFence,
+      provenance: { kind: resolved.kind },
       run: async (signal) => {
         if (signal.aborted) return;
-        await this.processTrigger(trigger, signal);
+        if (!this.isProvenanceCurrentlyValid(trigger.id, resolved)) {
+          this.metrics.triggersSuppressed.inc({ kind: trigger.kind, severity: String(trigger.severity) });
+          return;
+        }
+        await this.processTrigger(trigger, signal, marketEpochFence, resolved);
       },
     });
     if (!result.admitted) {
@@ -1262,17 +1443,32 @@ export class EngineService {
     this.syncRuntimeState();
   }
 
-  private async processTrigger(trigger: TriggerEvent, signal?: AbortSignal): Promise<void> {
+  private async processTrigger(
+    trigger: TriggerEvent,
+    signal?: AbortSignal,
+    marketEpochFence: ReadonlyMap<string, number> | null = null,
+    provenance: TriggerProvenance = { kind: "NONE" },
+  ): Promise<void> {
     this.metrics.noteProcessTriggerStart();
     const started = performance.now();
     try {
     if (signal?.aborted) return;
     if (this.processTriggerHold) await this.processTriggerHold;
     if (signal?.aborted) return;
+    if (this.shouldSuppressStaleMarketTrigger(trigger, marketEpochFence, provenance)) {
+      this.metrics.triggersSuppressed.inc({ kind: trigger.kind, severity: String(trigger.severity) });
+      return;
+    }
     this.metrics.triggers.inc({ kind: trigger.kind, severity: String(trigger.severity) });
     this.record(`TRIGGER_LEVEL_${trigger.severity}`, trigger.traceId, trigger.marketId, { triggerId: trigger.id, kind: trigger.kind, asset: trigger.asset ?? null }, trigger.asset ?? null);
     await this.safeAppend(createJournalEvent({ traceId: trigger.traceId, type: "TRIGGER_EVENT", aggregateType: "trigger", aggregateId: trigger.id, payload: trigger, sourceEventId: trigger.sourceEventIds[0] ?? null }), signal);
+    this.rememberProvenance(trigger.id, provenance);
     this.activeTriggers.set(trigger.id, trigger);
+    if (!this.isProvenanceCurrentlyValid(trigger.id, provenance)) {
+      this.markProvenanceInvalid(trigger.id);
+      this.state.addTrigger(trigger);
+      return;
+    }
     this.state.addTrigger(trigger);
     this.record("GROK_RESEARCH_AVAILABLE", trigger.traceId, trigger.marketId, { triggerId: trigger.id, expiresAt: trigger.expiresAt }, trigger.asset ?? null);
     await this.requestActivation(trigger);
@@ -1303,6 +1499,14 @@ export class EngineService {
       this.state.addActivation({ triggerId: trigger.id, reason: "ENTRY_CLOSED", at: this.nowFn().toISOString(), provider: this.env.GROK_ACTIVATION_PROVIDER, grokWakeObserved: false });
       return;
     }
+    if (!this.isTriggerActionable(trigger.id)) {
+      await this.safeAppend(createJournalEvent({
+        traceId: trigger.traceId, type: "GROK_ACTIVATION_DECISION", aggregateType: "activation", aggregateId: trigger.id,
+        payload: { triggerId: trigger.id, marketId: trigger.marketId, asset: trigger.asset ?? null, reason: "PROVENANCE_STALE", activate: false },
+      }));
+      this.state.addActivation({ triggerId: trigger.id, reason: "PROVENANCE_STALE", at: this.nowFn().toISOString(), provider: this.env.GROK_ACTIVATION_PROVIDER, grokWakeObserved: false });
+      return;
+    }
     const decision = this.activation.decide(trigger);
     await this.safeAppend(createJournalEvent({
       traceId: trigger.traceId, type: "GROK_ACTIVATION_DECISION", aggregateType: "activation", aggregateId: trigger.id,
@@ -1310,6 +1514,10 @@ export class EngineService {
     }));
     if (!decision.activate || !decision.request) {
       this.state.addActivation({ triggerId: trigger.id, reason: decision.reason, at: new Date().toISOString(), provider: this.env.GROK_ACTIVATION_PROVIDER, grokWakeObserved: false });
+      return;
+    }
+    if (!this.isTriggerActionable(trigger.id)) {
+      this.state.addActivation({ triggerId: trigger.id, reason: "PROVENANCE_STALE", at: this.nowFn().toISOString(), provider: this.env.GROK_ACTIVATION_PROVIDER, grokWakeObserved: false });
       return;
     }
     this.activation.markRequested(trigger, decision.request);
@@ -1361,8 +1569,14 @@ export class EngineService {
     if (new Date(trigger.expiresAt).getTime() <= now.getTime() || new Date(submission.output.expiresAt).getTime() <= now.getTime()) {
       this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "stale" }); return { status: "stale" };
     }
+    if (!this.isTriggerActionable(trigger.id)) {
+      this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "stale" }); return { status: "stale" };
+    }
     const claimed = await this.journal.claimIdempotency("grok_signal_submission", `${clientId}:${submission.submissionId}`);
     if (!claimed) { this.state.recordGrokRejection("duplicate"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "duplicate" }); return { status: "duplicate" }; }
+    if (!this.isTriggerActionable(trigger.id)) {
+      this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "stale" }); return { status: "stale" };
+    }
 
     const signal: GrokSignalEnvelope = grokSignalEnvelopeSchema.parse({
       signalId: createId("grok_signal"), submissionId: submission.submissionId, traceId: submission.traceId,
@@ -1395,6 +1609,7 @@ export class EngineService {
   }
 
   private async evaluateExternalConsensus(trigger: TriggerEvent): Promise<void> {
+    if (!this.isTriggerActionable(trigger.id)) return;
     const outputs = [...(this.signalsByTrigger.get(trigger.id)?.values() ?? [])];
     const fair = outputs.find((item) => item.agentId === "fair_probability_analyst")?.output as { estimatedEdge?: number; fairProbability?: number; direction?: Direction; marketProbability?: number } | undefined;
     const directional = outputs.flatMap((item) => {
@@ -1415,6 +1630,7 @@ export class EngineService {
   }
 
   private async evaluateTrade(trigger: TriggerEvent, consensus: NonNullable<EngineStateStore["latestConsensus"]>, outputs: GrokSignalEnvelope[]): Promise<void> {
+    if (!this.isTriggerActionable(trigger.id)) return;
     const pair = this.snapshots.get(trigger.marketId ?? "");
     if (!pair) return;
     const position = this.ledger.positions.get(trigger.marketId ?? "") ?? null;
@@ -1427,9 +1643,12 @@ export class EngineService {
       maxOrderSizeUsd: this.riskLimits.maxOrderSizeUsd, minimumLockedPairEdge: this.riskLimits.minExpectedEdge,
     });
     if (!candidate) return;
+    if (!this.adapterTokenSynchronized(candidate.tokenId)) return;
     if (candidate.intent === "OPEN_FIRST_LEG" && this.overload.state === "FAIL_CLOSED") return;
     if (candidate.intent === "OPEN_FIRST_LEG" && !experimentAllowsFirstLeg(this.experiment)) return;
     if (candidate.intent === "OPEN_FIRST_LEG" && !this.entryQualified.has(candidate.marketId)) return;
+    if (candidate.intent === "OPEN_FIRST_LEG" && !this.isMarketSynchronized(candidate.marketId)) return;
+    if (candidate.intent === "OPEN_FIRST_LEG" && assetNeedsReliableReference(this.referenceRequired.get(candidate.marketId), this.referenceUnreliable, this.assetByMarket.get(candidate.marketId))) return;
     if (candidate.intent === "HEDGE_SECOND_LEG" && !experimentAllowsHedge(this.experiment)) return;
     const snapshot = this.state.marketSnapshots.get(candidate.tokenId);
     if (!snapshot) return;
@@ -1731,10 +1950,23 @@ export class EngineService {
         connection.state = event.state;
         connection.reconnects = event.reconnectCount;
       }
-      if (event.state === "DISCONNECTED") {
+      if (event.state === "STALE") {
+        this.noteReferenceLogicalLoss(asset);
+        this.state.invalidateReferenceContext(asset);
+        this.triggerEngine.resetReferenceAfterReconnect(asset);
+        if (event.message?.includes("REFERENCE_INGRESS_OVERFLOW")) this.requestReferenceResync(asset);
+      } else if (event.state === "DISCONNECTED") {
         const kind = /kind=([a-z_]+)/.exec(event.message ?? "")?.[1] ?? "unknown";
         this.metrics.referenceCloses.inc({ kind });
         if (event.reconnectCount > 0) this.metrics.wsReconnects.inc({ feed: "reference" });
+        this.noteReferenceLogicalLoss(asset);
+        this.state.invalidateReferenceContext(asset);
+        this.triggerEngine.resetReferenceAfterReconnect(asset);
+      } else if (event.state === "CONNECTED") {
+        this.referenceLogicalGapped.delete(asset);
+        if (this.referenceUnreliable.has(asset) || this.triggerEngine.referenceWindowOverflowed(asset)) {
+          this.triggerEngine.resetReferenceAfterReconnect(asset);
+        }
       }
     }
     this.updateReady();
@@ -1795,6 +2027,7 @@ export class EngineService {
     try {
       await this.journalAdmission.run(journalClass, critical, async () => {
         if (signal?.aborted) throw new JournalAdmissionRejected(journalClass, critical, "JOURNAL_ADMISSION_CLOSED");
+        if (event.type === "TRIGGER_EVENT" && this.triggerEventPersistHold) await this.triggerEventPersistHold;
         await this.metrics.observeDirectJournal(event.type, async () => {
           await this.journal.append(event);
           if (critical) this.state.database = "UP";
@@ -2272,9 +2505,7 @@ export class EngineService {
     }
     for (const [triggerId, trigger] of [...this.activeTriggers]) {
       if (new Date(trigger.expiresAt).getTime() > nowMs) continue;
-      this.activeTriggers.delete(triggerId);
-      this.signalsByTrigger.delete(triggerId);
-      this.lastEvaluatedSignalCount.delete(triggerId);
+      this.forgetTrigger(triggerId);
     }
   }
 
@@ -2284,6 +2515,8 @@ export class EngineService {
       executionErrors: this.executionErrors.length,
       recentTrades: this.recentTrades.size,
       activeTriggers: this.activeTriggers.size,
+      triggerProvenance: this.triggerProvenance.size,
+      provenanceInvalid: this.provenanceInvalid.size,
       signalsByTrigger: this.signalsByTrigger.size,
       lastEvaluatedSignalCount: this.lastEvaluatedSignalCount.size,
     };
@@ -2300,6 +2533,7 @@ export class EngineService {
     if (input.recentTrades) for (const [key, at] of input.recentTrades) this.recentTrades.set(key, at);
     if (input.trigger) {
       this.activeTriggers.set(input.trigger.id, input.trigger);
+      this.rememberProvenance(input.trigger.id, this.captureProvenance(input.trigger));
       this.signalsByTrigger.set(input.trigger.id, new Map());
       this.lastEvaluatedSignalCount.set(input.trigger.id, 1);
     }
@@ -2350,6 +2584,63 @@ export class EngineService {
   }
   setMaintenanceHoldForTest(hold: Promise<void> | null): void { this.maintenanceHold = hold; }
   setProcessTriggerHoldForTest(hold: Promise<void> | null): void { this.processTriggerHold = hold; }
+  setTriggerEventPersistHoldForTest(hold: Promise<void> | null): void { this.triggerEventPersistHold = hold; }
+  setReferenceTelemetryHoldForTest(hold: Promise<void> | null): void { this.referenceTelemetryHoldForTest = hold; }
+  isTriggerActionable(triggerId: string): boolean {
+    const trigger = this.activeTriggers.get(triggerId);
+    const provenance = this.triggerProvenance.get(triggerId);
+    if (this.provenanceInvalid.has(triggerId)) return false;
+    if (!provenance) {
+      if (!trigger) return false;
+      return classifyTriggerProvenance(trigger) === "NONE";
+    }
+    return this.isProvenanceCurrentlyValid(triggerId, provenance);
+  }
+  triggerProvenanceForTest(triggerId: string): TriggerProvenance | undefined {
+    return this.triggerProvenance.get(triggerId);
+  }
+  referenceEpochForTest(asset: string): number { return this.referenceEpoch.get(asset) ?? 0; }
+  async flushReferenceRetryForTest(asset: string): Promise<void> {
+    this.clearReferenceRetry(asset);
+    await this.retryTransientReference(asset);
+  }
+  referenceRetryTimerCountForTest(): number { return this.referenceRetryTimers.size; }
+  referenceResyncRequestedForTest(asset: string): boolean { return this.referenceResyncRequested.has(asset); }
+  triggerDedupeScanCallsForTest(): number { return this.triggerEngine.dedupeScanCallsForTest(); }
+  lastAdmittedMarketEpochFenceForTest(): Record<string, number> | null {
+    if (!this.lastAdmittedMarketEpochFence || this.lastAdmittedMarketEpochFence.size === 0) return null;
+    return Object.fromEntries(this.lastAdmittedMarketEpochFence);
+  }
+  applyIngressGapForTest(tokenIds: readonly string[], reason: "explicit_resubscribe" | "reconnect" | "count_limit" = "explicit_resubscribe"): void {
+    this.invalidateMarketProjections(tokenIds);
+    this.metrics.noteIngressGap(reason);
+  }
+  async ingestReferenceTickForTest(tick: ReferenceTick): Promise<void> {
+    await this.onReferenceTick(tick);
+  }
+  referenceUnreliableForTest(asset: string): boolean { return this.referenceUnreliable.has(asset); }
+  applyReferenceConnectionForTest(asset: string, state: FeedConnectionEvent["state"], reconnectCount = 1): Promise<void> {
+    return this.onConnection({ feed: "reference", asset, state, at: new Date().toISOString(), reconnectCount });
+  }
+  activationCoordinatorForTest() { return this.activation; }
+  abandonWithoutCheckpointForTest(): void { this.overload.markIntegrityFault(); }
+  restingIndexOrderIdsForTest(tokenId: string): string[] { return [...this.restingIndex.orderIdsFor(tokenId)]; }
+  attachReferenceWindowForTest(asset: string, maxEntries: number): void {
+    this.triggerEngine.attachReferenceWindowForTest(asset, maxEntries);
+  }
+  referenceWindowOverflowedForTest(asset: string): boolean {
+    return this.triggerEngine.referenceWindowOverflowed(asset);
+  }
+  referenceWindowTotalEntriesForTest(): number {
+    return this.triggerEngine.referenceWindowTotalEntries();
+  }
+  openFirstLegBlockedByUnreliableReferenceForTest(marketId: string): boolean {
+    return assetNeedsReliableReference(
+      this.referenceRequired.get(marketId),
+      this.referenceUnreliable,
+      this.assetByMarket.get(marketId),
+    );
+  }
   async persistEventForTest(event: ReturnType<typeof createJournalEvent>): Promise<void> {
     await this.safeAppend(event);
   }
@@ -2370,6 +2661,233 @@ export class EngineService {
   }
   criticalReservedAvailable(): boolean { return this.supervisor.criticalReservedAvailable(); }
   heavyReadStats() { return { active: this.heavyRead.activeCount, waiting: this.heavyRead.waitingCount }; }
+
+  private adapterTokenSynchronized(tokenId: string): boolean {
+    const adapter = this.marketAdapter as PolymarketMarketDataAdapter & { isTokenSynchronized?(id: string): boolean };
+    if (typeof adapter.isTokenSynchronized === "function") return adapter.isTokenSynchronized(tokenId);
+    return true;
+  }
+
+  private adapterTokenEpoch(tokenId: string): number {
+    const adapter = this.marketAdapter as PolymarketMarketDataAdapter & { tokenEpoch?(id: string): number };
+    return typeof adapter.tokenEpoch === "function" ? adapter.tokenEpoch(tokenId) : 1;
+  }
+
+  private syncRestingIndexFromOrders(): void {
+    this.restingIndex.rebuild(this.restingOrders.values());
+    this.metrics.restingOrderTokenIndexEntries.set(this.restingIndex.entryCount());
+  }
+
+  private shouldSuppressStaleMarketTrigger(
+    trigger: TriggerEvent,
+    fence: ReadonlyMap<string, number> | null = null,
+    provenance: TriggerProvenance | null = null,
+  ): boolean {
+    if (provenance) {
+      if (provenance.kind === "NONE") return false;
+      if (!this.isProvenanceCurrentlyValid(trigger.id, provenance)) return true;
+    }
+    if (!isMarketDataDerivedTrigger(trigger) && classifyTriggerProvenance(trigger) === "NONE") return false;
+    if (trigger.marketId && this.marketHasGappedToken(trigger.marketId)) return true;
+    return this.marketEpochFenceStale(fence);
+  }
+
+  private provenanceForGenerated(
+    trigger: TriggerEvent,
+    plane: "MARKET" | "REFERENCE",
+    asset?: string,
+  ): TriggerProvenance {
+    const classified = classifyTriggerProvenance(trigger);
+    if (classified === "NONE") return { kind: "NONE" };
+    if (classified === "REFERENCE" || plane === "REFERENCE") {
+      const resolved = asset ?? trigger.asset;
+      if (!resolved) return { kind: "NONE" };
+      return { kind: "REFERENCE", asset: resolved, epoch: this.referenceEpoch.get(resolved) ?? 0 };
+    }
+    const fence = this.captureMarketEpochFence({ ...trigger, source: "polymarket", kind: trigger.kind === "NEWS_INFORMATION" ? "BOOK_IMBALANCE" : trigger.kind });
+    return { kind: "MARKET", tokenEpochs: fence ? Object.fromEntries(fence) : {} };
+  }
+
+  private captureProvenance(trigger: TriggerEvent): TriggerProvenance {
+    const plane = classifyTriggerProvenance(trigger);
+    if (plane === "NONE") return { kind: "NONE" };
+    if (plane === "REFERENCE") {
+      const asset = trigger.asset;
+      if (!asset) return { kind: "NONE" };
+      return { kind: "REFERENCE", asset, epoch: this.referenceEpoch.get(asset) ?? 0 };
+    }
+    const fence = this.captureMarketEpochFence({ ...trigger, source: "polymarket" });
+    return { kind: "MARKET", tokenEpochs: fence ? Object.fromEntries(fence) : {} };
+  }
+
+  private rememberProvenance(triggerId: string, provenance: TriggerProvenance): void {
+    this.triggerProvenance.set(triggerId, provenance);
+  }
+
+  private markProvenanceInvalid(triggerId: string): void {
+    this.provenanceInvalid.add(triggerId);
+  }
+
+  private forgetTrigger(triggerId: string): void {
+    this.activeTriggers.delete(triggerId);
+    this.triggerProvenance.delete(triggerId);
+    this.provenanceInvalid.delete(triggerId);
+    this.signalsByTrigger.delete(triggerId);
+    this.lastEvaluatedSignalCount.delete(triggerId);
+  }
+
+  private isProvenanceCurrentlyValid(triggerId: string, provenance: TriggerProvenance): boolean {
+    if (this.provenanceInvalid.has(triggerId)) return false;
+    if (provenance.kind === "NONE") return true;
+    if (provenance.kind === "MARKET") {
+      const tokens = Object.entries(provenance.tokenEpochs);
+      if (tokens.length === 0) return true;
+      for (const [tokenId, epoch] of tokens) {
+        if (!this.adapterTokenSynchronized(tokenId) || this.adapterTokenEpoch(tokenId) !== epoch) {
+          this.markProvenanceInvalid(triggerId);
+          return false;
+        }
+      }
+      return true;
+    }
+    if (this.referenceUnreliable.has(provenance.asset) || (this.referenceEpoch.get(provenance.asset) ?? 0) !== provenance.epoch) {
+      this.markProvenanceInvalid(triggerId);
+      return false;
+    }
+    return true;
+  }
+
+  private noteReferenceLogicalLoss(asset: string): void {
+    this.referenceUnreliable.add(asset);
+    if (this.referenceLogicalGapped.has(asset)) return;
+    this.referenceLogicalGapped.add(asset);
+    this.referenceEpoch.set(asset, (this.referenceEpoch.get(asset) ?? 0) + 1);
+  }
+
+  /**
+   * Market-data research is fenced by the trusted tokens that exist at admission.
+   * A sibling still AWAITING_BOOK does not drop the fence. At execution every
+   * captured token must still be SYNCED at that exact epoch. Risk/system/
+   * settlement stay unfenced. If no token is trusted yet, fence is null and
+   * MCP/research registration without books remains possible; that work is not
+   * treated as originating from trusted market data.
+   */
+  private captureMarketEpochFence(trigger: TriggerEvent): Map<string, number> | null {
+    if (!isMarketDataDerivedTrigger(trigger) || !trigger.marketId) return null;
+    const tokens = this.tokensForMarket(trigger.marketId);
+    if (tokens.length === 0) return null;
+    const fence = new Map<string, number>();
+    for (const tokenId of tokens) {
+      if (!this.adapterTokenSynchronized(tokenId)) continue;
+      fence.set(tokenId, this.adapterTokenEpoch(tokenId));
+    }
+    return fence.size > 0 ? fence : null;
+  }
+
+  private marketEpochFenceStale(fence: ReadonlyMap<string, number> | null): boolean {
+    if (!fence || fence.size === 0) return false;
+    for (const [tokenId, epoch] of fence) {
+      if (!this.adapterTokenSynchronized(tokenId) || this.adapterTokenEpoch(tokenId) !== epoch) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private tokensForMarket(marketId: string): string[] {
+    const discovered = this.marketsById.get(marketId)?.tokens.map((token) => token.tokenId) ?? [];
+    const pair = this.snapshots.get(marketId);
+    return uniqueStrings([
+      ...discovered,
+      pair?.UP?.tokenId,
+      pair?.DOWN?.tokenId,
+      ...[...this.state.marketSnapshots.values()].filter((item) => item.marketId === marketId).map((item) => item.tokenId),
+    ].filter((item): item is string => Boolean(item)));
+  }
+
+  private marketHasGappedToken(marketId: string): boolean {
+    const adapter = this.marketAdapter as PolymarketMarketDataAdapter & {
+      tokenSyncState?(id: string): string;
+    };
+    if (typeof adapter.tokenSyncState !== "function") return false;
+    const discovered = this.marketsById.get(marketId)?.tokens.map((token) => token.tokenId) ?? [];
+    const pair = this.snapshots.get(marketId);
+    const tokens = uniqueStrings([
+      ...discovered,
+      pair?.UP?.tokenId,
+      pair?.DOWN?.tokenId,
+      ...[...this.state.marketSnapshots.values()].filter((item) => item.marketId === marketId).map((item) => item.tokenId),
+    ].filter((item): item is string => Boolean(item)));
+    return tokens.some((tokenId) => adapter.tokenSyncState!(tokenId) === "GAPPED");
+  }
+
+  private tokenLocation(tokenId: string): { marketId: string; outcome: Outcome } | null {
+    const snapshot = this.state.marketSnapshots.get(tokenId);
+    if (snapshot) return { marketId: snapshot.marketId, outcome: snapshot.outcome };
+    for (const market of this.marketsById.values()) {
+      const token = market.tokens.find((item) => item.tokenId === tokenId);
+      if (token) return { marketId: market.id, outcome: token.outcome };
+    }
+    return null;
+  }
+
+  private clearMarketPairProjections(marketId: string): void {
+    this.triggerEngine.forgetMarketBooks(marketId);
+    this.snapshots.delete(marketId);
+    for (const [tokenId, snapshot] of [...this.state.marketSnapshots.entries()]) {
+      if (snapshot.marketId !== marketId) continue;
+      this.state.marketSnapshots.delete(tokenId);
+      this.snapshotEpoch.delete(tokenId);
+    }
+  }
+
+  private invalidateMarketProjections(tokenIds: readonly string[]): void {
+    const markets = new Set<string>();
+    for (const tokenId of tokenIds) {
+      const loc = this.tokenLocation(tokenId);
+      this.state.marketSnapshots.delete(tokenId);
+      this.snapshotEpoch.delete(tokenId);
+      if (loc) markets.add(loc.marketId);
+    }
+    for (const marketId of markets) this.clearMarketPairProjections(marketId);
+    this.updateReady();
+  }
+
+  private markReferenceUnreliable(asset: string): void {
+    this.referenceUnreliable.add(asset);
+  }
+
+  private requestReferenceResync(asset: string): void {
+    if (this.referenceResyncInFlight.has(asset)) return;
+    if (this.referenceRetryTimers.has(asset)) return;
+    if (this.referenceResyncRequested.has(asset)) return;
+    this.referenceResyncInFlight.add(asset);
+    this.state.invalidateReferenceContext(asset);
+    try {
+      this.referenceRegistry.stop(asset);
+    } catch { /* scripted registries may no-op */ }
+    void this.reconcileReferenceFeed(asset).catch((error) => {
+      this.logger.error({ err: error, asset }, "reference overflow resync failed");
+      this.referenceResyncRequested.delete(asset);
+      if (this.shouldRetryReferenceStart(asset)) this.scheduleReferenceRetry(asset, 50, 60_000);
+    }).finally(() => {
+      this.referenceResyncInFlight.delete(asset);
+    });
+  }
+
+  private siblingTokenId(marketId: string, outcome: Outcome): string | undefined {
+    const sibling: Outcome = outcome === "UP" ? "DOWN" : "UP";
+    const pair = this.snapshots.get(marketId);
+    if (pair?.[sibling]?.tokenId) return pair[sibling]!.tokenId;
+    return this.marketsById.get(marketId)?.tokens.find((token) => token.outcome === sibling)?.tokenId;
+  }
+
+  private syncIngressMetrics(): void {
+    const adapter = this.marketAdapter as PolymarketMarketDataAdapter & { ingressSnapshot?(): { depth: number; bytes: number; highWaterEvents: number } };
+    if (typeof adapter.ingressSnapshot !== "function") return;
+    this.metrics.noteIngressSnapshot(adapter.ingressSnapshot());
+    this.metrics.marketUnsynchronizedTokens.set(this.unsynchronizedTokenCount());
+  }
 }
 
 export function parseEnv(env: NodeJS.ProcessEnv): EngineEnv { return parseEngineEnv(env); }
@@ -2381,6 +2899,14 @@ function delay(ms: number): Promise<void> { return new Promise((resolve) => setT
 
 export function isRiskHedgeSettlementTrigger(kind: string): boolean {
   return isRiskHedgeSettlementKind(kind);
+}
+
+function assetNeedsReliableReference(
+  required: boolean | undefined,
+  unreliable: ReadonlySet<string>,
+  asset: string | null | undefined,
+): boolean {
+  return required === true && Boolean(asset) && unreliable.has(asset!);
 }
 
 export function collectMarketFeedAt(

@@ -78,6 +78,9 @@ export const RUNTIME_BOUNDS = {
   failureHistory: 32,
 } as const;
 
+/** Finite per-work market-epoch snapshot. Not durable and not public strategy metadata. */
+export type MarketEpochFence = ReadonlyMap<string, number>;
+
 export interface RuntimeWork {
   id: string;
   lane: WorkLane;
@@ -85,6 +88,10 @@ export interface RuntimeWork {
   estimatedBytes: number;
   critical: boolean;
   run: (signal: AbortSignal) => Promise<void>;
+  /** Trusted token epochs at admission; stale if the live market epoch advanced. */
+  marketEpochFence?: MarketEpochFence | null;
+  /** Explicit source-data provenance. Not inferred later from `source` strings. */
+  provenance?: { kind: "MARKET" | "REFERENCE" | "NONE" } | null;
 }
 
 export interface AdmitResult {

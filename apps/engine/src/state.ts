@@ -199,7 +199,20 @@ export class EngineStateStore {
   setDiscoveryLoopActive(active: boolean): void { this.discoveryLoopActive = active; }
   setMarketMonitoring(monitoring: boolean): void { this.marketMonitoring = monitoring; }
   setUnattributedMcp(activity: UnattributedMcpActivity): void { this.unattributedMcp = structuredClone(activity); }
-  dropReference(asset: string): void { this.reference.delete(asset); }
+  dropReference(asset: string): void {
+    this.reference.delete(asset);
+    this.invalidateReferenceContext(asset);
+  }
+
+  invalidateReferenceContext(asset: string): void {
+    this.referenceContext.delete(asset);
+    this.referenceContext.delete(asset.trim().toUpperCase());
+    const current = this.reference.get(asset);
+    if (current) current.lastMessageAt = null;
+    const keyed = this.reference.get(asset.trim().toUpperCase());
+    if (keyed) keyed.lastMessageAt = null;
+    if (asset === "BTC" || asset.trim().toUpperCase() === "BTC") this.lastBtcMessageAt = null;
+  }
   engineAlive(): boolean { return !this.draining && this.database === "UP"; }
   newPaperEntryAllowed(): boolean {
     return this.engineAlive() && this.overloadState !== "FAIL_CLOSED" && this.recoveryComplete;

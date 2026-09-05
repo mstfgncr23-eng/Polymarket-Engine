@@ -15,11 +15,22 @@ export interface ActivationDecision {
   request: GrokActivationRequest | null;
 }
 
+const SENT_TTL_MS = 3_600_000;
+export const ACTIVATION_SCOPE_TTL_MS = 3_600_000;
+const SCOPE_TTL_MS = ACTIVATION_SCOPE_TTL_MS;
+
 export class GrokActivationCoordinator {
   private readonly sent = new Map<string, number>();
+  private readonly sentOrder: Array<{ key: string; at: number } | undefined> = [];
+  private sentHead = 0;
   private readonly lastByMarketAsset = new Map<string, { at: number; severity: number }>();
+  private readonly lastOrder: Array<{ key: string; at: number } | undefined> = [];
+  private lastHead = 0;
   private readonly recent: number[] = [];
+  private recentHead = 0;
   readonly latency = new Map<string, ActivationLatency>();
+  private readonly latencyOrder: string[] = [];
+  private latencyHead = 0;
   private readonly unattributedMcp: Array<{ at: string; tool: string | null }> = [];
   private readonly retryAfterUntil = new Map<string, number>();
 
@@ -40,10 +51,8 @@ export class GrokActivationCoordinator {
     if (previous && now - previous.at < this.limits.cooldownMs && trigger.severity <= previous.severity && trigger.severity <= this.limits.suppressAtOrBelow) {
       return { activate: false, reason: "SEVERITY_SUPPRESSED", request };
     }
-    const recent = this.recent.filter((at) => now - at < 60_000);
-    this.recent.length = 0;
-    this.recent.push(...recent);
-    if (recent.length >= this.limits.maxPerMinute) return { activate: false, reason: "RATE_LIMITED", request };
+    this.trimRecent(now);
+    if (this.recentCount() >= this.limits.maxPerMinute) return { activate: false, reason: "RATE_LIMITED", request };
     const duplicate = request.targetRoles.every((role) => this.sent.has(activationIdempotencyKey(trigger.id, role)));
     if (duplicate) return { activate: false, reason: "DUPLICATE", request };
     return { activate: true, reason: "SEND", request };
@@ -51,10 +60,17 @@ export class GrokActivationCoordinator {
 
   markRequested(trigger: TriggerEvent, request: GrokActivationRequest): void {
     const now = this.now();
+    const nowMs = now.getTime();
     this.ensureLatency(trigger, now.toISOString());
-    this.lastByMarketAsset.set(`${trigger.marketId ?? "none"}:${trigger.asset ?? "none"}:${trigger.kind}`, { at: now.getTime(), severity: trigger.severity });
-    this.recent.push(now.getTime());
-    for (const role of request.targetRoles) this.sent.set(activationIdempotencyKey(trigger.id, role), now.getTime());
+    const scope = `${trigger.marketId ?? "none"}:${trigger.asset ?? "none"}:${trigger.kind}`;
+    this.lastByMarketAsset.set(scope, { at: nowMs, severity: trigger.severity });
+    this.lastOrder.push({ key: scope, at: nowMs });
+    this.recent.push(nowMs);
+    for (const role of request.targetRoles) {
+      const key = activationIdempotencyKey(trigger.id, role);
+      this.sent.set(key, nowMs);
+      this.sentOrder.push({ key, at: nowMs });
+    }
     this.prune();
   }
 
@@ -69,7 +85,8 @@ export class GrokActivationCoordinator {
       firstMcpRequestAt: null,
       firstAcceptedSignalAt: null,
     });
-    this.prune();
+    this.latencyOrder.push(trigger.id);
+    this.evictLatencyIfNeeded();
   }
 
   async dispatch(request: GrokActivationRequest): Promise<GrokActivationResult[]> {
@@ -137,8 +154,14 @@ export class GrokActivationCoordinator {
 
   restoreLatency(items: readonly ActivationLatency[]): void {
     this.latency.clear();
-    for (const item of items) this.latency.set(item.triggerId, structuredClone(item));
-    this.prune();
+    this.latencyOrder.length = 0;
+    this.latencyHead = 0;
+    const ordered = [...items].sort((a, b) => new Date(a.triggerCreatedAt).getTime() - new Date(b.triggerCreatedAt).getTime());
+    for (const item of ordered) {
+      this.latency.set(item.triggerId, structuredClone(item));
+      this.latencyOrder.push(item.triggerId);
+    }
+    this.evictLatencyIfNeeded();
   }
 
   noteMcp(triggerIds: readonly string[], at = new Date()): void {
@@ -169,22 +192,96 @@ export class GrokActivationCoordinator {
     return [...this.latency.values()];
   }
 
+  touchScopeForTest(marketId: string, asset: string, kind: string, severity = 2): void {
+    const nowMs = this.now().getTime();
+    const scope = `${marketId}:${asset}:${kind}`;
+    this.lastByMarketAsset.set(scope, { at: nowMs, severity });
+    this.lastOrder.push({ key: scope, at: nowMs });
+    this.prune();
+  }
+
   footprint(): { sent: number; lastByMarketAsset: number; latency: number; recent: number } {
     this.prune();
-    return { sent: this.sent.size, lastByMarketAsset: this.lastByMarketAsset.size, latency: this.latency.size, recent: this.recent.length };
+    return { sent: this.sent.size, lastByMarketAsset: this.lastByMarketAsset.size, latency: this.latency.size, recent: this.recentCount() };
+  }
+
+  private evictLatencyIfNeeded(): void {
+    const limit = this.limits.memoryLimit ?? 500;
+    while (this.latency.size > limit && this.latencyHead < this.latencyOrder.length) {
+      const oldest = this.latencyOrder[this.latencyHead];
+      this.latencyOrder[this.latencyHead] = undefined as unknown as string;
+      this.latencyHead += 1;
+      if (oldest) this.latency.delete(oldest);
+    }
+    this.compact(this.latencyOrder, this.latencyHead, (head) => { this.latencyHead = head; });
   }
 
   private prune(): void {
     const now = this.now().getTime();
-    const limit = this.limits.memoryLimit ?? 500;
-    for (const [key, at] of this.sent) if (now - at > 3_600_000) this.sent.delete(key);
-    for (const [key, item] of this.lastByMarketAsset) if (now - item.at > 3_600_000) this.lastByMarketAsset.delete(key);
+    this.trimRecent(now);
+    this.expireOrdered(this.sent, this.sentOrder, () => this.sentHead, (head) => { this.sentHead = head; }, now, SENT_TTL_MS);
+    this.expireLastByMarket(now);
     for (const [role, until] of this.retryAfterUntil) if (until <= now) this.retryAfterUntil.delete(role);
-    const latencies = [...this.latency.entries()].sort((a, b) => new Date(a[1].triggerCreatedAt).getTime() - new Date(b[1].triggerCreatedAt).getTime());
-    while (latencies.length > limit) {
-      const oldest = latencies.shift();
-      if (oldest) this.latency.delete(oldest[0]);
+    this.evictLatencyIfNeeded();
+  }
+
+  private trimRecent(now: number): void {
+    while (this.recentHead < this.recent.length && now - (this.recent[this.recentHead] ?? 0) >= 60_000) {
+      this.recentHead += 1;
     }
+    if (this.recentHead >= 1_024) {
+      this.recent.splice(0, this.recentHead);
+      this.recentHead = 0;
+    }
+  }
+
+  private recentCount(): number {
+    return this.recent.length - this.recentHead;
+  }
+
+  private expireOrdered(
+    map: Map<string, number>,
+    order: Array<{ key: string; at: number } | undefined>,
+    getHead: () => number,
+    setHead: (head: number) => void,
+    now: number,
+    ttl: number,
+  ): void {
+    let head = getHead();
+    while (head < order.length) {
+      const record = order[head];
+      if (!record) { head += 1; continue; }
+      const current = map.get(record.key);
+      if (current === record.at && now - record.at <= ttl) break;
+      if (current === record.at && now - record.at > ttl) map.delete(record.key);
+      order[head] = undefined;
+      head += 1;
+    }
+    setHead(head);
+    this.compact(order, head, setHead);
+  }
+
+  private expireLastByMarket(now: number): void {
+    while (this.lastHead < this.lastOrder.length) {
+      const record = this.lastOrder[this.lastHead];
+      if (!record) { this.lastHead += 1; continue; }
+      const item = this.lastByMarketAsset.get(record.key);
+      if (item && item.at === record.at && now - record.at <= SCOPE_TTL_MS) break;
+      if (item && item.at === record.at && now - record.at > SCOPE_TTL_MS) this.lastByMarketAsset.delete(record.key);
+      this.lastOrder[this.lastHead] = undefined;
+      this.lastHead += 1;
+    }
+    this.compact(this.lastOrder, this.lastHead, (head) => { this.lastHead = head; });
+  }
+
+  private compact(
+    order: Array<unknown>,
+    head: number,
+    setHead: (head: number) => void,
+  ): void {
+    if (head < 1_024) return;
+    order.splice(0, head);
+    setHead(0);
   }
 }
 
