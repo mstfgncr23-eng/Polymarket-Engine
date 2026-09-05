@@ -475,6 +475,7 @@ describe("Blocker 10 — live ingress metrics and one-logical-overflow gap accou
     expect(adapter.tokenSyncState("tok-up")).toBe("AWAITING_BOOK");
 
     expect(transport.push({ type: "book", payload: { tokenId: "tok-up" } }).ok).toBe(true);
+    transport.queue.flushObserver();
     expect(await metricValue(metrics, "market_ingress_high_water_total")).toBeGreaterThanOrEqual(1);
     ac.abort();
     await running;
