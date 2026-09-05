@@ -2600,7 +2600,7 @@ export class EngineService {
   private async restoreReportSourceIntegrity(): Promise<void> {
     const experimentId = this.experiment?.id;
     if (!experimentId) return;
-    if (this.experiment?.status === "IDLE" || this.experiment?.status === "MONITOR_ONLY") return;
+    if (this.experiment?.status === "IDLE") return;
     try {
       const { ids: repaired, overflow: repairOverflow } = await loadIntegrityRepairIds(this.journal, experimentId);
       if (repairOverflow) {
