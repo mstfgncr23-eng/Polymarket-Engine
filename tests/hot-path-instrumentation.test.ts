@@ -70,7 +70,7 @@ function expositionLabelNames(text: string): string[] {
 
 function expositionLabelValues(text: string, label: string): string[] {
   const values = new Set<string>();
-  const re = new RegExp(`${label}="([^"]*)"`, "g");
+  const re = new RegExp(`(?:^|[\\{,])${label}="([^"]*)"`, "g");
   for (const match of text.matchAll(re)) {
     if (match[1] !== undefined) values.add(match[1]);
   }
