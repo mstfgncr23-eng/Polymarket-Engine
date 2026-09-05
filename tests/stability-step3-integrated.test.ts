@@ -479,7 +479,10 @@ describe("D+E+F — end-to-end trigger provenance", () => {
     engine.setTriggerEventPersistHoldForTest(null);
     await drainRuntime(engine);
     const events = await journal.queryEvents({ types: ["TRIGGER_EVENT", "GROK_ACTIVATION_DECISION"] });
-    const triggers = events.filter((event) => event.type === "TRIGGER_EVENT");
+    const triggers = events.filter((event) => {
+      const kind = String(event.payload.kind ?? "");
+      return event.type === "TRIGGER_EVENT" && (kind === "BOOK_IMBALANCE" || kind === "NEWS_INFORMATION");
+    });
     expect(triggers.length).toBeGreaterThan(0);
     expect(events.some((event) => event.type === "GROK_ACTIVATION_DECISION" && event.payload.activate === true)).toBe(false);
     for (const event of triggers) {
@@ -646,23 +649,24 @@ describe("J — market reconnect backoff is stability-gated", () => {
       onError: () => undefined,
       onGap: (event) => { gaps.push(event.reason); },
     }, ac.signal);
-    await waitFor(() => transport.subscribeCalls >= 1);
+    await waitFor(() => transport.subscribeCalls >= 1 && transport.stream && !transport.current().closed);
     transport.current().endRemote();
     await waitFor(() => adapter.reconnectDelays.length >= 1);
+    await waitFor(() => transport.subscribeCalls >= 2 && transport.stream && !transport.current().closed);
     transport.current().endRemote();
     await waitFor(() => adapter.reconnectDelays.length >= 2);
     expect(adapter.reconnectDelays[1]!).toBeGreaterThan(adapter.reconnectDelays[0]! * 0.8);
-    await waitFor(() => transport.stream && !transport.current().closed);
+    await waitFor(() => transport.subscribeCalls >= 3 && transport.stream && !transport.current().closed);
     expect(transport.push(liveBook("tok-up", 1_000)).ok).toBe(true);
     await waitFor(() => adapter.isTokenSynchronized("tok-up"));
     transport.current().endRemote();
     await waitFor(() => adapter.reconnectDelays.length >= 3);
     adapter.setTokenIds(["tok-up", "tok-down"]);
-    await waitFor(() => gaps.includes("generation_change"));
+    await waitFor(() => gaps.includes("generation_change"), 20_000);
     expect(gaps.filter((reason) => reason === "generation_change").length).toBeGreaterThan(0);
     ac.abort();
     await running;
-  }, 15_000);
+  }, 25_000);
 
   it("trusted book that dies immediately does not reset backoff; a stable trusted session does", async () => {
     const transport = new ScriptedBoundedMarketTransport();

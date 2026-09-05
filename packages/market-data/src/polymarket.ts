@@ -392,10 +392,11 @@ export class PolymarketMarketDataAdapter {
           const previousStreamTrusted = this.streamHadTrustedBooks;
           this.streamHadTrustedBooks = false;
           this.streamOpenedAtMs = Date.now();
-          const emitGap = generationRestart
-            || (reconnectCount > 0 && !this.logicalLossGapped && previousStreamTrusted);
           const reason = this.pendingEpochReason
             ?? (reconnectCount > 0 ? "reconnect" : generationRestart ? "generation_change" : "explicit_resubscribe");
+          const emitGap = reason === "generation_change"
+            || generationRestart
+            || (reconnectCount > 0 && !this.logicalLossGapped && previousStreamTrusted);
           this.pendingEpochReason = null;
           this.beginStreamEpoch(current, reason, handlers, { emitGap });
           this.logicalLossGapped = false;
@@ -682,59 +683,57 @@ export class PolymarketMarketDataAdapter {
       throw new MarketIngressMalformedError(tokens);
     }
 
-    const copies = new Map<string, BookState>();
-    const lastChange = new Map<string, BookLevel | null>();
-    const staleTokens = new Set<string>();
+    const accepted: typeof parsed = [];
     for (const item of parsed) {
       const previous = this.lastTimestampByToken.get(item.tokenId);
       if (previous !== undefined && sourceMs < previous) {
-        staleTokens.add(item.tokenId);
         this.noteAnomaly(handlers, {
           kind: "stale", tokenId: item.tokenId, incomingMs: sourceMs, lastAcceptedMs: previous,
           regressionMs: previous - sourceMs,
         });
         continue;
       }
-      const copy = copies.get(item.tokenId) ?? cloneBookState(item.state);
-      copies.set(item.tokenId, copy);
-      const changed = item.side === "BUY"
-        ? applyLevelChange(copy.bids, copy.bidLevels, item.price, item.size, "desc")
-        : applyLevelChange(copy.asks, copy.askLevels, item.price, item.size, "asc");
-      if (changed) {
-        if (item.side === "BUY") copy.bidsDirty = true;
-        else copy.asksDirty = true;
-      }
-      copy.timestamp = new Date(sourceMs).toISOString();
-      copy.hash = nullableString(item.hash) ?? copy.hash;
-      lastChange.set(item.tokenId, Number(item.size) <= 0 ? null : { price: item.price, quantity: item.size });
+      accepted.push(item);
     }
-    if (copies.size === 0) {
+    if (accepted.length === 0) {
       this.normalizeObserver?.onPriceChangeEvent(changes.length, 0);
       return [];
     }
 
-    try {
-      for (const [tokenId, copy] of copies) {
-        validateNormalizedBook(copy, lastChange.get(tokenId) ?? null);
+    const staged = new Map<string, BookState>();
+    for (const item of accepted) {
+      const copy = staged.get(item.tokenId) ?? cloneBookState(item.state);
+      staged.set(item.tokenId, copy);
+      if (item.side === "BUY") applyLevelChange(copy.bids, copy.bidLevels, item.price, item.size, "desc");
+      else applyLevelChange(copy.asks, copy.askLevels, item.price, item.size, "asc");
+      const changedLevel = Number(item.size) <= 0 ? null : { price: item.price, quantity: item.size };
+      try { validateNormalizedBook(copy, changedLevel); } catch {
+        this.noteAnomaly(handlers, {
+          kind: "malformed", tokenId: item.tokenId, incomingMs: sourceMs,
+          lastAcceptedMs: this.lastTimestampByToken.get(item.tokenId) ?? null, regressionMs: null,
+        });
+        this.failIncrementalTrust([...staged.keys()], handlers);
+        throw new MarketIngressMalformedError([...staged.keys()]);
       }
-    } catch {
-      const tokens = [...copies.keys()];
-      this.noteAnomaly(handlers, {
-        kind: "malformed", tokenId: tokens[0] ?? "unknown", incomingMs: sourceMs,
-        lastAcceptedMs: tokens[0] ? this.lastTimestampByToken.get(tokens[0]) ?? null : null,
-        regressionMs: null,
-      });
-      this.failIncrementalTrust(tokens, handlers);
-      throw new MarketIngressMalformedError(tokens);
     }
 
     const snapshots: MarketSnapshot[] = [];
-    const started = performance.now();
-    for (const [tokenId, copy] of copies) {
-      copy.levelsValid = true;
-      this.lastTimestampByToken.set(tokenId, sourceMs);
-      this.books.set(tokenId, copy);
-      snapshots.push(this.toSnapshot(tokenId, copy, payload, lastChange.get(tokenId), started));
+    for (const item of accepted) {
+      const started = performance.now();
+      const live = this.books.get(item.tokenId);
+      if (!live) continue;
+      const changed = item.side === "BUY"
+        ? applyLevelChange(live.bids, live.bidLevels, item.price, item.size, "desc")
+        : applyLevelChange(live.asks, live.askLevels, item.price, item.size, "asc");
+      if (changed) {
+        if (item.side === "BUY") live.bidsDirty = true;
+        else live.asksDirty = true;
+      }
+      live.timestamp = new Date(sourceMs).toISOString();
+      live.hash = nullableString(item.hash) ?? live.hash;
+      this.lastTimestampByToken.set(item.tokenId, sourceMs);
+      const changedLevel = Number(item.size) <= 0 ? null : { price: item.price, quantity: item.size };
+      snapshots.push(this.toSnapshot(item.tokenId, live, payload, changedLevel, started));
     }
     this.normalizeObserver?.onPriceChangeEvent(changes.length, snapshots.length);
     return snapshots;
