@@ -1926,6 +1926,108 @@ describe("Step-4 follow-up: canonical report-input inventory", () => {
 });
 
 describe("Step-4 follow-up: crash-durable bounded integrity", () => {
+  it("an in-flight Grok claim is not a successful duplicate and does not poison its healthy first caller", async () => {
+    const journal = new MemoryEventJournal();
+    const engine = paperEngine(journal);
+    await engine.start();
+    let release!: () => void;
+    try {
+      expect(await engine.beginExperiment()).toMatchObject({ ok: true });
+      const now = Date.now();
+      const trigger = triggerEventSchema.parse({
+        id: "trig-concurrent", traceId: "trace-concurrent", marketId: "btc-mkt", asset: "BTC",
+        kind: "BOOK_IMBALANCE", severity: 2, score: 1, dedupeKey: "concurrent", evidence: {},
+        sourceEventIds: ["e-concurrent"], source: "polymarket",
+        createdAt: new Date(now).toISOString(), expiresAt: new Date(now + 60_000).toISOString(),
+      });
+      await engine.registerTriggerForResearch(trigger);
+      const submission = grokSignalSubmissionSchema.parse({
+        submissionId: "sub-concurrent", traceId: trigger.traceId, triggerId: trigger.id,
+        correlationId: "c-concurrent", marketId: "btc-mkt", asset: "BTC",
+        agentId: "fair_probability_analyst", role: "fair_probability_analyst", timestamp: new Date(now).toISOString(),
+        output: { confidence: 0.8, evidenceIds: ["e"], expiresAt: trigger.expiresAt,
+          reasonCodes: ["T"], direction: "UP", fairProbability: 0.6, marketProbability: 0.5, estimatedEdge: 0.04 },
+      });
+      journal.setAppendInFlightHoldForTest(new Promise<void>((resolve) => { release = resolve; }), ["GROK_SIGNAL_ACCEPTED"]);
+      const first = engine.submitGrokSignal(submission, submission.agentId);
+      await waitUntil(() => journal.inFlightAppends > 0);
+      await expect(engine.submitGrokSignal(submission, submission.agentId)).rejects.toThrow("GROK_SUBMISSION_CANONICAL_FACT_MISSING");
+      expect(engine.recoveryFailClosedForTest()).toBe(false);
+      expect(engine.state.grokActivity.acceptedSignals).toBe(0);
+      release();
+      expect(await first).toMatchObject({ status: "accepted" });
+      expect(await engine.submitGrokSignal(submission, submission.agentId)).toEqual({ status: "duplicate" });
+      expect(engine.state.grokActivity.acceptedSignals).toBe(1);
+      expect(await journal.queryEvents({ types: ["GROK_SIGNAL_ACCEPTED"] })).toHaveLength(1);
+    } finally {
+      release?.();
+      journal.setAppendInFlightHoldForTest(null);
+      await engine.stop();
+    }
+  });
+
+  it("triple persistence failure rejects Grok, stays fail closed, and never reinterprets the orphan claim after crash", async () => {
+    const journal = new MemoryEventJournal();
+    const engine = paperEngine(journal);
+    await engine.start();
+    const now = Date.now();
+    const trigger = triggerEventSchema.parse({
+      id: "trig-triple", traceId: "trace-triple", marketId: "btc-mkt", asset: "BTC",
+      kind: "BOOK_IMBALANCE", severity: 2, score: 1, dedupeKey: "triple", evidence: {},
+      sourceEventIds: ["e-triple"], source: "polymarket",
+      createdAt: new Date(now).toISOString(), expiresAt: new Date(now + 60_000).toISOString(),
+    });
+    const submission = grokSignalSubmissionSchema.parse({
+      submissionId: "sub-triple", traceId: trigger.traceId, triggerId: trigger.id,
+      correlationId: "c-triple", marketId: "btc-mkt", asset: "BTC",
+      agentId: "fair_probability_analyst", role: "fair_probability_analyst", timestamp: new Date(now).toISOString(),
+      output: { confidence: 0.8, evidenceIds: ["e-triple"], expiresAt: trigger.expiresAt,
+        reasonCodes: ["T"], direction: "UP", fairProbability: 0.6, marketProbability: 0.5, estimatedEdge: 0.04 },
+    });
+    let checkpointsBefore = 0;
+    try {
+      expect(await engine.beginExperiment()).toMatchObject({ ok: true });
+      await engine.registerTriggerForResearch(trigger);
+      checkpointsBefore = (await journal.listCheckpoints()).length;
+      journal.failAppendTypes.add("GROK_SIGNAL_ACCEPTED");
+      journal.failAppendTypes.add(REPORT_SOURCE_INTEGRITY_FAULT);
+      journal.failNextDurableInsert = true;
+      await expect(engine.submitGrokSignal(submission, submission.agentId)).rejects.toThrow("JOURNAL_APPEND_FAILED");
+      expect(journal.failNextDurableInsert).toBe(false);
+      expect(engine.recoveryFailClosedForTest()).toBe(true);
+      expect(engine.state.overloadState).toBe("FAIL_CLOSED");
+      expect(engine.state.ready).toBe(false);
+      expect(engine.state.grokActivity.acceptedSignals).toBe(0);
+      expect(engine.state.latestAgents.size).toBe(0);
+      expect(engine.reportSourceIntegrityForTest()).toHaveLength(1);
+      expect(await journal.idempotencyCreatedAt("grok_signal_submission", `${submission.agentId}:${submission.submissionId}`)).toBeTruthy();
+      expect(await journal.queryEvents({ types: ["GROK_SIGNAL_ACCEPTED", REPORT_SOURCE_INTEGRITY_FAULT] })).toEqual([]);
+      expect(await journal.queryDurableTransitions({ types: [REPORT_SOURCE_INTEGRITY_FAULT], limit: 8 })).toEqual([]);
+      journal.failAppendTypes.clear();
+      await engine.persistEventForTest(createJournalEvent({ traceId: "unrelated", type: "SYSTEM_HEALTH_EVENT",
+        aggregateType: "engine", aggregateId: "engine", payload: { status: "UP" } }));
+      await expect(engine.submitGrokSignal(submission, submission.agentId)).rejects.toThrow("REPORT_SOURCE_INTEGRITY_FAIL_CLOSED");
+      expect(engine.reportSourceIntegrityForTest()).toHaveLength(1);
+      expect((await engine.ensureSourceSealForTest()).reason).toBe("REPORT_SOURCE_INTEGRITY_UNRESOLVED");
+    } finally {
+      await engine.stop(); // Existing sticky integrity state forbids the shutdown checkpoint.
+    }
+    expect((await journal.listCheckpoints()).length).toBe(checkpointsBefore);
+    const restarted = paperEngine(journal);
+    await restarted.start();
+    try {
+      expect(restarted.reportSourceIntegrityForTest()).toEqual([]); // No hidden checkpoint/marker rescued this test.
+      await restarted.registerTriggerForResearch(trigger);
+      await expect(restarted.submitGrokSignal(submission, submission.agentId)).rejects.toThrow("GROK_SUBMISSION_CANONICAL_FACT_MISSING");
+      await expect(restarted.submitGrokSignal(submission, submission.agentId)).rejects.toThrow("GROK_SUBMISSION_CANONICAL_FACT_MISSING");
+      expect(restarted.state.grokActivity.acceptedSignals).toBe(0);
+      expect(restarted.state.grokActivity.duplicates).toBe(0);
+      expect(await journal.queryEvents({ types: ["GROK_SIGNAL_ACCEPTED", REPORT_SOURCE_INTEGRITY_FAULT] })).toEqual([]);
+    } finally {
+      await restarted.stop();
+    }
+  });
+
   it("A: double-failure + crash before checkpoint → restart refuses seal/canonical", async () => {
     const journal = new MemoryEventJournal();
     const engine = paperEngine(journal);

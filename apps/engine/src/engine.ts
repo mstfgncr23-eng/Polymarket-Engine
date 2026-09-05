@@ -236,9 +236,11 @@ export class EngineService {
   private sourceSealPersistHold: Promise<void> | null = null;
   private sourceSealAbort: AbortController | null = null;
   private sourceSealPersistInFlight = false;
+  private sourceSealFlight: Promise<{ sealed: boolean; reason: string | null }> | null = null;
   private researchIngressInFlight = 0;
   private grokClaimHold: Promise<void> | null = null;
   private readonly reportSourceIntegrity = new Map<string, ReportSourceIntegrityFault>();
+  private readonly persistedIntegrityFaults = new WeakSet<ReportSourceIntegrityFault>();
   private referenceTelemetryHoldForTest: Promise<void> | null = null;
   private lastAdmittedMarketEpochFence: ReadonlyMap<string, number> | null = null;
   private discoveryGenerationApplied = 0;
@@ -1609,6 +1611,7 @@ export class EngineService {
 
   /** The only ingress for external Grok research; it cannot create orders directly. */
   async submitGrokSignal(raw: GrokSignalSubmission, clientId: string): Promise<{ status: "accepted" | "duplicate" | "stale" | "unknown_trigger" | "trace_mismatch" | "market_mismatch" | "asset_mismatch" | "replay_rejected" | "malformed" | "identity_mismatch" | "source_sealed"; signalId?: string }> {
+    this.assertResearchIntegrity();
     let submission: GrokSignalSubmission;
     try { submission = grokSignalSubmissionSchema.parse(raw); }
     catch {
@@ -1654,7 +1657,30 @@ export class EngineService {
       if (this.grokClaimHold) await this.grokClaimHold;
       if (this.researchIngressStale(ingress.generation)) return rejectSealed();
       const claimed = await this.journal.claimIdempotency("grok_signal_submission", `${clientId}:${submission.submissionId}`);
-      if (!claimed) { this.state.recordGrokRejection("duplicate"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "duplicate" }); return { status: "duplicate" }; }
+      this.assertResearchIntegrity();
+      if (!claimed) {
+        // A claim proves admission only, including across a crash before append.
+        // Check the canonical fact with bounded trace pages (also works for old IDs).
+        let after: Parameters<EventJournal["readTracePage"]>[1]["after"];
+        let persisted = false;
+        do {
+          const page = await this.journal.readTracePage(submission.traceId, { after, limit: 128 });
+          persisted = page.events.some((event) => event.type === "GROK_SIGNAL_ACCEPTED"
+            && event.payload.clientId === clientId && event.payload.submissionId === submission.submissionId);
+          after = page.nextCursor ?? undefined;
+        } while (!persisted && after);
+        this.assertResearchIntegrity();
+        if (!persisted) {
+          // This can also be a concurrent claim whose first caller is still
+          // persisting. Reject the unproven duplicate without poisoning that
+          // caller. An actual total persistence failure installs the sticky
+          // fail-closed state in safeAppend; restart still cannot accept this claim.
+          throw new Error("GROK_SUBMISSION_CANONICAL_FACT_MISSING");
+        }
+        this.state.recordGrokRejection("duplicate");
+        this.metrics.grokSignals.inc({ agent: submission.agentId, status: "duplicate" });
+        return { status: "duplicate" };
+      }
       // Recheck the experiment-scoped fence immediately before irreversible accept.
       if (this.researchIngressStale(ingress.generation) || !this.isTriggerActionable(trigger.id)) {
         this.state.recordGrokRejection("rejected");
@@ -1670,6 +1696,11 @@ export class EngineService {
         receivedAt: now.toISOString(), timestamp: submission.timestamp, output: submission.output, resultingDecision: null,
       });
       if (this.researchIngressStale(ingress.generation)) return rejectSealed();
+      await this.safeAppend(createJournalEvent({ traceId: signal.traceId, type: "GROK_SIGNAL_ACCEPTED", aggregateType: "grok_signal", aggregateId: signal.signalId, payload: signal }));
+      if (submission.agentId === "strategy_supervisor" && submission.output.proposedChange) {
+        await this.safeAppend(createJournalEvent({ traceId: signal.traceId, type: "STRATEGY_CHANGE_PROPOSED", aggregateType: "strategy_change", aggregateId: signal.signalId, payload: submission.output.proposedChange }));
+      }
+      this.assertResearchIntegrity();
       const byRole = this.signalsByTrigger.get(trigger.id) ?? new Map<ExternalAgentRoleId, GrokSignalEnvelope>();
       byRole.set(signal.agentId, signal);
       this.signalsByTrigger.set(trigger.id, byRole);
@@ -1679,15 +1710,15 @@ export class EngineService {
       this.state.setActivationLatency(this.activation.snapshot());
       this.metrics.grokSignals.inc({ agent: signal.agentId, status: "accepted" });
       this.record(`${signal.agentId.toUpperCase()}_COMPLETE`, signal.traceId, trigger.marketId, { signalId: signal.signalId, clientId, confidence: submission.output.confidence, expiresAt: submission.output.expiresAt }, trigger.asset ?? null);
-      await this.safeAppend(createJournalEvent({ traceId: signal.traceId, type: "GROK_SIGNAL_ACCEPTED", aggregateType: "grok_signal", aggregateId: signal.signalId, payload: signal }));
-      if (submission.agentId === "strategy_supervisor" && submission.output.proposedChange) {
-        await this.safeAppend(createJournalEvent({ traceId: signal.traceId, type: "STRATEGY_CHANGE_PROPOSED", aggregateType: "strategy_change", aggregateId: signal.signalId, payload: submission.output.proposedChange }));
-      }
       await this.evaluateExternalConsensus(trigger);
       return { status: "accepted", signalId: signal.signalId };
     } finally {
       this.endResearchIngress();
     }
+  }
+
+  private assertResearchIntegrity(): void {
+    if (this.overload.hasIntegrityFault) throw new Error("REPORT_SOURCE_INTEGRITY_FAIL_CLOSED");
   }
 
   /** Public for deterministic trigger ingestion and focused integration tests. */
@@ -2145,7 +2176,12 @@ export class EngineService {
     } catch (error) {
       if (error instanceof JournalAppendAbortedError) throw error;
       if (shouldLatchReportSourceIntegrity(event, this.experiment)) {
-        await this.noteReportSourceIntegrityFault(event, error);
+        const durableFault = await this.noteReportSourceIntegrityFault(event, error);
+        if (!durableFault) {
+          this.failClosedIntegrity(error);
+          this.syncRuntimeState();
+          throw error;
+        }
       }
       if (critical) {
         this.overload.markIntegrityFault();
@@ -2675,7 +2711,8 @@ export class EngineService {
     }
   }
 
-  private async persistIntegrityFaultMarker(fault: ReportSourceIntegrityFault): Promise<void> {
+  private async persistIntegrityFaultMarker(fault: ReportSourceIntegrityFault): Promise<boolean> {
+    if (this.persistedIntegrityFaults.has(fault)) return true;
     try {
       await this.journal.append(createIntegrityFaultEvent(fault));
     } catch {
@@ -2700,15 +2737,19 @@ export class EngineService {
           err: error,
           eventId: fault.eventId,
         }, "report_source_integrity_durable_marker_failed");
+        return false;
       }
     }
+    this.persistedIntegrityFaults.add(fault);
+    return true;
   }
 
-  private async noteReportSourceIntegrityFault(event: JournalEvent, error: unknown): Promise<void> {
+  private async noteReportSourceIntegrityFault(event: JournalEvent, error: unknown): Promise<boolean> {
     const experimentId = this.experiment?.id;
-    if (!experimentId) return;
+    if (!experimentId) return false;
     const overflowKey = `${experimentId}:${INTEGRITY_OVERFLOW_EVENT_ID}`;
-    if (this.reportSourceIntegrity.has(overflowKey)) return;
+    const overflow = this.reportSourceIntegrity.get(overflowKey);
+    if (overflow) return this.persistIntegrityFaultMarker(overflow);
     const fault: ReportSourceIntegrityFault = {
       experimentId,
       eventType: event.type,
@@ -2717,15 +2758,9 @@ export class EngineService {
       at: this.nowFn().toISOString(),
     };
     const existing = this.reportSourceIntegrity.get(`${experimentId}:${event.id}`);
-    if (existing && existing.reason === fault.reason) return;
-    const count = [...this.reportSourceIntegrity.values()].filter((item) => item.experimentId === experimentId).length;
-    if (!existing && count >= REPORT_SOURCE_INTEGRITY_HARD_CAP) {
-      this.installIntegrityFault(overflowIntegrityFault(experimentId, fault.at));
-      await this.persistIntegrityFaultMarker(overflowIntegrityFault(experimentId, fault.at));
-      return;
-    }
+    if (existing) return this.persistIntegrityFaultMarker(existing);
     this.installIntegrityFault(fault);
-    await this.persistIntegrityFaultMarker(fault);
+    return this.persistIntegrityFaultMarker(this.reportSourceIntegrity.get(overflowKey) ?? fault);
   }
 
   private unresolvedReportSourceIntegrity(experimentId: string): ReportSourceIntegrityFault[] {
@@ -2747,7 +2782,14 @@ export class EngineService {
     return true;
   }
 
-  async ensureSourceSeal(experiment: { id: string; startedAt?: string | null; completedAt?: string | null } = this.experiment!): Promise<{ sealed: boolean; reason: string | null }> {
+  ensureSourceSeal(experiment: { id: string; startedAt?: string | null; completedAt?: string | null } = this.experiment!): Promise<{ sealed: boolean; reason: string | null }> {
+    // Keep concurrent callers/retries on the same transaction outcome.
+    if (this.sourceSealFlight) return this.sourceSealFlight;
+    this.sourceSealFlight = this.ensureSourceSealAttempt(experiment).finally(() => { this.sourceSealFlight = null; });
+    return this.sourceSealFlight;
+  }
+
+  private async ensureSourceSealAttempt(experiment: { id: string; startedAt?: string | null; completedAt?: string | null }): Promise<{ sealed: boolean; reason: string | null }> {
     if (this.unresolvedReportSourceIntegrity(experiment.id).length > 0) {
       return { sealed: false, reason: "REPORT_SOURCE_INTEGRITY_UNRESOLVED" };
     }
@@ -2776,7 +2818,7 @@ export class EngineService {
     const persist = this.persistSourceSeal(experiment, generation, persistAttempt, this.sourceSealAbort.signal);
     let timeoutId: ReturnType<typeof setTimeout> | undefined;
     const outcome = await Promise.race([
-      persist.then((ok) => ({ kind: "done" as const, ok }), () => ({ kind: "done" as const, ok: false })),
+      persist.then((ok) => ({ kind: "done" as const, ok }), () => ({ kind: "failed" as const })),
       new Promise<{ kind: "timeout" }>((resolve) => {
         timeoutId = setTimeout(() => {
           this.sourceSealAbort?.abort();
@@ -2790,7 +2832,11 @@ export class EngineService {
       this.sourceSealAbort?.abort();
       this.abortSourceSealPersist();
       if (this.sourceSealPersistInFlight) {
-        return { sealed: false, reason: "SOURCE_SEAL_TIMEOUT" };
+        // Abort requests do not establish a transaction outcome. PG17 disables
+        // transaction_timeout in the irreversible commit phase: await COMMIT or
+        // confirmed abort, even when the wall-clock budget has already elapsed.
+        try { await persist; }
+        catch { return { sealed: false, reason: "SOURCE_SEAL_PERSIST_FAILED" }; }
       }
       const already = await loadSourceSeal(this.journal, experiment.id);
       if (already) {
@@ -2800,7 +2846,8 @@ export class EngineService {
       }
       return { sealed: false, reason: "SOURCE_SEAL_TIMEOUT" };
     }
-    if (!outcome.ok) return { sealed: false, reason: "SOURCE_SEAL_PERSIST_FAILED" };
+    if (outcome.kind === "failed") return { sealed: false, reason: "SOURCE_SEAL_PERSIST_FAILED" };
+    if (!outcome.ok) return { sealed: false, reason: remaining() <= 0 ? "SOURCE_SEAL_TIMEOUT" : "SOURCE_SEAL_PERSIST_FAILED" };
     const persisted = await loadSourceSeal(this.journal, experiment.id);
     if (!persisted) return { sealed: false, reason: "SOURCE_SEAL_PERSIST_FAILED" };
     this.sourceSealed = true;

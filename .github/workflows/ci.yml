@@ -8,6 +8,20 @@ on:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    services:
+      postgres-step4:
+        image: postgres:17
+        env:
+          POSTGRES_USER: step4
+          POSTGRES_PASSWORD: step4
+          POSTGRES_DB: step4_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U step4 -d step4_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      STEP4_TEST_DATABASE_URL: postgres://step4:step4@127.0.0.1:5432/step4_test
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4

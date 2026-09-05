@@ -63,6 +63,25 @@ export class JournalAppendAbortedError extends Error {
   }
 }
 
+/** Memory's holds precede mutation, so cancellation proves that no commit can follow. */
+async function waitForAppendHold(hold: Promise<void>, options: JournalAppendOptions): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let abort: (() => void) | undefined;
+  try {
+    await Promise.race([hold, new Promise<never>((_, reject) => {
+      abort = () => reject(new JournalAppendAbortedError("aborted"));
+      options.signal?.addEventListener("abort", abort, { once: true });
+      if (options.signal?.aborted) abort();
+      if (options.deadlineAt != null) {
+        timer = setTimeout(() => reject(new JournalAppendAbortedError("deadline")), Math.max(0, options.deadlineAt - Date.now()));
+      }
+    })]);
+  } finally {
+    if (timer) clearTimeout(timer);
+    if (abort) options.signal?.removeEventListener("abort", abort);
+  }
+}
+
 export interface EventJournal {
   initialize(): Promise<void>;
   healthCheck(): Promise<boolean>;
@@ -156,12 +175,12 @@ export class MemoryEventJournal implements EventJournal {
     this.inFlightAppends += 1;
     try {
       const acquireApplies = !this.appendAcquireHoldTypes || this.appendAcquireHoldTypes.includes(parsed.type);
-      if (this.appendAcquireHold && acquireApplies) await this.appendAcquireHold;
+      if (this.appendAcquireHold && acquireApplies) await waitForAppendHold(this.appendAcquireHold, options);
       if (this.failAppendTypes.has(parsed.type)) throw new Error("JOURNAL_APPEND_FAILED");
       if (options.signal?.aborted) throw new JournalAppendAbortedError("aborted");
       if (options.deadlineAt != null && Date.now() >= options.deadlineAt) throw new JournalAppendAbortedError("deadline");
       const holdApplies = !this.appendInFlightHoldTypes || this.appendInFlightHoldTypes.includes(parsed.type);
-      if (this.appendInFlightHold && holdApplies) await this.appendInFlightHold;
+      if (this.appendInFlightHold && holdApplies) await waitForAppendHold(this.appendInFlightHold, options);
       if (this.failAppendTypes.has(parsed.type)) throw new Error("JOURNAL_APPEND_FAILED");
       if (options.signal?.aborted) throw new JournalAppendAbortedError("aborted");
       if (options.deadlineAt != null && Date.now() >= options.deadlineAt) throw new JournalAppendAbortedError("deadline");
@@ -542,21 +561,54 @@ export class PostgresEventJournal implements EventJournal {
     const value = journalEventSchema.parse(event);
     if (options.signal?.aborted) throw new JournalAppendAbortedError("aborted");
     if (options.deadlineAt != null && Date.now() >= options.deadlineAt) throw new JournalAppendAbortedError("deadline");
-    await this.db.transaction(async (tx) => {
-      // Recompute inside the acquired transaction immediately before mutation.
-      // Pool acquisition can consume the outer deadline; a pre-txn remaining is stale.
-      if (options.deadlineAt != null) {
-        if (Date.now() >= options.deadlineAt) throw new JournalAppendAbortedError("deadline");
-        const remaining = options.deadlineAt - Date.now();
-        if (remaining <= 0) throw new JournalAppendAbortedError("deadline");
-        await tx.execute(sql`SELECT set_config('statement_timeout', ${String(remaining)}, true)`);
+    let callbackFailed = false;
+    let transactionId: string | undefined;
+    try {
+      await this.db.transaction(async (tx) => {
+        try {
+          // Recompute inside the acquired transaction immediately before mutation.
+          // Pool acquisition can consume the outer deadline; a pre-txn remaining is stale.
+          if (options.deadlineAt != null) {
+            const remaining = options.deadlineAt - Date.now();
+            if (remaining <= 0) throw new JournalAppendAbortedError("deadline");
+            await tx.execute(sql`SELECT set_config('statement_timeout', ${String(remaining)}, true)`);
+            // PG17 bounds the open transaction, including idle time after INSERT.
+            // It disables this timer before irreversible COMMIT; callers must still
+            // await the transaction outcome rather than infer rollback from a timer.
+            const transactionRemaining = options.deadlineAt - Date.now();
+            if (transactionRemaining <= 0) throw new JournalAppendAbortedError("deadline");
+            const rows = await tx.execute(sql`SELECT set_config('transaction_timeout', ${String(transactionRemaining)}, true), pg_current_xact_id()::text AS xid`);
+            transactionId = rows[0]?.xid as string | undefined;
+          }
+          if (options.signal?.aborted) throw new JournalAppendAbortedError("aborted");
+          if (options.deadlineAt != null && Date.now() >= options.deadlineAt) throw new JournalAppendAbortedError("deadline");
+          await tx.insert(journalEvents).values({
+            ...value, occurredAt: new Date(value.occurredAt), recordedAt: new Date(value.recordedAt),
+          }).onConflictDoNothing({ target: journalEvents.id });
+        } catch (error) {
+          callbackFailed = true;
+          throw error;
+        }
+      });
+    } catch (error) {
+      // postgres.js can expose an idle transaction_timeout as CONNECTION_CLOSED.
+      // Resolve that ambiguity using this exact transaction's PostgreSQL status,
+      // not an absent-row read (an in-progress transaction also hides its row).
+      let status: unknown;
+      if (!callbackFailed && transactionId) {
+        try {
+          const rows = await this.db.execute(sql`SELECT pg_xact_status(${transactionId}::xid8) AS status`);
+          status = rows[0]?.status;
+        } catch { /* Unknown outcome remains an ordinary persist failure. */ }
+        if (status === "committed") return;
       }
-      if (options.signal?.aborted) throw new JournalAppendAbortedError("aborted");
-      if (options.deadlineAt != null && Date.now() >= options.deadlineAt) throw new JournalAppendAbortedError("deadline");
-      await tx.insert(journalEvents).values({
-        ...value, occurredAt: new Date(value.occurredAt), recordedAt: new Date(value.recordedAt),
-      }).onConflictDoNothing({ target: journalEvents.id });
-    });
+      // A failed callback never sends COMMIT (postgres.js begin). Otherwise only
+      // an explicit aborted transaction status can prove no late commit is possible.
+      if (options.deadlineAt != null && Date.now() >= options.deadlineAt && (callbackFailed || status === "aborted")) {
+        throw new JournalAppendAbortedError("deadline");
+      }
+      throw error;
+    }
   }
   async appendMany(events: readonly JournalEvent[]): Promise<void> {
     assertJournalCapability(this.access, "runtime-write", "appendMany");
