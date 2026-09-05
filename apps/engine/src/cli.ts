@@ -10,11 +10,10 @@ import {
   marketSnapshotSchema,
   paperOrderSchema,
 } from "@pm/core";
-import { MemoryEventJournal, PostgresEventJournal } from "@pm/db";
-import { persistCanonicalFinalReport, streamExperimentSummary } from "./final-report.js";
+import { MemoryEventJournal, PostgresEventJournal, type JournalAccessMode } from "@pm/db";
 import { applyJournalCleanup, dryRunJournalCleanup } from "./journal-cleanup.js";
+import { generateOperatorReport } from "./operator-report.js";
 import { PolymarketMarketDataAdapter, ReferenceFeedRegistry, createRestProbe } from "@pm/market-data";
-import { writeExperimentSummary } from "./report.js";
 import { startRuntime } from "./runtime.js";
 
 const command = process.argv[2] ?? "help";
@@ -27,44 +26,40 @@ if (command === "experiment:start") {
   console.log(JSON.stringify({ status: result.ok ? "running" : "blocked", mode: "paper", durationHours: Number(process.env.EXPERIMENT_DURATION_HOURS ?? 48), ...result }));
 } else if (command === "report") {
   const journal = process.env.DATABASE_URL
-    ? new PostgresEventJournal(process.env.DATABASE_URL, process.env.DB_MIGRATIONS_DIR ?? resolve(process.cwd(), "packages/db/migrations"))
+    ? new PostgresEventJournal(process.env.DATABASE_URL, process.env.DB_MIGRATIONS_DIR ?? resolve(process.cwd(), "packages/db/migrations"), { access: "readonly" })
     : new MemoryEventJournal();
-  await journal.initialize();
-  const experimentId = process.env.EXPERIMENT_ID ?? "no-persisted-memory-experiment";
-  const first = await journal.queryEventsKeyset({ types: ["EXPERIMENT_STARTED", "ENGINE_STARTED"], limit: 1 });
-  const streamed = await streamExperimentSummary(journal, {
-    id: experimentId,
-    startedAt: process.env.EXPERIMENT_STARTED_AT ?? first[0]?.occurredAt ?? new Date(0).toISOString(),
-    completedAt: process.env.EXPERIMENT_COMPLETED_AT ?? null,
-  }, { reportKind: "final", metricsScope: "complete" });
-  streamed.summary.complete = streamed.scan.complete && !streamed.scan.interrupted;
-  streamed.summary.truncated = streamed.scan.truncated || streamed.scan.interrupted;
-  if (process.env.DATABASE_URL && streamed.summary.complete && !streamed.summary.truncated) {
-    await persistCanonicalFinalReport(journal, { summary: streamed.summary, scan: streamed.scan }).catch(() => undefined);
+  if (journal.connectWithoutMigrate) await journal.connectWithoutMigrate("readonly");
+  try {
+    const result = await generateOperatorReport(journal, {
+      experimentId: process.env.EXPERIMENT_ID,
+      reportDirectory: resolve(process.cwd(), "reports"),
+      allowPersist: Boolean(process.env.DATABASE_URL),
+    });
+    console.log(JSON.stringify(result));
+  } finally {
+    await journal.close();
   }
-  const paths = await writeExperimentSummary(streamed.summary, resolve(process.cwd(), "reports"));
-  await journal.close();
-  console.log(JSON.stringify({ ...paths, complete: streamed.summary.complete, pages: streamed.scan.pages, scanned: streamed.scan.scanned }));
 } else if (command === "journal-cleanup") {
   const apply = process.argv.includes("--apply");
   const confirm = process.argv.includes("--i-understand-destructive");
   if (!process.env.DATABASE_URL) throw new Error("DATABASE_URL_REQUIRED_FOR_JOURNAL_CLEANUP");
-  const journal = new PostgresEventJournal(process.env.DATABASE_URL, process.env.DB_MIGRATIONS_DIR ?? resolve(process.cwd(), "packages/db/migrations"));
-  await journal.initialize();
+  const mode: JournalAccessMode = apply ? "maintenance" : "readonly";
+  const journal = new PostgresEventJournal(process.env.DATABASE_URL, process.env.DB_MIGRATIONS_DIR ?? resolve(process.cwd(), "packages/db/migrations"), { access: mode });
+  await journal.connectWithoutMigrate(mode);
   const experiment = process.env.EXPERIMENT_ID
-    ? { id: process.env.EXPERIMENT_ID, status: process.env.EXPERIMENT_STATUS ?? "UNKNOWN" }
+    ? { id: process.env.EXPERIMENT_ID, status: process.env.EXPERIMENT_STATUS ?? "UNKNOWN", startedAt: process.env.EXPERIMENT_STARTED_AT ?? null }
     : null;
-  if (!apply) {
-    const dry = await dryRunJournalCleanup(journal, new Date(), experiment);
+  try {
+    if (!apply) {
+      console.log(JSON.stringify(await dryRunJournalCleanup(journal, new Date(), experiment), null, 2));
+    } else {
+      if (!confirm) throw new Error("JOURNAL_CLEANUP_APPLY_REQUIRES_--i-understand-destructive");
+      console.log(JSON.stringify(await applyJournalCleanup(journal, {
+        experiment, confirm: "I_UNDERSTAND_DESTRUCTIVE_CLEANUP",
+      }), null, 2));
+    }
+  } finally {
     await journal.close();
-    console.log(JSON.stringify(dry, null, 2));
-  } else {
-    if (!confirm) throw new Error("JOURNAL_CLEANUP_APPLY_REQUIRES_--i-understand-destructive");
-    const result = await applyJournalCleanup(journal, {
-      experiment, confirm: "I_UNDERSTAND_DESTRUCTIVE_CLEANUP",
-    });
-    await journal.close();
-    console.log(JSON.stringify(result, null, 2));
   }
 } else if (command === "smoke") {
   const now = new Date();

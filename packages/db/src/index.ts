@@ -1,3 +1,4 @@
+export * from "./access.js";
 export * from "./durable.js";
 export * from "./journal.js";
 export * from "./reports.js";

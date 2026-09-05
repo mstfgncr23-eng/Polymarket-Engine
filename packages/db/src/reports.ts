@@ -79,3 +79,32 @@ export function hashExperimentReport(input: {
 export function isCanonicalFinalReport(report: Pick<DurableExperimentReport, "complete" | "truncated" | "reportKind">): boolean {
   return report.reportKind === "final" && report.complete === true && report.truncated === false;
 }
+
+export function reportGeneratedAuditId(experimentId: string, contentHash: string): string {
+  return `reportgen:${experimentId}:${contentHash}`;
+}
+
+export async function persistReportConflictSafe(
+  input: DurableExperimentReportInput,
+  deps: {
+    insert(report: DurableExperimentReport): Promise<DurableExperimentReport | "conflict">;
+    load(): Promise<DurableExperimentReport | null>;
+  },
+): Promise<PersistReportResult> {
+  const hash = input.contentHash || hashExperimentReport(input);
+  const stored: DurableExperimentReport = {
+    ...input,
+    contentHash: hash,
+    persistedAt: new Date().toISOString(),
+  };
+  const inserted = await deps.insert(stored);
+  if (inserted !== "conflict") {
+    return { inserted: true, existing: false, report: inserted };
+  }
+  const existing = await deps.load();
+  if (!existing) throw new Error("EXPERIMENT_REPORT_INSERT_FAILED");
+  if (existing.contentHash !== hash) {
+    throw new ExperimentReportConflictError(input.experimentId, existing.contentHash, hash);
+  }
+  return { inserted: false, existing: true, report: existing };
+}

@@ -43,8 +43,10 @@ export interface JournalKeysetQuery {
   after?: JournalKeysetCursor;
   /** Inclusive source fence: do not read past this (occurredAt, id). */
   through?: JournalKeysetCursor;
-  /** Exclude rows recorded after scan start (late-write fence). */
+  /** Exclude rows recorded after scan start (late-write fence). Not sufficient alone for commit stability. */
   recordedAtTo?: Date;
+  /** Inclusive commit-sequence fence assigned only when a row becomes visible. */
+  commitSeqTo?: number;
   limit: number;
 }
 

@@ -10,6 +10,8 @@ import {
 export interface EventJournalKeyset {
   queryEventsKeyset(query: JournalKeysetQuery): Promise<JournalEvent[]>;
   peekLatestKeyset(query: Omit<JournalKeysetQuery, "limit" | "after" | "through">): Promise<JournalKeysetCursor | null>;
+  latestCommitSeq?(): Promise<number>;
+  withReadSnapshot?<T>(work: (journal: EventJournalKeyset) => Promise<T>): Promise<{ value: T; stable: boolean }>;
 }
 
 export interface SourceFence {
@@ -17,6 +19,9 @@ export interface SourceFence {
   recordedAtTo: Date;
   windowStart: Date | null;
   windowEnd: Date | null;
+  commitSeqTo: number | null;
+  /** True when the scan used a commit-stable snapshot (PG REPEATABLE READ or frozen committed set). */
+  stable: boolean;
 }
 
 export interface ScanStats {
@@ -49,23 +54,28 @@ export async function captureSourceFence(
   if (query.from) peek.from = query.from;
   if (query.to) peek.to = query.to;
   const through = await journal.peekLatestKeyset(peek);
+  const commitSeqTo = journal.latestCommitSeq ? await journal.latestCommitSeq() : null;
   return {
     through,
     recordedAtTo: now,
     windowStart: query.from ?? null,
     windowEnd: query.to ?? null,
+    commitSeqTo,
+    stable: false,
   };
 }
 
-export async function scanJournalEvents(
+async function scanOnJournal(
   journal: EventJournalKeyset,
   query: Omit<JournalQuery, "limit" | "offset" | "order">,
-  options: ScanOptions = {},
+  options: ScanOptions,
+  stable: boolean,
 ): Promise<ScanStats> {
   const started = Date.now();
   const pageSize = Math.max(1, Math.min(options.pageSize ?? EVENT_PAGE_SIZE, 20_000));
   const ceiling = Math.max(1, options.ceiling ?? EVENT_SCAN_CEILING);
   const fence = await captureSourceFence(journal, query);
+  fence.stable = stable && (fence.commitSeqTo != null || stable);
   let after: JournalKeysetCursor | undefined;
   let scanned = 0;
   let pages = 0;
@@ -97,6 +107,7 @@ export async function scanJournalEvents(
       if (query.to) pageQuery.to = query.to;
       if (after) pageQuery.after = after;
       if (fence.through) pageQuery.through = fence.through;
+      if (fence.commitSeqTo != null) pageQuery.commitSeqTo = fence.commitSeqTo;
       const page = await journal.queryEventsKeyset(pageQuery);
       if (page.length === 0) break;
       pages += 1;
@@ -126,14 +137,26 @@ export async function scanJournalEvents(
     });
   }
   return {
-    complete: !truncated && !interrupted,
-    truncated,
+    complete: !truncated && !interrupted && fence.stable,
+    truncated: truncated || !fence.stable,
     interrupted,
     scanned,
     pages,
     durationMs: Date.now() - started,
     maxPageRetained,
     fence,
-    truncatedReason,
+    truncatedReason: truncatedReason ?? (fence.stable ? null : "SOURCE_FENCE_UNSTABLE"),
   };
+}
+
+export async function scanJournalEvents(
+  journal: EventJournalKeyset,
+  query: Omit<JournalQuery, "limit" | "offset" | "order">,
+  options: ScanOptions = {},
+): Promise<ScanStats> {
+  if (journal.withReadSnapshot) {
+    const { value } = await journal.withReadSnapshot((snap) => scanOnJournal(snap, query, options, true));
+    return value;
+  }
+  return scanOnJournal(journal, query, options, false);
 }

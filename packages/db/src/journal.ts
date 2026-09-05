@@ -21,12 +21,23 @@ import {
 import {
   ExperimentReportConflictError,
   hashExperimentReport,
+  persistReportConflictSafe,
   type DurableExperimentReport,
   type DurableExperimentReportInput,
   type PersistReportResult,
 } from "./reports.js";
 import { durableTransitions, engineCheckpoints, experimentReports, journalEvents, mcpIdempotencyKeys } from "./schema.js";
+import {
+  journalMayMigrate,
+  journalMayMutateData,
+  journalMustVerifySchema,
+  JournalMigrateForbiddenError,
+  LARGE_JOURNAL_KEYSET_INDEXES,
+  LARGE_JOURNAL_SYNC_INDEX_MAX_ROWS,
+  type JournalAccessMode,
+} from "./access.js";
 import { SchemaVerificationError, verifyRequiredSchema } from "./schema-verify.js";
+import type { EventJournalKeyset } from "./scan.js";
 
 export interface EngineCheckpoint {
   id: string;
@@ -66,31 +77,68 @@ export interface EventJournal {
   latestDurableSequence(): Promise<number>;
   saveCheckpoint(checkpoint: Omit<EngineCheckpoint, "id" | "createdAt">): Promise<EngineCheckpoint>;
   loadLatestCheckpoint(): Promise<EngineCheckpoint | null>;
+  countEligible(types: readonly string[], occurredBefore: Date): Promise<{ count: number; oldestOccurredAt: string | null }>;
+  withReadSnapshot<T>(work: (journal: EventJournalKeyset) => Promise<T>): Promise<{ value: T; stable: boolean }>;
+  latestCommitSeq(): Promise<number>;
+  connectWithoutMigrate?(mode: JournalAccessMode): Promise<void>;
   close(): Promise<void>;
 }
 
 export class MemoryEventJournal implements EventJournal {
   private readonly events: JournalEvent[] = [];
   private readonly eventIds = new Set<string>();
+  private readonly staged = new Map<string, JournalEvent>();
+  private readonly commitSeqById = new Map<string, number>();
+  private nextCommitSeq = 0;
   private readonly checkpoints: EngineCheckpoint[] = [];
   private readonly idempotencyKeys = new Map<string, string>();
   private readonly reports = new Map<string, DurableExperimentReport>();
   private readonly durableRows: DurableTransition[] = [];
   private readonly durableByKey = new Map<string, DurableTransition>();
   private durableChain = Promise.resolve();
+  private persistChain = Promise.resolve();
   available = true;
   failNextDurableInsert = false;
+  migrateInvocations = 0;
+  readonly mutations: string[] = [];
   readonly failAppendTypes = new Set<string>();
+  access: JournalAccessMode = "boot-migrate";
 
-  async initialize(): Promise<void> {}
+  async initialize(): Promise<void> {
+    if (!journalMayMigrate(this.access)) throw new JournalMigrateForbiddenError(this.access);
+    this.migrateInvocations += 1;
+  }
+  async connectWithoutMigrate(mode: JournalAccessMode): Promise<void> {
+    if (journalMayMigrate(mode)) throw new JournalMigrateForbiddenError(mode);
+    this.access = mode;
+  }
   async healthCheck(): Promise<boolean> { return this.available; }
   async append(event: JournalEvent): Promise<void> {
     if (!this.available) throw new Error("DATABASE_UNAVAILABLE");
     const parsed = journalEventSchema.parse(event);
     if (this.failAppendTypes.has(parsed.type)) throw new Error("JOURNAL_APPEND_FAILED");
-    if (this.eventIds.has(parsed.id)) return;
+    if (this.eventIds.has(parsed.id) || this.staged.has(parsed.id)) return;
     this.eventIds.add(parsed.id);
     this.events.push(structuredClone(parsed));
+    this.nextCommitSeq += 1;
+    this.commitSeqById.set(parsed.id, this.nextCommitSeq);
+    this.mutations.push(`append:${parsed.type}`);
+  }
+  /** Assign recordedAt now but keep the row invisible until commitStaged (commit-stability tests). */
+  stageUncommitted(event: JournalEvent): void {
+    const parsed = journalEventSchema.parse(event);
+    this.staged.set(parsed.id, structuredClone(parsed));
+  }
+  commitStaged(id: string): void {
+    const event = this.staged.get(id);
+    if (!event) return;
+    this.staged.delete(id);
+    if (this.eventIds.has(id)) return;
+    this.eventIds.add(id);
+    this.events.push(event);
+    this.nextCommitSeq += 1;
+    this.commitSeqById.set(id, this.nextCommitSeq);
+    this.mutations.push(`commit:${event.type}`);
   }
   async appendMany(events: readonly JournalEvent[]): Promise<void> {
     for (const event of events) await this.append(event);
@@ -151,6 +199,7 @@ export class MemoryEventJournal implements EventJournal {
     return true;
   }
   async pruneIdempotencyKeys(olderThan: Date, limit: number): Promise<{ deleted: number }> {
+    assertJournalMayMutate(this.access, "pruneIdempotencyKeys");
     const cutoff = olderThan.toISOString();
     const victims = [...this.idempotencyKeys.entries()]
       .filter(([, createdAt]) => createdAt < cutoff)
@@ -163,22 +212,26 @@ export class MemoryEventJournal implements EventJournal {
     return this.idempotencyKeys.get(`${scope}\u0000${key}`) ?? null;
   }
   async persistExperimentReport(input: DurableExperimentReportInput): Promise<PersistReportResult> {
-    const hash = input.contentHash || hashExperimentReport(input);
-    const key = `${input.experimentId}:${input.reportKind}`;
-    const existing = this.reports.get(key);
-    if (existing) {
-      if (existing.contentHash !== hash) throw new ExperimentReportConflictError(input.experimentId, existing.contentHash, hash);
-      return { inserted: false, existing: true, report: structuredClone(existing) };
-    }
-    const stored: DurableExperimentReport = { ...structuredClone(input), contentHash: hash, persistedAt: new Date().toISOString() };
-    this.reports.set(key, stored);
-    return { inserted: true, existing: false, report: structuredClone(stored) };
+    return this.withPersistLock(() => persistReportConflictSafe(input, {
+      insert: async (stored) => {
+        const key = `${stored.experimentId}:${stored.reportKind}`;
+        if (this.reports.has(key)) return "conflict";
+        this.reports.set(key, structuredClone(stored));
+        this.mutations.push("persistExperimentReport");
+        return structuredClone(stored);
+      },
+      load: async () => {
+        const existing = this.reports.get(`${input.experimentId}:${input.reportKind}`);
+        return existing ? structuredClone(existing) : null;
+      },
+    }));
   }
   async loadExperimentReport(experimentId: string, reportKind: "final" = "final"): Promise<DurableExperimentReport | null> {
     const existing = this.reports.get(`${experimentId}:${reportKind}`);
     return existing ? structuredClone(existing) : null;
   }
   async deleteJournalEventsBounded(input: { types: readonly string[]; occurredBefore: Date; limit: number }): Promise<{ deleted: number }> {
+    assertJournalMayMutate(this.access, "deleteJournalEventsBounded");
     if (input.types.some((type) => isProtectedJournalType(type))) {
       throw new Error("RETENTION_REFUSED_PROTECTED_TYPES");
     }
@@ -195,9 +248,39 @@ export class MemoryEventJournal implements EventJournal {
         this.events.splice(index, 1);
       }
     }
+    this.mutations.push(`deleteJournalEventsBounded:${victims.length}`);
     return { deleted: victims.length };
   }
+  async countEligible(types: readonly string[], occurredBefore: Date): Promise<{ count: number; oldestOccurredAt: string | null }> {
+    const cutoff = occurredBefore.toISOString();
+    const rows = this.events
+      .filter((event) => types.includes(event.type) && event.occurredAt < cutoff)
+      .sort(compareJournalEventOrder);
+    return { count: rows.length, oldestOccurredAt: rows[0]?.occurredAt ?? null };
+  }
+  async latestCommitSeq(): Promise<number> {
+    return this.nextCommitSeq;
+  }
+  async withReadSnapshot<T>(work: (journal: EventJournalKeyset) => Promise<T>): Promise<{ value: T; stable: boolean }> {
+    const frozen = this.events.map((event) => structuredClone(event));
+    const seq = new Map(this.commitSeqById);
+    const maxSeq = this.nextCommitSeq;
+    const snap: EventJournalKeyset = {
+      queryEventsKeyset: async (query) => {
+        const rows = filterKeysetRows(frozen, seq, query).sort(compareJournalEventOrder).slice(0, Math.max(1, query.limit));
+        return structuredClone(rows);
+      },
+      peekLatestKeyset: async (query) => {
+        const rows = filterKeysetRows(frozen, seq, { ...query, limit: 1 }).sort(compareJournalEventOrder);
+        const last = rows[rows.length - 1];
+        return last ? { occurredAt: last.occurredAt, id: last.id } : null;
+      },
+      latestCommitSeq: async () => maxSeq,
+    };
+    return { value: await work(snap), stable: true };
+  }
   async pruneOldCheckpoints(keepLatest: number): Promise<{ deleted: number; latestSequence: number | null }> {
+    assertJournalMayMutate(this.access, "pruneOldCheckpoints");
     const keep = Math.max(1, keepLatest);
     const ordered = [...this.checkpoints].sort((a, b) => b.sequence - a.sequence);
     const latest = ordered[0]?.sequence ?? null;
@@ -214,19 +297,9 @@ export class MemoryEventJournal implements EventJournal {
   }
 
   private filterKeyset(query: Omit<JournalKeysetQuery, "limit"> & { limit?: number }): JournalEvent[] {
-    let rows = this.events;
-    if (query.types && query.types.length > 0) rows = rows.filter((event) => query.types!.includes(event.type));
-    if (query.experimentId) {
-      rows = rows.filter((event) => event.aggregateId === query.experimentId
-        || (event.payload as { experimentId?: unknown }).experimentId === query.experimentId);
-    }
-    if (query.from) rows = rows.filter((event) => new Date(event.occurredAt).getTime() >= query.from!.getTime());
-    if (query.to) rows = rows.filter((event) => new Date(event.occurredAt).getTime() <= query.to!.getTime());
-    if (query.recordedAtTo) rows = rows.filter((event) => new Date(event.recordedAt).getTime() <= query.recordedAtTo!.getTime());
-    if (query.after) rows = rows.filter((event) => compareJournalEventOrder(event, query.after!) > 0);
-    if (query.through) rows = rows.filter((event) => compareJournalEventOrder(event, query.through!) <= 0);
-    return rows;
+    return filterKeysetRows(this.events, this.commitSeqById, query);
   }
+
   async commitDurableTransition(input: DurableTransitionInput, expectedPreviousSequence: number): Promise<DurableCommitResult> {
     return this.withDurableLock(() => this.commitDurableTransitionUnlocked(input, expectedPreviousSequence));
   }
@@ -258,6 +331,14 @@ export class MemoryEventJournal implements EventJournal {
     return latest ? structuredClone(latest) : null;
   }
   async close(): Promise<void> {}
+
+  private async withPersistLock<T>(work: () => T | Promise<T>): Promise<T> {
+    const previous = this.persistChain;
+    let release: () => void = () => undefined;
+    this.persistChain = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try { return await work(); } finally { release(); }
+  }
 
   private async withDurableLock<T>(work: () => T | Promise<T>): Promise<T> {
     const previous = this.durableChain;
@@ -326,18 +407,50 @@ export class MemoryEventJournal implements EventJournal {
   }
 }
 
+function filterKeysetRows(
+  events: readonly JournalEvent[],
+  commitSeqById: ReadonlyMap<string, number>,
+  query: Omit<JournalKeysetQuery, "limit"> & { limit?: number },
+): JournalEvent[] {
+  let rows = [...events];
+  if (query.types && query.types.length > 0) rows = rows.filter((event) => query.types!.includes(event.type));
+  if (query.experimentId) {
+    rows = rows.filter((event) => event.aggregateId === query.experimentId
+      || (event.payload as { experimentId?: unknown }).experimentId === query.experimentId);
+  }
+  if (query.from) rows = rows.filter((event) => new Date(event.occurredAt).getTime() >= query.from!.getTime());
+  if (query.to) rows = rows.filter((event) => new Date(event.occurredAt).getTime() <= query.to!.getTime());
+  if (query.recordedAtTo) rows = rows.filter((event) => new Date(event.recordedAt).getTime() <= query.recordedAtTo!.getTime());
+  if (query.commitSeqTo != null) {
+    rows = rows.filter((event) => (commitSeqById.get(event.id) ?? Number.POSITIVE_INFINITY) <= query.commitSeqTo!);
+  }
+  if (query.after) rows = rows.filter((event) => compareJournalEventOrder(event, query.after!) > 0);
+  if (query.through) rows = rows.filter((event) => compareJournalEventOrder(event, query.through!) <= 0);
+  return rows;
+}
+
 export class PostgresEventJournal implements EventJournal {
   private readonly client: ReturnType<typeof postgres>;
   private readonly db: ReturnType<typeof drizzle>;
+  readonly access: JournalAccessMode;
+  migrateInvocations = 0;
 
-  constructor(databaseUrl: string, private readonly migrationsFolder: string) {
+  constructor(databaseUrl: string, private readonly migrationsFolder: string, options: { access?: JournalAccessMode } = {}) {
+    this.access = options.access ?? "boot-migrate";
     this.client = postgres(databaseUrl, { max: 10, idle_timeout: 20, connect_timeout: 10 });
     this.db = drizzle(this.client);
   }
 
   async initialize(): Promise<void> {
+    if (!journalMayMigrate(this.access)) throw new JournalMigrateForbiddenError(this.access);
+    this.migrateInvocations += 1;
     await migrate(this.db, { migrationsFolder: this.migrationsFolder });
+    await this.ensureKeysetIndexesIfSafe();
     await this.verifySchema();
+  }
+  async connectWithoutMigrate(mode: JournalAccessMode = this.access): Promise<void> {
+    if (journalMayMigrate(mode)) throw new JournalMigrateForbiddenError(mode);
+    if (journalMustVerifySchema(mode)) await this.verifySchema();
   }
   async verifySchema(): Promise<void> {
     await verifyRequiredSchema(async <T extends Record<string, unknown>>(sql: string) => {
@@ -444,6 +557,7 @@ export class PostgresEventJournal implements EventJournal {
     return rows.length === 1;
   }
   async pruneIdempotencyKeys(olderThan: Date, limit: number): Promise<{ deleted: number }> {
+    assertJournalMayMutate(this.access, "pruneIdempotencyKeys");
     const cap = Math.max(1, Math.min(limit, 500));
     const result = await this.client`
       DELETE FROM mcp_idempotency_keys
@@ -465,38 +579,41 @@ export class PostgresEventJournal implements EventJournal {
   }
   async persistExperimentReport(input: DurableExperimentReportInput): Promise<PersistReportResult> {
     const hash = input.contentHash || hashExperimentReport(input);
-    return this.db.transaction(async (tx) => {
-      const existingRows = await tx.select().from(experimentReports)
-        .where(and(eq(experimentReports.experimentId, input.experimentId), eq(experimentReports.reportKind, input.reportKind)))
-        .limit(1);
-      const existing = existingRows[0];
-      if (existing) {
-        if (existing.contentHash !== hash) {
-          throw new ExperimentReportConflictError(input.experimentId, existing.contentHash, hash);
-        }
-        return { inserted: false, existing: true, report: toExperimentReport(existing) };
-      }
-      const inserted = await tx.insert(experimentReports).values({
-        experimentId: input.experimentId,
-        reportKind: input.reportKind,
-        schemaVersion: input.schemaVersion,
-        generatedAt: new Date(input.generatedAt),
-        complete: input.complete,
-        truncated: input.truncated,
-        sourceEventCount: input.sourceEventCount,
-        sourceWindowStart: input.sourceWindowStart ? new Date(input.sourceWindowStart) : null,
-        sourceWindowEnd: input.sourceWindowEnd ? new Date(input.sourceWindowEnd) : null,
-        sourceFenceOccurredAt: input.sourceFenceOccurredAt ? new Date(input.sourceFenceOccurredAt) : null,
-        sourceFenceId: input.sourceFenceId,
-        earliestIncludedAt: input.earliestIncludedAt ? new Date(input.earliestIncludedAt) : null,
-        latestIncludedAt: input.latestIncludedAt ? new Date(input.latestIncludedAt) : null,
-        canonicalSummary: input.canonicalSummary,
-        renderedMarkdown: input.renderedMarkdown,
-        contentHash: hash,
-      }).returning();
-      const row = inserted[0];
-      if (!row) throw new Error("EXPERIMENT_REPORT_INSERT_FAILED");
-      return { inserted: true, existing: false, report: toExperimentReport(row) };
+    const values = {
+      experimentId: input.experimentId,
+      reportKind: input.reportKind,
+      schemaVersion: input.schemaVersion,
+      generatedAt: new Date(input.generatedAt),
+      complete: input.complete,
+      truncated: input.truncated,
+      sourceEventCount: input.sourceEventCount,
+      sourceWindowStart: input.sourceWindowStart ? new Date(input.sourceWindowStart) : null,
+      sourceWindowEnd: input.sourceWindowEnd ? new Date(input.sourceWindowEnd) : null,
+      sourceFenceOccurredAt: input.sourceFenceOccurredAt ? new Date(input.sourceFenceOccurredAt) : null,
+      sourceFenceId: input.sourceFenceId,
+      earliestIncludedAt: input.earliestIncludedAt ? new Date(input.earliestIncludedAt) : null,
+      latestIncludedAt: input.latestIncludedAt ? new Date(input.latestIncludedAt) : null,
+      canonicalSummary: input.canonicalSummary,
+      renderedMarkdown: input.renderedMarkdown,
+      contentHash: hash,
+    };
+    return persistReportConflictSafe({ ...input, contentHash: hash }, {
+      insert: async (stored) => {
+        const inserted = await this.db.insert(experimentReports).values({
+          ...values,
+          persistedAt: new Date(stored.persistedAt),
+        }).onConflictDoNothing({
+          target: [experimentReports.experimentId, experimentReports.reportKind],
+        }).returning();
+        const row = inserted[0];
+        return row ? toExperimentReport(row) : "conflict";
+      },
+      load: async () => {
+        const rows = await this.db.select().from(experimentReports)
+          .where(and(eq(experimentReports.experimentId, input.experimentId), eq(experimentReports.reportKind, input.reportKind)))
+          .limit(1);
+        return rows[0] ? toExperimentReport(rows[0]) : null;
+      },
     });
   }
   async loadExperimentReport(experimentId: string, reportKind: "final" = "final"): Promise<DurableExperimentReport | null> {
@@ -506,6 +623,7 @@ export class PostgresEventJournal implements EventJournal {
     return rows[0] ? toExperimentReport(rows[0]) : null;
   }
   async deleteJournalEventsBounded(input: { types: readonly string[]; occurredBefore: Date; limit: number }): Promise<{ deleted: number }> {
+    assertJournalMayMutate(this.access, "deleteJournalEventsBounded");
     if (input.types.length === 0) return { deleted: 0 };
     if (input.types.some((type) => isProtectedJournalType(type))) {
       throw new Error("RETENTION_REFUSED_PROTECTED_TYPES");
@@ -524,6 +642,7 @@ export class PostgresEventJournal implements EventJournal {
     return { deleted: result.count ?? 0 };
   }
   async pruneOldCheckpoints(keepLatest: number): Promise<{ deleted: number; latestSequence: number | null }> {
+    assertJournalMayMutate(this.access, "pruneOldCheckpoints");
     const keep = Math.max(1, keepLatest);
     const latestRows = await this.db.select({
       max: sql<number>`coalesce(max(${engineCheckpoints.sequence}), 0)`,
@@ -659,7 +778,101 @@ export class PostgresEventJournal implements EventJournal {
     const row = rows[0];
     return row ? { id: row.id, experimentId: row.experimentId, sequence: row.sequence, payload: row.payload as Record<string, unknown>, createdAt: row.createdAt.toISOString() } : null;
   }
+  async countEligible(types: readonly string[], occurredBefore: Date): Promise<{ count: number; oldestOccurredAt: string | null }> {
+    if (types.length === 0) return { count: 0, oldestOccurredAt: null };
+    const rows = await this.db.select({
+      count: sql<number>`count(*)::int`,
+      oldest: sql<Date | null>`min(${journalEvents.occurredAt})`,
+    }).from(journalEvents)
+      .where(and(inArray(journalEvents.type, [...types]), sql`${journalEvents.occurredAt} < ${occurredBefore}`));
+    const row = rows[0];
+    return {
+      count: Number(row?.count ?? 0),
+      oldestOccurredAt: row?.oldest ? new Date(row.oldest).toISOString() : null,
+    };
+  }
+  async latestCommitSeq(): Promise<number> {
+    return 0;
+  }
+  async withReadSnapshot<T>(work: (journal: EventJournalKeyset) => Promise<T>): Promise<{ value: T; stable: boolean }> {
+    let value!: T;
+    await this.client.begin(async (sql) => {
+      await sql`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ`;
+      const snap: EventJournalKeyset = {
+        queryEventsKeyset: async (query) => {
+          const built = buildJournalKeysetSql(query);
+          const rows = await sql.unsafe(built.text, built.values as never[]) as Array<Record<string, unknown>>;
+          return rows.map((row) => toJournalEvent({
+            id: String(row.id),
+            traceId: String(row.trace_id),
+            correlationId: String(row.correlation_id),
+            type: String(row.type),
+            aggregateType: String(row.aggregate_type),
+            aggregateId: String(row.aggregate_id),
+            payload: row.payload as Record<string, unknown>,
+            occurredAt: new Date(String(row.occurred_at)),
+            recordedAt: new Date(String(row.recorded_at)),
+            sourceEventId: row.source_event_id == null ? null : String(row.source_event_id),
+          } as typeof journalEvents.$inferSelect));
+        },
+        peekLatestKeyset: async (query) => {
+          const built = buildJournalKeysetSql({ ...query, limit: 1, orderDesc: true });
+          const rows = await sql.unsafe(built.text, built.values as never[]) as Array<{ occurred_at: Date | string; id: string }>;
+          const row = rows[0];
+          return row ? { occurredAt: new Date(row.occurred_at).toISOString(), id: row.id } : null;
+        },
+        latestCommitSeq: async () => 0,
+      };
+      value = await work(snap);
+    });
+    return { value, stable: true };
+  }
+  private async ensureKeysetIndexesIfSafe(): Promise<void> {
+    const missing: string[] = [];
+    for (const name of LARGE_JOURNAL_KEYSET_INDEXES) {
+      const rows = await this.client`SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = ${name}`;
+      if (rows.length === 0) missing.push(name);
+    }
+    if (missing.length === 0) return;
+    const countRows = await this.client`SELECT coalesce(reltuples, 0)::bigint AS estimate FROM pg_class WHERE relname = 'journal_events'`;
+    const estimate = Number(countRows[0]?.estimate ?? 0);
+    if (estimate > LARGE_JOURNAL_SYNC_INDEX_MAX_ROWS) return;
+    await this.client.unsafe(`CREATE INDEX IF NOT EXISTS journal_occurred_id_idx ON journal_events (occurred_at, id)`);
+    await this.client.unsafe(`CREATE INDEX IF NOT EXISTS journal_type_occurred_id_idx ON journal_events (type, occurred_at, id)`);
+  }
   async close(): Promise<void> { await this.client.end({ timeout: 5 }); }
+}
+
+function buildJournalKeysetSql(query: JournalKeysetQuery & { orderDesc?: boolean }): { text: string; values: unknown[] } {
+  const clauses: string[] = [];
+  const values: unknown[] = [];
+  const push = (fragment: string, value: unknown) => {
+    values.push(value);
+    clauses.push(fragment.replace("?", `$${values.length}`));
+  };
+  if (query.types && query.types.length > 0) push(`type = ANY(?)`, query.types);
+  if (query.experimentId) {
+    values.push(query.experimentId, query.experimentId);
+    clauses.push(`(aggregate_id = $${values.length - 1} OR payload->>'experimentId' = $${values.length})`);
+  }
+  if (query.from) push(`occurred_at >= ?`, query.from);
+  if (query.to) push(`occurred_at <= ?`, query.to);
+  if (query.recordedAtTo) push(`recorded_at <= ?`, query.recordedAtTo);
+  if (query.after) {
+    values.push(query.after.occurredAt, query.after.id);
+    clauses.push(`(occurred_at, id) > ($${values.length - 1}::timestamptz, $${values.length})`);
+  }
+  if (query.through) {
+    values.push(query.through.occurredAt, query.through.id);
+    clauses.push(`(occurred_at, id) <= ($${values.length - 1}::timestamptz, $${values.length})`);
+  }
+  values.push(Math.max(1, Math.min(query.limit, 20_000)));
+  const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
+  const order = query.orderDesc ? "occurred_at DESC, id DESC" : "occurred_at ASC, id ASC";
+  return {
+    text: `SELECT id, trace_id, correlation_id, type, aggregate_type, aggregate_id, payload, occurred_at, recorded_at, source_event_id FROM journal_events ${where} ORDER BY ${order} LIMIT $${values.length}`,
+    values,
+  };
 }
 
 function journalKeysetFilters(query: Omit<JournalKeysetQuery, "limit">): ReturnType<typeof sql>[] {
@@ -700,6 +913,12 @@ function toExperimentReport(row: typeof experimentReports.$inferSelect): Durable
     contentHash: row.contentHash,
     persistedAt: row.persistedAt.toISOString(),
   };
+}
+
+function assertJournalMayMutate(mode: JournalAccessMode, operation: string): void {
+  if (!journalMayMutateData(mode)) {
+    throw new Error(`JOURNAL_MUTATE_FORBIDDEN: ${operation} access=${mode}`);
+  }
 }
 
 function toJournalEvent(row: typeof journalEvents.$inferSelect): JournalEvent {

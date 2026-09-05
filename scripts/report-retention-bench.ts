@@ -50,7 +50,7 @@ async function main(): Promise<void> {
   const wallMs = performance.now() - wall0;
   const cpu = cpuMs() - cpu0;
 
-  const retention = new RetentionManager(journal, defaultRetentionConfig({ batchSize: 200, cycleBudgetMs: 10_000 }));
+  const retention = new RetentionManager(journal, defaultRetentionConfig({ enabled: true, batchSize: 200, cycleBudgetMs: 10_000, maxBatchesPerCycle: 20, maxRowsPerCycle: 4_000 }));
   const t1 = performance.now();
   const cycle = await retention.runCycle({
     experiment: null,
@@ -69,6 +69,11 @@ async function main(): Promise<void> {
     scanned: scan.scanned,
     maxPageRetained: scan.maxPageRetained,
     accumulatorHighWaterBytes: acc.highWaterMarkBytes,
+    accumulatorHighWaterNote: "Estimator of retained structures, not JS heap proof.",
+    retainedEntityCardinality: acc.retainedEntityCardinality,
+    retainedMarketCardinality: acc.retainedMarketCardinality,
+    drainMaxBatchesPerCycle: 20,
+    drainMaxRowsPerCycle: 4_000,
     eventsPerSec: Math.round(scan.scanned / (wallMs / 1000)),
     scanWallMs: Number(wallMs.toFixed(2)),
     scanCpuMs: Number(cpu.toFixed(2)),

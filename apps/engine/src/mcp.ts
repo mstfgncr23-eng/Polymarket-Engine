@@ -16,7 +16,7 @@ import { createJournalEvent, isCanonicalFinalReport, type EventJournal } from "@
 import type { EngineMetrics } from "./metrics.js";
 import { streamExperimentSummary, summaryFromDurableReport } from "./final-report.js";
 import { buildExperimentSummary, filterCurrentExperimentEvents } from "./report.js";
-import { SharedResultFlight } from "./runtime-supervisor.js";
+import { KeyedResultFlight } from "./runtime-supervisor.js";
 import type { EngineStateStore } from "./state.js";
 
 export interface McpConfig {
@@ -94,10 +94,15 @@ let strategyMetricsCache: {
   value: ReturnType<typeof buildExperimentSummary>;
 } | null = null;
 
-const completeMetricsFlight = new SharedResultFlight<ReturnType<typeof buildExperimentSummary>>();
+const completeMetricsFlights = new KeyedResultFlight<ReturnType<typeof buildExperimentSummary>>();
 
 export function resetStrategyMetricsCacheForTest(): void {
   strategyMetricsCache = null;
+  completeMetricsFlights.clear();
+}
+
+export function completeMetricsFlightKey(experimentId: string, startedAt?: string | null, completedAt?: string | null): string {
+  return `${experimentId}|${startedAt ?? ""}|${completedAt ?? ""}`;
 }
 
 export const FORBIDDEN_MCP_TRADE_TOOLS = new Set([
@@ -355,13 +360,14 @@ export function createGrokMcpServer(clientId: string, dependencies: McpDependenc
         dependencies.metrics.reportScanEvents.observe(streamed.scan.scanned);
         dependencies.metrics.reportScanDuration.observe(streamed.scan.durationMs / 1000);
         dependencies.metrics.reportAccumulatorHighWaterBytes.set(streamed.accumulatorHighWaterBytes);
-        streamed.summary.complete = streamed.scan.complete && Boolean(startedAt) && !streamed.scan.interrupted;
-        streamed.summary.truncated = streamed.scan.truncated || streamed.scan.interrupted;
+        streamed.summary.complete = streamed.scan.complete && dependencies.state.experimentStatus === "COMPLETED" && streamed.scan.fence.stable && !streamed.scan.interrupted;
+        streamed.summary.truncated = streamed.scan.truncated || streamed.scan.interrupted || !streamed.scan.fence.stable;
         streamed.summary.truncatedReason = streamed.summary.truncated ? (streamed.scan.truncatedReason ?? "SCAN_CEILING") : null;
         return streamed.summary;
       };
-      if (completeMetricsFlight.inFlight) dependencies.metrics.completeMetricsCoalesced.inc();
-      return completeMetricsFlight.run(() => dependencies.heavyRead ? dependencies.heavyRead(work) : work());
+      const key = completeMetricsFlightKey(experimentId, startedAt, completedAt);
+      if (completeMetricsFlights.inFlight(key)) dependencies.metrics.completeMetricsCoalesced.inc();
+      return completeMetricsFlights.run(key, () => dependencies.heavyRead ? dependencies.heavyRead(work) : work());
     };
     const summary = scope === "complete"
       ? await readComplete()
@@ -373,7 +379,7 @@ export function createGrokMcpServer(clientId: string, dependencies: McpDependenc
           experiment,
         ),
         experimentId,
-        { status: dependencies.state.experimentStatus ?? "unknown", reportKind: "interim", metricsScope: "rolling", complete: true, truncated: false },
+        { status: dependencies.state.experimentStatus ?? "unknown", reportKind: "interim", metricsScope: "rolling", complete: false, truncated: false },
       );
     strategyMetricsCache = { at: now, scope, experimentId, value: summary };
     return toolResult(summary);

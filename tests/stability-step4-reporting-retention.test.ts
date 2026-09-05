@@ -14,24 +14,32 @@ import {
   assertMcpIdempotencyTtlSafe,
   classifyJournalRetention,
   createId,
+  engineEnvSchema,
   grokSignalSubmissionSchema,
   type JournalEvent,
 } from "@pm/core";
 import {
   ExperimentReportConflictError,
+  JournalMigrateForbiddenError,
   MemoryEventJournal,
+  PostgresEventJournal,
   createJournalEvent,
   evaluateSchemaInspection,
   hashExperimentReport,
   isCanonicalFinalReport,
+  persistReportConflictSafe,
+  reportGeneratedAuditId,
   scanJournalEvents,
   SchemaVerificationError,
 } from "@pm/db";
 import { createApiServer } from "../apps/engine/src/server.js";
 import { buildExperimentSummary, ExperimentSummaryAccumulator, writeExperimentSummary } from "../apps/engine/src/report.js";
-import { persistCanonicalFinalReport, streamExperimentSummary, summaryFromDurableReport, toDurableReportInput } from "../apps/engine/src/final-report.js";
+import { ensureReportGeneratedAudit, persistCanonicalFinalReport, resolveAuthoritativeExperiment, streamExperimentSummary, summaryFromDurableReport, toDurableReportInput } from "../apps/engine/src/final-report.js";
 import { applyJournalCleanup, dryRunJournalCleanup } from "../apps/engine/src/journal-cleanup.js";
-import { defaultRetentionConfig, experimentIsActive, RetentionManager } from "../apps/engine/src/retention-manager.js";
+import { generateOperatorReport } from "../apps/engine/src/operator-report.js";
+import { defaultRetentionConfig, experimentIsActive, experimentIsMonitorOnly, RetentionManager } from "../apps/engine/src/retention-manager.js";
+import { completeMetricsFlightKey, resetStrategyMetricsCacheForTest } from "../apps/engine/src/mcp.js";
+import { KeyedResultFlight } from "../apps/engine/src/runtime-supervisor.js";
 import { EngineMetrics } from "../apps/engine/src/metrics.js";
 import { EngineStateStore } from "../apps/engine/src/state.js";
 import { EngineService, RUNTIME_BOUNDS as ENGINE_BOUNDS } from "../apps/engine/src/engine.js";
@@ -119,7 +127,8 @@ describe("Step-4 keyset scanner bounds", () => {
     expect(scan.maxPageRetained).toBe(250);
     expect(acc.retainedEventCount).toBe(0);
     expect(summary.totalOpportunities).toBe(n);
-    expect(acc.highWaterMarkBytes).toBeLessThan(n * 200);
+    expect(acc.retainedEntityCardinality).toBeLessThan(16);
+    expect(acc.retainedMarketCardinality).toBeLessThan(8);
   });
 
   it("equal occurredAt neither duplicates nor skips", async () => {
@@ -148,7 +157,7 @@ describe("Step-4 keyset scanner bounds", () => {
     }, { reportKind: "final", metricsScope: "complete" }, { signal: abort.signal });
     expect(streamed.scan.interrupted).toBe(true);
     expect(streamed.summary.complete).toBe(false);
-    const persisted = await persistCanonicalFinalReport(journal, { summary: streamed.summary, scan: streamed.scan });
+    const persisted = await persistCanonicalFinalReport(journal, { summary: streamed.summary, scan: streamed.scan, experimentStatus: "COMPLETED" });
     expect(persisted).toBeNull();
     expect(await journal.loadExperimentReport("exp-1")).toBeNull();
   });
@@ -179,9 +188,9 @@ describe("Step-4 durable final report", () => {
     }, { reportKind: "final", metricsScope: "complete", generatedAt: "2026-09-01T12:00:00.000Z", complete: true, truncated: false });
     streamed.summary.complete = true;
     streamed.summary.truncated = false;
-    const first = await persistCanonicalFinalReport(journal, { summary: streamed.summary, scan: streamed.scan });
+    const first = await persistCanonicalFinalReport(journal, { summary: streamed.summary, scan: streamed.scan, experimentStatus: "COMPLETED" });
     expect(first?.inserted).toBe(true);
-    const second = await persistCanonicalFinalReport(journal, { summary: streamed.summary, scan: streamed.scan });
+    const second = await persistCanonicalFinalReport(journal, { summary: streamed.summary, scan: streamed.scan, experimentStatus: "COMPLETED" });
     expect(second?.inserted).toBe(false);
     expect(second?.report.contentHash).toBe(first?.report.contentHash);
     const conflict = { ...streamed.summary, totalFills: 99 };
@@ -205,7 +214,7 @@ describe("Step-4 MCP / API heavy-read closure", () => {
     }, { reportKind: "final", generatedAt: "2026-09-01T12:00:00.000Z", complete: true, truncated: false });
     streamed.summary.complete = true;
     streamed.summary.truncated = false;
-    await persistCanonicalFinalReport(journal, { summary: streamed.summary, scan: streamed.scan });
+    await persistCanonicalFinalReport(journal, { summary: streamed.summary, scan: streamed.scan, experimentStatus: "COMPLETED" });
     const loaded = await journal.loadExperimentReport("exp-1");
     expect(loaded && isCanonicalFinalReport(loaded)).toBe(true);
     expect(summaryFromDurableReport(loaded!).experimentId).toBe("exp-1");
@@ -266,7 +275,7 @@ describe("Step-4 retention classes and gates", () => {
     await journal.append(ev("TRIGGER_EVENT", "2026-09-01T00:00:00.000Z", { kind: "BOOK_IMBALANCE" }, "trig-old"));
     await journal.append(ev("MARKET_SNAPSHOT", "2026-09-01T00:00:00.000Z", { marketId: "m" }, "snap-old"));
     await journal.append(ev("PAPER_FILL", "2026-09-01T00:00:00.000Z", { ...fill("UP", "0.40") }, "fill-old"));
-    const manager = new RetentionManager(journal, defaultRetentionConfig({ telemetryTtlMs: 1, monitorTtlMs: 1, completedGraceMs: 1 }));
+    const manager = new RetentionManager(journal, defaultRetentionConfig({ enabled: true, telemetryTtlMs: 1, monitorTtlMs: 1, completedGraceMs: 1 }));
     const active = await manager.runCycle({
       experiment: { id: "exp-1", status: "RUNNING" }, now, degraded: false, failClosed: false, databaseUp: true,
     });
@@ -307,7 +316,7 @@ describe("Step-4 retention classes and gates", () => {
       contentHash: "ok",
     });
     const manager = new RetentionManager(journal, defaultRetentionConfig({
-      telemetryTtlMs: 1, monitorTtlMs: 1, completedGraceMs: 1, batchSize: 200,
+      enabled: true, telemetryTtlMs: 1, monitorTtlMs: 1, completedGraceMs: 1, batchSize: 200,
     }));
     const result = await manager.runCycle({
       experiment: { id: "exp-1", status: "COMPLETED" },
@@ -325,7 +334,7 @@ describe("Step-4 retention classes and gates", () => {
   it("retention failures do not corrupt trading state and skip when degraded", async () => {
     const journal = new MemoryEventJournal();
     journal.available = false;
-    const manager = new RetentionManager(journal, defaultRetentionConfig());
+    const manager = new RetentionManager(journal, defaultRetentionConfig({ enabled: true }));
     const skipped = await manager.runCycle({
       experiment: null, now: new Date(), degraded: true, failClosed: false, databaseUp: true,
     });
@@ -353,9 +362,10 @@ describe("Step-4 retention classes and gates", () => {
       experiment: { id: "exp-1", status: "RUNNING" },
       confirm: "I_UNDERSTAND_DESTRUCTIVE_CLEANUP",
     });
-    expect(apply.refused).toBe(true);
+    expect(apply.refused).toBe(false);
     expect(apply.durableTransitionsDeleted).toBe(0);
     expect((await journal.queryEvents({ types: ["PAPER_FILL"] })).length).toBe(1);
+    expect((await journal.queryEvents({ types: ["MARKET_SNAPSHOT"] })).length).toBe(0);
   });
 });
 
@@ -475,6 +485,18 @@ describe("Step-4 schema verification fails closed", () => {
       rlsEnabled: ["journal_events", "engine_checkpoints", "mcp_idempotency_keys", "durable_transitions", "experiment_reports"],
       rlsForced: [],
     })).not.toThrow();
+    expect(() => evaluateSchemaInspection({
+      tables: ["journal_events", "engine_checkpoints", "mcp_idempotency_keys", "durable_transitions", "experiment_reports"],
+      indexes: [
+        "journal_trace_idx", "journal_aggregate_idx", "journal_type_time_idx", "journal_experiment_idx",
+        "journal_occurred_id_idx", "journal_type_occurred_id_idx", "checkpoint_sequence_idx",
+        "mcp_idempotency_scope_key_idx", "durable_transitions_operation_key_uidx", "durable_transitions_sequence_idx",
+        "experiment_reports_pkey", "experiment_reports_hash_idx", "experiment_reports_complete_idx",
+      ],
+      rlsEnabled: ["journal_events", "engine_checkpoints", "mcp_idempotency_keys", "durable_transitions", "experiment_reports"],
+      rlsForced: [],
+      invalidIndexes: ["journal_occurred_id_idx"],
+    })).toThrow(/invalid index journal_occurred_id_idx/);
   });
 });
 
@@ -493,3 +515,242 @@ describe("Step-4 PR #12 bounds unchanged", () => {
     expect(DECISION_EVENT_TYPES).toContain("EXPERIMENT_REPORT_GENERATED");
   });
 });
+
+describe("Step-4 acceptance: operator access never migrates", () => {
+  it("dry-run and readonly access cannot invoke migrate or mutating SQL", async () => {
+    const journal = new MemoryEventJournal();
+    await journal.append(ev("MARKET_SNAPSHOT", "2026-09-01T00:00:00.000Z", {}, "snap"));
+    journal.mutations.length = 0;
+    journal.migrateInvocations = 0;
+    await journal.connectWithoutMigrate("readonly");
+    await expect(journal.initialize()).rejects.toBeInstanceOf(JournalMigrateForbiddenError);
+    expect(journal.migrateInvocations).toBe(0);
+    const dry = await dryRunJournalCleanup(journal, new Date("2026-09-08T00:00:00.000Z"));
+    expect(dry.mutated).toBe(false);
+    expect(journal.migrateInvocations).toBe(0);
+    expect(journal.mutations).toEqual([]);
+    expect(dry.telemetry.eligible).toBeGreaterThanOrEqual(1);
+    expect(dry.telemetry.cutoff).toBeTruthy();
+    expect(dry.durableTransitions).toBe("PROTECTED_NO_DELETE");
+    await expect(journal.deleteJournalEventsBounded({
+      types: TELEMETRY_EVENT_TYPES,
+      occurredBefore: new Date(),
+      limit: 10,
+    })).rejects.toThrow(/JOURNAL_MUTATE_FORBIDDEN/);
+    const pg = new PostgresEventJournal("postgres://operator:operator@127.0.0.1:1/none", "/tmp", { access: "readonly" });
+    await expect(pg.initialize()).rejects.toBeInstanceOf(JournalMigrateForbiddenError);
+    expect(pg.migrateInvocations).toBe(0);
+    await pg.close().catch(() => undefined);
+  });
+});
+
+describe("Step-4 acceptance: operator report CLI gates", () => {
+  it("persists a canonical final only for the proven COMPLETED experiment", async () => {
+    const journal = new MemoryEventJournal();
+    await journal.appendMany(fixtureEvents());
+    await journal.append(ev("EXPERIMENT_STARTED", "2026-08-01T00:00:00.000Z", { experimentId: "exp-old", aggregateId: "exp-old" }, "old-start"));
+    const dir = await mkdtemp(join(tmpdir(), "pm-op-report-"));
+    const running = await generateOperatorReport(journal, { experimentId: "exp-1", reportDirectory: dir, allowPersist: true });
+    // fixture has COMPLETED
+    expect(running.persisted).toBe(true);
+    expect(running.status).toBe("COMPLETED");
+    const runningJournal = new MemoryEventJournal();
+    await runningJournal.append(ev("EXPERIMENT_STARTED", "2026-09-01T00:00:00.000Z", { aggregateId: "exp-run" }, "s"));
+    const run = await generateOperatorReport(runningJournal, { experimentId: "exp-run", reportDirectory: dir, allowPersist: true });
+    expect(run.persisted).toBe(false);
+    expect(run.reason).toMatch(/NOT_COMPLETED:RUNNING/);
+    expect(await runningJournal.loadExperimentReport("exp-run")).toBeNull();
+    const closed = new MemoryEventJournal();
+    await closed.append(ev("EXPERIMENT_STARTED", "2026-09-01T00:00:00.000Z", { aggregateId: "exp-c" }, "cs"));
+    await closed.append(ev("EXPERIMENT_ENTRY_CLOSED", "2026-09-01T01:00:00.000Z", { aggregateId: "exp-c" }, "cc"));
+    const entry = await generateOperatorReport(closed, { experimentId: "exp-c", reportDirectory: dir, allowPersist: true });
+    expect(entry.persisted).toBe(false);
+    expect(entry.reason).toMatch(/ENTRY_CLOSED/);
+    const missing = await generateOperatorReport(journal, { experimentId: "exp-missing", reportDirectory: dir, allowPersist: true });
+    expect(missing.persisted).toBe(false);
+    expect(missing.reason).toBe("EXPERIMENT_IDENTITY_MISSING");
+    const resolved = await resolveAuthoritativeExperiment(journal, "exp-1");
+    expect(resolved?.startedAt).toBe("2026-09-01T00:00:00.000Z");
+    expect(resolved?.startedAt).not.toBe("2026-08-01T00:00:00.000Z");
+    const isolated = new MemoryEventJournal();
+    await isolated.append(ev("ENGINE_STARTED", "2026-07-01T00:00:00.000Z", {}, "eng"));
+    await isolated.append(ev("EXPERIMENT_STARTED", "2026-09-01T00:00:00.000Z", { experimentId: "exp-b", aggregateId: "exp-b" }, "b-start"));
+    await isolated.append(ev("EXPERIMENT_COMPLETED", "2026-09-01T02:00:00.000Z", { experimentId: "exp-b", aggregateId: "exp-b" }, "b-done"));
+    const own = await resolveAuthoritativeExperiment(isolated, "exp-b");
+    expect(own?.startedAt).toBe("2026-09-01T00:00:00.000Z");
+    expect(own?.startedAt).not.toBe("2026-07-01T00:00:00.000Z");
+    const conflictJournal = new MemoryEventJournal();
+    await conflictJournal.appendMany(fixtureEvents());
+    await conflictJournal.persistExperimentReport({
+      experimentId: "exp-1", reportKind: "final", schemaVersion: 1, generatedAt: "2026-09-01T00:00:00.000Z",
+      complete: true, truncated: false, sourceEventCount: 1,
+      sourceWindowStart: null, sourceWindowEnd: null, sourceFenceOccurredAt: null, sourceFenceId: null,
+      earliestIncludedAt: null, latestIncludedAt: null, canonicalSummary: { other: true }, renderedMarkdown: "other",
+      contentHash: "not-the-scan-hash",
+    });
+    await expect(generateOperatorReport(conflictJournal, { experimentId: "exp-1", reportDirectory: dir, allowPersist: true }))
+      .rejects.toBeInstanceOf(ExperimentReportConflictError);
+  });
+});
+
+describe("Step-4 acceptance: commit-stable source fence", () => {
+  it("excludes an event created before the fence but committed after capture", async () => {
+    const journal = new MemoryEventJournal();
+    await journal.append(ev("RISK_EVALUATION", "2026-09-01T00:00:00.000Z", { accepted: true, marketId: "m" }, "early"));
+    const delayed = ev("RISK_EVALUATION", "2026-08-31T23:59:59.000Z", { accepted: true, marketId: "m" }, "delayed");
+    journal.stageUncommitted(delayed);
+    const ids: string[] = [];
+    const stats = await scanJournalEvents(journal, { types: ["RISK_EVALUATION"] }, {
+      pageSize: 1,
+      onPage: async (page) => {
+        ids.push(...page.map((item) => item.id));
+        journal.commitStaged("delayed");
+        await journal.append(ev("RISK_EVALUATION", "2026-09-01T00:00:02.000Z", { accepted: true, marketId: "m" }, "late-audit"));
+      },
+    });
+    expect(ids).toEqual(["early"]);
+    expect(stats.fence.stable).toBe(true);
+    expect(stats.complete).toBe(true);
+    const again = await scanJournalEvents(journal, { types: ["RISK_EVALUATION"] });
+    expect(again.scanned).toBe(3);
+    expect(again.fence.stable).toBe(true);
+  });
+});
+
+describe("Step-4 acceptance: monitor-only and drain", () => {
+  it("monitor-only / no experiment allows monitor TTL; active protects in-window; completed needs final+grace", async () => {
+    const journal = new MemoryEventJournal();
+    const now = new Date("2026-09-08T00:00:00.000Z");
+    await journal.append(ev("TRIGGER_EVENT", "2026-09-01T00:00:00.000Z", {}, "pre"));
+    const manager = new RetentionManager(journal, defaultRetentionConfig({ enabled: true, monitorTtlMs: 1, telemetryTtlMs: 1, completedGraceMs: 1, batchSize: 50, maxBatchesPerCycle: 8, maxRowsPerCycle: 400 }));
+    expect(experimentIsMonitorOnly(null)).toBe(true);
+    const idle = await manager.runCycle({ experiment: null, now, degraded: false, failClosed: false, databaseUp: true });
+    expect(idle.monitorOnlyEligible).toBe(true);
+    expect((await journal.queryEvents({ types: ["TRIGGER_EVENT"] })).length).toBe(0);
+    await journal.append(ev("TRIGGER_EVENT", "2026-09-07T00:00:00.000Z", {}, "in-window"));
+    await journal.append(ev("TRIGGER_EVENT", "2026-09-01T00:00:00.000Z", {}, "pre2"));
+    const active = await manager.runCycle({
+      experiment: { id: "exp-1", status: "RUNNING", startedAt: "2026-09-06T00:00:00.000Z" },
+      now, degraded: false, failClosed: false, databaseUp: true,
+    });
+    expect((await journal.queryEvents({ types: ["TRIGGER_EVENT"] })).map((item) => item.id)).toEqual(["in-window"]);
+    expect(active.deletedByClass.monitor_control).toBe(1);
+    await journal.append(ev("TRIGGER_EVENT", "2026-09-01T00:00:00.000Z", {}, "done-old"));
+    const completed = await manager.runCycle({
+      experiment: { id: "exp-1", status: "COMPLETED", startedAt: "2026-09-06T00:00:00.000Z" },
+      now, degraded: false, failClosed: false, databaseUp: true,
+    });
+    expect(completed.transientEligible).toBe(false);
+    expect((await journal.queryEvents({ types: ["TRIGGER_EVENT"] })).some((item) => item.id === "done-old")).toBe(true);
+    const apply = await applyJournalCleanup(journal, { now, experiment: null, confirm: "I_UNDERSTAND_DESTRUCTIVE_CLEANUP" });
+    expect(apply.refused).toBe(false);
+    expect(apply.deletedByClass.monitor_control).toBeGreaterThanOrEqual(1);
+  });
+
+  it("multi-batch drain converges an eligible backlog instead of growing unbounded", async () => {
+    const journal = new MemoryEventJournal();
+    const manager = new RetentionManager(journal, defaultRetentionConfig({
+      enabled: true, telemetryTtlMs: 60_000, monitorTtlMs: 60_000, batchSize: 20,
+      maxBatchesPerCycle: 5, maxRowsPerCycle: 100, cycleBudgetMs: 5_000,
+    }));
+    let now = Date.parse("2026-09-01T00:00:00.000Z");
+    const eligible: number[] = [];
+    for (let cycle = 0; cycle < 12; cycle += 1) {
+      now += 60_000;
+      for (let i = 0; i < 80; i += 1) {
+        await journal.append(ev("MARKET_SNAPSHOT", new Date(now - 90_000).toISOString(), { i }, `tel-${cycle}-${i}`));
+      }
+      const result = await manager.runCycle({
+        experiment: null, now: new Date(now), degraded: false, failClosed: false, databaseUp: true,
+      });
+      eligible.push(result.eligibleBacklog);
+      expect(result.deletedByClass.raw_telemetry).toBeLessThanOrEqual(100);
+      expect(result.batchCount).toBeLessThanOrEqual(5 + 4);
+    }
+    const tail = eligible.slice(-4);
+    const first = eligible[0]!;
+    expect(Math.max(...tail)).toBeLessThan(first * 3);
+    expect(Math.max(...tail) - Math.min(...tail)).toBeLessThan(200);
+  });
+});
+
+describe("Step-4 acceptance: retention opt-in, persist races, audit repair, MCP keying", () => {
+  it("missing RETENTION_ENABLED does not enable automatic journal deletion", async () => {
+    const parsed = engineEnvSchema.parse({});
+    expect(parsed.RETENTION_ENABLED).toBe(false);
+    const journal = new MemoryEventJournal();
+    await journal.append(ev("MARKET_SNAPSHOT", "2026-01-01T00:00:00.000Z", {}, "snap"));
+    const manager = new RetentionManager(journal, defaultRetentionConfig());
+    const result = await manager.runCycle({
+      experiment: null, now: new Date(), degraded: false, failClosed: false, databaseUp: true,
+    });
+    expect(result.skipped).toBe(true);
+    expect(result.skipReason).toBe("disabled");
+    expect((await journal.queryEvents({ types: ["MARKET_SNAPSHOT"] })).length).toBe(1);
+  });
+
+  it("concurrent same-hash persist is idempotent; conflicting hash fails closed", async () => {
+    const journal = new MemoryEventJournal();
+    const input = {
+      experimentId: "exp-1", reportKind: "final" as const, schemaVersion: 1, generatedAt: "2026-09-01T00:00:00.000Z",
+      complete: true, truncated: false, sourceEventCount: 1,
+      sourceWindowStart: null, sourceWindowEnd: null, sourceFenceOccurredAt: null, sourceFenceId: null,
+      earliestIncludedAt: null, latestIncludedAt: null, canonicalSummary: { a: 1 }, renderedMarkdown: "ok",
+      contentHash: "abc",
+    };
+    const [a, b] = await Promise.all([journal.persistExperimentReport(input), journal.persistExperimentReport(input)]);
+    expect([a.inserted, b.inserted].sort()).toEqual([false, true]);
+    expect(a.report.contentHash).toBe("abc");
+    const conflict = persistReportConflictSafe({ ...input, contentHash: "zzz", canonicalSummary: { a: 2 } }, {
+      insert: async () => "conflict",
+      load: async () => ({ ...input, persistedAt: "2026-09-01T00:00:00.000Z" }),
+    });
+    await expect(conflict).rejects.toBeInstanceOf(ExperimentReportConflictError);
+  });
+
+  it("repairs EXPERIMENT_REPORT_GENERATED exactly once after persist-then-audit failure", async () => {
+    const journal = new MemoryEventJournal();
+    await journal.appendMany(fixtureEvents());
+    const streamed = await streamExperimentSummary(journal, {
+      id: "exp-1", startedAt: "2026-09-01T00:00:00.000Z", completedAt: "2026-09-01T00:00:08.000Z",
+    }, { reportKind: "final", complete: true, truncated: false, generatedAt: "2026-09-01T12:00:00.000Z" });
+    streamed.summary.complete = true;
+    streamed.summary.truncated = false;
+    const persisted = await persistCanonicalFinalReport(journal, { summary: streamed.summary, scan: streamed.scan, experimentStatus: "COMPLETED" });
+    expect(persisted).toBeTruthy();
+    journal.failAppendTypes.add("EXPERIMENT_REPORT_GENERATED");
+    await expect(ensureReportGeneratedAudit(journal, persisted!.report)).rejects.toThrow(/JOURNAL_APPEND_FAILED/);
+    journal.failAppendTypes.delete("EXPERIMENT_REPORT_GENERATED");
+    const first = await ensureReportGeneratedAudit(journal, persisted!.report);
+    const second = await ensureReportGeneratedAudit(journal, persisted!.report);
+    expect(first.repaired).toBe(true);
+    expect(second.repaired).toBe(false);
+    expect(first.id).toBe(reportGeneratedAuditId("exp-1", persisted!.report.contentHash));
+    const audits = await journal.queryEvents({ types: ["EXPERIMENT_REPORT_GENERATED"] });
+    expect(audits.filter((item) => item.id === first.id).length).toBe(1);
+  });
+
+  it("complete-metrics flights are keyed; experiment B does not receive A", async () => {
+    resetStrategyMetricsCacheForTest();
+    const flights = new KeyedResultFlight<string>();
+    let releaseA!: (value: string) => void;
+    const a = flights.run("exp-A|start|", () => new Promise<string>((resolve) => { releaseA = resolve; }));
+    const b = flights.run("exp-B|start|", async () => "summary-B");
+    expect(await b).toBe("summary-B");
+    releaseA("summary-A");
+    expect(await a).toBe("summary-A");
+    expect(completeMetricsFlightKey("exp-A", "s", "c")).not.toBe(completeMetricsFlightKey("exp-B", "s", "c"));
+  });
+
+  it("accumulator retained state follows entity cardinality, not event count", () => {
+    const acc = new ExperimentSummaryAccumulator("exp-1", { reportKind: "final" });
+    for (let i = 0; i < 2_000; i += 1) {
+      acc.fold(ev("RISK_EVALUATION", "2026-09-01T00:00:00.000Z", { accepted: true, marketId: `m-${i % 6}` }, `r-${i}`));
+    }
+    expect(acc.sourceEventCount).toBe(2_000);
+    expect(acc.retainedEventCount).toBe(0);
+    expect(acc.retainedEntityCardinality).toBeLessThan(20);
+    expect(acc.highWaterMarkBytes).toBeGreaterThan(0);
+  });
+});
+

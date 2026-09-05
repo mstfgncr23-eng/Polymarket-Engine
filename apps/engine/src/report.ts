@@ -92,7 +92,16 @@ export class ExperimentSummaryAccumulator {
 
   get retainedEventCount(): number { return 0; }
   get sourceEventCount(): number { return this.eventCount; }
+  /** Estimator of retained structure size — not a JS heap measurement. */
   get highWaterMarkBytes(): number { return this.highWaterBytes; }
+  /** Structural cardinality of retained maps — not event count and not JS heap. */
+  get retainedEntityCardinality(): number {
+    return this.fillReplay.size + this.latestPositions.size + Object.keys(this.byMarket).length + Object.keys(this.byAsset).length;
+  }
+  get retainedMarketCardinality(): number {
+    return new Set([...this.fillReplay.keys(), ...this.latestPositions.values()].map((item) => typeof item === "string" ? item : item.marketId)).size
+      || Object.keys(this.byMarket).length;
+  }
 
   fold(event: JournalEvent): void {
     this.eventCount += 1;

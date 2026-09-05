@@ -787,6 +787,36 @@ export class SharedResultFlight<T> {
   get inFlight(): boolean { return this.inflight != null; }
 }
 
+/** Coalesce by key so experiment A in flight cannot serve experiment B. */
+export class KeyedResultFlight<T> {
+  private readonly flights = new Map<string, SharedResultFlight<T>>();
+
+  async run(key: string, work: () => Promise<T>): Promise<T> {
+    let flight = this.flights.get(key);
+    if (!flight) {
+      flight = new SharedResultFlight<T>();
+      this.flights.set(key, flight);
+    }
+    if (flight.inFlight) this.coalesced += 1;
+    try {
+      return await flight.run(work);
+    } finally {
+      if (!flight.inFlight) this.flights.delete(key);
+    }
+  }
+
+  inFlight(key: string): boolean {
+    return this.flights.get(key)?.inFlight ?? false;
+  }
+
+  clear(): void {
+    this.flights.clear();
+    this.coalesced = 0;
+  }
+
+  coalesced = 0;
+}
+
 export class FiniteSemaphore {
   private active = 0;
   private readonly waiters: Array<{ resolve: () => void; reject: (error: unknown) => void }> = [];

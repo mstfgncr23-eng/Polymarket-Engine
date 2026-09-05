@@ -20,6 +20,9 @@ export const RETENTION_DEFAULTS = {
   checkpointKeep: 8,
   batchSize: 200,
   cycleBudgetMs: 250,
+  maxBatchesPerCycle: 20,
+  maxRowsPerCycle: 4_000,
+  enabled: false,
 } as const;
 
 export const RETENTION_BATCH_SIZE_MAX = 500;

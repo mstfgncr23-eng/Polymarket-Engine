@@ -84,7 +84,7 @@ import { EngineMetrics, classifyJournalMetricClass } from "./metrics.js";
 import { RestingOrderTokenIndex } from "./resting-order-index.js";
 import { SseHub } from "./server.js";
 import { EngineStateStore } from "./state.js";
-import { persistCanonicalFinalReport, reportGeneratedPayload, streamExperimentSummary, summaryFromDurableReport } from "./final-report.js";
+import { ensureReportGeneratedAudit, persistCanonicalFinalReport, streamExperimentSummary, summaryFromDurableReport } from "./final-report.js";
 import { writeExperimentSummary } from "./report.js";
 import { defaultRetentionConfig, RetentionManager } from "./retention-manager.js";
 import { GrokActivationCoordinator, persistableActivation } from "./activation/coordinator.js";
@@ -277,6 +277,8 @@ export class EngineService {
       checkpointKeep: env.RETENTION_CHECKPOINT_KEEP,
       batchSize: env.RETENTION_BATCH_SIZE,
       cycleBudgetMs: env.RETENTION_CYCLE_BUDGET_MS,
+      maxBatchesPerCycle: env.RETENTION_MAX_BATCHES_PER_CYCLE,
+      maxRowsPerCycle: env.RETENTION_MAX_ROWS_PER_CYCLE,
     }), {
       noteDeleted: (cls, n) => { if (n > 0) this.metrics.retentionDeleted.inc({ retention_class: cls }, n); },
       noteFailure: () => this.metrics.retentionFailures.inc(),
@@ -1118,7 +1120,10 @@ export class EngineService {
       this.syncExperimentWindow();
       if (this.experiment?.id) {
         const existing = await this.journal.loadExperimentReport(this.experiment.id, "final");
-        if (existing && isCanonicalFinalReport(existing)) this.reportGenerated = true;
+        if (existing && isCanonicalFinalReport(existing)) {
+          this.reportGenerated = true;
+          await ensureReportGeneratedAudit(this.journal, existing);
+        }
       }
     } catch (error) {
       if (error instanceof CrashInjectedError) throw error;
@@ -2487,6 +2492,7 @@ export class EngineService {
     try {
       const existing = await this.journal.loadExperimentReport(experiment.id, "final");
       if (existing && isCanonicalFinalReport(existing)) {
+        await ensureReportGeneratedAudit(this.journal, existing, { reportDirectory: process.env.REPORT_DIRECTORY ?? "reports" });
         this.reportGenerated = true;
         try {
           await writeExperimentSummary(summaryFromDurableReport(existing), process.env.REPORT_DIRECTORY ?? "reports");
@@ -2518,7 +2524,9 @@ export class EngineService {
       }
       let persisted;
       try {
-        persisted = await persistCanonicalFinalReport(this.journal, { summary: streamed.summary, scan: streamed.scan });
+        persisted = await persistCanonicalFinalReport(this.journal, {
+          summary: streamed.summary, scan: streamed.scan, experimentStatus: experiment.status,
+        });
       } catch (error) {
         this.metrics.finalReportPersistFailures.inc();
         throw error;
@@ -2532,14 +2540,11 @@ export class EngineService {
       } catch {
         this.metrics.finalReportFsExportFailures.inc();
       }
-      await this.journal.append(createJournalEvent({
-        traceId: experiment.id, type: "EXPERIMENT_REPORT_GENERATED", aggregateType: "experiment", aggregateId: experiment.id,
-        payload: reportGeneratedPayload(persisted.report, {
-          reportDirectory: process.env.REPORT_DIRECTORY ?? "reports",
-          settlementPnlUsd: streamed.summary.settlementPnlUsd,
-          unresolvedPositionCount: unresolved,
-        }),
-      }));
+      await ensureReportGeneratedAudit(this.journal, persisted.report, {
+        reportDirectory: process.env.REPORT_DIRECTORY ?? "reports",
+        settlementPnlUsd: streamed.summary.settlementPnlUsd,
+        unresolvedPositionCount: unresolved,
+      });
       this.reportGenerated = true;
       this.record("EXPERIMENT_REPORT_GENERATED", experiment.id, null, {
         reportKind: "final",

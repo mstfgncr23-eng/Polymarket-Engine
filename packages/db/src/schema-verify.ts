@@ -43,6 +43,7 @@ export interface SchemaInspection {
   indexes: readonly string[];
   rlsEnabled: readonly string[];
   rlsForced: readonly string[];
+  invalidIndexes?: readonly string[];
 }
 
 export function evaluateSchemaInspection(found: SchemaInspection): void {
@@ -52,6 +53,9 @@ export function evaluateSchemaInspection(found: SchemaInspection): void {
   }
   for (const index of REQUIRED_INDEXES) {
     if (!found.indexes.includes(index)) missing.push(`missing index ${index}`);
+  }
+  for (const index of found.invalidIndexes ?? []) {
+    missing.push(`invalid index ${index}`);
   }
   for (const table of REQUIRED_RLS_TABLES) {
     if (found.tables.includes(table) && !found.rlsEnabled.includes(table)) {
@@ -77,11 +81,19 @@ export async function inspectPublicSchema(
      JOIN pg_namespace n ON n.oid = c.relnamespace
      WHERE n.nspname = 'public' AND c.relkind = 'r'`,
   );
+  const invalid = await query<{ indexname: string }>(
+    `SELECT c.relname AS indexname
+     FROM pg_index i
+     JOIN pg_class c ON c.oid = i.indexrelid
+     JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'public' AND NOT i.indisvalid`,
+  ).catch(() => [] as { indexname: string }[]);
   return {
     tables: tables.map((row) => row.tablename),
     indexes: indexes.map((row) => row.indexname),
     rlsEnabled: rls.filter((row) => row.relrowsecurity).map((row) => row.relname),
     rlsForced: rls.filter((row) => row.relforcerowsecurity).map((row) => row.relname),
+    invalidIndexes: invalid.map((row) => row.indexname),
   };
 }
 

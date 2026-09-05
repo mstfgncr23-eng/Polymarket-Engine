@@ -33,10 +33,13 @@ CREATE INDEX IF NOT EXISTS experiment_reports_hash_idx
 CREATE INDEX IF NOT EXISTS experiment_reports_complete_idx
   ON experiment_reports (complete, truncated, persisted_at);
 
-CREATE INDEX IF NOT EXISTS journal_occurred_id_idx
-  ON journal_events (occurred_at, id);
-CREATE INDEX IF NOT EXISTS journal_type_occurred_id_idx
-  ON journal_events (type, occurred_at, id);
+-- Large journal_events keyset indexes are NOT created here. A transactional
+-- CREATE INDEX on ~1M live rows can block writers. Fresh/local boot creates
+-- them synchronously only when journal_events is small. Production must run
+-- packages/db/operator/create-journal-keyset-indexes.concurrent.sql
+-- (CREATE INDEX CONCURRENTLY) before readiness. Schema verification fails
+-- closed if those indexes are missing or INVALID.
+
 CREATE INDEX IF NOT EXISTS mcp_idempotency_created_at_idx
   ON mcp_idempotency_keys (created_at);
 

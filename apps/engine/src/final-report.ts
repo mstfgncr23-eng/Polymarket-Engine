@@ -6,8 +6,10 @@ import {
   type JournalEvent,
 } from "@pm/core";
 import {
+  createJournalEvent,
   hashExperimentReport,
   isCanonicalFinalReport,
+  reportGeneratedAuditId,
   scanJournalEvents,
   type DurableExperimentReport,
   type DurableExperimentReportInput,
@@ -85,12 +87,85 @@ export function toDurableReportInput(input: {
 
 export async function persistCanonicalFinalReport(
   journal: EventJournal,
-  input: { summary: ExperimentSummary; scan: ScanStats },
+  input: { summary: ExperimentSummary; scan: ScanStats; experimentStatus?: string | null },
 ): Promise<PersistReportResult | null> {
+  if (input.experimentStatus !== "COMPLETED") return null;
+  if (!input.scan.fence.stable) return null;
+  if (input.scan.interrupted || !input.scan.complete) return null;
   if (!isCanonicalFinalReport({ reportKind: "final", complete: input.summary.complete, truncated: input.summary.truncated })) {
     return null;
   }
   return journal.persistExperimentReport(toDurableReportInput(input));
+}
+
+export interface AuthoritativeExperiment {
+  id: string;
+  status: "RUNNING" | "ENTRY_CLOSED" | "COMPLETED" | null;
+  startedAt: string | null;
+  completedAt: string | null;
+  provenCompleted: boolean;
+}
+
+export async function resolveAuthoritativeExperiment(
+  journal: EventJournal,
+  experimentId: string,
+): Promise<AuthoritativeExperiment | null> {
+  if (!experimentId || experimentId === "unknown" || experimentId === "no-persisted-memory-experiment") return null;
+  const started = await journal.queryEventsKeyset({
+    types: ["EXPERIMENT_STARTED"],
+    experimentId,
+    limit: 8,
+  });
+  const ownStart = started.find((event) => event.aggregateId === experimentId
+    || (event.payload as { experimentId?: unknown }).experimentId === experimentId);
+  const completed = await journal.queryEventsKeyset({
+    types: ["EXPERIMENT_COMPLETED"],
+    experimentId,
+    limit: 8,
+  });
+  const ownComplete = completed.find((event) => event.aggregateId === experimentId
+    || (event.payload as { experimentId?: unknown }).experimentId === experimentId);
+  const entryClosed = await journal.queryEventsKeyset({
+    types: ["EXPERIMENT_ENTRY_CLOSED"],
+    experimentId,
+    limit: 8,
+  });
+  const ownEntry = entryClosed.find((event) => event.aggregateId === experimentId
+    || (event.payload as { experimentId?: unknown }).experimentId === experimentId);
+  if (!ownStart && !ownComplete && !ownEntry) return null;
+  const status = ownComplete ? "COMPLETED" : ownEntry ? "ENTRY_CLOSED" : "RUNNING";
+  return {
+    id: experimentId,
+    status,
+    startedAt: ownStart?.occurredAt ?? null,
+    completedAt: ownComplete?.occurredAt ?? null,
+    provenCompleted: status === "COMPLETED" && Boolean(ownStart) && Boolean(ownComplete),
+  };
+}
+
+export async function ensureReportGeneratedAudit(
+  journal: EventJournal,
+  report: DurableExperimentReport,
+  extras: Record<string, unknown> = {},
+): Promise<{ repaired: boolean; id: string }> {
+  const id = reportGeneratedAuditId(report.experimentId, report.contentHash);
+  const existing = await journal.queryEventsKeyset({
+    types: ["EXPERIMENT_REPORT_GENERATED"],
+    experimentId: report.experimentId,
+    limit: 50,
+  });
+  const found = existing.some((event) => event.id === id
+    || (event.payload as { contentHash?: unknown }).contentHash === report.contentHash);
+  if (found) return { repaired: false, id };
+  await journal.append(createJournalEvent({
+    id,
+    traceId: report.experimentId,
+    type: "EXPERIMENT_REPORT_GENERATED",
+    aggregateType: "experiment",
+    aggregateId: report.experimentId,
+    payload: reportGeneratedPayload(report, extras),
+  }));
+  return { repaired: true, id };
 }
 
 export function summaryFromDurableReport(report: DurableExperimentReport): ExperimentSummary {
