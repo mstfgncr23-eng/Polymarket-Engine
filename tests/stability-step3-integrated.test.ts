@@ -975,7 +975,7 @@ describe("J — market reconnect backoff is stability-gated", () => {
     transport.current().endRemote();
     await waitFor(() => adapter.reconnectDelays.length >= 2);
     const grown = adapter.reconnectDelays[1]!;
-    await waitFor(() => transport.subscribeCalls >= 3 && transport.stream && !transport.current().closed);
+    await waitFor(() => transport.subscribeCalls >= 3 && transport.stream && transport.current().alive);
     expect(transport.push(liveBook("tok-up", 3_000)).ok).toBe(true);
     await waitFor(() => adapter.isTokenSynchronized("tok-up"));
     await new Promise((resolve) => setTimeout(resolve, 50));
