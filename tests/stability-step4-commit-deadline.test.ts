@@ -113,17 +113,28 @@ describe("Step-4 Postgres transaction/commit outcome", () => {
     const migrations = fileURLToPath(new URL("../packages/db/migrations", import.meta.url));
     const pg = new PostgresEventJournal(url, migrations);
     const engine = paperEngine(pg);
-    const hold = deferred();
     const inserted = deferred();
     await engine.start();
     const db = Reflect.get(pg, "db");
+    const client = Reflect.get(pg, "client");
+    const blocker = await client.reserve();
+    let blockerReleased = false;
     const transaction = db.transaction.bind(db);
     let holdNext = true;
     try {
       expect(await engine.beginExperiment()).toMatchObject({ ok: true });
       await engine.completeExperimentForTest();
       const experimentId = engine.experimentManifest()!.id;
-      db.transaction = (work: (tx: Tx) => Promise<void>) => transaction(async (tx: Tx) => {
+      // Hold actual server-side COMMIT, after INSERT, in a deferred constraint
+      // trigger. This avoids replacing postgres.js's transaction completion.
+      await client.unsafe(`CREATE FUNCTION step4_hold_seal_commit() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN PERFORM pg_advisory_xact_lock(431517); RETURN NEW; END $$`);
+      await client.unsafe(`CREATE CONSTRAINT TRIGGER step4_hold_seal_commit
+        AFTER INSERT ON journal_events DEFERRABLE INITIALLY DEFERRED
+        FOR EACH ROW WHEN (NEW.type = 'EXPERIMENT_SOURCE_SEALED')
+        EXECUTE FUNCTION step4_hold_seal_commit()`);
+      await blocker.unsafe("SELECT pg_advisory_lock(431517)");
+      db.transaction = (work: (tx: Tx) => Promise<void>, ...args: unknown[]) => transaction(async (tx: Tx) => {
         if (!holdNext) return work(tx);
         holdNext = false;
         const execute = tx.execute.bind(tx);
@@ -134,16 +145,26 @@ describe("Step-4 Postgres transaction/commit outcome", () => {
           }
           return result;
         };
-        await work(tx); // Real INSERT returned successfully; postgres.js has not sent COMMIT.
+        const result = await work(tx); // Real INSERT succeeded; COMMIT runs the deferred trigger.
         inserted.resolve();
-        await hold.promise;
-      });
+        return result;
+      }, ...args);
       engine.setSourceSealTimeoutForTest(2_000);
       const attempt = engine.ensureSourceSealForTest();
       await inserted.promise;
       expect(await loadSourceSeal(pg, experimentId)).toBeNull();
+      const lockWaitDeadline = Date.now() + 400;
+      let commitWaiting = false;
+      while (!commitWaiting && Date.now() < lockWaitDeadline) {
+        const rows = await client.unsafe("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE wait_event = 'advisory' AND lower(query) = 'commit') AS waiting");
+        commitWaiting = rows[0].waiting;
+        if (!commitWaiting) await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      expect(commitWaiting).toBe(true);
       expect(await attempt).toEqual({ sealed: false, reason: "SOURCE_SEAL_TIMEOUT" });
-      hold.resolve();
+      await blocker.unsafe("SELECT pg_advisory_unlock(431517)");
+      blocker.release();
+      blockerReleased = true;
       await new Promise((resolve) => setTimeout(resolve, 50));
       expect(await loadSourceSeal(pg, experimentId)).toBeNull();
       engine.setSourceSealTimeoutForTest(5_000);
@@ -163,7 +184,11 @@ describe("Step-4 Postgres transaction/commit outcome", () => {
         expect((await restartJournal.loadExperimentReport(experimentId))?.contentHash).toBe(report!.contentHash);
       } finally { await restarted.stop(); }
     } finally {
-      hold.resolve();
+      // The service is disposable; release the lock even when an assertion fails.
+      if (!blockerReleased) {
+        await blocker.unsafe("SELECT pg_advisory_unlock(431517)").catch(() => undefined);
+        blocker.release();
+      }
       if (!engine.state.draining) await engine.stop();
     }
   });
