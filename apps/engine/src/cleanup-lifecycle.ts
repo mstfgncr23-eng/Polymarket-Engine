@@ -182,7 +182,7 @@ export async function resolveCleanupLifecycle(
       state = "CONFLICTING";
     } else if (hinted) {
       chosen = hinted;
-      if (state !== "CONFLICTING" && state !== "UNKNOWN") state = stateFor(hinted);
+      if (state !== "CONFLICTING") state = stateFor(hinted);
     } else if (chosen && chosen.id !== hintId) {
       hintMismatch = true;
       state = "CONFLICTING";

@@ -274,12 +274,19 @@ describe("processTrigger and journal in-flight gauges return to zero", () => {
       return original(event);
     };
     const writer = new BoundedJournalWriter(journal, () => undefined, { error: () => undefined }, undefined, metrics);
-    await writer.persist(createJournalEvent({
+    await expect(writer.persist(createJournalEvent({
       traceId: createId("trace"), type: "TRIGGER_EVENT", aggregateType: "trigger", aggregateId: "t1",
+      payload: { ok: true },
+    }))).rejects.toThrow(/REPORT_INPUT_MUST_USE_TRACKED_ADMISSION/);
+    expect(appends).toBe(0);
+    expect(await metricValue(metrics, "journal_direct_in_flight")).toBe(0);
+
+    await writer.persist(createJournalEvent({
+      traceId: createId("trace"), type: "WRITER_PROBE", aggregateType: "probe", aggregateId: "t1",
       payload: { ok: true },
     }));
     expect(await metricValue(metrics, "journal_direct_in_flight")).toBe(0);
-    expect(await metricValue(metrics, "journal_direct_writes_total", { class: "trigger" })).toBe(1);
+    expect(await metricValue(metrics, "journal_direct_writes_total", { class: "system" })).toBe(1);
     expect(appends).toBe(1);
 
     journal.append = async () => {
@@ -288,12 +295,12 @@ describe("processTrigger and journal in-flight gauges return to zero", () => {
     };
     const before = appends;
     await writer.persist(createJournalEvent({
-      traceId: createId("trace"), type: "TRIGGER_EVENT", aggregateType: "trigger", aggregateId: "t2",
+      traceId: createId("trace"), type: "WRITER_PROBE", aggregateType: "probe", aggregateId: "t2",
       payload: { ok: false },
     }));
     expect(appends).toBe(before + 1);
     expect(await metricValue(metrics, "journal_direct_in_flight")).toBe(0);
-    expect(await metricValue(metrics, "journal_direct_failures_total", { class: "trigger" })).toBe(1);
+    expect(await metricValue(metrics, "journal_direct_failures_total", { class: "system" })).toBe(1);
   });
 });
 

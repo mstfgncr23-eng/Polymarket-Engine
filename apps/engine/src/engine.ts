@@ -2600,21 +2600,29 @@ export class EngineService {
   private async restoreReportSourceIntegrity(): Promise<void> {
     const experimentId = this.experiment?.id;
     if (!experimentId) return;
-    const { ids: repaired, overflow: repairOverflow } = await loadIntegrityRepairIds(this.journal, experimentId);
-    if (repairOverflow) {
-      this.reportSourceIntegrity.set(`${experimentId}:integrity-scan-overflow`, {
-        experimentId, eventType: "OVERFLOW", eventId: "integrity-scan-overflow",
-        reason: "INTEGRITY_SCAN_OVERFLOW", at: this.nowFn().toISOString(),
-      });
-      return;
-    }
-    for (const [key, fault] of [...this.reportSourceIntegrity.entries()]) {
-      if (fault.experimentId === experimentId && repaired.has(fault.eventId)) {
-        this.reportSourceIntegrity.delete(key);
+    if (this.experiment?.status === "IDLE" || this.experiment?.status === "MONITOR_ONLY") return;
+    try {
+      const { ids: repaired, overflow: repairOverflow } = await loadIntegrityRepairIds(this.journal, experimentId);
+      if (repairOverflow) {
+        this.reportSourceIntegrity.set(`${experimentId}:integrity-scan-overflow`, {
+          experimentId, eventType: "OVERFLOW", eventId: "integrity-scan-overflow",
+          reason: "INTEGRITY_SCAN_OVERFLOW", at: this.nowFn().toISOString(),
+        });
+        return;
       }
-    }
-    for (const fault of await loadUnresolvedReportSourceIntegrity(this.journal, experimentId)) {
-      this.reportSourceIntegrity.set(`${fault.experimentId}:${fault.eventId}`, fault);
+      for (const [key, fault] of [...this.reportSourceIntegrity.entries()]) {
+        if (fault.experimentId === experimentId && repaired.has(fault.eventId)) {
+          this.reportSourceIntegrity.delete(key);
+        }
+      }
+      for (const fault of await loadUnresolvedReportSourceIntegrity(this.journal, experimentId)) {
+        this.reportSourceIntegrity.set(`${fault.experimentId}:${fault.eventId}`, fault);
+      }
+    } catch {
+      this.reportSourceIntegrity.set(`${experimentId}:integrity-restore-failed`, {
+        experimentId, eventType: "OVERFLOW", eventId: "integrity-restore-failed",
+        reason: "INTEGRITY_RESTORE_FAILED", at: this.nowFn().toISOString(),
+      });
     }
   }
 

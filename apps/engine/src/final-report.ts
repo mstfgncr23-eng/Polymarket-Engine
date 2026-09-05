@@ -98,7 +98,11 @@ export async function persistCanonicalFinalReport(
     return null;
   }
   if (!(await loadSourceSeal(journal, input.summary.experimentId))) return null;
-  if ((await loadUnresolvedReportSourceIntegrity(journal, input.summary.experimentId)).length > 0) return null;
+  try {
+    if ((await loadUnresolvedReportSourceIntegrity(journal, input.summary.experimentId)).length > 0) return null;
+  } catch {
+    return null;
+  }
   return journal.persistExperimentReport(toDurableReportInput(input));
 }
 

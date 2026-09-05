@@ -50,7 +50,15 @@ export async function generateOperatorReport(
   streamed.summary.complete = Boolean(authoritative.provenCompleted && streamed.scan.complete && streamed.scan.fence.stable && !streamed.scan.interrupted);
   streamed.summary.truncated = streamed.scan.truncated || streamed.scan.interrupted || !streamed.scan.fence.stable || !authoritative.provenCompleted;
   const sealed = Boolean(await loadSourceSeal(journal, authoritative.id));
-  const integrityFaults = await loadUnresolvedReportSourceIntegrity(journal, authoritative.id);
+  let integrityFaults: Awaited<ReturnType<typeof loadUnresolvedReportSourceIntegrity>> = [];
+  try {
+    integrityFaults = await loadUnresolvedReportSourceIntegrity(journal, authoritative.id);
+  } catch {
+    integrityFaults = [{
+      experimentId: authoritative.id, eventType: "OVERFLOW", eventId: "integrity-scan-failed",
+      reason: "INTEGRITY_RESTORE_FAILED", at: new Date().toISOString(),
+    }];
+  }
   if (integrityFaults.length > 0) {
     streamed.summary.complete = false;
   }
