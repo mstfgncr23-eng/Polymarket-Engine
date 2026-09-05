@@ -206,10 +206,10 @@ function journalCrossCheck(durable: ExperimentRow[], journal: ExperimentRow[] | 
   if (!journal) return "none";
   if (durable.length === 0 && journal.length > 0) return "legacy_only";
   if (!chosen) return "none";
-  const journalRow = journal.find((row) => row.id === chosen.id);
-  if (!journalRow) return "missing_audit";
   const journalActive = journal.filter((row) => !row.completedAt && row.startedAt && row.id !== chosen.id);
   if (journalActive.length > 0) return "conflict";
+  const journalRow = journal.find((row) => row.id === chosen.id);
+  if (!journalRow) return "missing_audit";
   return "match";
 }
 

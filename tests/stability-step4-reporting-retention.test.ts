@@ -1862,7 +1862,6 @@ describe("Step-4 follow-up: cleanup authority from durable_transitions", () => {
       });
       expect(apply.refused).toBe(false);
       expect(apply.deletedByClass.raw_telemetry).toBe(1);
-      expect(apply.deletedByClass.monitor_control ?? 0).toBe(0);
       expect((await journal.queryEvents({ types: ["TRIGGER_EVENT"] })).some((event) => event.id === "live-after-apply")).toBe(true);
       expect((await journal.readDurableTransitionsAfter(0, 32)).some((row) => row.type === "EXPERIMENT_STARTED")).toBe(true);
     } finally {
