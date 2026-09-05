@@ -77,9 +77,9 @@ export function isJournalAppendAbortedError(error: unknown): boolean {
 }
 
 export function isJournalAppendDeadlineError(error: unknown): boolean {
-  if (!isJournalAppendAbortedError(error)) return false;
+  if (!isJournalAppendAbortedError(error) || !error || typeof error !== "object") return false;
   if (error instanceof JournalAppendAbortedError) return error.reason === "deadline";
-  const reason = "reason" in error ? String(error.reason) : "";
+  const reason = "reason" in error ? String((error as { reason?: unknown }).reason) : "";
   const message = error instanceof Error ? error.message : "";
   return reason === "deadline" || message === "JOURNAL_APPEND_DEADLINE";
 }

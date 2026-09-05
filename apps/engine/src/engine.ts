@@ -2939,7 +2939,7 @@ export class EngineService {
     return Boolean(await loadSourceSeal(this.journal, experiment.id));
   }
 
-  private async writeFinalReport(retried = false): Promise<void> {
+  private async writeFinalReport(): Promise<void> {
     if (!this.experiment || this.reportGenerated) return;
     const experiment = this.experiment;
     try {
@@ -3028,9 +3028,6 @@ export class EngineService {
     } catch (error) {
       this.reportGenerated = false;
       this.logger.error({ err: error }, "final experiment report generation failed");
-    }
-    if (!retried && !this.reportGenerated && this.experiment?.status === "COMPLETED") {
-      await this.writeFinalReport(true);
     }
   }
 
