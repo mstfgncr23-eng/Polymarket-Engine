@@ -98,9 +98,9 @@ export async function scanJournalEvents(
       if (after) pageQuery.after = after;
       if (fence.through) pageQuery.through = fence.through;
       const page = await journal.queryEventsKeyset(pageQuery);
+      if (page.length === 0) break;
       pages += 1;
       maxPageRetained = Math.max(maxPageRetained, page.length);
-      if (page.length === 0) break;
       scanned += page.length;
       if (options.onPage) await options.onPage(page, pages - 1);
       const last = page[page.length - 1]!;

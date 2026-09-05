@@ -278,7 +278,7 @@ export class EngineService {
       batchSize: env.RETENTION_BATCH_SIZE,
       cycleBudgetMs: env.RETENTION_CYCLE_BUDGET_MS,
     }), {
-      noteDeleted: (cls, n) => { if (n > 0) this.metrics.retentionDeleted.inc({ class: cls }, n); },
+      noteDeleted: (cls, n) => { if (n > 0) this.metrics.retentionDeleted.inc({ retention_class: cls }, n); },
       noteFailure: () => this.metrics.retentionFailures.inc(),
       noteRun: () => this.metrics.retentionRuns.inc(),
       noteLastSuccess: (iso) => this.metrics.retentionLastSuccessUnix.set(Date.parse(iso) / 1000),
@@ -1583,7 +1583,7 @@ export class EngineService {
       this.metrics.grokSignals.inc({ agent: submission.agentId, status: "identity_mismatch" });
       return { status: "identity_mismatch" };
     }
-    const now = new Date();
+    const now = this.nowFn();
     const trigger = this.activeTriggers.get(submission.triggerId);
     if (!trigger) { this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "unknown_trigger" }); return { status: "unknown_trigger" }; }
     if (trigger.traceId !== submission.traceId) { this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "trace_mismatch" }); return { status: "trace_mismatch" }; }

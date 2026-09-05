@@ -19,6 +19,7 @@ export const REQUIRED_INDEXES = [
   "durable_transitions_sequence_idx",
   "experiment_reports_pkey",
   "experiment_reports_hash_idx",
+  "experiment_reports_complete_idx",
 ] as const;
 
 export const REQUIRED_RLS_TABLES = [

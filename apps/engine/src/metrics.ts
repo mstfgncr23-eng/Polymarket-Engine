@@ -346,7 +346,7 @@ export class EngineMetrics {
   readonly retentionDeleted = new Counter({
     name: "retention_deleted_total",
     help: "Journal/idempotency/checkpoint rows deleted by the bounded retention manager",
-    labelNames: ["class"],
+    labelNames: ["retention_class"],
     registers: [this.registry],
   });
   readonly retentionFailures = new Counter({
@@ -626,7 +626,7 @@ export class EngineMetrics {
     this.discoverySingleflightDirty.set(0);
     this.maintenanceSingleflightDirty.set(0);
     for (const cls of ["raw_telemetry", "monitor_control", "mcp_idempotency", "checkpoint"] as const) {
-      this.retentionDeleted.inc({ class: cls }, 0);
+      this.retentionDeleted.inc({ retention_class: cls }, 0);
     }
     this.retentionLastSuccessUnix.set(0);
     this.reportAccumulatorHighWaterBytes.set(0);

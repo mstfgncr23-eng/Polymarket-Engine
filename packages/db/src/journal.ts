@@ -71,6 +71,7 @@ export interface EventJournal {
 
 export class MemoryEventJournal implements EventJournal {
   private readonly events: JournalEvent[] = [];
+  private readonly eventIds = new Set<string>();
   private readonly checkpoints: EngineCheckpoint[] = [];
   private readonly idempotencyKeys = new Map<string, string>();
   private readonly reports = new Map<string, DurableExperimentReport>();
@@ -87,7 +88,8 @@ export class MemoryEventJournal implements EventJournal {
     if (!this.available) throw new Error("DATABASE_UNAVAILABLE");
     const parsed = journalEventSchema.parse(event);
     if (this.failAppendTypes.has(parsed.type)) throw new Error("JOURNAL_APPEND_FAILED");
-    if (this.events.some((item) => item.id === parsed.id)) return;
+    if (this.eventIds.has(parsed.id)) return;
+    this.eventIds.add(parsed.id);
     this.events.push(structuredClone(parsed));
   }
   async appendMany(events: readonly JournalEvent[]): Promise<void> {
@@ -187,7 +189,11 @@ export class MemoryEventJournal implements EventJournal {
       .slice(0, Math.max(1, input.limit));
     const ids = new Set(victims.map((event) => event.id));
     for (let index = this.events.length - 1; index >= 0; index -= 1) {
-      if (ids.has(this.events[index]!.id)) this.events.splice(index, 1);
+      const id = this.events[index]!.id;
+      if (ids.has(id)) {
+        this.eventIds.delete(id);
+        this.events.splice(index, 1);
+      }
     }
     return { deleted: victims.length };
   }

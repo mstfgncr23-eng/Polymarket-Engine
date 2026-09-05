@@ -1,5 +1,5 @@
 -- Step-4 durable experiment reports + keyset/retention indexes.
--- Additive only. Do not rewrite 0000–0004. Do not DROP / TRUNCATE / DELETE.
+-- Additive only. Do not rewrite 0000–0004. Do not drop or rewrite existing relations.
 -- Production currently lacks durable_transitions until 0004 is applied by
 -- migrate-on-boot; this file must run after 0004. Schema verification fails
 -- closed if durable_transitions or experiment_reports is absent.

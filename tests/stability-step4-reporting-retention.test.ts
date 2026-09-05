@@ -98,10 +98,10 @@ describe("Step-4 streaming summary equivalence", () => {
 });
 
 describe("Step-4 keyset scanner bounds", () => {
-  it("100k+ scan retains a page + bounded accumulator, not an event-count array", async () => {
+  it("100k+ scan retains a page + bounded accumulator, not an event-count array", { timeout: 60_000 }, async () => {
     const journal = new MemoryEventJournal();
     const start = Date.parse("2026-01-01T00:00:00.000Z");
-    const n = 12_000;
+    const n = 100_000;
     const batch = [];
     for (let i = 0; i < n; i += 1) {
       batch.push(ev("RISK_EVALUATION", new Date(start + i * 1000).toISOString(), { accepted: i % 2 === 0, marketId: "m", i }, `risk-${i}`));
@@ -225,7 +225,7 @@ describe("Step-4 MCP / API heavy-read closure", () => {
   it("GET /api/traces enforces a hard per-request page cap", async () => {
     const journal = new MemoryEventJournal();
     const traceId = "trace-cap";
-    for (let i = 0; i < 50; i += 1) {
+    for (let i = 0; i < TRACE_PAGE_MAX + 50; i += 1) {
       await journal.append(createJournalEvent({
         id: `e-${String(i).padStart(3, "0")}`, traceId, type: "TRIGGER_EVENT", aggregateType: "t", aggregateId: "t",
         payload: { i }, occurredAt: new Date(Date.parse("2026-09-01T00:00:00.000Z") + i),
@@ -391,7 +391,8 @@ describe("Step-4 MCP idempotency TTL cannot resurrect stale", () => {
       });
       expect(await engine.submitGrokSignal(submission, "fair_probability_analyst")).toMatchObject({ status: "accepted" });
       nowMs += 120_000;
-      await journal.pruneIdempotencyKeys(new Date(nowMs), 10);
+      // Memory claim timestamps use wall-clock created_at; prune by that column, not the injected engine clock.
+      await journal.pruneIdempotencyKeys(new Date(Date.now() + 60_000), 10);
       expect(await journal.idempotencyCreatedAt("grok_signal_submission", "fair_probability_analyst:sub-1")).toBeNull();
       expect(await engine.submitGrokSignal(submission, "fair_probability_analyst")).toMatchObject({ status: expect.stringMatching(/stale|unknown_trigger|replay_rejected/) });
     } finally {
@@ -469,7 +470,7 @@ describe("Step-4 schema verification fails closed", () => {
         "journal_trace_idx", "journal_aggregate_idx", "journal_type_time_idx", "journal_experiment_idx",
         "journal_occurred_id_idx", "journal_type_occurred_id_idx", "checkpoint_sequence_idx",
         "mcp_idempotency_scope_key_idx", "durable_transitions_operation_key_uidx", "durable_transitions_sequence_idx",
-        "experiment_reports_pkey", "experiment_reports_hash_idx",
+        "experiment_reports_pkey", "experiment_reports_hash_idx", "experiment_reports_complete_idx",
       ],
       rlsEnabled: ["journal_events", "engine_checkpoints", "mcp_idempotency_keys", "durable_transitions", "experiment_reports"],
       rlsForced: [],
