@@ -63,6 +63,47 @@ export class JournalAppendAbortedError extends Error {
   }
 }
 
+/** Duck-typed so bundled/src copies of this class still classify abort/deadline. */
+export function isJournalAppendAbortedError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  if (error instanceof JournalAppendAbortedError) return true;
+  const name = "name" in error ? String(error.name) : "";
+  const code = "code" in error ? String(error.code) : "";
+  const message = error instanceof Error ? error.message : "";
+  return name === "JournalAppendAbortedError"
+    || code === "JOURNAL_APPEND_ABORTED"
+    || message === "JOURNAL_APPEND_DEADLINE"
+    || message === "JOURNAL_APPEND_ABORTED";
+}
+
+export function isJournalAppendDeadlineError(error: unknown): boolean {
+  if (!isJournalAppendAbortedError(error)) return false;
+  if (error instanceof JournalAppendAbortedError) return error.reason === "deadline";
+  const reason = "reason" in error ? String(error.reason) : "";
+  const message = error instanceof Error ? error.message : "";
+  return reason === "deadline" || message === "JOURNAL_APPEND_DEADLINE";
+}
+
+/** Backend terminate / pool poison after transaction_timeout. Safe to retry once. */
+export function isTransientJournalError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  if (isJournalAppendAbortedError(error)) return false;
+  const code = "code" in error ? String(error.code) : "";
+  const message = error instanceof Error ? error.message : String(error);
+  return code === "CONNECTION_CLOSED"
+    || code === "CONNECTION_DESTROYED"
+    || code === "ECONNRESET"
+    || code === "57P01"
+    || code === "57P02"
+    || code === "57P03"
+    || code === "25P04"
+    || code === "08006"
+    || code === "08003"
+    || /connection (closed|terminated|ended|destroyed)/i.test(message)
+    || /terminating connection/i.test(message)
+    || /Cannot read properties of null/.test(message);
+}
+
 /** Memory's holds precede mutation, so cancellation proves that no commit can follow. */
 async function waitForAppendHold(hold: Promise<void>, options: JournalAppendOptions): Promise<void> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -532,7 +573,13 @@ export class PostgresEventJournal implements EventJournal {
 
   constructor(databaseUrl: string, private readonly migrationsFolder: string, options: { access?: JournalAccessMode } = {}) {
     this.access = options.access ?? "boot-migrate";
-    this.client = postgres(databaseUrl, { max: 10, idle_timeout: 20, connect_timeout: 10 });
+    this.client = postgres(databaseUrl, {
+      max: 10,
+      idle_timeout: 20,
+      connect_timeout: 10,
+      onclose: () => undefined,
+      onnotice: () => undefined,
+    });
     this.db = drizzle(this.client);
   }
 
@@ -745,7 +792,7 @@ export class PostgresEventJournal implements EventJournal {
       renderedMarkdown: input.renderedMarkdown,
       contentHash: hash,
     };
-    return persistReportConflictSafe({ ...input, contentHash: hash }, {
+    const persistOnce = () => persistReportConflictSafe({ ...input, contentHash: hash }, {
       insert: async (stored) => {
         const inserted = await this.db.insert(experimentReports).values({
           ...values,
@@ -763,6 +810,12 @@ export class PostgresEventJournal implements EventJournal {
         return rows[0] ? toExperimentReport(rows[0]) : null;
       },
     });
+    try {
+      return await persistOnce();
+    } catch (error) {
+      if (!isTransientJournalError(error)) throw error;
+      return persistOnce();
+    }
   }
   async loadExperimentReport(experimentId: string, reportKind: "final" = "final"): Promise<DurableExperimentReport | null> {
     const rows = await this.db.select().from(experimentReports)
@@ -965,37 +1018,45 @@ export class PostgresEventJournal implements EventJournal {
     return 0;
   }
   async withReadSnapshot<T>(work: (journal: EventJournalKeyset) => Promise<T>): Promise<{ value: T; stable: boolean }> {
-    let value!: T;
-    await this.client.begin(async (sql) => {
-      await sql`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ`;
-      const snap: EventJournalKeyset = {
-        queryEventsKeyset: async (query) => {
-          const built = buildJournalKeysetSql(query);
-          const rows = await sql.unsafe(built.text, built.values as never[]) as Array<Record<string, unknown>>;
-          return rows.map((row) => toJournalEvent({
-            id: String(row.id),
-            traceId: String(row.trace_id),
-            correlationId: String(row.correlation_id),
-            type: String(row.type),
-            aggregateType: String(row.aggregate_type),
-            aggregateId: String(row.aggregate_id),
-            payload: row.payload as Record<string, unknown>,
-            occurredAt: new Date(String(row.occurred_at)),
-            recordedAt: new Date(String(row.recorded_at)),
-            sourceEventId: row.source_event_id == null ? null : String(row.source_event_id),
-          } as typeof journalEvents.$inferSelect));
-        },
-        peekLatestKeyset: async (query) => {
-          const built = buildJournalKeysetSql({ ...query, limit: 1, orderDesc: true });
-          const rows = await sql.unsafe(built.text, built.values as never[]) as Array<{ occurred_at: Date | string; id: string }>;
-          const row = rows[0];
-          return row ? { occurredAt: new Date(row.occurred_at).toISOString(), id: row.id } : null;
-        },
-        latestCommitSeq: async () => 0,
-      };
-      value = await work(snap);
-    });
-    return { value, stable: true };
+    const readOnce = async (): Promise<{ value: T; stable: boolean }> => {
+      let value!: T;
+      await this.client.begin(async (sql) => {
+        await sql`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ`;
+        const snap: EventJournalKeyset = {
+          queryEventsKeyset: async (query) => {
+            const built = buildJournalKeysetSql(query);
+            const rows = await sql.unsafe(built.text, built.values as never[]) as Array<Record<string, unknown>>;
+            return rows.map((row) => toJournalEvent({
+              id: String(row.id),
+              traceId: String(row.trace_id),
+              correlationId: String(row.correlation_id),
+              type: String(row.type),
+              aggregateType: String(row.aggregate_type),
+              aggregateId: String(row.aggregate_id),
+              payload: row.payload as Record<string, unknown>,
+              occurredAt: new Date(String(row.occurred_at)),
+              recordedAt: new Date(String(row.recorded_at)),
+              sourceEventId: row.source_event_id == null ? null : String(row.source_event_id),
+            } as typeof journalEvents.$inferSelect));
+          },
+          peekLatestKeyset: async (query) => {
+            const built = buildJournalKeysetSql({ ...query, limit: 1, orderDesc: true });
+            const rows = await sql.unsafe(built.text, built.values as never[]) as Array<{ occurred_at: Date | string; id: string }>;
+            const row = rows[0];
+            return row ? { occurredAt: new Date(row.occurred_at).toISOString(), id: row.id } : null;
+          },
+          latestCommitSeq: async () => 0,
+        };
+        value = await work(snap);
+      });
+      return { value, stable: true };
+    };
+    try {
+      return await readOnce();
+    } catch (error) {
+      if (!isTransientJournalError(error)) throw error;
+      return readOnce();
+    }
   }
   private async ensureKeysetIndexesIfSafe(): Promise<void> {
     const missing: string[] = [];

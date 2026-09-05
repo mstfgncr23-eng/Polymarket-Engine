@@ -70,6 +70,8 @@ import {
   IdempotencyConflictError,
   isCanonicalFinalReport,
   JournalAppendAbortedError,
+  isJournalAppendAbortedError,
+  isJournalAppendDeadlineError,
   type DurableCommitResult,
   type DurableTransition,
   type EventJournal,
@@ -145,6 +147,11 @@ import {
   type AdmitResult,
   type JoinResult,
 } from "./runtime-supervisor.js";
+
+function isJournalAdmissionRejectedError(error: unknown): boolean {
+  return error instanceof JournalAdmissionRejected
+    || (Boolean(error) && typeof error === "object" && (error as { name?: string }).name === "JournalAdmissionRejected");
+}
 
 export class EngineService {
   readonly metrics = new EngineMetrics();
@@ -2174,7 +2181,7 @@ export class EngineService {
       }, signal, { reportInput });
       if (!critical) this.state.journalDegraded = false;
     } catch (error) {
-      if (error instanceof JournalAppendAbortedError) throw error;
+      if (isJournalAppendAbortedError(error)) throw error;
       if (shouldLatchReportSourceIntegrity(event, this.experiment)) {
         const durableFault = await this.noteReportSourceIntegrityFault(event, error);
         if (!durableFault) {
@@ -2819,8 +2826,9 @@ export class EngineService {
     let timeoutId: ReturnType<typeof setTimeout> | undefined;
     const outcome = await Promise.race([
       persist.then((ok) => ({ kind: "done" as const, ok }), (error) =>
-        error instanceof JournalAppendAbortedError && error.reason === "deadline"
-          ? { kind: "deadline" as const } : { kind: "failed" as const }),
+        isJournalAppendDeadlineError(error)
+          ? { kind: "deadline" as const }
+          : { kind: "failed" as const, error }),
       new Promise<{ kind: "timeout" }>((resolve) => {
         timeoutId = setTimeout(() => {
           this.sourceSealAbort?.abort();
@@ -2830,6 +2838,19 @@ export class EngineService {
       }),
     ]);
     if (timeoutId) clearTimeout(timeoutId);
+    const sealedIfPresent = async (): Promise<{ sealed: true; reason: null } | null> => {
+      const already = await loadSourceSeal(this.journal, experiment.id);
+      if (!already) return null;
+      this.sourceSealed = true;
+      this.sourceSealing = false;
+      return { sealed: true, reason: null };
+    };
+    const abortedWithoutCommit = (error: unknown) => (
+      isJournalAppendAbortedError(error)
+      || isJournalAdmissionRejectedError(error)
+      || this.sourceSealPersistCancelled
+      || remaining() <= 0
+    );
     if (outcome.kind === "timeout") {
       this.sourceSealAbort?.abort();
       this.abortSourceSealPersist();
@@ -2839,22 +2860,29 @@ export class EngineService {
         // confirmed abort, even when the wall-clock budget has already elapsed.
         try { await persist; }
         catch (error) {
-          if (!(error instanceof JournalAppendAbortedError && error.reason === "deadline")) {
-            return { sealed: false, reason: "SOURCE_SEAL_PERSIST_FAILED" };
-          }
+          const committed = await sealedIfPresent();
+          if (committed) return committed;
+          if (abortedWithoutCommit(error)) return { sealed: false, reason: "SOURCE_SEAL_TIMEOUT" };
+          return { sealed: false, reason: "SOURCE_SEAL_PERSIST_FAILED" };
         }
       }
-      const already = await loadSourceSeal(this.journal, experiment.id);
-      if (already) {
-        this.sourceSealed = true;
-        this.sourceSealing = false;
-        return { sealed: true, reason: null };
-      }
-      return { sealed: false, reason: "SOURCE_SEAL_TIMEOUT" };
+      return (await sealedIfPresent()) ?? { sealed: false, reason: "SOURCE_SEAL_TIMEOUT" };
     }
-    if (outcome.kind === "failed") return { sealed: false, reason: "SOURCE_SEAL_PERSIST_FAILED" };
-    if (outcome.kind === "deadline") return { sealed: false, reason: "SOURCE_SEAL_TIMEOUT" };
-    if (!outcome.ok) return { sealed: false, reason: remaining() <= 0 ? "SOURCE_SEAL_TIMEOUT" : "SOURCE_SEAL_PERSIST_FAILED" };
+    if (outcome.kind === "deadline") {
+      return (await sealedIfPresent()) ?? { sealed: false, reason: "SOURCE_SEAL_TIMEOUT" };
+    }
+    if (outcome.kind === "failed") {
+      const committed = await sealedIfPresent();
+      if (committed) return committed;
+      if (abortedWithoutCommit(outcome.error)) return { sealed: false, reason: "SOURCE_SEAL_TIMEOUT" };
+      return { sealed: false, reason: "SOURCE_SEAL_PERSIST_FAILED" };
+    }
+    if (!outcome.ok) {
+      return (await sealedIfPresent()) ?? {
+        sealed: false,
+        reason: remaining() <= 0 || this.sourceSealPersistCancelled ? "SOURCE_SEAL_TIMEOUT" : "SOURCE_SEAL_PERSIST_FAILED",
+      };
+    }
     const persisted = await loadSourceSeal(this.journal, experiment.id);
     if (!persisted) return { sealed: false, reason: "SOURCE_SEAL_PERSIST_FAILED" };
     this.sourceSealed = true;
@@ -2901,8 +2929,8 @@ export class EngineService {
         await this.journal.append(event, { signal, deadlineAt: this.sourceSealDeadlineAt });
       }, signal, { reportInput: false });
     } catch (error) {
-      if (error instanceof JournalAppendAbortedError && error.reason === "deadline") throw error;
-      if (error instanceof JournalAppendAbortedError || (error instanceof JournalAdmissionRejected)) return false;
+      if (isJournalAppendDeadlineError(error)) throw error;
+      if (isJournalAppendAbortedError(error) || isJournalAdmissionRejectedError(error)) return false;
       throw error;
     } finally {
       this.sourceSealPersistInFlight = false;
@@ -2911,7 +2939,7 @@ export class EngineService {
     return Boolean(await loadSourceSeal(this.journal, experiment.id));
   }
 
-  private async writeFinalReport(): Promise<void> {
+  private async writeFinalReport(retried = false): Promise<void> {
     if (!this.experiment || this.reportGenerated) return;
     const experiment = this.experiment;
     try {
@@ -3000,6 +3028,9 @@ export class EngineService {
     } catch (error) {
       this.reportGenerated = false;
       this.logger.error({ err: error }, "final experiment report generation failed");
+    }
+    if (!retried && !this.reportGenerated && this.experiment?.status === "COMPLETED") {
+      await this.writeFinalReport(true);
     }
   }
 

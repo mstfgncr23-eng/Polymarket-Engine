@@ -2,7 +2,7 @@ import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import type { JournalEvent } from "@pm/core";
-import { MemoryEventJournal, PostgresEventJournal, isCanonicalFinalReport, type JournalAppendOptions, type EventJournal } from "@pm/db";
+import { MemoryEventJournal, PostgresEventJournal, isCanonicalFinalReport, isJournalAppendAbortedError, isJournalAppendDeadlineError, isTransientJournalError, JournalAppendAbortedError, type JournalAppendOptions, type EventJournal } from "@pm/db";
 import { EngineService } from "../apps/engine/src/engine.js";
 import { streamExperimentSummary } from "../apps/engine/src/final-report.js";
 import { loadSourceSeal } from "../apps/engine/src/source-seal.js";
@@ -104,7 +104,63 @@ function paperEngine(journal: EventJournal) {
   });
 }
 
+const ADVISORY_COMMIT_WAITER_SQL = `SELECT EXISTS (
+  SELECT 1 FROM pg_stat_activity
+  WHERE wait_event_type = 'Lock'
+    AND wait_event = 'advisory'
+    AND lower(btrim(query)) IN ('commit', 'commit;')
+) AS waiting`;
+
+async function waitForAdvisoryCommitWaiter(
+  client: { unsafe: (sql: string) => Promise<Array<{ waiting: boolean }>> },
+  timeoutMs: number,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const rows = await client.unsafe(ADVISORY_COMMIT_WAITER_SQL);
+    if (rows[0]?.waiting) return true;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  return false;
+}
+
+async function waitUntilNoAdvisoryCommitWaiter(
+  client: { unsafe: (sql: string) => Promise<Array<{ waiting: boolean }>> },
+  timeoutMs: number,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const rows = await client.unsafe(ADVISORY_COMMIT_WAITER_SQL);
+    if (!rows[0]?.waiting) return true;
+    await new Promise((resolve) => setTimeout(resolve, 15));
+  }
+  return false;
+}
+
+async function dropSealCommitHold(client: { unsafe: (sql: string) => Promise<unknown> }): Promise<void> {
+  await client.unsafe("DROP TRIGGER IF EXISTS step4_hold_seal_commit ON journal_events").catch(() => undefined);
+  await client.unsafe("DROP FUNCTION IF EXISTS step4_hold_seal_commit()").catch(() => undefined);
+}
+
+async function evictDeadPoolConnections(client: { unsafe: (sql: string) => Promise<unknown> }): Promise<void> {
+  for (let i = 0; i < 4; i += 1) {
+    await client.unsafe("SELECT 1").catch(() => undefined);
+  }
+}
+
 describe("Step-4 Postgres transaction/commit outcome", () => {
+  it("classifies abort/deadline and transient journal errors without relying on instanceof identity", () => {
+    expect(isJournalAppendAbortedError(new JournalAppendAbortedError("deadline"))).toBe(true);
+    expect(isJournalAppendDeadlineError(new JournalAppendAbortedError("deadline"))).toBe(true);
+    expect(isJournalAppendDeadlineError(new JournalAppendAbortedError("aborted"))).toBe(false);
+    expect(isJournalAppendDeadlineError(Object.assign(new Error("JOURNAL_APPEND_DEADLINE"), { name: "JournalAppendAbortedError", code: "JOURNAL_APPEND_ABORTED", reason: "deadline" }))).toBe(true);
+    expect(isJournalAppendAbortedError(Object.assign(new Error("JOURNAL_APPEND_DEADLINE"), { name: "JournalAppendAbortedError", code: "JOURNAL_APPEND_ABORTED" }))).toBe(true);
+    expect(isJournalAppendAbortedError(new Error("JOURNAL_APPEND_FAILED"))).toBe(false);
+    expect(isTransientJournalError(Object.assign(new Error("terminating connection due to transaction timeout"), { code: "25P04" }))).toBe(true);
+    expect(isTransientJournalError(Object.assign(new Error("Cannot read properties of null (reading 'write')"), { code: "CONNECTION_CLOSED" }))).toBe(true);
+    expect(isTransientJournalError(new JournalAppendAbortedError("deadline"))).toBe(false);
+  });
+
   it.skipIf(!process.env.STEP4_TEST_DATABASE_URL)("real PG17: held transaction after INSERT aborts before timeout result, then retry/restart produce one canonical seal/report", { timeout: 30_000 }, async () => {
     const url = process.env.STEP4_TEST_DATABASE_URL!;
     const target = new URL(url);
@@ -154,19 +210,16 @@ describe("Step-4 Postgres transaction/commit outcome", () => {
       const attempt = engine.ensureSourceSealForTest();
       await inserted.promise;
       expect(await loadSourceSeal(pg, experimentId)).toBeNull();
-      const lockWaitDeadline = Date.now() + 400;
-      let commitWaiting = false;
-      while (!commitWaiting && Date.now() < lockWaitDeadline) {
-        const rows = await client.unsafe("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE wait_event = 'advisory' AND lower(query) = 'commit') AS waiting");
-        commitWaiting = rows[0].waiting;
-        if (!commitWaiting) await new Promise((resolve) => setTimeout(resolve, 5));
-      }
-      expect(commitWaiting).toBe(true);
+      expect(await waitForAdvisoryCommitWaiter(client, 400)).toBe(true);
       expect(await attempt).toEqual({ sealed: false, reason: "SOURCE_SEAL_TIMEOUT" });
-      await blocker.unsafe("SELECT pg_advisory_unlock(431517)");
+      // transaction_timeout must abort the waiter before unlock, or a late COMMIT can appear.
+      expect(await waitUntilNoAdvisoryCommitWaiter(client, 3_000)).toBe(true);
+      await dropSealCommitHold(client);
+      db.transaction = transaction;
+      await blocker.unsafe("SELECT pg_advisory_unlock(431517)").catch(() => undefined);
       blocker.release();
       blockerReleased = true;
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await evictDeadPoolConnections(client);
       expect(await loadSourceSeal(pg, experimentId)).toBeNull();
       engine.setSourceSealTimeoutForTest(5_000);
       expect(await engine.ensureSourceSealForTest()).toEqual({ sealed: true, reason: null });
@@ -189,14 +242,19 @@ describe("Step-4 Postgres transaction/commit outcome", () => {
         await restarted.writeFinalReportForTest();
         expect(await restartJournal.queryEvents({ types: ["EXPERIMENT_SOURCE_SEALED"], experimentId })).toHaveLength(1);
         expect((await restartJournal.loadExperimentReport(experimentId))?.contentHash).toBe(report!.contentHash);
-      } finally { await restarted.stop(); }
+      } finally {
+        await restarted.stop();
+        await restartJournal.close();
+      }
     } finally {
-      // The service is disposable; release the lock even when an assertion fails.
+      await dropSealCommitHold(client);
+      db.transaction = transaction;
       if (!blockerReleased) {
         await blocker.unsafe("SELECT pg_advisory_unlock(431517)").catch(() => undefined);
         blocker.release();
       }
       if (!engine.state.draining) await engine.stop();
+      await pg.close();
     }
   });
 

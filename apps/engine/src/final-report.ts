@@ -9,6 +9,7 @@ import {
   createJournalEvent,
   hashExperimentReport,
   isCanonicalFinalReport,
+  isTransientJournalError,
   reportGeneratedAuditId,
   scanJournalEvents,
   type DurableExperimentReport,
@@ -98,11 +99,18 @@ export async function persistCanonicalFinalReport(
     return null;
   }
   if (!(await loadSourceSeal(journal, input.summary.experimentId))) return null;
+  let unresolved: Awaited<ReturnType<typeof loadUnresolvedReportSourceIntegrity>>;
   try {
-    if ((await loadUnresolvedReportSourceIntegrity(journal, input.summary.experimentId)).length > 0) return null;
-  } catch {
-    return null;
+    unresolved = await loadUnresolvedReportSourceIntegrity(journal, input.summary.experimentId);
+  } catch (error) {
+    if (!isTransientJournalError(error)) return null;
+    try {
+      unresolved = await loadUnresolvedReportSourceIntegrity(journal, input.summary.experimentId);
+    } catch {
+      return null;
+    }
   }
+  if (unresolved.length > 0) return null;
   return journal.persistExperimentReport(toDurableReportInput(input));
 }
 
