@@ -2818,9 +2818,9 @@ export class EngineService {
     const persist = this.persistSourceSeal(experiment, generation, persistAttempt, this.sourceSealAbort.signal);
     let timeoutId: ReturnType<typeof setTimeout> | undefined;
     const outcome = await Promise.race([
-      persist.then((ok) => ({ kind: "done" as const, ok }), (error) => ({
-        kind: error instanceof JournalAppendAbortedError && error.reason === "deadline" ? "deadline" as const : "failed" as const,
-      })),
+      persist.then((ok) => ({ kind: "done" as const, ok }), (error) =>
+        error instanceof JournalAppendAbortedError && error.reason === "deadline"
+          ? { kind: "deadline" as const } : { kind: "failed" as const }),
       new Promise<{ kind: "timeout" }>((resolve) => {
         timeoutId = setTimeout(() => {
           this.sourceSealAbort?.abort();
