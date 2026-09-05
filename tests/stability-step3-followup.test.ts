@@ -414,13 +414,15 @@ describe("Blocker 10 — live ingress metrics and one-logical-overflow gap accou
   it("updates depth/bytes/high-water on enqueue/dequeue without a gap", () => {
     const seen: Array<{ depth: number; bytes: number; highWaterEvents: number; gapTotal: number }> = [];
     const queue = new BoundedIngressQueue(4, 10_000);
-    queue.setObserver((snapshot) => {
-      seen.push({
-        depth: snapshot.depth,
-        bytes: snapshot.bytes,
-        highWaterEvents: snapshot.highWaterEvents,
-        gapTotal: snapshot.gapTotal,
-      });
+    queue.setObserver({
+      onChange: (snapshot) => {
+        seen.push({
+          depth: snapshot.depth,
+          bytes: snapshot.bytes,
+          highWaterEvents: snapshot.highWaterEvents,
+          gapTotal: snapshot.gapTotal,
+        });
+      },
     });
     expect(queue.tryEnqueue("aa").ok).toBe(true);
     expect(queue.tryEnqueue("bbbb").ok).toBe(true);
@@ -474,7 +476,18 @@ describe("Blocker 10 — live ingress metrics and one-logical-overflow gap accou
   });
 
   it("reference_window_entries is the true total across assets", async () => {
-    const { engine } = await startQualifiedEngine();
+    const market = new ScriptedMarketAdapter();
+    market.queue(discoveryReport([
+      qualified("btc-mkt", "BTC", "btc-up", "btc-down"),
+      qualified("eth-mkt", "ETH", "eth-up", "eth-down"),
+    ]));
+    const journal = new MemoryEventJournal();
+    const engine = new EngineService(qualifiedPaperEnv(), journal, { error: () => undefined }, {
+      market: market as never,
+      referenceRegistry: new ScriptedReferenceRegistry() as never,
+      activation: new NoopGrokActivationBridge(),
+    });
+    await engine.start();
     engine.attachReferenceWindowForTest("BTC", 8);
     engine.attachReferenceWindowForTest("ETH", 8);
     const t0 = Date.parse("2026-08-31T12:00:00.000Z");
