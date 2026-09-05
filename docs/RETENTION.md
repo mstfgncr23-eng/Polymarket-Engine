@@ -48,11 +48,13 @@ A Postgres `REPEATABLE READ` snapshot is internally consistent; it does **not** 
 
 Seal procedure (bounded; does not stop market monitoring):
 
-1. Stop admitting new report-input work attributable to the completed experiment (`source_sealed`).
-2. Wait without cancelling for already-admitted supervisor work and report-input journal writes (telemetry is ignored).
-3. Append the durable seal event. Restart recovers a completed experiment without a seal by resuming sealing.
+1. Freeze experiment-scoped research ingress (`sourceSealGeneration++`) and stop admitting new report-input work attributable to the completed experiment (`source_sealed`).
+2. Drain without cancelling: supervisor work, in-flight `submitGrokSignal` / other experiment research ingress, then report-input journal writes (telemetry is ignored).
+3. Persist the durable seal event and verify it. The **entire** operation (freeze → drain → persist → verify) shares `SOURCE_SEAL_TIMEOUT_MS`. A persist timeout invalidates the in-flight append (generation + persist-attempt) before the deadline is reported; a later uncancelled write cannot become a successful seal. Retry is idempotent. Restart recovers a completed experiment without a seal by resuming sealing.
 
-Dry-run / APPLY retention uses the same `retentionConfigFromEnv` / `retentionConfigFromEngineEnv` path as `RetentionManager`. Dry-run output includes `effectiveConfig` (TTLs, grace, batch, cycle limits). Do not parse retention env in a second place.
+In-flight Grok / MCP research that entered before the freeze is counted and either finishes before persist or is rejected on the post-hold / pre-accept generation check. After COMPLETED or seal, `GROK_SIGNAL_ACCEPTED`, `STRATEGY_CHANGE_PROPOSED`, consensus mutation, and trade evaluation for that experiment are refused (`source_sealed`). Post-window market monitoring and discovery that are not experiment research may continue once the seal is durable.
+
+Dry-run / APPLY retention uses the same `retentionConfigFromEnv` / `retentionConfigFromEngineEnv` path as `RetentionManager`. Dry-run output includes `effectiveConfig` (automatic-cycle TTLs, grace, batch, cycle limits) **and** `applyBounds` (the exact global APPLY budget). APPLY does not treat `effectiveConfig.maxBatchesPerCycle` as a per-class cap. If one-time APPLY needs a different budget than automatic retention, pass explicit `maxBatches` / `maxRows` / `cycleBudgetMs` / `batchSize`; those appear only on `applyBounds`. Do not parse retention env in a second place.
 
 `RUNNING` and `ENTRY_CLOSED` may write an interim diagnostic export. They must not persist an immutable final.
 
@@ -136,8 +138,10 @@ Each cycle is a **bounded multi-batch drain**, not one huge `DELETE` and not a s
 - `RETENTION_MAX_ROWS_PER_CYCLE` default 4000
 - `RETENTION_CYCLE_BUDGET_MS` default 250
 - fairness across telemetry / monitor / idempotency / checkpoints
+- every destructive class, **including checkpoint pruning**, shares the same remaining `maxRowsPerCycle` / `maxBatchesPerCycle` / `cycleBudgetMs`
+- `pruneOldCheckpoints(keep, limit)` deletes at most `limit` rows and never the latest usable checkpoint
 - stop when budget, max batches, or max rows is exhausted, or a batch returns `< batchSize`
-- no unbounded loop, no huge ID arrays
+- no unbounded loop, no huge ID arrays, no internal `LIMIT` larger than the caller's remaining cycle allowance
 
 Deletes do **not** shrink PostgreSQL relation size immediately. Do not run `VACUUM FULL`.
 
@@ -155,7 +159,8 @@ Dry-run reports actual eligible candidates under configured horizons, still `mut
 - canonical report + grace gate
 - protected audit count
 - `durable_transitions=PROTECTED_NO_DELETE`
-- estimated bounded batches
+- estimated bounded batches (`min(class estimates, applyBounds.maxBatches)`, not a per-class sum uncapped by APPLY)
+- `applyBounds`: global APPLY `maxBatches` / `maxRows` / `cycleBudgetMs` / `batchSize`
 
 ## One-time existing-row cleanup
 
@@ -170,6 +175,8 @@ DATABASE_URL=… pnpm --filter @pm/engine exec tsx src/cli.ts journal-cleanup --
 ```
 
 APPLY never touches `durable_transitions` or audit-critical paper/execution rows. It does **not** migrate. With an active experiment it still applies **safe** classes (telemetry TTL; pre-start monitor when `startedAt` is known) and refuses in-window monitor deletion. Monitor-only / no-experiment rows older than the monitor TTL can be removed after explicit approval.
+
+APPLY is **globally** bounded for the whole invocation: telemetry and monitor share one `applyBounds` budget (total batches, total deleted rows, wall-clock `cycleBudgetMs`). `maxBatches=3` means at most 3 deletes across both classes, not 3 per class. Dry-run `applyBounds` is the budget APPLY will actually use.
 
 ## Accumulator diagnostic
 

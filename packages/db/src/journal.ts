@@ -72,7 +72,7 @@ export interface EventJournal {
     occurredBefore: Date;
     limit: number;
   }): Promise<{ deleted: number }>;
-  pruneOldCheckpoints(keepLatest: number): Promise<{ deleted: number; latestSequence: number | null }>;
+  pruneOldCheckpoints(keepLatest: number, limit?: number): Promise<{ deleted: number; latestSequence: number | null }>;
   listCheckpoints(): Promise<EngineCheckpoint[]>;
   commitDurableTransition(input: DurableTransitionInput, expectedPreviousSequence: number): Promise<DurableCommitResult>;
   readDurableTransitionsAfter(sequence: number, limit: number): Promise<DurableTransition[]>;
@@ -207,10 +207,12 @@ export class MemoryEventJournal implements EventJournal {
   async pruneIdempotencyKeys(olderThan: Date, limit: number): Promise<{ deleted: number }> {
     assertJournalCapability(this.access, "maintenance", "pruneIdempotencyKeys");
     const cutoff = olderThan.toISOString();
+    const cap = Math.max(0, Math.floor(limit));
+    if (cap <= 0) return { deleted: 0 };
     const victims = [...this.idempotencyKeys.entries()]
       .filter(([, createdAt]) => createdAt < cutoff)
       .sort((a, b) => a[1].localeCompare(b[1]))
-      .slice(0, Math.max(1, limit));
+      .slice(0, cap);
     for (const [key] of victims) this.idempotencyKeys.delete(key);
     return { deleted: victims.length };
   }
@@ -242,11 +244,13 @@ export class MemoryEventJournal implements EventJournal {
     if (input.types.some((type) => isProtectedJournalType(type))) {
       throw new Error("RETENTION_REFUSED_PROTECTED_TYPES");
     }
+    const cap = Math.max(0, Math.floor(input.limit));
+    if (cap <= 0) return { deleted: 0 };
     const cutoff = input.occurredBefore.toISOString();
     const victims = this.events
       .filter((event) => input.types.includes(event.type) && event.occurredAt < cutoff)
       .sort(compareJournalEventOrder)
-      .slice(0, Math.max(1, input.limit));
+      .slice(0, cap);
     const ids = new Set(victims.map((event) => event.id));
     for (let index = this.events.length - 1; index >= 0; index -= 1) {
       const id = this.events[index]!.id;
@@ -286,18 +290,23 @@ export class MemoryEventJournal implements EventJournal {
     };
     return { value: await work(snap), stable: true };
   }
-  async pruneOldCheckpoints(keepLatest: number): Promise<{ deleted: number; latestSequence: number | null }> {
+  async pruneOldCheckpoints(keepLatest: number, limit?: number): Promise<{ deleted: number; latestSequence: number | null }> {
     assertJournalCapability(this.access, "maintenance", "pruneOldCheckpoints");
     const keep = Math.max(1, keepLatest);
     const ordered = [...this.checkpoints].sort((a, b) => b.sequence - a.sequence);
     const latest = ordered[0]?.sequence ?? null;
+    if (limit != null && limit <= 0) return { deleted: 0, latestSequence: latest };
     const retained = new Set(ordered.slice(0, keep).map((row) => row.id));
-    const before = this.checkpoints.length;
-    for (let index = this.checkpoints.length - 1; index >= 0; index -= 1) {
-      const row = this.checkpoints[index]!;
-      if (!retained.has(row.id) && row.sequence !== latest) this.checkpoints.splice(index, 1);
+    const victims = this.checkpoints
+      .filter((row) => !retained.has(row.id) && row.sequence !== latest)
+      .sort((a, b) => a.sequence - b.sequence);
+    const capped = limit == null ? victims : victims.slice(0, Math.floor(limit));
+    const remove = new Set(capped.map((row) => row.id));
+    if (remove.size > 0) {
+      const kept = this.checkpoints.filter((row) => !remove.has(row.id));
+      this.checkpoints.splice(0, this.checkpoints.length, ...kept);
     }
-    return { deleted: before - this.checkpoints.length, latestSequence: latest };
+    return { deleted: remove.size, latestSequence: latest };
   }
   async listCheckpoints(): Promise<EngineCheckpoint[]> {
     return structuredClone(this.checkpoints);
@@ -570,7 +579,9 @@ export class PostgresEventJournal implements EventJournal {
   }
   async pruneIdempotencyKeys(olderThan: Date, limit: number): Promise<{ deleted: number }> {
     assertJournalCapability(this.access, "maintenance", "pruneIdempotencyKeys");
-    const cap = Math.max(1, Math.min(limit, 500));
+    const requested = Math.max(0, Math.floor(limit));
+    if (requested <= 0) return { deleted: 0 };
+    const cap = Math.min(requested, 500);
     const result = await this.client`
       DELETE FROM mcp_idempotency_keys
       WHERE (scope, key) IN (
@@ -641,7 +652,9 @@ export class PostgresEventJournal implements EventJournal {
     if (input.types.some((type) => isProtectedJournalType(type))) {
       throw new Error("RETENTION_REFUSED_PROTECTED_TYPES");
     }
-    const cap = Math.max(1, Math.min(input.limit, 500));
+    const requested = Math.max(0, Math.floor(input.limit));
+    if (requested <= 0) return { deleted: 0 };
+    const cap = Math.min(requested, 500);
     const result = await this.client`
       DELETE FROM journal_events
       WHERE (occurred_at, id) IN (
@@ -654,7 +667,7 @@ export class PostgresEventJournal implements EventJournal {
     `;
     return { deleted: result.count ?? 0 };
   }
-  async pruneOldCheckpoints(keepLatest: number): Promise<{ deleted: number; latestSequence: number | null }> {
+  async pruneOldCheckpoints(keepLatest: number, limit?: number): Promise<{ deleted: number; latestSequence: number | null }> {
     assertJournalCapability(this.access, "maintenance", "pruneOldCheckpoints");
     const keep = Math.max(1, keepLatest);
     const latestRows = await this.db.select({
@@ -662,6 +675,8 @@ export class PostgresEventJournal implements EventJournal {
     }).from(engineCheckpoints);
     const latest = Number(latestRows[0]?.max ?? 0);
     if (latest === 0) return { deleted: 0, latestSequence: null };
+    const cap = limit == null ? Number.MAX_SAFE_INTEGER : Math.max(0, Math.floor(limit));
+    if (cap <= 0) return { deleted: 0, latestSequence: latest };
     const result = await this.client`
       DELETE FROM engine_checkpoints
       WHERE id IN (
@@ -673,7 +688,7 @@ export class PostgresEventJournal implements EventJournal {
             LIMIT ${keep}
           )
         ORDER BY sequence ASC
-        LIMIT 200
+        LIMIT ${cap}
       )
     `;
     return { deleted: result.count ?? 0, latestSequence: latest };

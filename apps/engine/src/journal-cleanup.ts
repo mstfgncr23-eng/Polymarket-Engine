@@ -51,6 +51,8 @@ export interface CleanupDryRun {
     maxRowsPerCycle: number;
     cycleBudgetMs: number;
   };
+  /** Exact global bounds APPLY will use. Not a per-class budget and not a rename of effectiveConfig. */
+  applyBounds: CleanupApplyBounds;
   notes: string[];
 }
 
@@ -61,6 +63,31 @@ export interface CleanupApplyResult {
   reason: string | null;
   durableTransitionsDeleted: 0;
   batches: number;
+  applyBounds: CleanupApplyBounds;
+}
+
+/** Global APPLY budget. Distinct from automatic `effectiveConfig` even when the numbers match. */
+export interface CleanupApplyBounds {
+  maxBatches: number;
+  maxRows: number;
+  cycleBudgetMs: number;
+  batchSize: number;
+}
+
+export interface CleanupApplyOverrides {
+  maxBatches?: number;
+  maxRows?: number;
+  cycleBudgetMs?: number;
+  batchSize?: number;
+}
+
+export function resolveApplyBounds(config: RetentionConfig, overrides: CleanupApplyOverrides = {}): CleanupApplyBounds {
+  return {
+    maxBatches: Math.max(1, overrides.maxBatches ?? config.maxBatchesPerCycle),
+    maxRows: Math.max(0, overrides.maxRows ?? config.maxRowsPerCycle),
+    cycleBudgetMs: Math.max(0, overrides.cycleBudgetMs ?? config.cycleBudgetMs),
+    batchSize: clampRetentionBatchSize(overrides.batchSize ?? config.batchSize),
+  };
 }
 
 function estimate(total: number, eligible: { count: number; oldestOccurredAt: string | null }, cutoff: Date | null, batchSize: number): CleanupClassEstimate {
@@ -78,6 +105,7 @@ export async function dryRunJournalCleanup(
   now = new Date(),
   experiment?: { id: string; status: string; startedAt?: string | null } | null,
   config: RetentionConfig = defaultRetentionConfig(),
+  applyOverrides: CleanupApplyOverrides = {},
 ): Promise<CleanupDryRun> {
   const counts = await journal.countByType();
   const oldest = await journal.queryEventsKeyset({ limit: 1 });
@@ -114,6 +142,10 @@ export async function dryRunJournalCleanup(
   if (active) notes.push("Active experiment: in-window report-input / monitor rows are protected; pre-start monitor older than TTL may be eligible.");
   if (monitorOnlyEligible) notes.push("Monitor-only / no experiment: monitor rows older than monitor TTL are eligible.");
   if (experiment?.status === "COMPLETED" && !unlocked) notes.push("Completed experiment lacks a canonical final report + grace; in-window monitor cleanup refused.");
+  const applyBounds = resolveApplyBounds(config, applyOverrides);
+  notes.push(
+    `APPLY global bounds (one budget for telemetry+monitor): maxBatches=${applyBounds.maxBatches}, maxRows=${applyBounds.maxRows}, cycleBudgetMs=${applyBounds.cycleBudgetMs}, batchSize=${applyBounds.batchSize}.`,
+  );
   return {
     mode: "dry-run",
     mutated: false,
@@ -131,7 +163,10 @@ export async function dryRunJournalCleanup(
     monitor,
     telemetryCandidates: telemetry.eligible,
     monitorCandidates: monitor.eligible,
-    estimatedBoundedBatches: telemetry.estimatedBatches + monitor.estimatedBatches,
+    estimatedBoundedBatches: Math.min(
+      telemetry.estimatedBatches + monitor.estimatedBatches,
+      applyBounds.maxBatches,
+    ),
     refuseUnsafeExperimentCleanup: active && !experiment?.startedAt,
     effectiveConfig: {
       enabled: config.enabled,
@@ -143,6 +178,7 @@ export async function dryRunJournalCleanup(
       maxRowsPerCycle: config.maxRowsPerCycle,
       cycleBudgetMs: config.cycleBudgetMs,
     },
+    applyBounds,
     notes,
   };
 }
@@ -155,43 +191,94 @@ export async function applyJournalCleanup(
     batchSize?: number;
     confirm: "I_UNDERSTAND_DESTRUCTIVE_CLEANUP";
     maxBatches?: number;
+    maxRows?: number;
+    cycleBudgetMs?: number;
     config?: RetentionConfig;
   },
 ): Promise<CleanupApplyResult> {
   if (input.confirm !== "I_UNDERSTAND_DESTRUCTIVE_CLEANUP") {
-    return { mode: "apply", deletedByClass: {}, refused: true, reason: "CONFIRMATION_REQUIRED", durableTransitionsDeleted: 0, batches: 0 };
+    return {
+      mode: "apply", deletedByClass: {}, refused: true, reason: "CONFIRMATION_REQUIRED",
+      durableTransitionsDeleted: 0, batches: 0,
+      applyBounds: {
+        maxBatches: 0, maxRows: 0, cycleBudgetMs: 0, batchSize: 0,
+      },
+    };
   }
   const now = input.now ?? new Date();
   const config = input.config ?? defaultRetentionConfig();
-  const dry = await dryRunJournalCleanup(journal, now, input.experiment, config);
-  const limit = clampRetentionBatchSize(input.batchSize ?? config.batchSize);
-  const maxBatches = Math.max(1, input.maxBatches ?? config.maxBatchesPerCycle);
+  const applyOverrides: CleanupApplyOverrides = {
+    maxBatches: input.maxBatches,
+    maxRows: input.maxRows,
+    cycleBudgetMs: input.cycleBudgetMs,
+    batchSize: input.batchSize,
+  };
+  const dry = await dryRunJournalCleanup(journal, now, input.experiment, config, applyOverrides);
+  const applyBounds = dry.applyBounds;
+  const batchSize = applyBounds.batchSize;
+  const maxBatches = applyBounds.maxBatches;
+  const maxRows = applyBounds.maxRows;
+  const budgetEnd = Date.now() + applyBounds.cycleBudgetMs;
   const deletedByClass: Record<string, number> = { raw_telemetry: 0, monitor_control: 0 };
   let batches = 0;
-  for (let i = 0; i < maxBatches; i += 1) {
-    const tel = await journal.deleteJournalEventsBounded({
-      types: TELEMETRY_EVENT_TYPES,
-      occurredBefore: new Date(now.getTime() - config.telemetryTtlMs),
-      limit,
-    });
-    deletedByClass.raw_telemetry = (deletedByClass.raw_telemetry ?? 0) + tel.deleted;
-    batches += 1;
-    if (tel.deleted < limit) break;
-  }
+  let totalDeleted = 0;
   const monitorBefore = dry.monitor.cutoff ? new Date(dry.monitor.cutoff) : null;
+  const classes: Array<{ cls: "raw_telemetry" | "monitor_control"; exhausted: boolean; work: (limit: number) => Promise<{ deleted: number }> }> = [
+    {
+      cls: "raw_telemetry",
+      exhausted: false,
+      work: (limit) => journal.deleteJournalEventsBounded({
+        types: TELEMETRY_EVENT_TYPES,
+        occurredBefore: new Date(now.getTime() - config.telemetryTtlMs),
+        limit,
+      }),
+    },
+  ];
   if (monitorBefore && dry.monitor.eligible > 0) {
-    for (let i = 0; i < maxBatches; i += 1) {
-      const mon = await journal.deleteJournalEventsBounded({
+    classes.push({
+      cls: "monitor_control",
+      exhausted: false,
+      work: (limit) => journal.deleteJournalEventsBounded({
         types: MONITOR_CONTROL_EVENT_TYPES,
         occurredBefore: monitorBefore,
         limit,
-      });
-      deletedByClass.monitor_control = (deletedByClass.monitor_control ?? 0) + mon.deleted;
-      batches += 1;
-      if (mon.deleted < limit) break;
-    }
+      }),
+    });
   }
-  return { mode: "apply", deletedByClass, refused: false, reason: null, durableTransitionsDeleted: 0, batches };
+  let progressed = true;
+  while (
+    progressed
+    && Date.now() < budgetEnd
+    && batches < maxBatches
+    && totalDeleted < maxRows
+  ) {
+    progressed = false;
+    for (const drain of classes) {
+      if (drain.exhausted) continue;
+      if (Date.now() >= budgetEnd || batches >= maxBatches || totalDeleted >= maxRows) break;
+      const remaining = maxRows - totalDeleted;
+      if (remaining <= 0) break;
+      const limit = Math.min(batchSize, remaining);
+      const result = await drain.work(limit);
+      if (result.deleted > 0) {
+        batches += 1;
+        totalDeleted += result.deleted;
+        deletedByClass[drain.cls] = (deletedByClass[drain.cls] ?? 0) + result.deleted;
+        progressed = true;
+      }
+      if (result.deleted < limit) drain.exhausted = true;
+    }
+    if (classes.every((item) => item.exhausted)) break;
+  }
+  return {
+    mode: "apply",
+    deletedByClass,
+    refused: false,
+    reason: null,
+    durableTransitionsDeleted: 0,
+    batches,
+    applyBounds,
+  };
 }
 
 function sumTypes(counts: Record<string, number>, types: readonly string[]): number {

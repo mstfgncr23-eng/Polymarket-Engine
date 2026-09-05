@@ -1051,4 +1051,278 @@ describe("Step-4 acceptance: invalid index inspection fail-closed", () => {
   });
 });
 
+describe("Step-4 residual: experiment research ingress fence", () => {
+  it("held Grok submission is drained or rejected and cannot accept after the source seal", async () => {
+    const journal = new MemoryEventJournal();
+    const adapter = new ScriptedMarketAdapter();
+    adapter.queue(discoveryReport([qualified("btc-mkt", "BTC", "btc-up", "btc-down")]));
+    const engine = new EngineService(qualifiedPaperEnv(), journal, { error: () => undefined }, {
+      market: adapter as never,
+      referenceRegistry: new ScriptedReferenceRegistry() as never,
+      activation: new NoopGrokActivationBridge(),
+    });
+    await engine.start();
+    let releaseGrok!: () => void;
+    try {
+      expect(await engine.beginExperiment()).toMatchObject({ ok: true });
+      const experimentId = engine.experimentManifest()!.id;
+      const now = Date.now();
+      const trigger = triggerEventSchema.parse({
+        id: "trig-grok-seal", traceId: "tr-grok-seal", marketId: "btc-mkt", asset: "BTC",
+        kind: "BOOK_IMBALANCE", severity: 2, score: 1, dedupeKey: "grok-seal", evidence: {},
+        sourceEventIds: ["e-grok-seal"], source: "polymarket",
+        createdAt: new Date(now).toISOString(), expiresAt: new Date(now + 60_000).toISOString(),
+      });
+      await engine.registerTriggerForResearch(trigger);
+      const submission = grokSignalSubmissionSchema.parse({
+        submissionId: "sub-grok-seal", traceId: "tr-grok-seal", triggerId: "trig-grok-seal",
+        correlationId: "c-grok-seal", marketId: "btc-mkt", asset: "BTC",
+        agentId: "fair_probability_analyst", role: "fair_probability_analyst",
+        timestamp: new Date(now).toISOString(),
+        output: {
+          confidence: 0.8, evidenceIds: ["e"], expiresAt: new Date(now + 60_000).toISOString(),
+          reasonCodes: ["T"], direction: "UP", fairProbability: 0.6, marketProbability: 0.5, estimatedEdge: 0.04,
+        },
+      });
+      engine.setGrokClaimHoldForTest(new Promise<void>((resolve) => { releaseGrok = resolve; }));
+      const grokPromise = engine.submitGrokSignal(submission, "fair_probability_analyst");
+      await waitUntil(() => engine.researchIngressInFlightForTest() > 0);
+      await engine.completeExperimentForTest();
+      expect(engine.sourceSealStateForTest().sealing).toBe(true);
+      const sealPromise = engine.ensureSourceSealForTest();
+      await waitUntil(() => engine.sourceSealStateForTest().generation > 0);
+      expect(engine.researchIngressInFlightForTest()).toBeGreaterThan(0);
+      releaseGrok();
+      engine.setGrokClaimHoldForTest(null);
+      const [grok, seal] = await Promise.all([grokPromise, sealPromise]);
+      expect(grok.status).toBe("source_sealed");
+      expect(seal.sealed).toBe(true);
+      expect(await loadSourceSeal(journal, experimentId)).toBeTruthy();
+      expect((await journal.queryEvents({ types: ["GROK_SIGNAL_ACCEPTED"] })).length).toBe(0);
+      expect((await journal.queryEvents({ types: ["STRATEGY_CHANGE_PROPOSED"] })).length).toBe(0);
+      expect((await journal.queryEvents({ types: ["CONSENSUS_DECISION"] })).length).toBe(0);
+      expect((await journal.queryEvents({ types: ["RISK_EVALUATION"] })).length).toBe(0);
+      await engine.writeFinalReportForTest();
+      const first = await journal.loadExperimentReport(experimentId);
+      expect(first && isCanonicalFinalReport(first)).toBe(true);
+      const streamed = await streamExperimentSummary(journal, {
+        id: experimentId,
+        startedAt: engine.experimentManifest()?.startedAt,
+        completedAt: engine.experimentManifest()?.completedAt,
+      }, {
+        status: "COMPLETED",
+        reportKind: "final",
+        metricsScope: "complete",
+        complete: true,
+        truncated: false,
+        generatedAt: first!.generatedAt,
+      });
+      streamed.summary.complete = true;
+      streamed.summary.truncated = false;
+      expect(toDurableReportInput({ summary: streamed.summary, scan: streamed.scan }).contentHash).toBe(first!.contentHash);
+    } finally {
+      releaseGrok?.();
+      engine.setGrokClaimHoldForTest(null);
+      await engine.stop();
+    }
+  });
+});
+
+describe("Step-4 residual: source-seal persist deadline", () => {
+  it("stalls SOURCE_SEAL persistence itself and cannot later create a seal after timeout", async () => {
+    const journal = new MemoryEventJournal();
+    const adapter = new ScriptedMarketAdapter();
+    adapter.queue(discoveryReport([qualified("btc-mkt", "BTC", "btc-up", "btc-down")]));
+    const engine = new EngineService(qualifiedPaperEnv(), journal, { error: () => undefined }, {
+      market: adapter as never,
+      referenceRegistry: new ScriptedReferenceRegistry() as never,
+      activation: new NoopGrokActivationBridge(),
+    });
+    await engine.start();
+    let releasePersist!: () => void;
+    try {
+      expect(await engine.beginExperiment()).toMatchObject({ ok: true });
+      const experimentId = engine.experimentManifest()!.id;
+      engine.setSourceSealTimeoutForTest(40);
+      engine.setSourceSealPersistHoldForTest(new Promise<void>((resolve) => { releasePersist = resolve; }));
+      await engine.completeExperimentForTest();
+      const seal = await engine.ensureSourceSealForTest();
+      expect(seal.sealed).toBe(false);
+      expect(seal.reason).toBe("SOURCE_SEAL_TIMEOUT");
+      expect(await loadSourceSeal(journal, experimentId)).toBeNull();
+      expect(await journal.loadExperimentReport(experimentId)).toBeNull();
+      releasePersist();
+      engine.setSourceSealPersistHoldForTest(null);
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(await loadSourceSeal(journal, experimentId)).toBeNull();
+      expect(await journal.loadExperimentReport(experimentId)).toBeNull();
+      engine.setSourceSealTimeoutForTest(5_000);
+      const retry = await engine.ensureSourceSealForTest();
+      expect(retry.sealed).toBe(true);
+      expect(await loadSourceSeal(journal, experimentId)).toBeTruthy();
+      await engine.writeFinalReportForTest();
+      expect(await journal.loadExperimentReport(experimentId)).toMatchObject({ complete: true, truncated: false });
+    } finally {
+      releasePersist?.();
+      engine.setSourceSealPersistHoldForTest(null);
+      await engine.stop();
+    }
+  });
+});
+
+describe("Step-4 residual: checkpoint prune honors remaining cycle rows", () => {
+  async function seedCheckpoints(journal: MemoryEventJournal, n: number): Promise<void> {
+    for (let sequence = 1; sequence <= n; sequence += 1) {
+      await journal.saveCheckpoint({ experimentId: "exp", sequence, payload: { schemaVersion: 2, durableCursor: 0 } });
+    }
+  }
+
+  it("deletes at most the remaining 50-row cycle budget from a 200+ checkpoint backlog", async () => {
+    const journal = new MemoryEventJournal();
+    await seedCheckpoints(journal, 220);
+    const manager = new RetentionManager(journal, defaultRetentionConfig({
+      enabled: true, checkpointKeep: 1, batchSize: 200, maxRowsPerCycle: 50,
+      maxBatchesPerCycle: 8, cycleBudgetMs: 10_000, telemetryTtlMs: 1, monitorTtlMs: 1,
+    }));
+    const result = await manager.runCycle({
+      experiment: null, now: new Date(), degraded: false, failClosed: false, databaseUp: true,
+    });
+    expect(result.deletedByClass.checkpoint).toBeLessThanOrEqual(50);
+    expect(result.deletedByClass.checkpoint).toBe(50);
+    const left = await journal.listCheckpoints();
+    expect(left.some((row) => row.sequence === 220)).toBe(true);
+    expect((await journal.loadLatestCheckpoint())?.sequence).toBe(220);
+    expect(left.length).toBe(170);
+  });
+
+  it("after telemetry consumes part of the budget, checkpoint deletes only the remainder", async () => {
+    const journal = new MemoryEventJournal();
+    for (let i = 0; i < 30; i += 1) {
+      await journal.append(ev("MARKET_SNAPSHOT", "2026-01-01T00:00:00.000Z", { i }, `tel-cp-${i}`));
+    }
+    await seedCheckpoints(journal, 220);
+    const manager = new RetentionManager(journal, defaultRetentionConfig({
+      enabled: true, checkpointKeep: 1, batchSize: 200, maxRowsPerCycle: 50,
+      maxBatchesPerCycle: 8, cycleBudgetMs: 10_000, telemetryTtlMs: 1, monitorTtlMs: 1,
+    }));
+    const result = await manager.runCycle({
+      experiment: null, now: new Date(), degraded: false, failClosed: false, databaseUp: true,
+    });
+    expect(result.deletedByClass.raw_telemetry).toBe(30);
+    expect(result.deletedByClass.checkpoint).toBe(20);
+    expect(result.deletedByClass.raw_telemetry + result.deletedByClass.checkpoint).toBe(50);
+    expect((await journal.loadLatestCheckpoint())?.sequence).toBe(220);
+  });
+
+  it("journal prune API never deletes more than the caller limit and keeps the latest usable", async () => {
+    const journal = new MemoryEventJournal();
+    await seedCheckpoints(journal, 210);
+    const pruned = await journal.pruneOldCheckpoints(1, 50);
+    expect(pruned.deleted).toBe(50);
+    expect(pruned.latestSequence).toBe(210);
+    expect((await journal.loadLatestCheckpoint())?.sequence).toBe(210);
+    expect((await journal.pruneOldCheckpoints(1, 0)).deleted).toBe(0);
+    await journal.append(ev("MARKET_SNAPSHOT", "2026-01-01T00:00:00.000Z", {}, "tel-limit-0"));
+    expect((await journal.deleteJournalEventsBounded({
+      types: TELEMETRY_EVENT_TYPES,
+      occurredBefore: new Date(),
+      limit: 0,
+    })).deleted).toBe(0);
+    expect((await journal.queryEvents({ types: ["MARKET_SNAPSHOT"] })).length).toBe(1);
+  });
+});
+
+describe("Step-4 residual: operator APPLY global budget", () => {
+  async function seedCleanupBacklog(journal: MemoryEventJournal, telemetry: number, monitor: number): Promise<void> {
+    for (let i = 0; i < telemetry; i += 1) {
+      await journal.append(ev("MARKET_SNAPSHOT", "2026-01-01T00:00:00.000Z", { i }, `apply-tel-${i}`));
+    }
+    for (let i = 0; i < monitor; i += 1) {
+      await journal.append(ev("TRIGGER_EVENT", "2026-01-01T00:00:00.000Z", { i }, `apply-mon-${i}`));
+    }
+  }
+
+  it("maxBatches=3 is a global cap across telemetry and monitor, not 3 per class", async () => {
+    const journal = new MemoryEventJournal();
+    await seedCleanupBacklog(journal, 80, 80);
+    const config = defaultRetentionConfig({
+      enabled: true, telemetryTtlMs: 1, monitorTtlMs: 1, batchSize: 10,
+      maxBatchesPerCycle: 20, maxRowsPerCycle: 10_000, cycleBudgetMs: 10_000,
+    });
+    const apply = await applyJournalCleanup(journal, {
+      now: new Date("2026-09-08T00:00:00.000Z"), experiment: null,
+      confirm: "I_UNDERSTAND_DESTRUCTIVE_CLEANUP", config, maxBatches: 3,
+    });
+    expect(apply.batches).toBeLessThanOrEqual(3);
+    expect(apply.batches).toBe(3);
+    expect((apply.deletedByClass.raw_telemetry ?? 0) + (apply.deletedByClass.monitor_control ?? 0)).toBe(30);
+    expect(apply.applyBounds.maxBatches).toBe(3);
+    expect(apply.durableTransitionsDeleted).toBe(0);
+  });
+
+  it("non-divisible maxRows is never exceeded", async () => {
+    const journal = new MemoryEventJournal();
+    await seedCleanupBacklog(journal, 80, 80);
+    const config = defaultRetentionConfig({
+      enabled: true, telemetryTtlMs: 1, monitorTtlMs: 1, batchSize: 10,
+      maxBatchesPerCycle: 20, maxRowsPerCycle: 4_000, cycleBudgetMs: 10_000,
+    });
+    const apply = await applyJournalCleanup(journal, {
+      now: new Date("2026-09-08T00:00:00.000Z"), experiment: null,
+      confirm: "I_UNDERSTAND_DESTRUCTIVE_CLEANUP", config, maxRows: 25,
+    });
+    const deleted = (apply.deletedByClass.raw_telemetry ?? 0) + (apply.deletedByClass.monitor_control ?? 0);
+    expect(deleted).toBeLessThanOrEqual(25);
+    expect(deleted).toBe(25);
+    expect(apply.applyBounds.maxRows).toBe(25);
+    expect(apply.applyBounds.maxRows).not.toBe(config.maxRowsPerCycle);
+  });
+
+  it("time budget stops further batches", async () => {
+    const journal = new MemoryEventJournal();
+    await seedCleanupBacklog(journal, 80, 80);
+    const original = journal.deleteJournalEventsBounded.bind(journal);
+    journal.deleteJournalEventsBounded = async (input) => {
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      return original(input);
+    };
+    const config = defaultRetentionConfig({
+      enabled: true, telemetryTtlMs: 1, monitorTtlMs: 1, batchSize: 10,
+      maxBatchesPerCycle: 20, maxRowsPerCycle: 10_000, cycleBudgetMs: 250,
+    });
+    const apply = await applyJournalCleanup(journal, {
+      now: new Date("2026-09-08T00:00:00.000Z"), experiment: null,
+      confirm: "I_UNDERSTAND_DESTRUCTIVE_CLEANUP", config, cycleBudgetMs: 50, maxBatches: 20,
+    });
+    expect(apply.batches).toBeLessThan(8);
+    expect(apply.batches).toBeGreaterThanOrEqual(1);
+    expect(apply.applyBounds.cycleBudgetMs).toBe(50);
+  });
+
+  it("dry-run applyBounds equal the bounds APPLY actually uses", async () => {
+    const journal = new MemoryEventJournal();
+    await seedCleanupBacklog(journal, 40, 40);
+    const config = defaultRetentionConfig({
+      enabled: true, telemetryTtlMs: 1, monitorTtlMs: 1, batchSize: 10,
+      maxBatchesPerCycle: 20, maxRowsPerCycle: 4_000, cycleBudgetMs: 5_000,
+    });
+    const now = new Date("2026-09-08T00:00:00.000Z");
+    const overrides = { maxBatches: 3, maxRows: 25, cycleBudgetMs: 5_000, batchSize: 10 };
+    const dry = await dryRunJournalCleanup(journal, now, null, config, overrides);
+    expect(dry.effectiveConfig.maxBatchesPerCycle).toBe(20);
+    expect(dry.effectiveConfig.maxRowsPerCycle).toBe(4_000);
+    expect(dry.applyBounds).toEqual(overrides);
+    expect(dry.estimatedBoundedBatches).toBe(3);
+    const applyJournal = new MemoryEventJournal();
+    await seedCleanupBacklog(applyJournal, 40, 40);
+    const apply = await applyJournalCleanup(applyJournal, {
+      now, experiment: null, confirm: "I_UNDERSTAND_DESTRUCTIVE_CLEANUP", config, ...overrides,
+    });
+    expect(apply.applyBounds).toEqual(dry.applyBounds);
+    expect(apply.batches).toBeLessThanOrEqual(dry.applyBounds.maxBatches);
+    const deleted = (apply.deletedByClass.raw_telemetry ?? 0) + (apply.deletedByClass.monitor_control ?? 0);
+    expect(deleted).toBeLessThanOrEqual(dry.applyBounds.maxRows);
+  });
+});
+
 

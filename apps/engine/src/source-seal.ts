@@ -4,6 +4,10 @@ import { createJournalEvent, type EventJournal } from "@pm/db";
 export const EXPERIMENT_SOURCE_SEALED = "EXPERIMENT_SOURCE_SEALED";
 export const SOURCE_SEAL_TIMEOUT_MS = 5_000;
 
+export function remainingSealMs(deadlineAt: number, now = Date.now()): number {
+  return Math.max(0, deadlineAt - now);
+}
+
 export function sourceSealEventId(experimentId: string): string {
   return `sourceseal:${experimentId}`;
 }

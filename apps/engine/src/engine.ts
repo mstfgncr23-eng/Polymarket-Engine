@@ -88,7 +88,7 @@ import { EngineStateStore } from "./state.js";
 import { ensureReportGeneratedAudit, persistCanonicalFinalReport, streamExperimentSummary, summaryFromDurableReport } from "./final-report.js";
 import { writeExperimentSummary } from "./report.js";
 import { retentionConfigFromEngineEnv, RetentionManager } from "./retention-manager.js";
-import { createSourceSealEvent, loadSourceSeal, SOURCE_SEAL_TIMEOUT_MS, isSourceSealExemptType } from "./source-seal.js";
+import { createSourceSealEvent, loadSourceSeal, remainingSealMs, SOURCE_SEAL_TIMEOUT_MS, isSourceSealExemptType } from "./source-seal.js";
 import { GrokActivationCoordinator, persistableActivation } from "./activation/coordinator.js";
 import { createGrokActivationBridge } from "./activation/index.js";
 import { BoundedJournalWriter } from "./journal-writer.js";
@@ -212,6 +212,13 @@ export class EngineService {
   private sourceSealing = false;
   private sourceSealed = false;
   private sourceSealTimeoutMs = SOURCE_SEAL_TIMEOUT_MS;
+  private sourceSealGeneration = 0;
+  private sourceSealDeadlineAt = 0;
+  private sourceSealPersistCancelled = false;
+  private sourceSealPersistAttempt = 0;
+  private sourceSealPersistHold: Promise<void> | null = null;
+  private researchIngressInFlight = 0;
+  private grokClaimHold: Promise<void> | null = null;
   private referenceTelemetryHoldForTest: Promise<void> | null = null;
   private lastAdmittedMarketEpochFence: ReadonlyMap<string, number> | null = null;
   private discoveryGenerationApplied = 0;
@@ -1573,7 +1580,7 @@ export class EngineService {
   }
 
   /** The only ingress for external Grok research; it cannot create orders directly. */
-  async submitGrokSignal(raw: GrokSignalSubmission, clientId: string): Promise<{ status: "accepted" | "duplicate" | "stale" | "unknown_trigger" | "trace_mismatch" | "market_mismatch" | "asset_mismatch" | "replay_rejected" | "malformed" | "identity_mismatch"; signalId?: string }> {
+  async submitGrokSignal(raw: GrokSignalSubmission, clientId: string): Promise<{ status: "accepted" | "duplicate" | "stale" | "unknown_trigger" | "trace_mismatch" | "market_mismatch" | "asset_mismatch" | "replay_rejected" | "malformed" | "identity_mismatch" | "source_sealed"; signalId?: string }> {
     let submission: GrokSignalSubmission;
     try { submission = grokSignalSubmissionSchema.parse(raw); }
     catch {
@@ -1586,55 +1593,73 @@ export class EngineService {
       this.metrics.grokSignals.inc({ agent: submission.agentId, status: "identity_mismatch" });
       return { status: "identity_mismatch" };
     }
-    const now = this.nowFn();
-    const trigger = this.activeTriggers.get(submission.triggerId);
-    if (!trigger) { this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "unknown_trigger" }); return { status: "unknown_trigger" }; }
-    if (trigger.traceId !== submission.traceId) { this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "trace_mismatch" }); return { status: "trace_mismatch" }; }
-    if (trigger.marketId && trigger.marketId !== submission.marketId) {
-      this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "market_mismatch" }); return { status: "market_mismatch" };
-    }
-    if (submission.asset && trigger.asset && submission.asset !== trigger.asset) {
-      this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "asset_mismatch" }); return { status: "asset_mismatch" };
-    }
-    const submittedAt = new Date(submission.timestamp).getTime();
-    const maxSkewMs = 5 * 60_000;
-    if (!Number.isFinite(submittedAt) || submittedAt > now.getTime() + 60_000 || submittedAt < now.getTime() - maxSkewMs) {
-      this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "replay_rejected" }); return { status: "replay_rejected" };
-    }
-    if (new Date(trigger.expiresAt).getTime() <= now.getTime() || new Date(submission.output.expiresAt).getTime() <= now.getTime()) {
-      this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "stale" }); return { status: "stale" };
-    }
-    if (!this.isTriggerActionable(trigger.id)) {
-      this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "stale" }); return { status: "stale" };
-    }
-    const claimed = await this.journal.claimIdempotency("grok_signal_submission", `${clientId}:${submission.submissionId}`);
-    if (!claimed) { this.state.recordGrokRejection("duplicate"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "duplicate" }); return { status: "duplicate" }; }
-    if (!this.isTriggerActionable(trigger.id)) {
-      this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "stale" }); return { status: "stale" };
-    }
+    const rejectSealed = (): { status: "source_sealed" } => {
+      this.state.recordGrokRejection("rejected");
+      this.metrics.grokSignals.inc({ agent: submission.agentId, status: "source_sealed" });
+      return { status: "source_sealed" };
+    };
+    const ingress = this.beginResearchIngress();
+    try {
+      if (this.researchIngressStale(ingress.generation)) return rejectSealed();
+      const now = this.nowFn();
+      const trigger = this.activeTriggers.get(submission.triggerId);
+      if (!trigger) { this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "unknown_trigger" }); return { status: "unknown_trigger" }; }
+      if (trigger.traceId !== submission.traceId) { this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "trace_mismatch" }); return { status: "trace_mismatch" }; }
+      if (trigger.marketId && trigger.marketId !== submission.marketId) {
+        this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "market_mismatch" }); return { status: "market_mismatch" };
+      }
+      if (submission.asset && trigger.asset && submission.asset !== trigger.asset) {
+        this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "asset_mismatch" }); return { status: "asset_mismatch" };
+      }
+      const submittedAt = new Date(submission.timestamp).getTime();
+      const maxSkewMs = 5 * 60_000;
+      if (!Number.isFinite(submittedAt) || submittedAt > now.getTime() + 60_000 || submittedAt < now.getTime() - maxSkewMs) {
+        this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "replay_rejected" }); return { status: "replay_rejected" };
+      }
+      if (new Date(trigger.expiresAt).getTime() <= now.getTime() || new Date(submission.output.expiresAt).getTime() <= now.getTime()) {
+        this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "stale" }); return { status: "stale" };
+      }
+      if (!this.isTriggerActionable(trigger.id)) {
+        this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "stale" }); return { status: "stale" };
+      }
+      if (this.researchIngressStale(ingress.generation)) return rejectSealed();
+      if (this.grokClaimHold) await this.grokClaimHold;
+      if (this.researchIngressStale(ingress.generation)) return rejectSealed();
+      const claimed = await this.journal.claimIdempotency("grok_signal_submission", `${clientId}:${submission.submissionId}`);
+      if (!claimed) { this.state.recordGrokRejection("duplicate"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "duplicate" }); return { status: "duplicate" }; }
+      // Recheck the experiment-scoped fence immediately before irreversible accept.
+      if (this.researchIngressStale(ingress.generation) || !this.isTriggerActionable(trigger.id)) {
+        this.state.recordGrokRejection("rejected");
+        this.metrics.grokSignals.inc({ agent: submission.agentId, status: this.researchIngressStale(ingress.generation) ? "source_sealed" : "stale" });
+        return { status: this.researchIngressStale(ingress.generation) ? "source_sealed" : "stale" };
+      }
 
-    const signal: GrokSignalEnvelope = grokSignalEnvelopeSchema.parse({
-      signalId: createId("grok_signal"), submissionId: submission.submissionId, traceId: submission.traceId,
-      triggerId: submission.triggerId, correlationId: submission.correlationId, marketId: submission.marketId,
-      asset: submission.asset ?? trigger.asset ?? null,
-      agentId: submission.agentId, role: submission.role, provider: "grok_bot_mcp", clientId,
-      receivedAt: now.toISOString(), timestamp: submission.timestamp, output: submission.output, resultingDecision: null,
-    });
-    const byRole = this.signalsByTrigger.get(trigger.id) ?? new Map<ExternalAgentRoleId, GrokSignalEnvelope>();
-    byRole.set(signal.agentId, signal);
-    this.signalsByTrigger.set(trigger.id, byRole);
-    this.signalReceivedTimes.push(now.getTime());
-    this.state.addGrokSignal(signal);
-    this.activation.noteSignal(trigger.id, now);
-    this.state.setActivationLatency(this.activation.snapshot());
-    this.metrics.grokSignals.inc({ agent: signal.agentId, status: "accepted" });
-    this.record(`${signal.agentId.toUpperCase()}_COMPLETE`, signal.traceId, trigger.marketId, { signalId: signal.signalId, clientId, confidence: submission.output.confidence, expiresAt: submission.output.expiresAt }, trigger.asset ?? null);
-    await this.safeAppend(createJournalEvent({ traceId: signal.traceId, type: "GROK_SIGNAL_ACCEPTED", aggregateType: "grok_signal", aggregateId: signal.signalId, payload: signal }));
-    if (submission.agentId === "strategy_supervisor" && submission.output.proposedChange) {
-      await this.safeAppend(createJournalEvent({ traceId: signal.traceId, type: "STRATEGY_CHANGE_PROPOSED", aggregateType: "strategy_change", aggregateId: signal.signalId, payload: submission.output.proposedChange }));
+      const signal: GrokSignalEnvelope = grokSignalEnvelopeSchema.parse({
+        signalId: createId("grok_signal"), submissionId: submission.submissionId, traceId: submission.traceId,
+        triggerId: submission.triggerId, correlationId: submission.correlationId, marketId: submission.marketId,
+        asset: submission.asset ?? trigger.asset ?? null,
+        agentId: submission.agentId, role: submission.role, provider: "grok_bot_mcp", clientId,
+        receivedAt: now.toISOString(), timestamp: submission.timestamp, output: submission.output, resultingDecision: null,
+      });
+      if (this.researchIngressStale(ingress.generation)) return rejectSealed();
+      const byRole = this.signalsByTrigger.get(trigger.id) ?? new Map<ExternalAgentRoleId, GrokSignalEnvelope>();
+      byRole.set(signal.agentId, signal);
+      this.signalsByTrigger.set(trigger.id, byRole);
+      this.signalReceivedTimes.push(now.getTime());
+      this.state.addGrokSignal(signal);
+      this.activation.noteSignal(trigger.id, now);
+      this.state.setActivationLatency(this.activation.snapshot());
+      this.metrics.grokSignals.inc({ agent: signal.agentId, status: "accepted" });
+      this.record(`${signal.agentId.toUpperCase()}_COMPLETE`, signal.traceId, trigger.marketId, { signalId: signal.signalId, clientId, confidence: submission.output.confidence, expiresAt: submission.output.expiresAt }, trigger.asset ?? null);
+      await this.safeAppend(createJournalEvent({ traceId: signal.traceId, type: "GROK_SIGNAL_ACCEPTED", aggregateType: "grok_signal", aggregateId: signal.signalId, payload: signal }));
+      if (submission.agentId === "strategy_supervisor" && submission.output.proposedChange) {
+        await this.safeAppend(createJournalEvent({ traceId: signal.traceId, type: "STRATEGY_CHANGE_PROPOSED", aggregateType: "strategy_change", aggregateId: signal.signalId, payload: submission.output.proposedChange }));
+      }
+      await this.evaluateExternalConsensus(trigger);
+      return { status: "accepted", signalId: signal.signalId };
+    } finally {
+      this.endResearchIngress();
     }
-    await this.evaluateExternalConsensus(trigger);
-    return { status: "accepted", signalId: signal.signalId };
   }
 
   /** Public for deterministic trigger ingestion and focused integration tests. */
@@ -1644,6 +1669,7 @@ export class EngineService {
   }
 
   private async evaluateExternalConsensus(trigger: TriggerEvent): Promise<void> {
+    if (this.researchIngressBlocked()) return;
     if (!this.isTriggerActionable(trigger.id)) return;
     const outputs = [...(this.signalsByTrigger.get(trigger.id)?.values() ?? [])];
     const fair = outputs.find((item) => item.agentId === "fair_probability_analyst")?.output as { estimatedEdge?: number; fairProbability?: number; direction?: Direction; marketProbability?: number } | undefined;
@@ -1665,6 +1691,7 @@ export class EngineService {
   }
 
   private async evaluateTrade(trigger: TriggerEvent, consensus: NonNullable<EngineStateStore["latestConsensus"]>, outputs: GrokSignalEnvelope[]): Promise<void> {
+    if (this.researchIngressBlocked()) return;
     if (!this.isTriggerActionable(trigger.id)) return;
     const pair = this.snapshots.get(trigger.marketId ?? "");
     if (!pair) return;
@@ -2483,11 +2510,44 @@ export class EngineService {
       }),
       checkpoint: true,
     });
-    if (next.status === "COMPLETED") this.sourceSealing = true;
+    if (next.status === "COMPLETED") this.freezeExperimentResearchIngress();
   }
 
   private sourceSealBlocksAdmission(): boolean {
     return this.sourceSealing && !this.sourceSealed;
+  }
+
+  private researchIngressBlocked(): boolean {
+    return this.sourceSealing || this.sourceSealed || this.experiment?.status === "COMPLETED";
+  }
+
+  private freezeExperimentResearchIngress(): void {
+    this.sourceSealing = true;
+    this.sourceSealGeneration += 1;
+  }
+
+  private beginResearchIngress(): { generation: number } {
+    this.researchIngressInFlight += 1;
+    return { generation: this.sourceSealGeneration };
+  }
+
+  private endResearchIngress(): void {
+    this.researchIngressInFlight = Math.max(0, this.researchIngressInFlight - 1);
+  }
+
+  private researchIngressStale(generation: number): boolean {
+    return this.researchIngressBlocked() || generation !== this.sourceSealGeneration;
+  }
+
+  private async waitResearchIngress(deadlineMs: number): Promise<JoinResult> {
+    const started = Date.now();
+    while (this.researchIngressInFlight > 0) {
+      if (Date.now() - started >= deadlineMs) {
+        return { drained: false, unresolved: this.researchIngressInFlight, timedOut: true };
+      }
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    return { drained: true, unresolved: 0, timedOut: false };
   }
 
   private async restoreSourceSealState(): Promise<void> {
@@ -2509,24 +2569,74 @@ export class EngineService {
       this.sourceSealing = false;
       return { sealed: true, reason: null };
     }
-    this.sourceSealing = true;
-    const started = Date.now();
-    const work = await this.supervisor.waitUnresolved(this.sourceSealTimeoutMs);
-    const remaining = Math.max(0, this.sourceSealTimeoutMs - (Date.now() - started));
-    const journal = await this.journalAdmission.waitReportInput(remaining);
-    if (!work.drained || !journal.drained || work.timedOut || journal.timedOut) {
+    this.freezeExperimentResearchIngress();
+    this.sourceSealPersistCancelled = false;
+    this.sourceSealDeadlineAt = Date.now() + this.sourceSealTimeoutMs;
+    const generation = this.sourceSealGeneration;
+    const persistAttempt = ++this.sourceSealPersistAttempt;
+    const remaining = () => remainingSealMs(this.sourceSealDeadlineAt);
+    const work = await this.supervisor.waitUnresolved(remaining());
+    const research = await this.waitResearchIngress(remaining());
+    const journal = await this.journalAdmission.waitReportInput(remaining());
+    if (!work.drained || !research.drained || !journal.drained || work.timedOut || research.timedOut || journal.timedOut || remaining() <= 0) {
       return { sealed: false, reason: "SOURCE_SEAL_TIMEOUT" };
     }
-    await this.safeAppend(createSourceSealEvent({
-      experimentId: experiment.id,
-      startedAt: experiment.startedAt,
-      completedAt: experiment.completedAt,
-    }));
+    const persist = this.persistSourceSeal(experiment, generation, persistAttempt);
+    let timeoutId: ReturnType<typeof setTimeout> | undefined;
+    const outcome = await Promise.race([
+      persist.then((ok) => ({ kind: "done" as const, ok }), () => ({ kind: "done" as const, ok: false })),
+      new Promise<{ kind: "timeout" }>((resolve) => {
+        timeoutId = setTimeout(() => {
+          // Invalidate before resolving timeout so a held persist cannot append after we fail closed.
+          this.abortSourceSealPersist();
+          resolve({ kind: "timeout" });
+        }, remaining() || 0);
+      }),
+    ]);
+    if (timeoutId) clearTimeout(timeoutId);
+    if (outcome.kind === "timeout") {
+      this.abortSourceSealPersist();
+      return { sealed: false, reason: "SOURCE_SEAL_TIMEOUT" };
+    }
+    if (!outcome.ok) return { sealed: false, reason: "SOURCE_SEAL_PERSIST_FAILED" };
     const persisted = await loadSourceSeal(this.journal, experiment.id);
     if (!persisted) return { sealed: false, reason: "SOURCE_SEAL_PERSIST_FAILED" };
     this.sourceSealed = true;
     this.sourceSealing = false;
     return { sealed: true, reason: null };
+  }
+
+  private abortSourceSealPersist(): void {
+    this.sourceSealPersistCancelled = true;
+    this.sourceSealPersistAttempt += 1;
+    this.sourceSealGeneration += 1;
+  }
+
+  private sourceSealPersistStillValid(generation: number, persistAttempt: number): boolean {
+    return !this.sourceSealPersistCancelled
+      && generation === this.sourceSealGeneration
+      && persistAttempt === this.sourceSealPersistAttempt;
+  }
+
+  private async persistSourceSeal(
+    experiment: { id: string; startedAt?: string | null; completedAt?: string | null },
+    generation: number,
+    persistAttempt: number,
+  ): Promise<boolean> {
+    if (this.sourceSealPersistHold) await this.sourceSealPersistHold;
+    if (!this.sourceSealPersistStillValid(generation, persistAttempt)) return false;
+    if (remainingSealMs(this.sourceSealDeadlineAt) <= 0) {
+      this.abortSourceSealPersist();
+      return false;
+    }
+    if (!this.sourceSealPersistStillValid(generation, persistAttempt)) return false;
+    await this.safeAppend(createSourceSealEvent({
+      experimentId: experiment.id,
+      startedAt: experiment.startedAt,
+      completedAt: experiment.completedAt,
+    }));
+    if (!this.sourceSealPersistStillValid(generation, persistAttempt)) return false;
+    return Boolean(await loadSourceSeal(this.journal, experiment.id));
   }
 
   private async writeFinalReport(): Promise<void> {
@@ -2569,6 +2679,10 @@ export class EngineService {
       streamed.summary.truncated = streamed.scan.truncated || streamed.scan.interrupted;
       streamed.summary.truncatedReason = streamed.summary.truncated ? (streamed.scan.truncatedReason ?? "SCAN_CEILING") : null;
       if (!streamed.summary.complete || streamed.summary.truncated) {
+        this.reportGenerated = false;
+        return;
+      }
+      if (experiment.status === "COMPLETED" && !(await loadSourceSeal(this.journal, experiment.id))) {
         this.reportGenerated = false;
         return;
       }
@@ -2706,7 +2820,10 @@ export class EngineService {
   setProcessTriggerHoldForTest(hold: Promise<void> | null): void { this.processTriggerHold = hold; }
   setTriggerEventPersistHoldForTest(hold: Promise<void> | null): void { this.triggerEventPersistHold = hold; }
   setSourceSealTimeoutForTest(ms: number): void { this.sourceSealTimeoutMs = Math.max(1, ms); }
-  sourceSealStateForTest() { return { sealing: this.sourceSealing, sealed: this.sourceSealed }; }
+  setSourceSealPersistHoldForTest(hold: Promise<void> | null): void { this.sourceSealPersistHold = hold; }
+  setGrokClaimHoldForTest(hold: Promise<void> | null): void { this.grokClaimHold = hold; }
+  researchIngressInFlightForTest() { return this.researchIngressInFlight; }
+  sourceSealStateForTest() { return { sealing: this.sourceSealing, sealed: this.sourceSealed, generation: this.sourceSealGeneration }; }
   async completeExperimentForTest(): Promise<void> {
     if (!this.experiment) throw new Error("NO_EXPERIMENT");
     await this.commitExperimentStatus({

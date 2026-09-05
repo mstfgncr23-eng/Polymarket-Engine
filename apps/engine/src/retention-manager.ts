@@ -258,7 +258,7 @@ export class RetentionManager {
       drains.push({
         cls: "checkpoint",
         exhausted: false,
-        work: () => this.journal.pruneOldCheckpoints(this.config.checkpointKeep),
+        work: (limit) => this.journal.pruneOldCheckpoints(this.config.checkpointKeep, limit),
       });
 
       let progressed = true;
