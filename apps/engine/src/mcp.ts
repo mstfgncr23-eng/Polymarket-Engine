@@ -12,9 +12,11 @@ import {
   GrokSignalValidationError,
   type GrokSignalSubmission,
 } from "@pm/core";
-import { createJournalEvent, queryEventsPaged, type EventJournal } from "@pm/db";
+import { createJournalEvent, isCanonicalFinalReport, type EventJournal } from "@pm/db";
 import type { EngineMetrics } from "./metrics.js";
+import { streamExperimentSummary, summaryFromDurableReport } from "./final-report.js";
 import { buildExperimentSummary, filterCurrentExperimentEvents } from "./report.js";
+import { SharedResultFlight } from "./runtime-supervisor.js";
 import type { EngineStateStore } from "./state.js";
 
 export interface McpConfig {
@@ -91,6 +93,12 @@ let strategyMetricsCache: {
   experimentId: string;
   value: ReturnType<typeof buildExperimentSummary>;
 } | null = null;
+
+const completeMetricsFlight = new SharedResultFlight<ReturnType<typeof buildExperimentSummary>>();
+
+export function resetStrategyMetricsCacheForTest(): void {
+  strategyMetricsCache = null;
+}
 
 export const FORBIDDEN_MCP_TRADE_TOOLS = new Set([
   "place_order", "submit_order", "create_order", "cancel_order", "replace_order",
@@ -317,7 +325,7 @@ export function createGrokMcpServer(clientId: string, dependencies: McpDependenc
   });
 
   server.registerTool("get_strategy_metrics", {
-    description: "Read journal-derived paper strategy and experiment performance. scope=rolling is a recent window; scope=complete paginates the full experiment.",
+    description: "Read paper strategy metrics. scope=rolling is a bounded recent window. scope=complete prefers the durable final report when the experiment is completed; a running experiment streams with a bounded accumulator and coalesces concurrent callers.",
     inputSchema: { scope: z.enum(["rolling", "complete"]).default("rolling") }, annotations: readOnly,
   }, async ({ scope }) => {
     const now = Date.now();
@@ -330,28 +338,43 @@ export function createGrokMcpServer(clientId: string, dependencies: McpDependenc
       && strategyMetricsCache.experimentId === experimentId
       && now - strategyMetricsCache.at < 15_000
     ) return toolResult(strategyMetricsCache.value);
-    const window = {
-      from: startedAt ? new Date(startedAt) : undefined,
-      to: completedAt ? new Date(completedAt) : undefined,
+    const experiment = { id: experimentId, startedAt, completedAt };
+    const readComplete = async () => {
+      if (completedAt) {
+        const persisted = await dependencies.journal.loadExperimentReport(experimentId, "final");
+        if (persisted && isCanonicalFinalReport(persisted)) return summaryFromDurableReport(persisted);
+      }
+      const work = async () => {
+        const streamed = await streamExperimentSummary(dependencies.journal, experiment, {
+          status: dependencies.state.experimentStatus ?? "unknown",
+          reportKind: "final",
+          metricsScope: "complete",
+          complete: Boolean(startedAt),
+        });
+        dependencies.metrics.reportScanPages.observe(streamed.scan.pages);
+        dependencies.metrics.reportScanEvents.observe(streamed.scan.scanned);
+        dependencies.metrics.reportScanDuration.observe(streamed.scan.durationMs / 1000);
+        dependencies.metrics.reportAccumulatorHighWaterBytes.set(streamed.accumulatorHighWaterBytes);
+        streamed.summary.complete = streamed.scan.complete && Boolean(startedAt) && !streamed.scan.interrupted;
+        streamed.summary.truncated = streamed.scan.truncated || streamed.scan.interrupted;
+        streamed.summary.truncatedReason = streamed.summary.truncated ? (streamed.scan.truncatedReason ?? "SCAN_CEILING") : null;
+        return streamed.summary;
+      };
+      if (completeMetricsFlight.inFlight) dependencies.metrics.completeMetricsCoalesced.inc();
+      return completeMetricsFlight.run(() => dependencies.heavyRead ? dependencies.heavyRead(work) : work());
     };
-    const scan = scope === "complete"
-      ? await (dependencies.heavyRead
-        ? dependencies.heavyRead(() => queryEventsPaged(dependencies.journal, { types: DECISION_EVENT_TYPES, ...window }))
-        : queryEventsPaged(dependencies.journal, { types: DECISION_EVENT_TYPES, ...window }))
-      : { events: await (dependencies.heavyRead
-        ? dependencies.heavyRead(() => dependencies.journal.queryEvents({ types: DECISION_EVENT_TYPES, ...window, limit: 500, order: "desc" as const }))
-        : dependencies.journal.queryEvents({ types: DECISION_EVENT_TYPES, ...window, limit: 500, order: "desc" })), complete: true, truncated: false };
-    const scoped = filterCurrentExperimentEvents(scan.events, {
-      id: experimentId, startedAt, completedAt,
-    });
-    const summary = buildExperimentSummary(scoped, experimentId, {
-      status: dependencies.state.experimentStatus ?? "unknown",
-      reportKind: scope === "complete" ? "final" : "interim",
-      metricsScope: scope,
-      complete: scope === "complete" && scan.complete && Boolean(startedAt),
-      truncated: scan.truncated,
-      truncatedReason: scan.truncated ? "SCAN_CEILING" : null,
-    });
+    const summary = scope === "complete"
+      ? await readComplete()
+      : buildExperimentSummary(
+        filterCurrentExperimentEvents(
+          await (dependencies.heavyRead
+            ? dependencies.heavyRead(() => dependencies.journal.queryEvents({ types: DECISION_EVENT_TYPES, from: startedAt ? new Date(startedAt) : undefined, to: completedAt ? new Date(completedAt) : undefined, limit: 500, order: "desc" }))
+            : dependencies.journal.queryEvents({ types: DECISION_EVENT_TYPES, from: startedAt ? new Date(startedAt) : undefined, to: completedAt ? new Date(completedAt) : undefined, limit: 500, order: "desc" })),
+          experiment,
+        ),
+        experimentId,
+        { status: dependencies.state.experimentStatus ?? "unknown", reportKind: "interim", metricsScope: "rolling", complete: true, truncated: false },
+      );
     strategyMetricsCache = { at: now, scope, experimentId, value: summary };
     return toolResult(summary);
   });

@@ -343,6 +343,78 @@ export class EngineMetrics {
     registers: [this.registry],
   });
 
+  readonly retentionDeleted = new Counter({
+    name: "retention_deleted_total",
+    help: "Journal/idempotency/checkpoint rows deleted by the bounded retention manager",
+    labelNames: ["class"],
+    registers: [this.registry],
+  });
+  readonly retentionFailures = new Counter({
+    name: "retention_failures_total",
+    help: "Retention cycle failures (trading state is not mutated by retention)",
+    registers: [this.registry],
+  });
+  readonly retentionRuns = new Counter({
+    name: "retention_runs_total",
+    help: "Retention manager cycles that were not skipped for overlap",
+    registers: [this.registry],
+  });
+  readonly retentionLastSuccessUnix = new Gauge({
+    name: "retention_last_success_unix_seconds",
+    help: "Unix timestamp of the last successful retention cycle",
+    registers: [this.registry],
+  });
+  readonly retentionBatchSize = new Histogram({
+    name: "retention_batch_size",
+    help: "Rows deleted in one bounded retention batch",
+    buckets: [1, 5, 10, 25, 50, 100, 200, 500],
+    registers: [this.registry],
+  });
+  readonly retentionBatchDuration = new Histogram({
+    name: "retention_batch_duration_seconds",
+    help: "Wall time of one bounded retention batch",
+    buckets: DURATION_BUCKETS,
+    registers: [this.registry],
+  });
+  readonly reportScanPages = new Histogram({
+    name: "experiment_report_scan_pages",
+    help: "Keyset pages visited while building a streamed experiment summary",
+    buckets: [1, 2, 5, 10, 25, 50, 100, 250, 500],
+    registers: [this.registry],
+  });
+  readonly reportScanEvents = new Histogram({
+    name: "experiment_report_scan_events",
+    help: "Events visited while building a streamed experiment summary (logical, not retained)",
+    buckets: [1, 10, 100, 1_000, 10_000, 50_000, 100_000, 500_000],
+    registers: [this.registry],
+  });
+  readonly reportScanDuration = new Histogram({
+    name: "experiment_report_scan_duration_seconds",
+    help: "Streamed experiment summary scan duration",
+    buckets: DURATION_BUCKETS,
+    registers: [this.registry],
+  });
+  readonly reportAccumulatorHighWaterBytes = new Gauge({
+    name: "experiment_report_accumulator_high_water_bytes",
+    help: "Estimated bounded accumulator high-water mark for the last complete-scope scan",
+    registers: [this.registry],
+  });
+  readonly finalReportPersistFailures = new Counter({
+    name: "experiment_report_persist_failures_total",
+    help: "Canonical experiment report persist failures (filesystem export failures are separate)",
+    registers: [this.registry],
+  });
+  readonly finalReportFsExportFailures = new Counter({
+    name: "experiment_report_fs_export_failures_total",
+    help: "Optional /app/reports filesystem export failures after a successful canonical persist",
+    registers: [this.registry],
+  });
+  readonly completeMetricsCoalesced = new Counter({
+    name: "strategy_metrics_complete_coalesced_total",
+    help: "Concurrent get_strategy_metrics(scope=complete) callers that shared one scan",
+    registers: [this.registry],
+  });
+
   readonly runtimeWorkQueueDepth = new Gauge({
     name: "runtime_work_queue_depth",
     help: "Admitted trigger work waiting for a RuntimeSupervisor worker",
@@ -553,6 +625,14 @@ export class EngineMetrics {
     this.sseSlowClientDisconnects.inc({ reason: "persistent_backpressure" }, 0);
     this.discoverySingleflightDirty.set(0);
     this.maintenanceSingleflightDirty.set(0);
+    for (const cls of ["raw_telemetry", "monitor_control", "mcp_idempotency", "checkpoint"] as const) {
+      this.retentionDeleted.inc({ class: cls }, 0);
+    }
+    this.retentionLastSuccessUnix.set(0);
+    this.reportAccumulatorHighWaterBytes.set(0);
+    this.finalReportPersistFailures.inc(0);
+    this.finalReportFsExportFailures.inc(0);
+    this.completeMetricsCoalesced.inc(0);
     this.journalDirectWaiting.set(0);
     this.journalDirectActive.set(0);
     this.journalDirectActiveCritical.set(0);

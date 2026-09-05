@@ -24,7 +24,7 @@ flowchart LR
   C --> R[Deterministic risk veto\norder / market / asset / portfolio]
   R --> X[Conservative paper execution]
   X --> L[Ledger + positions]
-  E --> J[(PostgreSQL append-only journal\n+ checkpoints)]
+  E --> J[(PostgreSQL journal + durable_transitions\n+ experiment_reports)]
   L --> J
   E --> API[Fastify REST + SSE + /health /ready /metrics]
   API --> D[Separate Next.js dashboard]
@@ -226,7 +226,8 @@ Dashboard: `http://localhost:3000`; engine liveness/readiness/metrics: `http://l
 | `ENGINE_INTERNAL_URL` | Dashboard server-to-engine URL; not `NEXT_PUBLIC_*` |
 | `ENGINE_REGION` | Runtime metadata; `fra` default |
 | `GIT_SHA` | Recorded in experiment manifest |
-| `REPORT_DIRECTORY` | Automatic summary output, default `reports` |
+| `REPORT_DIRECTORY` | Optional ephemeral 48h JSON/Markdown export; canonical final report is `experiment_reports` in Postgres |
+| `RETENTION_*` | Bounded journal/checkpoint/idempotency TTLs. See [docs/RETENTION.md](docs/RETENTION.md). Defaults: telemetry 6h, monitor 24h, completed grace 7d. `durable_transitions` is never pruned. |
 
 Do not put wallet keys, signing keys, OpenAI keys, or Polymarket private credentials in this milestone. This repository does not create or provision xAI credentials and does not call an xAI inference API.
 
@@ -245,7 +246,8 @@ pnpm build                 # engine bundle + standalone Next dashboard
 pnpm smoke                 # deterministic fixture: consensus -> fill -> ledger
 pnpm smoke:live            # public Polymarket crypto discovery + reference feeds; no orders/agents
 pnpm --filter @pm/engine smoke:discovery  # closest 20 directional crypto markets by expiry
-pnpm report                # rebuild reports/48h-summary.{json,md} from DATABASE_URL journal
+pnpm report                # stream a bounded summary; persist canonical row in Postgres; optional reports/ export
+pnpm bench:retention       # report/retention boundedness diagnostic (not a capacity claim)
 ```
 
 Tests cover pair/PnL math, fee curve, slippage/VWAP, exposure/accounting, consensus, stale/expired/budget/risk vetoes, maker/taker execution, insufficient depth, trigger dedupe, Grok unavailable continuity, malformed/duplicate/stale/unauthorized MCP behavior, forbidden trade-tool rejection, journal outage/recovery, reconnect backoff, feed parsing, exact-six topology, the hard live-order gate, multi-market isolation, Grok activation bridge/dedupe/rate limits, and identity-binding regressions.

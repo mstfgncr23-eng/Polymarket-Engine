@@ -100,6 +100,17 @@ export const engineEnvSchema = z.object({
   DASHBOARD_SNAPSHOT_HZ: z.coerce.number().positive().default(4),
   ACTIVATION_FANOUT: z.coerce.number().int().positive().default(3),
   ACTIVATION_MEMORY_LIMIT: z.coerce.number().int().positive().default(500),
+  RETENTION_ENABLED: z.preprocess(
+    (value) => value === undefined ? undefined : value === true || value === "true" || value === "1",
+    z.boolean().optional(),
+  ).default(true),
+  RETENTION_TELEMETRY_TTL_MS: z.coerce.number().int().positive().default(6 * 60 * 60_000),
+  RETENTION_MONITOR_TTL_MS: z.coerce.number().int().positive().default(24 * 60 * 60_000),
+  RETENTION_COMPLETED_GRACE_MS: z.coerce.number().int().positive().default(7 * 24 * 60 * 60_000),
+  RETENTION_MCP_IDEMPOTENCY_TTL_MS: z.coerce.number().int().positive().default(24 * 60 * 60_000),
+  RETENTION_CHECKPOINT_KEEP: z.coerce.number().int().min(1).max(64).default(8),
+  RETENTION_BATCH_SIZE: z.coerce.number().int().positive().default(200),
+  RETENTION_CYCLE_BUDGET_MS: z.coerce.number().int().positive().default(250),
 });
 export type EngineEnv = z.infer<typeof engineEnvSchema>;
 

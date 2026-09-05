@@ -4,16 +4,17 @@ import {
   TemporalPairHedgeStrategy,
   buildConsensus,
   createId,
-  DECISION_EVENT_TYPES,
   defaultConsensusConfig,
   executePaperTaker,
   feeScheduleSchema,
   marketSnapshotSchema,
   paperOrderSchema,
 } from "@pm/core";
-import { MemoryEventJournal, PostgresEventJournal, queryEventsPaged } from "@pm/db";
+import { MemoryEventJournal, PostgresEventJournal } from "@pm/db";
+import { persistCanonicalFinalReport, streamExperimentSummary } from "./final-report.js";
+import { applyJournalCleanup, dryRunJournalCleanup } from "./journal-cleanup.js";
 import { PolymarketMarketDataAdapter, ReferenceFeedRegistry, createRestProbe } from "@pm/market-data";
-import { buildExperimentSummary, filterCurrentExperimentEvents, writeExperimentSummary } from "./report.js";
+import { writeExperimentSummary } from "./report.js";
 import { startRuntime } from "./runtime.js";
 
 const command = process.argv[2] ?? "help";
@@ -29,21 +30,42 @@ if (command === "experiment:start") {
     ? new PostgresEventJournal(process.env.DATABASE_URL, process.env.DB_MIGRATIONS_DIR ?? resolve(process.cwd(), "packages/db/migrations"))
     : new MemoryEventJournal();
   await journal.initialize();
-  const scan = await queryEventsPaged(journal, { types: DECISION_EVENT_TYPES });
   const experimentId = process.env.EXPERIMENT_ID ?? "no-persisted-memory-experiment";
-  const scoped = filterCurrentExperimentEvents(scan.events, {
+  const first = await journal.queryEventsKeyset({ types: ["EXPERIMENT_STARTED", "ENGINE_STARTED"], limit: 1 });
+  const streamed = await streamExperimentSummary(journal, {
     id: experimentId,
-    startedAt: process.env.EXPERIMENT_STARTED_AT ?? scan.events[0]?.occurredAt ?? null,
+    startedAt: process.env.EXPERIMENT_STARTED_AT ?? first[0]?.occurredAt ?? new Date(0).toISOString(),
     completedAt: process.env.EXPERIMENT_COMPLETED_AT ?? null,
-  });
-  const summary = buildExperimentSummary(
-    scoped,
-    experimentId,
-    { reportKind: "final", metricsScope: "complete", complete: scan.complete, truncated: scan.truncated, truncatedReason: scan.truncated ? "SCAN_CEILING" : null },
-  );
-  const paths = await writeExperimentSummary(summary, resolve(process.cwd(), "reports"));
+  }, { reportKind: "final", metricsScope: "complete" });
+  streamed.summary.complete = streamed.scan.complete && !streamed.scan.interrupted;
+  streamed.summary.truncated = streamed.scan.truncated || streamed.scan.interrupted;
+  if (process.env.DATABASE_URL && streamed.summary.complete && !streamed.summary.truncated) {
+    await persistCanonicalFinalReport(journal, { summary: streamed.summary, scan: streamed.scan }).catch(() => undefined);
+  }
+  const paths = await writeExperimentSummary(streamed.summary, resolve(process.cwd(), "reports"));
   await journal.close();
-  console.log(JSON.stringify(paths));
+  console.log(JSON.stringify({ ...paths, complete: streamed.summary.complete, pages: streamed.scan.pages, scanned: streamed.scan.scanned }));
+} else if (command === "journal-cleanup") {
+  const apply = process.argv.includes("--apply");
+  const confirm = process.argv.includes("--i-understand-destructive");
+  if (!process.env.DATABASE_URL) throw new Error("DATABASE_URL_REQUIRED_FOR_JOURNAL_CLEANUP");
+  const journal = new PostgresEventJournal(process.env.DATABASE_URL, process.env.DB_MIGRATIONS_DIR ?? resolve(process.cwd(), "packages/db/migrations"));
+  await journal.initialize();
+  const experiment = process.env.EXPERIMENT_ID
+    ? { id: process.env.EXPERIMENT_ID, status: process.env.EXPERIMENT_STATUS ?? "UNKNOWN" }
+    : null;
+  if (!apply) {
+    const dry = await dryRunJournalCleanup(journal, new Date(), experiment);
+    await journal.close();
+    console.log(JSON.stringify(dry, null, 2));
+  } else {
+    if (!confirm) throw new Error("JOURNAL_CLEANUP_APPLY_REQUIRES_--i-understand-destructive");
+    const result = await applyJournalCleanup(journal, {
+      experiment, confirm: "I_UNDERSTAND_DESTRUCTIVE_CLEANUP",
+    });
+    await journal.close();
+    console.log(JSON.stringify(result, null, 2));
+  }
 } else if (command === "smoke") {
   const now = new Date();
   const traceId = createId("trace");
@@ -173,5 +195,5 @@ if (command === "experiment:start") {
   console.log(JSON.stringify(result, null, 2));
   if (!result.ok) process.exitCode = 1;
 } else {
-  console.log("Usage: tsx src/cli.ts <smoke|live-feed-smoke|live-discovery-diag|experiment:start|report>");
+  console.log("Usage: tsx src/cli.ts <smoke|live-feed-smoke|live-discovery-diag|experiment:start|report|journal-cleanup>");
 }

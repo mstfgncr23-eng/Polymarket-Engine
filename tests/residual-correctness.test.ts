@@ -8,6 +8,7 @@ import {
   parsePublicBinaryResolution,
   riskLimitsSchema,
   type JournalEvent,
+  type JournalKeysetQuery,
   type JournalQuery,
   type TriggerEvent,
 } from "@pm/core";
@@ -97,12 +98,12 @@ describe("final-report retry", () => {
   it("does not set reportGenerated until the report actually succeeds, then retries", async () => {
     class FlakyJournal extends MemoryEventJournal {
       failures = 1;
-      override async queryEvents(query: JournalQuery) {
+      override async queryEventsKeyset(query: JournalKeysetQuery) {
         if (this.failures > 0) {
           this.failures -= 1;
           throw new Error("QUERY_FAILED");
         }
-        return super.queryEvents(query);
+        return super.queryEventsKeyset(query);
       }
     }
     let nowMs = Date.parse("2026-09-01T00:00:00.000Z");

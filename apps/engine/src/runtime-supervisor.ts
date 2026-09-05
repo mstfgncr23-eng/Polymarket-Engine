@@ -769,6 +769,24 @@ export class SingleFlight {
   }
 }
 
+/** Coalesce concurrent callers onto one in-flight promise; all waiters share the result. */
+export class SharedResultFlight<T> {
+  private inflight: Promise<T> | null = null;
+  coalesced = 0;
+
+  async run(work: () => Promise<T>): Promise<T> {
+    if (this.inflight) {
+      this.coalesced += 1;
+      return this.inflight;
+    }
+    const cycle = work().finally(() => { this.inflight = null; });
+    this.inflight = cycle;
+    return cycle;
+  }
+
+  get inFlight(): boolean { return this.inflight != null; }
+}
+
 export class FiniteSemaphore {
   private active = 0;
   private readonly waiters: Array<{ resolve: () => void; reject: (error: unknown) => void }> = [];

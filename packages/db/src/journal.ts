@@ -3,8 +3,9 @@ import { drizzle } from "drizzle-orm/postgres-js";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
 import postgres from "postgres";
 import {
-  compareJournalEventOrder, createId, EVENT_PAGE_SIZE, EVENT_SCAN_CEILING, journalEventSchema,
-  sortJournalEventsChronologically, type JournalEvent, type JournalQuery,
+  compareJournalEventOrder, createId, EVENT_PAGE_SIZE, EVENT_SCAN_CEILING, isProtectedJournalType,
+  journalEventSchema, sortJournalEventsChronologically,
+  type JournalEvent, type JournalKeysetCursor, type JournalKeysetQuery, type JournalQuery,
 } from "@pm/core";
 import {
   CheckpointFenceError,
@@ -17,7 +18,15 @@ import {
   type DurableTransition,
   type DurableTransitionInput,
 } from "./durable.js";
-import { durableTransitions, engineCheckpoints, journalEvents, mcpIdempotencyKeys } from "./schema.js";
+import {
+  ExperimentReportConflictError,
+  hashExperimentReport,
+  type DurableExperimentReport,
+  type DurableExperimentReportInput,
+  type PersistReportResult,
+} from "./reports.js";
+import { durableTransitions, engineCheckpoints, experimentReports, journalEvents, mcpIdempotencyKeys } from "./schema.js";
+import { SchemaVerificationError, verifyRequiredSchema } from "./schema-verify.js";
 
 export interface EngineCheckpoint {
   id: string;
@@ -33,10 +42,24 @@ export interface EventJournal {
   append(event: JournalEvent): Promise<void>;
   appendMany(events: readonly JournalEvent[]): Promise<void>;
   readTrace(traceId: string): Promise<JournalEvent[]>;
+  readTracePage(traceId: string, input: { after?: JournalKeysetCursor; limit: number }): Promise<{ events: JournalEvent[]; nextCursor: JournalKeysetCursor | null }>;
   readAll(): Promise<JournalEvent[]>;
   queryEvents(query: JournalQuery): Promise<JournalEvent[]>;
+  queryEventsKeyset(query: JournalKeysetQuery): Promise<JournalEvent[]>;
+  peekLatestKeyset(query: Omit<JournalKeysetQuery, "limit" | "after" | "through">): Promise<JournalKeysetCursor | null>;
   countByType(types?: readonly string[]): Promise<Record<string, number>>;
   claimIdempotency(scope: string, key: string): Promise<boolean>;
+  pruneIdempotencyKeys(olderThan: Date, limit: number): Promise<{ deleted: number }>;
+  idempotencyCreatedAt(scope: string, key: string): Promise<string | null>;
+  persistExperimentReport(input: DurableExperimentReportInput): Promise<PersistReportResult>;
+  loadExperimentReport(experimentId: string, reportKind?: "final"): Promise<DurableExperimentReport | null>;
+  deleteJournalEventsBounded(input: {
+    types: readonly string[];
+    occurredBefore: Date;
+    limit: number;
+  }): Promise<{ deleted: number }>;
+  pruneOldCheckpoints(keepLatest: number): Promise<{ deleted: number; latestSequence: number | null }>;
+  listCheckpoints(): Promise<EngineCheckpoint[]>;
   commitDurableTransition(input: DurableTransitionInput, expectedPreviousSequence: number): Promise<DurableCommitResult>;
   readDurableTransitionsAfter(sequence: number, limit: number): Promise<DurableTransition[]>;
   readDurableByOperationKey(operationKey: string): Promise<DurableTransition | null>;
@@ -49,7 +72,8 @@ export interface EventJournal {
 export class MemoryEventJournal implements EventJournal {
   private readonly events: JournalEvent[] = [];
   private readonly checkpoints: EngineCheckpoint[] = [];
-  private readonly idempotencyKeys = new Set<string>();
+  private readonly idempotencyKeys = new Map<string, string>();
+  private readonly reports = new Map<string, DurableExperimentReport>();
   private readonly durableRows: DurableTransition[] = [];
   private readonly durableByKey = new Map<string, DurableTransition>();
   private durableChain = Promise.resolve();
@@ -70,6 +94,19 @@ export class MemoryEventJournal implements EventJournal {
     for (const event of events) await this.append(event);
   }
   async readTrace(traceId: string): Promise<JournalEvent[]> { return structuredClone(this.events.filter((event) => event.traceId === traceId)); }
+  async readTracePage(traceId: string, input: { after?: JournalKeysetCursor; limit: number }): Promise<{ events: JournalEvent[]; nextCursor: JournalKeysetCursor | null }> {
+    const limit = Math.max(1, input.limit);
+    const rows = this.events.filter((event) => event.traceId === traceId).sort(compareJournalEventOrder);
+    const start = input.after
+      ? rows.findIndex((event) => compareJournalEventOrder(event, input.after!) > 0)
+      : 0;
+    const slice = start < 0 ? [] : rows.slice(start, start + limit);
+    const last = slice[slice.length - 1];
+    return {
+      events: structuredClone(slice),
+      nextCursor: last && slice.length === limit ? { occurredAt: last.occurredAt, id: last.id } : null,
+    };
+  }
   async readAll(): Promise<JournalEvent[]> { return structuredClone(this.events); }
   async queryEvents(query: JournalQuery): Promise<JournalEvent[]> {
     let rows = this.events;
@@ -95,12 +132,94 @@ export class MemoryEventJournal implements EventJournal {
     }
     return counts;
   }
+  async queryEventsKeyset(query: JournalKeysetQuery): Promise<JournalEvent[]> {
+    const rows = this.filterKeyset(query).sort(compareJournalEventOrder).slice(0, Math.max(1, query.limit));
+    return structuredClone(rows);
+  }
+  async peekLatestKeyset(query: Omit<JournalKeysetQuery, "limit" | "after" | "through">): Promise<JournalKeysetCursor | null> {
+    const rows = this.filterKeyset({ ...query, limit: 1 }).sort(compareJournalEventOrder);
+    const last = rows[rows.length - 1];
+    return last ? { occurredAt: last.occurredAt, id: last.id } : null;
+  }
   async claimIdempotency(scope: string, key: string): Promise<boolean> {
     if (!this.available) throw new Error("DATABASE_UNAVAILABLE");
     const composite = `${scope}\u0000${key}`;
     if (this.idempotencyKeys.has(composite)) return false;
-    this.idempotencyKeys.add(composite);
+    this.idempotencyKeys.set(composite, new Date().toISOString());
     return true;
+  }
+  async pruneIdempotencyKeys(olderThan: Date, limit: number): Promise<{ deleted: number }> {
+    const cutoff = olderThan.toISOString();
+    const victims = [...this.idempotencyKeys.entries()]
+      .filter(([, createdAt]) => createdAt < cutoff)
+      .sort((a, b) => a[1].localeCompare(b[1]))
+      .slice(0, Math.max(1, limit));
+    for (const [key] of victims) this.idempotencyKeys.delete(key);
+    return { deleted: victims.length };
+  }
+  async idempotencyCreatedAt(scope: string, key: string): Promise<string | null> {
+    return this.idempotencyKeys.get(`${scope}\u0000${key}`) ?? null;
+  }
+  async persistExperimentReport(input: DurableExperimentReportInput): Promise<PersistReportResult> {
+    const hash = input.contentHash || hashExperimentReport(input);
+    const key = `${input.experimentId}:${input.reportKind}`;
+    const existing = this.reports.get(key);
+    if (existing) {
+      if (existing.contentHash !== hash) throw new ExperimentReportConflictError(input.experimentId, existing.contentHash, hash);
+      return { inserted: false, existing: true, report: structuredClone(existing) };
+    }
+    const stored: DurableExperimentReport = { ...structuredClone(input), contentHash: hash, persistedAt: new Date().toISOString() };
+    this.reports.set(key, stored);
+    return { inserted: true, existing: false, report: structuredClone(stored) };
+  }
+  async loadExperimentReport(experimentId: string, reportKind: "final" = "final"): Promise<DurableExperimentReport | null> {
+    const existing = this.reports.get(`${experimentId}:${reportKind}`);
+    return existing ? structuredClone(existing) : null;
+  }
+  async deleteJournalEventsBounded(input: { types: readonly string[]; occurredBefore: Date; limit: number }): Promise<{ deleted: number }> {
+    if (input.types.some((type) => isProtectedJournalType(type))) {
+      throw new Error("RETENTION_REFUSED_PROTECTED_TYPES");
+    }
+    const cutoff = input.occurredBefore.toISOString();
+    const victims = this.events
+      .filter((event) => input.types.includes(event.type) && event.occurredAt < cutoff)
+      .sort(compareJournalEventOrder)
+      .slice(0, Math.max(1, input.limit));
+    const ids = new Set(victims.map((event) => event.id));
+    for (let index = this.events.length - 1; index >= 0; index -= 1) {
+      if (ids.has(this.events[index]!.id)) this.events.splice(index, 1);
+    }
+    return { deleted: victims.length };
+  }
+  async pruneOldCheckpoints(keepLatest: number): Promise<{ deleted: number; latestSequence: number | null }> {
+    const keep = Math.max(1, keepLatest);
+    const ordered = [...this.checkpoints].sort((a, b) => b.sequence - a.sequence);
+    const latest = ordered[0]?.sequence ?? null;
+    const retained = new Set(ordered.slice(0, keep).map((row) => row.id));
+    const before = this.checkpoints.length;
+    for (let index = this.checkpoints.length - 1; index >= 0; index -= 1) {
+      const row = this.checkpoints[index]!;
+      if (!retained.has(row.id) && row.sequence !== latest) this.checkpoints.splice(index, 1);
+    }
+    return { deleted: before - this.checkpoints.length, latestSequence: latest };
+  }
+  async listCheckpoints(): Promise<EngineCheckpoint[]> {
+    return structuredClone(this.checkpoints);
+  }
+
+  private filterKeyset(query: Omit<JournalKeysetQuery, "limit"> & { limit?: number }): JournalEvent[] {
+    let rows = this.events;
+    if (query.types && query.types.length > 0) rows = rows.filter((event) => query.types!.includes(event.type));
+    if (query.experimentId) {
+      rows = rows.filter((event) => event.aggregateId === query.experimentId
+        || (event.payload as { experimentId?: unknown }).experimentId === query.experimentId);
+    }
+    if (query.from) rows = rows.filter((event) => new Date(event.occurredAt).getTime() >= query.from!.getTime());
+    if (query.to) rows = rows.filter((event) => new Date(event.occurredAt).getTime() <= query.to!.getTime());
+    if (query.recordedAtTo) rows = rows.filter((event) => new Date(event.recordedAt).getTime() <= query.recordedAtTo!.getTime());
+    if (query.after) rows = rows.filter((event) => compareJournalEventOrder(event, query.after!) > 0);
+    if (query.through) rows = rows.filter((event) => compareJournalEventOrder(event, query.through!) <= 0);
+    return rows;
   }
   async commitDurableTransition(input: DurableTransitionInput, expectedPreviousSequence: number): Promise<DurableCommitResult> {
     return this.withDurableLock(() => this.commitDurableTransitionUnlocked(input, expectedPreviousSequence));
@@ -210,7 +329,16 @@ export class PostgresEventJournal implements EventJournal {
     this.db = drizzle(this.client);
   }
 
-  async initialize(): Promise<void> { await migrate(this.db, { migrationsFolder: this.migrationsFolder }); }
+  async initialize(): Promise<void> {
+    await migrate(this.db, { migrationsFolder: this.migrationsFolder });
+    await this.verifySchema();
+  }
+  async verifySchema(): Promise<void> {
+    await verifyRequiredSchema(async <T extends Record<string, unknown>>(sql: string) => {
+      const rows = await this.client.unsafe(sql);
+      return rows as unknown as T[];
+    });
+  }
   async healthCheck(): Promise<boolean> {
     try { await this.client`select 1`; return true; } catch { return false; }
   }
@@ -229,8 +357,28 @@ export class PostgresEventJournal implements EventJournal {
     await this.db.insert(journalEvents).values(values).onConflictDoNothing({ target: journalEvents.id });
   }
   async readTrace(traceId: string): Promise<JournalEvent[]> {
-    const rows = await this.db.select().from(journalEvents).where(eq(journalEvents.traceId, traceId));
+    const rows = await this.db.select().from(journalEvents)
+      .where(eq(journalEvents.traceId, traceId))
+      .orderBy(asc(journalEvents.occurredAt), asc(journalEvents.id))
+      .limit(10_000);
     return rows.map(toJournalEvent);
+  }
+  async readTracePage(traceId: string, input: { after?: JournalKeysetCursor; limit: number }): Promise<{ events: JournalEvent[]; nextCursor: JournalKeysetCursor | null }> {
+    const limit = Math.max(1, input.limit);
+    const filters = [eq(journalEvents.traceId, traceId)];
+    if (input.after) {
+      filters.push(sql`(${journalEvents.occurredAt}, ${journalEvents.id}) > (${input.after.occurredAt}::timestamptz, ${input.after.id})`);
+    }
+    const rows = await this.db.select().from(journalEvents)
+      .where(and(...filters))
+      .orderBy(asc(journalEvents.occurredAt), asc(journalEvents.id))
+      .limit(limit);
+    const events = rows.map(toJournalEvent);
+    const last = events[events.length - 1];
+    return {
+      events,
+      nextCursor: last && events.length === limit ? { occurredAt: last.occurredAt, id: last.id } : null,
+    };
   }
   async readAll(): Promise<JournalEvent[]> {
     const rows = await this.db.select().from(journalEvents).limit(10_000);
@@ -264,10 +412,140 @@ export class PostgresEventJournal implements EventJournal {
     }).from(journalEvents).where(filters.length > 0 ? and(...filters) : undefined).groupBy(journalEvents.type);
     return Object.fromEntries(rows.map((row) => [row.type, Number(row.count)]));
   }
+  async queryEventsKeyset(query: JournalKeysetQuery): Promise<JournalEvent[]> {
+    const filters = journalKeysetFilters(query);
+    const rows = await this.db.select().from(journalEvents)
+      .where(filters.length > 0 ? and(...filters) : undefined)
+      .orderBy(asc(journalEvents.occurredAt), asc(journalEvents.id))
+      .limit(Math.max(1, Math.min(query.limit, 20_000)));
+    return rows.map(toJournalEvent);
+  }
+  async peekLatestKeyset(query: Omit<JournalKeysetQuery, "limit" | "after" | "through">): Promise<JournalKeysetCursor | null> {
+    const filters = journalKeysetFilters(query);
+    const rows = await this.db.select({
+      occurredAt: journalEvents.occurredAt,
+      id: journalEvents.id,
+    }).from(journalEvents)
+      .where(filters.length > 0 ? and(...filters) : undefined)
+      .orderBy(desc(journalEvents.occurredAt), desc(journalEvents.id))
+      .limit(1);
+    const row = rows[0];
+    return row ? { occurredAt: row.occurredAt.toISOString(), id: row.id } : null;
+  }
   async claimIdempotency(scope: string, key: string): Promise<boolean> {
     const rows = await this.db.insert(mcpIdempotencyKeys).values({ scope, key })
       .onConflictDoNothing({ target: [mcpIdempotencyKeys.scope, mcpIdempotencyKeys.key] }).returning({ key: mcpIdempotencyKeys.key });
     return rows.length === 1;
+  }
+  async pruneIdempotencyKeys(olderThan: Date, limit: number): Promise<{ deleted: number }> {
+    const cap = Math.max(1, Math.min(limit, 500));
+    const result = await this.client`
+      DELETE FROM mcp_idempotency_keys
+      WHERE (scope, key) IN (
+        SELECT scope, key FROM mcp_idempotency_keys
+        WHERE created_at < ${olderThan}
+        ORDER BY created_at ASC, scope ASC, key ASC
+        LIMIT ${cap}
+      )
+    `;
+    return { deleted: result.count ?? 0 };
+  }
+  async idempotencyCreatedAt(scope: string, key: string): Promise<string | null> {
+    const rows = await this.db.select({ createdAt: mcpIdempotencyKeys.createdAt })
+      .from(mcpIdempotencyKeys)
+      .where(and(eq(mcpIdempotencyKeys.scope, scope), eq(mcpIdempotencyKeys.key, key)))
+      .limit(1);
+    return rows[0]?.createdAt.toISOString() ?? null;
+  }
+  async persistExperimentReport(input: DurableExperimentReportInput): Promise<PersistReportResult> {
+    const hash = input.contentHash || hashExperimentReport(input);
+    return this.db.transaction(async (tx) => {
+      const existingRows = await tx.select().from(experimentReports)
+        .where(and(eq(experimentReports.experimentId, input.experimentId), eq(experimentReports.reportKind, input.reportKind)))
+        .limit(1);
+      const existing = existingRows[0];
+      if (existing) {
+        if (existing.contentHash !== hash) {
+          throw new ExperimentReportConflictError(input.experimentId, existing.contentHash, hash);
+        }
+        return { inserted: false, existing: true, report: toExperimentReport(existing) };
+      }
+      const inserted = await tx.insert(experimentReports).values({
+        experimentId: input.experimentId,
+        reportKind: input.reportKind,
+        schemaVersion: input.schemaVersion,
+        generatedAt: new Date(input.generatedAt),
+        complete: input.complete,
+        truncated: input.truncated,
+        sourceEventCount: input.sourceEventCount,
+        sourceWindowStart: input.sourceWindowStart ? new Date(input.sourceWindowStart) : null,
+        sourceWindowEnd: input.sourceWindowEnd ? new Date(input.sourceWindowEnd) : null,
+        sourceFenceOccurredAt: input.sourceFenceOccurredAt ? new Date(input.sourceFenceOccurredAt) : null,
+        sourceFenceId: input.sourceFenceId,
+        earliestIncludedAt: input.earliestIncludedAt ? new Date(input.earliestIncludedAt) : null,
+        latestIncludedAt: input.latestIncludedAt ? new Date(input.latestIncludedAt) : null,
+        canonicalSummary: input.canonicalSummary,
+        renderedMarkdown: input.renderedMarkdown,
+        contentHash: hash,
+      }).returning();
+      const row = inserted[0];
+      if (!row) throw new Error("EXPERIMENT_REPORT_INSERT_FAILED");
+      return { inserted: true, existing: false, report: toExperimentReport(row) };
+    });
+  }
+  async loadExperimentReport(experimentId: string, reportKind: "final" = "final"): Promise<DurableExperimentReport | null> {
+    const rows = await this.db.select().from(experimentReports)
+      .where(and(eq(experimentReports.experimentId, experimentId), eq(experimentReports.reportKind, reportKind)))
+      .limit(1);
+    return rows[0] ? toExperimentReport(rows[0]) : null;
+  }
+  async deleteJournalEventsBounded(input: { types: readonly string[]; occurredBefore: Date; limit: number }): Promise<{ deleted: number }> {
+    if (input.types.length === 0) return { deleted: 0 };
+    if (input.types.some((type) => isProtectedJournalType(type))) {
+      throw new Error("RETENTION_REFUSED_PROTECTED_TYPES");
+    }
+    const cap = Math.max(1, Math.min(input.limit, 500));
+    const result = await this.client`
+      DELETE FROM journal_events
+      WHERE (occurred_at, id) IN (
+        SELECT occurred_at, id FROM journal_events
+        WHERE type = ANY(${input.types as string[]})
+          AND occurred_at < ${input.occurredBefore}
+        ORDER BY occurred_at ASC, id ASC
+        LIMIT ${cap}
+      )
+    `;
+    return { deleted: result.count ?? 0 };
+  }
+  async pruneOldCheckpoints(keepLatest: number): Promise<{ deleted: number; latestSequence: number | null }> {
+    const keep = Math.max(1, keepLatest);
+    const latestRows = await this.db.select({
+      max: sql<number>`coalesce(max(${engineCheckpoints.sequence}), 0)`,
+    }).from(engineCheckpoints);
+    const latest = Number(latestRows[0]?.max ?? 0);
+    if (latest === 0) return { deleted: 0, latestSequence: null };
+    const result = await this.client`
+      DELETE FROM engine_checkpoints
+      WHERE id IN (
+        SELECT id FROM engine_checkpoints
+        WHERE sequence < ${latest}
+          AND sequence NOT IN (
+            SELECT sequence FROM engine_checkpoints
+            ORDER BY sequence DESC
+            LIMIT ${keep}
+          )
+        ORDER BY sequence ASC
+        LIMIT 200
+      )
+    `;
+    return { deleted: result.count ?? 0, latestSequence: latest };
+  }
+  async listCheckpoints(): Promise<EngineCheckpoint[]> {
+    const rows = await this.db.select().from(engineCheckpoints).orderBy(desc(engineCheckpoints.sequence)).limit(64);
+    return rows.map((row) => ({
+      id: row.id, experimentId: row.experimentId, sequence: row.sequence,
+      payload: row.payload as Record<string, unknown>, createdAt: row.createdAt.toISOString(),
+    }));
   }
   async commitDurableTransition(input: DurableTransitionInput, expectedPreviousSequence: number): Promise<DurableCommitResult> {
     const parsed = durableTransitionInputSchema.parse(input);
@@ -378,6 +656,46 @@ export class PostgresEventJournal implements EventJournal {
   async close(): Promise<void> { await this.client.end({ timeout: 5 }); }
 }
 
+function journalKeysetFilters(query: Omit<JournalKeysetQuery, "limit">): ReturnType<typeof sql>[] {
+  const filters = [];
+  if (query.types && query.types.length > 0) filters.push(inArray(journalEvents.type, [...query.types]));
+  if (query.experimentId) {
+    filters.push(sql`(${journalEvents.aggregateId} = ${query.experimentId} OR ${journalEvents.payload}->>'experimentId' = ${query.experimentId})`);
+  }
+  if (query.from) filters.push(gte(journalEvents.occurredAt, query.from));
+  if (query.to) filters.push(lte(journalEvents.occurredAt, query.to));
+  if (query.recordedAtTo) filters.push(lte(journalEvents.recordedAt, query.recordedAtTo));
+  if (query.after) {
+    filters.push(sql`(${journalEvents.occurredAt}, ${journalEvents.id}) > (${query.after.occurredAt}::timestamptz, ${query.after.id})`);
+  }
+  if (query.through) {
+    filters.push(sql`(${journalEvents.occurredAt}, ${journalEvents.id}) <= (${query.through.occurredAt}::timestamptz, ${query.through.id})`);
+  }
+  return filters;
+}
+
+function toExperimentReport(row: typeof experimentReports.$inferSelect): DurableExperimentReport {
+  return {
+    experimentId: row.experimentId,
+    reportKind: "final",
+    schemaVersion: row.schemaVersion,
+    generatedAt: row.generatedAt.toISOString(),
+    complete: row.complete,
+    truncated: row.truncated,
+    sourceEventCount: row.sourceEventCount,
+    sourceWindowStart: row.sourceWindowStart?.toISOString() ?? null,
+    sourceWindowEnd: row.sourceWindowEnd?.toISOString() ?? null,
+    sourceFenceOccurredAt: row.sourceFenceOccurredAt?.toISOString() ?? null,
+    sourceFenceId: row.sourceFenceId,
+    earliestIncludedAt: row.earliestIncludedAt?.toISOString() ?? null,
+    latestIncludedAt: row.latestIncludedAt?.toISOString() ?? null,
+    canonicalSummary: row.canonicalSummary as Record<string, unknown>,
+    renderedMarkdown: row.renderedMarkdown,
+    contentHash: row.contentHash,
+    persistedAt: row.persistedAt.toISOString(),
+  };
+}
+
 function toJournalEvent(row: typeof journalEvents.$inferSelect): JournalEvent {
   return journalEventSchema.parse({ ...row, occurredAt: row.occurredAt.toISOString(), recordedAt: row.recordedAt.toISOString() });
 }
@@ -453,4 +771,4 @@ export function createJournalEvent(input: {
   };
 }
 
-export { CheckpointFenceError, DurableCursorBehindError, IdempotencyConflictError };
+export { CheckpointFenceError, DurableCursorBehindError, IdempotencyConflictError, ExperimentReportConflictError, SchemaVerificationError };

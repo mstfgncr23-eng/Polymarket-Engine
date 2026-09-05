@@ -30,11 +30,38 @@ export interface JournalQuery {
   order?: "asc" | "desc";
 }
 
+export interface JournalKeysetCursor {
+  occurredAt: string;
+  id: string;
+}
+
+export interface JournalKeysetQuery {
+  types?: readonly string[];
+  experimentId?: string;
+  from?: Date;
+  to?: Date;
+  after?: JournalKeysetCursor;
+  /** Inclusive source fence: do not read past this (occurredAt, id). */
+  through?: JournalKeysetCursor;
+  /** Exclude rows recorded after scan start (late-write fence). */
+  recordedAtTo?: Date;
+  limit: number;
+}
+
 /** Bounded page size for full-experiment scans. Do not raise a silent truncation cap. */
 export const EVENT_PAGE_SIZE = 500;
 
 /** Safety ceiling for paged scans. Hitting it MUST mark the scan incomplete — never complete=true. */
 export const EVENT_SCAN_CEILING = 2_000_000;
+
+/** Hard per-request cap for GET /api/traces/:traceId. */
+export const TRACE_PAGE_MAX = 200;
+
+/** Hard per-request cap for GET /api/history/decisions. */
+export const HISTORY_DECISIONS_LIMIT = 500;
+
+export const EXPERIMENT_REPORT_SCHEMA_VERSION = 1;
+export const EXPERIMENT_REPORT_KIND_FINAL = "final" as const;
 
 export function compareJournalEventOrder(
   a: { occurredAt: string; id: string },

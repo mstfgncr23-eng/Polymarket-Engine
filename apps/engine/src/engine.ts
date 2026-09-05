@@ -32,7 +32,6 @@ import {
   classifySettledOutcome,
   settlementCashDelta,
   settlementRealizedDelta,
-  DECISION_EVENT_TYPES,
   createIdleExperiment,
   d,
   decimal,
@@ -67,7 +66,7 @@ import {
   derivedAuditEventId,
   DurableCursorBehindError,
   IdempotencyConflictError,
-  queryEventsPaged,
+  isCanonicalFinalReport,
   type DurableCommitResult,
   type DurableTransition,
   type EventJournal,
@@ -85,7 +84,9 @@ import { EngineMetrics, classifyJournalMetricClass } from "./metrics.js";
 import { RestingOrderTokenIndex } from "./resting-order-index.js";
 import { SseHub } from "./server.js";
 import { EngineStateStore } from "./state.js";
-import { buildExperimentSummary, filterCurrentExperimentEvents, writeExperimentSummary } from "./report.js";
+import { persistCanonicalFinalReport, reportGeneratedPayload, streamExperimentSummary, summaryFromDurableReport } from "./final-report.js";
+import { writeExperimentSummary } from "./report.js";
+import { defaultRetentionConfig, RetentionManager } from "./retention-manager.js";
 import { GrokActivationCoordinator, persistableActivation } from "./activation/coordinator.js";
 import { createGrokActivationBridge } from "./activation/index.js";
 import { BoundedJournalWriter } from "./journal-writer.js";
@@ -198,6 +199,7 @@ export class EngineService {
   private readonly discoveryFlight: SingleFlight;
   private readonly maintenanceFlight: SingleFlight;
   private readonly heavyRead: FiniteSemaphore;
+  private readonly retention: RetentionManager;
   private readonly shutdownJoinDeadlineMs: number;
   private lastShutdown: JoinResult | null = null;
   private lastJournalShutdown: JoinResult | null = null;
@@ -265,6 +267,25 @@ export class EngineService {
     this.maintenanceFlight = new SingleFlight({
       onCoalesced: () => this.metrics.maintenanceSingleflightCoalesced.inc(),
       onDirty: (dirty) => this.metrics.maintenanceSingleflightDirty.set(dirty ? 1 : 0),
+    });
+    this.retention = new RetentionManager(journal, defaultRetentionConfig({
+      enabled: env.RETENTION_ENABLED,
+      telemetryTtlMs: env.RETENTION_TELEMETRY_TTL_MS,
+      monitorTtlMs: env.RETENTION_MONITOR_TTL_MS,
+      completedGraceMs: env.RETENTION_COMPLETED_GRACE_MS,
+      mcpIdempotencyTtlMs: env.RETENTION_MCP_IDEMPOTENCY_TTL_MS,
+      checkpointKeep: env.RETENTION_CHECKPOINT_KEEP,
+      batchSize: env.RETENTION_BATCH_SIZE,
+      cycleBudgetMs: env.RETENTION_CYCLE_BUDGET_MS,
+    }), {
+      noteDeleted: (cls, n) => { if (n > 0) this.metrics.retentionDeleted.inc({ class: cls }, n); },
+      noteFailure: () => this.metrics.retentionFailures.inc(),
+      noteRun: () => this.metrics.retentionRuns.inc(),
+      noteLastSuccess: (iso) => this.metrics.retentionLastSuccessUnix.set(Date.parse(iso) / 1000),
+      noteBatch: (size, durationMs) => {
+        this.metrics.retentionBatchSize.observe(size);
+        this.metrics.retentionBatchDuration.observe(durationMs / 1000);
+      },
     });
     this.activation = new GrokActivationCoordinator(
       adapters?.activation ?? createGrokActivationBridge(env),
@@ -552,6 +573,13 @@ export class EngineService {
     await this.maintenanceFlight.trigger(async () => {
       if (this.maintenanceHold) await this.maintenanceHold;
       await this.maintainExperiment();
+      await this.retention.runCycle({
+        experiment: this.experiment,
+        now: this.nowFn(),
+        degraded: this.state.journalDegraded || this.overload.state === "DEGRADED" || this.state.telemetryDegraded,
+        failClosed: this.overload.state === "FAIL_CLOSED",
+        databaseUp: this.state.database === "UP",
+      });
     });
   }
 
@@ -1088,6 +1116,10 @@ export class EngineService {
         this.syncRecoveredProjection();
       }
       this.syncExperimentWindow();
+      if (this.experiment?.id) {
+        const existing = await this.journal.loadExperimentReport(this.experiment.id, "final");
+        if (existing && isCanonicalFinalReport(existing)) this.reportGenerated = true;
+      }
     } catch (error) {
       if (error instanceof CrashInjectedError) throw error;
       const normalized = normalizeRecoveryError(error);
@@ -2453,34 +2485,67 @@ export class EngineService {
     if (!this.experiment || this.reportGenerated) return;
     const experiment = this.experiment;
     try {
-      const scan = await this.heavyRead.run(() => queryEventsPaged(this.journal, {
-        types: [...DECISION_EVENT_TYPES],
-        from: experiment.startedAt ? new Date(experiment.startedAt) : undefined,
-        to: experiment.completedAt ? new Date(experiment.completedAt) : this.nowFn(),
-      }));
-      const events = filterCurrentExperimentEvents(scan.events, experiment);
+      const existing = await this.journal.loadExperimentReport(experiment.id, "final");
+      if (existing && isCanonicalFinalReport(existing)) {
+        this.reportGenerated = true;
+        try {
+          await writeExperimentSummary(summaryFromDurableReport(existing), process.env.REPORT_DIRECTORY ?? "reports");
+        } catch {
+          this.metrics.finalReportFsExportFailures.inc();
+        }
+        return;
+      }
       const unresolved = [...this.ledger.positions.values()].filter((position) => Number(position.upQuantity) > 0 || Number(position.downQuantity) > 0).length;
-      const summary = buildExperimentSummary(events, this.experiment.id, {
-        status: this.experiment.status,
-        closePolicy: this.experiment.closePolicy ?? "observe_until_settlement",
+      const streamed = await this.heavyRead.run(() => streamExperimentSummary(this.journal, experiment, {
+        status: experiment.status,
+        closePolicy: experiment.closePolicy ?? "observe_until_settlement",
         reportKind: "final",
         unresolvedPositionCount: unresolved,
         metricsScope: "complete",
-        complete: scan.complete && !scan.truncated,
-        truncated: scan.truncated,
-        truncatedReason: scan.truncated ? "SCAN_CEILING" : null,
-      });
-      await writeExperimentSummary(summary, process.env.REPORT_DIRECTORY ?? "reports");
+        complete: true,
+        truncated: false,
+      }));
+      this.metrics.reportScanPages.observe(streamed.scan.pages);
+      this.metrics.reportScanEvents.observe(streamed.scan.scanned);
+      this.metrics.reportScanDuration.observe(streamed.scan.durationMs / 1000);
+      this.metrics.reportAccumulatorHighWaterBytes.set(streamed.accumulatorHighWaterBytes);
+      streamed.summary.complete = streamed.scan.complete && !streamed.scan.truncated && !streamed.scan.interrupted;
+      streamed.summary.truncated = streamed.scan.truncated || streamed.scan.interrupted;
+      streamed.summary.truncatedReason = streamed.summary.truncated ? (streamed.scan.truncatedReason ?? "SCAN_CEILING") : null;
+      if (!streamed.summary.complete || streamed.summary.truncated) {
+        this.reportGenerated = false;
+        return;
+      }
+      let persisted;
+      try {
+        persisted = await persistCanonicalFinalReport(this.journal, { summary: streamed.summary, scan: streamed.scan });
+      } catch (error) {
+        this.metrics.finalReportPersistFailures.inc();
+        throw error;
+      }
+      if (!persisted) {
+        this.reportGenerated = false;
+        return;
+      }
+      try {
+        await writeExperimentSummary(streamed.summary, process.env.REPORT_DIRECTORY ?? "reports");
+      } catch {
+        this.metrics.finalReportFsExportFailures.inc();
+      }
       await this.journal.append(createJournalEvent({
-        traceId: this.experiment.id, type: "EXPERIMENT_REPORT_GENERATED", aggregateType: "experiment", aggregateId: this.experiment.id,
-        payload: {
-          reportDirectory: process.env.REPORT_DIRECTORY ?? "reports", reportKind: "final",
-          settlementPnlUsd: summary.settlementPnlUsd, unresolvedPositionCount: unresolved,
-          experimentId: this.experiment.id, complete: summary.complete, truncated: summary.truncated,
-        },
+        traceId: experiment.id, type: "EXPERIMENT_REPORT_GENERATED", aggregateType: "experiment", aggregateId: experiment.id,
+        payload: reportGeneratedPayload(persisted.report, {
+          reportDirectory: process.env.REPORT_DIRECTORY ?? "reports",
+          settlementPnlUsd: streamed.summary.settlementPnlUsd,
+          unresolvedPositionCount: unresolved,
+        }),
       }));
       this.reportGenerated = true;
-      this.record("EXPERIMENT_REPORT_GENERATED", this.experiment.id, null, { reportKind: "final", settlementPnlUsd: summary.settlementPnlUsd });
+      this.record("EXPERIMENT_REPORT_GENERATED", experiment.id, null, {
+        reportKind: "final",
+        settlementPnlUsd: streamed.summary.settlementPnlUsd,
+        contentHash: persisted.report.contentHash,
+      });
     } catch (error) {
       this.reportGenerated = false;
       this.logger.error({ err: error }, "final experiment report generation failed");
@@ -2661,6 +2726,18 @@ export class EngineService {
   }
   criticalReservedAvailable(): boolean { return this.supervisor.criticalReservedAvailable(); }
   heavyReadStats() { return { active: this.heavyRead.activeCount, waiting: this.heavyRead.waitingCount }; }
+  retentionManagerForTest() { return this.retention; }
+  async writeFinalReportForTest() { await this.writeFinalReport(); }
+  reportGeneratedForTest() { return this.reportGenerated; }
+  async runRetentionCycleForTest() {
+    return this.retention.runCycle({
+      experiment: this.experiment,
+      now: this.nowFn(),
+      degraded: this.state.journalDegraded || this.overload.state === "DEGRADED",
+      failClosed: this.overload.state === "FAIL_CLOSED",
+      databaseUp: this.state.database === "UP",
+    });
+  }
 
   private adapterTokenSynchronized(tokenId: string): boolean {
     const adapter = this.marketAdapter as PolymarketMarketDataAdapter & { isTokenSynchronized?(id: string): boolean };

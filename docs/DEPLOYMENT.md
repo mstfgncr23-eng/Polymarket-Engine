@@ -105,7 +105,7 @@ fly secrets set -a polymarket-engine ENGINE_READ_TOKEN='<high-entropy>' ENGINE_O
 
 `fly.engine.toml` may list `app = "polymarket-engine"` as a documented intended default. The operator must own or create **their** app. Do **not** assume that name at deploy time. Manual and GitHub Action deploys must pass `--app <operator-app>`.
 
-Topology (already in toml): `fra`, internal `8080`, `shared-cpu-1x`, `512mb`, `min_machines_running = 1`, `auto_stop_machines = "off"`. **No Fly Managed Postgres.** **No Fly volume** for reports.
+Topology (already in toml): `fra`, internal `8080`, **`shared-cpu-2x`**, `512mb`, `min_machines_running = 1`, `auto_stop_machines = "off"`. Dashboard toml remains `shared-cpu-1x` / `256mb`. This document does **not** change VM size — it only matches `fly.engine.toml`. **No Fly Managed Postgres.** **No Fly volume** for reports.
 
 ```bash
 # Create only if the operator does not already own the app
@@ -136,9 +136,13 @@ Zero qualified markets is `discoveryStatus=ZERO_QUALIFIED`, not a crash. Fly mus
 
 ### Filesystem
 
-Fly disks are **not** durable canonical state. PostgreSQL is. The engine image creates `/app/reports` owned by user `engine` (`REPORT_DIRECTORY=/app/reports`) so final-report writes succeed without a Fly volume. That directory is **ephemeral**; rebuild with `pnpm report` from the journal (`DATABASE_URL` + `EXPERIMENT_ID`).
+Fly disks are **not** durable canonical state. PostgreSQL is. The canonical final experiment report lives in `experiment_reports` (hash + schema version + summary JSON + markdown). The engine image still creates `/app/reports` (`REPORT_DIRECTORY=/app/reports`) as an **optional ephemeral export**. A filesystem write failure must not destroy an already-persisted canonical report. Rebuild/export with `pnpm report` from `DATABASE_URL` + `EXPERIMENT_ID`.
 
-Migrate-on-boot: `Dockerfile.engine` copies `packages/db/migrations` (SQL + `meta/_journal.json`) to `/app/packages/db/migrations` and sets `DB_MIGRATIONS_DIR`. Runtime `PostgresEventJournal.initialize()` runs Drizzle migrate. SQL is additive (`CREATE IF NOT EXISTS`, idempotent `ENABLE ROW LEVEL SECURITY`, role-guarded `REVOKE`). Re-running against an already-provisioned schema does **not** DROP tables.
+Migrate-on-boot: `Dockerfile.engine` copies `packages/db/migrations` (SQL + `meta/_journal.json`) to `/app/packages/db/migrations` and sets `DB_MIGRATIONS_DIR`. Runtime `PostgresEventJournal.initialize()` runs Drizzle migrate **then schema verification**. Required relations include `journal_events`, `engine_checkpoints`, `mcp_idempotency_keys`, `durable_transitions`, and `experiment_reports`. If migrate-on-boot completes but a required relation/index/RLS invariant is absent (including a production database that never applied `0004_critical_replay.sql`), boot/readiness fails closed. SQL is additive (`CREATE IF NOT EXISTS`, idempotent `ENABLE ROW LEVEL SECURITY`, role-guarded `REVOKE`). Re-running against an already-provisioned schema does **not** DROP tables.
+
+Do **not** manually create `durable_transitions` in production. Let migrate-on-boot apply `0004` before `0005`. `durable_transitions` is recovery-authoritative and is **never pruned** by Step-4 retention.
+
+See [RETENTION.md](./RETENTION.md) for retention classes, dry-run cleanup, and when a completed experiment may drop transient journal rows.
 
 ### Supabase migration history
 
