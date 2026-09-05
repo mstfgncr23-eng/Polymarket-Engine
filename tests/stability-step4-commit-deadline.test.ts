@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { JournalEvent } from "@pm/core";
 import { MemoryEventJournal, PostgresEventJournal, isCanonicalFinalReport, type JournalAppendOptions, type EventJournal } from "@pm/db";
 import { EngineService } from "../apps/engine/src/engine.js";
+import { streamExperimentSummary } from "../apps/engine/src/final-report.js";
 import { loadSourceSeal } from "../apps/engine/src/source-seal.js";
 import { NoopGrokActivationBridge } from "../apps/engine/src/activation/index.js";
 import { discoveryReport, qualified, qualifiedPaperEnv, ScriptedMarketAdapter, ScriptedReferenceRegistry } from "./paper-engine-testkit.js";
@@ -170,6 +171,12 @@ describe("Step-4 Postgres transaction/commit outcome", () => {
       engine.setSourceSealTimeoutForTest(5_000);
       expect(await engine.ensureSourceSealForTest()).toEqual({ sealed: true, reason: null });
       expect(await pg.queryEvents({ types: ["EXPERIMENT_SOURCE_SEALED"], experimentId })).toHaveLength(1);
+      const streamed = await streamExperimentSummary(pg, engine.experimentManifest()!, {
+        status: "COMPLETED", reportKind: "final", metricsScope: "complete", complete: true, truncated: false,
+      });
+      expect(streamed.scan.complete).toBe(true);
+      expect(streamed.scan.scanned).toBeGreaterThanOrEqual(2);
+      expect(streamed.summary.complete).toBe(true);
       await engine.writeFinalReportForTest();
       const report = await pg.loadExperimentReport(experimentId);
       expect(report && isCanonicalFinalReport(report)).toBe(true);

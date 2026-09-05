@@ -2818,7 +2818,9 @@ export class EngineService {
     const persist = this.persistSourceSeal(experiment, generation, persistAttempt, this.sourceSealAbort.signal);
     let timeoutId: ReturnType<typeof setTimeout> | undefined;
     const outcome = await Promise.race([
-      persist.then((ok) => ({ kind: "done" as const, ok }), () => ({ kind: "failed" as const })),
+      persist.then((ok) => ({ kind: "done" as const, ok }), (error) => ({
+        kind: error instanceof JournalAppendAbortedError && error.reason === "deadline" ? "deadline" as const : "failed" as const,
+      })),
       new Promise<{ kind: "timeout" }>((resolve) => {
         timeoutId = setTimeout(() => {
           this.sourceSealAbort?.abort();
@@ -2836,7 +2838,11 @@ export class EngineService {
         // transaction_timeout in the irreversible commit phase: await COMMIT or
         // confirmed abort, even when the wall-clock budget has already elapsed.
         try { await persist; }
-        catch { return { sealed: false, reason: "SOURCE_SEAL_PERSIST_FAILED" }; }
+        catch (error) {
+          if (!(error instanceof JournalAppendAbortedError && error.reason === "deadline")) {
+            return { sealed: false, reason: "SOURCE_SEAL_PERSIST_FAILED" };
+          }
+        }
       }
       const already = await loadSourceSeal(this.journal, experiment.id);
       if (already) {
@@ -2847,6 +2853,7 @@ export class EngineService {
       return { sealed: false, reason: "SOURCE_SEAL_TIMEOUT" };
     }
     if (outcome.kind === "failed") return { sealed: false, reason: "SOURCE_SEAL_PERSIST_FAILED" };
+    if (outcome.kind === "deadline") return { sealed: false, reason: "SOURCE_SEAL_TIMEOUT" };
     if (!outcome.ok) return { sealed: false, reason: remaining() <= 0 ? "SOURCE_SEAL_TIMEOUT" : "SOURCE_SEAL_PERSIST_FAILED" };
     const persisted = await loadSourceSeal(this.journal, experiment.id);
     if (!persisted) return { sealed: false, reason: "SOURCE_SEAL_PERSIST_FAILED" };
@@ -2894,6 +2901,7 @@ export class EngineService {
         await this.journal.append(event, { signal, deadlineAt: this.sourceSealDeadlineAt });
       }, signal, { reportInput: false });
     } catch (error) {
+      if (error instanceof JournalAppendAbortedError && error.reason === "deadline") throw error;
       if (error instanceof JournalAppendAbortedError || (error instanceof JournalAdmissionRejected)) return false;
       throw error;
     } finally {

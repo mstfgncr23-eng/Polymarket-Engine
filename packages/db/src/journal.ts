@@ -57,7 +57,7 @@ export interface JournalAppendOptions {
 
 export class JournalAppendAbortedError extends Error {
   readonly code = "JOURNAL_APPEND_ABORTED";
-  constructor(reason: "aborted" | "deadline" = "aborted") {
+  constructor(readonly reason: "aborted" | "deadline" = "aborted") {
     super(reason === "deadline" ? "JOURNAL_APPEND_DEADLINE" : "JOURNAL_APPEND_ABORTED");
     this.name = "JournalAppendAbortedError";
   }
