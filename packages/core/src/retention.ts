@@ -74,11 +74,50 @@ export function isProtectedJournalType(type: string): boolean {
   return cls === "long_lived_audit" || cls === "unknown_retain";
 }
 
-/** Types the final-report scanner must observe. Protected while an experiment is ACTIVE or lacks a complete final report. */
-export const REPORT_INPUT_EVENT_TYPES = DECISION_EVENT_TYPES;
+/**
+ * Canonical experiment-source types. These enter the complete-report hash /
+ * sourceEventCount and must have fail-closed or sticky integrity semantics.
+ * Intentionally narrower than DECISION_EVENT_TYPES (dashboard / SSE list).
+ */
+export const CANONICAL_REPORT_INPUT_EVENT_TYPES = [
+  "TRIGGER_EVENT", "TRIGGER_LEVEL_1", "TRIGGER_LEVEL_2", "TRIGGER_LEVEL_3",
+  "GROK_RESEARCH_AVAILABLE", "GROK_ACTIVATION_DECISION", "GROK_ACTIVATION_RESULT", "GROK_SIGNAL_ACCEPTED",
+  "CONSENSUS_DECISION", "SEVERE_DISAGREEMENT",
+  "RISK_EVALUATION", "RISK_VETO", "RISK_ACCEPT",
+  "PAPER_ORDER_CREATED", "PAPER_FILL", "PAPER_EXECUTION_ERROR", "PAPER_MAKER_RESERVED", "PAPER_MAKER_RELEASED", "PAPER_ORDER_CANCELLED",
+  "POSITION_UPDATED", "POSITION_SETTLED", "POSITION_WIN", "POSITION_LOSS", "POSITION_BREAKEVEN", "PAIR_REALIZED", "PNL_SNAPSHOT",
+  "MARKET_RESOLUTION_OBSERVED", "HEDGE_COMPLETE", "FAILED_HEDGE", "FIRST_LEG_FILLED",
+  "EXPERIMENT_STARTED", "EXPERIMENT_ENTRY_CLOSED", "EXPERIMENT_COMPLETED", "EXPERIMENT_PREFLIGHT",
+  "MCP_INTERACTION", "STRATEGY_CHANGE_PROPOSED",
+] as const;
+
+/** Dashboard / monitor / control-plane types. Not part of the canonical source hash. */
+export const OPERATIONAL_MONITOR_EVENT_TYPES = [
+  "ENGINE_STARTED", "ENGINE_DRAINING", "ENGINE_STOPPED", "STATE_RECOVERED",
+  "DISCOVERY_RECONCILED",
+  "REFERENCE_FEED_STARTED", "REFERENCE_FEED_STOPPED", "REFERENCE_UNSUPPORTED",
+  "REFERENCE_PROBE_TRANSIENT", "REFERENCE_PROVIDER_BLOCKED",
+  "SYSTEM_HEALTH_EVENT",
+  "EXPERIMENT_REPORT_GENERATED", "EXPERIMENT_SOURCE_SEALED",
+] as const;
+
+export type ReportInputClass = "canonical" | "operational";
+
+export function classifyReportInput(type: string): ReportInputClass | null {
+  if ((CANONICAL_REPORT_INPUT_EVENT_TYPES as readonly string[]).includes(type)) return "canonical";
+  if ((OPERATIONAL_MONITOR_EVENT_TYPES as readonly string[]).includes(type)) return "operational";
+  return null;
+}
+
+/** @deprecated Use CANONICAL_REPORT_INPUT_EVENT_TYPES. Alias kept for seal/writer/admission. */
+export const REPORT_INPUT_EVENT_TYPES = CANONICAL_REPORT_INPUT_EVENT_TYPES;
 
 export function isReportInputEventType(type: string): boolean {
-  return (REPORT_INPUT_EVENT_TYPES as readonly string[]).includes(type);
+  return (CANONICAL_REPORT_INPUT_EVENT_TYPES as readonly string[]).includes(type);
+}
+
+export function isOperationalMonitorEventType(type: string): boolean {
+  return (OPERATIONAL_MONITOR_EVENT_TYPES as readonly string[]).includes(type);
 }
 
 export function assertMcpIdempotencyTtlSafe(ttlMs: number): void {
@@ -94,3 +133,21 @@ export function clampRetentionBatchSize(size: number): number {
 if (RETENTION_DEFAULTS.mcpIdempotencyTtlMs < MCP_IDEMPOTENCY_MIN_TTL_MS) {
   throw new Error("RETENTION_DEFAULTS.mcpIdempotencyTtlMs below proven acceptance horizon");
 }
+
+function assertReportInputInventory(): void {
+  const classified = new Set<string>();
+  for (const type of CANONICAL_REPORT_INPUT_EVENT_TYPES) {
+    if (classified.has(type)) throw new Error(`duplicate canonical report-input type ${type}`);
+    classified.add(type);
+  }
+  for (const type of OPERATIONAL_MONITOR_EVENT_TYPES) {
+    if (classified.has(type)) throw new Error(`report-input type in both classes: ${type}`);
+    classified.add(type);
+  }
+  for (const type of DECISION_EVENT_TYPES) {
+    if (classifyReportInput(type) == null) {
+      throw new Error(`DECISION type missing canonical/operational class: ${type}`);
+    }
+  }
+}
+assertReportInputInventory();

@@ -89,7 +89,9 @@ export interface EventJournal {
   listCheckpoints(): Promise<EngineCheckpoint[]>;
   commitDurableTransition(input: DurableTransitionInput, expectedPreviousSequence: number): Promise<DurableCommitResult>;
   readDurableTransitionsAfter(sequence: number, limit: number): Promise<DurableTransition[]>;
+  queryDurableTransitions(query: { types?: readonly string[]; afterSequence?: number; limit: number }): Promise<DurableTransition[]>;
   readDurableByOperationKey(operationKey: string): Promise<DurableTransition | null>;
+  readJournalEventById(id: string): Promise<JournalEvent | null>;
   latestDurableSequence(): Promise<number>;
   saveCheckpoint(checkpoint: Omit<EngineCheckpoint, "id" | "createdAt">): Promise<EngineCheckpoint>;
   loadLatestCheckpoint(): Promise<EngineCheckpoint | null>;
@@ -121,11 +123,19 @@ export class MemoryEventJournal implements EventJournal {
   access: JournalAccessMode = "boot-migrate";
   appendInFlightHold: Promise<void> | null = null;
   appendInFlightHoldTypes: string[] | null = null;
+  appendAcquireHold: Promise<void> | null = null;
+  appendAcquireHoldTypes: string[] | null = null;
   inFlightAppends = 0;
 
   setAppendInFlightHoldForTest(hold: Promise<void> | null, types?: string[]): void {
     this.appendInFlightHold = hold;
     this.appendInFlightHoldTypes = types ?? null;
+  }
+
+  /** Stall after append has begun but before the in-transaction deadline is recomputed (pool-acquire analogue). */
+  setAppendAcquireHoldForTest(hold: Promise<void> | null, types?: string[]): void {
+    this.appendAcquireHold = hold;
+    this.appendAcquireHoldTypes = types ?? null;
   }
 
   async initialize(): Promise<void> {
@@ -145,8 +155,14 @@ export class MemoryEventJournal implements EventJournal {
     if (this.eventIds.has(parsed.id) || this.staged.has(parsed.id)) return;
     this.inFlightAppends += 1;
     try {
+      const acquireApplies = !this.appendAcquireHoldTypes || this.appendAcquireHoldTypes.includes(parsed.type);
+      if (this.appendAcquireHold && acquireApplies) await this.appendAcquireHold;
+      if (this.failAppendTypes.has(parsed.type)) throw new Error("JOURNAL_APPEND_FAILED");
+      if (options.signal?.aborted) throw new JournalAppendAbortedError("aborted");
+      if (options.deadlineAt != null && Date.now() >= options.deadlineAt) throw new JournalAppendAbortedError("deadline");
       const holdApplies = !this.appendInFlightHoldTypes || this.appendInFlightHoldTypes.includes(parsed.type);
       if (this.appendInFlightHold && holdApplies) await this.appendInFlightHold;
+      if (this.failAppendTypes.has(parsed.type)) throw new Error("JOURNAL_APPEND_FAILED");
       if (options.signal?.aborted) throw new JournalAppendAbortedError("aborted");
       if (options.deadlineAt != null && Date.now() >= options.deadlineAt) throw new JournalAppendAbortedError("deadline");
       if (this.eventIds.has(parsed.id) || this.staged.has(parsed.id)) return;
@@ -359,6 +375,17 @@ export class MemoryEventJournal implements EventJournal {
     const existing = this.durableByKey.get(operationKey);
     return existing ? structuredClone(existing) : null;
   }
+  async queryDurableTransitions(query: { types?: readonly string[]; afterSequence?: number; limit: number }): Promise<DurableTransition[]> {
+    const after = query.afterSequence ?? 0;
+    const cap = Math.max(1, Math.min(query.limit, 10_000));
+    return structuredClone(this.durableRows
+      .filter((row) => row.sequence > after && (!query.types || query.types.includes(row.type)))
+      .slice(0, cap));
+  }
+  async readJournalEventById(id: string): Promise<JournalEvent | null> {
+    const event = this.events.find((row) => row.id === id);
+    return event ? structuredClone(event) : null;
+  }
   async latestDurableSequence(): Promise<number> {
     return this.durableRows.length === 0 ? 0 : this.durableRows[this.durableRows.length - 1]!.sequence;
   }
@@ -514,13 +541,18 @@ export class PostgresEventJournal implements EventJournal {
     assertJournalCapability(this.access, "runtime-write", "append");
     const value = journalEventSchema.parse(event);
     if (options.signal?.aborted) throw new JournalAppendAbortedError("aborted");
-    const remaining = options.deadlineAt != null ? Math.max(1, options.deadlineAt - Date.now()) : null;
     if (options.deadlineAt != null && Date.now() >= options.deadlineAt) throw new JournalAppendAbortedError("deadline");
     await this.db.transaction(async (tx) => {
-      if (remaining != null) {
+      // Recompute inside the acquired transaction immediately before mutation.
+      // Pool acquisition can consume the outer deadline; a pre-txn remaining is stale.
+      if (options.deadlineAt != null) {
+        if (Date.now() >= options.deadlineAt) throw new JournalAppendAbortedError("deadline");
+        const remaining = options.deadlineAt - Date.now();
+        if (remaining <= 0) throw new JournalAppendAbortedError("deadline");
         await tx.execute(sql`SELECT set_config('statement_timeout', ${String(remaining)}, true)`);
       }
       if (options.signal?.aborted) throw new JournalAppendAbortedError("aborted");
+      if (options.deadlineAt != null && Date.now() >= options.deadlineAt) throw new JournalAppendAbortedError("deadline");
       await tx.insert(journalEvents).values({
         ...value, occurredAt: new Date(value.occurredAt), recordedAt: new Date(value.recordedAt),
       }).onConflictDoNothing({ target: journalEvents.id });
@@ -809,6 +841,22 @@ export class PostgresEventJournal implements EventJournal {
       .where(eq(durableTransitions.operationKey, operationKey)).limit(1);
     const row = rows[0];
     return row ? toDurableTransition(row) : null;
+  }
+  async queryDurableTransitions(query: { types?: readonly string[]; afterSequence?: number; limit: number }): Promise<DurableTransition[]> {
+    const after = query.afterSequence ?? 0;
+    const cap = Math.max(1, Math.min(query.limit, 10_000));
+    const filters = [gt(durableTransitions.sequence, after)];
+    if (query.types && query.types.length > 0) filters.push(inArray(durableTransitions.type, [...query.types]));
+    const rows = await this.db.select().from(durableTransitions)
+      .where(and(...filters))
+      .orderBy(asc(durableTransitions.sequence))
+      .limit(cap);
+    return rows.map(toDurableTransition);
+  }
+  async readJournalEventById(id: string): Promise<JournalEvent | null> {
+    const rows = await this.db.select().from(journalEvents).where(eq(journalEvents.id, id)).limit(1);
+    const row = rows[0];
+    return row ? toJournalEvent(row) : null;
   }
   async latestDurableSequence(): Promise<number> {
     const rows = await this.db.select({

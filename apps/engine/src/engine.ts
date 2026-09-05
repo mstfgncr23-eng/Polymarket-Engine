@@ -92,11 +92,17 @@ import { writeExperimentSummary } from "./report.js";
 import { retentionConfigFromEngineEnv, RetentionManager } from "./retention-manager.js";
 import { createSourceSealEvent, loadSourceSeal, remainingSealMs, SOURCE_SEAL_TIMEOUT_MS, isSourceSealExemptType } from "./source-seal.js";
 import {
+  boundIntegrityFaults,
   createIntegrityFaultEvent,
   createIntegrityRepairEvent,
+  integrityDurableOperationKey,
+  INTEGRITY_OVERFLOW_EVENT_ID,
   loadIntegrityRepairIds,
   loadUnresolvedReportSourceIntegrity,
+  overflowIntegrityFault,
   parseCheckpointIntegrityFaults,
+  REPORT_SOURCE_INTEGRITY_HARD_CAP,
+  REPORT_SOURCE_INTEGRITY_FAULT,
   shouldLatchReportSourceIntegrity,
   type ReportSourceIntegrityFault,
 } from "./report-source-integrity.js";
@@ -1290,7 +1296,7 @@ export class EngineService {
           await this.journal.append(event);
           this.state.database = "UP";
         });
-      }, signal, { reportInput: isReportInputEventType(event.type) && !isSourceSealExemptType(event.type) });
+      }, signal, { reportInput: this.isCanonicalWindowAdmission(event.type) });
     } catch (error) {
       if (error instanceof CrashInjectedError) throw error;
       this.failClosedIntegrity(error);
@@ -2105,9 +2111,18 @@ export class EngineService {
     this.sse.publish("snapshot", () => this.state.snapshot());
   }
 
+  private isExperimentWindowOpen(): boolean {
+    const status = this.experiment?.status;
+    return status === "RUNNING" || status === "ENTRY_CLOSED";
+  }
+
+  private isCanonicalWindowAdmission(type: string): boolean {
+    return isReportInputEventType(type) && !isSourceSealExemptType(type) && this.isExperimentWindowOpen();
+  }
+
   async persistReportInput(event: JournalEvent): Promise<void> {
     const experimentId = this.experiment?.id;
-    const stamped = experimentId && typeof event.payload.experimentId !== "string"
+    const stamped = this.isExperimentWindowOpen() && experimentId && typeof event.payload.experimentId !== "string"
       ? { ...event, payload: { ...event.payload, experimentId } }
       : event;
     await this.safeAppend(stamped);
@@ -2116,7 +2131,7 @@ export class EngineService {
   private async safeAppend(event: ReturnType<typeof createJournalEvent>, signal?: AbortSignal, extra?: { deadlineAt?: number }): Promise<void> {
     const critical = isCriticalPersistenceType(event.type);
     const journalClass = classifyJournalMetricClass(event.type);
-    const reportInput = isReportInputEventType(event.type) && !isSourceSealExemptType(event.type);
+    const reportInput = this.isCanonicalWindowAdmission(event.type);
     try {
       await this.journalAdmission.run(journalClass, critical, async () => {
         if (signal?.aborted) throw new JournalAdmissionRejected(journalClass, critical, "JOURNAL_ADMISSION_CLOSED");
@@ -2181,7 +2196,10 @@ export class EngineService {
           marketMetadata: [...this.marketsById.values()].map((market) => ({ ...market, raw: {} })),
           lastInfrastructureAccrualAt: this.lastInfrastructureAccrualAt,
           derivedAuditCursor: this.derivedAuditCursor,
-          reportSourceIntegrity: [...this.reportSourceIntegrity.values()],
+          reportSourceIntegrity: boundIntegrityFaults(
+            [...this.reportSourceIntegrity.values()].filter((fault) => fault.experimentId === this.experiment!.id),
+            this.experiment.id,
+          ),
         },
       });
       this.metrics.checkpointWrites.inc({ status: "success" });
@@ -2597,32 +2615,53 @@ export class EngineService {
     this.sourceSealing = true;
   }
 
+  private installIntegrityFault(fault: ReportSourceIntegrityFault): void {
+    const overflowKey = `${fault.experimentId}:${INTEGRITY_OVERFLOW_EVENT_ID}`;
+    if (this.reportSourceIntegrity.has(overflowKey)) return;
+    const key = `${fault.experimentId}:${fault.eventId}`;
+    if (this.reportSourceIntegrity.has(key)) return;
+    const count = [...this.reportSourceIntegrity.values()].filter((item) => item.experimentId === fault.experimentId).length;
+    if (fault.eventId === INTEGRITY_OVERFLOW_EVENT_ID || count >= REPORT_SOURCE_INTEGRITY_HARD_CAP) {
+      for (const [existing, item] of this.reportSourceIntegrity) {
+        if (item.experimentId === fault.experimentId) this.reportSourceIntegrity.delete(existing);
+      }
+      this.reportSourceIntegrity.set(overflowKey, overflowIntegrityFault(fault.experimentId, fault.at));
+      return;
+    }
+    this.reportSourceIntegrity.set(key, fault);
+  }
+
   private async restoreReportSourceIntegrity(): Promise<void> {
     const experimentId = this.experiment?.id;
     if (!experimentId) return;
     if (this.experiment?.status === "IDLE") return;
     try {
-      const { ids: repaired, overflow: repairOverflow } = await loadIntegrityRepairIds(this.journal, experimentId);
-      if (repairOverflow) {
-        this.reportSourceIntegrity.set(`${experimentId}:integrity-scan-overflow`, {
-          experimentId, eventType: "OVERFLOW", eventId: "integrity-scan-overflow",
-          reason: "INTEGRITY_SCAN_OVERFLOW", at: this.nowFn().toISOString(),
-        });
+      const unresolved = await loadUnresolvedReportSourceIntegrity(this.journal, experimentId);
+      const repairs = await loadIntegrityRepairIds(this.journal, experimentId);
+      if (repairs.overflow) {
+        this.clearExperimentIntegrity(experimentId);
+        this.installIntegrityFault(overflowIntegrityFault(experimentId, this.nowFn().toISOString()));
         return;
       }
       for (const [key, fault] of [...this.reportSourceIntegrity.entries()]) {
-        if (fault.experimentId === experimentId && repaired.has(fault.eventId)) {
+        if (fault.experimentId !== experimentId) continue;
+        if (repairs.ids.has(fault.eventId) && fault.eventId !== INTEGRITY_OVERFLOW_EVENT_ID) {
           this.reportSourceIntegrity.delete(key);
         }
       }
-      for (const fault of await loadUnresolvedReportSourceIntegrity(this.journal, experimentId)) {
-        this.reportSourceIntegrity.set(`${fault.experimentId}:${fault.eventId}`, fault);
-      }
+      for (const fault of unresolved) this.installIntegrityFault(fault);
+      const remaining = [...this.reportSourceIntegrity.values()].filter((fault) => fault.experimentId === experimentId);
+      this.clearExperimentIntegrity(experimentId);
+      for (const fault of boundIntegrityFaults(remaining, experimentId)) this.installIntegrityFault(fault);
     } catch {
-      this.reportSourceIntegrity.set(`${experimentId}:integrity-restore-failed`, {
-        experimentId, eventType: "OVERFLOW", eventId: "integrity-restore-failed",
-        reason: "INTEGRITY_RESTORE_FAILED", at: this.nowFn().toISOString(),
-      });
+      this.clearExperimentIntegrity(experimentId);
+      this.installIntegrityFault(overflowIntegrityFault(experimentId, this.nowFn().toISOString()));
+    }
+  }
+
+  private clearExperimentIntegrity(experimentId: string): void {
+    for (const key of [...this.reportSourceIntegrity.keys()]) {
+      if (key.startsWith(`${experimentId}:`)) this.reportSourceIntegrity.delete(key);
     }
   }
 
@@ -2636,9 +2675,40 @@ export class EngineService {
     }
   }
 
+  private async persistIntegrityFaultMarker(fault: ReportSourceIntegrityFault): Promise<void> {
+    try {
+      await this.journal.append(createIntegrityFaultEvent(fault));
+    } catch {
+      try {
+        await this.commitAuthoritative({
+          operationKey: integrityDurableOperationKey("fault", fault.experimentId, fault.eventId),
+          type: REPORT_SOURCE_INTEGRITY_FAULT,
+          aggregateType: "experiment",
+          aggregateId: fault.experimentId,
+          buildPayload: () => ({
+            eventId: fault.eventId,
+            eventType: fault.eventType,
+            reason: fault.reason,
+            experimentId: fault.experimentId,
+            at: fault.at,
+            derivedAudit: [],
+          }),
+          checkpoint: false,
+        });
+      } catch (error) {
+        this.logger.error({
+          err: error,
+          eventId: fault.eventId,
+        }, "report_source_integrity_durable_marker_failed");
+      }
+    }
+  }
+
   private async noteReportSourceIntegrityFault(event: JournalEvent, error: unknown): Promise<void> {
     const experimentId = this.experiment?.id;
     if (!experimentId) return;
+    const overflowKey = `${experimentId}:${INTEGRITY_OVERFLOW_EVENT_ID}`;
+    if (this.reportSourceIntegrity.has(overflowKey)) return;
     const fault: ReportSourceIntegrityFault = {
       experimentId,
       eventType: event.type,
@@ -2646,12 +2716,16 @@ export class EngineService {
       reason: error instanceof Error ? error.message : String(error),
       at: this.nowFn().toISOString(),
     };
-    this.reportSourceIntegrity.set(`${experimentId}:${event.id}`, fault);
-    try {
-      await this.journal.append(createIntegrityFaultEvent(fault));
-    } catch {
-      // Memory latch remains; next checkpoint also snapshots unresolved faults.
+    const existing = this.reportSourceIntegrity.get(`${experimentId}:${event.id}`);
+    if (existing && existing.reason === fault.reason) return;
+    const count = [...this.reportSourceIntegrity.values()].filter((item) => item.experimentId === experimentId).length;
+    if (!existing && count >= REPORT_SOURCE_INTEGRITY_HARD_CAP) {
+      this.installIntegrityFault(overflowIntegrityFault(experimentId, fault.at));
+      await this.persistIntegrityFaultMarker(overflowIntegrityFault(experimentId, fault.at));
+      return;
     }
+    this.installIntegrityFault(fault);
+    await this.persistIntegrityFaultMarker(fault);
   }
 
   private unresolvedReportSourceIntegrity(experimentId: string): ReportSourceIntegrityFault[] {
@@ -2662,11 +2736,12 @@ export class EngineService {
     await this.journal.append(event);
     const experimentId = this.experiment?.id;
     if (!experimentId) return false;
+    if (this.reportSourceIntegrity.has(`${experimentId}:${INTEGRITY_OVERFLOW_EVENT_ID}`)) return false;
     const key = `${experimentId}:${event.id}`;
     const fault = this.reportSourceIntegrity.get(key);
     if (!fault) return false;
-    const verified = await this.journal.queryEventsKeyset({ types: [event.type], limit: 64 });
-    if (!verified.some((row) => row.id === event.id)) return false;
+    const verified = await this.journal.readJournalEventById(event.id);
+    if (!verified || verified.type !== event.type) return false;
     await this.journal.append(createIntegrityRepairEvent(fault));
     this.reportSourceIntegrity.delete(key);
     return true;
@@ -2694,6 +2769,9 @@ export class EngineService {
     const journal = await this.journalAdmission.waitReportInput(remaining());
     if (!work.drained || !research.drained || !journal.drained || work.timedOut || research.timedOut || journal.timedOut || remaining() <= 0) {
       return { sealed: false, reason: "SOURCE_SEAL_TIMEOUT" };
+    }
+    if (this.unresolvedReportSourceIntegrity(experiment.id).length > 0) {
+      return { sealed: false, reason: "REPORT_SOURCE_INTEGRITY_UNRESOLVED" };
     }
     const persist = this.persistSourceSeal(experiment, generation, persistAttempt, this.sourceSealAbort.signal);
     let timeoutId: ReturnType<typeof setTimeout> | undefined;
@@ -2755,6 +2833,7 @@ export class EngineService {
       return false;
     }
     if (!this.sourceSealPersistStillValid(generation, persistAttempt) || signal?.aborted) return false;
+    if (this.unresolvedReportSourceIntegrity(experiment.id).length > 0) return false;
     const event = createSourceSealEvent({
       experimentId: experiment.id,
       startedAt: experiment.startedAt,

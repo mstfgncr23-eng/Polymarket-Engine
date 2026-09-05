@@ -4,7 +4,10 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   AUDIT_CRITICAL_EVENT_TYPES,
+  CANONICAL_REPORT_INPUT_EVENT_TYPES,
+  classifyReportInput,
   DECISION_EVENT_TYPES,
+  OPERATIONAL_MONITOR_EVENT_TYPES,
   EVENT_PAGE_SIZE,
   MONITOR_CONTROL_EVENT_TYPES,
   PaperLedger,
@@ -40,12 +43,17 @@ import { createApiServer } from "../apps/engine/src/server.js";
 import { buildExperimentSummary, ExperimentSummaryAccumulator, writeExperimentSummary } from "../apps/engine/src/report.js";
 import { ensureReportGeneratedAudit, persistCanonicalFinalReport, resolveAuthoritativeExperiment, streamExperimentSummary, summaryFromDurableReport, toDurableReportInput } from "../apps/engine/src/final-report.js";
 import { applyJournalCleanup, dryRunJournalCleanup } from "../apps/engine/src/journal-cleanup.js";
-import { resolveCleanupLifecycle } from "../apps/engine/src/cleanup-lifecycle.js";
+import { resolveCleanupLifecycle, seedDurableLifecycle } from "../apps/engine/src/cleanup-lifecycle.js";
 import {
+  boundIntegrityFaults,
+  INTEGRITY_OVERFLOW_EVENT_ID,
   REPORT_SOURCE_INTEGRITY_FAULT,
+  REPORT_SOURCE_INTEGRITY_HARD_CAP,
   REPORT_SOURCE_INTEGRITY_REPAIRED,
   shouldLatchReportSourceIntegrity,
 } from "../apps/engine/src/report-source-integrity.js";
+import { isSourceSealExemptType } from "../apps/engine/src/source-seal.js";
+import { isCriticalPersistenceType } from "../apps/engine/src/runtime-supervisor.js";
 import { readFileSync } from "node:fs";
 import { BoundedJournalWriter } from "../apps/engine/src/journal-writer.js";
 import { generateOperatorReport } from "../apps/engine/src/operator-report.js";
@@ -1352,11 +1360,13 @@ describe("Step-4 closure: all REPORT_INPUT producers participate in source seal"
     expect(writer).toMatch(/REPORT_INPUT_MUST_USE_TRACKED_ADMISSION/);
     const engine = readFileSync(new URL("../apps/engine/src/engine.ts", import.meta.url), "utf8");
     expect(engine).toMatch(/persistReportInput\(event/);
-    expect(engine).toMatch(/reportInput: isReportInputEventType/);
+    expect(engine).toMatch(/reportInput: this\.isCanonicalWindowAdmission/);
     expect(shouldLatchReportSourceIntegrity({ type: "MARKET_SNAPSHOT" }, { id: "e", status: "RUNNING" })).toBe(false);
     expect(shouldLatchReportSourceIntegrity({ type: "SYSTEM_HEALTH_EVENT" }, { id: "e", status: "RUNNING" })).toBe(false);
     expect(shouldLatchReportSourceIntegrity({ type: "MCP_INTERACTION" }, { id: "e", status: "RUNNING" })).toBe(true);
     expect(shouldLatchReportSourceIntegrity({ type: "GROK_SIGNAL_ACCEPTED" }, { id: "e", status: "IDLE" })).toBe(false);
+    expect(shouldLatchReportSourceIntegrity({ type: "MCP_INTERACTION", payload: {} }, { id: "e", status: "COMPLETED" })).toBe(false);
+    expect(shouldLatchReportSourceIntegrity({ type: "MCP_INTERACTION", payload: { experimentId: "e" } }, { id: "e", status: "COMPLETED" })).toBe(true);
   });
 
   it("BoundedJournalWriter refuses report-input instead of appending untracked", async () => {
@@ -1582,10 +1592,11 @@ describe("Step-4 closure: authoritative cleanup lifecycle", () => {
 
   it("A: resolves ACTIVE_RUNNING from durable EXPERIMENT_STARTED, not env", async () => {
     const journal = new MemoryEventJournal();
+    await seedDurableLifecycle(journal, { id: "exp-live", startedAt: "2026-09-07T00:00:00.000Z" });
     await journal.append(ev("EXPERIMENT_STARTED", "2026-09-07T00:00:00.000Z", { experimentId: "exp-live", aggregateId: "exp-live" }, "start-live"));
     const lifecycle = await resolveCleanupLifecycle(journal, {});
     expect(lifecycle.state).toBe("ACTIVE_RUNNING");
-    expect(lifecycle.source).toBe("durable_journal");
+    expect(lifecycle.source).toBe("durable_transitions");
     expect(lifecycle.experimentId).toBe("exp-live");
     expect(lifecycle.status).toBe("RUNNING");
     expect(lifecycle.monitorDeleteAllowed).toBe(true);
@@ -1594,6 +1605,7 @@ describe("Step-4 closure: authoritative cleanup lifecycle", () => {
 
   it("B: env hint mismatch fail-closes; never becomes PROVEN_NO_ACTIVE", async () => {
     const journal = new MemoryEventJournal();
+    await seedDurableLifecycle(journal, { id: "exp-a", startedAt: "2026-09-07T00:00:00.000Z" });
     await journal.append(ev("EXPERIMENT_STARTED", "2026-09-07T00:00:00.000Z", { experimentId: "exp-a", aggregateId: "exp-a" }, "start-a"));
     const lifecycle = await resolveCleanupLifecycle(journal, { experimentId: "exp-other", status: "COMPLETED" });
     expect(lifecycle.hintMismatch).toBe(true);
@@ -1608,6 +1620,7 @@ describe("Step-4 closure: authoritative cleanup lifecycle", () => {
 
   it("C: missing EXPERIMENT_ID is not monitor-only while an experiment is active", async () => {
     const journal = new MemoryEventJournal();
+    await seedDurableLifecycle(journal, { id: "exp-c", startedAt: "2026-09-07T12:00:00.000Z" });
     await journal.append(ev("EXPERIMENT_STARTED", "2026-09-07T12:00:00.000Z", { experimentId: "exp-c", aggregateId: "exp-c" }, "start-c"));
     await journal.append(ev("TRIGGER_EVENT", "2026-09-07T13:00:00.000Z", { experimentId: "exp-c" }, "in-window-c"));
     const lifecycle = await resolveCleanupLifecycle(journal, {});
@@ -1648,6 +1661,7 @@ describe("Step-4 closure: authoritative cleanup lifecycle", () => {
 
   it("E: RUNNING/ENTRY_CLOSED protect in-window; missing startedAt forbids monitor delete", async () => {
     const running = new MemoryEventJournal();
+    await seedDurableLifecycle(running, { id: "exp-e", startedAt: "2026-09-07T12:00:00.000Z" });
     await running.append(ev("EXPERIMENT_STARTED", "2026-09-07T12:00:00.000Z", { experimentId: "exp-e", aggregateId: "exp-e" }, "start-e"));
     await running.append(ev("TRIGGER_EVENT", "2026-09-07T13:00:00.000Z", { experimentId: "exp-e" }, "win-e"));
     await running.append(ev("TRIGGER_EVENT", "2026-01-01T00:00:00.000Z", {}, "pre-e"));
@@ -1655,6 +1669,7 @@ describe("Step-4 closure: authoritative cleanup lifecycle", () => {
     const runningDry = await dryRunJournalCleanup(running, now, runningLife.experiment, config, {}, runningLife);
     expect(runningDry.monitor.eligible).toBe(1);
     const closed = new MemoryEventJournal();
+    await seedDurableLifecycle(closed, { id: "exp-closed", entryClosedAt: "2026-09-07T12:00:00.000Z" });
     await closed.append(ev("EXPERIMENT_ENTRY_CLOSED", "2026-09-07T12:00:00.000Z", { experimentId: "exp-closed", aggregateId: "exp-closed" }, "closed-only"));
     await closed.append(ev("TRIGGER_EVENT", "2026-01-01T00:00:00.000Z", {}, "mon-closed"));
     const closedLife = await resolveCleanupLifecycle(closed);
@@ -1667,6 +1682,11 @@ describe("Step-4 closure: authoritative cleanup lifecycle", () => {
 
   it("F: COMPLETED requires canonical complete+non-truncated + grace", async () => {
     const journal = new MemoryEventJournal();
+    await seedDurableLifecycle(journal, {
+      id: "exp-1",
+      startedAt: "2026-09-01T00:00:00.000Z",
+      completedAt: "2026-09-01T00:00:08.000Z",
+    });
     await journal.appendMany(fixtureEvents());
     const lifecycle = await resolveCleanupLifecycle(journal, { experimentId: "exp-1" });
     expect(lifecycle.state).toBe("COMPLETED");
@@ -1692,6 +1712,7 @@ describe("Step-4 closure: authoritative cleanup lifecycle", () => {
 
   it("H: dry-run shows lifecycle state/source/id/status/times/allowed/reason", async () => {
     const journal = new MemoryEventJournal();
+    await seedDurableLifecycle(journal, { id: "exp-h", startedAt: "2026-09-07T00:00:00.000Z" });
     await journal.append(ev("EXPERIMENT_STARTED", "2026-09-07T00:00:00.000Z", { experimentId: "exp-h", aggregateId: "exp-h" }, "start-h"));
     const lifecycle = await resolveCleanupLifecycle(journal, { experimentId: "exp-h", status: "RUNNING" });
     const dry = await dryRunJournalCleanup(journal, now, lifecycle.experiment, config, {}, lifecycle);
@@ -1710,6 +1731,7 @@ describe("Step-4 closure: authoritative cleanup lifecycle", () => {
 
   it("DATABASE_URL-only (no EXPERIMENT_ID) while active experiment is SAFE", async () => {
     const journal = new MemoryEventJournal();
+    await seedDurableLifecycle(journal, { id: "exp-db", startedAt: "2026-09-07T12:00:00.000Z" });
     await journal.append(ev("EXPERIMENT_STARTED", "2026-09-07T12:00:00.000Z", { experimentId: "exp-db", aggregateId: "exp-db" }, "start-db"));
     await journal.append(ev("TRIGGER_EVENT", "2026-09-07T13:00:00.000Z", { experimentId: "exp-db" }, "live-mon"));
     await journal.append(ev("MARKET_SNAPSHOT", "2026-01-01T00:00:00.000Z", {}, "old-tel"));
@@ -1769,6 +1791,412 @@ describe("Step-4 closure: in-flight source-seal database write hold", () => {
     } finally {
       release?.();
       journal.setAppendInFlightHoldForTest(null);
+      if (!engine.state.draining) await engine.stop();
+    }
+  });
+});
+
+describe("Step-4 follow-up: cleanup authority from durable_transitions", () => {
+  const now = new Date("2026-09-08T00:00:00.000Z");
+  const config = defaultRetentionConfig({
+    enabled: true, telemetryTtlMs: 1, monitorTtlMs: 1, completedGraceMs: 1, batchSize: 50,
+    maxBatchesPerCycle: 10, maxRowsPerCycle: 1_000, cycleBudgetMs: 5_000,
+  });
+
+  it("A: durable EXPERIMENT_STARTED without derived audit is ACTIVE_RUNNING", async () => {
+    const journal = new MemoryEventJournal();
+    await seedDurableLifecycle(journal, { id: "exp-auditless", startedAt: "2026-09-07T12:00:00.000Z" });
+    expect((await journal.queryEvents({ types: ["EXPERIMENT_STARTED"] })).length).toBe(0);
+    const lifecycle = await resolveCleanupLifecycle(journal, {});
+    expect(lifecycle.state).toBe("ACTIVE_RUNNING");
+    expect(lifecycle.source).toBe("durable_transitions");
+    expect(lifecycle.journalCrossCheck).toBe("missing_audit");
+    expect(lifecycle.experimentId).toBe("exp-auditless");
+    expect(lifecycle.monitorDeleteAllowed).toBe(true);
+  });
+
+  it("B: two durable active identities are CONFLICTING", async () => {
+    const journal = new MemoryEventJournal();
+    await seedDurableLifecycle(journal, { id: "exp-one", startedAt: "2026-09-07T10:00:00.000Z" });
+    await seedDurableLifecycle(journal, { id: "exp-two", startedAt: "2026-09-07T11:00:00.000Z" });
+    const lifecycle = await resolveCleanupLifecycle(journal, {});
+    expect(lifecycle.state).toBe("CONFLICTING");
+    expect(lifecycle.monitorDeleteAllowed).toBe(false);
+    expect(lifecycle.state).not.toBe("PROVEN_NO_ACTIVE_EXPERIMENT");
+  });
+
+  it("C: only no durable and no legacy journal lifecycle is PROVEN_NO_ACTIVE", async () => {
+    const journal = new MemoryEventJournal();
+    await journal.append(ev("TRIGGER_EVENT", "2026-01-01T00:00:00.000Z", {}, "orphan"));
+    const none = await resolveCleanupLifecycle(journal, {});
+    expect(none.state).toBe("PROVEN_NO_ACTIVE_EXPERIMENT");
+    await journal.append(ev("EXPERIMENT_STARTED", "2026-09-07T00:00:00.000Z", { experimentId: "legacy-only", aggregateId: "legacy-only" }, "legacy-start"));
+    const legacy = await resolveCleanupLifecycle(journal, {});
+    expect(legacy.state).toBe("UNKNOWN");
+    expect(legacy.source).toBe("legacy_journal");
+    expect(legacy.journalCrossCheck).toBe("legacy_only");
+    expect(legacy.state).not.toBe("PROVEN_NO_ACTIVE_EXPERIMENT");
+    expect(legacy.monitorDeleteAllowed).toBe(false);
+  });
+
+  it("D: DATABASE_URL-only APPLY is SAFE in AFTER_APPLY_BEFORE_DERIVED_AUDIT", async () => {
+    const journal = new MemoryEventJournal();
+    const engine = paperEngine(journal);
+    await engine.start();
+    try {
+      engine.setCrashInjectionForTest("AFTER_APPLY_BEFORE_DERIVED_AUDIT");
+      await expect(engine.beginExperiment()).rejects.toThrow(/CRASH_INJECTED/);
+      const experimentId = (await journal.readDurableTransitionsAfter(0, 8))
+        .find((row) => row.type === "EXPERIMENT_STARTED")?.aggregateId;
+      expect(experimentId).toBeTruthy();
+      expect((await journal.queryEvents({ types: ["EXPERIMENT_STARTED"] })).length).toBe(0);
+      await journal.append(ev("TRIGGER_EVENT", "2026-09-07T13:00:00.000Z", { experimentId }, "live-after-apply"));
+      await journal.append(ev("MARKET_SNAPSHOT", "2026-01-01T00:00:00.000Z", {}, "old-tel-after-apply"));
+      const lifecycle = await resolveCleanupLifecycle(journal, {});
+      expect(lifecycle.state).toBe("ACTIVE_RUNNING");
+      expect(lifecycle.source).toBe("durable_transitions");
+      expect(lifecycle.journalCrossCheck).toBe("missing_audit");
+      expect(lifecycle.experimentId).toBe(experimentId);
+      const apply = await applyJournalCleanup(journal, {
+        now, experiment: lifecycle.experiment, confirm: "I_UNDERSTAND_DESTRUCTIVE_CLEANUP", config, lifecycle,
+      });
+      expect(apply.refused).toBe(false);
+      expect(apply.deletedByClass.raw_telemetry).toBe(1);
+      expect(apply.deletedByClass.monitor_control ?? 0).toBe(0);
+      expect((await journal.queryEvents({ types: ["TRIGGER_EVENT"] })).some((event) => event.id === "live-after-apply")).toBe(true);
+      expect((await journal.readDurableTransitionsAfter(0, 32)).some((row) => row.type === "EXPERIMENT_STARTED")).toBe(true);
+    } finally {
+      if (!engine.state.draining) await engine.stop().catch(() => undefined);
+    }
+  });
+
+  it("E: journal must not override durable ACTIVE to no-active or CONFLICTING", async () => {
+    const journal = new MemoryEventJournal();
+    await seedDurableLifecycle(journal, { id: "exp-durable", startedAt: "2026-09-07T12:00:00.000Z" });
+    await journal.append(ev("EXPERIMENT_STARTED", "2026-09-07T13:00:00.000Z", { experimentId: "exp-journal-extra", aggregateId: "exp-journal-extra" }, "extra-start"));
+    const lifecycle = await resolveCleanupLifecycle(journal, {});
+    expect(lifecycle.state).toBe("ACTIVE_RUNNING");
+    expect(lifecycle.experimentId).toBe("exp-durable");
+    expect(lifecycle.journalCrossCheck).toBe("conflict");
+    expect(lifecycle.state).not.toBe("CONFLICTING");
+    expect(lifecycle.state).not.toBe("PROVEN_NO_ACTIVE_EXPERIMENT");
+  });
+
+  it("F: durable_transitions are never pruned by APPLY", async () => {
+    const journal = new MemoryEventJournal();
+    await seedDurableLifecycle(journal, { id: "exp-keep", startedAt: "2026-09-07T00:00:00.000Z" });
+    const before = await journal.readDurableTransitionsAfter(0, 32);
+    expect(before.length).toBeGreaterThan(0);
+    const lifecycle = await resolveCleanupLifecycle(journal, {});
+    const apply = await applyJournalCleanup(journal, {
+      now, experiment: lifecycle.experiment, confirm: "I_UNDERSTAND_DESTRUCTIVE_CLEANUP", config, lifecycle,
+    });
+    expect(apply.refused).toBe(false);
+    expect(await journal.readDurableTransitionsAfter(0, 32)).toEqual(before);
+  });
+});
+
+describe("Step-4 follow-up: canonical report-input inventory", () => {
+  it("classifies every DECISION type exactly once; every canonical type has integrity or fail-closed semantics", () => {
+    const seen = new Set<string>();
+    for (const type of CANONICAL_REPORT_INPUT_EVENT_TYPES) {
+      expect(classifyReportInput(type)).toBe("canonical");
+      expect(seen.has(type)).toBe(false);
+      seen.add(type);
+    }
+    for (const type of OPERATIONAL_MONITOR_EVENT_TYPES) {
+      expect(classifyReportInput(type)).toBe("operational");
+      expect(seen.has(type)).toBe(false);
+      seen.add(type);
+    }
+    for (const type of DECISION_EVENT_TYPES) {
+      expect(classifyReportInput(type), type).not.toBeNull();
+    }
+    for (const type of CANONICAL_REPORT_INPUT_EVENT_TYPES) {
+      const swallowable = !isCriticalPersistenceType(type);
+      const exempt = isSourceSealExemptType(type);
+      const latches = shouldLatchReportSourceIntegrity({ type, payload: { experimentId: "e" } }, { id: "e", status: "RUNNING" });
+      if (swallowable && !exempt) expect(latches, type).toBe(true);
+      if (exempt) expect(latches, type).toBe(false);
+      expect(swallowable && !exempt && !latches, `${type} swallowable without integrity`).toBe(false);
+    }
+    for (const type of OPERATIONAL_MONITOR_EVENT_TYPES) {
+      expect(shouldLatchReportSourceIntegrity({ type }, { id: "e", status: "RUNNING" }), type).toBe(false);
+    }
+  });
+});
+
+describe("Step-4 follow-up: crash-durable bounded integrity", () => {
+  it("A: double-failure + crash before checkpoint → restart refuses seal/canonical", async () => {
+    const journal = new MemoryEventJournal();
+    const engine = paperEngine(journal);
+    await engine.start();
+    try {
+      expect(await engine.beginExperiment()).toMatchObject({ ok: true });
+      const experimentId = engine.experimentManifest()!.id;
+      const checkpointsBefore = (await journal.listCheckpoints()).length;
+      journal.failAppendTypes.add("GROK_SIGNAL_ACCEPTED");
+      journal.failAppendTypes.add(REPORT_SOURCE_INTEGRITY_FAULT);
+      const lost = createJournalEvent({
+        id: "grok-double-fail", traceId: "tr-double", type: "GROK_SIGNAL_ACCEPTED",
+        aggregateType: "grok_signal", aggregateId: "sig-double",
+        payload: { experimentId, signalId: "sig-double" },
+      });
+      await engine.persistEventForTest(lost);
+      expect((await journal.queryEvents({ types: [REPORT_SOURCE_INTEGRITY_FAULT] })).length).toBe(0);
+      expect((await journal.queryDurableTransitions({ types: [REPORT_SOURCE_INTEGRITY_FAULT], limit: 8 })).length).toBe(1);
+      expect((await journal.listCheckpoints()).length).toBe(checkpointsBefore);
+      expect(engine.reportSourceIntegrityForTest().some((fault) => fault.eventId === "grok-double-fail")).toBe(true);
+    } finally {
+      await engine.stop();
+    }
+    const restarted = paperEngine(journal);
+    await restarted.start();
+    try {
+      expect(restarted.reportSourceIntegrityForTest().some((fault) => fault.eventId === "grok-double-fail")).toBe(true);
+      expect((await restarted.ensureSourceSealForTest()).reason).toBe("REPORT_SOURCE_INTEGRITY_UNRESOLVED");
+      await restarted.writeFinalReportForTest();
+      expect(await journal.loadExperimentReport(restarted.experimentManifest()!.id)).toBeNull();
+    } finally {
+      await restarted.stop();
+    }
+  });
+
+  it("B: 10k/100k unique failures stay hard-bounded and fail closed", { timeout: 60_000 }, async () => {
+    const hundredK = Array.from({ length: 100_000 }, (_, i) => ({
+      experimentId: "exp-bound", eventType: "TRIGGER_EVENT", eventId: `f-${i}`, reason: "x", at: "2026-09-01T00:00:00.000Z",
+    }));
+    const bounded = boundIntegrityFaults(hundredK, "exp-bound");
+    expect(bounded).toEqual([expect.objectContaining({ eventId: INTEGRITY_OVERFLOW_EVENT_ID })]);
+    expect(JSON.stringify(bounded).length).toBeLessThan(2_000);
+
+    const journal = new MemoryEventJournal();
+    const engine = paperEngine(journal);
+    await engine.start();
+    try {
+      expect(await engine.beginExperiment()).toMatchObject({ ok: true });
+      const experimentId = engine.experimentManifest()!.id;
+      journal.failAppendTypes.add("TRIGGER_EVENT");
+      journal.failAppendTypes.add(REPORT_SOURCE_INTEGRITY_FAULT);
+      for (let i = 0; i < 10_000; i += 1) {
+        await engine.persistEventForTest(createJournalEvent({
+          id: `trig-flood-${i}`, traceId: "tr-flood", type: "TRIGGER_EVENT",
+          aggregateType: "trigger", aggregateId: `trig-flood-${i}`,
+          payload: { experimentId, i },
+        }));
+      }
+      const faults = engine.reportSourceIntegrityForTest().filter((fault) => fault.experimentId === experimentId);
+      expect(faults.length).toBe(1);
+      expect(faults[0]?.eventId).toBe(INTEGRITY_OVERFLOW_EVENT_ID);
+      expect((await journal.queryEvents({ types: [REPORT_SOURCE_INTEGRITY_FAULT] })).length).toBeLessThanOrEqual(REPORT_SOURCE_INTEGRITY_HARD_CAP + 1);
+      expect((await journal.queryDurableTransitions({ types: [REPORT_SOURCE_INTEGRITY_FAULT], limit: 256 })).length).toBeLessThanOrEqual(REPORT_SOURCE_INTEGRITY_HARD_CAP + 1);
+      await engine.completeExperimentForTest();
+      const checkpoint = (await journal.listCheckpoints()).at(-1);
+      const payloadFaults = Array.isArray(checkpoint?.payload.reportSourceIntegrity) ? checkpoint!.payload.reportSourceIntegrity : [];
+      expect(payloadFaults.length).toBe(1);
+      expect(JSON.stringify(payloadFaults).length).toBeLessThan(2_000);
+      expect((await engine.ensureSourceSealForTest()).reason).toBe("REPORT_SOURCE_INTEGRITY_UNRESOLVED");
+    } finally {
+      await engine.stop();
+    }
+  });
+
+  it("C: unrelated success cannot clear a latched fault", async () => {
+    const journal = new MemoryEventJournal();
+    const engine = paperEngine(journal);
+    await engine.start();
+    try {
+      expect(await engine.beginExperiment()).toMatchObject({ ok: true });
+      const experimentId = engine.experimentManifest()!.id;
+      journal.failAppendTypes.add("GROK_SIGNAL_ACCEPTED");
+      await engine.persistEventForTest(createJournalEvent({
+        id: "grok-sticky", traceId: "tr-sticky", type: "GROK_SIGNAL_ACCEPTED",
+        aggregateType: "grok_signal", aggregateId: "sig-sticky",
+        payload: { experimentId },
+      }));
+      journal.failAppendTypes.delete("GROK_SIGNAL_ACCEPTED");
+      await engine.persistEventForTest(ev("SYSTEM_HEALTH_EVENT", new Date().toISOString(), { experimentId }, "health-clear"));
+      await engine.persistEventForTest(ev("TRIGGER_EVENT", new Date().toISOString(), { experimentId }, "trig-ok"));
+      expect(engine.reportSourceIntegrityForTest().some((fault) => fault.eventId === "grok-sticky")).toBe(true);
+      await engine.completeExperimentForTest();
+      expect((await engine.ensureSourceSealForTest()).reason).toBe("REPORT_SOURCE_INTEGRITY_UNRESOLVED");
+    } finally {
+      await engine.stop();
+    }
+  });
+
+  it("D: verified repair is exact-id; overflow cannot be cleared by one proven row", async () => {
+    const journal = new MemoryEventJournal();
+    const engine = paperEngine(journal);
+    await engine.start();
+    try {
+      expect(await engine.beginExperiment()).toMatchObject({ ok: true });
+      const experimentId = engine.experimentManifest()!.id;
+      journal.failAppendTypes.add("TRIGGER_EVENT");
+      const first = createJournalEvent({
+        id: "trig-repair-1", traceId: "tr-repair", type: "TRIGGER_EVENT",
+        aggregateType: "trigger", aggregateId: "trig-repair-1",
+        payload: { experimentId },
+      });
+      await engine.persistEventForTest(first);
+      journal.failAppendTypes.delete("TRIGGER_EVENT");
+      expect(await engine.repairReportSourceIntegrityForTest(first)).toBe(true);
+      expect(engine.reportSourceIntegrityForTest().some((fault) => fault.eventId === "trig-repair-1")).toBe(false);
+
+      journal.failAppendTypes.add("TRIGGER_EVENT");
+      for (let i = 0; i < REPORT_SOURCE_INTEGRITY_HARD_CAP + 2; i += 1) {
+        await engine.persistEventForTest(createJournalEvent({
+          id: `trig-ovf-${i}`, traceId: "tr-ovf", type: "TRIGGER_EVENT",
+          aggregateType: "trigger", aggregateId: `trig-ovf-${i}`,
+          payload: { experimentId },
+        }));
+      }
+      expect(engine.reportSourceIntegrityForTest().some((fault) => fault.eventId === INTEGRITY_OVERFLOW_EVENT_ID)).toBe(true);
+      journal.failAppendTypes.delete("TRIGGER_EVENT");
+      const one = createJournalEvent({
+        id: "trig-ovf-0", traceId: "tr-ovf", type: "TRIGGER_EVENT",
+        aggregateType: "trigger", aggregateId: "trig-ovf-0",
+        payload: { experimentId },
+      });
+      expect(await engine.repairReportSourceIntegrityForTest(one)).toBe(false);
+      expect(engine.reportSourceIntegrityForTest().some((fault) => fault.eventId === INTEGRITY_OVERFLOW_EVENT_ID)).toBe(true);
+      await engine.completeExperimentForTest();
+      expect((await engine.ensureSourceSealForTest()).reason).toBe("REPORT_SOURCE_INTEGRITY_UNRESOLVED");
+    } finally {
+      await engine.stop();
+    }
+  });
+});
+
+describe("Step-4 follow-up: seal recheck after drain + window-only work", () => {
+  it("fault during drain refuses seal and leaves no EXPERIMENT_SOURCE_SEALED row", async () => {
+    const journal = new MemoryEventJournal();
+    const engine = paperEngine(journal);
+    await engine.start();
+    let release!: () => void;
+    try {
+      expect(await engine.beginExperiment()).toMatchObject({ ok: true });
+      const experimentId = engine.experimentManifest()!.id;
+      journal.setAppendInFlightHoldForTest(new Promise<void>((resolve) => { release = resolve; }), ["GROK_SIGNAL_ACCEPTED"]);
+      const lost = createJournalEvent({
+        id: "grok-drain-fail", traceId: "tr-drain", type: "GROK_SIGNAL_ACCEPTED",
+        aggregateType: "grok_signal", aggregateId: "sig-drain",
+        payload: { experimentId, signalId: "sig-drain" },
+      });
+      const persist = engine.persistEventForTest(lost);
+      await waitUntil(() => journal.inFlightAppends > 0);
+      expect(engine.reportSourceIntegrityForTest()).toEqual([]);
+      await engine.completeExperimentForTest();
+      const sealPromise = engine.ensureSourceSealForTest();
+      journal.failAppendTypes.add("GROK_SIGNAL_ACCEPTED");
+      release();
+      await persist;
+      const seal = await sealPromise;
+      expect(seal.sealed).toBe(false);
+      expect(seal.reason).toBe("REPORT_SOURCE_INTEGRITY_UNRESOLVED");
+      expect(await loadSourceSeal(journal, experimentId)).toBeNull();
+      expect(await journal.loadExperimentReport(experimentId)).toBeNull();
+    } finally {
+      release?.();
+      journal.setAppendInFlightHoldForTest(null);
+      if (!engine.state.draining) await engine.stop();
+    }
+  });
+
+  it("COMPLETED+sealing with continuous post-window activity seals boundedly and keeps hash stable", async () => {
+    const journal = new MemoryEventJournal();
+    const engine = paperEngine(journal);
+    await engine.start();
+    try {
+      expect(await engine.beginExperiment()).toMatchObject({ ok: true });
+      const experimentId = engine.experimentManifest()!.id;
+      await engine.persistEventForTest(ev("TRIGGER_EVENT", new Date().toISOString(), { experimentId }, "pre-window-trig"));
+      await engine.completeExperimentForTest();
+      let stop = false;
+      let posted = 0;
+      const flood = (async () => {
+        while (!stop) {
+          posted += 1;
+          await engine.persistEventForTest(ev("SYSTEM_HEALTH_EVENT", new Date().toISOString(), { status: "OK" }, `post-health-${posted}`));
+          await engine.persistEventForTest(createJournalEvent({
+            id: `post-mcp-${posted}`, traceId: "tr-post", type: "MCP_INTERACTION",
+            aggregateType: "mcp_client", aggregateId: "post-window",
+            payload: { clientId: "post-window", method: "tools/call", status: "ok" },
+          }));
+          await engine.persistEventForTest(ev("DISCOVERY_RECONCILED", new Date().toISOString(), { markets: 1 }, `post-disc-${posted}`));
+        }
+      })();
+      const started = Date.now();
+      const seal = await engine.ensureSourceSealForTest();
+      expect(Date.now() - started).toBeLessThan(5_000);
+      expect(seal.sealed).toBe(true);
+      stop = true;
+      await flood;
+      expect(posted).toBeGreaterThan(0);
+      await engine.writeFinalReportForTest();
+      const first = await journal.loadExperimentReport(experimentId);
+      expect(first && isCanonicalFinalReport(first)).toBe(true);
+      const streamed = await streamExperimentSummary(journal, {
+        id: experimentId,
+        startedAt: engine.experimentManifest()?.startedAt,
+        completedAt: engine.experimentManifest()?.completedAt,
+      }, {
+        status: "COMPLETED", reportKind: "final", metricsScope: "complete", complete: true, truncated: false,
+        generatedAt: first!.generatedAt,
+      });
+      streamed.summary.complete = true;
+      streamed.summary.truncated = false;
+      expect(toDurableReportInput({ summary: streamed.summary, scan: streamed.scan }).contentHash).toBe(first!.contentHash);
+      expect(streamed.scan.scanned).toBe(first!.sourceEventCount);
+      expect(engine.state.engineAlive()).toBe(true);
+    } finally {
+      if (!engine.state.draining) await engine.stop();
+    }
+  });
+});
+
+describe("Step-4 follow-up: source-seal deadline covers acquired transaction", () => {
+  it("acquire-hold analogue: txn obtained near deadline cannot later commit a timed-out seal", async () => {
+    const journal = new MemoryEventJournal();
+    const engine = paperEngine(journal);
+    await engine.start();
+    let release!: () => void;
+    try {
+      expect(await engine.beginExperiment()).toMatchObject({ ok: true });
+      const experimentId = engine.experimentManifest()!.id;
+      engine.setSourceSealTimeoutForTest(200);
+      journal.setAppendAcquireHoldForTest(new Promise<void>((resolve) => { release = resolve; }), ["EXPERIMENT_SOURCE_SEALED"]);
+      await engine.completeExperimentForTest();
+      const sealPromise = engine.ensureSourceSealForTest();
+      await waitUntil(() => journal.inFlightAppends > 0);
+      await new Promise((resolve) => setTimeout(resolve, 220));
+      release();
+      const seal = await sealPromise;
+      expect(seal.sealed).toBe(false);
+      expect(seal.reason).toBe("SOURCE_SEAL_TIMEOUT");
+      expect(await loadSourceSeal(journal, experimentId)).toBeNull();
+      journal.setAppendAcquireHoldForTest(null);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(await loadSourceSeal(journal, experimentId)).toBeNull();
+      engine.setSourceSealTimeoutForTest(5_000);
+      const retry = await engine.ensureSourceSealForTest();
+      expect(retry.sealed).toBe(true);
+      expect((await journal.queryEvents({ types: ["EXPERIMENT_SOURCE_SEALED"] })).length).toBe(1);
+      await engine.writeFinalReportForTest();
+      const first = await journal.loadExperimentReport(experimentId);
+      expect(first && isCanonicalFinalReport(first)).toBe(true);
+      await engine.stop();
+      const restarted = paperEngine(journal);
+      await restarted.start();
+      try {
+        expect((await journal.loadExperimentReport(experimentId))?.contentHash).toBe(first!.contentHash);
+        expect((await restarted.ensureSourceSealForTest()).sealed).toBe(true);
+      } finally {
+        await restarted.stop();
+      }
+    } finally {
+      release?.();
+      journal.setAppendAcquireHoldForTest(null);
       if (!engine.state.draining) await engine.stop();
     }
   });

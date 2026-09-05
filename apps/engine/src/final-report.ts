@@ -1,5 +1,5 @@
 import {
-  DECISION_EVENT_TYPES,
+  CANONICAL_REPORT_INPUT_EVENT_TYPES,
   EXPERIMENT_REPORT_SCHEMA_VERSION,
   renderExperimentSummaryMarkdown,
   type ExperimentSummary,
@@ -39,7 +39,7 @@ export async function streamExperimentSummary(
 ): Promise<StreamedExperimentSummary> {
   const acc = new ExperimentSummaryAccumulator(experiment.id, extras);
   const scan = await scanJournalEvents(journal, {
-    types: DECISION_EVENT_TYPES,
+    types: CANONICAL_REPORT_INPUT_EVENT_TYPES,
     from: experiment.startedAt ? new Date(experiment.startedAt) : undefined,
     to: experiment.completedAt ? new Date(experiment.completedAt) : undefined,
   }, {

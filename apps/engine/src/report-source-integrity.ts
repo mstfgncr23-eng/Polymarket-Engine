@@ -1,21 +1,13 @@
 import { isReportInputEventType, isTelemetryEventType, type JournalEvent } from "@pm/core";
-import { createJournalEvent, type EventJournal } from "@pm/db";
+import { createJournalEvent, type DurableTransition, type EventJournal } from "@pm/db";
 import { isSourceSealExemptType } from "./source-seal.js";
 
 export const REPORT_SOURCE_INTEGRITY_FAULT = "REPORT_SOURCE_INTEGRITY_FAULT";
 export const REPORT_SOURCE_INTEGRITY_REPAIRED = "REPORT_SOURCE_INTEGRITY_REPAIRED";
 
-/** Accepted experiment facts whose durable loss must refuse a complete final. */
-const LATCH_TYPES = new Set([
-  "TRIGGER_EVENT", "TRIGGER_LEVEL_1", "TRIGGER_LEVEL_2", "TRIGGER_LEVEL_3",
-  "GROK_RESEARCH_AVAILABLE", "GROK_ACTIVATION_DECISION", "GROK_ACTIVATION_RESULT", "GROK_SIGNAL_ACCEPTED",
-  "CONSENSUS_DECISION", "SEVERE_DISAGREEMENT",
-  "RISK_EVALUATION", "RISK_VETO", "RISK_ACCEPT",
-  "PAPER_ORDER_CREATED", "PAPER_FILL", "PAPER_EXECUTION_ERROR", "PAPER_MAKER_RESERVED", "PAPER_MAKER_RELEASED", "PAPER_ORDER_CANCELLED",
-  "POSITION_UPDATED", "POSITION_SETTLED", "POSITION_WIN", "POSITION_LOSS", "POSITION_BREAKEVEN", "PAIR_REALIZED", "PNL_SNAPSHOT",
-  "MARKET_RESOLUTION_OBSERVED", "HEDGE_COMPLETE", "FAILED_HEDGE", "FIRST_LEG_FILLED",
-  "STRATEGY_CHANGE_PROPOSED", "MCP_INTERACTION",
-]);
+/** Hard cap on retained per-experiment fault identities. One overflow sentinel is enough to refuse finality. */
+export const REPORT_SOURCE_INTEGRITY_HARD_CAP = 64;
+export const INTEGRITY_OVERFLOW_EVENT_ID = "integrity-overflow";
 
 export interface ReportSourceIntegrityFault {
   experimentId: string;
@@ -25,13 +17,19 @@ export interface ReportSourceIntegrityFault {
   at: string;
 }
 
-export function shouldLatchReportSourceIntegrity(event: { type: string }, experiment?: { id?: string; status?: string } | null): boolean {
+export function shouldLatchReportSourceIntegrity(
+  event: { type: string; payload?: Record<string, unknown> },
+  experiment?: { id?: string; status?: string } | null,
+): boolean {
   if (!experiment?.id) return false;
-  if (experiment.status === "IDLE" || experiment.status === "MONITOR_ONLY") return false;
+  if (experiment.status === "IDLE") return false;
   if (!isReportInputEventType(event.type)) return false;
   if (isTelemetryEventType(event.type)) return false;
   if (isSourceSealExemptType(event.type)) return false;
-  return LATCH_TYPES.has(event.type);
+  const windowOpen = experiment.status === "RUNNING" || experiment.status === "ENTRY_CLOSED";
+  if (windowOpen) return true;
+  const stamped = typeof event.payload?.experimentId === "string" ? event.payload.experimentId : undefined;
+  return stamped === experiment.id;
 }
 
 export function integrityFaultEventId(experimentId: string, eventId: string): string {
@@ -40,6 +38,12 @@ export function integrityFaultEventId(experimentId: string, eventId: string): st
 
 export function integrityRepairEventId(experimentId: string, eventId: string): string {
   return `rsrcrepair:${experimentId}:${eventId}`;
+}
+
+export function integrityDurableOperationKey(kind: "fault" | "repair", experimentId: string, eventId: string): string {
+  return kind === "fault"
+    ? `rsrcfault:${experimentId}:${eventId}`
+    : `rsrcrepair:${experimentId}:${eventId}`;
 }
 
 export function createIntegrityFaultEvent(fault: ReportSourceIntegrityFault): JournalEvent {
@@ -62,6 +66,24 @@ export function createIntegrityRepairEvent(fault: ReportSourceIntegrityFault): J
     aggregateId: fault.experimentId,
     payload: { ...fault, unresolved: false, repaired: true },
   });
+}
+
+export function overflowIntegrityFault(experimentId: string, at = new Date().toISOString()): ReportSourceIntegrityFault {
+  return {
+    experimentId,
+    eventType: "OVERFLOW",
+    eventId: INTEGRITY_OVERFLOW_EVENT_ID,
+    reason: "REPORT_SOURCE_INTEGRITY_OVERFLOW",
+    at,
+  };
+}
+
+export function boundIntegrityFaults(faults: readonly ReportSourceIntegrityFault[], experimentId: string): ReportSourceIntegrityFault[] {
+  const overflow = faults.find((fault) => fault.eventId === INTEGRITY_OVERFLOW_EVENT_ID || fault.reason.includes("OVERFLOW"));
+  if (overflow || faults.length > REPORT_SOURCE_INTEGRITY_HARD_CAP) {
+    return [overflow ?? overflowIntegrityFault(experimentId)];
+  }
+  return [...faults];
 }
 
 const INTEGRITY_PAGE = 256;
@@ -91,16 +113,53 @@ export async function pageJournalEventsByTypes(
   }
 }
 
+export async function pageDurableTransitionsByTypes(
+  journal: EventJournal,
+  types: readonly string[],
+  ceiling = INTEGRITY_SCAN_CEILING,
+): Promise<{ rows: DurableTransition[]; overflow: boolean }> {
+  const rows: DurableTransition[] = [];
+  let afterSequence = 0;
+  for (;;) {
+    const page = await journal.queryDurableTransitions({ types: [...types], afterSequence, limit: INTEGRITY_PAGE });
+    rows.push(...page);
+    if (rows.length > ceiling) return { rows: rows.slice(0, ceiling), overflow: true };
+    if (page.length < INTEGRITY_PAGE) return { rows, overflow: false };
+    const last = page[page.length - 1];
+    if (!last) return { rows, overflow: false };
+    afterSequence = last.sequence;
+  }
+}
+
+function faultFromRecord(experimentId: string, payload: Record<string, unknown>, fallbackAt: string): ReportSourceIntegrityFault | null {
+  const eventId = typeof payload.eventId === "string" ? payload.eventId : "";
+  if (!eventId) return null;
+  return {
+    experimentId: typeof payload.experimentId === "string" ? payload.experimentId : experimentId,
+    eventType: typeof payload.eventType === "string" ? payload.eventType : "UNKNOWN",
+    eventId,
+    reason: typeof payload.reason === "string" ? payload.reason : "REPORT_INPUT_PERSIST_FAILED",
+    at: typeof payload.at === "string" ? payload.at : fallbackAt,
+  };
+}
+
 export async function loadIntegrityRepairIds(
   journal: EventJournal,
   experimentId: string,
 ): Promise<{ ids: Set<string>; overflow: boolean }> {
   if (!experimentId) return { ids: new Set(), overflow: false };
-  const { events, overflow } = await pageJournalEventsByTypes(journal, [REPORT_SOURCE_INTEGRITY_REPAIRED], experimentId);
-  return {
-    ids: new Set(events.map((event) => String((event.payload as { eventId?: unknown }).eventId ?? "")).filter(Boolean)),
-    overflow,
-  };
+  const journalRepairs = await pageJournalEventsByTypes(journal, [REPORT_SOURCE_INTEGRITY_REPAIRED], experimentId);
+  const durable = await pageDurableTransitionsByTypes(journal, [REPORT_SOURCE_INTEGRITY_REPAIRED]);
+  if (journalRepairs.overflow || durable.overflow) return { ids: new Set(), overflow: true };
+  const ids = new Set(
+    journalRepairs.events.map((event) => String((event.payload as { eventId?: unknown }).eventId ?? "")).filter(Boolean),
+  );
+  for (const row of durable.rows) {
+    if (row.aggregateId !== experimentId && (row.payload as { experimentId?: unknown }).experimentId !== experimentId) continue;
+    const eventId = String((row.payload as { eventId?: unknown }).eventId ?? "");
+    if (eventId) ids.add(eventId);
+  }
+  return { ids, overflow: false };
 }
 
 export async function loadUnresolvedReportSourceIntegrity(
@@ -108,35 +167,40 @@ export async function loadUnresolvedReportSourceIntegrity(
   experimentId: string,
 ): Promise<ReportSourceIntegrityFault[]> {
   if (!experimentId) return [];
-  const faultsPage = await pageJournalEventsByTypes(journal, [REPORT_SOURCE_INTEGRITY_FAULT], experimentId);
-  const repairs = await loadIntegrityRepairIds(journal, experimentId);
-  if (faultsPage.overflow || repairs.overflow) {
-    return [{
-      experimentId,
-      eventType: "OVERFLOW",
-      eventId: "integrity-scan-overflow",
-      reason: "INTEGRITY_SCAN_OVERFLOW",
-      at: new Date().toISOString(),
-    }];
+  const journalFaults = await pageJournalEventsByTypes(journal, [REPORT_SOURCE_INTEGRITY_FAULT], experimentId);
+  const journalRepairs = await loadIntegrityRepairIds(journal, experimentId);
+  const durable = await pageDurableTransitionsByTypes(journal, [REPORT_SOURCE_INTEGRITY_FAULT, REPORT_SOURCE_INTEGRITY_REPAIRED]);
+  if (journalFaults.overflow || journalRepairs.overflow || durable.overflow) {
+    return [overflowIntegrityFault(experimentId)];
   }
-  return faultsPage.events.flatMap((event) => {
-    const payload = event.payload as Partial<ReportSourceIntegrityFault>;
-    const eventId = String(payload.eventId ?? "");
-    if (!eventId || repairs.ids.has(eventId)) return [];
-    return [{
-      experimentId,
-      eventType: String(payload.eventType ?? event.type),
-      eventId,
-      reason: String(payload.reason ?? "REPORT_INPUT_PERSIST_FAILED"),
-      at: payload.at ?? event.occurredAt,
-    }];
-  });
+  const repaired = new Set(journalRepairs.ids);
+  for (const row of durable.rows) {
+    if (row.type !== REPORT_SOURCE_INTEGRITY_REPAIRED) continue;
+    if (row.aggregateId !== experimentId && (row.payload as { experimentId?: unknown }).experimentId !== experimentId) continue;
+    const eventId = String((row.payload as { eventId?: unknown }).eventId ?? "");
+    if (eventId) repaired.add(eventId);
+  }
+  const byId = new Map<string, ReportSourceIntegrityFault>();
+  for (const event of journalFaults.events) {
+    const fault = faultFromRecord(experimentId, event.payload, event.occurredAt);
+    if (fault && !repaired.has(fault.eventId)) byId.set(fault.eventId, fault);
+  }
+  for (const row of durable.rows) {
+    if (row.type !== REPORT_SOURCE_INTEGRITY_FAULT) continue;
+    if (row.aggregateId !== experimentId && (row.payload as { experimentId?: unknown }).experimentId !== experimentId) continue;
+    const fault = faultFromRecord(experimentId, row.payload, row.occurredAt);
+    if (fault && !repaired.has(fault.eventId)) byId.set(fault.eventId, fault);
+  }
+  return boundIntegrityFaults([...byId.values()], experimentId);
 }
 
 export function parseCheckpointIntegrityFaults(payload: Record<string, unknown>): ReportSourceIntegrityFault[] {
   const raw = payload.reportSourceIntegrity;
   if (!Array.isArray(raw)) return [];
-  return raw.flatMap((item) => {
+  const experimentId = typeof (payload.experiment as { id?: unknown } | undefined)?.id === "string"
+    ? (payload.experiment as { id: string }).id
+    : "";
+  const faults = raw.flatMap((item) => {
     if (!item || typeof item !== "object") return [];
     const row = item as Record<string, unknown>;
     if (typeof row.experimentId !== "string" || typeof row.eventId !== "string") return [];
@@ -148,4 +212,5 @@ export function parseCheckpointIntegrityFaults(payload: Record<string, unknown>)
       at: typeof row.at === "string" ? row.at : new Date().toISOString(),
     }];
   });
+  return boundIntegrityFaults(faults, experimentId || faults[0]?.experimentId || "unknown");
 }
