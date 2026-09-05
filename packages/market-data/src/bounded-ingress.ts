@@ -49,6 +49,7 @@ export class BoundedIngressQueue {
   private observer: IngressQueueObserver | null = null;
   private mutationsSincePublish = 0;
   private lastPublishAt = 0;
+  private flushTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
     readonly maxEvents: number = MARKET_INGRESS_BOUNDS.maxEvents,
@@ -128,14 +129,38 @@ export class BoundedIngressQueue {
     this.mutationsSincePublish += 1;
     const now = Date.now();
     if (
-      !force
-      && this.mutationsSincePublish < INGRESS_OBSERVER_BOUNDS.coalesceEveryMutations
-      && now - this.lastPublishAt < INGRESS_OBSERVER_BOUNDS.coalesceMinIntervalMs
+      force
+      || this.mutationsSincePublish >= INGRESS_OBSERVER_BOUNDS.coalesceEveryMutations
+      || now - this.lastPublishAt >= INGRESS_OBSERVER_BOUNDS.coalesceMinIntervalMs
     ) {
+      this.emitNow();
       return;
     }
+    this.scheduleFlush();
+  }
+
+  /** At most one unref'd timer per queue. Additional mutations reuse it. */
+  private scheduleFlush(): void {
+    if (this.flushTimer) return;
+    const elapsed = Date.now() - this.lastPublishAt;
+    const waitMs = Math.max(0, INGRESS_OBSERVER_BOUNDS.coalesceMinIntervalMs - elapsed);
+    this.flushTimer = setTimeout(() => {
+      this.flushTimer = null;
+      this.emitNow();
+    }, waitMs);
+    this.flushTimer.unref?.();
+  }
+
+  private clearFlushTimer(): void {
+    if (!this.flushTimer) return;
+    clearTimeout(this.flushTimer);
+    this.flushTimer = null;
+  }
+
+  private emitNow(): void {
+    this.clearFlushTimer();
     this.mutationsSincePublish = 0;
-    this.lastPublishAt = now;
+    this.lastPublishAt = Date.now();
     this.observerPublishCount += 1;
     this.observer?.onChange(this.snapshot());
   }

@@ -20,6 +20,11 @@ export const MARKET_INGRESS_BOUNDS = {
   maxBytes: 4 * 1024 * 1024,
 } as const;
 
+/** Finite application-level deadline for owned market WebSocket connect. */
+export const MARKET_CONNECT_BOUNDS = {
+  connectTimeoutMs: 5_000,
+} as const;
+
 /** Coalesce queue-observer metric publishes. Overflow/gap may flush immediately. */
 export const INGRESS_OBSERVER_BOUNDS = {
   coalesceEveryMutations: 64,

@@ -115,11 +115,11 @@ export class ScriptedMarketAdapter {
     await this.handlers?.onSnapshot(next);
   }
   isTokenSynchronized(tokenId: string): boolean {
-    return (this.sync.get(tokenId)?.state ?? "SYNCED") === "SYNCED";
+    return this.sync.get(tokenId)?.state === "SYNCED";
   }
-  tokenEpoch(tokenId: string): number { return this.sync.get(tokenId)?.epoch ?? 1; }
+  tokenEpoch(tokenId: string): number { return this.sync.get(tokenId)?.epoch ?? 0; }
   tokenSyncState(tokenId: string): "AWAITING_BOOK" | "SYNCED" | "GAPPED" {
-    return this.sync.get(tokenId)?.state ?? "SYNCED";
+    return this.sync.get(tokenId)?.state ?? "AWAITING_BOOK";
   }
   unsynchronizedTokenCount(): number {
     return [...this.sync.values()].filter((item) => item.state !== "SYNCED").length;

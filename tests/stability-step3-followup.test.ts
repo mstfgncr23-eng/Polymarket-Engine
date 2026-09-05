@@ -13,7 +13,11 @@ import {
 } from "@pm/core";
 import { MemoryEventJournal } from "@pm/db";
 import {
+  BoundedClobMarketTransport,
   BoundedIngressQueue,
+  CLOB_MARKET_CLOSED_BEFORE_OPEN,
+  CLOB_MARKET_CONNECT_ABORTED,
+  CLOB_MARKET_CONNECT_TIMEOUT,
   INGRESS_OBSERVER_BOUNDS,
   POLYMARKET_CLIENT_SUBSCRIBE_FINDINGS,
   PolymarketMarketDataAdapter,
@@ -959,5 +963,235 @@ describe("Step-3 follow-up 5 — coalesced ingress metrics and O(1) dedupe count
     await drainRuntime(engine);
     expect(engine.triggerDedupeScanCallsForTest()).toBe(before);
     await engine.stop();
+  });
+
+  it("F: quiet queue auto-flushes coalesced depth to 0 without flushObserver", async () => {
+    const metrics = new EngineMetrics();
+    const queue = new BoundedIngressQueue(16, 10_000);
+    queue.setObserver({ onChange: (snapshot) => metrics.noteIngressSnapshot(snapshot) });
+    expect(queue.tryEnqueue("a").ok).toBe(true);
+    expect(queue.tryEnqueue("b").ok).toBe(true);
+    expect(queue.dequeue()).toBe("a");
+    expect(queue.dequeue()).toBe("b");
+    expect(queue.depth).toBe(0);
+    await new Promise((resolve) => setTimeout(resolve, INGRESS_OBSERVER_BOUNDS.coalesceMinIntervalMs + 20));
+    expect(await metricValue(metrics, "market_ingress_queue_depth")).toBe(0);
+  });
+});
+
+describe("Step-3 review — partial-sync epoch fence stays attached", () => {
+  it("A: UP SYNCED + DOWN AWAITING admits an UP-derived trigger with a non-null fence", async () => {
+    const { engine, market } = await startQualifiedEngine();
+    await market.waitForHandlers();
+    await market.emitSnapshot(book("UP", "0.30"));
+    expect(market.tokenSyncState("btc-up")).toBe("SYNCED");
+    expect(market.tokenSyncState("btc-down")).toBe("AWAITING_BOOK");
+    const admitted = engine.enqueueTriggerStormForTest([marketTrigger({ id: "partial-up" })]);
+    expect(admitted.admitted).toBe(1);
+    const fence = engine.lastAdmittedMarketEpochFenceForTest();
+    expect(fence).not.toBeNull();
+    expect(fence?.["btc-up"]).toBe(market.tokenEpoch("btc-up"));
+    expect(fence?.["btc-down"]).toBeUndefined();
+    await engine.stop();
+  });
+
+  it("B: held partial-sync trigger is stale after UP epoch advances and full resync", async () => {
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => { release = resolve; });
+    const { engine, market, journal } = await startQualifiedEngine();
+    await market.waitForHandlers();
+    await market.emitSnapshot(book("UP", "0.30"));
+    try {
+      engine.setProcessTriggerHoldForTest(hold);
+      expect(engine.enqueueTriggerStormForTest([marketTrigger({ id: "partial-stale" })]).admitted).toBe(1);
+      await waitFor(() => engine.runtimeSupervisorSnapshot().totalInFlight >= 1);
+      expect(engine.lastAdmittedMarketEpochFenceForTest()).not.toBeNull();
+      market.emitGap(["btc-up", "btc-down"]);
+      market.markTokenSync("btc-up", "SYNCED");
+      market.markTokenSync("btc-down", "SYNCED");
+      await market.emitSnapshot(book("UP", "0.31", { sequence: 2, eventId: createId("market") }));
+      await market.emitSnapshot(book("DOWN", "0.52", { sequence: 2, eventId: createId("market") }));
+      engine.setProcessTriggerHoldForTest(null);
+      release();
+      await drainRuntime(engine);
+      const events = await journal.queryEvents({ types: ["TRIGGER_EVENT", "GROK_ACTIVATION_DECISION"] });
+      expect(events.some((event) => event.payload.id === "partial-stale" || event.payload.triggerId === "partial-stale")).toBe(false);
+    } finally {
+      engine.setProcessTriggerHoldForTest(null);
+      release();
+      await engine.stop();
+    }
+  });
+
+  it("C: same partial-sync trigger with no epoch change remains actionable", async () => {
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => { release = resolve; });
+    const { engine, market, journal } = await startQualifiedEngine();
+    await market.waitForHandlers();
+    await market.emitSnapshot(book("UP", "0.30"));
+    try {
+      engine.setProcessTriggerHoldForTest(hold);
+      expect(engine.enqueueTriggerStormForTest([marketTrigger({ id: "partial-live" })]).admitted).toBe(1);
+      await waitFor(() => engine.runtimeSupervisorSnapshot().totalInFlight >= 1);
+      engine.setProcessTriggerHoldForTest(null);
+      release();
+      await drainRuntime(engine);
+      const events = await journal.queryEvents({ types: ["TRIGGER_EVENT"] });
+      expect(events.some((event) => event.payload.id === "partial-live")).toBe(true);
+    } finally {
+      engine.setProcessTriggerHoldForTest(null);
+      release();
+      await engine.stop();
+    }
+  });
+
+  it("D: PAIR_COST still requires a current trusted pair", async () => {
+    const { engine, market, journal } = await startQualifiedEngine();
+    await market.waitForHandlers();
+    await market.emitSnapshot(book("UP", "0.47"));
+    await drainRuntime(engine);
+    const afterUp = await journal.queryEvents({ types: ["TRIGGER_EVENT"] });
+    expect(afterUp.some((event) => event.payload.kind === "PAIR_COST_OPPORTUNITY")).toBe(false);
+    market.markTokenSync("btc-down", "SYNCED");
+    await market.emitSnapshot(book("DOWN", "0.47"));
+    await drainRuntime(engine);
+    const afterPair = await journal.queryEvents({ types: ["TRIGGER_EVENT"] });
+    expect(afterPair.some((event) => event.payload.kind === "PAIR_COST_OPPORTUNITY")).toBe(true);
+    await engine.stop();
+  });
+});
+
+class SilentWebSocket extends EventTarget {
+  static created = 0;
+  readyState = 0;
+  constructor(readonly url: string) {
+    super();
+    SilentWebSocket.created += 1;
+  }
+  send(): void { /* never opens */ }
+  close(): void {
+    this.readyState = 3;
+    this.dispatchEvent(new Event("close"));
+  }
+}
+
+class ImmediateCloseWebSocket extends EventTarget {
+  readyState = 0;
+  constructor(readonly url: string) {
+    super();
+    queueMicrotask(() => {
+      this.readyState = 3;
+      this.dispatchEvent(new Event("close"));
+    });
+  }
+  send(): void { /* closed before open */ }
+  close(): void {
+    this.readyState = 3;
+    this.dispatchEvent(new Event("close"));
+  }
+}
+
+describe("Step-3 review — owned market connect is finitely bounded", () => {
+  it("A: WebSocket never opens -> bounded connect timeout -> adapter retries with no hung promise", async () => {
+    SilentWebSocket.created = 0;
+    const timed = new BoundedClobMarketTransport({
+      webSocket: SilentWebSocket as unknown as typeof WebSocket,
+      connectTimeoutMs: 40,
+    });
+    await expect(timed.subscribe(["tok-up"])).rejects.toThrow(CLOB_MARKET_CONNECT_TIMEOUT);
+    SilentWebSocket.created = 0;
+    const transport = new BoundedClobMarketTransport({
+      webSocket: SilentWebSocket as unknown as typeof WebSocket,
+      connectTimeoutMs: 40,
+    });
+    const adapter = new PolymarketMarketDataAdapter(undefined, { transport, ingress: transport.queue });
+    adapter.registerManualToken("tok-up", "tok-up", "UP", "BTC");
+    const ac = new AbortController();
+    const gaps: string[] = [];
+    const running = adapter.run(["tok-up"], {
+      onSnapshot: () => undefined,
+      onConnection: () => undefined,
+      onError: () => undefined,
+      onGap: (event) => { gaps.push(event.reason); },
+    }, ac.signal);
+    await waitFor(() => SilentWebSocket.created >= 2, 3_000);
+    expect(gaps).toEqual([]);
+    ac.abort();
+    await running;
+    expect(gaps).toEqual([]);
+  });
+
+  it("B: close before open rejects subscribe and retry proceeds", async () => {
+    const transport = new BoundedClobMarketTransport({
+      webSocket: ImmediateCloseWebSocket as unknown as typeof WebSocket,
+      connectTimeoutMs: 500,
+    });
+    const adapter = new PolymarketMarketDataAdapter(undefined, { transport, ingress: transport.queue });
+    adapter.registerManualToken("tok-up", "tok-up", "UP", "BTC");
+    const ac = new AbortController();
+    const connections: string[] = [];
+    const gaps: string[] = [];
+    const pending = transport.subscribe(["tok-up"], true);
+    await expect(pending).rejects.toThrow(CLOB_MARKET_CLOSED_BEFORE_OPEN);
+    const running = adapter.run(["tok-up"], {
+      onSnapshot: () => undefined,
+      onConnection: (event) => { connections.push(event.state); },
+      onError: () => undefined,
+      onGap: (event) => { gaps.push(event.reason); },
+    }, ac.signal);
+    await waitFor(() => connections.filter((state) => state === "DISCONNECTED").length >= 1);
+    expect(gaps).toEqual([]);
+    ac.abort();
+    await running;
+  });
+
+  it("C: abort during CONNECTING settles the connect promise promptly", async () => {
+    const direct = new BoundedClobMarketTransport({
+      webSocket: SilentWebSocket as unknown as typeof WebSocket,
+      connectTimeoutMs: 5_000,
+    });
+    const connectAbort = new AbortController();
+    const pending = direct.subscribe(["tok-up"], true, connectAbort.signal);
+    await Promise.resolve();
+    const before = Date.now();
+    connectAbort.abort();
+    await expect(pending).rejects.toThrow(CLOB_MARKET_CONNECT_ABORTED);
+    expect(Date.now() - before).toBeLessThan(200);
+
+    const transport = new ScriptedBoundedMarketTransport();
+    transport.holdNextSubscribe();
+    const adapter = new PolymarketMarketDataAdapter(undefined, { transport, ingress: transport.queue });
+    adapter.registerManualToken("tok-up", "tok-up", "UP", "BTC");
+    const ac = new AbortController();
+    const connections: string[] = [];
+    const running = adapter.run(["tok-up"], {
+      onSnapshot: () => undefined,
+      onConnection: (event) => { connections.push(event.state); },
+      onError: () => undefined,
+    }, ac.signal);
+    await waitFor(() => transport.subscribeCalls >= 1 && connections.includes("CONNECTING"));
+    const started = Date.now();
+    ac.abort();
+    await running;
+    expect(Date.now() - started).toBeLessThan(200);
+  });
+
+  it("D-F: trusted loss is one gap; failed reconnects add none; later trusted loss adds one", async () => {
+    const { adapter, transport, ac, running, gaps } = await startLiveAdapter();
+    expect(transport.push(liveBookEvent("tok-up", 1_000)).ok).toBe(true);
+    await waitFor(() => adapter.isTokenSynchronized("tok-up"));
+    transport.current().endRemote();
+    await waitFor(() => gaps.length === 1);
+    expect(gaps).toEqual(["reconnect"]);
+    transport.failNextSubscribeCount = 3;
+    await waitFor(() => transport.subscribeCalls >= 5, 5_000);
+    expect(gaps).toEqual(["reconnect"]);
+    expect(transport.push(liveBookEvent("tok-up", 2_000)).ok).toBe(true);
+    await waitFor(() => adapter.isTokenSynchronized("tok-up"));
+    transport.current().endRemote();
+    await waitFor(() => gaps.length === 2);
+    expect(gaps).toEqual(["reconnect", "reconnect"]);
+    ac.abort();
+    await running;
   });
 });

@@ -9,7 +9,11 @@ import type { BoundedIngressQueue } from "./bounded-ingress.js";
 export interface MarketStreamTransport {
   readonly bounded: true;
   readonly queue?: BoundedIngressQueue;
-  subscribe(tokenIds: readonly string[], customFeatureEnabled?: boolean): Promise<BoundedMarketStream>;
+  subscribe(
+    tokenIds: readonly string[],
+    customFeatureEnabled?: boolean,
+    signal?: AbortSignal,
+  ): Promise<BoundedMarketStream>;
 }
 
 export function isBoundedMarketStreamTransport(value: unknown): value is MarketStreamTransport {

@@ -13,6 +13,9 @@ export class ScriptedBoundedMarketTransport implements MarketStreamTransport {
   subscribeCalls = 0;
   concurrent = 0;
   maxConcurrent = 0;
+  failNextSubscribeCount = 0;
+  failNextSubscribeError = new Error("CLOB_MARKET_WS_ERROR");
+  private subscribeGate: Promise<void> | null = null;
 
   constructor(queue?: BoundedIngressQueue) {
     this.queue = queue ?? new BoundedIngressQueue();
@@ -22,8 +25,32 @@ export class ScriptedBoundedMarketTransport implements MarketStreamTransport {
 
   current(): ScriptedBoundedStream { return this.streams.at(-1)!; }
 
-  async subscribe(_tokenIds: readonly string[] = [], _customFeatureEnabled = true): Promise<ScriptedBoundedStream> {
+  holdNextSubscribe(): { release: () => void } {
+    let release!: () => void;
+    this.subscribeGate = new Promise<void>((resolve) => { release = resolve; });
+    return { release };
+  }
+
+  async subscribe(
+    _tokenIds: readonly string[] = [],
+    _customFeatureEnabled = true,
+    signal?: AbortSignal,
+  ): Promise<ScriptedBoundedStream> {
     this.subscribeCalls += 1;
+    if (signal?.aborted) throw abortConnectError(signal.reason);
+    if (this.subscribeGate) {
+      const gate = this.subscribeGate;
+      this.subscribeGate = null;
+      await Promise.race([
+        gate,
+        abortConnectPromise(signal),
+      ]);
+    }
+    if (signal?.aborted) throw abortConnectError(signal.reason);
+    if (this.failNextSubscribeCount > 0) {
+      this.failNextSubscribeCount -= 1;
+      throw this.failNextSubscribeError;
+    }
     this.concurrent += 1;
     this.maxConcurrent = Math.max(this.maxConcurrent, this.concurrent);
     this.queue.clear();
@@ -124,4 +151,16 @@ export class ScriptedBoundedStream implements BoundedMarketStream {
       break;
     }
   }
+}
+
+function abortConnectError(reason: unknown): Error {
+  return reason instanceof Error ? reason : new Error("CLOB_MARKET_WS_CONNECT_ABORTED");
+}
+
+function abortConnectPromise(signal?: AbortSignal): Promise<never> {
+  if (!signal) return new Promise(() => undefined);
+  if (signal.aborted) return Promise.reject(abortConnectError(signal.reason));
+  return new Promise((_, reject) => {
+    signal.addEventListener("abort", () => reject(abortConnectError(signal.reason)), { once: true });
+  });
 }

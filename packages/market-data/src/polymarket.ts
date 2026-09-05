@@ -162,7 +162,8 @@ export class PolymarketMarketDataAdapter {
   private readonly sync = new TokenSyncIndex();
   readonly ingress: BoundedIngressQueue;
   private readonly transport: MarketStreamTransport;
-  private hadTrustedBooks = false;
+  /** Trusted full book observed on the CURRENT stream attempt only. */
+  private streamHadTrustedBooks = false;
   private logicalLossGapped = false;
 
   constructor(
@@ -366,8 +367,10 @@ export class PolymarketMarketDataAdapter {
           const current = [...this.tokenIds];
           if (current.length === 0) continue;
           const generationRestart = generation > 1 && reconnectCount === 0;
+          const previousStreamTrusted = this.streamHadTrustedBooks;
+          this.streamHadTrustedBooks = false;
           const emitGap = generationRestart
-            || (reconnectCount > 0 && !this.logicalLossGapped && this.hadTrustedBooks);
+            || (reconnectCount > 0 && !this.logicalLossGapped && previousStreamTrusted);
           this.beginStreamEpoch(
             current,
             reconnectCount > 0 ? "reconnect" : generationRestart ? "generation_change" : "explicit_resubscribe",
@@ -375,13 +378,26 @@ export class PolymarketMarketDataAdapter {
             { emitGap },
           );
           this.logicalLossGapped = false;
-          const stream = await this.transport.subscribe(current, true);
+          const connectAbort = new AbortController();
+          const onParentAbort = () => connectAbort.abort(signal.reason);
+          if (signal.aborted) connectAbort.abort(signal.reason);
+          else signal.addEventListener("abort", onParentAbort, { once: true });
+          this.closeCurrentStream = () => {
+            resubscribed = true;
+            connectAbort.abort("MARKET_STREAM_RESUBSCRIBE");
+          };
+          let stream: Awaited<ReturnType<MarketStreamTransport["subscribe"]>>;
+          try {
+            stream = await this.transport.subscribe(current, true, connectAbort.signal);
+          } finally {
+            signal.removeEventListener("abort", onParentAbort);
+          }
           this.activeStreams += 1;
           this.closeCurrentStream = () => {
             resubscribed = true;
             void stream.close();
           };
-          if (signal.aborted) this.closeCurrentStream();
+          if (signal.aborted || connectAbort.signal.aborted) this.closeCurrentStream();
           try {
             backoff.reset();
             await handlers.onConnection({ feed: "polymarket", state: "CONNECTED", at: new Date().toISOString(), reconnectCount });
@@ -489,7 +505,7 @@ export class PolymarketMarketDataAdapter {
   }
 
   private noteUnexpectedStreamLoss(reason: IngressGapReason, handlers?: Pick<PolymarketFeedHandlers, "onGap">): void {
-    if (this.logicalLossGapped || !this.hadTrustedBooks) return;
+    if (this.logicalLossGapped || !this.streamHadTrustedBooks) return;
     this.gapAll(reason, handlers);
   }
 
@@ -530,7 +546,7 @@ export class PolymarketMarketDataAdapter {
       };
       this.books.set(tokenId, state);
       const synced = this.sync.markSyncedFromBook(tokenId);
-      this.hadTrustedBooks = true;
+      this.streamHadTrustedBooks = true;
       if (synced.wasResync) {
         handlers.onResync?.({ reason: "full_book", tokenId, epoch: synced.epoch });
       }

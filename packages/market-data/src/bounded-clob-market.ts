@@ -1,5 +1,5 @@
 import { BoundedIngressQueue, IngressOverflowError } from "./bounded-ingress.js";
-import { CLOB_MARKET_WS_URL, MARKET_INGRESS_BOUNDS } from "./ingress-bounds.js";
+import { CLOB_MARKET_WS_URL, MARKET_CONNECT_BOUNDS, MARKET_INGRESS_BOUNDS } from "./ingress-bounds.js";
 import type { MarketStreamTransport } from "./market-stream-transport.js";
 
 export interface BoundedMarketStream {
@@ -14,8 +14,13 @@ export interface BoundedMarketTransportOptions {
   queue?: BoundedIngressQueue;
   pingIntervalMs?: number;
   staleMs?: number;
+  connectTimeoutMs?: number;
   webSocket?: typeof WebSocket;
 }
+
+export const CLOB_MARKET_CONNECT_TIMEOUT = "CLOB_MARKET_WS_CONNECT_TIMEOUT";
+export const CLOB_MARKET_CONNECT_ABORTED = "CLOB_MARKET_WS_CONNECT_ABORTED";
+export const CLOB_MARKET_CLOSED_BEFORE_OPEN = "CLOB_MARKET_WS_CLOSED_BEFORE_OPEN";
 
 /**
  * Owned CLOB market WebSocket. Nearest controlled layer in front of the
@@ -24,6 +29,9 @@ export interface BoundedMarketTransportOptions {
  * Subscribe frame matches the official SDK (`type: "market"`, `assets_ids`,
  * `custom_feature_enabled`). Fresh subscribe is how the CLOB emits canonical
  * `book` snapshots; this transport does not invent books.
+ *
+ * Connect is finitely bounded: timeout, error, close-before-open, and AbortSignal
+ * all reject the subscribe promise. Listeners/timers are cleaned on settle.
  */
 export class BoundedClobMarketTransport implements MarketStreamTransport {
   readonly bounded = true as const;
@@ -31,6 +39,7 @@ export class BoundedClobMarketTransport implements MarketStreamTransport {
   private readonly url: string;
   private readonly pingIntervalMs: number;
   private readonly staleMs: number;
+  private readonly connectTimeoutMs: number;
   private readonly WebSocketImpl: typeof WebSocket;
 
   constructor(options: BoundedMarketTransportOptions = {}) {
@@ -41,10 +50,15 @@ export class BoundedClobMarketTransport implements MarketStreamTransport {
     );
     this.pingIntervalMs = options.pingIntervalMs ?? 10_000;
     this.staleMs = options.staleMs ?? 30_000;
+    this.connectTimeoutMs = options.connectTimeoutMs ?? MARKET_CONNECT_BOUNDS.connectTimeoutMs;
     this.WebSocketImpl = options.webSocket ?? WebSocket;
   }
 
-  async subscribe(tokenIds: readonly string[], customFeatureEnabled = true): Promise<BoundedMarketStream> {
+  async subscribe(
+    tokenIds: readonly string[],
+    customFeatureEnabled = true,
+    signal?: AbortSignal,
+  ): Promise<BoundedMarketStream> {
     const queue = this.queue;
     queue.clear();
     const socket = new this.WebSocketImpl(this.url);
@@ -54,6 +68,7 @@ export class BoundedClobMarketTransport implements MarketStreamTransport {
     const waiters: Array<(result: IteratorResult<unknown>) => void> = [];
     let pendingError: Error | null = null;
     let ended = false;
+    let opened = false;
 
     const wake = () => {
       while (waiters.length > 0) {
@@ -101,44 +116,98 @@ export class BoundedClobMarketTransport implements MarketStreamTransport {
       wake();
     };
 
-    await new Promise<void>((resolve, reject) => {
-      socket.addEventListener("open", () => {
-        socket.send(JSON.stringify({
-          assets_ids: [...tokenIds],
-          custom_feature_enabled: customFeatureEnabled,
-          type: "market",
-        }));
-        lastPong = Date.now();
-        pingTimer = setInterval(() => {
-          if (Date.now() - lastPong > this.staleMs) {
-            fail(new Error("CLOB_MARKET_WS_STALE"));
-            void closeSocket();
-            return;
-          }
-          try { socket.send("PING"); } catch { /* closed */ }
-        }, this.pingIntervalMs);
-        resolve();
-      }, { once: true });
-      socket.addEventListener("error", () => reject(new Error("CLOB_MARKET_WS_ERROR")), { once: true });
-      socket.addEventListener("close", () => {
-        ended = true;
-        wake();
-      });
-      socket.addEventListener("message", (message) => {
-        const data = typeof message.data === "string" ? message.data : String(message.data);
-        if (data === "PONG") {
-          lastPong = Date.now();
-          return;
-        }
-        let parsed: unknown;
-        try { parsed = JSON.parse(data) as unknown; } catch {
-          fail(new Error("MARKET_INGRESS_MALFORMED"));
+    const onOpen = () => {
+      socket.send(JSON.stringify({
+        assets_ids: [...tokenIds],
+        custom_feature_enabled: customFeatureEnabled,
+        type: "market",
+      }));
+      lastPong = Date.now();
+      pingTimer = setInterval(() => {
+        if (Date.now() - lastPong > this.staleMs) {
+          fail(new Error("CLOB_MARKET_WS_STALE"));
           void closeSocket();
           return;
         }
-        const events = Array.isArray(parsed) ? parsed : [parsed];
-        for (const event of events) enqueue(event);
-      });
+        try { socket.send("PING"); } catch { /* closed */ }
+      }, this.pingIntervalMs);
+    };
+
+    const onMessage = (message: { data?: unknown }) => {
+      const data = typeof message.data === "string" ? message.data : String(message.data);
+      if (data === "PONG") {
+        lastPong = Date.now();
+        return;
+      }
+      let parsed: unknown;
+      try { parsed = JSON.parse(data) as unknown; } catch {
+        fail(new Error("MARKET_INGRESS_MALFORMED"));
+        void closeSocket();
+        return;
+      }
+      const events = Array.isArray(parsed) ? parsed : [parsed];
+      for (const event of events) enqueue(event);
+    };
+
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const connectTimer = setTimeout(() => {
+        finish(new Error(CLOB_MARKET_CONNECT_TIMEOUT));
+      }, this.connectTimeoutMs);
+      connectTimer.unref?.();
+
+      const onAbort = () => finish(new Error(CLOB_MARKET_CONNECT_ABORTED));
+      const onError = () => finish(new Error("CLOB_MARKET_WS_ERROR"));
+      const onClose = () => {
+        if (!opened) {
+          finish(new Error(CLOB_MARKET_CLOSED_BEFORE_OPEN));
+          return;
+        }
+        ended = true;
+        wake();
+      };
+      const onOpened = () => {
+        opened = true;
+        onOpen();
+        finish();
+      };
+
+      const cleanup = () => {
+        clearTimeout(connectTimer);
+        signal?.removeEventListener("abort", onAbort);
+        socket.removeEventListener("open", onOpened);
+        socket.removeEventListener("error", onError);
+        socket.removeEventListener("close", onCloseDuringConnect);
+      };
+
+      const onCloseDuringConnect = () => onClose();
+
+      const finish = (error?: Error) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        if (!error) {
+          socket.addEventListener("close", () => {
+            ended = true;
+            wake();
+          });
+          resolve();
+          return;
+        }
+        ended = true;
+        void closeSocket();
+        reject(error);
+      };
+
+      socket.addEventListener("open", onOpened, { once: true });
+      socket.addEventListener("error", onError, { once: true });
+      socket.addEventListener("close", onCloseDuringConnect);
+      socket.addEventListener("message", onMessage);
+      if (signal?.aborted) {
+        finish(new Error(CLOB_MARKET_CONNECT_ABORTED));
+        return;
+      }
+      signal?.addEventListener("abort", onAbort);
     });
 
     return {

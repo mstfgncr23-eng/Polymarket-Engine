@@ -198,6 +198,7 @@ export class EngineService {
   private maintenanceHold: Promise<void> | null = null;
   private processTriggerHold: Promise<void> | null = null;
   private referenceTelemetryHoldForTest: Promise<void> | null = null;
+  private lastAdmittedMarketEpochFence: ReadonlyMap<string, number> | null = null;
   private discoveryGenerationApplied = 0;
 
   constructor(
@@ -1362,6 +1363,7 @@ export class EngineService {
     }
     const lane = triggerWorkLane(trigger.kind);
     const marketEpochFence = this.captureMarketEpochFence(trigger);
+    this.lastAdmittedMarketEpochFence = marketEpochFence;
     const result = this.supervisor.admit({
       id: trigger.id,
       lane,
@@ -2525,6 +2527,10 @@ export class EngineService {
   referenceRetryTimerCountForTest(): number { return this.referenceRetryTimers.size; }
   referenceResyncRequestedForTest(asset: string): boolean { return this.referenceResyncRequested.has(asset); }
   triggerDedupeScanCallsForTest(): number { return this.triggerEngine.dedupeScanCallsForTest(); }
+  lastAdmittedMarketEpochFenceForTest(): Record<string, number> | null {
+    if (!this.lastAdmittedMarketEpochFence || this.lastAdmittedMarketEpochFence.size === 0) return null;
+    return Object.fromEntries(this.lastAdmittedMarketEpochFence);
+  }
   applyIngressGapForTest(tokenIds: readonly string[], reason: "explicit_resubscribe" | "reconnect" | "count_limit" = "explicit_resubscribe"): void {
     this.invalidateMarketProjections(tokenIds);
     this.metrics.noteIngressGap(reason);
@@ -2601,16 +2607,24 @@ export class EngineService {
     return this.marketEpochFenceStale(fence);
   }
 
+  /**
+   * Market-data research is fenced by the trusted tokens that exist at admission.
+   * A sibling still AWAITING_BOOK does not drop the fence. At execution every
+   * captured token must still be SYNCED at that exact epoch. Risk/system/
+   * settlement stay unfenced. If no token is trusted yet, fence is null and
+   * MCP/research registration without books remains possible; that work is not
+   * treated as originating from trusted market data.
+   */
   private captureMarketEpochFence(trigger: TriggerEvent): Map<string, number> | null {
     if (!isMarketDataDerivedTrigger(trigger) || !trigger.marketId) return null;
     const tokens = this.tokensForMarket(trigger.marketId);
     if (tokens.length === 0) return null;
     const fence = new Map<string, number>();
     for (const tokenId of tokens) {
-      if (!this.adapterTokenSynchronized(tokenId)) return null;
+      if (!this.adapterTokenSynchronized(tokenId)) continue;
       fence.set(tokenId, this.adapterTokenEpoch(tokenId));
     }
-    return fence;
+    return fence.size > 0 ? fence : null;
   }
 
   private marketEpochFenceStale(fence: ReadonlyMap<string, number> | null): boolean {
