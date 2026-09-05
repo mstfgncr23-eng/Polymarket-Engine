@@ -2,7 +2,7 @@ import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import type { JournalEvent } from "@pm/core";
-import { MemoryEventJournal, PostgresEventJournal, isCanonicalFinalReport, type JournalAppendOptions, type EventJournal } from "@pm/db";
+import { JournalAppendAbortedError, MemoryEventJournal, PostgresEventJournal, isCanonicalFinalReport, type JournalAppendOptions, type EventJournal } from "@pm/db";
 import { EngineService } from "../apps/engine/src/engine.js";
 import { streamExperimentSummary } from "../apps/engine/src/final-report.js";
 import { loadSourceSeal } from "../apps/engine/src/source-seal.js";
@@ -105,6 +105,24 @@ function paperEngine(journal: EventJournal) {
 }
 
 describe("Step-4 Postgres transaction/commit outcome", () => {
+  it("preserves a confirmed adapter deadline abort even if the client wall clock still has time remaining", async () => {
+    const journal = new MemoryEventJournal();
+    const engine = paperEngine(journal);
+    await engine.start();
+    try {
+      expect(await engine.beginExperiment()).toMatchObject({ ok: true });
+      await engine.completeExperimentForTest();
+      const append = journal.append.bind(journal);
+      journal.append = async (event, options) => {
+        if (event.type === "EXPERIMENT_SOURCE_SEALED") throw new JournalAppendAbortedError("deadline");
+        return append(event, options);
+      };
+      engine.setSourceSealTimeoutForTest(5_000);
+      expect(await engine.ensureSourceSealForTest()).toEqual({ sealed: false, reason: "SOURCE_SEAL_TIMEOUT" });
+      expect(await loadSourceSeal(journal, engine.experimentManifest()!.id)).toBeNull();
+    } finally { await engine.stop(); }
+  });
+
   it.skipIf(!process.env.STEP4_TEST_DATABASE_URL)("real PG17: held transaction after INSERT aborts before timeout result, then retry/restart produce one canonical seal/report", { timeout: 30_000 }, async () => {
     const url = process.env.STEP4_TEST_DATABASE_URL!;
     const target = new URL(url);
@@ -171,6 +189,8 @@ describe("Step-4 Postgres transaction/commit outcome", () => {
       engine.setSourceSealTimeoutForTest(5_000);
       expect(await engine.ensureSourceSealForTest()).toEqual({ sealed: true, reason: null });
       expect(await pg.queryEvents({ types: ["EXPERIMENT_SOURCE_SEALED"], experimentId })).toHaveLength(1);
+      const snapshot = await pg.withReadSnapshot((snap) => snap.queryEventsKeyset({ experimentId, limit: 100 }));
+      expect(snapshot.value).toEqual(await pg.queryEventsKeyset({ experimentId, limit: 100 }));
       const streamed = await streamExperimentSummary(pg, engine.experimentManifest()!, {
         status: "COMPLETED", reportKind: "final", metricsScope: "complete", complete: true, truncated: false,
       });

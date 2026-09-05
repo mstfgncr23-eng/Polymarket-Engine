@@ -980,8 +980,8 @@ export class PostgresEventJournal implements EventJournal {
             aggregateType: String(row.aggregate_type),
             aggregateId: String(row.aggregate_id),
             payload: row.payload as Record<string, unknown>,
-            occurredAt: new Date(String(row.occurred_at)),
-            recordedAt: new Date(String(row.recorded_at)),
+            occurredAt: new Date(row.occurred_at as string | Date),
+            recordedAt: new Date(row.recorded_at as string | Date),
             sourceEventId: row.source_event_id == null ? null : String(row.source_event_id),
           } as typeof journalEvents.$inferSelect));
         },
@@ -1025,9 +1025,11 @@ function buildJournalKeysetSql(query: JournalKeysetQuery & { orderDesc?: boolean
     values.push(query.experimentId, query.experimentId);
     clauses.push(`(aggregate_id = $${values.length - 1} OR payload->>'experimentId' = $${values.length})`);
   }
-  if (query.from) push(`occurred_at >= ?`, query.from);
-  if (query.to) push(`occurred_at <= ?`, query.to);
-  if (query.recordedAtTo) push(`recorded_at <= ?`, query.recordedAtTo);
+  // Drizzle installs pass-through timestamp serializers on this shared client.
+  // Raw postgres.js snapshot queries must bind ISO strings, not Date objects.
+  if (query.from) push(`occurred_at >= ?`, query.from.toISOString());
+  if (query.to) push(`occurred_at <= ?`, query.to.toISOString());
+  if (query.recordedAtTo) push(`recorded_at <= ?`, query.recordedAtTo.toISOString());
   if (query.after) {
     values.push(query.after.occurredAt, query.after.id);
     clauses.push(`(occurred_at, id) > ($${values.length - 1}::timestamptz, $${values.length})`);
