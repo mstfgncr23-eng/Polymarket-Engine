@@ -1667,21 +1667,38 @@ export class EngineService {
       this.assertResearchIntegrity();
       if (!claimed) {
         // A claim proves admission only, including across a crash before append.
-        // Check the canonical fact with bounded trace pages (also works for old IDs).
+        // Check every canonical fact required by this submission with bounded trace
+        // pages (also works for old IDs). The proposal is linked to the accepted
+        // signal by the same trace and aggregate identity.
+        const requiresStrategyProposal = submission.agentId === "strategy_supervisor"
+          && submission.output.proposedChange !== null;
+        let acceptedEvent: JournalEvent | undefined;
+        const strategyProposalAggregateIds = new Set<string>();
         let after: Parameters<EventJournal["readTracePage"]>[1]["after"];
-        let persisted = false;
         do {
           const page = await this.journal.readTracePage(submission.traceId, { after, limit: 128 });
-          persisted = page.events.some((event) => event.type === "GROK_SIGNAL_ACCEPTED"
-            && event.payload.clientId === clientId && event.payload.submissionId === submission.submissionId);
+          for (const event of page.events) {
+            if (event.type === "STRATEGY_CHANGE_PROPOSED" && event.traceId === submission.traceId) {
+              strategyProposalAggregateIds.add(event.aggregateId);
+            }
+            if (!acceptedEvent && event.type === "GROK_SIGNAL_ACCEPTED"
+              && event.traceId === submission.traceId
+              && event.payload.clientId === clientId && event.payload.submissionId === submission.submissionId) {
+              acceptedEvent = event;
+            }
+          }
           after = page.nextCursor ?? undefined;
-        } while (!persisted && after);
+          const proposalPersisted = acceptedEvent !== undefined && strategyProposalAggregateIds.has(acceptedEvent.aggregateId);
+          if (acceptedEvent !== undefined && (!requiresStrategyProposal || proposalPersisted)) break;
+        } while (after);
         this.assertResearchIntegrity();
-        if (!persisted) {
+        const proposalPersisted = acceptedEvent !== undefined && strategyProposalAggregateIds.has(acceptedEvent.aggregateId);
+        if (acceptedEvent === undefined || (requiresStrategyProposal && !proposalPersisted)) {
           // This can also be a concurrent claim whose first caller is still
-          // persisting. Reject the unproven duplicate without poisoning that
-          // caller. An actual total persistence failure installs the sticky
-          // fail-closed state in safeAppend; restart still cannot accept this claim.
+          // persisting one of its canonical facts. Reject the unproven duplicate
+          // without poisoning that caller. An actual total persistence failure
+          // installs the sticky fail-closed state in safeAppend; restart still
+          // cannot accept this claim.
           throw new Error("GROK_SUBMISSION_CANONICAL_FACT_MISSING");
         }
         this.state.recordGrokRejection("duplicate");

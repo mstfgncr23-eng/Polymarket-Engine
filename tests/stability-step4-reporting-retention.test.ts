@@ -2028,6 +2028,65 @@ describe("Step-4 follow-up: crash-durable bounded integrity", () => {
     }
   });
 
+  it("strategy proposal persistence failure never reinterprets an accepted-only claim as a duplicate after restart", async () => {
+    const journal = new MemoryEventJournal();
+    const engine = paperEngine(journal);
+    await engine.start();
+    const now = Date.now();
+    const trigger = triggerEventSchema.parse({
+      id: "trig-strategy-orphan", traceId: "trace-strategy-orphan", marketId: "btc-mkt", asset: "BTC",
+      kind: "BOOK_IMBALANCE", severity: 2, score: 1, dedupeKey: "strategy-orphan", evidence: {},
+      sourceEventIds: ["e-strategy-orphan"], source: "polymarket",
+      createdAt: new Date(now).toISOString(), expiresAt: new Date(now + 60_000).toISOString(),
+    });
+    const submission = grokSignalSubmissionSchema.parse({
+      submissionId: "sub-strategy-orphan", traceId: trigger.traceId, triggerId: trigger.id,
+      correlationId: "c-strategy-orphan", marketId: "btc-mkt", asset: "BTC",
+      agentId: "strategy_supervisor", role: "strategy_supervisor", timestamp: new Date(now).toISOString(),
+      output: {
+        confidence: 0.8, evidenceIds: ["e-strategy-orphan"], expiresAt: trigger.expiresAt, reasonCodes: ["T"],
+        diagnosis: "regime shift", regime: "VOLATILE",
+        proposedChange: { status: "PROPOSED", summary: "raise entry threshold", parameterPatch: { entryThreshold: 0.07 } },
+      },
+    });
+    let checkpointsBefore = 0;
+    try {
+      expect(await engine.beginExperiment()).toMatchObject({ ok: true });
+      await engine.registerTriggerForResearch(trigger);
+      checkpointsBefore = (await journal.listCheckpoints()).length;
+      journal.failAppendTypes.add("STRATEGY_CHANGE_PROPOSED");
+      journal.failAppendTypes.add(REPORT_SOURCE_INTEGRITY_FAULT);
+      journal.failNextDurableInsert = true;
+      await expect(engine.submitGrokSignal(submission, submission.agentId)).rejects.toThrow("JOURNAL_APPEND_FAILED");
+      expect(journal.failNextDurableInsert).toBe(false);
+      expect(engine.recoveryFailClosedForTest()).toBe(true);
+      expect(engine.state.overloadState).toBe("FAIL_CLOSED");
+      expect(engine.state.grokActivity.acceptedSignals).toBe(0);
+      expect(await journal.queryEvents({ types: ["GROK_SIGNAL_ACCEPTED"] })).toHaveLength(1);
+      expect(await journal.queryEvents({ types: ["STRATEGY_CHANGE_PROPOSED"] })).toEqual([]);
+      expect(await journal.queryEvents({ types: [REPORT_SOURCE_INTEGRITY_FAULT] })).toEqual([]);
+      expect(await journal.queryDurableTransitions({ types: [REPORT_SOURCE_INTEGRITY_FAULT], limit: 8 })).toEqual([]);
+      expect(await journal.idempotencyCreatedAt("grok_signal_submission", `${submission.agentId}:${submission.submissionId}`)).toBeTruthy();
+      journal.failAppendTypes.clear();
+    } finally {
+      await engine.stop();
+    }
+    expect((await journal.listCheckpoints()).length).toBe(checkpointsBefore);
+
+    const restarted = paperEngine(journal);
+    await restarted.start();
+    try {
+      expect(restarted.reportSourceIntegrityForTest()).toEqual([]);
+      await restarted.registerTriggerForResearch(trigger);
+      await expect(restarted.submitGrokSignal(submission, submission.agentId)).rejects.toThrow("GROK_SUBMISSION_CANONICAL_FACT_MISSING");
+      await expect(restarted.submitGrokSignal(submission, submission.agentId)).rejects.toThrow("GROK_SUBMISSION_CANONICAL_FACT_MISSING");
+      expect(restarted.state.grokActivity.acceptedSignals).toBe(0);
+      expect(restarted.state.grokActivity.duplicates).toBe(0);
+    } finally {
+      await restarted.stop();
+    }
+  });
+
   it("A: double-failure + crash before checkpoint → restart refuses seal/canonical", async () => {
     const journal = new MemoryEventJournal();
     const engine = paperEngine(journal);
