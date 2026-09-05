@@ -1068,11 +1068,16 @@ export class PostgresEventJournal implements EventJournal {
   async close(): Promise<void> { await this.client.end({ timeout: 5 }); }
 }
 
-function buildJournalKeysetSql(query: JournalKeysetQuery & { orderDesc?: boolean }): { text: string; values: unknown[] } {
+/** postgres.js `unsafe` binds text; Date objects throw at parameter bind. */
+function sqlBindValue(value: unknown): unknown {
+  return value instanceof Date ? value.toISOString() : value;
+}
+
+export function buildJournalKeysetSql(query: JournalKeysetQuery & { orderDesc?: boolean }): { text: string; values: unknown[] } {
   const clauses: string[] = [];
   const values: unknown[] = [];
   const push = (fragment: string, value: unknown) => {
-    values.push(value);
+    values.push(sqlBindValue(value));
     clauses.push(fragment.replace("?", `$${values.length}`));
   };
   if (query.types && query.types.length > 0) push(`type = ANY(?)`, query.types);
@@ -1082,15 +1087,15 @@ function buildJournalKeysetSql(query: JournalKeysetQuery & { orderDesc?: boolean
   }
   // Drizzle installs pass-through timestamp serializers on this shared client.
   // Raw postgres.js snapshot queries must bind ISO strings, not Date objects.
-  if (query.from) push(`occurred_at >= ?`, query.from.toISOString());
-  if (query.to) push(`occurred_at <= ?`, query.to.toISOString());
-  if (query.recordedAtTo) push(`recorded_at <= ?`, query.recordedAtTo.toISOString());
+  if (query.from) push(`occurred_at >= ?`, query.from);
+  if (query.to) push(`occurred_at <= ?`, query.to);
+  if (query.recordedAtTo) push(`recorded_at <= ?`, query.recordedAtTo);
   if (query.after) {
-    values.push(query.after.occurredAt, query.after.id);
+    values.push(sqlBindValue(query.after.occurredAt), query.after.id);
     clauses.push(`(occurred_at, id) > ($${values.length - 1}::timestamptz, $${values.length})`);
   }
   if (query.through) {
-    values.push(query.through.occurredAt, query.through.id);
+    values.push(sqlBindValue(query.through.occurredAt), query.through.id);
     clauses.push(`(occurred_at, id) <= ($${values.length - 1}::timestamptz, $${values.length})`);
   }
   values.push(Math.max(1, Math.min(query.limit, 20_000)));

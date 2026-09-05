@@ -2,7 +2,7 @@ import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import type { JournalEvent } from "@pm/core";
-import { MemoryEventJournal, PostgresEventJournal, isCanonicalFinalReport, isJournalAppendAbortedError, isJournalAppendDeadlineError, isTransientJournalError, JournalAppendAbortedError, type JournalAppendOptions, type EventJournal } from "@pm/db";
+import { MemoryEventJournal, PostgresEventJournal, buildJournalKeysetSql, isCanonicalFinalReport, isJournalAppendAbortedError, isJournalAppendDeadlineError, isTransientJournalError, JournalAppendAbortedError, type JournalAppendOptions, type EventJournal } from "@pm/db";
 import { EngineService } from "../apps/engine/src/engine.js";
 import { streamExperimentSummary } from "../apps/engine/src/final-report.js";
 import { loadSourceSeal } from "../apps/engine/src/source-seal.js";
@@ -174,6 +174,28 @@ describe("Step-4 Postgres transaction/commit outcome", () => {
     expect(isTransientJournalError(Object.assign(new Error("terminating connection due to transaction timeout"), { code: "25P04" }))).toBe(true);
     expect(isTransientJournalError(Object.assign(new Error("Cannot read properties of null (reading 'write')"), { code: "CONNECTION_CLOSED" }))).toBe(true);
     expect(isTransientJournalError(new JournalAppendAbortedError("deadline"))).toBe(false);
+  });
+
+  it("REPEATABLE READ keyset SQL binds Date fences as ISO strings for postgres.js unsafe", () => {
+    const recordedAtTo = new Date("2026-09-05T18:00:00.000Z");
+    const built = buildJournalKeysetSql({
+      types: ["EXPERIMENT_STARTED"],
+      from: new Date("2026-09-05T17:00:00.000Z"),
+      to: new Date("2026-09-05T18:00:00.000Z"),
+      recordedAtTo,
+      after: { occurredAt: "2026-09-05T17:30:00.000Z", id: "evt-1" },
+      limit: 8,
+    });
+    expect(built.values.every((value) => !(value instanceof Date))).toBe(true);
+    expect(built.values).toEqual([
+      ["EXPERIMENT_STARTED"],
+      "2026-09-05T17:00:00.000Z",
+      "2026-09-05T18:00:00.000Z",
+      "2026-09-05T18:00:00.000Z",
+      "2026-09-05T17:30:00.000Z",
+      "evt-1",
+      8,
+    ]);
   });
 
   it.skipIf(!process.env.STEP4_TEST_DATABASE_URL)("real PG17: held transaction after INSERT aborts before timeout result, then retry/restart produce one canonical seal/report", { timeout: 30_000 }, async () => {
