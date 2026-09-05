@@ -2546,8 +2546,24 @@ export class EngineService {
 
   private shouldSuppressStaleMarketTrigger(trigger: TriggerEvent): boolean {
     if (!isMarketDataDerivedTrigger(trigger)) return false;
-    if (trigger.marketId && !this.isMarketSynchronized(trigger.marketId)) return true;
-    return false;
+    if (!trigger.marketId) return false;
+    return this.marketHasGappedToken(trigger.marketId);
+  }
+
+  private marketHasGappedToken(marketId: string): boolean {
+    const adapter = this.marketAdapter as PolymarketMarketDataAdapter & {
+      tokenSyncState?(id: string): string;
+    };
+    if (typeof adapter.tokenSyncState !== "function") return false;
+    const discovered = this.marketsById.get(marketId)?.tokens.map((token) => token.tokenId) ?? [];
+    const pair = this.snapshots.get(marketId);
+    const tokens = uniqueStrings([
+      ...discovered,
+      pair?.UP?.tokenId,
+      pair?.DOWN?.tokenId,
+      ...[...this.state.marketSnapshots.values()].filter((item) => item.marketId === marketId).map((item) => item.tokenId),
+    ].filter((item): item is string => Boolean(item)));
+    return tokens.some((tokenId) => adapter.tokenSyncState!(tokenId) === "GAPPED");
   }
 
   private tokenLocation(tokenId: string): { marketId: string; outcome: Outcome } | null {
