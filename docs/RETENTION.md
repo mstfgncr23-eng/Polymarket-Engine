@@ -49,8 +49,12 @@ A Postgres `REPEATABLE READ` snapshot is internally consistent; it does **not** 
 Seal procedure (bounded; does not stop market monitoring):
 
 1. Freeze experiment-scoped research ingress (`sourceSealGeneration++`) and stop admitting new report-input work attributable to the completed experiment (`source_sealed`).
-2. Drain without cancelling: supervisor work, in-flight `submitGrokSignal` / other experiment research ingress, then report-input journal writes (telemetry is ignored).
-3. Persist the durable seal event and verify it. The **entire** operation (freeze → drain → persist → verify) shares `SOURCE_SEAL_TIMEOUT_MS`. A persist timeout invalidates the in-flight append (generation + persist-attempt) before the deadline is reported; a later uncancelled write cannot become a successful seal. Retry is idempotent. Restart recovers a completed experiment without a seal by resuming sealing.
+2. Drain without cancelling: supervisor work, in-flight `submitGrokSignal` / other experiment research ingress, then **all tracked report-input journal writes** (including `MCP_INTERACTION`). Telemetry is ignored.
+3. Persist the durable seal event with a cancellable, deadline-bounded journal append (`AbortSignal` + `deadlineAt` / statement timeout). Timeout **aborts the in-flight write** so a later commit cannot create a valid seal. Retry is idempotent. Restart recovers a completed experiment without a seal by resuming sealing.
+
+Every `REPORT_INPUT_EVENT_TYPES` producer must use source-aware admission (`safeAppend` / `persistReportInput` / `appendAcknowledged`). `BoundedJournalWriter` refuses report-input. `EXPERIMENT_REPORT_GENERATED` is intentionally seal-exempt (written after canonical persist). Sampled telemetry stays outside the seal drain.
+
+Canonical `complete=true` also requires experiment-scoped **report-source integrity**: a failed persist of an accepted experiment fact (`GROK_SIGNAL_ACCEPTED`, `TRIGGER_EVENT`, `MCP_INTERACTION`, paper/risk/consensus, …) is sticky, survives restart, is not cleared by a later unrelated success, and refuses seal + canonical until a verified durable repair. `SYSTEM_HEALTH` / sampled telemetry do not poison the latch.
 
 In-flight Grok / MCP research that entered before the freeze is counted and either finishes before persist or is rejected on the post-hold / pre-accept generation check. After COMPLETED or seal, `GROK_SIGNAL_ACCEPTED`, `STRATEGY_CHANGE_PROPOSED`, consensus mutation, and trade evaluation for that experiment are refused (`source_sealed`). Post-window market monitoring and discovery that are not experiment research may continue once the seal is durable.
 
@@ -121,9 +125,14 @@ Do not reintroduce a transactional `CREATE INDEX` on live `journal_events` insid
 
 | Experiment state | Monitor/control cleanup |
 |---|---|
-| `null` / IDLE / MONITOR_ONLY / no experiment | Rows older than monitor TTL are eligible (no active experiment report to protect) |
-| `RUNNING` / `ENTRY_CLOSED` | Protect in-window report-input. Pre-start monitor older than `min(now-ttl, startedAt)` may delete. No `startedAt` → do not delete monitor |
+| `PROVEN_NO_ACTIVE_EXPERIMENT` / IDLE (no start) / MONITOR_ONLY | Rows older than monitor TTL are eligible |
+| `ACTIVE_RUNNING` / `ACTIVE_ENTRY_CLOSED` | Protect in-window report-input. Pre-start monitor older than `min(now-ttl, startedAt)` may delete. No `startedAt` → do not delete monitor |
 | `COMPLETED` | Require canonical complete/non-truncated final **and** 7d grace before deleting transient report-input |
+| `FAILED` / `UNKNOWN` / `CONFLICTING` | Monitor delete **forbidden**. `UNKNOWN` is never `PROVEN_NO_ACTIVE_EXPERIMENT`. |
+
+Operator `journal-cleanup` **always** resolves this table from durable journal rows (`EXPERIMENT_STARTED` / `ENTRY_CLOSED` / `COMPLETED`). Env `EXPERIMENT_ID` / `EXPERIMENT_STATUS` / `EXPERIMENT_STARTED_AT` are hints verified against that state; mismatch fail-closes. Missing `EXPERIMENT_ID` is **not** treated as monitor-only. A query failure or incomplete lifecycle scan is `UNKNOWN` (fail closed), not no-active. In-process `RetentionManager` tests may still pass a caller-asserted `experiment=null` without lifecycle; the CLI never does.
+
+`REPORT_SOURCE_INTEGRITY_FAULT` / `REPAIRED` are `unknown_retain` control-plane events (not report-input, not hash contributors, never pruned).
 
 Pre-experiment historical monitor rows are distinguishable from an active window when `startedAt` is known.
 
@@ -174,7 +183,7 @@ DATABASE_URL=… pnpm --filter @pm/engine exec tsx src/cli.ts journal-cleanup
 DATABASE_URL=… pnpm --filter @pm/engine exec tsx src/cli.ts journal-cleanup --apply --i-understand-destructive
 ```
 
-APPLY never touches `durable_transitions` or audit-critical paper/execution rows. It does **not** migrate. With an active experiment it still applies **safe** classes (telemetry TTL; pre-start monitor when `startedAt` is known) and refuses in-window monitor deletion. Monitor-only / no-experiment rows older than the monitor TTL can be removed after explicit approval.
+APPLY never touches `durable_transitions` or audit-critical paper/execution rows. It does **not** migrate. Operator cleanup **resolves experiment lifecycle from durable journal state**. `EXPERIMENT_ID` / `EXPERIMENT_STATUS` / `EXPERIMENT_STARTED_AT` are hints verified against that state; mismatch fail-closes. Missing `EXPERIMENT_ID` is **not** monitor-only. `UNKNOWN` is never `PROVEN_NO_ACTIVE_EXPERIMENT`, forbids monitor delete, and refuses APPLY (query/scan could not prove lifecycle). `RUNNING` / `ENTRY_CLOSED` protect in-window report-input (missing `startedAt` forbids monitor delete). `COMPLETED` requires a canonical complete+non-truncated final plus grace. Only `PROVEN_NO_ACTIVE_EXPERIMENT` (and idle-without-start) is monitor-TTL eligible. Dry-run prints lifecycle `state/source/id/status/times/monitorDeleteAllowed/reason`. A `DATABASE_URL`-only APPLY while an experiment is active is SAFE: lifecycle resolves `ACTIVE_RUNNING` from the journal; telemetry may drain; in-window monitor/report-input does not.
 
 APPLY is **globally** bounded for the whole invocation: telemetry and monitor share one `applyBounds` budget (total batches, total deleted rows, wall-clock `cycleBudgetMs`). `maxBatches=3` means at most 3 deletes across both classes, not 3 per class. Dry-run `applyBounds` is the budget APPLY will actually use.
 

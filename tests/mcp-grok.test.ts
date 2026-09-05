@@ -148,6 +148,7 @@ describe("authenticated MCP HTTP", () => {
       dashboardOrigin: "http://localhost:3000", logger: false,
       mcp: { bearerTokens: tokens, allowedOrigins: "https://grok.com,https://x.ai", rateLimitPerMinute },
       submitGrokSignal: (signal, clientId) => engine.submitGrokSignal(signal, clientId),
+      persistReportInput: (event) => engine.persistReportInput(event),
     });
     await server.listen({ host: "127.0.0.1", port: 0 });
     const address = server.server.address();

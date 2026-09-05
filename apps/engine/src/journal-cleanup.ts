@@ -13,6 +13,10 @@ import {
   monitorCutoff,
   type RetentionConfig,
 } from "./retention-manager.js";
+import {
+  lifecycleForbidsMonitorDelete,
+  type CleanupLifecycle,
+} from "./cleanup-lifecycle.js";
 
 export interface CleanupClassEstimate {
   totalRows: number;
@@ -41,6 +45,7 @@ export interface CleanupDryRun {
   monitorCandidates: number;
   estimatedBoundedBatches: number;
   refuseUnsafeExperimentCleanup: boolean;
+  lifecycle: CleanupLifecycle | null;
   effectiveConfig: {
     enabled: boolean;
     telemetryTtlMs: number;
@@ -106,6 +111,7 @@ export async function dryRunJournalCleanup(
   experiment?: { id: string; status: string; startedAt?: string | null } | null,
   config: RetentionConfig = defaultRetentionConfig(),
   applyOverrides: CleanupApplyOverrides = {},
+  lifecycle: CleanupLifecycle | null = null,
 ): Promise<CleanupDryRun> {
   const counts = await journal.countByType();
   const oldest = await journal.queryEventsKeyset({ limit: 1 });
@@ -113,20 +119,26 @@ export async function dryRunJournalCleanup(
   const telemetryTotal = sumTypes(counts, TELEMETRY_EVENT_TYPES);
   const monitorTotal = sumTypes(counts, MONITOR_CONTROL_EVENT_TYPES);
   const protectedCriticalRows = sumTypes(counts, AUDIT_CRITICAL_EVENT_TYPES);
-  const report = experiment?.id ? await journal.loadExperimentReport(experiment.id, "final") : null;
-  const active = experimentIsActive(experiment ?? null);
-  const monitorOnlyEligible = experimentIsMonitorOnly(experiment ?? null);
-  const unlocked = experiment
-    ? await completedReportUnlocksTransient(journal, experiment, now, config.completedGraceMs)
+  const effectiveExperiment = lifecycle ? lifecycle.experiment : experiment ?? null;
+  const report = effectiveExperiment?.id ? await journal.loadExperimentReport(effectiveExperiment.id, "final") : null;
+  const active = experimentIsActive(effectiveExperiment);
+  const monitorOnlyEligible = lifecycle
+    ? lifecycle.state === "PROVEN_NO_ACTIVE_EXPERIMENT" || lifecycle.state === "IDLE"
+    : experimentIsMonitorOnly(effectiveExperiment);
+  const unlocked = effectiveExperiment
+    ? await completedReportUnlocksTransient(journal, effectiveExperiment, now, config.completedGraceMs)
     : false;
   const telemetryCutoff = new Date(now.getTime() - config.telemetryTtlMs);
-  const monitorBefore = monitorCutoff({
-    now,
-    monitorTtlMs: config.monitorTtlMs,
-    experiment: experiment ?? null,
-    monitorOnlyEligible,
-    transientEligible: unlocked,
-  });
+  const forbidMonitor = lifecycle ? lifecycleForbidsMonitorDelete(lifecycle) : false;
+  const monitorBefore = forbidMonitor
+    ? null
+    : monitorCutoff({
+      now,
+      monitorTtlMs: config.monitorTtlMs,
+      experiment: effectiveExperiment,
+      monitorOnlyEligible,
+      transientEligible: unlocked,
+    });
   const telemetryEligible = await journal.countEligible([...TELEMETRY_EVENT_TYPES], telemetryCutoff);
   const monitorEligible = monitorBefore
     ? await journal.countEligible([...MONITOR_CONTROL_EVENT_TYPES], monitorBefore)
@@ -139,9 +151,12 @@ export async function dryRunJournalCleanup(
     "durable_transitions is never deleted.",
     "No automatic startup purge. RETENTION_ENABLED defaults false until operator review.",
   ];
+  if (lifecycle) notes.push(`Authoritative lifecycle: ${lifecycle.state} source=${lifecycle.source} id=${lifecycle.experimentId ?? "none"} status=${lifecycle.status ?? "none"} startedAt=${lifecycle.startedAt ?? "none"} completedAt=${lifecycle.completedAt ?? "none"} monitorDeleteAllowed=${lifecycle.monitorDeleteAllowed} reason=${lifecycle.reason}`);
   if (active) notes.push("Active experiment: in-window report-input / monitor rows are protected; pre-start monitor older than TTL may be eligible.");
   if (monitorOnlyEligible) notes.push("Monitor-only / no experiment: monitor rows older than monitor TTL are eligible.");
-  if (experiment?.status === "COMPLETED" && !unlocked) notes.push("Completed experiment lacks a canonical final report + grace; in-window monitor cleanup refused.");
+  if (effectiveExperiment?.status === "COMPLETED" && !unlocked) notes.push("Completed experiment lacks a canonical final report + grace; in-window monitor cleanup refused.");
+  if (lifecycle?.hintMismatch) notes.push("Cleanup hint/authoritative mismatch: fail closed.");
+  if (forbidMonitor) notes.push("Monitor delete forbidden by authoritative lifecycle.");
   const applyBounds = resolveApplyBounds(config, applyOverrides);
   notes.push(
     `APPLY global bounds (one budget for telemetry+monitor): maxBatches=${applyBounds.maxBatches}, maxRows=${applyBounds.maxRows}, cycleBudgetMs=${applyBounds.cycleBudgetMs}, batchSize=${applyBounds.batchSize}.`,
@@ -167,7 +182,8 @@ export async function dryRunJournalCleanup(
       telemetry.estimatedBatches + monitor.estimatedBatches,
       applyBounds.maxBatches,
     ),
-    refuseUnsafeExperimentCleanup: active && !experiment?.startedAt,
+    refuseUnsafeExperimentCleanup: Boolean((active && !effectiveExperiment?.startedAt) || lifecycle?.hintMismatch || lifecycle?.state === "UNKNOWN" || lifecycle?.state === "CONFLICTING"),
+    lifecycle,
     effectiveConfig: {
       enabled: config.enabled,
       telemetryTtlMs: config.telemetryTtlMs,
@@ -194,6 +210,7 @@ export async function applyJournalCleanup(
     maxRows?: number;
     cycleBudgetMs?: number;
     config?: RetentionConfig;
+    lifecycle?: CleanupLifecycle | null;
   },
 ): Promise<CleanupApplyResult> {
   if (input.confirm !== "I_UNDERSTAND_DESTRUCTIVE_CLEANUP") {
@@ -213,7 +230,17 @@ export async function applyJournalCleanup(
     cycleBudgetMs: input.cycleBudgetMs,
     batchSize: input.batchSize,
   };
-  const dry = await dryRunJournalCleanup(journal, now, input.experiment, config, applyOverrides);
+  const dry = await dryRunJournalCleanup(journal, now, input.experiment, config, applyOverrides, input.lifecycle ?? null);
+  if (dry.lifecycle?.hintMismatch || dry.lifecycle?.state === "CONFLICTING" || dry.lifecycle?.state === "UNKNOWN") {
+    return {
+      mode: "apply", deletedByClass: {}, refused: true, reason: dry.lifecycle.hintMismatch
+        ? "LIFECYCLE_HINT_MISMATCH"
+        : dry.lifecycle.state === "UNKNOWN"
+          ? "UNKNOWN_EXPERIMENT_LIFECYCLE"
+          : "CONFLICTING_EXPERIMENT_LIFECYCLE",
+      durableTransitionsDeleted: 0, batches: 0, applyBounds: dry.applyBounds,
+    };
+  }
   const applyBounds = dry.applyBounds;
   const batchSize = applyBounds.batchSize;
   const maxBatches = applyBounds.maxBatches;

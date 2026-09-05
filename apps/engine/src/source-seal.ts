@@ -38,6 +38,7 @@ export function createSourceSealEvent(input: {
   startedAt?: string | null;
   completedAt?: string | null;
   occurredAt?: Date;
+  persistAttempt?: number;
 }): JournalEvent {
   return createJournalEvent({
     id: sourceSealEventId(input.experimentId),
@@ -50,6 +51,7 @@ export function createSourceSealEvent(input: {
       startedAt: input.startedAt ?? null,
       completedAt: input.completedAt ?? null,
       sealed: true,
+      persistAttempt: input.persistAttempt ?? null,
     },
     occurredAt: input.occurredAt,
   });

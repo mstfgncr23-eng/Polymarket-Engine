@@ -147,6 +147,7 @@ export async function createApiServer(input: {
   dashboardOrigin: string;
   mcp: McpConfig;
   submitGrokSignal(signal: GrokSignalSubmission, clientId: string): Promise<Record<string, unknown>>;
+  persistReportInput?(event: import("@pm/core").JournalEvent): Promise<void>;
   noteMcpRequest?(tool: string | null, triggerId?: string): void;
   isTokenSynchronized?(tokenId: string): boolean;
   isTriggerActionable?(triggerId: string): boolean;
@@ -187,8 +188,12 @@ export async function createApiServer(input: {
     if (!auth.ok && input.metricsToken) return reply.code(401).send({ error: "METRICS_UNAUTHORIZED" });
     return reply.type(input.metrics.registry.contentType).send(await input.metrics.registry.metrics());
   });
+  const persistReportInput = input.persistReportInput ?? (async (event) => {
+    throw new Error(`PERSIST_REPORT_INPUT_REQUIRED:${event.type}`);
+  });
   const mcpHandler = createMcpHttpHandler(input.mcp, {
     state: input.state, journal: input.journal, metrics: input.metrics, submitSignal: input.submitGrokSignal,
+    persistReportInput,
     noteMcpRequest: input.noteMcpRequest,
     isTokenSynchronized: input.isTokenSynchronized,
     isTriggerActionable: input.isTriggerActionable,

@@ -1,4 +1,4 @@
-import { isTelemetryEventType, type JournalEvent } from "@pm/core";
+import { isReportInputEventType, isTelemetryEventType, type JournalEvent } from "@pm/core";
 import { createJournalEvent, type EventJournal } from "@pm/db";
 import type { EngineMetrics } from "./metrics.js";
 
@@ -91,6 +91,9 @@ export class BoundedJournalWriter {
   }
 
   private async writeDecision(event: JournalEvent): Promise<void> {
+    if (isReportInputEventType(event.type)) {
+      throw new Error("REPORT_INPUT_MUST_USE_TRACKED_ADMISSION");
+    }
     const write = async () => {
       try {
         await this.journal.append(event);

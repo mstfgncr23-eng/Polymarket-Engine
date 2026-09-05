@@ -102,10 +102,10 @@ export function experimentIsActive(experiment: { status?: string | null } | null
 }
 
 export function experimentIsMonitorOnly(experiment: RetentionExperiment): boolean {
+  if (experiment?.status === "UNKNOWN") return false;
   return experiment == null
     || experiment.status === "IDLE"
     || experiment.status === "MONITOR_ONLY"
-    || experiment.status === "UNKNOWN"
     || experiment.status === "";
 }
 

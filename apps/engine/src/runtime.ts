@@ -20,6 +20,7 @@ export async function startRuntime(envInput: NodeJS.ProcessEnv = process.env): P
     dashboardOrigin: env.DASHBOARD_ORIGIN, logger: { level: env.LOG_LEVEL },
     mcp: { bearerTokens: env.GROK_MCP_BEARER_TOKENS, allowedOrigins: env.GROK_MCP_ALLOWED_ORIGINS, rateLimitPerMinute: env.GROK_MCP_RATE_LIMIT_PER_MINUTE },
     submitGrokSignal: (signal, clientId) => engine.submitGrokSignal(signal, clientId),
+    persistReportInput: (event) => engine.persistReportInput(event),
     noteMcpRequest: (tool, triggerId) => engine.noteMcpRequest(tool, triggerId),
     isTokenSynchronized: (tokenId) => engine.isTokenSynchronized(tokenId),
     isTriggerActionable: (triggerId) => engine.isTriggerActionable(triggerId),

@@ -30,6 +30,7 @@ export interface McpDependencies {
   journal: EventJournal;
   metrics: EngineMetrics;
   submitSignal(signal: GrokSignalSubmission, clientId: string): Promise<Record<string, unknown>>;
+  persistReportInput(event: import("@pm/core").JournalEvent): Promise<void>;
   noteMcpRequest?(tool: string | null, triggerId?: string): void;
   heavyRead?<T>(work: () => Promise<T>): Promise<T>;
   isTokenSynchronized?(tokenId: string): boolean;
@@ -188,7 +189,7 @@ export function createMcpHttpHandler(config: McpConfig, dependencies: McpDepende
     if (!auth.ok) {
       dependencies.state.recordGrokRejection("unauthorized");
       dependencies.metrics.mcpInteractions.inc({ status: auth.status === 503 ? "unconfigured" : "unauthorized", method });
-      await audit(dependencies.journal, {
+      await audit(dependencies.persistReportInput, {
         clientId: "unauthorized", tokenFingerprint: auth.tokenFingerprint, method, tool: toolName, requestId,
         status: auth.reason, rateLimitResult: "not_evaluated", durationMs: performance.now() - started,
       });
@@ -197,7 +198,7 @@ export function createMcpHttpHandler(config: McpConfig, dependencies: McpDepende
     }
     if (!security.originAllowed(request.headers.origin)) {
       dependencies.metrics.mcpInteractions.inc({ status: "origin_rejected", method });
-      await audit(dependencies.journal, {
+      await audit(dependencies.persistReportInput, {
         clientId: auth.clientId, tokenFingerprint: auth.tokenFingerprint, method, tool: toolName, requestId,
         status: "ORIGIN_REJECTED", rateLimitResult: "not_evaluated", durationMs: performance.now() - started,
       });
@@ -206,7 +207,7 @@ export function createMcpHttpHandler(config: McpConfig, dependencies: McpDepende
     if (!security.consume(auth.clientId)) {
       dependencies.state.recordGrokRejection("rate_limited");
       dependencies.metrics.mcpInteractions.inc({ status: "rate_limited", method });
-      await audit(dependencies.journal, {
+      await audit(dependencies.persistReportInput, {
         clientId: auth.clientId, tokenFingerprint: auth.tokenFingerprint, method, tool: toolName, requestId,
         status: "RATE_LIMITED", rateLimitResult: "limited", durationMs: performance.now() - started,
       });
@@ -214,7 +215,7 @@ export function createMcpHttpHandler(config: McpConfig, dependencies: McpDepende
     }
     if (request.method !== "POST") {
       dependencies.metrics.mcpInteractions.inc({ status: "method_not_allowed", method });
-      await audit(dependencies.journal, {
+      await audit(dependencies.persistReportInput, {
         clientId: auth.clientId, tokenFingerprint: auth.tokenFingerprint, method, tool: toolName, requestId,
         status: "METHOD_NOT_ALLOWED", rateLimitResult: "ok", durationMs: performance.now() - started,
       });
@@ -224,7 +225,7 @@ export function createMcpHttpHandler(config: McpConfig, dependencies: McpDepende
     if (toolName && ALLOWED_MCP_WRITE_TOOLS.includes(toolName as (typeof ALLOWED_MCP_WRITE_TOOLS)[number]) && !clientMayCallWriteTool(auth.clientId, toolName)) {
       dependencies.state.recordGrokRejection("rejected");
       dependencies.metrics.mcpInteractions.inc({ status: "write_tool_forbidden", method });
-      await audit(dependencies.journal, {
+      await audit(dependencies.persistReportInput, {
         clientId: auth.clientId, tokenFingerprint: auth.tokenFingerprint, method, tool: toolName, requestId,
         status: "WRITE_TOOL_FORBIDDEN", rateLimitResult: "ok", durationMs: performance.now() - started,
         payloadMeta: { argumentKeys: argumentKeys(request.body), agentId: auth.clientId },
@@ -241,7 +242,7 @@ export function createMcpHttpHandler(config: McpConfig, dependencies: McpDepende
       const status = forbidden ? "FORBIDDEN_TRADE_TOOL" : "UNKNOWN_TOOL";
       dependencies.state.recordGrokRejection("rejected");
       dependencies.metrics.mcpInteractions.inc({ status: forbidden ? "forbidden_trade" : "unknown_tool", method });
-      await audit(dependencies.journal, {
+      await audit(dependencies.persistReportInput, {
         clientId: auth.clientId, tokenFingerprint: auth.tokenFingerprint, method, tool: toolName, requestId,
         status, rateLimitResult: "ok", durationMs: performance.now() - started,
         payloadMeta: { argumentKeys: argumentKeys(request.body) },
@@ -262,7 +263,7 @@ export function createMcpHttpHandler(config: McpConfig, dependencies: McpDepende
       await transport.handleRequest(request.raw, reply.raw, request.body);
       dependencies.metrics.mcpInteractions.inc({ status: "handled", method });
       dependencies.metrics.mcpLatency.observe({ method }, (performance.now() - started) / 1000);
-      await audit(dependencies.journal, {
+      await audit(dependencies.persistReportInput, {
         clientId: auth.clientId, tokenFingerprint: auth.tokenFingerprint, method, tool: toolName, requestId,
         status: "HANDLED", rateLimitResult: "ok", durationMs: performance.now() - started,
         ...submissionAuditMeta(request.body),
@@ -270,7 +271,7 @@ export function createMcpHttpHandler(config: McpConfig, dependencies: McpDepende
       return reply;
     } catch (error) {
       dependencies.metrics.mcpInteractions.inc({ status: "error", method });
-      await audit(dependencies.journal, {
+      await audit(dependencies.persistReportInput, {
         clientId: auth.clientId, tokenFingerprint: auth.tokenFingerprint, method, tool: toolName, requestId,
         status: "ERROR", rateLimitResult: "ok", durationMs: performance.now() - started, errorCode: safeErrorCode(error),
       });
@@ -527,12 +528,14 @@ function looksLikeTradeTool(name: string): boolean {
 
 function safeErrorCode(error: unknown): string { return error instanceof Error ? error.name.slice(0, 80) : "UNKNOWN_ERROR"; }
 
-async function audit(journal: EventJournal, input: {
+async function audit(
+  persistReportInput: (event: import("@pm/core").JournalEvent) => Promise<void>,
+  input: {
   clientId: string; tokenFingerprint: string | null; method: string; tool: string | null; requestId: string | number | null;
   status: string; rateLimitResult: string; durationMs: number; errorCode?: string; idempotencyId?: string; traceId?: string;
   triggerId?: string; payloadMeta?: Record<string, unknown>;
 }): Promise<void> {
-  await journal.append(createJournalEvent({
+  await persistReportInput(createJournalEvent({
     traceId: input.traceId ?? createId("mcp_trace"),
     correlationId: input.idempotencyId ?? (input.requestId !== null ? String(input.requestId) : createId("mcp_req")),
     type: "MCP_INTERACTION", aggregateType: "mcp_client", aggregateId: input.clientId,

@@ -40,6 +40,14 @@ import { createApiServer } from "../apps/engine/src/server.js";
 import { buildExperimentSummary, ExperimentSummaryAccumulator, writeExperimentSummary } from "../apps/engine/src/report.js";
 import { ensureReportGeneratedAudit, persistCanonicalFinalReport, resolveAuthoritativeExperiment, streamExperimentSummary, summaryFromDurableReport, toDurableReportInput } from "../apps/engine/src/final-report.js";
 import { applyJournalCleanup, dryRunJournalCleanup } from "../apps/engine/src/journal-cleanup.js";
+import { resolveCleanupLifecycle } from "../apps/engine/src/cleanup-lifecycle.js";
+import {
+  REPORT_SOURCE_INTEGRITY_FAULT,
+  REPORT_SOURCE_INTEGRITY_REPAIRED,
+  shouldLatchReportSourceIntegrity,
+} from "../apps/engine/src/report-source-integrity.js";
+import { readFileSync } from "node:fs";
+import { BoundedJournalWriter } from "../apps/engine/src/journal-writer.js";
 import { generateOperatorReport } from "../apps/engine/src/operator-report.js";
 import { defaultRetentionConfig, experimentIsActive, experimentIsMonitorOnly, RetentionManager } from "../apps/engine/src/retention-manager.js";
 import { loadSourceSeal } from "../apps/engine/src/source-seal.js";
@@ -1129,7 +1137,7 @@ describe("Step-4 residual: experiment research ingress fence", () => {
 });
 
 describe("Step-4 residual: source-seal persist deadline", () => {
-  it("stalls SOURCE_SEAL persistence itself and cannot later create a seal after timeout", async () => {
+  it("PRE-APPEND HOLD: stalls SOURCE_SEAL persistence itself and cannot later create a seal after timeout", async () => {
     const journal = new MemoryEventJournal();
     const adapter = new ScriptedMarketAdapter();
     adapter.queue(discoveryReport([qualified("btc-mkt", "BTC", "btc-up", "btc-down")]));
@@ -1322,6 +1330,447 @@ describe("Step-4 residual: operator APPLY global budget", () => {
     expect(apply.batches).toBeLessThanOrEqual(dry.applyBounds.maxBatches);
     const deleted = (apply.deletedByClass.raw_telemetry ?? 0) + (apply.deletedByClass.monitor_control ?? 0);
     expect(deleted).toBeLessThanOrEqual(dry.applyBounds.maxRows);
+  });
+});
+
+function paperEngine(journal: MemoryEventJournal) {
+  const adapter = new ScriptedMarketAdapter();
+  adapter.queue(discoveryReport([qualified("btc-mkt", "BTC", "btc-up", "btc-down")]));
+  return new EngineService(qualifiedPaperEnv(), journal, { error: () => undefined }, {
+    market: adapter as never,
+    referenceRegistry: new ScriptedReferenceRegistry() as never,
+    activation: new NoopGrokActivationBridge(),
+  });
+}
+
+describe("Step-4 closure: all REPORT_INPUT producers participate in source seal", () => {
+  it("proves MCP_INTERACTION and writer/engine paths: no untracked report-input append", () => {
+    const mcp = readFileSync(new URL("../apps/engine/src/mcp.ts", import.meta.url), "utf8");
+    expect(mcp).not.toMatch(/journal\.append\s*\(/);
+    expect(mcp).toMatch(/persistReportInput/);
+    const writer = readFileSync(new URL("../apps/engine/src/journal-writer.ts", import.meta.url), "utf8");
+    expect(writer).toMatch(/REPORT_INPUT_MUST_USE_TRACKED_ADMISSION/);
+    const engine = readFileSync(new URL("../apps/engine/src/engine.ts", import.meta.url), "utf8");
+    expect(engine).toMatch(/persistReportInput\(event/);
+    expect(engine).toMatch(/reportInput: isReportInputEventType/);
+    expect(shouldLatchReportSourceIntegrity({ type: "MARKET_SNAPSHOT" }, { id: "e", status: "RUNNING" })).toBe(false);
+    expect(shouldLatchReportSourceIntegrity({ type: "SYSTEM_HEALTH_EVENT" }, { id: "e", status: "RUNNING" })).toBe(false);
+    expect(shouldLatchReportSourceIntegrity({ type: "MCP_INTERACTION" }, { id: "e", status: "RUNNING" })).toBe(true);
+    expect(shouldLatchReportSourceIntegrity({ type: "GROK_SIGNAL_ACCEPTED" }, { id: "e", status: "IDLE" })).toBe(false);
+  });
+
+  it("BoundedJournalWriter refuses report-input instead of appending untracked", async () => {
+    const journal = new MemoryEventJournal();
+    const writer = new BoundedJournalWriter(journal, () => undefined, { error: () => undefined });
+    await expect(writer.persist(ev("TRIGGER_EVENT", "2026-09-01T00:00:00.000Z", {}, "writer-trig")))
+      .rejects.toThrow(/REPORT_INPUT_MUST_USE_TRACKED_ADMISSION/);
+    expect(await journal.queryEvents({ types: ["TRIGGER_EVENT"] })).toEqual([]);
+  });
+
+  it("IN-FLIGHT MCP_INTERACTION persist cannot be sealed ahead of; release yields stable hash across restart", async () => {
+    const journal = new MemoryEventJournal();
+    const engine = paperEngine(journal);
+    await engine.start();
+    let release!: () => void;
+    try {
+      expect(await engine.beginExperiment()).toMatchObject({ ok: true });
+      const experimentId = engine.experimentManifest()!.id;
+      journal.setAppendInFlightHoldForTest(new Promise<void>((resolve) => { release = resolve; }), ["MCP_INTERACTION"]);
+      const mcpEvent = createJournalEvent({
+        id: "mcp-inflight-1",
+        traceId: "tr-mcp-seal",
+        type: "MCP_INTERACTION",
+        aggregateType: "mcp_client",
+        aggregateId: "client-1",
+        payload: { tool: "get_strategy_metrics", status: "ok" },
+      });
+      const persistP = engine.persistReportInput(mcpEvent);
+      await waitUntil(() => journal.inFlightAppends > 0);
+      await engine.completeExperimentForTest();
+      const sealPromise = engine.ensureSourceSealForTest();
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      expect(await loadSourceSeal(journal, experimentId)).toBeNull();
+      expect(await journal.loadExperimentReport(experimentId)).toBeNull();
+      expect((await journal.queryEvents({ types: ["MCP_INTERACTION"] })).length).toBe(0);
+      release();
+      journal.setAppendInFlightHoldForTest(null);
+      await persistP;
+      const seal = await sealPromise;
+      expect(seal.sealed).toBe(true);
+      expect((await journal.queryEvents({ types: ["MCP_INTERACTION"] })).some((event) => event.id === "mcp-inflight-1")).toBe(true);
+      await engine.writeFinalReportForTest();
+      const first = await journal.loadExperimentReport(experimentId);
+      expect(first && isCanonicalFinalReport(first)).toBe(true);
+      const streamed = await streamExperimentSummary(journal, {
+        id: experimentId,
+        startedAt: engine.experimentManifest()?.startedAt,
+        completedAt: engine.experimentManifest()?.completedAt,
+      }, {
+        status: "COMPLETED", reportKind: "final", metricsScope: "complete", complete: true, truncated: false,
+        generatedAt: first!.generatedAt,
+      });
+      streamed.summary.complete = true;
+      streamed.summary.truncated = false;
+      const rerun = toDurableReportInput({ summary: streamed.summary, scan: streamed.scan });
+      expect(rerun.contentHash).toBe(first!.contentHash);
+      expect(streamed.scan.scanned).toBe(first!.sourceEventCount);
+      expect(streamed.scan.fence.through).toEqual({
+        occurredAt: first!.sourceFenceOccurredAt,
+        id: first!.sourceFenceId,
+      });
+      await engine.stop();
+      const restarted = paperEngine(journal);
+      await restarted.start();
+      try {
+        expect((await journal.loadExperimentReport(experimentId))?.contentHash).toBe(first!.contentHash);
+        await restarted.writeFinalReportForTest();
+        expect((await journal.loadExperimentReport(experimentId))?.contentHash).toBe(first!.contentHash);
+      } finally {
+        await restarted.stop();
+      }
+    } finally {
+      release?.();
+      journal.setAppendInFlightHoldForTest(null);
+      if (!engine.state.draining) await engine.stop();
+    }
+  });
+});
+
+describe("Step-4 closure: experiment-scoped report-source integrity", () => {
+  it("A: GROK_SIGNAL_ACCEPTED loss is sticky; later unrelated success does not clear; sampled telemetry does not poison", async () => {
+    const journal = new MemoryEventJournal();
+    const engine = paperEngine(journal);
+    await engine.start();
+    try {
+      expect(await engine.beginExperiment()).toMatchObject({ ok: true });
+      const experimentId = engine.experimentManifest()!.id;
+      journal.failAppendTypes.add("GROK_SIGNAL_ACCEPTED");
+      journal.failAppendTypes.add("MARKET_SNAPSHOT");
+      const lost = createJournalEvent({
+        id: "grok-lost-1", traceId: "tr-grok-lost", type: "GROK_SIGNAL_ACCEPTED",
+        aggregateType: "grok_signal", aggregateId: "sig-lost",
+        payload: { experimentId, signalId: "sig-lost" },
+      });
+      await engine.persistEventForTest(lost);
+      expect(engine.reportSourceIntegrityForTest().some((fault) => fault.eventId === "grok-lost-1")).toBe(true);
+      expect((await journal.queryEvents({ types: [REPORT_SOURCE_INTEGRITY_FAULT] })).length).toBe(1);
+      await engine.persistEventForTest(ev("MARKET_SNAPSHOT", new Date().toISOString(), { experimentId }, "snap-fail"));
+      expect(engine.reportSourceIntegrityForTest().every((fault) => fault.eventType !== "MARKET_SNAPSHOT")).toBe(true);
+      journal.failAppendTypes.delete("MARKET_SNAPSHOT");
+      journal.failAppendTypes.delete("GROK_SIGNAL_ACCEPTED");
+      await engine.persistEventForTest(ev("SYSTEM_HEALTH_EVENT", new Date().toISOString(), { experimentId, status: "OK" }, "health-ok"));
+      expect(engine.reportSourceIntegrityForTest().some((fault) => fault.eventId === "grok-lost-1")).toBe(true);
+      await engine.completeExperimentForTest();
+      const seal = await engine.ensureSourceSealForTest();
+      expect(seal.sealed).toBe(false);
+      expect(seal.reason).toBe("REPORT_SOURCE_INTEGRITY_UNRESOLVED");
+      await engine.writeFinalReportForTest();
+      expect(await journal.loadExperimentReport(experimentId)).toBeNull();
+    } finally {
+      await engine.stop();
+    }
+  });
+
+  it("B: TRIGGER_EVENT loss refuses seal and canonical until verified durable repair", async () => {
+    const journal = new MemoryEventJournal();
+    const engine = paperEngine(journal);
+    await engine.start();
+    try {
+      expect(await engine.beginExperiment()).toMatchObject({ ok: true });
+      const experimentId = engine.experimentManifest()!.id;
+      journal.failAppendTypes.add("TRIGGER_EVENT");
+      const lost = createJournalEvent({
+        id: "trig-lost-1", traceId: "tr-trig-lost", type: "TRIGGER_EVENT",
+        aggregateType: "trigger", aggregateId: "trig-lost-1",
+        payload: { experimentId, id: "trig-lost-1" },
+      });
+      await engine.persistEventForTest(lost);
+      journal.failAppendTypes.delete("TRIGGER_EVENT");
+      await engine.persistEventForTest(ev("SYSTEM_HEALTH_EVENT", new Date().toISOString(), { experimentId }, "health-2"));
+      await engine.completeExperimentForTest();
+      expect((await engine.ensureSourceSealForTest()).reason).toBe("REPORT_SOURCE_INTEGRITY_UNRESOLVED");
+      expect(await engine.repairReportSourceIntegrityForTest(lost)).toBe(true);
+      expect(engine.reportSourceIntegrityForTest().length).toBe(0);
+      expect((await journal.queryEvents({ types: [REPORT_SOURCE_INTEGRITY_REPAIRED] })).length).toBe(1);
+      const seal = await engine.ensureSourceSealForTest();
+      expect(seal.sealed).toBe(true);
+      await engine.writeFinalReportForTest();
+      expect(await journal.loadExperimentReport(experimentId)).toMatchObject({ complete: true, truncated: false });
+    } finally {
+      await engine.stop();
+    }
+  });
+
+  it("C2: stale checkpoint fault is dropped after durable REPAIRED", async () => {
+    const journal = new MemoryEventJournal();
+    const engine = paperEngine(journal);
+    await engine.start();
+    try {
+      expect(await engine.beginExperiment()).toMatchObject({ ok: true });
+      const experimentId = engine.experimentManifest()!.id;
+      journal.failAppendTypes.add("TRIGGER_EVENT");
+      const lost = createJournalEvent({
+        id: "trig-stale-cp", traceId: "tr-stale-cp", type: "TRIGGER_EVENT",
+        aggregateType: "trigger", aggregateId: "trig-stale-cp",
+        payload: { experimentId, id: "trig-stale-cp" },
+      });
+      await engine.persistEventForTest(lost);
+      journal.failAppendTypes.delete("TRIGGER_EVENT");
+      await engine.completeExperimentForTest();
+      expect(await engine.repairReportSourceIntegrityForTest(lost)).toBe(true);
+      await engine.stop();
+      const restarted = paperEngine(journal);
+      await restarted.start();
+      try {
+        expect(restarted.reportSourceIntegrityForTest().some((fault) => fault.eventId === "trig-stale-cp")).toBe(false);
+        expect((await restarted.ensureSourceSealForTest()).sealed).toBe(true);
+      } finally {
+        await restarted.stop();
+      }
+    } finally {
+      if (!engine.state.draining) await engine.stop();
+    }
+  });
+
+  it("C: restart with unresolved integrity must not silently forget or complete", async () => {
+    const journal = new MemoryEventJournal();
+    const engine = paperEngine(journal);
+    await engine.start();
+    const lost = createJournalEvent({
+      id: "grok-lost-restart", traceId: "tr-grok-restart", type: "GROK_SIGNAL_ACCEPTED",
+      aggregateType: "grok_signal", aggregateId: "sig-restart",
+      payload: { signalId: "sig-restart" },
+    });
+    try {
+      expect(await engine.beginExperiment()).toMatchObject({ ok: true });
+      const experimentId = engine.experimentManifest()!.id;
+      journal.failAppendTypes.add("GROK_SIGNAL_ACCEPTED");
+      await engine.persistEventForTest(lost);
+      journal.failAppendTypes.delete("GROK_SIGNAL_ACCEPTED");
+      await engine.completeExperimentForTest();
+      expect((await engine.ensureSourceSealForTest()).reason).toBe("REPORT_SOURCE_INTEGRITY_UNRESOLVED");
+      await engine.stop();
+      const restarted = paperEngine(journal);
+      await restarted.start();
+      try {
+        expect(restarted.reportSourceIntegrityForTest().some((fault) => fault.eventId === "grok-lost-restart")).toBe(true);
+        expect((await restarted.ensureSourceSealForTest()).reason).toBe("REPORT_SOURCE_INTEGRITY_UNRESOLVED");
+        await restarted.writeFinalReportForTest();
+        expect(await journal.loadExperimentReport(experimentId)).toBeNull();
+        expect(await restarted.repairReportSourceIntegrityForTest({
+          ...lost,
+          payload: { ...lost.payload, experimentId },
+        })).toBe(true);
+        expect((await restarted.ensureSourceSealForTest()).sealed).toBe(true);
+        await restarted.writeFinalReportForTest();
+        expect(await journal.loadExperimentReport(restarted.experimentManifest()!.id)).toMatchObject({ complete: true, truncated: false });
+      } finally {
+        await restarted.stop();
+      }
+    } finally {
+      if (!engine.state.draining) await engine.stop();
+    }
+  });
+});
+
+describe("Step-4 closure: authoritative cleanup lifecycle", () => {
+  const now = new Date("2026-09-08T00:00:00.000Z");
+  const config = defaultRetentionConfig({
+    enabled: true, telemetryTtlMs: 1, monitorTtlMs: 1, completedGraceMs: 1, batchSize: 50,
+    maxBatchesPerCycle: 10, maxRowsPerCycle: 1_000, cycleBudgetMs: 5_000,
+  });
+
+  it("A: resolves ACTIVE_RUNNING from durable EXPERIMENT_STARTED, not env", async () => {
+    const journal = new MemoryEventJournal();
+    await journal.append(ev("EXPERIMENT_STARTED", "2026-09-07T00:00:00.000Z", { experimentId: "exp-live", aggregateId: "exp-live" }, "start-live"));
+    const lifecycle = await resolveCleanupLifecycle(journal, {});
+    expect(lifecycle.state).toBe("ACTIVE_RUNNING");
+    expect(lifecycle.source).toBe("durable_journal");
+    expect(lifecycle.experimentId).toBe("exp-live");
+    expect(lifecycle.status).toBe("RUNNING");
+    expect(lifecycle.monitorDeleteAllowed).toBe(true);
+    expect(lifecycle.experiment).toMatchObject({ id: "exp-live", status: "RUNNING" });
+  });
+
+  it("B: env hint mismatch fail-closes; never becomes PROVEN_NO_ACTIVE", async () => {
+    const journal = new MemoryEventJournal();
+    await journal.append(ev("EXPERIMENT_STARTED", "2026-09-07T00:00:00.000Z", { experimentId: "exp-a", aggregateId: "exp-a" }, "start-a"));
+    const lifecycle = await resolveCleanupLifecycle(journal, { experimentId: "exp-other", status: "COMPLETED" });
+    expect(lifecycle.hintMismatch).toBe(true);
+    expect(lifecycle.state === "CONFLICTING" || lifecycle.state === "UNKNOWN").toBe(true);
+    expect(lifecycle.state).not.toBe("PROVEN_NO_ACTIVE_EXPERIMENT");
+    expect(lifecycle.monitorDeleteAllowed).toBe(false);
+    const apply = await applyJournalCleanup(journal, {
+      now, experiment: lifecycle.experiment, confirm: "I_UNDERSTAND_DESTRUCTIVE_CLEANUP", config, lifecycle,
+    });
+    expect(apply.refused).toBe(true);
+  });
+
+  it("C: missing EXPERIMENT_ID is not monitor-only while an experiment is active", async () => {
+    const journal = new MemoryEventJournal();
+    await journal.append(ev("EXPERIMENT_STARTED", "2026-09-07T12:00:00.000Z", { experimentId: "exp-c", aggregateId: "exp-c" }, "start-c"));
+    await journal.append(ev("TRIGGER_EVENT", "2026-09-07T13:00:00.000Z", { experimentId: "exp-c" }, "in-window-c"));
+    const lifecycle = await resolveCleanupLifecycle(journal, {});
+    expect(lifecycle.state).toBe("ACTIVE_RUNNING");
+    const dry = await dryRunJournalCleanup(journal, now, null, config, {}, lifecycle);
+    expect(dry.monitorOnlyEligible).toBe(false);
+    expect(dry.lifecycle?.state).toBe("ACTIVE_RUNNING");
+    expect(dry.monitor.eligible).toBe(0);
+  });
+
+  it("D: UNKNOWN forbids monitor delete, is visible on dry-run, and refuses APPLY", async () => {
+    class UnreadableLifecycleJournal extends MemoryEventJournal {
+      override async queryEventsKeyset(query: Parameters<MemoryEventJournal["queryEventsKeyset"]>[0]) {
+        if (query.types?.includes("EXPERIMENT_STARTED")) throw new Error("JOURNAL_QUERY_FAILED");
+        return super.queryEventsKeyset(query);
+      }
+    }
+    const journal = new UnreadableLifecycleJournal();
+    await MemoryEventJournal.prototype.append.call(journal, ev("TRIGGER_EVENT", "2026-01-01T00:00:00.000Z", {}, "mon-unknown"));
+    const lifecycle = await resolveCleanupLifecycle(journal, {});
+    expect(lifecycle.state).toBe("UNKNOWN");
+    expect(lifecycle.state).not.toBe("PROVEN_NO_ACTIVE_EXPERIMENT");
+    expect(lifecycle.monitorDeleteAllowed).toBe(false);
+    const dry = await dryRunJournalCleanup(journal, now, null, config, {}, lifecycle);
+    expect(dry.monitor.eligible).toBe(0);
+    expect(dry.refuseUnsafeExperimentCleanup).toBe(true);
+    expect(dry.notes.some((note) => note.includes("UNKNOWN"))).toBe(true);
+    expect(dry.lifecycle).toMatchObject({
+      state: "UNKNOWN", source: "unresolved", monitorDeleteAllowed: false,
+    });
+    const apply = await applyJournalCleanup(journal, {
+      now, experiment: lifecycle.experiment, confirm: "I_UNDERSTAND_DESTRUCTIVE_CLEANUP", config, lifecycle,
+    });
+    expect(apply.refused).toBe(true);
+    expect(apply.reason).toBe("UNKNOWN_EXPERIMENT_LIFECYCLE");
+    expect(apply.deletedByClass.monitor_control ?? 0).toBe(0);
+  });
+
+  it("E: RUNNING/ENTRY_CLOSED protect in-window; missing startedAt forbids monitor delete", async () => {
+    const running = new MemoryEventJournal();
+    await running.append(ev("EXPERIMENT_STARTED", "2026-09-07T12:00:00.000Z", { experimentId: "exp-e", aggregateId: "exp-e" }, "start-e"));
+    await running.append(ev("TRIGGER_EVENT", "2026-09-07T13:00:00.000Z", { experimentId: "exp-e" }, "win-e"));
+    await running.append(ev("TRIGGER_EVENT", "2026-01-01T00:00:00.000Z", {}, "pre-e"));
+    const runningLife = await resolveCleanupLifecycle(running);
+    const runningDry = await dryRunJournalCleanup(running, now, runningLife.experiment, config, {}, runningLife);
+    expect(runningDry.monitor.eligible).toBe(1);
+    const closed = new MemoryEventJournal();
+    await closed.append(ev("EXPERIMENT_ENTRY_CLOSED", "2026-09-07T12:00:00.000Z", { experimentId: "exp-closed", aggregateId: "exp-closed" }, "closed-only"));
+    await closed.append(ev("TRIGGER_EVENT", "2026-01-01T00:00:00.000Z", {}, "mon-closed"));
+    const closedLife = await resolveCleanupLifecycle(closed);
+    expect(closedLife.state).toBe("ACTIVE_ENTRY_CLOSED");
+    expect(closedLife.startedAt).toBeNull();
+    expect(closedLife.monitorDeleteAllowed).toBe(false);
+    const closedDry = await dryRunJournalCleanup(closed, now, closedLife.experiment, config, {}, closedLife);
+    expect(closedDry.monitor.eligible).toBe(0);
+  });
+
+  it("F: COMPLETED requires canonical complete+non-truncated + grace", async () => {
+    const journal = new MemoryEventJournal();
+    await journal.appendMany(fixtureEvents());
+    const lifecycle = await resolveCleanupLifecycle(journal, { experimentId: "exp-1" });
+    expect(lifecycle.state).toBe("COMPLETED");
+    const blocked = await dryRunJournalCleanup(journal, new Date("2026-09-01T00:00:10.000Z"), lifecycle.experiment, defaultRetentionConfig({
+      enabled: true, telemetryTtlMs: 1, monitorTtlMs: 1, completedGraceMs: 7 * 24 * 60 * 60_000,
+    }), {}, lifecycle);
+    expect(blocked.completedGraceGate).toBe(false);
+    expect(blocked.monitor.eligible).toBe(0);
+  });
+
+  it("G: PROVEN_NO_ACTIVE_EXPERIMENT is monitor TTL eligible", async () => {
+    const journal = new MemoryEventJournal();
+    await journal.append(ev("TRIGGER_EVENT", "2026-01-01T00:00:00.000Z", {}, "orphan-mon"));
+    await journal.append(ev("MARKET_SNAPSHOT", "2026-01-01T00:00:00.000Z", {}, "orphan-tel"));
+    const lifecycle = await resolveCleanupLifecycle(journal, {});
+    expect(lifecycle.state).toBe("PROVEN_NO_ACTIVE_EXPERIMENT");
+    expect(lifecycle.experiment).toBeNull();
+    expect(lifecycle.monitorDeleteAllowed).toBe(true);
+    const dry = await dryRunJournalCleanup(journal, now, null, config, {}, lifecycle);
+    expect(dry.monitorOnlyEligible).toBe(true);
+    expect(dry.monitor.eligible).toBe(1);
+  });
+
+  it("H: dry-run shows lifecycle state/source/id/status/times/allowed/reason", async () => {
+    const journal = new MemoryEventJournal();
+    await journal.append(ev("EXPERIMENT_STARTED", "2026-09-07T00:00:00.000Z", { experimentId: "exp-h", aggregateId: "exp-h" }, "start-h"));
+    const lifecycle = await resolveCleanupLifecycle(journal, { experimentId: "exp-h", status: "RUNNING" });
+    const dry = await dryRunJournalCleanup(journal, now, lifecycle.experiment, config, {}, lifecycle);
+    expect(dry.lifecycle).toEqual(expect.objectContaining({
+      state: "ACTIVE_RUNNING",
+      source: "hint_verified",
+      experimentId: "exp-h",
+      status: "RUNNING",
+      startedAt: "2026-09-07T00:00:00.000Z",
+      completedAt: null,
+      monitorDeleteAllowed: true,
+    }));
+    expect(dry.lifecycle?.reason.length).toBeGreaterThan(10);
+    expect(dry.notes.some((note) => note.includes("Authoritative lifecycle: ACTIVE_RUNNING"))).toBe(true);
+  });
+
+  it("DATABASE_URL-only (no EXPERIMENT_ID) while active experiment is SAFE", async () => {
+    const journal = new MemoryEventJournal();
+    await journal.append(ev("EXPERIMENT_STARTED", "2026-09-07T12:00:00.000Z", { experimentId: "exp-db", aggregateId: "exp-db" }, "start-db"));
+    await journal.append(ev("TRIGGER_EVENT", "2026-09-07T13:00:00.000Z", { experimentId: "exp-db" }, "live-mon"));
+    await journal.append(ev("MARKET_SNAPSHOT", "2026-01-01T00:00:00.000Z", {}, "old-tel"));
+    const lifecycle = await resolveCleanupLifecycle(journal, {});
+    expect(lifecycle.state).toBe("ACTIVE_RUNNING");
+    const apply = await applyJournalCleanup(journal, {
+      now, experiment: lifecycle.experiment, confirm: "I_UNDERSTAND_DESTRUCTIVE_CLEANUP", config, lifecycle,
+    });
+    expect(apply.refused).toBe(false);
+    expect(apply.deletedByClass.raw_telemetry).toBe(1);
+    expect(apply.deletedByClass.monitor_control ?? 0).toBe(0);
+    expect((await journal.queryEvents({ types: ["TRIGGER_EVENT"] })).some((event) => event.id === "live-mon")).toBe(true);
+    expect((await journal.queryEvents({ types: ["MARKET_SNAPSHOT"] })).length).toBe(0);
+  });
+});
+
+describe("Step-4 closure: in-flight source-seal database write hold", () => {
+  it("IN-FLIGHT DATABASE WRITE HOLD: stall inside EventJournal source-seal append cannot later commit a timed-out seal", async () => {
+    const journal = new MemoryEventJournal();
+    const engine = paperEngine(journal);
+    await engine.start();
+    let release!: () => void;
+    try {
+      expect(await engine.beginExperiment()).toMatchObject({ ok: true });
+      const experimentId = engine.experimentManifest()!.id;
+      engine.setSourceSealTimeoutForTest(250);
+      journal.setAppendInFlightHoldForTest(new Promise<void>((resolve) => { release = resolve; }), ["EXPERIMENT_SOURCE_SEALED"]);
+      await engine.completeExperimentForTest();
+      const sealPromise = engine.ensureSourceSealForTest();
+      await waitUntil(() => journal.inFlightAppends > 0 || engine.sourceSealPersistInFlightForTest());
+      expect(engine.sourceSealPersistInFlightForTest() || journal.inFlightAppends > 0).toBe(true);
+      const seal = await sealPromise;
+      expect(seal.sealed).toBe(false);
+      expect(seal.reason).toBe("SOURCE_SEAL_TIMEOUT");
+      expect(await loadSourceSeal(journal, experimentId)).toBeNull();
+      expect(await journal.loadExperimentReport(experimentId)).toBeNull();
+      release();
+      journal.setAppendInFlightHoldForTest(null);
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(await loadSourceSeal(journal, experimentId)).toBeNull();
+      expect(await journal.loadExperimentReport(experimentId)).toBeNull();
+      engine.setSourceSealTimeoutForTest(5_000);
+      const retry = await engine.ensureSourceSealForTest();
+      expect(retry.sealed).toBe(true);
+      expect(await loadSourceSeal(journal, experimentId)).toBeTruthy();
+      await engine.writeFinalReportForTest();
+      const first = await journal.loadExperimentReport(experimentId);
+      expect(first && isCanonicalFinalReport(first)).toBe(true);
+      await engine.stop();
+      const restarted = paperEngine(journal);
+      await restarted.start();
+      try {
+        expect((await journal.loadExperimentReport(experimentId))?.contentHash).toBe(first!.contentHash);
+      } finally {
+        await restarted.stop();
+      }
+    } finally {
+      release?.();
+      journal.setAppendInFlightHoldForTest(null);
+      if (!engine.state.draining) await engine.stop();
+    }
   });
 });
 

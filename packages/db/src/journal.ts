@@ -50,10 +50,23 @@ export interface EngineCheckpoint {
   createdAt: string;
 }
 
+export interface JournalAppendOptions {
+  signal?: AbortSignal;
+  deadlineAt?: number;
+}
+
+export class JournalAppendAbortedError extends Error {
+  readonly code = "JOURNAL_APPEND_ABORTED";
+  constructor(reason: "aborted" | "deadline" = "aborted") {
+    super(reason === "deadline" ? "JOURNAL_APPEND_DEADLINE" : "JOURNAL_APPEND_ABORTED");
+    this.name = "JournalAppendAbortedError";
+  }
+}
+
 export interface EventJournal {
   initialize(): Promise<void>;
   healthCheck(): Promise<boolean>;
-  append(event: JournalEvent): Promise<void>;
+  append(event: JournalEvent, options?: JournalAppendOptions): Promise<void>;
   appendMany(events: readonly JournalEvent[]): Promise<void>;
   readTrace(traceId: string): Promise<JournalEvent[]>;
   readTracePage(traceId: string, input: { after?: JournalKeysetCursor; limit: number }): Promise<{ events: JournalEvent[]; nextCursor: JournalKeysetCursor | null }>;
@@ -106,6 +119,14 @@ export class MemoryEventJournal implements EventJournal {
   readonly mutations: string[] = [];
   readonly failAppendTypes = new Set<string>();
   access: JournalAccessMode = "boot-migrate";
+  appendInFlightHold: Promise<void> | null = null;
+  appendInFlightHoldTypes: string[] | null = null;
+  inFlightAppends = 0;
+
+  setAppendInFlightHoldForTest(hold: Promise<void> | null, types?: string[]): void {
+    this.appendInFlightHold = hold;
+    this.appendInFlightHoldTypes = types ?? null;
+  }
 
   async initialize(): Promise<void> {
     if (!journalMayMigrate(this.access)) throw new JournalMigrateForbiddenError(this.access);
@@ -116,17 +137,27 @@ export class MemoryEventJournal implements EventJournal {
     this.access = mode;
   }
   async healthCheck(): Promise<boolean> { return this.available; }
-  async append(event: JournalEvent): Promise<void> {
+  async append(event: JournalEvent, options: JournalAppendOptions = {}): Promise<void> {
     assertJournalCapability(this.access, "runtime-write", "append");
     if (!this.available) throw new Error("DATABASE_UNAVAILABLE");
     const parsed = journalEventSchema.parse(event);
     if (this.failAppendTypes.has(parsed.type)) throw new Error("JOURNAL_APPEND_FAILED");
     if (this.eventIds.has(parsed.id) || this.staged.has(parsed.id)) return;
-    this.eventIds.add(parsed.id);
-    this.events.push(structuredClone(parsed));
-    this.nextCommitSeq += 1;
-    this.commitSeqById.set(parsed.id, this.nextCommitSeq);
-    this.mutations.push(`append:${parsed.type}`);
+    this.inFlightAppends += 1;
+    try {
+      const holdApplies = !this.appendInFlightHoldTypes || this.appendInFlightHoldTypes.includes(parsed.type);
+      if (this.appendInFlightHold && holdApplies) await this.appendInFlightHold;
+      if (options.signal?.aborted) throw new JournalAppendAbortedError("aborted");
+      if (options.deadlineAt != null && Date.now() >= options.deadlineAt) throw new JournalAppendAbortedError("deadline");
+      if (this.eventIds.has(parsed.id) || this.staged.has(parsed.id)) return;
+      this.eventIds.add(parsed.id);
+      this.events.push(structuredClone(parsed));
+      this.nextCommitSeq += 1;
+      this.commitSeqById.set(parsed.id, this.nextCommitSeq);
+      this.mutations.push(`append:${parsed.type}`);
+    } finally {
+      this.inFlightAppends = Math.max(0, this.inFlightAppends - 1);
+    }
   }
   /** Assign recordedAt now but keep the row invisible until commitStaged (commit-stability tests). */
   stageUncommitted(event: JournalEvent): void {
@@ -479,12 +510,21 @@ export class PostgresEventJournal implements EventJournal {
   async healthCheck(): Promise<boolean> {
     try { await this.client`select 1`; return true; } catch { return false; }
   }
-  async append(event: JournalEvent): Promise<void> {
+  async append(event: JournalEvent, options: JournalAppendOptions = {}): Promise<void> {
     assertJournalCapability(this.access, "runtime-write", "append");
     const value = journalEventSchema.parse(event);
-    await this.db.insert(journalEvents).values({
-      ...value, occurredAt: new Date(value.occurredAt), recordedAt: new Date(value.recordedAt),
-    }).onConflictDoNothing({ target: journalEvents.id });
+    if (options.signal?.aborted) throw new JournalAppendAbortedError("aborted");
+    const remaining = options.deadlineAt != null ? Math.max(1, options.deadlineAt - Date.now()) : null;
+    if (options.deadlineAt != null && Date.now() >= options.deadlineAt) throw new JournalAppendAbortedError("deadline");
+    await this.db.transaction(async (tx) => {
+      if (remaining != null) {
+        await tx.execute(sql`SELECT set_config('statement_timeout', ${String(remaining)}, true)`);
+      }
+      if (options.signal?.aborted) throw new JournalAppendAbortedError("aborted");
+      await tx.insert(journalEvents).values({
+        ...value, occurredAt: new Date(value.occurredAt), recordedAt: new Date(value.recordedAt),
+      }).onConflictDoNothing({ target: journalEvents.id });
+    });
   }
   async appendMany(events: readonly JournalEvent[]): Promise<void> {
     assertJournalCapability(this.access, "runtime-write", "appendMany");

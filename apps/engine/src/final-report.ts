@@ -23,6 +23,7 @@ import {
   type ExperimentSummaryExtras,
 } from "./report.js";
 import { loadSourceSeal } from "./source-seal.js";
+import { loadUnresolvedReportSourceIntegrity } from "./report-source-integrity.js";
 
 export interface StreamedExperimentSummary {
   summary: ExperimentSummary;
@@ -97,6 +98,7 @@ export async function persistCanonicalFinalReport(
     return null;
   }
   if (!(await loadSourceSeal(journal, input.summary.experimentId))) return null;
+  if ((await loadUnresolvedReportSourceIntegrity(journal, input.summary.experimentId)).length > 0) return null;
   return journal.persistExperimentReport(toDurableReportInput(input));
 }
 

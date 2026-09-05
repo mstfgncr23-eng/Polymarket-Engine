@@ -40,6 +40,7 @@ import {
   openPositionsRemain,
   shouldWriteFinalReport,
   isReportInputEventType,
+  type JournalEvent,
   type ExternalAgentRoleId,
   type Direction,
   type GrokActivationBridge,
@@ -68,6 +69,7 @@ import {
   DurableCursorBehindError,
   IdempotencyConflictError,
   isCanonicalFinalReport,
+  JournalAppendAbortedError,
   type DurableCommitResult,
   type DurableTransition,
   type EventJournal,
@@ -89,6 +91,15 @@ import { ensureReportGeneratedAudit, persistCanonicalFinalReport, streamExperime
 import { writeExperimentSummary } from "./report.js";
 import { retentionConfigFromEngineEnv, RetentionManager } from "./retention-manager.js";
 import { createSourceSealEvent, loadSourceSeal, remainingSealMs, SOURCE_SEAL_TIMEOUT_MS, isSourceSealExemptType } from "./source-seal.js";
+import {
+  createIntegrityFaultEvent,
+  createIntegrityRepairEvent,
+  loadIntegrityRepairIds,
+  loadUnresolvedReportSourceIntegrity,
+  parseCheckpointIntegrityFaults,
+  shouldLatchReportSourceIntegrity,
+  type ReportSourceIntegrityFault,
+} from "./report-source-integrity.js";
 import { GrokActivationCoordinator, persistableActivation } from "./activation/coordinator.js";
 import { createGrokActivationBridge } from "./activation/index.js";
 import { BoundedJournalWriter } from "./journal-writer.js";
@@ -217,8 +228,11 @@ export class EngineService {
   private sourceSealPersistCancelled = false;
   private sourceSealPersistAttempt = 0;
   private sourceSealPersistHold: Promise<void> | null = null;
+  private sourceSealAbort: AbortController | null = null;
+  private sourceSealPersistInFlight = false;
   private researchIngressInFlight = 0;
   private grokClaimHold: Promise<void> | null = null;
+  private readonly reportSourceIntegrity = new Map<string, ReportSourceIntegrityFault>();
   private referenceTelemetryHoldForTest: Promise<void> | null = null;
   private lastAdmittedMarketEpochFence: ReadonlyMap<string, number> | null = null;
   private discoveryGenerationApplied = 0;
@@ -307,6 +321,7 @@ export class EngineService {
     await this.initializeJournalWithRetry();
     await this.restoreAndRecover();
     await this.restoreSourceSealState();
+    await this.restoreReportSourceIntegrity();
     this.state.recoveryComplete = true;
     const configuredTokens = splitList(this.env.POLYMARKET_TOKEN_IDS);
     if (configuredTokens.length > 0) {
@@ -509,6 +524,10 @@ export class EngineService {
       checkpoint: true,
       afterApply: async () => {
         this.reportGenerated = false;
+        this.abortSourceSealPersist();
+        this.sourceSealed = false;
+        this.sourceSealing = false;
+        this.clearReportSourceIntegrity(next.id);
         this.record("EXPERIMENT_STARTED", next.id, null, { status: next.status });
       },
     });
@@ -1205,6 +1224,9 @@ export class EngineService {
     if (typeof payload.derivedAuditCursor === "number") {
       this.derivedAuditCursor = parseCheckpointDerivedAuditCursor(payload);
     }
+    for (const fault of parseCheckpointIntegrityFaults(payload)) {
+      this.reportSourceIntegrity.set(`${fault.experimentId}:${fault.eventId}`, fault);
+    }
     return { positions: positions.length, restingOrders: resting.length, activeTriggers: triggers.length, grokSignals: signals.length };
   }
 
@@ -1268,7 +1290,7 @@ export class EngineService {
           await this.journal.append(event);
           this.state.database = "UP";
         });
-      }, signal);
+      }, signal, { reportInput: isReportInputEventType(event.type) && !isSourceSealExemptType(event.type) });
     } catch (error) {
       if (error instanceof CrashInjectedError) throw error;
       this.failClosedIntegrity(error);
@@ -2083,7 +2105,15 @@ export class EngineService {
     this.sse.publish("snapshot", () => this.state.snapshot());
   }
 
-  private async safeAppend(event: ReturnType<typeof createJournalEvent>, signal?: AbortSignal): Promise<void> {
+  async persistReportInput(event: JournalEvent): Promise<void> {
+    const experimentId = this.experiment?.id;
+    const stamped = experimentId && typeof event.payload.experimentId !== "string"
+      ? { ...event, payload: { ...event.payload, experimentId } }
+      : event;
+    await this.safeAppend(stamped);
+  }
+
+  private async safeAppend(event: ReturnType<typeof createJournalEvent>, signal?: AbortSignal, extra?: { deadlineAt?: number }): Promise<void> {
     const critical = isCriticalPersistenceType(event.type);
     const journalClass = classifyJournalMetricClass(event.type);
     const reportInput = isReportInputEventType(event.type) && !isSourceSealExemptType(event.type);
@@ -2092,12 +2122,16 @@ export class EngineService {
         if (signal?.aborted) throw new JournalAdmissionRejected(journalClass, critical, "JOURNAL_ADMISSION_CLOSED");
         if (event.type === "TRIGGER_EVENT" && this.triggerEventPersistHold) await this.triggerEventPersistHold;
         await this.metrics.observeDirectJournal(event.type, async () => {
-          await this.journal.append(event);
+          await this.journal.append(event, { signal, deadlineAt: extra?.deadlineAt });
           if (critical) this.state.database = "UP";
         });
       }, signal, { reportInput });
       if (!critical) this.state.journalDegraded = false;
     } catch (error) {
+      if (error instanceof JournalAppendAbortedError) throw error;
+      if (shouldLatchReportSourceIntegrity(event, this.experiment)) {
+        await this.noteReportSourceIntegrityFault(event, error);
+      }
       if (critical) {
         this.overload.markIntegrityFault();
         this.state.overloadState = "FAIL_CLOSED";
@@ -2147,6 +2181,7 @@ export class EngineService {
           marketMetadata: [...this.marketsById.values()].map((market) => ({ ...market, raw: {} })),
           lastInfrastructureAccrualAt: this.lastInfrastructureAccrualAt,
           derivedAuditCursor: this.derivedAuditCursor,
+          reportSourceIntegrity: [...this.reportSourceIntegrity.values()],
         },
       });
       this.metrics.checkpointWrites.inc({ status: "success" });
@@ -2562,7 +2597,77 @@ export class EngineService {
     this.sourceSealing = true;
   }
 
+  private async restoreReportSourceIntegrity(): Promise<void> {
+    const experimentId = this.experiment?.id;
+    if (!experimentId) return;
+    const { ids: repaired, overflow: repairOverflow } = await loadIntegrityRepairIds(this.journal, experimentId);
+    if (repairOverflow) {
+      this.reportSourceIntegrity.set(`${experimentId}:integrity-scan-overflow`, {
+        experimentId, eventType: "OVERFLOW", eventId: "integrity-scan-overflow",
+        reason: "INTEGRITY_SCAN_OVERFLOW", at: this.nowFn().toISOString(),
+      });
+      return;
+    }
+    for (const [key, fault] of [...this.reportSourceIntegrity.entries()]) {
+      if (fault.experimentId === experimentId && repaired.has(fault.eventId)) {
+        this.reportSourceIntegrity.delete(key);
+      }
+    }
+    for (const fault of await loadUnresolvedReportSourceIntegrity(this.journal, experimentId)) {
+      this.reportSourceIntegrity.set(`${fault.experimentId}:${fault.eventId}`, fault);
+    }
+  }
+
+  private clearReportSourceIntegrity(keepExperimentId?: string): void {
+    if (!keepExperimentId) {
+      this.reportSourceIntegrity.clear();
+      return;
+    }
+    for (const key of [...this.reportSourceIntegrity.keys()]) {
+      if (!key.startsWith(`${keepExperimentId}:`)) this.reportSourceIntegrity.delete(key);
+    }
+  }
+
+  private async noteReportSourceIntegrityFault(event: JournalEvent, error: unknown): Promise<void> {
+    const experimentId = this.experiment?.id;
+    if (!experimentId) return;
+    const fault: ReportSourceIntegrityFault = {
+      experimentId,
+      eventType: event.type,
+      eventId: event.id,
+      reason: error instanceof Error ? error.message : String(error),
+      at: this.nowFn().toISOString(),
+    };
+    this.reportSourceIntegrity.set(`${experimentId}:${event.id}`, fault);
+    try {
+      await this.journal.append(createIntegrityFaultEvent(fault));
+    } catch {
+      // Memory latch remains; next checkpoint also snapshots unresolved faults.
+    }
+  }
+
+  private unresolvedReportSourceIntegrity(experimentId: string): ReportSourceIntegrityFault[] {
+    return [...this.reportSourceIntegrity.values()].filter((fault) => fault.experimentId === experimentId);
+  }
+
+  async repairReportSourceIntegrityForTest(event: JournalEvent): Promise<boolean> {
+    await this.journal.append(event);
+    const experimentId = this.experiment?.id;
+    if (!experimentId) return false;
+    const key = `${experimentId}:${event.id}`;
+    const fault = this.reportSourceIntegrity.get(key);
+    if (!fault) return false;
+    const verified = await this.journal.queryEventsKeyset({ types: [event.type], limit: 64 });
+    if (!verified.some((row) => row.id === event.id)) return false;
+    await this.journal.append(createIntegrityRepairEvent(fault));
+    this.reportSourceIntegrity.delete(key);
+    return true;
+  }
+
   async ensureSourceSeal(experiment: { id: string; startedAt?: string | null; completedAt?: string | null } = this.experiment!): Promise<{ sealed: boolean; reason: string | null }> {
+    if (this.unresolvedReportSourceIntegrity(experiment.id).length > 0) {
+      return { sealed: false, reason: "REPORT_SOURCE_INTEGRITY_UNRESOLVED" };
+    }
     const existing = await loadSourceSeal(this.journal, experiment.id);
     if (existing) {
       this.sourceSealed = true;
@@ -2572,6 +2677,7 @@ export class EngineService {
     this.freezeExperimentResearchIngress();
     this.sourceSealPersistCancelled = false;
     this.sourceSealDeadlineAt = Date.now() + this.sourceSealTimeoutMs;
+    this.sourceSealAbort = new AbortController();
     const generation = this.sourceSealGeneration;
     const persistAttempt = ++this.sourceSealPersistAttempt;
     const remaining = () => remainingSealMs(this.sourceSealDeadlineAt);
@@ -2581,13 +2687,13 @@ export class EngineService {
     if (!work.drained || !research.drained || !journal.drained || work.timedOut || research.timedOut || journal.timedOut || remaining() <= 0) {
       return { sealed: false, reason: "SOURCE_SEAL_TIMEOUT" };
     }
-    const persist = this.persistSourceSeal(experiment, generation, persistAttempt);
+    const persist = this.persistSourceSeal(experiment, generation, persistAttempt, this.sourceSealAbort.signal);
     let timeoutId: ReturnType<typeof setTimeout> | undefined;
     const outcome = await Promise.race([
       persist.then((ok) => ({ kind: "done" as const, ok }), () => ({ kind: "done" as const, ok: false })),
       new Promise<{ kind: "timeout" }>((resolve) => {
         timeoutId = setTimeout(() => {
-          // Invalidate before resolving timeout so a held persist cannot append after we fail closed.
+          this.sourceSealAbort?.abort();
           this.abortSourceSealPersist();
           resolve({ kind: "timeout" });
         }, remaining() || 0);
@@ -2595,7 +2701,17 @@ export class EngineService {
     ]);
     if (timeoutId) clearTimeout(timeoutId);
     if (outcome.kind === "timeout") {
+      this.sourceSealAbort?.abort();
       this.abortSourceSealPersist();
+      if (this.sourceSealPersistInFlight) {
+        return { sealed: false, reason: "SOURCE_SEAL_TIMEOUT" };
+      }
+      const already = await loadSourceSeal(this.journal, experiment.id);
+      if (already) {
+        this.sourceSealed = true;
+        this.sourceSealing = false;
+        return { sealed: true, reason: null };
+      }
       return { sealed: false, reason: "SOURCE_SEAL_TIMEOUT" };
     }
     if (!outcome.ok) return { sealed: false, reason: "SOURCE_SEAL_PERSIST_FAILED" };
@@ -2622,20 +2738,34 @@ export class EngineService {
     experiment: { id: string; startedAt?: string | null; completedAt?: string | null },
     generation: number,
     persistAttempt: number,
+    signal?: AbortSignal,
   ): Promise<boolean> {
     if (this.sourceSealPersistHold) await this.sourceSealPersistHold;
-    if (!this.sourceSealPersistStillValid(generation, persistAttempt)) return false;
+    if (!this.sourceSealPersistStillValid(generation, persistAttempt) || signal?.aborted) return false;
     if (remainingSealMs(this.sourceSealDeadlineAt) <= 0) {
       this.abortSourceSealPersist();
       return false;
     }
-    if (!this.sourceSealPersistStillValid(generation, persistAttempt)) return false;
-    await this.safeAppend(createSourceSealEvent({
+    if (!this.sourceSealPersistStillValid(generation, persistAttempt) || signal?.aborted) return false;
+    const event = createSourceSealEvent({
       experimentId: experiment.id,
       startedAt: experiment.startedAt,
       completedAt: experiment.completedAt,
-    }));
-    if (!this.sourceSealPersistStillValid(generation, persistAttempt)) return false;
+      persistAttempt,
+    });
+    this.sourceSealPersistInFlight = true;
+    try {
+      await this.journalAdmission.run("audit", true, async () => {
+        if (signal?.aborted) throw new JournalAppendAbortedError("aborted");
+        await this.journal.append(event, { signal, deadlineAt: this.sourceSealDeadlineAt });
+      }, signal, { reportInput: false });
+    } catch (error) {
+      if (error instanceof JournalAppendAbortedError || (error instanceof JournalAdmissionRejected)) return false;
+      throw error;
+    } finally {
+      this.sourceSealPersistInFlight = false;
+    }
+    if (!this.sourceSealPersistStillValid(generation, persistAttempt) || signal?.aborted) return false;
     return Boolean(await loadSourceSeal(this.journal, experiment.id));
   }
 
@@ -2644,6 +2774,10 @@ export class EngineService {
     const experiment = this.experiment;
     try {
       if (experiment.status === "COMPLETED") {
+        if (this.unresolvedReportSourceIntegrity(experiment.id).length > 0) {
+          this.reportGenerated = false;
+          return;
+        }
         const seal = await this.ensureSourceSeal(experiment);
         if (!seal.sealed) {
           this.reportGenerated = false;
@@ -2682,9 +2816,15 @@ export class EngineService {
         this.reportGenerated = false;
         return;
       }
-      if (experiment.status === "COMPLETED" && !(await loadSourceSeal(this.journal, experiment.id))) {
-        this.reportGenerated = false;
-        return;
+      if (experiment.status === "COMPLETED") {
+        if (this.unresolvedReportSourceIntegrity(experiment.id).length > 0) {
+          this.reportGenerated = false;
+          return;
+        }
+        if (!(await loadSourceSeal(this.journal, experiment.id))) {
+          this.reportGenerated = false;
+          return;
+        }
       }
       let persisted;
       try {
@@ -2821,6 +2961,7 @@ export class EngineService {
   setTriggerEventPersistHoldForTest(hold: Promise<void> | null): void { this.triggerEventPersistHold = hold; }
   setSourceSealTimeoutForTest(ms: number): void { this.sourceSealTimeoutMs = Math.max(1, ms); }
   setSourceSealPersistHoldForTest(hold: Promise<void> | null): void { this.sourceSealPersistHold = hold; }
+  sourceSealPersistInFlightForTest() { return this.sourceSealPersistInFlight; }
   setGrokClaimHoldForTest(hold: Promise<void> | null): void { this.grokClaimHold = hold; }
   researchIngressInFlightForTest() { return this.researchIngressInFlight; }
   sourceSealStateForTest() { return { sealing: this.sourceSealing, sealed: this.sourceSealed, generation: this.sourceSealGeneration }; }
@@ -2893,8 +3034,9 @@ export class EngineService {
     );
   }
   async persistEventForTest(event: ReturnType<typeof createJournalEvent>): Promise<void> {
-    await this.safeAppend(event);
+    await this.persistReportInput(event);
   }
+  reportSourceIntegrityForTest() { return [...this.reportSourceIntegrity.values()]; }
   enqueueTriggerStormForTest(triggers: TriggerEvent[]): { admitted: number; rejected: number; reasons: Record<string, number> } {
     let admitted = 0;
     let rejected = 0;

@@ -12,6 +12,7 @@ import {
 } from "@pm/core";
 import { MemoryEventJournal, PostgresEventJournal, type JournalAccessMode } from "@pm/db";
 import { applyJournalCleanup, dryRunJournalCleanup } from "./journal-cleanup.js";
+import { resolveCleanupLifecycle } from "./cleanup-lifecycle.js";
 import { generateOperatorReport } from "./operator-report.js";
 import { retentionConfigFromEnv } from "./retention-manager.js";
 import { PolymarketMarketDataAdapter, ReferenceFeedRegistry, createRestProbe } from "@pm/market-data";
@@ -50,17 +51,20 @@ if (command === "experiment:start") {
   const mode: JournalAccessMode = apply ? "maintenance" : "readonly";
   const journal = new PostgresEventJournal(process.env.DATABASE_URL, process.env.DB_MIGRATIONS_DIR ?? resolve(process.cwd(), "packages/db/migrations"), { access: mode });
   await journal.connectWithoutMigrate(mode);
-  const experiment = process.env.EXPERIMENT_ID
-    ? { id: process.env.EXPERIMENT_ID, status: process.env.EXPERIMENT_STATUS ?? "UNKNOWN", startedAt: process.env.EXPERIMENT_STARTED_AT ?? null }
-    : null;
+  const lifecycle = await resolveCleanupLifecycle(journal, {
+    experimentId: process.env.EXPERIMENT_ID,
+    status: process.env.EXPERIMENT_STATUS,
+    startedAt: process.env.EXPERIMENT_STARTED_AT,
+  });
+  const experiment = lifecycle.experiment;
   const retention = retentionConfigFromEnv(process.env);
   try {
     if (!apply) {
-      console.log(JSON.stringify(await dryRunJournalCleanup(journal, new Date(), experiment, retention), null, 2));
+      console.log(JSON.stringify(await dryRunJournalCleanup(journal, new Date(), experiment, retention, {}, lifecycle), null, 2));
     } else {
       if (!confirm) throw new Error("JOURNAL_CLEANUP_APPLY_REQUIRES_--i-understand-destructive");
       console.log(JSON.stringify(await applyJournalCleanup(journal, {
-        experiment, confirm: "I_UNDERSTAND_DESTRUCTIVE_CLEANUP", config: retention,
+        experiment, confirm: "I_UNDERSTAND_DESTRUCTIVE_CLEANUP", config: retention, lifecycle,
       }), null, 2));
     }
   } finally {
