@@ -124,6 +124,9 @@ export class ScriptedBoundedStream implements BoundedMarketStream {
     return {
       next: async () => {
         if (this.pendingError) throw this.pendingError;
+        if (this.ended) {
+          return { value: undefined, done: true };
+        }
         const existing = this.queue.dequeue();
         if (existing !== undefined) return { value: existing, done: false };
         if (this.ended) {
@@ -154,6 +157,10 @@ export class ScriptedBoundedStream implements BoundedMarketStream {
     while (this.waiters.length > 0) {
       if (this.pendingError) {
         this.waiters.shift()!.reject(this.pendingError);
+        continue;
+      }
+      if (this.ended) {
+        this.waiters.shift()!.resolve({ value: undefined, done: true });
         continue;
       }
       const item = this.queue.dequeue();

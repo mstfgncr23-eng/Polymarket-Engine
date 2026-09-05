@@ -81,6 +81,32 @@ class SilentRefSocket extends EventTarget {
   }
 }
 
+/** close() returns normally and never emits a close event. */
+class CloseNeverAcksSocket extends EventTarget {
+  readyState = 0;
+  added = 0;
+  removed = 0;
+  get liveListeners(): number { return this.added - this.removed; }
+  addEventListener(type: string, callback: EventListenerOrEventListenerObject | null, options?: boolean | AddEventListenerOptions): void {
+    this.added += 1;
+    super.addEventListener(type, callback, options);
+  }
+  removeEventListener(type: string, callback: EventListenerOrEventListenerObject | null, options?: boolean | EventListenerOptions): void {
+    this.removed += 1;
+    super.removeEventListener(type, callback, options);
+  }
+  open(): void {
+    this.readyState = 1;
+    this.dispatchEvent(new Event("open"));
+  }
+  close(): void {
+    this.readyState = 2;
+  }
+  message(data: string): void {
+    this.dispatchEvent(new MessageEvent("message", { data }));
+  }
+}
+
 class ControllableRefSocket extends EventTarget {
   readyState = 0;
   messages: string[] = [];
@@ -111,12 +137,13 @@ function liveBook(tokenId: string, timestamp: number, qty = "10") {
   };
 }
 
-function liveDelta(tokenId: string, timestamp: number, extras: Array<Record<string, unknown>> = []) {
+function liveDelta(tokenId: string, timestamp: number, extras: Array<Record<string, unknown>> = [], fields: Record<string, unknown> = {}) {
   return {
     type: "price_change",
     payload: {
       timestamp,
       priceChanges: [{ tokenId, side: "BUY", price: "0.47", size: "9" }, ...extras],
+      ...fields,
     },
   };
 }
@@ -292,6 +319,30 @@ describe("A — CLOB stream terminalization is total", () => {
     expect((item.value as { payload?: { timestamp?: number } }).payload?.timestamp).toBe(2_000);
   });
 
+  it("old generation iterator cannot dequeue a newer stream event", async () => {
+    const { transport, stream } = await openStream();
+    const oldIter = stream[Symbol.asyncIterator]();
+    await stream.close();
+    const pending = transport.subscribe(["tok-up"]);
+    await waitFor(() => ControllableWebSocket.instances.length === 2);
+    ControllableWebSocket.instances[1]!.open();
+    const stream2 = await pending;
+    const newIter = stream2[Symbol.asyncIterator]();
+    ControllableWebSocket.instances[1]!.message(JSON.stringify(liveBook("tok-up", 2_000)));
+    expect(transport.queue.depth).toBe(1);
+    const oldNext = await oldIter.next();
+    expect(oldNext.done).toBe(true);
+    expect(oldNext.value).toBeUndefined();
+    expect(transport.queue.depth).toBe(1);
+    const oldAgain = await oldIter.next();
+    expect(oldAgain.done).toBe(true);
+    expect(transport.queue.depth).toBe(1);
+    const newNext = await newIter.next();
+    expect(newNext.done).toBe(false);
+    expect((newNext.value as { payload?: { timestamp?: number } }).payload?.timestamp).toBe(2_000);
+    expect(transport.queue.depth).toBe(0);
+  });
+
   it("multi-event frame overflow stops after the first failure and counts one gap", async () => {
     const { transport, socket, stream } = await openStream({ maxEvents: 2, maxBytes: 4_096 });
     const next = stream[Symbol.asyncIterator]().next();
@@ -406,6 +457,65 @@ describe("B+C — atomic full book and price_change", () => {
     const resynced = instance.normalizeSourceEvent(liveBook("tok-up", 2_000, "12"));
     expect(resynced).toHaveLength(1);
     expect(instance.normalizeSourceEvent(liveDelta("tok-up", 2_001))).toHaveLength(1);
+  });
+
+  it("A: valid delta + malformed tickSize throws MarketIngressMalformedError with zero trusted mutation", () => {
+    const instance = adapter();
+    instance.normalizeSourceEvent(liveBook("tok-up", 1_000));
+    expect(instance.lastAcceptedTimestamp("tok-up")).toBe(1_000);
+    expect(() => instance.normalizeSourceEvent(liveDelta("tok-up", 1_001, [], { tickSize: "nope" }))).toThrow(MarketIngressMalformedError);
+    expect(instance.bookState("tok-up")).toBeUndefined();
+    expect(instance.tokenSyncState("tok-up")).toBe("GAPPED");
+    expect(instance.lastAcceptedTimestamp("tok-up")).toBeUndefined();
+    expect(instance.isTokenSynchronized("tok-up")).toBe(false);
+  });
+
+  it("B: valid delta + malformed minOrderSize throws MarketIngressMalformedError with zero trusted mutation", () => {
+    const instance = adapter();
+    instance.normalizeSourceEvent(liveBook("tok-up", 1_000));
+    expect(() => instance.normalizeSourceEvent(liveDelta("tok-up", 1_001, [], { minOrderSize: "nope" }))).toThrow(MarketIngressMalformedError);
+    expect(instance.bookState("tok-up")).toBeUndefined();
+    expect(instance.tokenSyncState("tok-up")).toBe("GAPPED");
+    expect(instance.lastAcceptedTimestamp("tok-up")).toBeUndefined();
+  });
+
+  it("C: multi-entry valid book deltas do not commit when later snapshot-level validation fails", () => {
+    const instance = new PolymarketMarketDataAdapter();
+    instance.registerManualToken("tok-up", "mkt", "UP", "BTC");
+    instance.registerManualToken("tok-down", "mkt", "DOWN", "BTC");
+    instance.setTokenIds(["tok-up", "tok-down"]);
+    instance.normalizeSourceEvent(liveBook("tok-up", 1_000));
+    instance.normalizeSourceEvent(liveBook("tok-down", 1_000));
+    expect(() => instance.normalizeSourceEvent({
+      type: "price_change",
+      payload: {
+        timestamp: 1_001,
+        tickSize: "nope",
+        priceChanges: [
+          { tokenId: "tok-up", side: "BUY", price: "0.41", size: "4" },
+          { tokenId: "tok-down", side: "SELL", price: "0.52", size: "3" },
+        ],
+      },
+    })).toThrow(MarketIngressMalformedError);
+    expect(instance.bookState("tok-up")).toBeUndefined();
+    expect(instance.bookState("tok-down")).toBeUndefined();
+    expect(instance.tokenSyncState("tok-up")).toBe("GAPPED");
+    expect(instance.tokenSyncState("tok-down")).toBe("GAPPED");
+    expect(instance.lastAcceptedTimestamp("tok-up")).toBeUndefined();
+    expect(instance.lastAcceptedTimestamp("tok-down")).toBeUndefined();
+  });
+
+  it("D: fresh full book after snapshot-metadata gap restores normal processing", () => {
+    const instance = adapter();
+    instance.normalizeSourceEvent(liveBook("tok-up", 1_000));
+    expect(() => instance.normalizeSourceEvent(liveDelta("tok-up", 1_001, [], { tickSize: "nope" }))).toThrow(MarketIngressMalformedError);
+    expect(instance.tokenSyncState("tok-up")).toBe("GAPPED");
+    const resynced = instance.normalizeSourceEvent(liveBook("tok-up", 2_000, "12"));
+    expect(resynced).toHaveLength(1);
+    expect(instance.isTokenSynchronized("tok-up")).toBe(true);
+    const deltas = instance.normalizeSourceEvent(liveDelta("tok-up", 2_001));
+    expect(deltas).toHaveLength(1);
+    expect(instance.bookState("tok-up")?.bids.get("0.47")).toBe("9");
   });
 });
 
@@ -633,6 +743,120 @@ describe("G+H+I — reference ingress, connect, timestamps", () => {
     expect(engine.referenceWindowTotalEntriesForTest()).toBeLessThanOrEqual(2);
     await engine.stop();
   });
+
+  it("A: never-open close-never-acks connect timeout settles and retries", async () => {
+    const sockets: CloseNeverAcksSocket[] = [];
+    const adapter = new ReferencePriceFeedAdapter({
+      asset: "SOL", symbol: "SOLUSDT", url: "wss://example/sol",
+      factory: () => {
+        const socket = new CloseNeverAcksSocket();
+        sockets.push(socket);
+        return socket;
+      },
+      reconnect: { initialDelayMs: 20, maxDelayMs: 20, jitterRatio: 0, connectTimeoutMs: 30, closeWatchdogMs: 40 },
+    });
+    const abort = new AbortController();
+    const running = adapter.run({
+      onTick: () => undefined,
+      onConnection: () => undefined,
+      onError: () => undefined,
+    }, abort.signal);
+    await waitFor(() => sockets.length >= 2, 3_000);
+    expect(sockets.length).toBeGreaterThanOrEqual(2);
+    expect(adapter.lastIngress).toBeNull();
+    abort.abort(REFERENCE_WS_CONNECT_TIMEOUT);
+    await running;
+  });
+
+  it("B: abort while CONNECTING + close-never-acks settles run promptly", async () => {
+    const sockets: CloseNeverAcksSocket[] = [];
+    const adapter = new ReferencePriceFeedAdapter({
+      asset: "ETH", symbol: "ETHUSDT", url: "wss://example/eth",
+      factory: () => {
+        const socket = new CloseNeverAcksSocket();
+        sockets.push(socket);
+        return socket;
+      },
+      reconnect: { initialDelayMs: 5_000, maxDelayMs: 5_000, jitterRatio: 0, connectTimeoutMs: 5_000, closeWatchdogMs: 40 },
+    });
+    const abort = new AbortController();
+    const running = adapter.run({
+      onTick: () => undefined,
+      onConnection: () => undefined,
+      onError: () => undefined,
+    }, abort.signal);
+    await waitFor(() => sockets.length === 1);
+    const started = Date.now();
+    abort.abort("test");
+    await running;
+    expect(Date.now() - started).toBeLessThan(250);
+    expect(adapter.lastIngress).toBeNull();
+    expect(adapter.running).toBe(false);
+  });
+
+  it("C+D: late open/message/close after forced finalization are ignored and nothing is retained", async () => {
+    const sockets: CloseNeverAcksSocket[] = [];
+    const ticks: string[] = [];
+    const connections: string[] = [];
+    const adapter = new ReferencePriceFeedAdapter({
+      asset: "BTC", symbol: "BTCUSDT", url: "wss://example/btc",
+      factory: () => {
+        const socket = new CloseNeverAcksSocket();
+        sockets.push(socket);
+        return socket;
+      },
+      reconnect: { initialDelayMs: 20, maxDelayMs: 20, jitterRatio: 0, connectTimeoutMs: 30, closeWatchdogMs: 40 },
+    });
+    const generationBefore = adapter.currentSessionGeneration();
+    const abort = new AbortController();
+    const running = adapter.run({
+      onTick: (tick) => { ticks.push(tick.price); },
+      onConnection: (event) => { connections.push(event.state); },
+      onError: () => undefined,
+    }, abort.signal);
+    await waitFor(() => sockets.length >= 1 && adapter.currentSessionGeneration() > generationBefore);
+    await waitFor(() => sockets.length >= 2, 3_000);
+    const first = sockets[0]!;
+    first.open();
+    first.message(binanceTrade("999"));
+    first.dispatchEvent(new Event("close"));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(ticks).not.toContain("999");
+    expect(connections).not.toContain("CONNECTED");
+    expect(first.liveListeners).toBe(0);
+    expect(adapter.lastIngress).toBeNull();
+    abort.abort("test");
+    await running;
+  });
+
+  it("STALE terminal initiation is one-shot while close never acks", async () => {
+    const sockets: CloseNeverAcksSocket[] = [];
+    const connections: string[] = [];
+    const adapter = new ReferencePriceFeedAdapter({
+      asset: "XRP", symbol: "XRPUSDT", url: "wss://example/xrp",
+      staleTimeoutMs: 40,
+      factory: () => {
+        const socket = new CloseNeverAcksSocket();
+        sockets.push(socket);
+        queueMicrotask(() => socket.open());
+        return socket;
+      },
+      reconnect: { initialDelayMs: 10_000, maxDelayMs: 10_000, jitterRatio: 0, closeWatchdogMs: 40 },
+    });
+    const abort = new AbortController();
+    const running = adapter.run({
+      onTick: () => undefined,
+      onConnection: (event) => { connections.push(event.state); },
+      onError: () => undefined,
+    }, abort.signal);
+    await waitFor(() => connections.includes("CONNECTED"));
+    await waitFor(() => connections.includes("STALE"), 2_000);
+    await new Promise((resolve) => setTimeout(resolve, 1_200));
+    expect(connections.filter((state) => state === "STALE")).toHaveLength(1);
+    expect(adapter.lastIngress).toBeNull();
+    abort.abort("test");
+    await running;
+  });
 });
 
 describe("J — market reconnect backoff is stability-gated", () => {
@@ -694,6 +918,90 @@ describe("J — market reconnect backoff is stability-gated", () => {
     transport.current().endRemote();
     await waitFor(() => adapter.reconnectDelays.length >= 2);
     expect(adapter.reconnectDelays.at(-1)!).toBeLessThanOrEqual(afterUnstable * 1.5);
+    ac.abort();
+    await running;
+  }, 15_000);
+
+  it("A: slow connect plus immediate trusted-book death does not reset backoff", async () => {
+    const transport = new ScriptedBoundedMarketTransport();
+    const adapter = new PolymarketMarketDataAdapter(undefined, { transport, ingress: transport.queue, stableAfterMs: 40 });
+    adapter.registerManualToken("tok-up", "tok-up", "UP", "BTC");
+    const ac = new AbortController();
+    const running = adapter.run(["tok-up"], {
+      onSnapshot: () => undefined,
+      onConnection: () => undefined,
+      onError: () => undefined,
+    }, ac.signal);
+    await waitFor(() => transport.subscribeCalls >= 1 && transport.stream && !transport.current().closed);
+    transport.current().endRemote();
+    await waitFor(() => adapter.reconnectDelays.length >= 1);
+    await waitFor(() => transport.subscribeCalls >= 2 && transport.stream && !transport.current().closed);
+    transport.current().endRemote();
+    await waitFor(() => adapter.reconnectDelays.length >= 2);
+    const grown = adapter.reconnectDelays[1]!;
+    expect(grown).toBeGreaterThan(adapter.reconnectDelays[0]! * 0.8);
+    const held = transport.holdNextSubscribe();
+    await waitFor(() => transport.subscribeCalls >= 3);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    held.release();
+    await waitFor(() => transport.stream && !transport.current().closed);
+    expect(transport.push(liveBook("tok-up", 3_000)).ok).toBe(true);
+    await waitFor(() => adapter.isTokenSynchronized("tok-up"));
+    transport.current().endRemote();
+    await waitFor(() => adapter.reconnectDelays.length >= 3);
+    expect(adapter.reconnectDelays[2]!).toBeGreaterThan(grown * 0.8);
+    ac.abort();
+    await running;
+  }, 15_000);
+
+  it("B: fast connect + trusted book + survive stableAfterMs resets backoff", async () => {
+    const transport = new ScriptedBoundedMarketTransport();
+    const adapter = new PolymarketMarketDataAdapter(undefined, { transport, ingress: transport.queue, stableAfterMs: 40 });
+    adapter.registerManualToken("tok-up", "tok-up", "UP", "BTC");
+    const ac = new AbortController();
+    const running = adapter.run(["tok-up"], {
+      onSnapshot: () => undefined,
+      onConnection: () => undefined,
+      onError: () => undefined,
+    }, ac.signal);
+    await waitFor(() => transport.subscribeCalls >= 1 && transport.stream && !transport.current().closed);
+    transport.current().endRemote();
+    await waitFor(() => adapter.reconnectDelays.length >= 1);
+    await waitFor(() => transport.subscribeCalls >= 2 && transport.stream && !transport.current().closed);
+    transport.current().endRemote();
+    await waitFor(() => adapter.reconnectDelays.length >= 2);
+    const grown = adapter.reconnectDelays[1]!;
+    await waitFor(() => transport.subscribeCalls >= 3 && transport.stream && !transport.current().closed);
+    expect(transport.push(liveBook("tok-up", 3_000)).ok).toBe(true);
+    await waitFor(() => adapter.isTokenSynchronized("tok-up"));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    transport.current().endRemote();
+    await waitFor(() => adapter.reconnectDelays.length >= 3);
+    expect(adapter.reconnectDelays[2]!).toBeLessThan(grown);
+    ac.abort();
+    await running;
+  }, 15_000);
+
+  it("C: connect without a trusted book for longer than stableAfterMs never resets backoff", async () => {
+    const transport = new ScriptedBoundedMarketTransport();
+    const adapter = new PolymarketMarketDataAdapter(undefined, { transport, ingress: transport.queue, stableAfterMs: 40 });
+    adapter.registerManualToken("tok-up", "tok-up", "UP", "BTC");
+    const ac = new AbortController();
+    const running = adapter.run(["tok-up"], {
+      onSnapshot: () => undefined,
+      onConnection: () => undefined,
+      onError: () => undefined,
+    }, ac.signal);
+    await waitFor(() => transport.subscribeCalls >= 1 && transport.stream && !transport.current().closed);
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    transport.current().endRemote();
+    await waitFor(() => adapter.reconnectDelays.length >= 1);
+    const first = adapter.reconnectDelays[0]!;
+    await waitFor(() => transport.subscribeCalls >= 2 && transport.stream && !transport.current().closed);
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    transport.current().endRemote();
+    await waitFor(() => adapter.reconnectDelays.length >= 2);
+    expect(adapter.reconnectDelays[1]!).toBeGreaterThan(first * 0.8);
     ac.abort();
     await running;
   }, 15_000);

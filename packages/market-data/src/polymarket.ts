@@ -173,9 +173,10 @@ export class PolymarketMarketDataAdapter {
   private readonly transport: MarketStreamTransport;
   /** Trusted full book observed on the CURRENT stream attempt only. */
   private streamHadTrustedBooks = false;
+  /** First trusted canonical book on the CURRENT stream attempt. Not connect time. */
+  private firstTrustedBookAtMs = 0;
   private logicalLossGapped = false;
   private tokenIdSet = new Set<string>();
-  private streamOpenedAtMs = 0;
   private pendingEpochReason: IngressGapReason | null = null;
   private readonly stableAfterMs: number;
   lastReconnectDelayMs = 0;
@@ -391,7 +392,7 @@ export class PolymarketMarketDataAdapter {
           const generationRestart = generation > 1 && reconnectCount === 0;
           const previousStreamTrusted = this.streamHadTrustedBooks;
           this.streamHadTrustedBooks = false;
-          this.streamOpenedAtMs = Date.now();
+          this.firstTrustedBookAtMs = 0;
           const reason = this.pendingEpochReason
             ?? (reconnectCount > 0 ? "reconnect" : generationRestart ? "generation_change" : "explicit_resubscribe");
           const emitGap = reason === "generation_change"
@@ -452,8 +453,8 @@ export class PolymarketMarketDataAdapter {
           } finally {
             if (
               this.streamHadTrustedBooks
-              && this.streamOpenedAtMs > 0
-              && Date.now() - this.streamOpenedAtMs >= this.stableAfterMs
+              && this.firstTrustedBookAtMs > 0
+              && Date.now() - this.firstTrustedBookAtMs >= this.stableAfterMs
             ) {
               backoff.reset();
             }
@@ -628,6 +629,7 @@ export class PolymarketMarketDataAdapter {
     this.lastTimestampByToken.set(tokenId, sourceMs);
     this.books.set(tokenId, staged);
     const synced = this.sync.markSyncedFromBook(tokenId);
+    if (this.firstTrustedBookAtMs === 0) this.firstTrustedBookAtMs = Date.now();
     this.streamHadTrustedBooks = true;
     if (synced.wasResync) {
       handlers.onResync?.({ reason: "full_book", tokenId, epoch: synced.epoch });
@@ -701,42 +703,60 @@ export class PolymarketMarketDataAdapter {
     }
 
     const staged = new Map<string, BookState>();
+    const commits: Array<{ tokenId: string; state: BookState; changedLevel: BookLevel | null }> = [];
     for (const item of accepted) {
-      const copy = staged.get(item.tokenId) ?? cloneBookState(item.state);
-      staged.set(item.tokenId, copy);
+      const copy = cloneBookState(staged.get(item.tokenId) ?? item.state);
       if (item.side === "BUY") applyLevelChange(copy.bids, copy.bidLevels, item.price, item.size, "desc");
       else applyLevelChange(copy.asks, copy.askLevels, item.price, item.size, "asc");
+      copy.timestamp = new Date(sourceMs).toISOString();
+      copy.hash = nullableString(item.hash) ?? copy.hash;
       const changedLevel = Number(item.size) <= 0 ? null : { price: item.price, quantity: item.size };
-      try { validateNormalizedBook(copy, changedLevel); } catch {
+      try {
+        this.assertSnapshotPublishable(item.tokenId, copy, payload, changedLevel);
+      } catch {
         this.noteAnomaly(handlers, {
           kind: "malformed", tokenId: item.tokenId, incomingMs: sourceMs,
           lastAcceptedMs: this.lastTimestampByToken.get(item.tokenId) ?? null, regressionMs: null,
         });
-        this.failIncrementalTrust([...staged.keys()], handlers);
-        throw new MarketIngressMalformedError([...staged.keys()]);
+        this.failIncrementalTrust([...new Set(accepted.map((entry) => entry.tokenId))], handlers);
+        throw new MarketIngressMalformedError([...new Set(accepted.map((entry) => entry.tokenId))]);
       }
+      staged.set(item.tokenId, copy);
+      commits.push({ tokenId: item.tokenId, state: copy, changedLevel });
+    }
+
+    for (const [tokenId, state] of staged) {
+      this.books.set(tokenId, state);
+      this.lastTimestampByToken.set(tokenId, sourceMs);
     }
 
     const snapshots: MarketSnapshot[] = [];
-    for (const item of accepted) {
+    for (const commit of commits) {
       const started = performance.now();
-      const live = this.books.get(item.tokenId);
-      if (!live) continue;
-      const changed = item.side === "BUY"
-        ? applyLevelChange(live.bids, live.bidLevels, item.price, item.size, "desc")
-        : applyLevelChange(live.asks, live.askLevels, item.price, item.size, "asc");
-      if (changed) {
-        if (item.side === "BUY") live.bidsDirty = true;
-        else live.asksDirty = true;
-      }
-      live.timestamp = new Date(sourceMs).toISOString();
-      live.hash = nullableString(item.hash) ?? live.hash;
-      this.lastTimestampByToken.set(item.tokenId, sourceMs);
-      const changedLevel = Number(item.size) <= 0 ? null : { price: item.price, quantity: item.size };
-      snapshots.push(this.toSnapshot(item.tokenId, live, payload, changedLevel, started));
+      snapshots.push(this.toSnapshot(commit.tokenId, commit.state, payload, commit.changedLevel, started));
     }
     this.normalizeObserver?.onPriceChangeEvent(changes.length, snapshots.length);
     return snapshots;
+  }
+
+  /**
+   * Every check toSnapshot needs before a source event may mutate trusted state.
+   * Does not increment sequence or publish sides.
+   */
+  private assertSnapshotPublishable(
+    tokenId: string,
+    state: BookState,
+    raw: Record<string, unknown>,
+    changedLevel?: BookLevel | null,
+  ): void {
+    const market = this.marketsByToken.get(tokenId);
+    if (!market) throw new Error("UNKNOWN_TOKEN");
+    validateNormalizedBook(state, changedLevel);
+    assertDecimalString(state.lastTradePrice);
+    assertDecimalString(nullableString(raw.lastTradePrice));
+    assertDecimalString(nullableString(raw.tickSize));
+    assertDecimalString(nullableString(raw.minOrderSize));
+    if (market.feeSchedule != null) feeScheduleSchema.parse(market.feeSchedule);
   }
 
   private failIncrementalTrust(
@@ -807,11 +827,8 @@ export class PolymarketMarketDataAdapter {
     const minOrderSize = nullableString(raw.minOrderSize);
     let feeSchedule: MarketSnapshot["feeSchedule"] = null;
     try {
-      validateNormalizedBook(state, changedLevel);
-      assertDecimalString(state.lastTradePrice);
-      assertDecimalString(tickSize);
-      assertDecimalString(minOrderSize);
-      feeSchedule = market.feeSchedule == null ? null : feeScheduleSchema.parse(market.feeSchedule);
+      this.assertSnapshotPublishable(tokenId, state, raw, changedLevel);
+      feeSchedule = market.feeSchedule == null ? null : market.feeSchedule;
       state.levelsValid = true;
     } catch (error) {
       state.levelsValid = false;

@@ -115,10 +115,16 @@ export class BoundedClobMarketTransport implements MarketStreamTransport {
       }
     };
 
+    const isCurrentGeneration = () => generation === this.generation;
+
     const pump = () => {
       while (waiters.length > 0) {
         if (pendingError) {
           waiters.shift()!.reject(pendingError);
+          continue;
+        }
+        if (ended || !isCurrentGeneration()) {
+          waiters.shift()!.resolve({ value: undefined, done: true });
           continue;
         }
         const item = queue.dequeue();
@@ -126,7 +132,7 @@ export class BoundedClobMarketTransport implements MarketStreamTransport {
           waiters.shift()!.resolve({ value: item, done: false });
           continue;
         }
-        if (ended) {
+        if (ended || !isCurrentGeneration()) {
           waiters.shift()!.resolve({ value: undefined, done: true });
           continue;
         }
@@ -290,9 +296,13 @@ export class BoundedClobMarketTransport implements MarketStreamTransport {
       [Symbol.asyncIterator]: () => ({
         next: async () => {
           if (pendingError) throw pendingError;
+          if (ended || !isCurrentGeneration()) {
+            if (pendingError) throw pendingError;
+            return { value: undefined, done: true };
+          }
           const existing = queue.dequeue();
           if (existing !== undefined) return { value: existing, done: false };
-          if (ended) {
+          if (ended || !isCurrentGeneration()) {
             if (pendingError) throw pendingError;
             return { value: undefined, done: true };
           }

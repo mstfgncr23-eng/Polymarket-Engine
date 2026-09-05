@@ -583,7 +583,7 @@ describe("reference-feed lifecycle closure", () => {
     };
     const adapter = new ReferencePriceFeedAdapter({
       asset: "ETH", symbol: "ETHUSDT", url: "wss://example/eth", factory, staleTimeoutMs: 60_000,
-      reconnect: { initialDelayMs: 20, maxDelayMs: 20, jitterRatio: 0, stableAfterMs: 10_000 },
+      reconnect: { initialDelayMs: 20, maxDelayMs: 20, jitterRatio: 0, stableAfterMs: 10_000, closeWatchdogMs: 60_000 },
     });
     const abort = new AbortController();
     const running = adapter.run(silentHandlers(), abort.signal);

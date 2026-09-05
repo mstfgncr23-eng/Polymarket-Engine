@@ -57,7 +57,12 @@ export interface ReferenceReconnectOptions extends Partial<ReconnectOptions> {
   /** Override of REFERENCE_STABLE_CONNECTION_MS. Not reset on `"open"`. */
   stableAfterMs?: number;
   connectTimeoutMs?: number;
+  /** Finite deadline to settle after close() if the socket never emits `"close"`. */
+  closeWatchdogMs?: number;
 }
+
+/** Application-controlled settle deadline when a socket close is never acknowledged. */
+export const REFERENCE_CLOSE_WATCHDOG_MS = 2_000;
 
 export function formatReferenceClose(closed: Omit<ReferenceCloseEvent, "reconnectCount" | "asset"> & { reconnectCount?: number; asset?: string }): string {
   return `REFERENCE_CLOSE:kind=${closed.kind}:code=${closed.code ?? "none"}:wasClean=${closed.wasClean}:abort=${closed.abortInitiated}:reason=${closed.reason || ""}`;
@@ -90,6 +95,7 @@ export class ReferencePriceFeedAdapter {
   private readonly reconnect: ReconnectOptions;
   private readonly stableAfterMs: number;
   private readonly connectTimeoutMs: number;
+  private readonly closeWatchdogMs: number;
   private inFlight = false;
   private sessionGeneration = 0;
   lastIngress: BoundedIngressQueue | null = null;
@@ -106,6 +112,7 @@ export class ReferencePriceFeedAdapter {
     };
     this.stableAfterMs = options.reconnect?.stableAfterMs ?? REFERENCE_STABLE_CONNECTION_MS;
     this.connectTimeoutMs = options.reconnect?.connectTimeoutMs ?? REFERENCE_INGRESS_BOUNDS.connectTimeoutMs;
+    this.closeWatchdogMs = options.reconnect?.closeWatchdogMs ?? REFERENCE_CLOSE_WATCHDOG_MS;
   }
 
   get asset(): string { return this.options.asset; }
@@ -163,33 +170,25 @@ export class ReferencePriceFeedAdapter {
       let overflowed = false;
       let consumerRunning = false;
       let openedAt: number | null = null;
+      let closeWatchdog: ReturnType<typeof setTimeout> | null = null;
       const listeners: Array<{ type: string; fn: EventListenerOrEventListenerObject }> = [];
       const listen = (type: string, fn: EventListenerOrEventListenerObject, options?: AddEventListenerOptions) => {
         socket.addEventListener(type, fn, options);
         listeners.push({ type, fn });
       };
-      const staleTimer = setInterval(() => {
-        if (connected && Date.now() - lastMessageAt > this.staleTimeoutMs) {
-          staleForced = true;
-          void handlers.onConnection(this.connection("STALE", reconnectCount));
-          try { socket.close(4000, "stale feed"); } catch { /* ignore */ }
-        }
-      }, Math.max(500, Math.floor(this.staleTimeoutMs / 2)));
-      const connectTimer = setTimeout(() => {
-        if (!connected && !settled) {
-          sawError = true;
-          requestClose(4001, REFERENCE_WS_CONNECT_TIMEOUT);
-        }
-      }, this.connectTimeoutMs);
-      connectTimer.unref?.();
       const finish = (input: { code: number | null; reason: string; wasClean: boolean }) => {
         if (settled) return;
         settled = true;
         if (this.sessionGeneration === generation) this.sessionGeneration += 1;
         clearInterval(staleTimer);
         clearTimeout(connectTimer);
+        if (closeWatchdog != null) {
+          clearTimeout(closeWatchdog);
+          closeWatchdog = null;
+        }
         signal.removeEventListener("abort", onAbort);
         for (const { type, fn } of listeners) socket.removeEventListener(type, fn);
+        listeners.length = 0;
         ingress.clear();
         if (this.lastIngress === ingress) this.lastIngress = null;
         if (connected && openedAt != null && Date.now() - openedAt >= this.stableAfterMs) backoff.reset();
@@ -203,8 +202,35 @@ export class ReferencePriceFeedAdapter {
         });
       };
       const requestClose = (code: number, reason: string) => {
-        try { socket.close(code, reason); } catch { finish({ code, reason, wasClean: abortInitiated }); }
+        if (settled) return;
+        try {
+          socket.close(code, reason);
+        } catch {
+          finish({ code, reason, wasClean: abortInitiated });
+          return;
+        }
+        if (settled || closeWatchdog != null) return;
+        closeWatchdog = setTimeout(() => {
+          closeWatchdog = null;
+          finish({ code, reason, wasClean: abortInitiated });
+        }, this.closeWatchdogMs);
+        closeWatchdog.unref?.();
       };
+      const staleTimer = setInterval(() => {
+        if (settled || staleForced) return;
+        if (connected && Date.now() - lastMessageAt > this.staleTimeoutMs) {
+          staleForced = true;
+          void handlers.onConnection(this.connection("STALE", reconnectCount));
+          requestClose(4000, "stale feed");
+        }
+      }, Math.max(500, Math.floor(this.staleTimeoutMs / 2)));
+      const connectTimer = setTimeout(() => {
+        if (!connected && !settled) {
+          sawError = true;
+          requestClose(4001, REFERENCE_WS_CONNECT_TIMEOUT);
+        }
+      }, this.connectTimeoutMs);
+      connectTimer.unref?.();
       const onAbort = () => {
         abortInitiated = true;
         requestClose(1000, "shutdown");
