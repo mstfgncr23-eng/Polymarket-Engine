@@ -5,8 +5,8 @@
  *
  *   pnpm bench:retention
  */
-import { createId, TELEMETRY_EVENT_TYPES } from "@pm/core";
-import { MemoryEventJournal, createJournalEvent, scanJournalEvents } from "@pm/db";
+import { createId, TELEMETRY_EVENT_TYPES } from "../packages/core/src/index.ts";
+import { MemoryEventJournal, createJournalEvent, scanJournalEvents } from "../packages/db/src/index.ts";
 import { ExperimentSummaryAccumulator } from "../apps/engine/src/report.ts";
 import { defaultRetentionConfig, RetentionManager } from "../apps/engine/src/retention-manager.ts";
 
@@ -59,6 +59,7 @@ async function main(): Promise<void> {
     failClosed: false,
     databaseUp: true,
   });
+  const retentionWallMs = performance.now() - t1;
 
   const result = {
     disclaimer: "Boundedness diagnostic only. Not a production capacity claim.",
@@ -76,6 +77,7 @@ async function main(): Promise<void> {
     retentionBatchCount: cycle.batchCount,
     lastRetentionBatchSize: cycle.lastBatchSize,
     lastRetentionBatchDurationMs: cycle.lastBatchDurationMs,
+    retentionWallMs: Number(retentionWallMs.toFixed(2)),
     telemetryTypes: TELEMETRY_EVENT_TYPES,
   };
   console.log(JSON.stringify(result, null, 2));
