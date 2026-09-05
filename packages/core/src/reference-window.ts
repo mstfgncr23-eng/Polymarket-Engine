@@ -9,6 +9,8 @@ export interface StoredReferenceTick {
 export interface ReferenceWindowPushResult {
   accepted: boolean;
   overflow: boolean;
+  /** Incoming sourceTimestamp < last accepted in this epoch. Not appended. */
+  stale: boolean;
   size: number;
 }
 
@@ -23,6 +25,8 @@ export class ReferenceTickWindow {
   private head = 0;
   private count = 0;
   private overflowed = false;
+  /** Reset only on clear / new reference epoch. Equal timestamps are accepted. */
+  private lastAcceptedSourceMs: number | null = null;
   readonly maxEntries: number;
   readonly windowMs: number;
 
@@ -44,21 +48,25 @@ export class ReferenceTickWindow {
 
   push(tick: ReferenceTick, sourceMs = Date.parse(tick.sourceTimestamp)): ReferenceWindowPushResult {
     if (this.overflowed) {
-      return { accepted: false, overflow: true, size: this.count };
+      return { accepted: false, overflow: true, stale: false, size: this.count };
     }
     if (!Number.isFinite(sourceMs)) {
-      return { accepted: false, overflow: false, size: this.count };
+      return { accepted: false, overflow: false, stale: false, size: this.count };
+    }
+    if (this.lastAcceptedSourceMs != null && sourceMs < this.lastAcceptedSourceMs) {
+      return { accepted: false, overflow: false, stale: true, size: this.count };
     }
     const cutoff = sourceMs - this.windowMs;
     this.evictExpired(cutoff);
     if (this.count >= this.maxEntries) {
       this.overflowed = true;
-      return { accepted: false, overflow: true, size: this.count };
+      return { accepted: false, overflow: true, stale: false, size: this.count };
     }
     const index = (this.head + this.count) % this.maxEntries;
     this.slots[index] = { tick, sourceMs };
     this.count += 1;
-    return { accepted: true, overflow: false, size: this.count };
+    this.lastAcceptedSourceMs = sourceMs;
+    return { accepted: true, overflow: false, stale: false, size: this.count };
   }
 
   clear(): void {
@@ -66,6 +74,7 @@ export class ReferenceTickWindow {
     this.head = 0;
     this.count = 0;
     this.overflowed = false;
+    this.lastAcceptedSourceMs = null;
   }
 
   resetAfterReconnect(): void {

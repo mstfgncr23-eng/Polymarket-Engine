@@ -6,7 +6,7 @@ import {
   TriggerEngine,
   triggerConfigSchema,
 } from "@pm/core";
-import { BoundedIngressQueue, MARKET_INGRESS_BOUNDS, TokenSyncIndex } from "@pm/market-data";
+import { BoundedIngressQueue, MARKET_INGRESS_BOUNDS, REFERENCE_INGRESS_BOUNDS, TokenSyncIndex } from "@pm/market-data";
 import { ACTIVATION_SCOPE_TTL_MS, GrokActivationCoordinator } from "../apps/engine/src/activation/coordinator.js";
 import { NoopGrokActivationBridge } from "../apps/engine/src/activation/noop.js";
 import { RestingOrderTokenIndex } from "../apps/engine/src/resting-order-index.js";
@@ -53,6 +53,14 @@ describe("100k-event structure plateaus", () => {
     for (let i = 0; i < 100_000; i += 1) queue.tryEnqueue({ i, pad: "x".repeat(8) });
     expect(queue.depth).toBeLessThanOrEqual(MARKET_INGRESS_BOUNDS.maxEvents);
     expect(queue.queuedBytes).toBeLessThanOrEqual(MARKET_INGRESS_BOUNDS.maxBytes);
+  });
+
+  it("reference pre-handler ingress stays within count and byte bounds", () => {
+    const queue = new BoundedIngressQueue(REFERENCE_INGRESS_BOUNDS.maxEvents, REFERENCE_INGRESS_BOUNDS.maxBytes);
+    for (let i = 0; i < 100_000; i += 1) queue.tryEnqueueWeighted("x".repeat(32), 32);
+    expect(queue.depth).toBeLessThanOrEqual(REFERENCE_INGRESS_BOUNDS.maxEvents);
+    expect(queue.queuedBytes).toBeLessThanOrEqual(REFERENCE_INGRESS_BOUNDS.maxBytes);
+    expect(queue.snapshot().gapTotal).toBeGreaterThan(0);
   });
 
   it("asset→market, token→resting, activation, and token sync stay finite", () => {

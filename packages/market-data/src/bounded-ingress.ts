@@ -61,8 +61,15 @@ export class BoundedIngressQueue {
 
   setObserver(observer: IngressQueueObserver | null): void { this.observer = observer; }
 
-  tryEnqueue(event: unknown): { ok: true } | { ok: false; reason: Extract<IngressGapReason, "count_limit" | "byte_limit"> } {
-    const size = approximateEventBytes(event);
+  tryEnqueue(event: unknown, precomputedBytes?: number): { ok: true } | { ok: false; reason: Extract<IngressGapReason, "count_limit" | "byte_limit"> } {
+    return this.tryEnqueueWeighted(event, precomputedBytes ?? approximateEventBytes(event));
+  }
+
+  tryEnqueueWeighted(
+    event: unknown,
+    bytes: number,
+  ): { ok: true } | { ok: false; reason: Extract<IngressGapReason, "count_limit" | "byte_limit"> } {
+    const size = Number.isFinite(bytes) && bytes >= 0 ? bytes : 16;
     if (this.depth >= this.maxEvents) {
       this.noteGap("count_limit");
       return { ok: false, reason: "count_limit" };
@@ -78,6 +85,17 @@ export class BoundedIngressQueue {
     if (this.bytes > this.highWaterBytes) this.highWaterBytes = this.bytes;
     this.publish(false);
     return { ok: true };
+  }
+
+  canAdmit(count: number, bytes: number): { ok: true } | { ok: false; reason: Extract<IngressGapReason, "count_limit" | "byte_limit"> } {
+    if (this.depth + count > this.maxEvents) return { ok: false, reason: "count_limit" };
+    if (this.bytes + bytes > this.maxBytes) return { ok: false, reason: "byte_limit" };
+    return { ok: true };
+  }
+
+  /** Count one logical overflow without enqueueing. Idempotent callers must invoke this once. */
+  noteOverflow(reason: Extract<IngressGapReason, "count_limit" | "byte_limit">): void {
+    this.noteGap(reason);
   }
 
   dequeue(): unknown | undefined {

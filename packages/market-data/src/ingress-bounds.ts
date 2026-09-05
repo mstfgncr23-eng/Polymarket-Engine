@@ -18,10 +18,21 @@ export type IngressGapReason = (typeof INGRESS_GAP_REASONS)[number];
 export const MARKET_INGRESS_BOUNDS = {
   maxEvents: 4_096,
   maxBytes: 4 * 1024 * 1024,
+  /** Hard raw-frame cap enforced before JSON.parse. */
+  maxRawFrameBytes: 256 * 1024,
 } as const;
 
 /** Finite application-level deadline for owned market WebSocket connect. */
 export const MARKET_CONNECT_BOUNDS = {
+  connectTimeoutMs: 5_000,
+  /** Reset market backoff only after a trusted book survived this long. */
+  stableAfterMs: 5_000,
+} as const;
+
+export const REFERENCE_INGRESS_BOUNDS = {
+  maxEvents: 2_048,
+  maxBytes: 1 * 1024 * 1024,
+  maxRawFrameBytes: 64 * 1024,
   connectTimeoutMs: 5_000,
 } as const;
 

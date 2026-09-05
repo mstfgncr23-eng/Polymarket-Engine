@@ -12,6 +12,7 @@ import { NoopGrokActivationBridge } from "../apps/engine/src/activation/noop.ts"
 import { EngineMetrics } from "../apps/engine/src/metrics.ts";
 import { bookImbalance, spread, TriggerEngine, triggerConfigSchema, type MarketSnapshot, type ReferenceTick, type TriggerEvent } from "../packages/core/src/index.ts";
 import { BoundedIngressQueue } from "../packages/market-data/src/bounded-ingress.ts";
+import { MARKET_INGRESS_BOUNDS, PolymarketMarketDataAdapter } from "../packages/market-data/src/index.ts";
 
 interface Row {
   case: string;
@@ -172,6 +173,86 @@ rows.push(measure("ingress enqueue+dequeue x100000 metrics-observer-on", 100_000
   queue.setObserver({ onChange: (snapshot) => metrics.noteIngressSnapshot(snapshot) });
   for (let i = 0; i < 50_000; i += 1) queue.tryEnqueue(i);
   for (let i = 0; i < 50_000; i += 1) queue.dequeue();
+}));
+
+function rawBookFrame(levels: number, timestamp: number): string {
+  const bids = Array.from({ length: levels }, (_, i) => ({ price: (0.4 - i * 0.001).toFixed(4), size: "3" }));
+  const asks = Array.from({ length: levels }, (_, i) => ({ price: (0.6 + i * 0.001).toFixed(4), size: "2" }));
+  return JSON.stringify({
+    type: "book",
+    payload: { tokenId: "up", market: "m", timestamp, bids, asks, lastTradePrice: "0.48" },
+  });
+}
+
+function rawPriceChangeFrame(timestamp: number, entries: number): string {
+  return JSON.stringify({
+    type: "price_change",
+    payload: {
+      timestamp,
+      priceChanges: Array.from({ length: entries }, (_, i) => ({
+        tokenId: "up", side: i % 2 === 0 ? "BUY" : "SELL", price: (0.4 + i * 0.001).toFixed(4), size: "1",
+      })),
+    },
+  });
+}
+
+const fullBookFrame = rawBookFrame(10, 1_000);
+const deepBookFrame = rawBookFrame(100, 1_000);
+const singleDeltaFrame = rawPriceChangeFrame(1_001, 1);
+const multiDeltaFrame = rawPriceChangeFrame(1_002, 8);
+
+function enqueueRaw(queue: BoundedIngressQueue, raw: string, n: number): void {
+  for (let i = 0; i < n; i += 1) {
+    if (raw.length > MARKET_INGRESS_BOUNDS.maxRawFrameBytes) break;
+    const parsed = JSON.parse(raw) as unknown;
+    const events = Array.isArray(parsed) ? parsed : [parsed];
+    const admit = queue.canAdmit(events.length, raw.length);
+    if (!admit.ok) break;
+    const share = Math.ceil(raw.length / events.length);
+    for (const event of events) queue.tryEnqueueWeighted(event, share);
+  }
+}
+
+rows.push(measure("realistic ingress full-book-10lvl x2000 raw-bound+metrics", 2_000, () => {
+  const metrics = new EngineMetrics();
+  const queue = new BoundedIngressQueue(8_000, 16_000_000);
+  queue.setObserver({ onChange: (snapshot) => metrics.noteIngressSnapshot(snapshot) });
+  enqueueRaw(queue, fullBookFrame, 2_000);
+  while (queue.dequeue() !== undefined) { /* drain */ }
+}));
+
+rows.push(measure("realistic ingress 100-level book x500 raw-bound", 500, () => {
+  const queue = new BoundedIngressQueue(2_000, 16_000_000);
+  enqueueRaw(queue, deepBookFrame, 500);
+  while (queue.dequeue() !== undefined) { /* drain */ }
+}));
+
+rows.push(measure("realistic ingress single price_change x5000", 5_000, () => {
+  const queue = new BoundedIngressQueue(8_000, 16_000_000);
+  enqueueRaw(queue, singleDeltaFrame, 5_000);
+  while (queue.dequeue() !== undefined) { /* drain */ }
+}));
+
+rows.push(measure("realistic ingress multi-entry price_change x2000", 2_000, () => {
+  const queue = new BoundedIngressQueue(8_000, 16_000_000);
+  enqueueRaw(queue, multiDeltaFrame, 2_000);
+  while (queue.dequeue() !== undefined) { /* drain */ }
+}));
+
+rows.push(measure("normalize full-book then mostly-suppressed deltas x2000", 2_000, () => {
+  const adapter = new PolymarketMarketDataAdapter();
+  adapter.registerManualToken("up", "m", "UP", "BTC");
+  adapter.setTokenIds(["up"]);
+  adapter.normalizeSourceEvent(JSON.parse(fullBookFrame));
+  for (let i = 0; i < 2_000; i += 1) {
+    adapter.normalizeSourceEvent({
+      type: "price_change",
+      payload: {
+        timestamp: 1_001 + i,
+        priceChanges: [{ tokenId: "up", side: "BUY", price: "0.40", size: String(3 + (i % 2)) }],
+      },
+    });
+  }
 }));
 
 const report = {

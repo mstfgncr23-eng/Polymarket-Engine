@@ -4,6 +4,9 @@ import type { MarketStreamTransport } from "./market-stream-transport.js";
 
 export interface BoundedMarketStream {
   close(): Promise<void>;
+  pendingWaiterCount(): number;
+  pingTimerActive(): boolean;
+  streamGeneration(): number;
   [Symbol.asyncIterator](): AsyncIterator<unknown>;
 }
 
@@ -11,6 +14,7 @@ export interface BoundedMarketTransportOptions {
   url?: string;
   maxEvents?: number;
   maxBytes?: number;
+  maxRawFrameBytes?: number;
   queue?: BoundedIngressQueue;
   pingIntervalMs?: number;
   staleMs?: number;
@@ -21,6 +25,15 @@ export interface BoundedMarketTransportOptions {
 export const CLOB_MARKET_CONNECT_TIMEOUT = "CLOB_MARKET_WS_CONNECT_TIMEOUT";
 export const CLOB_MARKET_CONNECT_ABORTED = "CLOB_MARKET_WS_CONNECT_ABORTED";
 export const CLOB_MARKET_CLOSED_BEFORE_OPEN = "CLOB_MARKET_WS_CLOSED_BEFORE_OPEN";
+export const CLOB_MARKET_WS_ERROR = "CLOB_MARKET_WS_ERROR";
+export const CLOB_MARKET_WS_STALE = "CLOB_MARKET_WS_STALE";
+export const CLOB_MARKET_WS_OPEN_FAILED = "CLOB_MARKET_WS_OPEN_FAILED";
+export const MARKET_INGRESS_MALFORMED = "MARKET_INGRESS_MALFORMED";
+
+interface StreamWaiter {
+  resolve: (result: IteratorResult<unknown>) => void;
+  reject: (error: Error) => void;
+}
 
 /**
  * Owned CLOB market WebSocket. Nearest controlled layer in front of the
@@ -30,8 +43,11 @@ export const CLOB_MARKET_CLOSED_BEFORE_OPEN = "CLOB_MARKET_WS_CLOSED_BEFORE_OPEN
  * `custom_feature_enabled`). Fresh subscribe is how the CLOB emits canonical
  * `book` snapshots; this transport does not invent books.
  *
- * Connect is finitely bounded: timeout, error, close-before-open, and AbortSignal
- * all reject the subscribe promise. Listeners/timers are cleaned on settle.
+ * Terminalization is total and idempotent: every pending iterator.next()
+ * settles on malformed ingress, stale socket, runtime error, remote close,
+ * overflow, explicit close, or abort. Error terminals reject; explicit close
+ * and remote close complete cleanly. Ping/listeners are detached on any
+ * terminal. A dead generation never enqueues into a later stream's queue.
  */
 export class BoundedClobMarketTransport implements MarketStreamTransport {
   readonly bounded = true as const;
@@ -40,7 +56,9 @@ export class BoundedClobMarketTransport implements MarketStreamTransport {
   private readonly pingIntervalMs: number;
   private readonly staleMs: number;
   private readonly connectTimeoutMs: number;
+  private readonly maxRawFrameBytes: number;
   private readonly WebSocketImpl: typeof WebSocket;
+  private generation = 0;
 
   constructor(options: BoundedMarketTransportOptions = {}) {
     this.url = options.url ?? CLOB_MARKET_WS_URL;
@@ -51,103 +69,156 @@ export class BoundedClobMarketTransport implements MarketStreamTransport {
     this.pingIntervalMs = options.pingIntervalMs ?? 10_000;
     this.staleMs = options.staleMs ?? 30_000;
     this.connectTimeoutMs = options.connectTimeoutMs ?? MARKET_CONNECT_BOUNDS.connectTimeoutMs;
+    this.maxRawFrameBytes = options.maxRawFrameBytes ?? MARKET_INGRESS_BOUNDS.maxRawFrameBytes;
     this.WebSocketImpl = options.webSocket ?? WebSocket;
   }
+
+  currentGeneration(): number { return this.generation; }
 
   async subscribe(
     tokenIds: readonly string[],
     customFeatureEnabled = true,
     signal?: AbortSignal,
   ): Promise<BoundedMarketStream> {
+    const generation = ++this.generation;
     const queue = this.queue;
     queue.clear();
     const socket = new this.WebSocketImpl(this.url);
-    let closed = false;
-    let lastPong = Date.now();
-    let pingTimer: ReturnType<typeof setInterval> | undefined;
-    const waiters: Array<(result: IteratorResult<unknown>) => void> = [];
+    const waiters: StreamWaiter[] = [];
+    const listeners: Array<{ type: string; fn: EventListenerOrEventListenerObject }> = [];
     let pendingError: Error | null = null;
     let ended = false;
+    let finalized = false;
     let opened = false;
+    let lastPong = Date.now();
+    let pingTimer: ReturnType<typeof setInterval> | undefined;
 
-    const wake = () => {
+    const attach = (type: string, fn: EventListenerOrEventListenerObject, options?: AddEventListenerOptions) => {
+      socket.addEventListener(type, fn, options);
+      listeners.push({ type, fn });
+    };
+
+    const detachAll = () => {
+      for (const { type, fn } of listeners) socket.removeEventListener(type, fn);
+      listeners.length = 0;
+      if (pingTimer) {
+        clearInterval(pingTimer);
+        pingTimer = undefined;
+      }
+    };
+
+    const settleWaiters = () => {
+      while (waiters.length > 0) {
+        const waiter = waiters.shift()!;
+        if (pendingError) waiter.reject(pendingError);
+        else waiter.resolve({ value: undefined, done: true });
+      }
+    };
+
+    const pump = () => {
       while (waiters.length > 0) {
         if (pendingError) {
-          waiters.shift();
+          waiters.shift()!.reject(pendingError);
           continue;
         }
         const item = queue.dequeue();
         if (item !== undefined) {
-          waiters.shift()!({ value: item, done: false });
+          waiters.shift()!.resolve({ value: item, done: false });
           continue;
         }
         if (ended) {
-          waiters.shift()!({ value: undefined, done: true });
+          waiters.shift()!.resolve({ value: undefined, done: true });
           continue;
         }
         break;
       }
     };
 
-    const fail = (error: Error) => {
-      pendingError = error;
+    const finalize = (error: Error | null) => {
+      if (finalized) return;
+      finalized = true;
       ended = true;
-      while (waiters.length > 0) {
-        waiters.shift()!({ value: undefined, done: true });
-      }
+      if (error && !pendingError) pendingError = error;
+      detachAll();
+      signal?.removeEventListener("abort", onAbort);
+      try { socket.close(); } catch { /* already closed */ }
+      settleWaiters();
     };
 
-    const enqueue = (event: unknown) => {
-      const result = queue.tryEnqueue(event);
-      if (!result.ok) {
-        fail(new IngressOverflowError(result.reason));
-        void closeSocket();
+    let finishConnect: ((error?: Error) => void) | null = null;
+    const onAbort = () => {
+      if (finishConnect) {
+        finishConnect(new Error(CLOB_MARKET_CONNECT_ABORTED));
         return;
       }
-      wake();
+      finalize(new Error(CLOB_MARKET_CONNECT_ABORTED));
     };
 
-    const closeSocket = async () => {
-      if (closed) return;
-      closed = true;
-      if (pingTimer) clearInterval(pingTimer);
-      ended = true;
-      try { socket.close(); } catch { /* already closed */ }
-      wake();
-    };
-
-    const onOpen = () => {
-      socket.send(JSON.stringify({
-        assets_ids: [...tokenIds],
-        custom_feature_enabled: customFeatureEnabled,
-        type: "market",
-      }));
-      lastPong = Date.now();
-      pingTimer = setInterval(() => {
-        if (Date.now() - lastPong > this.staleMs) {
-          fail(new Error("CLOB_MARKET_WS_STALE"));
-          void closeSocket();
-          return;
-        }
-        try { socket.send("PING"); } catch { /* closed */ }
-      }, this.pingIntervalMs);
-    };
-
-    const onMessage = (message: { data?: unknown }) => {
-      const data = typeof message.data === "string" ? message.data : String(message.data);
-      if (data === "PONG") {
-        lastPong = Date.now();
+    const enqueueFrame = (raw: string) => {
+      if (finalized || generation !== this.generation) return;
+      if (raw.length > this.maxRawFrameBytes) {
+        queue.noteOverflow("byte_limit");
+        finalize(new IngressOverflowError("byte_limit"));
         return;
       }
       let parsed: unknown;
-      try { parsed = JSON.parse(data) as unknown; } catch {
-        fail(new Error("MARKET_INGRESS_MALFORMED"));
-        void closeSocket();
+      try { parsed = JSON.parse(raw) as unknown; } catch {
+        finalize(new Error(MARKET_INGRESS_MALFORMED));
         return;
       }
       const events = Array.isArray(parsed) ? parsed : [parsed];
-      for (const event of events) enqueue(event);
+      const admit = queue.canAdmit(events.length, raw.length);
+      if (!admit.ok) {
+        queue.noteOverflow(admit.reason);
+        finalize(new IngressOverflowError(admit.reason));
+        return;
+      }
+      const n = events.length;
+      let remaining = raw.length;
+      for (let i = 0; i < n; i += 1) {
+        if (finalized || generation !== this.generation) return;
+        const share = i === n - 1 ? remaining : Math.floor(raw.length / n);
+        remaining -= share;
+        const result = queue.tryEnqueueWeighted(events[i], share);
+        if (!result.ok) {
+          finalize(new IngressOverflowError(result.reason));
+          return;
+        }
+      }
+      pump();
     };
+
+    const onMessage = (message: Event) => {
+      if (finalized || generation !== this.generation) return;
+      const data = (message as MessageEvent).data;
+      const raw = typeof data === "string" ? data : String(data ?? "");
+      if (raw === "PONG") {
+        lastPong = Date.now();
+        return;
+      }
+      enqueueFrame(raw);
+    };
+
+    const startPing = () => {
+      lastPong = Date.now();
+      pingTimer = setInterval(() => {
+        if (finalized || generation !== this.generation) {
+          if (pingTimer) {
+            clearInterval(pingTimer);
+            pingTimer = undefined;
+          }
+          return;
+        }
+        if (Date.now() - lastPong > this.staleMs) {
+          finalize(new Error(CLOB_MARKET_WS_STALE));
+          return;
+        }
+        try { socket.send("PING"); } catch { finalize(new Error(CLOB_MARKET_WS_ERROR)); }
+      }, this.pingIntervalMs);
+    };
+
+    const onRuntimeError = () => finalize(new Error(CLOB_MARKET_WS_ERROR));
+    const onRemoteClose = () => finalize(null);
 
     await new Promise<void>((resolve, reject) => {
       let settled = false;
@@ -156,53 +227,54 @@ export class BoundedClobMarketTransport implements MarketStreamTransport {
       }, this.connectTimeoutMs);
       connectTimer.unref?.();
 
-      const onAbort = () => finish(new Error(CLOB_MARKET_CONNECT_ABORTED));
-      const onError = () => finish(new Error("CLOB_MARKET_WS_ERROR"));
-      const onClose = () => {
-        if (!opened) {
-          finish(new Error(CLOB_MARKET_CLOSED_BEFORE_OPEN));
-          return;
-        }
-        ended = true;
-        wake();
+      const onConnectError = () => finish(new Error(CLOB_MARKET_WS_ERROR));
+      const onCloseDuringConnect = () => {
+        if (!opened) finish(new Error(CLOB_MARKET_CLOSED_BEFORE_OPEN));
       };
       const onOpened = () => {
         opened = true;
-        onOpen();
+        try {
+          socket.send(JSON.stringify({
+            assets_ids: [...tokenIds],
+            custom_feature_enabled: customFeatureEnabled,
+            type: "market",
+          }));
+          startPing();
+        } catch (error) {
+          finish(error instanceof Error ? error : new Error(CLOB_MARKET_WS_OPEN_FAILED));
+          return;
+        }
         finish();
       };
-
-      const cleanup = () => {
-        clearTimeout(connectTimer);
-        signal?.removeEventListener("abort", onAbort);
-        socket.removeEventListener("open", onOpened);
-        socket.removeEventListener("error", onError);
-        socket.removeEventListener("close", onCloseDuringConnect);
-      };
-
-      const onCloseDuringConnect = () => onClose();
 
       const finish = (error?: Error) => {
         if (settled) return;
         settled = true;
-        cleanup();
+        finishConnect = null;
+        clearTimeout(connectTimer);
+        socket.removeEventListener("open", onOpened);
+        socket.removeEventListener("error", onConnectError);
+        socket.removeEventListener("close", onCloseDuringConnect);
         if (!error) {
-          socket.addEventListener("close", () => {
-            ended = true;
-            wake();
-          });
+          attach("close", onRemoteClose);
+          attach("error", onRuntimeError);
+          if (signal?.aborted) {
+            finalize(new Error(CLOB_MARKET_CONNECT_ABORTED));
+            resolve();
+            return;
+          }
           resolve();
           return;
         }
-        ended = true;
-        void closeSocket();
+        finalize(error);
         reject(error);
       };
+      finishConnect = finish;
 
+      attach("message", onMessage as EventListener);
       socket.addEventListener("open", onOpened, { once: true });
-      socket.addEventListener("error", onError, { once: true });
+      socket.addEventListener("error", onConnectError, { once: true });
       socket.addEventListener("close", onCloseDuringConnect);
-      socket.addEventListener("message", onMessage);
       if (signal?.aborted) {
         finish(new Error(CLOB_MARKET_CONNECT_ABORTED));
         return;
@@ -211,7 +283,10 @@ export class BoundedClobMarketTransport implements MarketStreamTransport {
     });
 
     return {
-      close: closeSocket,
+      close: async () => { finalize(null); },
+      pendingWaiterCount: () => waiters.length,
+      pingTimerActive: () => pingTimer != null,
+      streamGeneration: () => generation,
       [Symbol.asyncIterator]: () => ({
         next: async () => {
           if (pendingError) throw pendingError;
@@ -221,12 +296,9 @@ export class BoundedClobMarketTransport implements MarketStreamTransport {
             if (pendingError) throw pendingError;
             return { value: undefined, done: true };
           }
-          return await new Promise<IteratorResult<unknown>>((resolve) => {
-            waiters.push(resolve);
-            wake();
-          }).then((result) => {
-            if (pendingError) throw pendingError;
-            return result;
+          return await new Promise<IteratorResult<unknown>>((resolve, reject) => {
+            waiters.push({ resolve, reject });
+            pump();
           });
         },
       }),

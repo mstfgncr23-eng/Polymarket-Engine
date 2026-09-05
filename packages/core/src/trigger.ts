@@ -172,7 +172,6 @@ export class TriggerEngine {
       this.ticksByAsset.set(asset, window);
       if (window.hasOverflowed) {
         this.observer?.onReferenceWindow?.(window.size);
-        this.observer?.onReferenceWindowOverflow?.();
         return { overflow: true, accepted: false, triggers: [] };
       }
       const sourceMs = Date.parse(tick.sourceTimestamp);

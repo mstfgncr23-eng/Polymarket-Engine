@@ -22,6 +22,7 @@ export async function startRuntime(envInput: NodeJS.ProcessEnv = process.env): P
     submitGrokSignal: (signal, clientId) => engine.submitGrokSignal(signal, clientId),
     noteMcpRequest: (tool, triggerId) => engine.noteMcpRequest(tool, triggerId),
     isTokenSynchronized: (tokenId) => engine.isTokenSynchronized(tokenId),
+    isTriggerActionable: (triggerId) => engine.isTriggerActionable(triggerId),
     startExperiment: () => engine.beginExperiment(),
     engineReadToken: env.ENGINE_READ_TOKEN,
     operatorToken: env.ENGINE_OPERATOR_TOKEN,

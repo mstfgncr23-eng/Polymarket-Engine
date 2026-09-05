@@ -90,6 +90,8 @@ export interface RuntimeWork {
   run: (signal: AbortSignal) => Promise<void>;
   /** Trusted token epochs at admission; stale if the live market epoch advanced. */
   marketEpochFence?: MarketEpochFence | null;
+  /** Explicit source-data provenance. Not inferred later from `source` strings. */
+  provenance?: { kind: "MARKET" | "REFERENCE" | "NONE" } | null;
 }
 
 export interface AdmitResult {

@@ -31,6 +31,7 @@ export interface McpDependencies {
   noteMcpRequest?(tool: string | null, triggerId?: string): void;
   heavyRead?<T>(work: () => Promise<T>): Promise<T>;
   isTokenSynchronized?(tokenId: string): boolean;
+  isTriggerActionable?(triggerId: string): boolean;
 }
 
 export function mcpVisibleOrderbook(
@@ -40,6 +41,15 @@ export function mcpVisibleOrderbook(
 ) {
   if (isTokenSynchronized && !isTokenSynchronized(tokenId)) return null;
   return state.marketSnapshots.get(tokenId) ?? null;
+}
+
+export function mcpVisibleRecentTriggers(
+  state: EngineStateStore,
+  isTriggerActionable?: (triggerId: string) => boolean,
+) {
+  return isTriggerActionable
+    ? state.recentTriggers.filter((item) => isTriggerActionable(item.id))
+    : state.recentTriggers;
 }
 
 export function mcpVisibleMarketSnapshots(
@@ -288,10 +298,9 @@ export function createGrokMcpServer(clientId: string, dependencies: McpDependenc
     description: "Read recent deterministic triggers available for external research. Monitoring never waits for Grok. Optional triggerId attributes this MCP request to that trigger only.",
     inputSchema: { limit: z.number().int().min(1).max(100).default(25), triggerId: z.string().min(1).max(160).optional() }, annotations: readOnly,
   }, async ({ limit, triggerId }) => {
-    const items = triggerId
-      ? dependencies.state.recentTriggers.filter((item) => item.id === triggerId).slice(0, limit)
-      : dependencies.state.recentTriggers.slice(0, limit);
-    return toolResult(items);
+    const visible = mcpVisibleRecentTriggers(dependencies.state, dependencies.isTriggerActionable)
+      .filter((item) => !triggerId || item.id === triggerId);
+    return toolResult(visible.slice(0, limit));
   });
 
   server.registerTool("get_positions", {

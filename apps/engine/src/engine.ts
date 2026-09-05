@@ -56,7 +56,9 @@ import {
   type TriggerEvent,
   type ActivationLatency,
   AssetMarketIndex,
+  classifyTriggerProvenance,
   isMarketDataDerivedTrigger,
+  type TriggerProvenance,
 } from "@pm/core";
 import {
   CHECKPOINT_SCHEMA_VERSION,
@@ -146,6 +148,8 @@ export class EngineService {
   private readonly makerReservations = new Map<string, string>();
   private readonly recentTrades = new Map<string, number>();
   private readonly activeTriggers = new Map<string, TriggerEvent>();
+  private readonly triggerProvenance = new Map<string, TriggerProvenance>();
+  private readonly provenanceInvalid = new Set<string>();
   private readonly signalsByTrigger = new Map<string, Map<ExternalAgentRoleId, GrokSignalEnvelope>>();
   private readonly signalReceivedTimes: number[] = [];
   private readonly lastEvaluatedSignalCount = new Map<string, number>();
@@ -159,6 +163,8 @@ export class EngineService {
   private readonly restingIndex = new RestingOrderTokenIndex();
   private readonly snapshotEpoch = new Map<string, number>();
   private readonly referenceUnreliable = new Set<string>();
+  private readonly referenceEpoch = new Map<string, number>();
+  private readonly referenceLogicalGapped = new Set<string>();
   private readonly referenceResyncInFlight = new Set<string>();
   private readonly referenceResyncRequested = new Set<string>();
   private readonly referenceRequired = new Map<string, boolean>();
@@ -166,6 +172,7 @@ export class EngineService {
   private readonly referenceRetryTimers = new Map<string, NodeJS.Timeout>();
   private readonly referenceRetryDeadlines = new Map<string, number>();
   private tokenIds: string[] = [];
+  private tokenIdSet = new Set<string>();
   private marketLoopStarted = false;
   private experiment: ExperimentManifest | null = null;
   private checkpointSequence = 0;
@@ -197,6 +204,7 @@ export class EngineService {
   private lastShutdownCheckpointed = false;
   private maintenanceHold: Promise<void> | null = null;
   private processTriggerHold: Promise<void> | null = null;
+  private triggerEventPersistHold: Promise<void> | null = null;
   private referenceTelemetryHoldForTest: Promise<void> | null = null;
   private lastAdmittedMarketEpochFence: ReadonlyMap<string, number> | null = null;
   private discoveryGenerationApplied = 0;
@@ -279,6 +287,7 @@ export class EngineService {
     if (configuredTokens.length > 0) {
       configuredTokens.forEach((tokenId, index) => this.marketAdapter.registerManualToken(tokenId, tokenId, index % 2 === 0 ? "UP" : "DOWN"));
       this.tokenIds = configuredTokens;
+      this.tokenIdSet = new Set(configuredTokens);
       this.marketAdapter.setTokenIds(this.tokenIds);
       this.state.setDiscoveryStatus("MONITORING", this.tokenIds.length);
       this.state.setDiscoveryLoopActive(false);
@@ -601,6 +610,7 @@ export class EngineService {
     const removedAssets = [...previousAssets].filter((asset) => !nextAssets.has(asset));
 
     this.tokenIds = nextTokens;
+    this.tokenIdSet = new Set(nextTokens);
     this.marketAdapter.setTokenIds(nextTokens);
     this.dropRemovedMarketState(removedMarkets, removedAssets);
     this.state.setDiscovery({
@@ -687,6 +697,8 @@ export class EngineService {
       this.triggerEngine.dropAsset(asset);
       this.assetIndex.dropAsset(asset);
       this.referenceUnreliable.delete(asset);
+      this.referenceEpoch.delete(asset);
+      this.referenceLogicalGapped.delete(asset);
       this.referenceResyncRequested.delete(asset);
       this.referenceResyncInFlight.delete(asset);
       this.state.dropReference(asset);
@@ -695,9 +707,7 @@ export class EngineService {
     this.metrics.assetMarketIndexEntries.set(this.assetIndex.entryCount());
     for (const [triggerId, trigger] of [...this.activeTriggers]) {
       if (!trigger.marketId || !removedMarkets.includes(trigger.marketId)) continue;
-      this.activeTriggers.delete(triggerId);
-      this.signalsByTrigger.delete(triggerId);
-      this.lastEvaluatedSignalCount.delete(triggerId);
+      this.forgetTrigger(triggerId);
     }
   }
 
@@ -1110,7 +1120,19 @@ export class EngineService {
       ? payload.makerReservations as Record<string, string> : {};
     for (const [orderId, amount] of Object.entries(reservations)) this.makerReservations.set(orderId, amount);
     const triggers = Array.isArray(payload.activeTriggers) ? payload.activeTriggers.map((item) => triggerEventSchema.parse(item)) : [];
-    for (const trigger of triggers) { this.activeTriggers.set(trigger.id, trigger); this.state.addTrigger(trigger); }
+    for (const trigger of triggers) {
+      this.activeTriggers.set(trigger.id, trigger);
+      this.state.addTrigger(trigger);
+      const plane = classifyTriggerProvenance(trigger);
+      if (plane === "MARKET" || plane === "REFERENCE") {
+        this.triggerProvenance.set(trigger.id, plane === "MARKET"
+          ? { kind: "MARKET", tokenEpochs: {} }
+          : { kind: "REFERENCE", asset: trigger.asset ?? "", epoch: -1 });
+        this.provenanceInvalid.add(trigger.id);
+      } else {
+        this.triggerProvenance.set(trigger.id, { kind: "NONE" });
+      }
+    }
     const signals = Array.isArray(payload.grokSignals) ? payload.grokSignals.map((item) => grokSignalEnvelopeSchema.parse(item)) : [];
     for (const signal of signals) {
       const byRole = this.signalsByTrigger.get(signal.triggerId) ?? new Map<ExternalAgentRoleId, GrokSignalEnvelope>();
@@ -1246,7 +1268,7 @@ export class EngineService {
 
   private async onMarketSnapshot(snapshot: MarketSnapshot): Promise<void> {
     if (!this.state.recoveryComplete) return;
-    if (!this.tokenIds.includes(snapshot.tokenId)) return;
+    if (!this.tokenIdSet.has(snapshot.tokenId)) return;
     const started = performance.now();
     this.metrics.marketMessages.inc();
     this.state.connections.polymarket.lastMessageAt = snapshot.receivedAt;
@@ -1300,7 +1322,7 @@ export class EngineService {
 
     if (synchronized) {
       const triggers = this.triggerEngine.ingestMarket(snapshot);
-      for (const trigger of triggers) this.admitTrigger(trigger);
+      for (const trigger of triggers) this.admitTrigger(trigger, this.provenanceForGenerated(trigger, "MARKET"));
     }
     const window = this.marketsById.get(snapshot.marketId);
     if (window?.endDate) this.triggerEngine.noteMarketWindow(snapshot.marketId, snapshot.asset ?? window.asset, window.endDate);
@@ -1316,7 +1338,7 @@ export class EngineService {
     const started = performance.now();
     const admission = this.triggerEngine.admitReferenceTick(tick);
     if (admission.overflow) {
-      this.markReferenceUnreliable(tick.asset);
+      this.noteReferenceLogicalLoss(tick.asset);
       this.state.invalidateReferenceContext(tick.asset);
       this.requestReferenceResync(tick.asset);
       await this.persistReferenceTick(tick);
@@ -1344,7 +1366,7 @@ export class EngineService {
       this.referenceResyncRequested.delete(tick.asset);
     }
     this.metrics.referenceWindowEntries.set(this.triggerEngine.referenceWindowTotalEntries());
-    for (const trigger of admission.triggers) this.admitTrigger(trigger);
+    for (const trigger of admission.triggers) this.admitTrigger(trigger, this.provenanceForGenerated(trigger, "REFERENCE", tick.asset));
     this.metrics.triggerDedupeEntries.set(this.triggerEngine.dedupeEntryCount());
     this.metrics.referenceTickProcessingDuration.observe((performance.now() - started) / 1000);
   }
@@ -1357,12 +1379,15 @@ export class EngineService {
     }));
   }
 
-  private admitTrigger(trigger: TriggerEvent): AdmitResult {
+  private admitTrigger(trigger: TriggerEvent, provenance?: TriggerProvenance): AdmitResult {
     if (this.started && !this.state.recoveryComplete) {
       return { admitted: false, reason: "fail_closed", done: Promise.resolve() };
     }
+    const resolved = provenance ?? this.captureProvenance(trigger);
     const lane = triggerWorkLane(trigger.kind);
-    const marketEpochFence = this.captureMarketEpochFence(trigger);
+    const marketEpochFence = resolved.kind === "MARKET" && Object.keys(resolved.tokenEpochs).length > 0
+      ? new Map(Object.entries(resolved.tokenEpochs))
+      : this.captureMarketEpochFence(trigger);
     this.lastAdmittedMarketEpochFence = marketEpochFence;
     const result = this.supervisor.admit({
       id: trigger.id,
@@ -1371,9 +1396,14 @@ export class EngineService {
       estimatedBytes: RUNTIME_BOUNDS.triggerByteEstimate,
       critical: lane === "p0",
       marketEpochFence,
+      provenance: { kind: resolved.kind },
       run: async (signal) => {
         if (signal.aborted) return;
-        await this.processTrigger(trigger, signal, marketEpochFence);
+        if (!this.isProvenanceCurrentlyValid(trigger.id, resolved)) {
+          this.metrics.triggersSuppressed.inc({ kind: trigger.kind, severity: String(trigger.severity) });
+          return;
+        }
+        await this.processTrigger(trigger, signal, marketEpochFence, resolved);
       },
     });
     if (!result.admitted) {
@@ -1417,6 +1447,7 @@ export class EngineService {
     trigger: TriggerEvent,
     signal?: AbortSignal,
     marketEpochFence: ReadonlyMap<string, number> | null = null,
+    provenance: TriggerProvenance = { kind: "NONE" },
   ): Promise<void> {
     this.metrics.noteProcessTriggerStart();
     const started = performance.now();
@@ -1424,14 +1455,20 @@ export class EngineService {
     if (signal?.aborted) return;
     if (this.processTriggerHold) await this.processTriggerHold;
     if (signal?.aborted) return;
-    if (this.shouldSuppressStaleMarketTrigger(trigger, marketEpochFence)) {
+    if (this.shouldSuppressStaleMarketTrigger(trigger, marketEpochFence, provenance)) {
       this.metrics.triggersSuppressed.inc({ kind: trigger.kind, severity: String(trigger.severity) });
       return;
     }
     this.metrics.triggers.inc({ kind: trigger.kind, severity: String(trigger.severity) });
     this.record(`TRIGGER_LEVEL_${trigger.severity}`, trigger.traceId, trigger.marketId, { triggerId: trigger.id, kind: trigger.kind, asset: trigger.asset ?? null }, trigger.asset ?? null);
     await this.safeAppend(createJournalEvent({ traceId: trigger.traceId, type: "TRIGGER_EVENT", aggregateType: "trigger", aggregateId: trigger.id, payload: trigger, sourceEventId: trigger.sourceEventIds[0] ?? null }), signal);
+    this.rememberProvenance(trigger.id, provenance);
     this.activeTriggers.set(trigger.id, trigger);
+    if (!this.isProvenanceCurrentlyValid(trigger.id, provenance)) {
+      this.markProvenanceInvalid(trigger.id);
+      this.state.addTrigger(trigger);
+      return;
+    }
     this.state.addTrigger(trigger);
     this.record("GROK_RESEARCH_AVAILABLE", trigger.traceId, trigger.marketId, { triggerId: trigger.id, expiresAt: trigger.expiresAt }, trigger.asset ?? null);
     await this.requestActivation(trigger);
@@ -1462,6 +1499,14 @@ export class EngineService {
       this.state.addActivation({ triggerId: trigger.id, reason: "ENTRY_CLOSED", at: this.nowFn().toISOString(), provider: this.env.GROK_ACTIVATION_PROVIDER, grokWakeObserved: false });
       return;
     }
+    if (!this.isTriggerActionable(trigger.id)) {
+      await this.safeAppend(createJournalEvent({
+        traceId: trigger.traceId, type: "GROK_ACTIVATION_DECISION", aggregateType: "activation", aggregateId: trigger.id,
+        payload: { triggerId: trigger.id, marketId: trigger.marketId, asset: trigger.asset ?? null, reason: "PROVENANCE_STALE", activate: false },
+      }));
+      this.state.addActivation({ triggerId: trigger.id, reason: "PROVENANCE_STALE", at: this.nowFn().toISOString(), provider: this.env.GROK_ACTIVATION_PROVIDER, grokWakeObserved: false });
+      return;
+    }
     const decision = this.activation.decide(trigger);
     await this.safeAppend(createJournalEvent({
       traceId: trigger.traceId, type: "GROK_ACTIVATION_DECISION", aggregateType: "activation", aggregateId: trigger.id,
@@ -1469,6 +1514,10 @@ export class EngineService {
     }));
     if (!decision.activate || !decision.request) {
       this.state.addActivation({ triggerId: trigger.id, reason: decision.reason, at: new Date().toISOString(), provider: this.env.GROK_ACTIVATION_PROVIDER, grokWakeObserved: false });
+      return;
+    }
+    if (!this.isTriggerActionable(trigger.id)) {
+      this.state.addActivation({ triggerId: trigger.id, reason: "PROVENANCE_STALE", at: this.nowFn().toISOString(), provider: this.env.GROK_ACTIVATION_PROVIDER, grokWakeObserved: false });
       return;
     }
     this.activation.markRequested(trigger, decision.request);
@@ -1520,8 +1569,14 @@ export class EngineService {
     if (new Date(trigger.expiresAt).getTime() <= now.getTime() || new Date(submission.output.expiresAt).getTime() <= now.getTime()) {
       this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "stale" }); return { status: "stale" };
     }
+    if (!this.isTriggerActionable(trigger.id)) {
+      this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "stale" }); return { status: "stale" };
+    }
     const claimed = await this.journal.claimIdempotency("grok_signal_submission", `${clientId}:${submission.submissionId}`);
     if (!claimed) { this.state.recordGrokRejection("duplicate"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "duplicate" }); return { status: "duplicate" }; }
+    if (!this.isTriggerActionable(trigger.id)) {
+      this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "stale" }); return { status: "stale" };
+    }
 
     const signal: GrokSignalEnvelope = grokSignalEnvelopeSchema.parse({
       signalId: createId("grok_signal"), submissionId: submission.submissionId, traceId: submission.traceId,
@@ -1554,6 +1609,7 @@ export class EngineService {
   }
 
   private async evaluateExternalConsensus(trigger: TriggerEvent): Promise<void> {
+    if (!this.isTriggerActionable(trigger.id)) return;
     const outputs = [...(this.signalsByTrigger.get(trigger.id)?.values() ?? [])];
     const fair = outputs.find((item) => item.agentId === "fair_probability_analyst")?.output as { estimatedEdge?: number; fairProbability?: number; direction?: Direction; marketProbability?: number } | undefined;
     const directional = outputs.flatMap((item) => {
@@ -1574,6 +1630,7 @@ export class EngineService {
   }
 
   private async evaluateTrade(trigger: TriggerEvent, consensus: NonNullable<EngineStateStore["latestConsensus"]>, outputs: GrokSignalEnvelope[]): Promise<void> {
+    if (!this.isTriggerActionable(trigger.id)) return;
     const pair = this.snapshots.get(trigger.marketId ?? "");
     if (!pair) return;
     const position = this.ledger.positions.get(trigger.marketId ?? "") ?? null;
@@ -1893,14 +1950,20 @@ export class EngineService {
         connection.state = event.state;
         connection.reconnects = event.reconnectCount;
       }
-      if (event.state === "DISCONNECTED") {
+      if (event.state === "STALE") {
+        this.noteReferenceLogicalLoss(asset);
+        this.state.invalidateReferenceContext(asset);
+        this.triggerEngine.resetReferenceAfterReconnect(asset);
+        if (event.message?.includes("REFERENCE_INGRESS_OVERFLOW")) this.requestReferenceResync(asset);
+      } else if (event.state === "DISCONNECTED") {
         const kind = /kind=([a-z_]+)/.exec(event.message ?? "")?.[1] ?? "unknown";
         this.metrics.referenceCloses.inc({ kind });
         if (event.reconnectCount > 0) this.metrics.wsReconnects.inc({ feed: "reference" });
-        this.markReferenceUnreliable(asset);
+        this.noteReferenceLogicalLoss(asset);
         this.state.invalidateReferenceContext(asset);
         this.triggerEngine.resetReferenceAfterReconnect(asset);
       } else if (event.state === "CONNECTED") {
+        this.referenceLogicalGapped.delete(asset);
         if (this.referenceUnreliable.has(asset) || this.triggerEngine.referenceWindowOverflowed(asset)) {
           this.triggerEngine.resetReferenceAfterReconnect(asset);
         }
@@ -1964,6 +2027,7 @@ export class EngineService {
     try {
       await this.journalAdmission.run(journalClass, critical, async () => {
         if (signal?.aborted) throw new JournalAdmissionRejected(journalClass, critical, "JOURNAL_ADMISSION_CLOSED");
+        if (event.type === "TRIGGER_EVENT" && this.triggerEventPersistHold) await this.triggerEventPersistHold;
         await this.metrics.observeDirectJournal(event.type, async () => {
           await this.journal.append(event);
           if (critical) this.state.database = "UP";
@@ -2441,9 +2505,7 @@ export class EngineService {
     }
     for (const [triggerId, trigger] of [...this.activeTriggers]) {
       if (new Date(trigger.expiresAt).getTime() > nowMs) continue;
-      this.activeTriggers.delete(triggerId);
-      this.signalsByTrigger.delete(triggerId);
-      this.lastEvaluatedSignalCount.delete(triggerId);
+      this.forgetTrigger(triggerId);
     }
   }
 
@@ -2453,6 +2515,8 @@ export class EngineService {
       executionErrors: this.executionErrors.length,
       recentTrades: this.recentTrades.size,
       activeTriggers: this.activeTriggers.size,
+      triggerProvenance: this.triggerProvenance.size,
+      provenanceInvalid: this.provenanceInvalid.size,
       signalsByTrigger: this.signalsByTrigger.size,
       lastEvaluatedSignalCount: this.lastEvaluatedSignalCount.size,
     };
@@ -2469,6 +2533,7 @@ export class EngineService {
     if (input.recentTrades) for (const [key, at] of input.recentTrades) this.recentTrades.set(key, at);
     if (input.trigger) {
       this.activeTriggers.set(input.trigger.id, input.trigger);
+      this.rememberProvenance(input.trigger.id, this.captureProvenance(input.trigger));
       this.signalsByTrigger.set(input.trigger.id, new Map());
       this.lastEvaluatedSignalCount.set(input.trigger.id, 1);
     }
@@ -2519,7 +2584,22 @@ export class EngineService {
   }
   setMaintenanceHoldForTest(hold: Promise<void> | null): void { this.maintenanceHold = hold; }
   setProcessTriggerHoldForTest(hold: Promise<void> | null): void { this.processTriggerHold = hold; }
+  setTriggerEventPersistHoldForTest(hold: Promise<void> | null): void { this.triggerEventPersistHold = hold; }
   setReferenceTelemetryHoldForTest(hold: Promise<void> | null): void { this.referenceTelemetryHoldForTest = hold; }
+  isTriggerActionable(triggerId: string): boolean {
+    const trigger = this.activeTriggers.get(triggerId);
+    const provenance = this.triggerProvenance.get(triggerId);
+    if (this.provenanceInvalid.has(triggerId)) return false;
+    if (!provenance) {
+      if (!trigger) return false;
+      return classifyTriggerProvenance(trigger) === "NONE";
+    }
+    return this.isProvenanceCurrentlyValid(triggerId, provenance);
+  }
+  triggerProvenanceForTest(triggerId: string): TriggerProvenance | undefined {
+    return this.triggerProvenance.get(triggerId);
+  }
+  referenceEpochForTest(asset: string): number { return this.referenceEpoch.get(asset) ?? 0; }
   async flushReferenceRetryForTest(asset: string): Promise<void> {
     this.clearReferenceRetry(asset);
     await this.retryTransientReference(asset);
@@ -2601,10 +2681,87 @@ export class EngineService {
   private shouldSuppressStaleMarketTrigger(
     trigger: TriggerEvent,
     fence: ReadonlyMap<string, number> | null = null,
+    provenance: TriggerProvenance | null = null,
   ): boolean {
-    if (!isMarketDataDerivedTrigger(trigger)) return false;
+    if (provenance) {
+      if (provenance.kind === "NONE") return false;
+      if (!this.isProvenanceCurrentlyValid(trigger.id, provenance)) return true;
+    }
+    if (!isMarketDataDerivedTrigger(trigger) && classifyTriggerProvenance(trigger) === "NONE") return false;
     if (trigger.marketId && this.marketHasGappedToken(trigger.marketId)) return true;
     return this.marketEpochFenceStale(fence);
+  }
+
+  private provenanceForGenerated(
+    trigger: TriggerEvent,
+    plane: "MARKET" | "REFERENCE",
+    asset?: string,
+  ): TriggerProvenance {
+    const classified = classifyTriggerProvenance(trigger);
+    if (classified === "NONE") return { kind: "NONE" };
+    if (classified === "REFERENCE" || plane === "REFERENCE") {
+      const resolved = asset ?? trigger.asset;
+      if (!resolved) return { kind: "NONE" };
+      return { kind: "REFERENCE", asset: resolved, epoch: this.referenceEpoch.get(resolved) ?? 0 };
+    }
+    const fence = this.captureMarketEpochFence({ ...trigger, source: "polymarket", kind: trigger.kind === "NEWS_INFORMATION" ? "BOOK_IMBALANCE" : trigger.kind });
+    return { kind: "MARKET", tokenEpochs: fence ? Object.fromEntries(fence) : {} };
+  }
+
+  private captureProvenance(trigger: TriggerEvent): TriggerProvenance {
+    const plane = classifyTriggerProvenance(trigger);
+    if (plane === "NONE") return { kind: "NONE" };
+    if (plane === "REFERENCE") {
+      const asset = trigger.asset;
+      if (!asset) return { kind: "NONE" };
+      return { kind: "REFERENCE", asset, epoch: this.referenceEpoch.get(asset) ?? 0 };
+    }
+    const fence = this.captureMarketEpochFence({ ...trigger, source: "polymarket" });
+    return { kind: "MARKET", tokenEpochs: fence ? Object.fromEntries(fence) : {} };
+  }
+
+  private rememberProvenance(triggerId: string, provenance: TriggerProvenance): void {
+    this.triggerProvenance.set(triggerId, provenance);
+  }
+
+  private markProvenanceInvalid(triggerId: string): void {
+    this.provenanceInvalid.add(triggerId);
+  }
+
+  private forgetTrigger(triggerId: string): void {
+    this.activeTriggers.delete(triggerId);
+    this.triggerProvenance.delete(triggerId);
+    this.provenanceInvalid.delete(triggerId);
+    this.signalsByTrigger.delete(triggerId);
+    this.lastEvaluatedSignalCount.delete(triggerId);
+  }
+
+  private isProvenanceCurrentlyValid(triggerId: string, provenance: TriggerProvenance): boolean {
+    if (this.provenanceInvalid.has(triggerId)) return false;
+    if (provenance.kind === "NONE") return true;
+    if (provenance.kind === "MARKET") {
+      const tokens = Object.entries(provenance.tokenEpochs);
+      if (tokens.length === 0) return true;
+      for (const [tokenId, epoch] of tokens) {
+        if (!this.adapterTokenSynchronized(tokenId) || this.adapterTokenEpoch(tokenId) !== epoch) {
+          this.markProvenanceInvalid(triggerId);
+          return false;
+        }
+      }
+      return true;
+    }
+    if (this.referenceUnreliable.has(provenance.asset) || (this.referenceEpoch.get(provenance.asset) ?? 0) !== provenance.epoch) {
+      this.markProvenanceInvalid(triggerId);
+      return false;
+    }
+    return true;
+  }
+
+  private noteReferenceLogicalLoss(asset: string): void {
+    this.referenceUnreliable.add(asset);
+    if (this.referenceLogicalGapped.has(asset)) return;
+    this.referenceLogicalGapped.add(asset);
+    this.referenceEpoch.set(asset, (this.referenceEpoch.get(asset) ?? 0) + 1);
   }
 
   /**

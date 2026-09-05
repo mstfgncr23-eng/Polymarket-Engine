@@ -66,20 +66,31 @@ export class ScriptedBoundedMarketTransport implements MarketStreamTransport {
   }
 }
 
+interface ScriptedWaiter {
+  resolve: (result: IteratorResult<unknown>) => void;
+  reject: (error: Error) => void;
+}
+
 export class ScriptedBoundedStream implements BoundedMarketStream {
-  private readonly waiters: Array<(result: IteratorResult<unknown>) => void> = [];
+  private readonly waiters: ScriptedWaiter[] = [];
   private pendingError: Error | null = null;
   private ended = false;
+  private finalized = false;
   closed = false;
   closeCount = 0;
+  private readonly generation = 1;
 
   constructor(
     private readonly queue: BoundedIngressQueue,
     private readonly onClosed?: () => void,
   ) {}
 
+  pendingWaiterCount(): number { return this.waiters.length; }
+  pingTimerActive(): boolean { return false; }
+  streamGeneration(): number { return this.generation; }
+
   push(event: unknown): { ok: true } | { ok: false; reason: "count_limit" | "byte_limit" } {
-    if (this.closed) return { ok: true };
+    if (this.closed || this.finalized) return { ok: true };
     const result = this.queue.tryEnqueue(event);
     if (!result.ok) {
       this.fail(new IngressOverflowError(result.reason));
@@ -91,25 +102,22 @@ export class ScriptedBoundedStream implements BoundedMarketStream {
 
   /** Remote unexpected close without going through adapter closeCurrentStream. */
   endRemote(): void {
-    this.ended = true;
-    this.wake();
+    this.finalize(null);
   }
 
   fail(error: Error): void {
-    this.pendingError = error;
-    this.ended = true;
-    while (this.waiters.length > 0) {
-      this.waiters.shift()!({ value: undefined, done: true });
-    }
+    this.finalize(error);
   }
 
   async close(): Promise<void> {
-    if (this.closed) return;
+    if (this.closed) {
+      this.finalize(null);
+      return;
+    }
     this.closed = true;
     this.closeCount += 1;
-    this.ended = true;
     this.onClosed?.();
-    this.wake();
+    this.finalize(null);
   }
 
   [Symbol.asyncIterator](): AsyncIterator<unknown> {
@@ -122,30 +130,39 @@ export class ScriptedBoundedStream implements BoundedMarketStream {
           if (this.pendingError) throw this.pendingError;
           return { value: undefined, done: true };
         }
-        return await new Promise<IteratorResult<unknown>>((resolve) => {
-          this.waiters.push(resolve);
+        return await new Promise<IteratorResult<unknown>>((resolve, reject) => {
+          this.waiters.push({ resolve, reject });
           this.wake();
-        }).then((result) => {
-          if (this.pendingError) throw this.pendingError;
-          return result;
         });
       },
     };
   }
 
+  private finalize(error: Error | null): void {
+    if (this.finalized) return;
+    this.finalized = true;
+    this.ended = true;
+    if (error && !this.pendingError) this.pendingError = error;
+    while (this.waiters.length > 0) {
+      const waiter = this.waiters.shift()!;
+      if (this.pendingError) waiter.reject(this.pendingError);
+      else waiter.resolve({ value: undefined, done: true });
+    }
+  }
+
   private wake(): void {
     while (this.waiters.length > 0) {
       if (this.pendingError) {
-        this.waiters.shift()!({ value: undefined, done: true });
+        this.waiters.shift()!.reject(this.pendingError);
         continue;
       }
       const item = this.queue.dequeue();
       if (item !== undefined) {
-        this.waiters.shift()!({ value: item, done: false });
+        this.waiters.shift()!.resolve({ value: item, done: false });
         continue;
       }
       if (this.ended) {
-        this.waiters.shift()!({ value: undefined, done: true });
+        this.waiters.shift()!.resolve({ value: undefined, done: true });
         continue;
       }
       break;

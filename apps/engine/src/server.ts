@@ -149,6 +149,7 @@ export async function createApiServer(input: {
   submitGrokSignal(signal: GrokSignalSubmission, clientId: string): Promise<Record<string, unknown>>;
   noteMcpRequest?(tool: string | null, triggerId?: string): void;
   isTokenSynchronized?(tokenId: string): boolean;
+  isTriggerActionable?(triggerId: string): boolean;
   startExperiment?: () => Promise<Record<string, unknown>>;
   engineReadToken?: string;
   operatorToken?: string;
@@ -190,6 +191,7 @@ export async function createApiServer(input: {
     state: input.state, journal: input.journal, metrics: input.metrics, submitSignal: input.submitGrokSignal,
     noteMcpRequest: input.noteMcpRequest,
     isTokenSynchronized: input.isTokenSynchronized,
+    isTriggerActionable: input.isTriggerActionable,
     heavyRead: (work) => heavyRead.run(work),
   });
   app.route({ method: ["GET", "POST", "DELETE"], url: "/mcp", handler: mcpHandler });
