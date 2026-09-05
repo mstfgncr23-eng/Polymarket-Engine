@@ -105,7 +105,7 @@ fly secrets set -a polymarket-engine ENGINE_READ_TOKEN='<high-entropy>' ENGINE_O
 
 `fly.engine.toml` may list `app = "polymarket-engine"` as a documented intended default. The operator must own or create **their** app. Do **not** assume that name at deploy time. Manual and GitHub Action deploys must pass `--app <operator-app>`.
 
-Topology (already in toml): `fra`, internal `8080`, `shared-cpu-1x`, `512mb`, `min_machines_running = 1`, `auto_stop_machines = "off"`. **No Fly Managed Postgres.** **No Fly volume** for reports.
+Topology (already in toml): `fra`, internal `8080`, **`shared-cpu-2x`**, `512mb`, `min_machines_running = 1`, `auto_stop_machines = "off"`. Dashboard toml remains `shared-cpu-1x` / `256mb`. This document does **not** change VM size — it only matches `fly.engine.toml`. **No Fly Managed Postgres.** **No Fly volume** for reports.
 
 ```bash
 # Create only if the operator does not already own the app
@@ -136,9 +136,19 @@ Zero qualified markets is `discoveryStatus=ZERO_QUALIFIED`, not a crash. Fly mus
 
 ### Filesystem
 
-Fly disks are **not** durable canonical state. PostgreSQL is. The engine image creates `/app/reports` owned by user `engine` (`REPORT_DIRECTORY=/app/reports`) so final-report writes succeed without a Fly volume. That directory is **ephemeral**; rebuild with `pnpm report` from the journal (`DATABASE_URL` + `EXPERIMENT_ID`).
+Fly disks are **not** durable canonical state. PostgreSQL is. The canonical final experiment report lives in `experiment_reports` (hash + schema version + summary JSON + markdown). The engine image still creates `/app/reports` (`REPORT_DIRECTORY=/app/reports`) as an **optional ephemeral export**. A filesystem write failure must not destroy an already-persisted canonical report. Rebuild/export with `pnpm report` from `DATABASE_URL` + `EXPERIMENT_ID`.
 
-Migrate-on-boot: `Dockerfile.engine` copies `packages/db/migrations` (SQL + `meta/_journal.json`) to `/app/packages/db/migrations` and sets `DB_MIGRATIONS_DIR`. Runtime `PostgresEventJournal.initialize()` runs Drizzle migrate. SQL is additive (`CREATE IF NOT EXISTS`, idempotent `ENABLE ROW LEVEL SECURITY`, role-guarded `REVOKE`). Re-running against an already-provisioned schema does **not** DROP tables.
+Migrate-on-boot: `Dockerfile.engine` copies `packages/db/migrations` (SQL + `meta/_journal.json`) to `/app/packages/db/migrations` and sets `DB_MIGRATIONS_DIR`. Runtime `PostgresEventJournal.initialize()` (`boot-migrate` only) runs Drizzle migrate **then schema verification**. Required relations include `journal_events`, `engine_checkpoints`, `mcp_idempotency_keys`, `durable_transitions`, and `experiment_reports`. If migrate-on-boot completes but a required relation/index/RLS invariant is absent (including a production database that never applied `0004_critical_replay.sql`), boot/readiness fails closed. SQL is additive (`CREATE IF NOT EXISTS`, idempotent `ENABLE ROW LEVEL SECURITY`, role-guarded `REVOKE`). Re-running against an already-provisioned schema does **not** DROP tables.
+
+`0005` does **not** create large `journal_events` keyset indexes. A transactional `CREATE INDEX` on ~1M live rows can block writers. Fresh/local boot may create those indexes synchronously only when `journal_events` is small. Production must run `packages/db/operator/create-journal-keyset-indexes.concurrent.sql` (`CREATE INDEX CONCURRENTLY`, outside a migration transaction) before readiness. Schema verification fails closed on missing or `INVALID` indexes, and on failure to inspect `pg_index`. An interrupted `CREATE INDEX CONCURRENTLY` leaves an INVALID index; `IF NOT EXISTS` cannot repair it — `DROP INDEX CONCURRENTLY` then recreate (see [RETENTION.md](./RETENTION.md)). This PR does not execute that script or recovery against production.
+
+Operator CLIs: `journal-cleanup` dry-run is `readonly`; APPLY is `maintenance`; `pnpm report` is `readonly` unless `REPORT_PERSIST=1` selects `report-write`. They use `connectWithoutMigrate`. They never call `initialize()` and must not apply `0004`/`0005` or persist a report merely because `DATABASE_URL` is set. Dry-run/APPLY use the same `retentionConfigFromEnv` path as runtime `RetentionManager`.
+
+Do **not** manually create `durable_transitions` in production. Let migrate-on-boot apply `0004` before `0005`. `durable_transitions` is recovery-authoritative and is **never pruned** by Step-4 retention.
+
+`RETENTION_ENABLED` defaults **false**. Do not enable automatic journal deletion until after a dry-run review. This PR does not change production secrets.
+
+See [RETENTION.md](./RETENTION.md) for access modes, retention classes, dry-run cleanup, concurrent-index sequence, and when a completed experiment may drop transient journal rows.
 
 ### Supabase migration history
 

@@ -19,7 +19,8 @@
     "smoke:live": "pnpm --filter @pm/engine smoke:live",
     "experiment:start": "pnpm --filter @pm/engine experiment:start",
     "report": "pnpm --filter @pm/engine report",
-    "bench:stability": "tsx scripts/stability-hot-path-bench.ts"
+    "bench:stability": "tsx scripts/stability-hot-path-bench.ts",
+    "bench:retention": "tsx scripts/report-retention-bench.ts"
   },
   "devDependencies": {
     "@types/node": "26.4.0",

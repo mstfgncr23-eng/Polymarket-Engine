@@ -184,6 +184,8 @@ export function durableIdentityConflicts(
     case "EXPERIMENT_ENTRY_CLOSED":
     case "EXPERIMENT_COMPLETED":
     case "LEDGER_MARK_TO_MARKET":
+    case "REPORT_SOURCE_INTEGRITY_FAULT":
+    case "REPORT_SOURCE_INTEGRITY_REPAIRED":
       return false;
     default:
       return hashDurablePayload(existing) !== hashDurablePayload(incoming);
@@ -308,6 +310,9 @@ export function applyDurableTransition(state: RecoverableEngineState, transition
         state.lastInfrastructureAccrualAt = payload.accrualKey;
         return;
       }
+      case "REPORT_SOURCE_INTEGRITY_FAULT":
+      case "REPORT_SOURCE_INTEGRITY_REPAIRED":
+        return;
       default:
         throw new RecoveryFailClosedError("unsupported", `unhandled authoritative type ${transition.type}`);
     }

@@ -32,7 +32,6 @@ import {
   classifySettledOutcome,
   settlementCashDelta,
   settlementRealizedDelta,
-  DECISION_EVENT_TYPES,
   createIdleExperiment,
   d,
   decimal,
@@ -40,6 +39,8 @@ import {
   experimentAllowsHedge,
   openPositionsRemain,
   shouldWriteFinalReport,
+  isReportInputEventType,
+  type JournalEvent,
   type ExternalAgentRoleId,
   type Direction,
   type GrokActivationBridge,
@@ -67,7 +68,10 @@ import {
   derivedAuditEventId,
   DurableCursorBehindError,
   IdempotencyConflictError,
-  queryEventsPaged,
+  isCanonicalFinalReport,
+  JournalAppendAbortedError,
+  isJournalAppendAbortedError,
+  isJournalAppendDeadlineError,
   type DurableCommitResult,
   type DurableTransition,
   type EventJournal,
@@ -85,7 +89,25 @@ import { EngineMetrics, classifyJournalMetricClass } from "./metrics.js";
 import { RestingOrderTokenIndex } from "./resting-order-index.js";
 import { SseHub } from "./server.js";
 import { EngineStateStore } from "./state.js";
-import { buildExperimentSummary, filterCurrentExperimentEvents, writeExperimentSummary } from "./report.js";
+import { ensureReportGeneratedAudit, persistCanonicalFinalReport, streamExperimentSummary, summaryFromDurableReport } from "./final-report.js";
+import { writeExperimentSummary } from "./report.js";
+import { retentionConfigFromEngineEnv, RetentionManager } from "./retention-manager.js";
+import { createSourceSealEvent, loadSourceSeal, remainingSealMs, SOURCE_SEAL_TIMEOUT_MS, isSourceSealExemptType } from "./source-seal.js";
+import {
+  boundIntegrityFaults,
+  createIntegrityFaultEvent,
+  createIntegrityRepairEvent,
+  integrityDurableOperationKey,
+  INTEGRITY_OVERFLOW_EVENT_ID,
+  loadIntegrityRepairIds,
+  loadUnresolvedReportSourceIntegrity,
+  overflowIntegrityFault,
+  parseCheckpointIntegrityFaults,
+  REPORT_SOURCE_INTEGRITY_HARD_CAP,
+  REPORT_SOURCE_INTEGRITY_FAULT,
+  shouldLatchReportSourceIntegrity,
+  type ReportSourceIntegrityFault,
+} from "./report-source-integrity.js";
 import { GrokActivationCoordinator, persistableActivation } from "./activation/coordinator.js";
 import { createGrokActivationBridge } from "./activation/index.js";
 import { BoundedJournalWriter } from "./journal-writer.js";
@@ -125,6 +147,11 @@ import {
   type AdmitResult,
   type JoinResult,
 } from "./runtime-supervisor.js";
+
+function isJournalAdmissionRejectedError(error: unknown): boolean {
+  return error instanceof JournalAdmissionRejected
+    || (Boolean(error) && typeof error === "object" && (error as { name?: string }).name === "JournalAdmissionRejected");
+}
 
 export class EngineService {
   readonly metrics = new EngineMetrics();
@@ -198,6 +225,7 @@ export class EngineService {
   private readonly discoveryFlight: SingleFlight;
   private readonly maintenanceFlight: SingleFlight;
   private readonly heavyRead: FiniteSemaphore;
+  private readonly retention: RetentionManager;
   private readonly shutdownJoinDeadlineMs: number;
   private lastShutdown: JoinResult | null = null;
   private lastJournalShutdown: JoinResult | null = null;
@@ -205,6 +233,21 @@ export class EngineService {
   private maintenanceHold: Promise<void> | null = null;
   private processTriggerHold: Promise<void> | null = null;
   private triggerEventPersistHold: Promise<void> | null = null;
+  private sourceSealing = false;
+  private sourceSealed = false;
+  private sourceSealTimeoutMs = SOURCE_SEAL_TIMEOUT_MS;
+  private sourceSealGeneration = 0;
+  private sourceSealDeadlineAt = 0;
+  private sourceSealPersistCancelled = false;
+  private sourceSealPersistAttempt = 0;
+  private sourceSealPersistHold: Promise<void> | null = null;
+  private sourceSealAbort: AbortController | null = null;
+  private sourceSealPersistInFlight = false;
+  private sourceSealFlight: Promise<{ sealed: boolean; reason: string | null }> | null = null;
+  private researchIngressInFlight = 0;
+  private grokClaimHold: Promise<void> | null = null;
+  private readonly reportSourceIntegrity = new Map<string, ReportSourceIntegrityFault>();
+  private readonly persistedIntegrityFaults = new WeakSet<ReportSourceIntegrityFault>();
   private referenceTelemetryHoldForTest: Promise<void> | null = null;
   private lastAdmittedMarketEpochFence: ReadonlyMap<string, number> | null = null;
   private discoveryGenerationApplied = 0;
@@ -266,6 +309,16 @@ export class EngineService {
       onCoalesced: () => this.metrics.maintenanceSingleflightCoalesced.inc(),
       onDirty: (dirty) => this.metrics.maintenanceSingleflightDirty.set(dirty ? 1 : 0),
     });
+    this.retention = new RetentionManager(journal, retentionConfigFromEngineEnv(env), {
+      noteDeleted: (cls, n) => { if (n > 0) this.metrics.retentionDeleted.inc({ retention_class: cls }, n); },
+      noteFailure: () => this.metrics.retentionFailures.inc(),
+      noteRun: () => this.metrics.retentionRuns.inc(),
+      noteLastSuccess: (iso) => this.metrics.retentionLastSuccessUnix.set(Date.parse(iso) / 1000),
+      noteBatch: (size, durationMs) => {
+        this.metrics.retentionBatchSize.observe(size);
+        this.metrics.retentionBatchDuration.observe(durationMs / 1000);
+      },
+    });
     this.activation = new GrokActivationCoordinator(
       adapters?.activation ?? createGrokActivationBridge(env),
       {
@@ -282,6 +335,8 @@ export class EngineService {
     this.started = true;
     await this.initializeJournalWithRetry();
     await this.restoreAndRecover();
+    await this.restoreSourceSealState();
+    await this.restoreReportSourceIntegrity();
     this.state.recoveryComplete = true;
     const configuredTokens = splitList(this.env.POLYMARKET_TOKEN_IDS);
     if (configuredTokens.length > 0) {
@@ -484,6 +539,10 @@ export class EngineService {
       checkpoint: true,
       afterApply: async () => {
         this.reportGenerated = false;
+        this.abortSourceSealPersist();
+        this.sourceSealed = false;
+        this.sourceSealing = false;
+        this.clearReportSourceIntegrity(next.id);
         this.record("EXPERIMENT_STARTED", next.id, null, { status: next.status });
       },
     });
@@ -552,6 +611,13 @@ export class EngineService {
     await this.maintenanceFlight.trigger(async () => {
       if (this.maintenanceHold) await this.maintenanceHold;
       await this.maintainExperiment();
+      await this.retention.runCycle({
+        experiment: this.experiment,
+        now: this.nowFn(),
+        degraded: this.state.journalDegraded || this.overload.state === "DEGRADED" || this.state.telemetryDegraded,
+        failClosed: this.overload.state === "FAIL_CLOSED",
+        databaseUp: this.state.database === "UP",
+      });
     });
   }
 
@@ -1088,6 +1154,13 @@ export class EngineService {
         this.syncRecoveredProjection();
       }
       this.syncExperimentWindow();
+      if (this.experiment?.id) {
+        const existing = await this.journal.loadExperimentReport(this.experiment.id, "final");
+        if (existing && isCanonicalFinalReport(existing)) {
+          this.reportGenerated = true;
+          await ensureReportGeneratedAudit(this.journal, existing);
+        }
+      }
     } catch (error) {
       if (error instanceof CrashInjectedError) throw error;
       const normalized = normalizeRecoveryError(error);
@@ -1166,6 +1239,9 @@ export class EngineService {
     if (typeof payload.derivedAuditCursor === "number") {
       this.derivedAuditCursor = parseCheckpointDerivedAuditCursor(payload);
     }
+    for (const fault of parseCheckpointIntegrityFaults(payload)) {
+      this.reportSourceIntegrity.set(`${fault.experimentId}:${fault.eventId}`, fault);
+    }
     return { positions: positions.length, restingOrders: resting.length, activeTriggers: triggers.length, grokSignals: signals.length };
   }
 
@@ -1229,7 +1305,7 @@ export class EngineService {
           await this.journal.append(event);
           this.state.database = "UP";
         });
-      }, signal);
+      }, signal, { reportInput: this.isCanonicalWindowAdmission(event.type) });
     } catch (error) {
       if (error instanceof CrashInjectedError) throw error;
       this.failClosedIntegrity(error);
@@ -1382,6 +1458,9 @@ export class EngineService {
   private admitTrigger(trigger: TriggerEvent, provenance?: TriggerProvenance): AdmitResult {
     if (this.started && !this.state.recoveryComplete) {
       return { admitted: false, reason: "fail_closed", done: Promise.resolve() };
+    }
+    if (this.sourceSealBlocksAdmission()) {
+      return { admitted: false, reason: "source_sealed", done: Promise.resolve() };
     }
     const resolved = provenance ?? this.captureProvenance(trigger);
     const lane = triggerWorkLane(trigger.kind);
@@ -1538,7 +1617,8 @@ export class EngineService {
   }
 
   /** The only ingress for external Grok research; it cannot create orders directly. */
-  async submitGrokSignal(raw: GrokSignalSubmission, clientId: string): Promise<{ status: "accepted" | "duplicate" | "stale" | "unknown_trigger" | "trace_mismatch" | "market_mismatch" | "asset_mismatch" | "replay_rejected" | "malformed" | "identity_mismatch"; signalId?: string }> {
+  async submitGrokSignal(raw: GrokSignalSubmission, clientId: string): Promise<{ status: "accepted" | "duplicate" | "stale" | "unknown_trigger" | "trace_mismatch" | "market_mismatch" | "asset_mismatch" | "replay_rejected" | "malformed" | "identity_mismatch" | "source_sealed"; signalId?: string }> {
+    this.assertResearchIntegrity();
     let submission: GrokSignalSubmission;
     try { submission = grokSignalSubmissionSchema.parse(raw); }
     catch {
@@ -1551,55 +1631,118 @@ export class EngineService {
       this.metrics.grokSignals.inc({ agent: submission.agentId, status: "identity_mismatch" });
       return { status: "identity_mismatch" };
     }
-    const now = new Date();
-    const trigger = this.activeTriggers.get(submission.triggerId);
-    if (!trigger) { this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "unknown_trigger" }); return { status: "unknown_trigger" }; }
-    if (trigger.traceId !== submission.traceId) { this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "trace_mismatch" }); return { status: "trace_mismatch" }; }
-    if (trigger.marketId && trigger.marketId !== submission.marketId) {
-      this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "market_mismatch" }); return { status: "market_mismatch" };
-    }
-    if (submission.asset && trigger.asset && submission.asset !== trigger.asset) {
-      this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "asset_mismatch" }); return { status: "asset_mismatch" };
-    }
-    const submittedAt = new Date(submission.timestamp).getTime();
-    const maxSkewMs = 5 * 60_000;
-    if (!Number.isFinite(submittedAt) || submittedAt > now.getTime() + 60_000 || submittedAt < now.getTime() - maxSkewMs) {
-      this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "replay_rejected" }); return { status: "replay_rejected" };
-    }
-    if (new Date(trigger.expiresAt).getTime() <= now.getTime() || new Date(submission.output.expiresAt).getTime() <= now.getTime()) {
-      this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "stale" }); return { status: "stale" };
-    }
-    if (!this.isTriggerActionable(trigger.id)) {
-      this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "stale" }); return { status: "stale" };
-    }
-    const claimed = await this.journal.claimIdempotency("grok_signal_submission", `${clientId}:${submission.submissionId}`);
-    if (!claimed) { this.state.recordGrokRejection("duplicate"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "duplicate" }); return { status: "duplicate" }; }
-    if (!this.isTriggerActionable(trigger.id)) {
-      this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "stale" }); return { status: "stale" };
-    }
+    const rejectSealed = (): { status: "source_sealed" } => {
+      this.state.recordGrokRejection("rejected");
+      this.metrics.grokSignals.inc({ agent: submission.agentId, status: "source_sealed" });
+      return { status: "source_sealed" };
+    };
+    const ingress = this.beginResearchIngress();
+    try {
+      if (this.researchIngressStale(ingress.generation)) return rejectSealed();
+      const now = this.nowFn();
+      const trigger = this.activeTriggers.get(submission.triggerId);
+      if (!trigger) { this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "unknown_trigger" }); return { status: "unknown_trigger" }; }
+      if (trigger.traceId !== submission.traceId) { this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "trace_mismatch" }); return { status: "trace_mismatch" }; }
+      if (trigger.marketId && trigger.marketId !== submission.marketId) {
+        this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "market_mismatch" }); return { status: "market_mismatch" };
+      }
+      if (submission.asset && trigger.asset && submission.asset !== trigger.asset) {
+        this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "asset_mismatch" }); return { status: "asset_mismatch" };
+      }
+      const submittedAt = new Date(submission.timestamp).getTime();
+      const maxSkewMs = 5 * 60_000;
+      if (!Number.isFinite(submittedAt) || submittedAt > now.getTime() + 60_000 || submittedAt < now.getTime() - maxSkewMs) {
+        this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "replay_rejected" }); return { status: "replay_rejected" };
+      }
+      if (new Date(trigger.expiresAt).getTime() <= now.getTime() || new Date(submission.output.expiresAt).getTime() <= now.getTime()) {
+        this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "stale" }); return { status: "stale" };
+      }
+      if (!this.isTriggerActionable(trigger.id)) {
+        this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "stale" }); return { status: "stale" };
+      }
+      if (this.researchIngressStale(ingress.generation)) return rejectSealed();
+      if (this.grokClaimHold) await this.grokClaimHold;
+      if (this.researchIngressStale(ingress.generation)) return rejectSealed();
+      const claimed = await this.journal.claimIdempotency("grok_signal_submission", `${clientId}:${submission.submissionId}`);
+      this.assertResearchIntegrity();
+      if (!claimed) {
+        // A claim proves admission only, including across a crash before append.
+        // Check every canonical fact required by this submission with bounded trace
+        // pages (also works for old IDs). The proposal is linked to the accepted
+        // signal by the same trace and aggregate identity.
+        const requiresStrategyProposal = submission.agentId === "strategy_supervisor"
+          && submission.output.proposedChange !== null;
+        let acceptedEvent: JournalEvent | undefined;
+        const strategyProposalAggregateIds = new Set<string>();
+        let after: Parameters<EventJournal["readTracePage"]>[1]["after"];
+        do {
+          const page = await this.journal.readTracePage(submission.traceId, { after, limit: 128 });
+          for (const event of page.events) {
+            if (event.type === "STRATEGY_CHANGE_PROPOSED" && event.traceId === submission.traceId) {
+              strategyProposalAggregateIds.add(event.aggregateId);
+            }
+            if (!acceptedEvent && event.type === "GROK_SIGNAL_ACCEPTED"
+              && event.traceId === submission.traceId
+              && event.payload.clientId === clientId && event.payload.submissionId === submission.submissionId) {
+              acceptedEvent = event;
+            }
+          }
+          after = page.nextCursor ?? undefined;
+          const proposalPersisted = acceptedEvent !== undefined && strategyProposalAggregateIds.has(acceptedEvent.aggregateId);
+          if (acceptedEvent !== undefined && (!requiresStrategyProposal || proposalPersisted)) break;
+        } while (after);
+        this.assertResearchIntegrity();
+        const proposalPersisted = acceptedEvent !== undefined && strategyProposalAggregateIds.has(acceptedEvent.aggregateId);
+        if (acceptedEvent === undefined || (requiresStrategyProposal && !proposalPersisted)) {
+          // This can also be a concurrent claim whose first caller is still
+          // persisting one of its canonical facts. Reject the unproven duplicate
+          // without poisoning that caller. An actual total persistence failure
+          // installs the sticky fail-closed state in safeAppend; restart still
+          // cannot accept this claim.
+          throw new Error("GROK_SUBMISSION_CANONICAL_FACT_MISSING");
+        }
+        this.state.recordGrokRejection("duplicate");
+        this.metrics.grokSignals.inc({ agent: submission.agentId, status: "duplicate" });
+        return { status: "duplicate" };
+      }
+      // Recheck the experiment-scoped fence immediately before irreversible accept.
+      if (this.researchIngressStale(ingress.generation) || !this.isTriggerActionable(trigger.id)) {
+        this.state.recordGrokRejection("rejected");
+        this.metrics.grokSignals.inc({ agent: submission.agentId, status: this.researchIngressStale(ingress.generation) ? "source_sealed" : "stale" });
+        return { status: this.researchIngressStale(ingress.generation) ? "source_sealed" : "stale" };
+      }
 
-    const signal: GrokSignalEnvelope = grokSignalEnvelopeSchema.parse({
-      signalId: createId("grok_signal"), submissionId: submission.submissionId, traceId: submission.traceId,
-      triggerId: submission.triggerId, correlationId: submission.correlationId, marketId: submission.marketId,
-      asset: submission.asset ?? trigger.asset ?? null,
-      agentId: submission.agentId, role: submission.role, provider: "grok_bot_mcp", clientId,
-      receivedAt: now.toISOString(), timestamp: submission.timestamp, output: submission.output, resultingDecision: null,
-    });
-    const byRole = this.signalsByTrigger.get(trigger.id) ?? new Map<ExternalAgentRoleId, GrokSignalEnvelope>();
-    byRole.set(signal.agentId, signal);
-    this.signalsByTrigger.set(trigger.id, byRole);
-    this.signalReceivedTimes.push(now.getTime());
-    this.state.addGrokSignal(signal);
-    this.activation.noteSignal(trigger.id, now);
-    this.state.setActivationLatency(this.activation.snapshot());
-    this.metrics.grokSignals.inc({ agent: signal.agentId, status: "accepted" });
-    this.record(`${signal.agentId.toUpperCase()}_COMPLETE`, signal.traceId, trigger.marketId, { signalId: signal.signalId, clientId, confidence: submission.output.confidence, expiresAt: submission.output.expiresAt }, trigger.asset ?? null);
-    await this.safeAppend(createJournalEvent({ traceId: signal.traceId, type: "GROK_SIGNAL_ACCEPTED", aggregateType: "grok_signal", aggregateId: signal.signalId, payload: signal }));
-    if (submission.agentId === "strategy_supervisor" && submission.output.proposedChange) {
-      await this.safeAppend(createJournalEvent({ traceId: signal.traceId, type: "STRATEGY_CHANGE_PROPOSED", aggregateType: "strategy_change", aggregateId: signal.signalId, payload: submission.output.proposedChange }));
+      const signal: GrokSignalEnvelope = grokSignalEnvelopeSchema.parse({
+        signalId: createId("grok_signal"), submissionId: submission.submissionId, traceId: submission.traceId,
+        triggerId: submission.triggerId, correlationId: submission.correlationId, marketId: submission.marketId,
+        asset: submission.asset ?? trigger.asset ?? null,
+        agentId: submission.agentId, role: submission.role, provider: "grok_bot_mcp", clientId,
+        receivedAt: now.toISOString(), timestamp: submission.timestamp, output: submission.output, resultingDecision: null,
+      });
+      if (this.researchIngressStale(ingress.generation)) return rejectSealed();
+      await this.safeAppend(createJournalEvent({ traceId: signal.traceId, type: "GROK_SIGNAL_ACCEPTED", aggregateType: "grok_signal", aggregateId: signal.signalId, payload: signal }));
+      if (submission.agentId === "strategy_supervisor" && submission.output.proposedChange) {
+        await this.safeAppend(createJournalEvent({ traceId: signal.traceId, type: "STRATEGY_CHANGE_PROPOSED", aggregateType: "strategy_change", aggregateId: signal.signalId, payload: submission.output.proposedChange }));
+      }
+      this.assertResearchIntegrity();
+      const byRole = this.signalsByTrigger.get(trigger.id) ?? new Map<ExternalAgentRoleId, GrokSignalEnvelope>();
+      byRole.set(signal.agentId, signal);
+      this.signalsByTrigger.set(trigger.id, byRole);
+      this.signalReceivedTimes.push(now.getTime());
+      this.state.addGrokSignal(signal);
+      this.activation.noteSignal(trigger.id, now);
+      this.state.setActivationLatency(this.activation.snapshot());
+      this.metrics.grokSignals.inc({ agent: signal.agentId, status: "accepted" });
+      this.record(`${signal.agentId.toUpperCase()}_COMPLETE`, signal.traceId, trigger.marketId, { signalId: signal.signalId, clientId, confidence: submission.output.confidence, expiresAt: submission.output.expiresAt }, trigger.asset ?? null);
+      await this.evaluateExternalConsensus(trigger);
+      return { status: "accepted", signalId: signal.signalId };
+    } finally {
+      this.endResearchIngress();
     }
-    await this.evaluateExternalConsensus(trigger);
-    return { status: "accepted", signalId: signal.signalId };
+  }
+
+  private assertResearchIntegrity(): void {
+    if (this.overload.hasIntegrityFault) throw new Error("REPORT_SOURCE_INTEGRITY_FAIL_CLOSED");
   }
 
   /** Public for deterministic trigger ingestion and focused integration tests. */
@@ -1609,6 +1752,7 @@ export class EngineService {
   }
 
   private async evaluateExternalConsensus(trigger: TriggerEvent): Promise<void> {
+    if (this.researchIngressBlocked()) return;
     if (!this.isTriggerActionable(trigger.id)) return;
     const outputs = [...(this.signalsByTrigger.get(trigger.id)?.values() ?? [])];
     const fair = outputs.find((item) => item.agentId === "fair_probability_analyst")?.output as { estimatedEdge?: number; fairProbability?: number; direction?: Direction; marketProbability?: number } | undefined;
@@ -1630,6 +1774,7 @@ export class EngineService {
   }
 
   private async evaluateTrade(trigger: TriggerEvent, consensus: NonNullable<EngineStateStore["latestConsensus"]>, outputs: GrokSignalEnvelope[]): Promise<void> {
+    if (this.researchIngressBlocked()) return;
     if (!this.isTriggerActionable(trigger.id)) return;
     const pair = this.snapshots.get(trigger.marketId ?? "");
     if (!pair) return;
@@ -2021,20 +2166,47 @@ export class EngineService {
     this.sse.publish("snapshot", () => this.state.snapshot());
   }
 
-  private async safeAppend(event: ReturnType<typeof createJournalEvent>, signal?: AbortSignal): Promise<void> {
+  private isExperimentWindowOpen(): boolean {
+    const status = this.experiment?.status;
+    return status === "RUNNING" || status === "ENTRY_CLOSED";
+  }
+
+  private isCanonicalWindowAdmission(type: string): boolean {
+    return isReportInputEventType(type) && !isSourceSealExemptType(type) && this.isExperimentWindowOpen();
+  }
+
+  async persistReportInput(event: JournalEvent): Promise<void> {
+    const experimentId = this.experiment?.id;
+    const stamped = this.isExperimentWindowOpen() && experimentId && typeof event.payload.experimentId !== "string"
+      ? { ...event, payload: { ...event.payload, experimentId } }
+      : event;
+    await this.safeAppend(stamped);
+  }
+
+  private async safeAppend(event: ReturnType<typeof createJournalEvent>, signal?: AbortSignal, extra?: { deadlineAt?: number }): Promise<void> {
     const critical = isCriticalPersistenceType(event.type);
     const journalClass = classifyJournalMetricClass(event.type);
+    const reportInput = this.isCanonicalWindowAdmission(event.type);
     try {
       await this.journalAdmission.run(journalClass, critical, async () => {
         if (signal?.aborted) throw new JournalAdmissionRejected(journalClass, critical, "JOURNAL_ADMISSION_CLOSED");
         if (event.type === "TRIGGER_EVENT" && this.triggerEventPersistHold) await this.triggerEventPersistHold;
         await this.metrics.observeDirectJournal(event.type, async () => {
-          await this.journal.append(event);
+          await this.journal.append(event, { signal, deadlineAt: extra?.deadlineAt });
           if (critical) this.state.database = "UP";
         });
-      }, signal);
+      }, signal, { reportInput });
       if (!critical) this.state.journalDegraded = false;
     } catch (error) {
+      if (isJournalAppendAbortedError(error)) throw error;
+      if (shouldLatchReportSourceIntegrity(event, this.experiment)) {
+        const durableFault = await this.noteReportSourceIntegrityFault(event, error);
+        if (!durableFault) {
+          this.failClosedIntegrity(error);
+          this.syncRuntimeState();
+          throw error;
+        }
+      }
       if (critical) {
         this.overload.markIntegrityFault();
         this.state.overloadState = "FAIL_CLOSED";
@@ -2084,6 +2256,10 @@ export class EngineService {
           marketMetadata: [...this.marketsById.values()].map((market) => ({ ...market, raw: {} })),
           lastInfrastructureAccrualAt: this.lastInfrastructureAccrualAt,
           derivedAuditCursor: this.derivedAuditCursor,
+          reportSourceIntegrity: boundIntegrityFaults(
+            [...this.reportSourceIntegrity.values()].filter((fault) => fault.experimentId === this.experiment!.id),
+            this.experiment.id,
+          ),
         },
       });
       this.metrics.checkpointWrites.inc({ status: "success" });
@@ -2447,40 +2623,423 @@ export class EngineService {
       }),
       checkpoint: true,
     });
+    if (next.status === "COMPLETED") this.freezeExperimentResearchIngress();
+  }
+
+  private sourceSealBlocksAdmission(): boolean {
+    return this.sourceSealing && !this.sourceSealed;
+  }
+
+  private researchIngressBlocked(): boolean {
+    return this.sourceSealing || this.sourceSealed || this.experiment?.status === "COMPLETED";
+  }
+
+  private freezeExperimentResearchIngress(): void {
+    this.sourceSealing = true;
+    this.sourceSealGeneration += 1;
+  }
+
+  private beginResearchIngress(): { generation: number } {
+    this.researchIngressInFlight += 1;
+    return { generation: this.sourceSealGeneration };
+  }
+
+  private endResearchIngress(): void {
+    this.researchIngressInFlight = Math.max(0, this.researchIngressInFlight - 1);
+  }
+
+  private researchIngressStale(generation: number): boolean {
+    return this.researchIngressBlocked() || generation !== this.sourceSealGeneration;
+  }
+
+  private async waitResearchIngress(deadlineMs: number): Promise<JoinResult> {
+    const started = Date.now();
+    while (this.researchIngressInFlight > 0) {
+      if (Date.now() - started >= deadlineMs) {
+        return { drained: false, unresolved: this.researchIngressInFlight, timedOut: true };
+      }
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    return { drained: true, unresolved: 0, timedOut: false };
+  }
+
+  private async restoreSourceSealState(): Promise<void> {
+    const experiment = this.experiment;
+    if (!experiment || experiment.status !== "COMPLETED") return;
+    const existing = await loadSourceSeal(this.journal, experiment.id);
+    if (existing) {
+      this.sourceSealed = true;
+      this.sourceSealing = false;
+      return;
+    }
+    this.sourceSealing = true;
+  }
+
+  private installIntegrityFault(fault: ReportSourceIntegrityFault): void {
+    const overflowKey = `${fault.experimentId}:${INTEGRITY_OVERFLOW_EVENT_ID}`;
+    if (this.reportSourceIntegrity.has(overflowKey)) return;
+    const key = `${fault.experimentId}:${fault.eventId}`;
+    if (this.reportSourceIntegrity.has(key)) return;
+    const count = [...this.reportSourceIntegrity.values()].filter((item) => item.experimentId === fault.experimentId).length;
+    if (fault.eventId === INTEGRITY_OVERFLOW_EVENT_ID || count >= REPORT_SOURCE_INTEGRITY_HARD_CAP) {
+      for (const [existing, item] of this.reportSourceIntegrity) {
+        if (item.experimentId === fault.experimentId) this.reportSourceIntegrity.delete(existing);
+      }
+      this.reportSourceIntegrity.set(overflowKey, overflowIntegrityFault(fault.experimentId, fault.at));
+      return;
+    }
+    this.reportSourceIntegrity.set(key, fault);
+  }
+
+  private async restoreReportSourceIntegrity(): Promise<void> {
+    const experimentId = this.experiment?.id;
+    if (!experimentId) return;
+    if (this.experiment?.status === "IDLE") return;
+    try {
+      const unresolved = await loadUnresolvedReportSourceIntegrity(this.journal, experimentId);
+      const repairs = await loadIntegrityRepairIds(this.journal, experimentId);
+      if (repairs.overflow) {
+        this.clearExperimentIntegrity(experimentId);
+        this.installIntegrityFault(overflowIntegrityFault(experimentId, this.nowFn().toISOString()));
+        return;
+      }
+      for (const [key, fault] of [...this.reportSourceIntegrity.entries()]) {
+        if (fault.experimentId !== experimentId) continue;
+        if (repairs.ids.has(fault.eventId) && fault.eventId !== INTEGRITY_OVERFLOW_EVENT_ID) {
+          this.reportSourceIntegrity.delete(key);
+        }
+      }
+      for (const fault of unresolved) this.installIntegrityFault(fault);
+      const remaining = [...this.reportSourceIntegrity.values()].filter((fault) => fault.experimentId === experimentId);
+      this.clearExperimentIntegrity(experimentId);
+      for (const fault of boundIntegrityFaults(remaining, experimentId)) this.installIntegrityFault(fault);
+    } catch {
+      this.clearExperimentIntegrity(experimentId);
+      this.installIntegrityFault(overflowIntegrityFault(experimentId, this.nowFn().toISOString()));
+    }
+  }
+
+  private clearExperimentIntegrity(experimentId: string): void {
+    for (const key of [...this.reportSourceIntegrity.keys()]) {
+      if (key.startsWith(`${experimentId}:`)) this.reportSourceIntegrity.delete(key);
+    }
+  }
+
+  private clearReportSourceIntegrity(keepExperimentId?: string): void {
+    if (!keepExperimentId) {
+      this.reportSourceIntegrity.clear();
+      return;
+    }
+    for (const key of [...this.reportSourceIntegrity.keys()]) {
+      if (!key.startsWith(`${keepExperimentId}:`)) this.reportSourceIntegrity.delete(key);
+    }
+  }
+
+  private async persistIntegrityFaultMarker(fault: ReportSourceIntegrityFault): Promise<boolean> {
+    if (this.persistedIntegrityFaults.has(fault)) return true;
+    try {
+      await this.journal.append(createIntegrityFaultEvent(fault));
+    } catch {
+      try {
+        await this.commitAuthoritative({
+          operationKey: integrityDurableOperationKey("fault", fault.experimentId, fault.eventId),
+          type: REPORT_SOURCE_INTEGRITY_FAULT,
+          aggregateType: "experiment",
+          aggregateId: fault.experimentId,
+          buildPayload: () => ({
+            eventId: fault.eventId,
+            eventType: fault.eventType,
+            reason: fault.reason,
+            experimentId: fault.experimentId,
+            at: fault.at,
+            derivedAudit: [],
+          }),
+          checkpoint: false,
+        });
+      } catch (error) {
+        this.logger.error({
+          err: error,
+          eventId: fault.eventId,
+        }, "report_source_integrity_durable_marker_failed");
+        return false;
+      }
+    }
+    this.persistedIntegrityFaults.add(fault);
+    return true;
+  }
+
+  private async noteReportSourceIntegrityFault(event: JournalEvent, error: unknown): Promise<boolean> {
+    const experimentId = this.experiment?.id;
+    if (!experimentId) return false;
+    const overflowKey = `${experimentId}:${INTEGRITY_OVERFLOW_EVENT_ID}`;
+    const overflow = this.reportSourceIntegrity.get(overflowKey);
+    if (overflow) return this.persistIntegrityFaultMarker(overflow);
+    const fault: ReportSourceIntegrityFault = {
+      experimentId,
+      eventType: event.type,
+      eventId: event.id,
+      reason: error instanceof Error ? error.message : String(error),
+      at: this.nowFn().toISOString(),
+    };
+    const existing = this.reportSourceIntegrity.get(`${experimentId}:${event.id}`);
+    if (existing) return this.persistIntegrityFaultMarker(existing);
+    this.installIntegrityFault(fault);
+    return this.persistIntegrityFaultMarker(this.reportSourceIntegrity.get(overflowKey) ?? fault);
+  }
+
+  private unresolvedReportSourceIntegrity(experimentId: string): ReportSourceIntegrityFault[] {
+    return [...this.reportSourceIntegrity.values()].filter((fault) => fault.experimentId === experimentId);
+  }
+
+  async repairReportSourceIntegrityForTest(event: JournalEvent): Promise<boolean> {
+    await this.journal.append(event);
+    const experimentId = this.experiment?.id;
+    if (!experimentId) return false;
+    if (this.reportSourceIntegrity.has(`${experimentId}:${INTEGRITY_OVERFLOW_EVENT_ID}`)) return false;
+    const key = `${experimentId}:${event.id}`;
+    const fault = this.reportSourceIntegrity.get(key);
+    if (!fault) return false;
+    const verified = await this.journal.readJournalEventById(event.id);
+    if (!verified || verified.type !== event.type) return false;
+    await this.journal.append(createIntegrityRepairEvent(fault));
+    this.reportSourceIntegrity.delete(key);
+    return true;
+  }
+
+  ensureSourceSeal(experiment: { id: string; startedAt?: string | null; completedAt?: string | null } = this.experiment!): Promise<{ sealed: boolean; reason: string | null }> {
+    // Keep concurrent callers/retries on the same transaction outcome.
+    if (this.sourceSealFlight) return this.sourceSealFlight;
+    this.sourceSealFlight = this.ensureSourceSealAttempt(experiment).finally(() => { this.sourceSealFlight = null; });
+    return this.sourceSealFlight;
+  }
+
+  private async ensureSourceSealAttempt(experiment: { id: string; startedAt?: string | null; completedAt?: string | null }): Promise<{ sealed: boolean; reason: string | null }> {
+    if (this.unresolvedReportSourceIntegrity(experiment.id).length > 0) {
+      return { sealed: false, reason: "REPORT_SOURCE_INTEGRITY_UNRESOLVED" };
+    }
+    const existing = await loadSourceSeal(this.journal, experiment.id);
+    if (existing) {
+      this.sourceSealed = true;
+      this.sourceSealing = false;
+      return { sealed: true, reason: null };
+    }
+    this.freezeExperimentResearchIngress();
+    this.sourceSealPersistCancelled = false;
+    this.sourceSealDeadlineAt = Date.now() + this.sourceSealTimeoutMs;
+    this.sourceSealAbort = new AbortController();
+    const generation = this.sourceSealGeneration;
+    const persistAttempt = ++this.sourceSealPersistAttempt;
+    const remaining = () => remainingSealMs(this.sourceSealDeadlineAt);
+    const work = await this.supervisor.waitUnresolved(remaining());
+    const research = await this.waitResearchIngress(remaining());
+    const journal = await this.journalAdmission.waitReportInput(remaining());
+    if (!work.drained || !research.drained || !journal.drained || work.timedOut || research.timedOut || journal.timedOut || remaining() <= 0) {
+      return { sealed: false, reason: "SOURCE_SEAL_TIMEOUT" };
+    }
+    if (this.unresolvedReportSourceIntegrity(experiment.id).length > 0) {
+      return { sealed: false, reason: "REPORT_SOURCE_INTEGRITY_UNRESOLVED" };
+    }
+    const persist = this.persistSourceSeal(experiment, generation, persistAttempt, this.sourceSealAbort.signal);
+    let timeoutId: ReturnType<typeof setTimeout> | undefined;
+    const outcome = await Promise.race([
+      persist.then((ok) => ({ kind: "done" as const, ok }), (error) =>
+        isJournalAppendDeadlineError(error)
+          ? { kind: "deadline" as const }
+          : { kind: "failed" as const, error }),
+      new Promise<{ kind: "timeout" }>((resolve) => {
+        timeoutId = setTimeout(() => {
+          this.sourceSealAbort?.abort();
+          this.abortSourceSealPersist();
+          resolve({ kind: "timeout" });
+        }, remaining() || 0);
+      }),
+    ]);
+    if (timeoutId) clearTimeout(timeoutId);
+    const sealedIfPresent = async (): Promise<{ sealed: true; reason: null } | null> => {
+      const already = await loadSourceSeal(this.journal, experiment.id);
+      if (!already) return null;
+      this.sourceSealed = true;
+      this.sourceSealing = false;
+      return { sealed: true, reason: null };
+    };
+    const abortedWithoutCommit = (error: unknown) => (
+      isJournalAppendAbortedError(error)
+      || isJournalAdmissionRejectedError(error)
+    );
+    if (outcome.kind === "timeout") {
+      this.sourceSealAbort?.abort();
+      this.abortSourceSealPersist();
+      if (this.sourceSealPersistInFlight) {
+        // Abort requests do not establish a transaction outcome. PG17 disables
+        // transaction_timeout in the irreversible commit phase: await COMMIT or
+        // confirmed abort, even when the wall-clock budget has already elapsed.
+        try { await persist; }
+        catch (error) {
+          const committed = await sealedIfPresent();
+          if (committed) return committed;
+          if (abortedWithoutCommit(error)) return { sealed: false, reason: "SOURCE_SEAL_TIMEOUT" };
+          return { sealed: false, reason: "SOURCE_SEAL_PERSIST_FAILED" };
+        }
+      }
+      return (await sealedIfPresent()) ?? { sealed: false, reason: "SOURCE_SEAL_TIMEOUT" };
+    }
+    if (outcome.kind === "deadline") {
+      return (await sealedIfPresent()) ?? { sealed: false, reason: "SOURCE_SEAL_TIMEOUT" };
+    }
+    if (outcome.kind === "failed") {
+      const committed = await sealedIfPresent();
+      if (committed) return committed;
+      if (abortedWithoutCommit(outcome.error)) return { sealed: false, reason: "SOURCE_SEAL_TIMEOUT" };
+      return { sealed: false, reason: "SOURCE_SEAL_PERSIST_FAILED" };
+    }
+    if (!outcome.ok) {
+      return (await sealedIfPresent()) ?? {
+        sealed: false,
+        reason: remaining() <= 0 || this.sourceSealPersistCancelled ? "SOURCE_SEAL_TIMEOUT" : "SOURCE_SEAL_PERSIST_FAILED",
+      };
+    }
+    const persisted = await loadSourceSeal(this.journal, experiment.id);
+    if (!persisted) return { sealed: false, reason: "SOURCE_SEAL_PERSIST_FAILED" };
+    this.sourceSealed = true;
+    this.sourceSealing = false;
+    return { sealed: true, reason: null };
+  }
+
+  private abortSourceSealPersist(): void {
+    this.sourceSealPersistCancelled = true;
+    this.sourceSealPersistAttempt += 1;
+    this.sourceSealGeneration += 1;
+  }
+
+  private sourceSealPersistStillValid(generation: number, persistAttempt: number): boolean {
+    return !this.sourceSealPersistCancelled
+      && generation === this.sourceSealGeneration
+      && persistAttempt === this.sourceSealPersistAttempt;
+  }
+
+  private async persistSourceSeal(
+    experiment: { id: string; startedAt?: string | null; completedAt?: string | null },
+    generation: number,
+    persistAttempt: number,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    if (this.sourceSealPersistHold) await this.sourceSealPersistHold;
+    if (!this.sourceSealPersistStillValid(generation, persistAttempt) || signal?.aborted) return false;
+    if (remainingSealMs(this.sourceSealDeadlineAt) <= 0) {
+      this.abortSourceSealPersist();
+      return false;
+    }
+    if (!this.sourceSealPersistStillValid(generation, persistAttempt) || signal?.aborted) return false;
+    if (this.unresolvedReportSourceIntegrity(experiment.id).length > 0) return false;
+    const event = createSourceSealEvent({
+      experimentId: experiment.id,
+      startedAt: experiment.startedAt,
+      completedAt: experiment.completedAt,
+      persistAttempt,
+    });
+    this.sourceSealPersistInFlight = true;
+    try {
+      await this.journalAdmission.run("audit", true, async () => {
+        if (signal?.aborted) throw new JournalAppendAbortedError("aborted");
+        await this.journal.append(event, { signal, deadlineAt: this.sourceSealDeadlineAt });
+      }, signal, { reportInput: false });
+    } catch (error) {
+      if (isJournalAppendDeadlineError(error)) throw error;
+      if (isJournalAppendAbortedError(error) || isJournalAdmissionRejectedError(error)) return false;
+      throw error;
+    } finally {
+      this.sourceSealPersistInFlight = false;
+    }
+    if (!this.sourceSealPersistStillValid(generation, persistAttempt) || signal?.aborted) return false;
+    return Boolean(await loadSourceSeal(this.journal, experiment.id));
   }
 
   private async writeFinalReport(): Promise<void> {
     if (!this.experiment || this.reportGenerated) return;
     const experiment = this.experiment;
     try {
-      const scan = await this.heavyRead.run(() => queryEventsPaged(this.journal, {
-        types: [...DECISION_EVENT_TYPES],
-        from: experiment.startedAt ? new Date(experiment.startedAt) : undefined,
-        to: experiment.completedAt ? new Date(experiment.completedAt) : this.nowFn(),
-      }));
-      const events = filterCurrentExperimentEvents(scan.events, experiment);
+      if (experiment.status === "COMPLETED") {
+        if (this.unresolvedReportSourceIntegrity(experiment.id).length > 0) {
+          this.reportGenerated = false;
+          return;
+        }
+        const seal = await this.ensureSourceSeal(experiment);
+        if (!seal.sealed) {
+          this.reportGenerated = false;
+          return;
+        }
+      }
+      const existing = await this.journal.loadExperimentReport(experiment.id, "final");
+      if (existing && isCanonicalFinalReport(existing)) {
+        await ensureReportGeneratedAudit(this.journal, existing, { reportDirectory: process.env.REPORT_DIRECTORY ?? "reports" });
+        this.reportGenerated = true;
+        try {
+          await writeExperimentSummary(summaryFromDurableReport(existing), process.env.REPORT_DIRECTORY ?? "reports");
+        } catch {
+          this.metrics.finalReportFsExportFailures.inc();
+        }
+        return;
+      }
       const unresolved = [...this.ledger.positions.values()].filter((position) => Number(position.upQuantity) > 0 || Number(position.downQuantity) > 0).length;
-      const summary = buildExperimentSummary(events, this.experiment.id, {
-        status: this.experiment.status,
-        closePolicy: this.experiment.closePolicy ?? "observe_until_settlement",
+      const streamed = await this.heavyRead.run(() => streamExperimentSummary(this.journal, experiment, {
+        status: experiment.status,
+        closePolicy: experiment.closePolicy ?? "observe_until_settlement",
         reportKind: "final",
         unresolvedPositionCount: unresolved,
         metricsScope: "complete",
-        complete: scan.complete && !scan.truncated,
-        truncated: scan.truncated,
-        truncatedReason: scan.truncated ? "SCAN_CEILING" : null,
-      });
-      await writeExperimentSummary(summary, process.env.REPORT_DIRECTORY ?? "reports");
-      await this.journal.append(createJournalEvent({
-        traceId: this.experiment.id, type: "EXPERIMENT_REPORT_GENERATED", aggregateType: "experiment", aggregateId: this.experiment.id,
-        payload: {
-          reportDirectory: process.env.REPORT_DIRECTORY ?? "reports", reportKind: "final",
-          settlementPnlUsd: summary.settlementPnlUsd, unresolvedPositionCount: unresolved,
-          experimentId: this.experiment.id, complete: summary.complete, truncated: summary.truncated,
-        },
+        complete: true,
+        truncated: false,
       }));
+      this.metrics.reportScanPages.observe(streamed.scan.pages);
+      this.metrics.reportScanEvents.observe(streamed.scan.scanned);
+      this.metrics.reportScanDuration.observe(streamed.scan.durationMs / 1000);
+      this.metrics.reportAccumulatorHighWaterBytes.set(streamed.accumulatorHighWaterBytes);
+      streamed.summary.complete = streamed.scan.complete && !streamed.scan.truncated && !streamed.scan.interrupted;
+      streamed.summary.truncated = streamed.scan.truncated || streamed.scan.interrupted;
+      streamed.summary.truncatedReason = streamed.summary.truncated ? (streamed.scan.truncatedReason ?? "SCAN_CEILING") : null;
+      if (!streamed.summary.complete || streamed.summary.truncated) {
+        this.reportGenerated = false;
+        return;
+      }
+      if (experiment.status === "COMPLETED") {
+        if (this.unresolvedReportSourceIntegrity(experiment.id).length > 0) {
+          this.reportGenerated = false;
+          return;
+        }
+        if (!(await loadSourceSeal(this.journal, experiment.id))) {
+          this.reportGenerated = false;
+          return;
+        }
+      }
+      let persisted;
+      try {
+        persisted = await persistCanonicalFinalReport(this.journal, {
+          summary: streamed.summary, scan: streamed.scan, experimentStatus: experiment.status,
+        });
+      } catch (error) {
+        this.metrics.finalReportPersistFailures.inc();
+        throw error;
+      }
+      if (!persisted) {
+        this.reportGenerated = false;
+        return;
+      }
+      try {
+        await writeExperimentSummary(streamed.summary, process.env.REPORT_DIRECTORY ?? "reports");
+      } catch {
+        this.metrics.finalReportFsExportFailures.inc();
+      }
+      await ensureReportGeneratedAudit(this.journal, persisted.report, {
+        reportDirectory: process.env.REPORT_DIRECTORY ?? "reports",
+        settlementPnlUsd: streamed.summary.settlementPnlUsd,
+        unresolvedPositionCount: unresolved,
+      });
       this.reportGenerated = true;
-      this.record("EXPERIMENT_REPORT_GENERATED", this.experiment.id, null, { reportKind: "final", settlementPnlUsd: summary.settlementPnlUsd });
+      this.record("EXPERIMENT_REPORT_GENERATED", experiment.id, null, {
+        reportKind: "final",
+        settlementPnlUsd: streamed.summary.settlementPnlUsd,
+        contentHash: persisted.report.contentHash,
+      });
     } catch (error) {
       this.reportGenerated = false;
       this.logger.error({ err: error }, "final experiment report generation failed");
@@ -2585,6 +3144,24 @@ export class EngineService {
   setMaintenanceHoldForTest(hold: Promise<void> | null): void { this.maintenanceHold = hold; }
   setProcessTriggerHoldForTest(hold: Promise<void> | null): void { this.processTriggerHold = hold; }
   setTriggerEventPersistHoldForTest(hold: Promise<void> | null): void { this.triggerEventPersistHold = hold; }
+  setSourceSealTimeoutForTest(ms: number): void { this.sourceSealTimeoutMs = Math.max(1, ms); }
+  setSourceSealPersistHoldForTest(hold: Promise<void> | null): void { this.sourceSealPersistHold = hold; }
+  sourceSealPersistInFlightForTest() { return this.sourceSealPersistInFlight; }
+  setGrokClaimHoldForTest(hold: Promise<void> | null): void { this.grokClaimHold = hold; }
+  researchIngressInFlightForTest() { return this.researchIngressInFlight; }
+  sourceSealStateForTest() { return { sealing: this.sourceSealing, sealed: this.sourceSealed, generation: this.sourceSealGeneration }; }
+  async completeExperimentForTest(): Promise<void> {
+    if (!this.experiment) throw new Error("NO_EXPERIMENT");
+    await this.commitExperimentStatus({
+      ...this.experiment,
+      status: "COMPLETED",
+      completedAt: this.nowFn().toISOString(),
+    });
+  }
+  async ensureSourceSealForTest() {
+    if (!this.experiment) throw new Error("NO_EXPERIMENT");
+    return this.ensureSourceSeal(this.experiment);
+  }
   setReferenceTelemetryHoldForTest(hold: Promise<void> | null): void { this.referenceTelemetryHoldForTest = hold; }
   isTriggerActionable(triggerId: string): boolean {
     const trigger = this.activeTriggers.get(triggerId);
@@ -2642,8 +3219,9 @@ export class EngineService {
     );
   }
   async persistEventForTest(event: ReturnType<typeof createJournalEvent>): Promise<void> {
-    await this.safeAppend(event);
+    await this.persistReportInput(event);
   }
+  reportSourceIntegrityForTest() { return [...this.reportSourceIntegrity.values()]; }
   enqueueTriggerStormForTest(triggers: TriggerEvent[]): { admitted: number; rejected: number; reasons: Record<string, number> } {
     let admitted = 0;
     let rejected = 0;
@@ -2661,6 +3239,18 @@ export class EngineService {
   }
   criticalReservedAvailable(): boolean { return this.supervisor.criticalReservedAvailable(); }
   heavyReadStats() { return { active: this.heavyRead.activeCount, waiting: this.heavyRead.waitingCount }; }
+  retentionManagerForTest() { return this.retention; }
+  async writeFinalReportForTest() { await this.writeFinalReport(); }
+  reportGeneratedForTest() { return this.reportGenerated; }
+  async runRetentionCycleForTest() {
+    return this.retention.runCycle({
+      experiment: this.experiment,
+      now: this.nowFn(),
+      degraded: this.state.journalDegraded || this.overload.state === "DEGRADED",
+      failClosed: this.overload.state === "FAIL_CLOSED",
+      databaseUp: this.state.database === "UP",
+    });
+  }
 
   private adapterTokenSynchronized(tokenId: string): boolean {
     const adapter = this.marketAdapter as PolymarketMarketDataAdapter & { isTokenSynchronized?(id: string): boolean };

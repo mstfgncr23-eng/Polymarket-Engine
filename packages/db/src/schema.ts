@@ -1,4 +1,4 @@
-import { bigint, boolean, index, integer, jsonb, numeric, pgTable, text, timestamp, uniqueIndex } from "drizzle-orm/pg-core";
+import { bigint, boolean, index, integer, jsonb, numeric, pgTable, primaryKey, text, timestamp, uniqueIndex } from "drizzle-orm/pg-core";
 
 const tracedColumns = {
   id: text("id").primaryKey(),
@@ -102,6 +102,30 @@ export const mcpIdempotencyKeys = pgTable("mcp_idempotency_keys", {
   scope: text("scope").notNull(), key: text("key").notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (table) => [uniqueIndex("mcp_idempotency_scope_key_idx").on(table.scope, table.key)]);
+
+export const experimentReports = pgTable("experiment_reports", {
+  experimentId: text("experiment_id").notNull(),
+  reportKind: text("report_kind").notNull(),
+  schemaVersion: integer("schema_version").notNull(),
+  generatedAt: timestamp("generated_at", { withTimezone: true }).notNull(),
+  complete: boolean("complete").notNull(),
+  truncated: boolean("truncated").notNull(),
+  sourceEventCount: integer("source_event_count").notNull(),
+  sourceWindowStart: timestamp("source_window_start", { withTimezone: true }),
+  sourceWindowEnd: timestamp("source_window_end", { withTimezone: true }),
+  sourceFenceOccurredAt: timestamp("source_fence_occurred_at", { withTimezone: true }),
+  sourceFenceId: text("source_fence_id"),
+  earliestIncludedAt: timestamp("earliest_included_at", { withTimezone: true }),
+  latestIncludedAt: timestamp("latest_included_at", { withTimezone: true }),
+  canonicalSummary: jsonb("canonical_summary").notNull(),
+  renderedMarkdown: text("rendered_markdown").notNull(),
+  contentHash: text("content_hash").notNull(),
+  persistedAt: timestamp("persisted_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  primaryKey({ name: "experiment_reports_pkey", columns: [table.experimentId, table.reportKind] }),
+  index("experiment_reports_hash_idx").on(table.experimentId, table.contentHash),
+  index("experiment_reports_complete_idx").on(table.complete, table.truncated, table.persistedAt),
+]);
 
 export const durableTransitions = pgTable("durable_transitions", {
   sequence: bigint("sequence", { mode: "number" }).primaryKey(),

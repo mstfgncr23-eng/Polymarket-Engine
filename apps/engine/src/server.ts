@@ -2,7 +2,7 @@ import cors from "@fastify/cors";
 import sensible from "@fastify/sensible";
 import Fastify, { type FastifyInstance, type FastifyRequest } from "fastify";
 import { timingSafeEqual } from "node:crypto";
-import { DECISION_EVENT_TYPES, type GrokSignalSubmission } from "@pm/core";
+import { DECISION_EVENT_TYPES, HISTORY_DECISIONS_LIMIT, TRACE_PAGE_MAX, type GrokSignalSubmission } from "@pm/core";
 import type { EventJournal } from "@pm/db";
 import type { EngineMetrics } from "./metrics.js";
 import type { DashboardSnapshot, EngineStateStore } from "./state.js";
@@ -147,6 +147,7 @@ export async function createApiServer(input: {
   dashboardOrigin: string;
   mcp: McpConfig;
   submitGrokSignal(signal: GrokSignalSubmission, clientId: string): Promise<Record<string, unknown>>;
+  persistReportInput?(event: import("@pm/core").JournalEvent): Promise<void>;
   noteMcpRequest?(tool: string | null, triggerId?: string): void;
   isTokenSynchronized?(tokenId: string): boolean;
   isTriggerActionable?(triggerId: string): boolean;
@@ -187,8 +188,12 @@ export async function createApiServer(input: {
     if (!auth.ok && input.metricsToken) return reply.code(401).send({ error: "METRICS_UNAUTHORIZED" });
     return reply.type(input.metrics.registry.contentType).send(await input.metrics.registry.metrics());
   });
+  const persistReportInput = input.persistReportInput ?? (async (event) => {
+    throw new Error(`PERSIST_REPORT_INPUT_REQUIRED:${event.type}`);
+  });
   const mcpHandler = createMcpHttpHandler(input.mcp, {
     state: input.state, journal: input.journal, metrics: input.metrics, submitSignal: input.submitGrokSignal,
+    persistReportInput,
     noteMcpRequest: input.noteMcpRequest,
     isTokenSynchronized: input.isTokenSynchronized,
     isTriggerActionable: input.isTriggerActionable,
@@ -212,21 +217,33 @@ export async function createApiServer(input: {
     if (denied) return denied;
     return input.state.snapshot().equityHistory;
   });
-  app.get<{ Params: { traceId: string } }>("/api/traces/:traceId", async (request, reply) => {
+  app.get<{ Params: { traceId: string }; Querystring: { cursor?: string; limit?: string } }>("/api/traces/:traceId", async (request, reply) => {
     const denied = await requireRead(request, reply);
     if (denied) return denied;
     try {
-      return { traceId: request.params.traceId, events: await heavyRead.run(() => input.journal.readTrace(request.params.traceId)) };
+      const requested = Number(request.query.limit ?? TRACE_PAGE_MAX);
+      const limit = Math.max(1, Math.min(Number.isFinite(requested) ? requested : TRACE_PAGE_MAX, TRACE_PAGE_MAX));
+      const after = parseTraceCursor(request.query.cursor);
+      const page = await heavyRead.run(() => input.journal.readTracePage(request.params.traceId, { after, limit }));
+      return {
+        traceId: request.params.traceId,
+        events: page.events,
+        nextCursor: page.nextCursor ? `${page.nextCursor.occurredAt}|${page.nextCursor.id}` : null,
+        limit,
+        complete: page.nextCursor == null,
+      };
     } catch (error) {
       if (error instanceof Error && error.message === "HEAVY_READ_BUSY") return reply.code(503).send({ error: "HEAVY_READ_BUSY" });
       throw error;
     }
   });
-  app.get("/api/history/decisions", async (request, reply) => {
+  app.get<{ Querystring: { limit?: string } }>("/api/history/decisions", async (request, reply) => {
     const denied = await requireRead(request, reply);
     if (denied) return denied;
     try {
-      return { events: await heavyRead.run(() => input.journal.queryEvents({ types: DECISION_EVENT_TYPES, limit: 500 })) };
+      const requested = Number(request.query.limit ?? HISTORY_DECISIONS_LIMIT);
+      const limit = Math.max(1, Math.min(Number.isFinite(requested) ? requested : HISTORY_DECISIONS_LIMIT, HISTORY_DECISIONS_LIMIT));
+      return { events: await heavyRead.run(() => input.journal.queryEvents({ types: DECISION_EVENT_TYPES, limit })) };
     } catch (error) {
       if (error instanceof Error && error.message === "HEAVY_READ_BUSY") return reply.code(503).send({ error: "HEAVY_READ_BUSY" });
       throw error;
@@ -264,4 +281,11 @@ export async function createApiServer(input: {
     request.raw.on("close", () => { clearInterval(keepalive); remove(); });
   });
   return app;
+}
+
+function parseTraceCursor(raw: string | undefined): { occurredAt: string; id: string } | undefined {
+  if (!raw) return undefined;
+  const sep = raw.indexOf("|");
+  if (sep <= 0 || sep === raw.length - 1) return undefined;
+  return { occurredAt: raw.slice(0, sep), id: raw.slice(sep + 1) };
 }

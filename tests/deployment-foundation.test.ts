@@ -337,7 +337,7 @@ describe("deployment foundation", () => {
 
   it("Drizzle migrations are additive and safe against a pre-provisioned schema", () => {
     const dir = join(repoRoot, "packages/db/migrations");
-    const files = ["0000_initial.sql", "0001_grok_mcp.sql", "0002_journal_query.sql", "0003_rls_lockdown.sql", "0004_critical_replay.sql"];
+    const files = ["0000_initial.sql", "0001_grok_mcp.sql", "0002_journal_query.sql", "0003_rls_lockdown.sql", "0004_critical_replay.sql", "0005_step4_reports_retention.sql"];
     const sql = files.map((name) => readFileSync(join(dir, name), "utf8")).join("\n");
     expect(sql).not.toMatch(/\bDROP\s+TABLE\b/i);
     expect(sql).not.toMatch(/\bDROP\s+SCHEMA\b/i);
@@ -353,8 +353,13 @@ describe("deployment foundation", () => {
     expect(rls).toMatch(/Duplicate supabase_migrations rows named 0003_rls_lockdown are harmless/);
     const journal = JSON.parse(readFileSync(join(dir, "meta/_journal.json"), "utf8")) as { entries: Array<{ tag: string }> };
     expect(readFileSync(join(dir, "0004_critical_replay.sql"), "utf8")).toMatch(/CREATE TABLE IF NOT EXISTS durable_transitions/);
+    const step4 = readFileSync(join(dir, "0005_step4_reports_retention.sql"), "utf8");
+    expect(step4).toMatch(/CREATE TABLE IF NOT EXISTS experiment_reports/);
+    expect(step4).toMatch(/ENABLE ROW LEVEL SECURITY/);
+    expect(step4).not.toMatch(/FORCE ROW LEVEL SECURITY/);
+    expect(step4).not.toMatch(/CREATE POLICY/i);
     expect(journal.entries.map((entry) => entry.tag)).toEqual([
-      "0000_initial", "0001_grok_mcp", "0002_journal_query", "0003_rls_lockdown", "0004_critical_replay",
+      "0000_initial", "0001_grok_mcp", "0002_journal_query", "0003_rls_lockdown", "0004_critical_replay", "0005_step4_reports_retention",
     ]);
   });
 });

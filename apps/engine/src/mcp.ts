@@ -12,9 +12,11 @@ import {
   GrokSignalValidationError,
   type GrokSignalSubmission,
 } from "@pm/core";
-import { createJournalEvent, queryEventsPaged, type EventJournal } from "@pm/db";
+import { createJournalEvent, isCanonicalFinalReport, type EventJournal } from "@pm/db";
 import type { EngineMetrics } from "./metrics.js";
+import { streamExperimentSummary, summaryFromDurableReport } from "./final-report.js";
 import { buildExperimentSummary, filterCurrentExperimentEvents } from "./report.js";
+import { KeyedResultFlight } from "./runtime-supervisor.js";
 import type { EngineStateStore } from "./state.js";
 
 export interface McpConfig {
@@ -28,6 +30,7 @@ export interface McpDependencies {
   journal: EventJournal;
   metrics: EngineMetrics;
   submitSignal(signal: GrokSignalSubmission, clientId: string): Promise<Record<string, unknown>>;
+  persistReportInput(event: import("@pm/core").JournalEvent): Promise<void>;
   noteMcpRequest?(tool: string | null, triggerId?: string): void;
   heavyRead?<T>(work: () => Promise<T>): Promise<T>;
   isTokenSynchronized?(tokenId: string): boolean;
@@ -91,6 +94,17 @@ let strategyMetricsCache: {
   experimentId: string;
   value: ReturnType<typeof buildExperimentSummary>;
 } | null = null;
+
+const completeMetricsFlights = new KeyedResultFlight<ReturnType<typeof buildExperimentSummary>>();
+
+export function resetStrategyMetricsCacheForTest(): void {
+  strategyMetricsCache = null;
+  completeMetricsFlights.clear();
+}
+
+export function completeMetricsFlightKey(experimentId: string, startedAt?: string | null, completedAt?: string | null): string {
+  return `${experimentId}|${startedAt ?? ""}|${completedAt ?? ""}`;
+}
 
 export const FORBIDDEN_MCP_TRADE_TOOLS = new Set([
   "place_order", "submit_order", "create_order", "cancel_order", "replace_order",
@@ -175,7 +189,7 @@ export function createMcpHttpHandler(config: McpConfig, dependencies: McpDepende
     if (!auth.ok) {
       dependencies.state.recordGrokRejection("unauthorized");
       dependencies.metrics.mcpInteractions.inc({ status: auth.status === 503 ? "unconfigured" : "unauthorized", method });
-      await audit(dependencies.journal, {
+      await audit(dependencies.persistReportInput, {
         clientId: "unauthorized", tokenFingerprint: auth.tokenFingerprint, method, tool: toolName, requestId,
         status: auth.reason, rateLimitResult: "not_evaluated", durationMs: performance.now() - started,
       });
@@ -184,7 +198,7 @@ export function createMcpHttpHandler(config: McpConfig, dependencies: McpDepende
     }
     if (!security.originAllowed(request.headers.origin)) {
       dependencies.metrics.mcpInteractions.inc({ status: "origin_rejected", method });
-      await audit(dependencies.journal, {
+      await audit(dependencies.persistReportInput, {
         clientId: auth.clientId, tokenFingerprint: auth.tokenFingerprint, method, tool: toolName, requestId,
         status: "ORIGIN_REJECTED", rateLimitResult: "not_evaluated", durationMs: performance.now() - started,
       });
@@ -193,7 +207,7 @@ export function createMcpHttpHandler(config: McpConfig, dependencies: McpDepende
     if (!security.consume(auth.clientId)) {
       dependencies.state.recordGrokRejection("rate_limited");
       dependencies.metrics.mcpInteractions.inc({ status: "rate_limited", method });
-      await audit(dependencies.journal, {
+      await audit(dependencies.persistReportInput, {
         clientId: auth.clientId, tokenFingerprint: auth.tokenFingerprint, method, tool: toolName, requestId,
         status: "RATE_LIMITED", rateLimitResult: "limited", durationMs: performance.now() - started,
       });
@@ -201,7 +215,7 @@ export function createMcpHttpHandler(config: McpConfig, dependencies: McpDepende
     }
     if (request.method !== "POST") {
       dependencies.metrics.mcpInteractions.inc({ status: "method_not_allowed", method });
-      await audit(dependencies.journal, {
+      await audit(dependencies.persistReportInput, {
         clientId: auth.clientId, tokenFingerprint: auth.tokenFingerprint, method, tool: toolName, requestId,
         status: "METHOD_NOT_ALLOWED", rateLimitResult: "ok", durationMs: performance.now() - started,
       });
@@ -211,7 +225,7 @@ export function createMcpHttpHandler(config: McpConfig, dependencies: McpDepende
     if (toolName && ALLOWED_MCP_WRITE_TOOLS.includes(toolName as (typeof ALLOWED_MCP_WRITE_TOOLS)[number]) && !clientMayCallWriteTool(auth.clientId, toolName)) {
       dependencies.state.recordGrokRejection("rejected");
       dependencies.metrics.mcpInteractions.inc({ status: "write_tool_forbidden", method });
-      await audit(dependencies.journal, {
+      await audit(dependencies.persistReportInput, {
         clientId: auth.clientId, tokenFingerprint: auth.tokenFingerprint, method, tool: toolName, requestId,
         status: "WRITE_TOOL_FORBIDDEN", rateLimitResult: "ok", durationMs: performance.now() - started,
         payloadMeta: { argumentKeys: argumentKeys(request.body), agentId: auth.clientId },
@@ -228,7 +242,7 @@ export function createMcpHttpHandler(config: McpConfig, dependencies: McpDepende
       const status = forbidden ? "FORBIDDEN_TRADE_TOOL" : "UNKNOWN_TOOL";
       dependencies.state.recordGrokRejection("rejected");
       dependencies.metrics.mcpInteractions.inc({ status: forbidden ? "forbidden_trade" : "unknown_tool", method });
-      await audit(dependencies.journal, {
+      await audit(dependencies.persistReportInput, {
         clientId: auth.clientId, tokenFingerprint: auth.tokenFingerprint, method, tool: toolName, requestId,
         status, rateLimitResult: "ok", durationMs: performance.now() - started,
         payloadMeta: { argumentKeys: argumentKeys(request.body) },
@@ -249,7 +263,7 @@ export function createMcpHttpHandler(config: McpConfig, dependencies: McpDepende
       await transport.handleRequest(request.raw, reply.raw, request.body);
       dependencies.metrics.mcpInteractions.inc({ status: "handled", method });
       dependencies.metrics.mcpLatency.observe({ method }, (performance.now() - started) / 1000);
-      await audit(dependencies.journal, {
+      await audit(dependencies.persistReportInput, {
         clientId: auth.clientId, tokenFingerprint: auth.tokenFingerprint, method, tool: toolName, requestId,
         status: "HANDLED", rateLimitResult: "ok", durationMs: performance.now() - started,
         ...submissionAuditMeta(request.body),
@@ -257,7 +271,7 @@ export function createMcpHttpHandler(config: McpConfig, dependencies: McpDepende
       return reply;
     } catch (error) {
       dependencies.metrics.mcpInteractions.inc({ status: "error", method });
-      await audit(dependencies.journal, {
+      await audit(dependencies.persistReportInput, {
         clientId: auth.clientId, tokenFingerprint: auth.tokenFingerprint, method, tool: toolName, requestId,
         status: "ERROR", rateLimitResult: "ok", durationMs: performance.now() - started, errorCode: safeErrorCode(error),
       });
@@ -317,7 +331,7 @@ export function createGrokMcpServer(clientId: string, dependencies: McpDependenc
   });
 
   server.registerTool("get_strategy_metrics", {
-    description: "Read journal-derived paper strategy and experiment performance. scope=rolling is a recent window; scope=complete paginates the full experiment.",
+    description: "Read paper strategy metrics. scope=rolling is a bounded recent window. scope=complete prefers the durable final report when the experiment is completed; a running experiment streams with a bounded accumulator and coalesces concurrent callers.",
     inputSchema: { scope: z.enum(["rolling", "complete"]).default("rolling") }, annotations: readOnly,
   }, async ({ scope }) => {
     const now = Date.now();
@@ -330,28 +344,44 @@ export function createGrokMcpServer(clientId: string, dependencies: McpDependenc
       && strategyMetricsCache.experimentId === experimentId
       && now - strategyMetricsCache.at < 15_000
     ) return toolResult(strategyMetricsCache.value);
-    const window = {
-      from: startedAt ? new Date(startedAt) : undefined,
-      to: completedAt ? new Date(completedAt) : undefined,
+    const experiment = { id: experimentId, startedAt, completedAt };
+    const readComplete = async () => {
+      if (completedAt) {
+        const persisted = await dependencies.journal.loadExperimentReport(experimentId, "final");
+        if (persisted && isCanonicalFinalReport(persisted)) return summaryFromDurableReport(persisted);
+      }
+      const work = async () => {
+        const streamed = await streamExperimentSummary(dependencies.journal, experiment, {
+          status: dependencies.state.experimentStatus ?? "unknown",
+          reportKind: "final",
+          metricsScope: "complete",
+          complete: Boolean(startedAt),
+        });
+        dependencies.metrics.reportScanPages.observe(streamed.scan.pages);
+        dependencies.metrics.reportScanEvents.observe(streamed.scan.scanned);
+        dependencies.metrics.reportScanDuration.observe(streamed.scan.durationMs / 1000);
+        dependencies.metrics.reportAccumulatorHighWaterBytes.set(streamed.accumulatorHighWaterBytes);
+        streamed.summary.complete = streamed.scan.complete && dependencies.state.experimentStatus === "COMPLETED" && streamed.scan.fence.stable && !streamed.scan.interrupted;
+        streamed.summary.truncated = streamed.scan.truncated || streamed.scan.interrupted || !streamed.scan.fence.stable;
+        streamed.summary.truncatedReason = streamed.summary.truncated ? (streamed.scan.truncatedReason ?? "SCAN_CEILING") : null;
+        return streamed.summary;
+      };
+      const key = completeMetricsFlightKey(experimentId, startedAt, completedAt);
+      if (completeMetricsFlights.inFlight(key)) dependencies.metrics.completeMetricsCoalesced.inc();
+      return completeMetricsFlights.run(key, () => dependencies.heavyRead ? dependencies.heavyRead(work) : work());
     };
-    const scan = scope === "complete"
-      ? await (dependencies.heavyRead
-        ? dependencies.heavyRead(() => queryEventsPaged(dependencies.journal, { types: DECISION_EVENT_TYPES, ...window }))
-        : queryEventsPaged(dependencies.journal, { types: DECISION_EVENT_TYPES, ...window }))
-      : { events: await (dependencies.heavyRead
-        ? dependencies.heavyRead(() => dependencies.journal.queryEvents({ types: DECISION_EVENT_TYPES, ...window, limit: 500, order: "desc" as const }))
-        : dependencies.journal.queryEvents({ types: DECISION_EVENT_TYPES, ...window, limit: 500, order: "desc" })), complete: true, truncated: false };
-    const scoped = filterCurrentExperimentEvents(scan.events, {
-      id: experimentId, startedAt, completedAt,
-    });
-    const summary = buildExperimentSummary(scoped, experimentId, {
-      status: dependencies.state.experimentStatus ?? "unknown",
-      reportKind: scope === "complete" ? "final" : "interim",
-      metricsScope: scope,
-      complete: scope === "complete" && scan.complete && Boolean(startedAt),
-      truncated: scan.truncated,
-      truncatedReason: scan.truncated ? "SCAN_CEILING" : null,
-    });
+    const summary = scope === "complete"
+      ? await readComplete()
+      : buildExperimentSummary(
+        filterCurrentExperimentEvents(
+          await (dependencies.heavyRead
+            ? dependencies.heavyRead(() => dependencies.journal.queryEvents({ types: DECISION_EVENT_TYPES, from: startedAt ? new Date(startedAt) : undefined, to: completedAt ? new Date(completedAt) : undefined, limit: 500, order: "desc" }))
+            : dependencies.journal.queryEvents({ types: DECISION_EVENT_TYPES, from: startedAt ? new Date(startedAt) : undefined, to: completedAt ? new Date(completedAt) : undefined, limit: 500, order: "desc" })),
+          experiment,
+        ),
+        experimentId,
+        { status: dependencies.state.experimentStatus ?? "unknown", reportKind: "interim", metricsScope: "rolling", complete: false, truncated: false },
+      );
     strategyMetricsCache = { at: now, scope, experimentId, value: summary };
     return toolResult(summary);
   });
@@ -498,12 +528,14 @@ function looksLikeTradeTool(name: string): boolean {
 
 function safeErrorCode(error: unknown): string { return error instanceof Error ? error.name.slice(0, 80) : "UNKNOWN_ERROR"; }
 
-async function audit(journal: EventJournal, input: {
+async function audit(
+  persistReportInput: (event: import("@pm/core").JournalEvent) => Promise<void>,
+  input: {
   clientId: string; tokenFingerprint: string | null; method: string; tool: string | null; requestId: string | number | null;
   status: string; rateLimitResult: string; durationMs: number; errorCode?: string; idempotencyId?: string; traceId?: string;
   triggerId?: string; payloadMeta?: Record<string, unknown>;
 }): Promise<void> {
-  await journal.append(createJournalEvent({
+  await persistReportInput(createJournalEvent({
     traceId: input.traceId ?? createId("mcp_trace"),
     correlationId: input.idempotencyId ?? (input.requestId !== null ? String(input.requestId) : createId("mcp_req")),
     type: "MCP_INTERACTION", aggregateType: "mcp_client", aggregateId: input.clientId,
