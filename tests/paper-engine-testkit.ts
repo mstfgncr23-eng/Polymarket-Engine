@@ -127,6 +127,35 @@ export class ScriptedMarketAdapter {
   markTokenSync(tokenId: string, state: "AWAITING_BOOK" | "SYNCED" | "GAPPED", epoch?: number): void {
     const current = this.sync.get(tokenId);
     this.sync.set(tokenId, { state, epoch: epoch ?? (current?.epoch ?? 1) + (state === "GAPPED" || state === "AWAITING_BOOK" ? 1 : 0) });
+    if (state === "GAPPED") {
+      void this.handlers?.onGap?.({
+        reason: "explicit_resubscribe",
+        tokenCount: 1,
+        epoch: this.sync.get(tokenId)?.epoch ?? 1,
+        tokenIds: [tokenId],
+      });
+    }
+  }
+
+  async waitForHandlers(timeoutMs = 1_500): Promise<void> {
+    const started = Date.now();
+    while (!this.handlers) {
+      if (Date.now() - started > timeoutMs) throw new Error("scripted market handlers not attached");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  }
+
+  emitGap(tokenIds: readonly string[], reason: "explicit_resubscribe" | "reconnect" | "count_limit" = "explicit_resubscribe"): void {
+    for (const tokenId of tokenIds) {
+      const current = this.sync.get(tokenId);
+      this.sync.set(tokenId, { state: "GAPPED", epoch: (current?.epoch ?? 1) + 1 });
+    }
+    void this.handlers?.onGap?.({
+      reason,
+      tokenCount: tokenIds.length,
+      epoch: tokenIds[0] ? (this.sync.get(tokenIds[0])?.epoch ?? 1) : 0,
+      tokenIds: [...tokenIds],
+    });
   }
 }
 
@@ -143,7 +172,11 @@ export class ScriptedReferenceRegistry {
     this.startCounts.set(asset, (this.startCounts.get(asset) ?? 0) + 1);
     return "started";
   }
-  stop(asset: string): boolean { return this.running.delete(asset); }
+  readonly stopCounts = new Map<string, number>();
+  stop(asset: string): boolean {
+    this.stopCounts.set(asset, (this.stopCounts.get(asset) ?? 0) + 1);
+    return this.running.delete(asset);
+  }
   runningAssets(): string[] { return [...this.running.keys()]; }
 }
 
@@ -166,14 +199,15 @@ export async function startQualifiedEngine(overrides: Record<string, string | un
   market.queue(discoveryReport([btc]));
   const journal = new MemoryEventJournal();
   const env = qualifiedPaperEnv(overrides);
+  const referenceRegistry = new ScriptedReferenceRegistry();
   const engine = new EngineService(env, journal, { error: () => undefined }, {
     market: market as never,
-    referenceRegistry: new ScriptedReferenceRegistry() as never,
+    referenceRegistry: referenceRegistry as never,
     activation: new NoopGrokActivationBridge(),
     now,
   });
   await engine.start();
-  return { engine, journal, market, env, marketId: btc.id };
+  return { engine, journal, market, env, marketId: btc.id, referenceRegistry };
 }
 
 export function book(overrides: Partial<MarketSnapshot> = {}): MarketSnapshot {

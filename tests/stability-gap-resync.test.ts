@@ -46,8 +46,14 @@ function deltaEvent(timestamp: number, size = "9") {
 describe("SDK subscribe findings + owned bounds", () => {
   it("default adapter (no injected client) uses the owned bounded CLOB transport", () => {
     const adapter = new PolymarketMarketDataAdapter();
+    expect(adapter.usesBoundedMarketTransport()).toBe(true);
     expect(adapter.usesOwnedBoundedTransport()).toBe(true);
     expect(POLYMARKET_CLIENT_SUBSCRIBE_FINDINGS.bounded).toBe(false);
+  });
+
+  it("injected PublicClient is discovery/REST only — market stream stays bounded", () => {
+    const adapter = createAdapter();
+    expect(adapter.usesBoundedMarketTransport()).toBe(true);
   });
 
   it("documents that @polymarket/client subscribe is an unbounded it-pushable FIFO", () => {

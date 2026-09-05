@@ -103,17 +103,14 @@ export function spread(snapshot: MarketSnapshot): string | null {
   return bid && ask ? decimal(d(ask.price).minus(bid.price)) : null;
 }
 
-const DECIMAL_QTY_RE = /^-?\d+(?:\.\d+)?$/;
-
 /**
- * First-N-level imbalance without slice/reduce temps. Number fast path only
- * when every visited quantity is an exact IEEE value (Decimal fallback otherwise).
+ * First-N-level imbalance without slice/reduce temps. Decimal accumulate then
+ * ratio→Number — same semantics as the original reduce. No Number-sum fast path
+ * (intermediate sums are not IEEE-exact even when each quantity is).
  */
 export function bookImbalance(snapshot: MarketSnapshot, levels = 5): number {
   const bidN = Math.min(levels, snapshot.bids.length);
   const askN = Math.min(levels, snapshot.asks.length);
-  const fast = tryNumberBookImbalance(snapshot, bidN, askN);
-  if (fast !== null) return fast;
   let bid = d(0);
   let ask = d(0);
   for (let i = 0; i < bidN; i += 1) bid = bid.plus(snapshot.bids[i]!.quantity);
@@ -122,47 +119,11 @@ export function bookImbalance(snapshot: MarketSnapshot, levels = 5): number {
   return total.eq(0) ? 0 : bid.minus(ask).div(total).toNumber();
 }
 
-export function exactNumberQuantity(value: string): number | null {
-  if (!DECIMAL_QTY_RE.test(value)) return null;
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric)) return null;
-  // Decimal(number) uses Number#toString and hides binary error (0.1 → "0.1").
-  // Compare the decimal literal to the true IEEE value (21-digit precision).
-  const ieee = numeric.toPrecision(21);
-  if (/e/i.test(ieee)) return d(value).eq(d(ieee)) ? numeric : null;
-  return normalizeDecimalLiteral(value) === normalizeDecimalLiteral(ieee) ? numeric : null;
-}
-
-function normalizeDecimalLiteral(raw: string): string {
-  let text = raw;
-  let sign = "";
-  if (text.startsWith("-")) {
-    sign = "-";
-    text = text.slice(1);
-  }
-  const dot = text.indexOf(".");
-  let whole = dot === -1 ? text : text.slice(0, dot);
-  let frac = dot === -1 ? "" : text.slice(dot + 1);
-  whole = whole.replace(/^0+(?=\d)/, "");
-  frac = frac.replace(/0+$/, "");
-  return frac.length > 0 ? `${sign}${whole}.${frac}` : `${sign}${whole || "0"}`;
-}
-
-function tryNumberBookImbalance(snapshot: MarketSnapshot, bidN: number, askN: number): number | null {
-  let bid = 0;
-  let ask = 0;
-  for (let i = 0; i < bidN; i += 1) {
-    const quantity = exactNumberQuantity(snapshot.bids[i]!.quantity);
-    if (quantity === null) return null;
-    bid += quantity;
-  }
-  for (let i = 0; i < askN; i += 1) {
-    const quantity = exactNumberQuantity(snapshot.asks[i]!.quantity);
-    if (quantity === null) return null;
-    ask += quantity;
-  }
-  const total = bid + ask;
-  return total === 0 ? 0 : (bid - ask) / total;
+export function bookImbalanceReference(snapshot: MarketSnapshot, levels = 5): number {
+  const bid = snapshot.bids.slice(0, levels).reduce((sum, level) => sum.plus(level.quantity), d(0));
+  const ask = snapshot.asks.slice(0, levels).reduce((sum, level) => sum.plus(level.quantity), d(0));
+  const total = bid.plus(ask);
+  return total.eq(0) ? 0 : bid.minus(ask).div(total).toNumber();
 }
 
 export interface PairMetrics {

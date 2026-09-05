@@ -16,14 +16,15 @@ export interface ActivationDecision {
 }
 
 const SENT_TTL_MS = 3_600_000;
-const SCOPE_TTL_MS = 3_600_000;
+export const ACTIVATION_SCOPE_TTL_MS = 3_600_000;
+const SCOPE_TTL_MS = ACTIVATION_SCOPE_TTL_MS;
 
 export class GrokActivationCoordinator {
   private readonly sent = new Map<string, number>();
-  private readonly sentOrder: string[] = [];
+  private readonly sentOrder: Array<{ key: string; at: number } | undefined> = [];
   private sentHead = 0;
   private readonly lastByMarketAsset = new Map<string, { at: number; severity: number }>();
-  private readonly lastOrder: string[] = [];
+  private readonly lastOrder: Array<{ key: string; at: number } | undefined> = [];
   private lastHead = 0;
   private readonly recent: number[] = [];
   private recentHead = 0;
@@ -62,13 +63,13 @@ export class GrokActivationCoordinator {
     const nowMs = now.getTime();
     this.ensureLatency(trigger, now.toISOString());
     const scope = `${trigger.marketId ?? "none"}:${trigger.asset ?? "none"}:${trigger.kind}`;
-    if (!this.lastByMarketAsset.has(scope)) this.lastOrder.push(scope);
     this.lastByMarketAsset.set(scope, { at: nowMs, severity: trigger.severity });
+    this.lastOrder.push({ key: scope, at: nowMs });
     this.recent.push(nowMs);
     for (const role of request.targetRoles) {
       const key = activationIdempotencyKey(trigger.id, role);
-      if (!this.sent.has(key)) this.sentOrder.push(key);
       this.sent.set(key, nowMs);
+      this.sentOrder.push({ key, at: nowMs });
     }
     this.prune();
   }
@@ -191,6 +192,14 @@ export class GrokActivationCoordinator {
     return [...this.latency.values()];
   }
 
+  touchScopeForTest(marketId: string, asset: string, kind: string, severity = 2): void {
+    const nowMs = this.now().getTime();
+    const scope = `${marketId}:${asset}:${kind}`;
+    this.lastByMarketAsset.set(scope, { at: nowMs, severity });
+    this.lastOrder.push({ key: scope, at: nowMs });
+    this.prune();
+  }
+
   footprint(): { sent: number; lastByMarketAsset: number; latency: number; recent: number } {
     this.prune();
     return { sent: this.sent.size, lastByMarketAsset: this.lastByMarketAsset.size, latency: this.latency.size, recent: this.recentCount() };
@@ -204,7 +213,7 @@ export class GrokActivationCoordinator {
       this.latencyHead += 1;
       if (oldest) this.latency.delete(oldest);
     }
-    this.compact(this.latencyOrder, () => { this.latencyHead = 0; }, this.latencyHead, (head) => { this.latencyHead = head; });
+    this.compact(this.latencyOrder, this.latencyHead, (head) => { this.latencyHead = head; });
   }
 
   private prune(): void {
@@ -232,7 +241,7 @@ export class GrokActivationCoordinator {
 
   private expireOrdered(
     map: Map<string, number>,
-    order: string[],
+    order: Array<{ key: string; at: number } | undefined>,
     getHead: () => number,
     setHead: (head: number) => void,
     now: number,
@@ -240,36 +249,39 @@ export class GrokActivationCoordinator {
   ): void {
     let head = getHead();
     while (head < order.length) {
-      const key = order[head];
-      if (!key) { head += 1; continue; }
-      const at = map.get(key);
-      if (at !== undefined && now - at <= ttl) break;
-      if (at !== undefined && now - at > ttl) map.delete(key);
-      order[head] = undefined as unknown as string;
+      const record = order[head];
+      if (!record) { head += 1; continue; }
+      const current = map.get(record.key);
+      if (current === record.at && now - record.at <= ttl) break;
+      if (current === record.at && now - record.at > ttl) map.delete(record.key);
+      order[head] = undefined;
       head += 1;
     }
     setHead(head);
-    this.compact(order, () => setHead(0), head, setHead);
+    this.compact(order, head, setHead);
   }
 
   private expireLastByMarket(now: number): void {
     while (this.lastHead < this.lastOrder.length) {
-      const key = this.lastOrder[this.lastHead];
-      if (!key) { this.lastHead += 1; continue; }
-      const item = this.lastByMarketAsset.get(key);
-      if (item && now - item.at <= SCOPE_TTL_MS) break;
-      if (item && now - item.at > SCOPE_TTL_MS) this.lastByMarketAsset.delete(key);
-      this.lastOrder[this.lastHead] = undefined as unknown as string;
+      const record = this.lastOrder[this.lastHead];
+      if (!record) { this.lastHead += 1; continue; }
+      const item = this.lastByMarketAsset.get(record.key);
+      if (item && item.at === record.at && now - record.at <= SCOPE_TTL_MS) break;
+      if (item && item.at === record.at && now - record.at > SCOPE_TTL_MS) this.lastByMarketAsset.delete(record.key);
+      this.lastOrder[this.lastHead] = undefined;
       this.lastHead += 1;
     }
-    this.compact(this.lastOrder, () => { this.lastHead = 0; }, this.lastHead, (head) => { this.lastHead = head; });
+    this.compact(this.lastOrder, this.lastHead, (head) => { this.lastHead = head; });
   }
 
-  private compact(order: string[], resetHead: () => void, head: number, setHead: (head: number) => void): void {
+  private compact(
+    order: Array<unknown>,
+    head: number,
+    setHead: (head: number) => void,
+  ): void {
     if (head < 1_024) return;
     order.splice(0, head);
     setHead(0);
-    resetHead();
   }
 }
 

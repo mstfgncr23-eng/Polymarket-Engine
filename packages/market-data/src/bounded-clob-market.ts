@@ -1,5 +1,6 @@
 import { BoundedIngressQueue, IngressOverflowError } from "./bounded-ingress.js";
 import { CLOB_MARKET_WS_URL, MARKET_INGRESS_BOUNDS } from "./ingress-bounds.js";
+import type { MarketStreamTransport } from "./market-stream-transport.js";
 
 export interface BoundedMarketStream {
   close(): Promise<void>;
@@ -24,7 +25,8 @@ export interface BoundedMarketTransportOptions {
  * `custom_feature_enabled`). Fresh subscribe is how the CLOB emits canonical
  * `book` snapshots; this transport does not invent books.
  */
-export class BoundedClobMarketTransport {
+export class BoundedClobMarketTransport implements MarketStreamTransport {
+  readonly bounded = true as const;
   readonly queue: BoundedIngressQueue;
   private readonly url: string;
   private readonly pingIntervalMs: number;

@@ -30,6 +30,25 @@ export interface McpDependencies {
   submitSignal(signal: GrokSignalSubmission, clientId: string): Promise<Record<string, unknown>>;
   noteMcpRequest?(tool: string | null, triggerId?: string): void;
   heavyRead?<T>(work: () => Promise<T>): Promise<T>;
+  isTokenSynchronized?(tokenId: string): boolean;
+}
+
+export function mcpVisibleOrderbook(
+  state: EngineStateStore,
+  tokenId: string,
+  isTokenSynchronized?: (tokenId: string) => boolean,
+) {
+  if (isTokenSynchronized && !isTokenSynchronized(tokenId)) return null;
+  return state.marketSnapshots.get(tokenId) ?? null;
+}
+
+export function mcpVisibleMarketSnapshots(
+  state: EngineStateStore,
+  marketId: string,
+  isTokenSynchronized?: (tokenId: string) => boolean,
+) {
+  const items = [...state.marketSnapshots.values()].filter((snapshot) => snapshot.marketId === marketId);
+  return isTokenSynchronized ? items.filter((snapshot) => isTokenSynchronized(snapshot.tokenId)) : items;
 }
 
 type AuthResult = { ok: true; clientId: string; tokenFingerprint: string } | { ok: false; status: 401 | 503; reason: string; tokenFingerprint: string | null };
@@ -258,12 +277,12 @@ export function createGrokMcpServer(clientId: string, dependencies: McpDependenc
   server.registerTool("get_market_snapshot", {
     description: "Read the latest normalized snapshots for one market. Read-only; no trading capability.",
     inputSchema: { marketId: z.string().min(1) }, annotations: readOnly,
-  }, async ({ marketId }) => toolResult([...dependencies.state.marketSnapshots.values()].filter((snapshot) => snapshot.marketId === marketId)));
+  }, async ({ marketId }) => toolResult(mcpVisibleMarketSnapshots(dependencies.state, marketId, dependencies.isTokenSynchronized)));
 
   server.registerTool("get_orderbook", {
     description: "Read one current normalized order book by token ID. Read-only; no trading capability.",
     inputSchema: { tokenId: z.string().min(1) }, annotations: readOnly,
-  }, async ({ tokenId }) => toolResult(dependencies.state.marketSnapshots.get(tokenId) ?? null));
+  }, async ({ tokenId }) => toolResult(mcpVisibleOrderbook(dependencies.state, tokenId, dependencies.isTokenSynchronized)));
 
   server.registerTool("get_recent_triggers", {
     description: "Read recent deterministic triggers available for external research. Monitoring never waits for Grok. Optional triggerId attributes this MCP request to that trigger only.",

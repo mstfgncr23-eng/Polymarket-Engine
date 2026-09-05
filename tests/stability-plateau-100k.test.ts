@@ -7,7 +7,7 @@ import {
   triggerConfigSchema,
 } from "@pm/core";
 import { BoundedIngressQueue, MARKET_INGRESS_BOUNDS, TokenSyncIndex } from "@pm/market-data";
-import { GrokActivationCoordinator } from "../apps/engine/src/activation/coordinator.js";
+import { ACTIVATION_SCOPE_TTL_MS, GrokActivationCoordinator } from "../apps/engine/src/activation/coordinator.js";
 import { NoopGrokActivationBridge } from "../apps/engine/src/activation/noop.js";
 import { RestingOrderTokenIndex } from "../apps/engine/src/resting-order-index.js";
 import { RUNTIME_BOUNDS } from "../apps/engine/src/runtime-supervisor.js";
@@ -79,6 +79,30 @@ describe("100k-event structure plateaus", () => {
       });
     }
     expect(coordinator.footprint().latency).toBeLessThanOrEqual(500);
+  });
+
+  it("activation TTL prune is not head-blocked by a refreshed scope (100k one-shots)", () => {
+    let now = Date.parse("2026-08-31T12:00:00.000Z");
+    const coordinator = new GrokActivationCoordinator(new NoopGrokActivationBridge(), {
+      cooldownMs: 1, maxPerMinute: 10_000, suppressAtOrBelow: 0, memoryLimit: 500,
+    }, () => new Date(now));
+    coordinator.touchScopeForTest("keep", "BTC", "BOOK_IMBALANCE");
+    for (let i = 0; i < 100_000; i += 1) {
+      if (i % 64 === 0) coordinator.touchScopeForTest("keep", "BTC", "BOOK_IMBALANCE");
+      coordinator.touchScopeForTest(`oneshot-${i}`, "BTC", "BOOK_IMBALANCE");
+    }
+    coordinator.touchScopeForTest("keep", "BTC", "BOOK_IMBALANCE");
+    const beforeAdvance = coordinator.footprint();
+    expect(beforeAdvance.lastByMarketAsset).toBeGreaterThan(1);
+    now += ACTIVATION_SCOPE_TTL_MS + 1;
+    coordinator.touchScopeForTest("keep", "BTC", "BOOK_IMBALANCE");
+    const after = coordinator.footprint();
+    expect(after.lastByMarketAsset).toBe(1);
+    expect(after.sent).toBe(0);
+    expect(after.latency).toBeLessThanOrEqual(500);
+    now += ACTIVATION_SCOPE_TTL_MS + 1;
+    coordinator.touchScopeForTest("keep", "BTC", "BOOK_IMBALANCE");
+    expect(coordinator.footprint().lastByMarketAsset).toBe(1);
   });
 
   it("preserves PR #12 architectural bounds exactly", () => {

@@ -15,13 +15,14 @@ import {
   type QualificationResult,
 } from "@pm/core";
 import { BoundedClobMarketTransport } from "./bounded-clob-market.js";
-import { BoundedIngressQueue, IngressOverflowError } from "./bounded-ingress.js";
+import { BoundedIngressQueue, IngressOverflowError, type IngressQueueObserver } from "./bounded-ingress.js";
 import {
   CLOB_MARKET_WS_URL,
   type IngressGapReason,
   type IngressQueueSnapshot,
   type TokenSyncState,
 } from "./ingress-bounds.js";
+import { isBoundedMarketStreamTransport, type MarketStreamTransport } from "./market-stream-transport.js";
 import { abortableDelay, ExponentialBackoff } from "./reconnect.js";
 import { TokenSyncIndex } from "./token-sync.js";
 
@@ -90,6 +91,8 @@ export interface MarketIngressGapEvent {
   reason: IngressGapReason;
   tokenCount: number;
   epoch: number;
+  /** Affected tokens for engine invalidation. Never a metric label. */
+  tokenIds: string[];
 }
 
 export interface MarketIngressResyncEvent {
@@ -158,24 +161,21 @@ export class PolymarketMarketDataAdapter {
   private normalizeObserver: MarketNormalizeObserver | null = null;
   private readonly sync = new TokenSyncIndex();
   readonly ingress: BoundedIngressQueue;
-  private readonly transport: BoundedClobMarketTransport;
-  private readonly useOwnedTransport: boolean;
-  private readonly injectedSubscribe: boolean;
+  private readonly transport: MarketStreamTransport;
 
   constructor(
     client?: PublicClient,
-    options: { useSdkSubscribe?: boolean; ownedTransport?: boolean; marketWsUrl?: string; ingress?: BoundedIngressQueue } = {},
+    options: { transport?: MarketStreamTransport; marketWsUrl?: string; ingress?: BoundedIngressQueue } = {},
   ) {
     this.client = client ?? createPublicClient();
-    this.ingress = options.ingress ?? new BoundedIngressQueue();
-    this.transport = new BoundedClobMarketTransport({
+    if (options.transport && !isBoundedMarketStreamTransport(options.transport)) {
+      throw new Error("MARKET_TRANSPORT_MUST_BE_BOUNDED");
+    }
+    this.ingress = options.ingress ?? options.transport?.queue ?? new BoundedIngressQueue();
+    this.transport = options.transport ?? new BoundedClobMarketTransport({
       url: options.marketWsUrl ?? CLOB_MARKET_WS_URL,
       queue: this.ingress,
     });
-    this.injectedSubscribe = client !== undefined;
-    this.useOwnedTransport = options.useSdkSubscribe === true
-      ? false
-      : (options.ownedTransport ?? client === undefined);
   }
 
   setNormalizeObserver(observer: MarketNormalizeObserver | null): void { this.normalizeObserver = observer; }
@@ -186,7 +186,10 @@ export class PolymarketMarketDataAdapter {
   unsynchronizedTokenCount(): number { return this.sync.unsynchronizedCount(); }
   tokenSyncEntryCount(): number { return this.sync.entryCount(); }
   ingressSnapshot(): IngressQueueSnapshot { return this.ingress.snapshot(); }
-  usesOwnedBoundedTransport(): boolean { return this.useOwnedTransport; }
+  usesBoundedMarketTransport(): boolean { return this.transport.bounded === true; }
+  /** @deprecated Use usesBoundedMarketTransport. Always true — SDK subscribe is not a runtime path. */
+  usesOwnedBoundedTransport(): boolean { return this.usesBoundedMarketTransport(); }
+  setIngressObserver(observer: IngressQueueObserver | null): void { this.ingress.setObserver(observer); }
 
   getMarket(tokenId: string): DiscoveredMarket | undefined { return this.marketsByToken.get(tokenId); }
   getMarkets(): DiscoveredMarket[] { return uniqueMarkets([...this.marketsByToken.values()]); }
@@ -360,10 +363,14 @@ export class PolymarketMarketDataAdapter {
         try {
           const current = [...this.tokenIds];
           if (current.length === 0) continue;
-          this.beginStreamEpoch(current, reconnectCount > 0 ? "reconnect" : "explicit_resubscribe", handlers);
-          const stream = this.useOwnedTransport
-            ? await this.transport.subscribe(current, true)
-            : await this.client.subscribe([{ topic: "market", tokenIds: current, customFeatureEnabled: true }]);
+          const generationRestart = generation > 1 && reconnectCount === 0;
+          this.beginStreamEpoch(
+            current,
+            reconnectCount > 0 ? "reconnect" : generationRestart ? "generation_change" : "explicit_resubscribe",
+            handlers,
+            { emitGap: reconnectCount > 0 || generationRestart },
+          );
+          const stream = await this.transport.subscribe(current, true);
           this.activeStreams += 1;
           this.closeCurrentStream = () => {
             resubscribed = true;
@@ -448,23 +455,36 @@ export class PolymarketMarketDataAdapter {
     });
   }
 
-  beginStreamEpoch(tokenIds: readonly string[], reason: IngressGapReason, handlers?: Pick<PolymarketFeedHandlers, "onGap">): void {
+  beginStreamEpoch(
+    tokenIds: readonly string[],
+    reason: IngressGapReason,
+    handlers?: Pick<PolymarketFeedHandlers, "onGap">,
+    options: { emitGap?: boolean } = {},
+  ): void {
     const epoch = this.sync.beginEpoch(tokenIds, reason);
     for (const tokenId of tokenIds) {
       this.books.delete(tokenId);
       this.lastTimestampByToken.delete(tokenId);
     }
-    this.ingress.clear(reason);
-    handlers?.onGap?.({ reason, tokenCount: tokenIds.length, epoch });
+    this.ingress.clear();
+    if (options.emitGap !== false && (options.emitGap === true || reason !== "explicit_resubscribe")) {
+      handlers?.onGap?.({ reason, tokenCount: tokenIds.length, epoch, tokenIds: [...tokenIds] });
+    }
   }
 
   gapAll(reason: IngressGapReason, handlers?: Pick<PolymarketFeedHandlers, "onGap">): void {
-    for (const tokenId of this.tokenIds) {
+    const tokenIds = [...this.tokenIds];
+    for (const tokenId of tokenIds) {
       this.sync.markGapped(tokenId, reason);
       this.books.delete(tokenId);
     }
-    this.ingress.clear(reason);
-    handlers?.onGap?.({ reason, tokenCount: this.tokenIds.length, epoch: this.tokenIds[0] ? this.sync.epochOf(this.tokenIds[0]) : 0 });
+    this.ingress.clear();
+    handlers?.onGap?.({
+      reason,
+      tokenCount: tokenIds.length,
+      epoch: tokenIds[0] ? this.sync.epochOf(tokenIds[0]) : 0,
+      tokenIds,
+    });
   }
 
   markTokenGappedForTest(tokenId: string, reason: IngressGapReason = "explicit_resubscribe"): void {

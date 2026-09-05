@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   bookImbalance,
+  bookImbalanceReference,
   deriveBook,
-  exactNumberQuantity,
   SAFETY_ESCALATION_KINDS,
   safetyEscalationMayEmit,
   totalDepthCombined,
@@ -46,46 +46,50 @@ describe("Part 1 totalDepth combined first-10 semantics", () => {
   });
 });
 
-describe("Part 1 bookImbalance allocation-free + Number exact/fallback", () => {
+describe("Part 1 bookImbalance allocation-free Decimal accumulate", () => {
   it("preserves first-N-level Decimal semantics vs the previous slice/reduce formula", () => {
     const snapshot = book({
       bids: [{ price: "0.4", quantity: "10" }, { price: "0.39", quantity: "5" }, { price: "0.38", quantity: "1" }],
       asks: [{ price: "0.5", quantity: "2" }, { price: "0.51", quantity: "2" }],
     });
+    expect(bookImbalance(snapshot)).toBe(bookImbalanceReference(snapshot));
     expect(bookImbalance(snapshot)).toBeCloseTo((16 - 4) / 20, 12);
   });
 
-  it("uses Number only when every quantity is an exact IEEE value", () => {
-    expect(exactNumberQuantity("10")).toBe(10);
-    expect(exactNumberQuantity("0.5")).toBe(0.5);
-    expect(exactNumberQuantity("0.1")).toBeNull();
-    const inexact = book({
-      bids: [{ price: "0.4", quantity: "0.1" }],
-      asks: [{ price: "0.5", quantity: "0.1" }],
-    });
-    expect(bookImbalance(inexact)).toBe(0);
+  it("matches Decimal reference for 2^53+1, tiny decimals, mixed, and extremes", () => {
+    const cases: Array<Pick<MarketSnapshot, "bids" | "asks">> = [
+      {
+        bids: [{ price: "0.4", quantity: String(2 ** 53 + 1) }],
+        asks: [{ price: "0.5", quantity: "1" }],
+      },
+      {
+        bids: [{ price: "0.4", quantity: "0.0000000000000001" }],
+        asks: [{ price: "0.5", quantity: "0.0000000000000002" }],
+      },
+      {
+        bids: [{ price: "0.4", quantity: "0.1" }, { price: "0.39", quantity: "10" }],
+        asks: [{ price: "0.5", quantity: "2.25" }, { price: "0.51", quantity: "0.3" }],
+      },
+      {
+        bids: [{ price: "0.01", quantity: "999999999999999" }],
+        asks: [{ price: "0.99", quantity: "0.00000001" }],
+      },
+    ];
+    for (const item of cases) {
+      const snapshot = book(item);
+      expect(bookImbalance(snapshot)).toBe(bookImbalanceReference(snapshot));
+    }
   });
 
-  it("randomized equivalence: Number path and Decimal path match when exact, else Decimal wins", () => {
+  it("randomized equivalence vs Decimal slice/reduce reference", () => {
     for (let i = 0; i < 200; i += 1) {
       const qty = i % 3 === 0 ? "0.1" : String(1 + (i % 17));
       const snapshot = book({
         bids: levels(6, 0.1, qty),
         asks: levels(6, 0.6, String(2 + (i % 5))),
       });
-      const value = bookImbalance(snapshot);
-      let bid = 0;
-      let ask = 0;
-      for (const level of snapshot.bids.slice(0, 5)) bid += Number(level.quantity);
-      for (const level of snapshot.asks.slice(0, 5)) ask += Number(level.quantity);
-      const naive = bid + ask === 0 ? 0 : (bid - ask) / (bid + ask);
-      if (qty === "0.1") {
-        expect(exactNumberQuantity(qty)).toBeNull();
-        expect(Number.isFinite(value)).toBe(true);
-      } else {
-        expect(value).toBeCloseTo(naive, 12);
-      }
-      expect(Math.abs(value)).toBeLessThanOrEqual(1);
+      expect(bookImbalance(snapshot)).toBe(bookImbalanceReference(snapshot));
+      expect(Math.abs(bookImbalance(snapshot))).toBeLessThanOrEqual(1);
     }
   });
 });

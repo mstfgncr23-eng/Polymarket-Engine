@@ -74,8 +74,14 @@ export class TriggerEngine {
 
   forgetBook(marketId: string, outcome: Outcome): void {
     this.books.delete(bookKey(marketId, outcome));
-    const pair = this.pair.get(marketId);
-    if (pair) delete pair[outcome];
+    this.pair.delete(marketId);
+  }
+
+  /** Clears both pair sides so pair-cost cannot mix epochs. */
+  forgetMarketBooks(marketId: string): void {
+    this.books.delete(bookKey(marketId, "UP"));
+    this.books.delete(bookKey(marketId, "DOWN"));
+    this.pair.delete(marketId);
   }
 
   ingestMarket(snapshot: MarketSnapshot): TriggerEvent[] {
@@ -162,6 +168,11 @@ export class TriggerEngine {
       const asset = tick.asset;
       const window = this.ticksByAsset.get(asset) ?? new ReferenceTickWindow();
       this.ticksByAsset.set(asset, window);
+      if (window.hasOverflowed) {
+        this.observer?.onReferenceWindow?.(window.size);
+        this.observer?.onReferenceWindowOverflow?.();
+        return [];
+      }
       const sourceMs = Date.parse(tick.sourceTimestamp);
       const pushed = window.push(tick, sourceMs);
       this.observer?.onReferenceWindow?.(window.size);
@@ -253,8 +264,18 @@ export class TriggerEngine {
     this.ticksByAsset.get(asset)?.resetAfterReconnect();
   }
 
+  attachReferenceWindowForTest(asset: string, maxEntries: number): void {
+    this.ticksByAsset.set(asset, new ReferenceTickWindow(maxEntries));
+  }
+
   referenceWindowSize(asset: string): number {
     return this.ticksByAsset.get(asset)?.size ?? 0;
+  }
+
+  referenceWindowTotalEntries(): number {
+    let total = 0;
+    for (const window of this.ticksByAsset.values()) total += window.size;
+    return total;
   }
 
   referenceWindowOverflowed(asset: string): boolean {

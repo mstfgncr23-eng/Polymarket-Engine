@@ -281,7 +281,7 @@ export class EngineMetrics {
   });
   readonly referenceWindowEntries = new Gauge({
     name: "reference_window_entries",
-    help: "Total retained reference-window ticks across assets",
+    help: "Total retained reference-window ticks across all assets",
     registers: [this.registry],
   });
   readonly referenceWindowOverflow = new Counter({

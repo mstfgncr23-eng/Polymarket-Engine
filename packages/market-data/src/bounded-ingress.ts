@@ -30,6 +30,10 @@ function approximateEventBytes(event: unknown): number {
  * Dual-bound (event-count + approximate bytes) FIFO. Overflow never drops
  * oldest/newest/sampled events to continue — the caller must GAP + resync.
  */
+export interface IngressQueueObserver {
+  onChange(snapshot: IngressQueueSnapshot): void;
+}
+
 export class BoundedIngressQueue {
   private readonly items: QueuedIngress[] = [];
   private head = 0;
@@ -40,6 +44,7 @@ export class BoundedIngressQueue {
   processed = 0;
   gapTotal = 0;
   lastGapReason: IngressGapReason | null = null;
+  private observer: IngressQueueObserver | null = null;
 
   constructor(
     readonly maxEvents: number = MARKET_INGRESS_BOUNDS.maxEvents,
@@ -48,6 +53,8 @@ export class BoundedIngressQueue {
 
   get depth(): number { return this.items.length - this.head; }
   get queuedBytes(): number { return this.bytes; }
+
+  setObserver(observer: IngressQueueObserver | null): void { this.observer = observer; }
 
   tryEnqueue(event: unknown): { ok: true } | { ok: false; reason: Extract<IngressGapReason, "count_limit" | "byte_limit"> } {
     const size = approximateEventBytes(event);
@@ -64,6 +71,7 @@ export class BoundedIngressQueue {
     this.accepted += 1;
     if (this.depth > this.highWaterEvents) this.highWaterEvents = this.depth;
     if (this.bytes > this.highWaterBytes) this.highWaterBytes = this.bytes;
+    this.publish();
     return { ok: true };
   }
 
@@ -78,14 +86,16 @@ export class BoundedIngressQueue {
       this.items.splice(0, this.head);
       this.head = 0;
     }
+    this.publish();
     return item.event;
   }
 
-  clear(reason?: IngressGapReason): void {
-    if (reason) this.noteGap(reason);
+  /** Drain queued events. Does not increment gapTotal — overflow already counted at tryEnqueue. */
+  clear(): void {
     this.items.length = 0;
     this.head = 0;
     this.bytes = 0;
+    this.publish();
   }
 
   snapshot(): IngressQueueSnapshot {
@@ -103,5 +113,10 @@ export class BoundedIngressQueue {
   private noteGap(reason: IngressGapReason): void {
     this.gapTotal += 1;
     this.lastGapReason = reason;
+    this.publish();
+  }
+
+  private publish(): void {
+    this.observer?.onChange(this.snapshot());
   }
 }

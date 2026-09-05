@@ -3,6 +3,7 @@ import { PaperLedger, engineEnvSchema, evaluateRisk, riskLimitsSchema } from "@p
 import { MemoryEventJournal } from "@pm/db";
 import {
   PolymarketMarketDataAdapter,
+  ScriptedBoundedMarketTransport,
   REFERENCE_STABLE_CONNECTION_MS,
   ReferenceFeedRegistry,
   ReferencePriceFeedAdapter,
@@ -27,63 +28,10 @@ async function waitFor(predicate: () => boolean, timeoutMs = 1_500): Promise<voi
   }
 }
 
-class ControllableMarketStream {
-  private queue: unknown[] = [];
-  private waiters: Array<(result: IteratorResult<unknown>) => void> = [];
-  closed = false;
-  closeCount = 0;
-
-  push(event: unknown): void {
-    if (this.closed) return;
-    const waiter = this.waiters.shift();
-    if (waiter) waiter({ value: event, done: false });
-    else this.queue.push(event);
-  }
-
-  async close(): Promise<void> {
-    this.closeCount += 1;
-    this.closed = true;
-    const waiter = this.waiters.shift();
-    if (waiter) waiter({ value: undefined, done: true });
-  }
-
-  async *[Symbol.asyncIterator](): AsyncGenerator<unknown> {
-    while (true) {
-      if (this.queue.length > 0) {
-        yield this.queue.shift();
-        continue;
-      }
-      if (this.closed) return;
-      const result = await new Promise<IteratorResult<unknown>>((resolve) => this.waiters.push(resolve));
-      if (result.done) return;
-      yield result.value;
-    }
-  }
-}
-
-class FakePolymarketClient {
-  readonly streams: ControllableMarketStream[] = [];
-  subscribeCalls = 0;
-  closeSubscriptionsCalls = 0;
-  concurrent = 0;
-  maxConcurrent = 0;
-
-  async subscribe(): Promise<ControllableMarketStream> {
-    this.subscribeCalls += 1;
-    this.concurrent += 1;
-    this.maxConcurrent = Math.max(this.maxConcurrent, this.concurrent);
-    const stream = new ControllableMarketStream();
-    const original = stream.close.bind(stream);
-    stream.close = async () => {
-      if (!stream.closed) this.concurrent = Math.max(0, this.concurrent - 1);
-      await original();
-    };
-    this.streams.push(stream);
-    return stream;
-  }
-
-  async closeSubscriptions(): Promise<void> { this.closeSubscriptionsCalls += 1; }
-  current(): ControllableMarketStream { return this.streams.at(-1)!; }
+function scriptedMarket(): { transport: ScriptedBoundedMarketTransport; adapter: PolymarketMarketDataAdapter } {
+  const transport = new ScriptedBoundedMarketTransport();
+  const adapter = new PolymarketMarketDataAdapter(undefined, { transport });
+  return { transport, adapter };
 }
 
 function bookEvent(tokenId: string, timestamp: number | string | null, bidPrice: string) {
@@ -163,8 +111,7 @@ function silentHandlers(extra: Partial<ReferenceFeedHandlers> = {}): ReferenceFe
 
 describe("A 1ms stale Polymarket event does not tear down the stream", () => {
   it("accepts 1000, drops 999, accepts 1001 without reconnect", async () => {
-    const client = new FakePolymarketClient();
-    const adapter = new PolymarketMarketDataAdapter(client as never);
+    const { transport, adapter } = scriptedMarket();
     adapter.registerManualToken("up", "mkt", "UP", "BTC");
     const snapshots: Array<{ timestamp: string; bid: string | undefined }> = [];
     const connections: FeedConnectionEvent[] = [];
@@ -179,18 +126,18 @@ describe("A 1ms stale Polymarket event does not tear down the stream", () => {
       onError: (error) => { errors.push(error.message); },
       onAnomaly: (anomaly) => { anomalies.push(anomaly); },
     }, abort.signal);
-    await waitFor(() => client.streams.length === 1 && connections.some((event) => event.state === "CONNECTED"));
-    client.current().push(bookEvent("up", 1000, "0.40"));
+    await waitFor(() => transport.streams.length === 1 && connections.some((event) => event.state === "CONNECTED"));
+    transport.current().push(bookEvent("up", 1000, "0.40"));
     await waitFor(() => snapshots.length === 1);
-    client.current().push(bookEvent("up", 999, "0.99"));
+    transport.current().push(bookEvent("up", 999, "0.99"));
     await waitFor(() => anomalies.length === 1);
-    client.current().push(bookEvent("up", 1001, "0.41"));
+    transport.current().push(bookEvent("up", 1001, "0.41"));
     await waitFor(() => snapshots.length === 2);
 
     expect(errors).toEqual([]);
     expect(connections.filter((event) => event.state === "DISCONNECTED")).toHaveLength(0);
-    expect(client.current().closeCount).toBe(0);
-    expect(client.subscribeCalls).toBe(1);
+    expect(transport.current().closeCount).toBe(0);
+    expect(transport.subscribeCalls).toBe(1);
     expect(adapter.activeStreamCount()).toBe(1);
     expect(adapter.lastAcceptedTimestamp("up")).toBe(1001);
     expect(snapshots.map((item) => item.bid)).toEqual(["0.40", "0.41"]);
@@ -202,8 +149,7 @@ describe("A 1ms stale Polymarket event does not tear down the stream", () => {
 
 describe("B stale event does not mutate the book", () => {
   it("ignores a stale full book and a stale price_change", async () => {
-    const client = new FakePolymarketClient();
-    const adapter = new PolymarketMarketDataAdapter(client as never);
+    const { transport, adapter } = scriptedMarket();
     adapter.registerManualToken("up", "mkt");
     const abort = new AbortController();
     const running = adapter.run(["up"], {
@@ -211,11 +157,11 @@ describe("B stale event does not mutate the book", () => {
       onConnection: () => undefined,
       onError: () => { throw new Error("unexpected feed error"); },
     }, abort.signal);
-    await waitFor(() => client.streams.length === 1);
-    client.current().push(bookEvent("up", 1000, "0.40"));
+    await waitFor(() => transport.streams.length === 1);
+    transport.current().push(bookEvent("up", 1000, "0.40"));
     await waitFor(() => adapter.bookState("up")?.bids.get("0.40") === "10");
-    client.current().push(bookEvent("up", 999, "0.11"));
-    client.current().push(priceChangeEvent("up", 998, "0.40", "99"));
+    transport.current().push(bookEvent("up", 999, "0.11"));
+    transport.current().push(priceChangeEvent("up", 998, "0.40", "99"));
     await waitFor(() => adapter.timestampStats().staleDropped >= 2);
     const book = adapter.bookState("up");
     expect(book?.bids.get("0.40")).toBe("10");
@@ -228,8 +174,7 @@ describe("B stale event does not mutate the book", () => {
 
 describe("C stale then newer valid event updates state", () => {
   it("applies a later price_change after dropping a 1ms stale book", async () => {
-    const client = new FakePolymarketClient();
-    const adapter = new PolymarketMarketDataAdapter(client as never);
+    const { transport, adapter } = scriptedMarket();
     adapter.registerManualToken("up", "mkt");
     const bids: string[] = [];
     const abort = new AbortController();
@@ -238,11 +183,11 @@ describe("C stale then newer valid event updates state", () => {
       onConnection: () => undefined,
       onError: () => undefined,
     }, abort.signal);
-    await waitFor(() => client.streams.length === 1);
-    client.current().push(bookEvent("up", 1000, "0.40"));
+    await waitFor(() => transport.streams.length === 1);
+    transport.current().push(bookEvent("up", 1000, "0.40"));
     await waitFor(() => bids.length === 1);
-    client.current().push(bookEvent("up", 999, "0.12"));
-    client.current().push(priceChangeEvent("up", 1001, "0.42", "8"));
+    transport.current().push(bookEvent("up", 999, "0.12"));
+    transport.current().push(priceChangeEvent("up", 1001, "0.42", "8"));
     await waitFor(() => bids.length === 2);
     expect(bids).toEqual(["0.40", "0.42"]);
     expect(adapter.bookState("up")?.bids.get("0.42")).toBe("8");
@@ -254,8 +199,7 @@ describe("C stale then newer valid event updates state", () => {
 
 describe("D stale-event diagnostic is bounded", () => {
   it("counts every drop but samples only a bounded number of diagnostics", async () => {
-    const client = new FakePolymarketClient();
-    const adapter = new PolymarketMarketDataAdapter(client as never);
+    const { transport, adapter } = scriptedMarket();
     adapter.registerManualToken("up", "mkt");
     const sampled: PolymarketFeedAnomaly[] = [];
     const abort = new AbortController();
@@ -265,17 +209,17 @@ describe("D stale-event diagnostic is bounded", () => {
       onError: () => undefined,
       onAnomaly: (anomaly) => { if (anomaly.sampled) sampled.push(anomaly); },
     }, abort.signal);
-    await waitFor(() => client.streams.length === 1);
-    client.current().push(bookEvent("up", 5_000, "0.40"));
+    await waitFor(() => transport.streams.length === 1);
+    transport.current().push(bookEvent("up", 5_000, "0.40"));
     await waitFor(() => adapter.lastAcceptedTimestamp("up") === 5_000);
-    for (let i = 0; i < 1_000; i += 1) client.current().push(bookEvent("up", 4_999, "0.01"));
+    for (let i = 0; i < 1_000; i += 1) transport.current().push(bookEvent("up", 4_999, "0.01"));
     await waitFor(() => adapter.timestampStats().staleDropped === 1_000);
     const stats = adapter.timestampStats();
     expect(stats.staleDropped).toBe(1_000);
     expect(stats.diagnosticsEmitted).toBeLessThanOrEqual(16);
     expect(sampled.length).toBe(stats.diagnosticsEmitted);
     expect(sampled.length).toBeGreaterThan(0);
-    expect(client.subscribeCalls).toBe(1);
+    expect(transport.subscribeCalls).toBe(1);
     expect(adapter.lastAcceptedTimestamp("up")).toBe(5_000);
     abort.abort("test");
     await running;
@@ -459,8 +403,7 @@ describe("H /health and /ready remain state-only", () => {
 
 describe("stale-event storm does not reconnect or grow maps", () => {
   it("keeps one stream and bounded per-token state under mixed valid/stale load", async () => {
-    const client = new FakePolymarketClient();
-    const adapter = new PolymarketMarketDataAdapter(client as never);
+    const { transport, adapter } = scriptedMarket();
     adapter.registerManualToken("up", "mkt");
     const abort = new AbortController();
     let accepted = 0;
@@ -469,14 +412,14 @@ describe("stale-event storm does not reconnect or grow maps", () => {
       onConnection: () => undefined,
       onError: () => { throw new Error("reconnect from stale events"); },
     }, abort.signal);
-    await waitFor(() => client.streams.length === 1);
+    await waitFor(() => transport.streams.length === 1);
     for (let i = 0; i < 400; i += 1) {
-      client.current().push(bookEvent("up", 10_000 + i, "0.40"));
-      if (i % 5 === 0) client.current().push(bookEvent("up", 10_000 + i - 1, "0.01"));
+      transport.current().push(bookEvent("up", 10_000 + i, "0.40"));
+      if (i % 5 === 0) transport.current().push(bookEvent("up", 10_000 + i - 1, "0.01"));
     }
     await waitFor(() => accepted === 400);
     expect(adapter.timestampStats().staleDropped).toBe(80);
-    expect(client.subscribeCalls).toBe(1);
+    expect(transport.subscribeCalls).toBe(1);
     expect(adapter.activeStreamCount()).toBe(1);
     expect(adapter.lastAcceptedTimestamp("up")).toBe(10_399);
     abort.abort("test");
@@ -484,8 +427,7 @@ describe("stale-event storm does not reconnect or grow maps", () => {
   });
 
   it("changing qualified tokens resubscribes without overlapping streams", async () => {
-    const client = new FakePolymarketClient();
-    const adapter = new PolymarketMarketDataAdapter(client as never);
+    const { transport, adapter } = scriptedMarket();
     adapter.registerManualToken("up", "mkt");
     adapter.registerManualToken("down", "mkt", "DOWN");
     const abort = new AbortController();
@@ -494,10 +436,10 @@ describe("stale-event storm does not reconnect or grow maps", () => {
       onConnection: () => undefined,
       onError: () => undefined,
     }, abort.signal);
-    await waitFor(() => client.subscribeCalls === 1);
+    await waitFor(() => transport.subscribeCalls === 1);
     adapter.setTokenIds(["up", "down"]);
-    await waitFor(() => client.subscribeCalls === 2);
-    expect(client.maxConcurrent).toBe(1);
+    await waitFor(() => transport.subscribeCalls === 2);
+    expect(transport.maxConcurrent).toBe(1);
     abort.abort("test");
     await running;
   });

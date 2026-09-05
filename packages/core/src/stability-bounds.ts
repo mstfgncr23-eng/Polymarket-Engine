@@ -39,6 +39,34 @@ export function safetyEscalationMayEmit(
   return isSafetyEscalationKind(kind) && nextSeverity > previousSeverity;
 }
 
+export const MARKET_DATA_TRIGGER_KINDS = [
+  "BOOK_IMBALANCE",
+  "SPREAD_CHANGE",
+  "DEPTH_CHANGE",
+  "PAIR_COST_OPPORTUNITY",
+  "REPRICING_LAG",
+  "EDGE_CHANGE",
+] as const satisfies readonly TriggerKind[];
+
+/** Risk / system / settlement kinds that must still run after a market-data gap. */
+export const NON_SUPPRESSIBLE_ON_MARKET_GAP_KINDS = [
+  "DIRECTIONAL_EXPOSURE",
+  "FAILED_HEDGE",
+  "NEARING_EXPIRY",
+  "SEVERE_DISAGREEMENT",
+  "LOSS_CLUSTER",
+  "SCHEDULED_REVIEW",
+] as const satisfies readonly TriggerKind[];
+
+const MARKET_DATA_SET = new Set<string>(MARKET_DATA_TRIGGER_KINDS);
+const NON_SUPPRESSIBLE_SET = new Set<string>(NON_SUPPRESSIBLE_ON_MARKET_GAP_KINDS);
+
+export function isMarketDataDerivedTrigger(trigger: { kind: string; source?: string | null }): boolean {
+  if (NON_SUPPRESSIBLE_SET.has(trigger.kind)) return false;
+  if (MARKET_DATA_SET.has(trigger.kind)) return true;
+  return trigger.source === "polymarket";
+}
+
 export function triggerDedupeScopeKey(
   marketId: string | null,
   asset: string | null,

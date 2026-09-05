@@ -8,7 +8,7 @@ import {
   type TriggerEvent,
 } from "@pm/core";
 import { MemoryEventJournal, createJournalEvent } from "@pm/db";
-import { PolymarketMarketDataAdapter } from "@pm/market-data";
+import { PolymarketMarketDataAdapter, ScriptedBoundedMarketTransport } from "@pm/market-data";
 import {
   EngineMetrics,
   FORBIDDEN_METRIC_LABEL_NAMES,
@@ -94,40 +94,6 @@ async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 
     if (Date.now() - started > timeoutMs) throw new Error("waitFor timeout");
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
-}
-
-class ControllableMarketStream {
-  private queue: unknown[] = [];
-  private waiters: Array<(result: IteratorResult<unknown>) => void> = [];
-  closed = false;
-  push(event: unknown): void {
-    const waiter = this.waiters.shift();
-    if (waiter) waiter({ value: event, done: false });
-    else this.queue.push(event);
-  }
-  async close(): Promise<void> {
-    this.closed = true;
-    const waiter = this.waiters.shift();
-    if (waiter) waiter({ value: undefined, done: true });
-  }
-  async *[Symbol.asyncIterator](): AsyncGenerator<unknown> {
-    while (true) {
-      if (this.queue.length > 0) {
-        yield this.queue.shift();
-        continue;
-      }
-      if (this.closed) return;
-      const result = await new Promise<IteratorResult<unknown>>((resolve) => this.waiters.push(resolve));
-      if (result.done) return;
-      yield result.value;
-    }
-  }
-}
-
-class FakePolymarketClient {
-  readonly stream = new ControllableMarketStream();
-  async subscribe(): Promise<ControllableMarketStream> { return this.stream; }
-  async closeSubscriptions(): Promise<void> {}
 }
 
 class DelayedDiscoveryAdapter extends ScriptedMarketAdapter {
@@ -423,8 +389,8 @@ describe("existing paper / SSE / discovery / journal semantics remain unchanged"
 describe("market normalization and trigger/reference/telemetry metrics", () => {
   it("records snapshot, price-change, and book-level metrics without extra collection scans", async () => {
     const metrics = new EngineMetrics();
-    const client = new FakePolymarketClient();
-    const adapter = new PolymarketMarketDataAdapter(client as never);
+    const transport = new ScriptedBoundedMarketTransport();
+    const adapter = new PolymarketMarketDataAdapter(undefined, { transport });
     adapter.setNormalizeObserver(metrics.normalizeObserver());
     adapter.registerManualToken("tok-up", "mkt", "UP", "BTC");
     adapter.setTokenIds(["tok-up"]);
@@ -436,7 +402,7 @@ describe("market normalization and trigger/reference/telemetry metrics", () => {
       onError: () => undefined,
     }, controller.signal);
     await waitFor(() => adapter.activeStreamCount() === 1);
-    client.stream.push({
+    transport.push({
       type: "book",
       payload: {
         tokenId: "tok-up", market: "mkt", timestamp: 1_000,
@@ -445,7 +411,7 @@ describe("market normalization and trigger/reference/telemetry metrics", () => {
       },
     });
     await waitFor(() => snapshots.length === 1);
-    client.stream.push({
+    transport.push({
       type: "price_change",
       payload: {
         timestamp: 1_001,
@@ -471,7 +437,7 @@ describe("market normalization and trigger/reference/telemetry metrics", () => {
     const metrics = new EngineMetrics();
     const durations: number[] = [];
     const inner = metrics.normalizeObserver();
-    const adapter = new PolymarketMarketDataAdapter(new FakePolymarketClient() as never);
+    const adapter = new PolymarketMarketDataAdapter();
     adapter.setNormalizeObserver({
       onNormalizedSnapshot: (input) => {
         durations.push(input.durationSeconds);

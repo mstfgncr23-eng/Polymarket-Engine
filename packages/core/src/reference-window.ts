@@ -27,8 +27,8 @@ export class ReferenceTickWindow {
   readonly windowMs: number;
 
   constructor(
-    maxEntries = TRIGGER_STABILITY_BOUNDS.referenceWindowMaxEntries,
-    windowMs = TRIGGER_STABILITY_BOUNDS.referenceWindowMs,
+    maxEntries: number = TRIGGER_STABILITY_BOUNDS.referenceWindowMaxEntries,
+    windowMs: number = TRIGGER_STABILITY_BOUNDS.referenceWindowMs,
   ) {
     this.maxEntries = maxEntries;
     this.windowMs = windowMs;
@@ -43,6 +43,9 @@ export class ReferenceTickWindow {
   }
 
   push(tick: ReferenceTick, sourceMs = Date.parse(tick.sourceTimestamp)): ReferenceWindowPushResult {
+    if (this.overflowed) {
+      return { accepted: false, overflow: true, size: this.count };
+    }
     if (!Number.isFinite(sourceMs)) {
       return { accepted: false, overflow: false, size: this.count };
     }
