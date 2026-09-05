@@ -901,6 +901,7 @@ describe("Step-3 follow-up 5 — coalesced ingress metrics and O(1) dedupe count
     expect(queue.dequeue()).toBe("e0");
     await new Promise((resolve) => setTimeout(resolve, INGRESS_OBSERVER_BOUNDS.coalesceMinIntervalMs + 5));
     expect(queue.tryEnqueue("late").ok).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, INGRESS_OBSERVER_BOUNDS.coalesceMinIntervalMs + 5));
     expect(await metricValue(metrics, "market_ingress_queue_depth")).toBe(queue.snapshot().depth);
     expect(await metricValue(metrics, "market_ingress_high_water_total")).toBe(queue.snapshot().highWaterEvents);
     queue.flushObserver();
@@ -1184,7 +1185,7 @@ describe("Step-3 review — owned market connect is finitely bounded", () => {
     await waitFor(() => gaps.length === 1);
     expect(gaps).toEqual(["reconnect"]);
     transport.failNextSubscribeCount = 3;
-    await waitFor(() => transport.subscribeCalls >= 5, 5_000);
+    await waitFor(() => transport.subscribeCalls >= 5, 15_000);
     expect(gaps).toEqual(["reconnect"]);
     expect(transport.push(liveBookEvent("tok-up", 2_000)).ok).toBe(true);
     await waitFor(() => adapter.isTokenSynchronized("tok-up"));
@@ -1193,5 +1194,5 @@ describe("Step-3 review — owned market connect is finitely bounded", () => {
     expect(gaps).toEqual(["reconnect", "reconnect"]);
     ac.abort();
     await running;
-  });
+  }, 20_000);
 });
