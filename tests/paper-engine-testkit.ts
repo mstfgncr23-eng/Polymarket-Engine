@@ -159,18 +159,45 @@ export class ScriptedMarketAdapter {
   }
 }
 
+export type ScriptedEnsureOutcome = "started" | "already" | "transient" | "unsupported" | "stopped" | "throw";
+
 export class ScriptedReferenceRegistry {
   readonly startCounts = new Map<string, number>();
+  readonly ensureCalls = new Map<string, number>();
+  readonly maxConcurrentEnsure = { value: 0 };
+  private ensureInFlight = 0;
+  private readonly queuedOutcomes = new Map<string, ScriptedEnsureOutcome[]>();
   private readonly running = new Map<string, ReferenceFeedHandlers>();
   async resolve(asset: string): Promise<ReferenceResolution> {
     return { asset, supported: true, symbol: `${asset}USDT`, url: `wss://example/${asset.toLowerCase()}`, reason: "RESOLVED", status: "SUPPORTED" };
   }
   adapterFor(): null { return null; }
-  async ensureRunning(asset: string, handlers: ReferenceFeedHandlers): Promise<"started" | "already"> {
-    if (this.running.has(asset)) return "already";
-    this.running.set(asset, handlers);
-    this.startCounts.set(asset, (this.startCounts.get(asset) ?? 0) + 1);
-    return "started";
+  queueEnsureOutcome(asset: string, outcome: ScriptedEnsureOutcome): void {
+    const queued = this.queuedOutcomes.get(asset) ?? [];
+    queued.push(outcome);
+    this.queuedOutcomes.set(asset, queued);
+  }
+  async ensureRunning(
+    asset: string,
+    handlers: ReferenceFeedHandlers,
+  ): Promise<"started" | "already" | "transient" | "unsupported" | "stopped"> {
+    this.ensureInFlight += 1;
+    this.maxConcurrentEnsure.value = Math.max(this.maxConcurrentEnsure.value, this.ensureInFlight);
+    this.ensureCalls.set(asset, (this.ensureCalls.get(asset) ?? 0) + 1);
+    try {
+      const queued = this.queuedOutcomes.get(asset) ?? [];
+      const next = queued.shift() ?? (this.running.has(asset) ? "already" : "started");
+      if (next === "throw") throw new Error("REFERENCE_ENSURE_THROW");
+      if (next === "started") {
+        this.running.set(asset, handlers);
+        this.startCounts.set(asset, (this.startCounts.get(asset) ?? 0) + 1);
+      } else if (next === "already" && !this.running.has(asset)) {
+        this.running.set(asset, handlers);
+      }
+      return next;
+    } finally {
+      this.ensureInFlight = Math.max(0, this.ensureInFlight - 1);
+    }
   }
   readonly stopCounts = new Map<string, number>();
   stop(asset: string): boolean {

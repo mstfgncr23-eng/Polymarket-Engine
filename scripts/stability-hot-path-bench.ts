@@ -9,7 +9,9 @@ import { cpus } from "node:os";
 import { performance } from "node:perf_hooks";
 import { GrokActivationCoordinator } from "../apps/engine/src/activation/coordinator.ts";
 import { NoopGrokActivationBridge } from "../apps/engine/src/activation/noop.ts";
+import { EngineMetrics } from "../apps/engine/src/metrics.ts";
 import { bookImbalance, spread, TriggerEngine, triggerConfigSchema, type MarketSnapshot, type ReferenceTick, type TriggerEvent } from "../packages/core/src/index.ts";
+import { BoundedIngressQueue } from "../packages/market-data/src/bounded-ingress.ts";
 
 interface Row {
   case: string;
@@ -162,6 +164,14 @@ rows.push(measure("activation ensureLatency+snapshot+prune 500", 500, () => {
     if (i % 17 === 0) coordinator.snapshot();
   }
   coordinator.snapshot();
+}));
+
+rows.push(measure("ingress enqueue+dequeue x100000 metrics-observer-on", 100_000, () => {
+  const metrics = new EngineMetrics();
+  const queue = new BoundedIngressQueue(200_000, 16_000_000);
+  queue.setObserver({ onChange: (snapshot) => metrics.noteIngressSnapshot(snapshot) });
+  for (let i = 0; i < 50_000; i += 1) queue.tryEnqueue(i);
+  for (let i = 0; i < 50_000; i += 1) queue.dequeue();
 }));
 
 const report = {

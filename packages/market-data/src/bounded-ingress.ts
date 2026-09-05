@@ -1,4 +1,5 @@
 import {
+  INGRESS_OBSERVER_BOUNDS,
   MARKET_INGRESS_BOUNDS,
   type IngressGapReason,
   type IngressQueueSnapshot,
@@ -44,7 +45,10 @@ export class BoundedIngressQueue {
   processed = 0;
   gapTotal = 0;
   lastGapReason: IngressGapReason | null = null;
+  observerPublishCount = 0;
   private observer: IngressQueueObserver | null = null;
+  private mutationsSincePublish = 0;
+  private lastPublishAt = 0;
 
   constructor(
     readonly maxEvents: number = MARKET_INGRESS_BOUNDS.maxEvents,
@@ -71,7 +75,7 @@ export class BoundedIngressQueue {
     this.accepted += 1;
     if (this.depth > this.highWaterEvents) this.highWaterEvents = this.depth;
     if (this.bytes > this.highWaterBytes) this.highWaterBytes = this.bytes;
-    this.publish();
+    this.publish(false);
     return { ok: true };
   }
 
@@ -86,7 +90,7 @@ export class BoundedIngressQueue {
       this.items.splice(0, this.head);
       this.head = 0;
     }
-    this.publish();
+    this.publish(false);
     return item.event;
   }
 
@@ -95,7 +99,11 @@ export class BoundedIngressQueue {
     this.items.length = 0;
     this.head = 0;
     this.bytes = 0;
-    this.publish();
+    this.publish(false);
+  }
+
+  flushObserver(): void {
+    this.publish(true);
   }
 
   snapshot(): IngressQueueSnapshot {
@@ -113,10 +121,22 @@ export class BoundedIngressQueue {
   private noteGap(reason: IngressGapReason): void {
     this.gapTotal += 1;
     this.lastGapReason = reason;
-    this.publish();
+    this.publish(true);
   }
 
-  private publish(): void {
+  private publish(force: boolean): void {
+    this.mutationsSincePublish += 1;
+    const now = Date.now();
+    if (
+      !force
+      && this.mutationsSincePublish < INGRESS_OBSERVER_BOUNDS.coalesceEveryMutations
+      && now - this.lastPublishAt < INGRESS_OBSERVER_BOUNDS.coalesceMinIntervalMs
+    ) {
+      return;
+    }
+    this.mutationsSincePublish = 0;
+    this.lastPublishAt = now;
+    this.observerPublishCount += 1;
     this.observer?.onChange(this.snapshot());
   }
 }

@@ -54,6 +54,8 @@ export class TriggerEngine {
   private readonly dedupeOrder: string[] = [];
   private dedupeOrderHead = 0;
   private dedupeCount = 0;
+  private dedupeLiveEntries = 0;
+  private dedupeScanCalls = 0;
   private readonly assetIndex = new AssetMarketIndex();
   private lastScheduledReviewAt = 0;
 
@@ -162,7 +164,7 @@ export class TriggerEngine {
     }
   }
 
-  ingestReference(tick: ReferenceTick): TriggerEvent[] {
+  admitReferenceTick(tick: ReferenceTick): { overflow: boolean; accepted: boolean; triggers: TriggerEvent[] } {
     const started = performance.now();
     try {
       const asset = tick.asset;
@@ -171,21 +173,21 @@ export class TriggerEngine {
       if (window.hasOverflowed) {
         this.observer?.onReferenceWindow?.(window.size);
         this.observer?.onReferenceWindowOverflow?.();
-        return [];
+        return { overflow: true, accepted: false, triggers: [] };
       }
       const sourceMs = Date.parse(tick.sourceTimestamp);
       const pushed = window.push(tick, sourceMs);
       this.observer?.onReferenceWindow?.(window.size);
       if (pushed.overflow) {
         this.observer?.onReferenceWindowOverflow?.();
-        return [];
+        return { overflow: true, accepted: false, triggers: [] };
       }
-      if (!pushed.accepted) return [];
+      if (!pushed.accepted) return { overflow: false, accepted: false, triggers: [] };
       const first = window.first();
-      if (!first) return [];
+      if (!first) return { overflow: false, accepted: true, triggers: [] };
       const moveBps = d(tick.price).minus(first.tick.price).div(first.tick.price).mul(10_000).toNumber();
       const threshold = this.config.referenceRapidMoveBps ?? this.config.btcRapidMoveBps;
-      if (Math.abs(moveBps) < threshold) return [];
+      if (Math.abs(moveBps) < threshold) return { overflow: false, accepted: true, triggers: [] };
       const kind: TriggerKind = asset === "BTC" ? "BTC_RAPID_MOVE" : "CRYPTO_REFERENCE_RAPID_MOVE";
       const severity = (Math.abs(moveBps) >= this.config.volatilitySpikeBps ? 2 : 1) as 1 | 2 | 3;
       const candidate: Candidate = {
@@ -198,16 +200,20 @@ export class TriggerEngine {
         : [];
       const marketIds = this.assetIndex.marketIds(asset);
       if (marketIds.length === 0) {
-        return this.emit(tick.traceId, null, asset, tick.eventId, [candidate, ...extras], new Map());
+        return { overflow: false, accepted: true, triggers: this.emit(tick.traceId, null, asset, tick.eventId, [candidate, ...extras], new Map()) };
       }
       const emitted: TriggerEvent[] = [];
       for (const marketId of marketIds) {
         emitted.push(...this.emit(tick.traceId, marketId, asset, tick.eventId, [candidate, ...extras], this.marketEmitted(marketId)));
       }
-      return emitted;
+      return { overflow: false, accepted: true, triggers: emitted };
     } finally {
       this.observer?.onReferenceIngest?.((performance.now() - started) / 1000);
     }
+  }
+
+  ingestReference(tick: ReferenceTick): TriggerEvent[] {
+    return this.admitReferenceTick(tick).triggers;
   }
 
   ingestPosition(position: Position, traceId: string, asset: string | null): TriggerEvent[] {
@@ -250,6 +256,8 @@ export class TriggerEngine {
     for (const key of [...this.books.keys()]) if (key.startsWith(`${marketId}:`)) this.books.delete(key);
     this.pair.delete(marketId);
     this.windows.delete(marketId);
+    const bucket = this.emittedByMarket.get(marketId);
+    if (bucket) this.dedupeLiveEntries = Math.max(0, this.dedupeLiveEntries - bucket.size);
     this.emittedByMarket.delete(marketId);
     this.assetIndex.removeMarket(marketId);
   }
@@ -283,9 +291,18 @@ export class TriggerEngine {
   }
 
   dedupeEntryCount(): number {
+    return this.dedupeLiveEntries;
+  }
+
+  dedupeEntryCountScanForTest(): number {
+    this.dedupeScanCalls += 1;
     let count = 0;
     for (const bucket of this.emittedByMarket.values()) count += bucket.size;
     return count;
+  }
+
+  dedupeScanCallsForTest(): number {
+    return this.dedupeScanCalls;
   }
 
   assetMarketIndexEntries(): number {
@@ -328,7 +345,9 @@ export class TriggerEngine {
           continue;
         }
       }
+      const existed = emitted.has(dedupeKey);
       emitted.set(dedupeKey, { at: nowMs, severity: candidate.severity });
+      if (!existed) this.dedupeLiveEntries += 1;
       this.noteDedupe(marketId ?? "none", dedupeKey, nowMs);
       result.push({
         id: createId("trigger"), traceId, marketId, asset, source: candidate.source, kind: candidate.kind, severity: candidate.severity,
@@ -378,7 +397,10 @@ export class TriggerEngine {
   private removeDedupeRecord(marketId: string, dedupeKey: string, at: number): void {
     const bucket = this.emittedByMarket.get(marketId);
     const current = bucket?.get(dedupeKey);
-    if (current && current.at === at) bucket!.delete(dedupeKey);
+    if (current && current.at === at) {
+      bucket!.delete(dedupeKey);
+      this.dedupeLiveEntries = Math.max(0, this.dedupeLiveEntries - 1);
+    }
     if (bucket && bucket.size === 0) this.emittedByMarket.delete(marketId);
   }
 

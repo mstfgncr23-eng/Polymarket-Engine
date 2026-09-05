@@ -20,6 +20,12 @@ export const MARKET_INGRESS_BOUNDS = {
   maxBytes: 4 * 1024 * 1024,
 } as const;
 
+/** Coalesce queue-observer metric publishes. Overflow/gap may flush immediately. */
+export const INGRESS_OBSERVER_BOUNDS = {
+  coalesceEveryMutations: 64,
+  coalesceMinIntervalMs: 50,
+} as const;
+
 export const CLOB_MARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 
 export const TOKEN_SYNC_STATES = ["AWAITING_BOOK", "SYNCED", "GAPPED"] as const;

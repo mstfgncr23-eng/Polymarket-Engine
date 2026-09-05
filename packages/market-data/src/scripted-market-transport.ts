@@ -62,6 +62,20 @@ export class ScriptedBoundedStream implements BoundedMarketStream {
     return { ok: true };
   }
 
+  /** Remote unexpected close without going through adapter closeCurrentStream. */
+  endRemote(): void {
+    this.ended = true;
+    this.wake();
+  }
+
+  fail(error: Error): void {
+    this.pendingError = error;
+    this.ended = true;
+    while (this.waiters.length > 0) {
+      this.waiters.shift()!({ value: undefined, done: true });
+    }
+  }
+
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
@@ -90,14 +104,6 @@ export class ScriptedBoundedStream implements BoundedMarketStream {
         });
       },
     };
-  }
-
-  private fail(error: Error): void {
-    this.pendingError = error;
-    this.ended = true;
-    while (this.waiters.length > 0) {
-      this.waiters.shift()!({ value: undefined, done: true });
-    }
   }
 
   private wake(): void {

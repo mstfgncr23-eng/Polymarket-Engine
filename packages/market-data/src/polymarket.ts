@@ -162,6 +162,8 @@ export class PolymarketMarketDataAdapter {
   private readonly sync = new TokenSyncIndex();
   readonly ingress: BoundedIngressQueue;
   private readonly transport: MarketStreamTransport;
+  private hadTrustedBooks = false;
+  private logicalLossGapped = false;
 
   constructor(
     client?: PublicClient,
@@ -364,12 +366,15 @@ export class PolymarketMarketDataAdapter {
           const current = [...this.tokenIds];
           if (current.length === 0) continue;
           const generationRestart = generation > 1 && reconnectCount === 0;
+          const emitGap = generationRestart
+            || (reconnectCount > 0 && !this.logicalLossGapped && this.hadTrustedBooks);
           this.beginStreamEpoch(
             current,
             reconnectCount > 0 ? "reconnect" : generationRestart ? "generation_change" : "explicit_resubscribe",
             handlers,
-            { emitGap: reconnectCount > 0 || generationRestart },
+            { emitGap },
           );
+          this.logicalLossGapped = false;
           const stream = await this.transport.subscribe(current, true);
           this.activeStreams += 1;
           this.closeCurrentStream = () => {
@@ -391,7 +396,7 @@ export class PolymarketMarketDataAdapter {
               } catch (error) {
                 const normalized = error instanceof Error ? error : new Error(String(error));
                 if (normalized instanceof IngressOverflowError) {
-                  this.gapAll(normalized.reason, handlers);
+                  this.noteUnexpectedStreamLoss(normalized.reason, handlers);
                   await stream.close();
                   break;
                 }
@@ -414,19 +419,13 @@ export class PolymarketMarketDataAdapter {
           if (signal.aborted) break;
           if (resubscribed || generation !== this.streamGeneration) continue;
           const normalized = error instanceof Error ? error : new Error(String(error));
-          if (normalized instanceof IngressOverflowError) {
-            this.gapAll(normalized.reason, handlers);
-            reconnectCount += 1;
-            await handlers.onConnection({ feed: "polymarket", state: "DISCONNECTED", at: new Date().toISOString(), reconnectCount, message: normalized.message });
-            await abortableDelay(backoff.nextDelay(), signal).catch(() => undefined);
-            continue;
-          }
           if (isTimestampDisorderError(normalized)) {
             this.noteAnomaly(handlers, timestampDisorderAnomaly(normalized));
             continue;
           }
+          this.noteUnexpectedStreamLoss(unexpectedLossReason(normalized), handlers);
           reconnectCount += 1;
-          await handlers.onError(normalized);
+          if (!(normalized instanceof IngressOverflowError)) await handlers.onError(normalized);
           await handlers.onConnection({ feed: "polymarket", state: "DISCONNECTED", at: new Date().toISOString(), reconnectCount, message: normalized.message });
           await abortableDelay(backoff.nextDelay(), signal).catch(() => undefined);
         }
@@ -477,14 +476,21 @@ export class PolymarketMarketDataAdapter {
     for (const tokenId of tokenIds) {
       this.sync.markGapped(tokenId, reason);
       this.books.delete(tokenId);
+      this.lastTimestampByToken.delete(tokenId);
     }
     this.ingress.clear();
+    this.logicalLossGapped = true;
     handlers?.onGap?.({
       reason,
       tokenCount: tokenIds.length,
       epoch: tokenIds[0] ? this.sync.epochOf(tokenIds[0]) : 0,
       tokenIds,
     });
+  }
+
+  private noteUnexpectedStreamLoss(reason: IngressGapReason, handlers?: Pick<PolymarketFeedHandlers, "onGap">): void {
+    if (this.logicalLossGapped || !this.hadTrustedBooks) return;
+    this.gapAll(reason, handlers);
   }
 
   markTokenGappedForTest(tokenId: string, reason: IngressGapReason = "explicit_resubscribe"): void {
@@ -524,6 +530,7 @@ export class PolymarketMarketDataAdapter {
       };
       this.books.set(tokenId, state);
       const synced = this.sync.markSyncedFromBook(tokenId);
+      this.hadTrustedBooks = true;
       if (synced.wasResync) {
         handlers.onResync?.({ reason: "full_book", tokenId, epoch: synced.epoch });
       }
@@ -1026,6 +1033,12 @@ function cryptoConfigAsset(value: Record<string, unknown>): string | null {
     if (asset) return asset.toUpperCase();
   }
   return null;
+}
+
+function unexpectedLossReason(error: Error): IngressGapReason {
+  if (error instanceof IngressOverflowError) return error.reason;
+  if (error.message.includes("MALFORMED") || error.message === "MARKET_INGRESS_MALFORMED") return "malformed";
+  return "reconnect";
 }
 
 export function closestDirectionalDiagnostics(report: DiscoveryReport, limit = 20): DirectionalMarketDiagnostic[] {

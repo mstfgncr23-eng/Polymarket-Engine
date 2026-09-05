@@ -197,6 +197,7 @@ export class EngineService {
   private lastShutdownCheckpointed = false;
   private maintenanceHold: Promise<void> | null = null;
   private processTriggerHold: Promise<void> | null = null;
+  private referenceTelemetryHoldForTest: Promise<void> | null = null;
   private discoveryGenerationApplied = 0;
 
   constructor(
@@ -766,13 +767,40 @@ export class EngineService {
       this.logger.error({ err: error, asset }, "reference feed failed to start");
       return "transient" as const;
     });
-    if (outcome === "started") {
-      await this.safeAppend(createJournalEvent({
-        traceId: createId("trace"), type: "REFERENCE_FEED_STARTED", aggregateType: "reference", aggregateId: asset,
-        payload: { asset, symbol: resolution.symbol, sharedByMarkets: markets },
-      }));
-      this.record("REFERENCE_FEED_STARTED", createId("trace"), null, { asset, markets }, asset);
+    if (outcome === "started" || outcome === "already") {
+      if (outcome === "started") {
+        await this.safeAppend(createJournalEvent({
+          traceId: createId("trace"), type: "REFERENCE_FEED_STARTED", aggregateType: "reference", aggregateId: asset,
+          payload: { asset, symbol: resolution.symbol, sharedByMarkets: markets },
+        }));
+        this.record("REFERENCE_FEED_STARTED", createId("trace"), null, { asset, markets }, asset);
+      }
+      if (this.referenceUnreliable.has(asset) && this.assetStillNeeded(asset)) {
+        this.referenceResyncRequested.add(asset);
+      } else if (!this.assetStillNeeded(asset)) {
+        this.referenceResyncRequested.delete(asset);
+        try { this.referenceRegistry.stop(asset); } catch { /* scripted */ }
+      }
+      return;
     }
+    this.referenceResyncRequested.delete(asset);
+    if (outcome === "unsupported") {
+      return;
+    }
+    if ((outcome === "transient" || outcome === "stopped") && this.shouldRetryReferenceStart(asset)) {
+      this.scheduleReferenceRetry(asset, 50, 60_000);
+    }
+  }
+
+  private assetStillNeeded(asset: string): boolean {
+    return [...this.assetByMarket.values()].includes(asset);
+  }
+
+  private shouldRetryReferenceStart(asset: string): boolean {
+    return this.referenceUnreliable.has(asset)
+      && this.assetStillNeeded(asset)
+      && !this.abort.signal.aborted
+      && !this.state.draining;
   }
 
   private scheduleReferenceRetry(asset: string, retryAfterMs: number | undefined, maxDelayMs: number): void {
@@ -1285,10 +1313,17 @@ export class EngineService {
     if (this.usesDiscovery() && !this.assetIndex.hasAsset(tick.asset)) return;
     this.metrics.referenceTicks.inc();
     const started = performance.now();
-    if (this.triggerEngine.referenceWindowOverflowed(tick.asset)) {
+    const admission = this.triggerEngine.admitReferenceTick(tick);
+    if (admission.overflow) {
       this.markReferenceUnreliable(tick.asset);
       this.state.invalidateReferenceContext(tick.asset);
       this.requestReferenceResync(tick.asset);
+      await this.persistReferenceTick(tick);
+      this.metrics.referenceWindowEntries.set(this.triggerEngine.referenceWindowTotalEntries());
+      this.metrics.referenceTickProcessingDuration.observe((performance.now() - started) / 1000);
+      return;
+    }
+    if (!admission.accepted) {
       this.metrics.referenceWindowEntries.set(this.triggerEngine.referenceWindowTotalEntries());
       this.metrics.referenceTickProcessingDuration.observe((performance.now() - started) / 1000);
       return;
@@ -1302,24 +1337,23 @@ export class EngineService {
       this.state.connections.btc.lastMessageAt = tick.receivedAt;
     }
     this.updateReady();
-    await this.writer.persist(createJournalEvent({ traceId: tick.traceId, type: "REFERENCE_TICK", aggregateType: "reference", aggregateId: tick.asset, payload: tick, occurredAt: new Date(tick.sourceTimestamp), sourceEventId: tick.eventId }));
-    const triggers = this.triggerEngine.ingestReference(tick);
-    if (this.triggerEngine.referenceWindowOverflowed(tick.asset)) {
-      this.markReferenceUnreliable(tick.asset);
-      this.state.invalidateReferenceContext(tick.asset);
-      this.requestReferenceResync(tick.asset);
-      this.metrics.referenceWindowEntries.set(this.triggerEngine.referenceWindowTotalEntries());
-      this.metrics.referenceTickProcessingDuration.observe((performance.now() - started) / 1000);
-      return;
-    }
+    await this.persistReferenceTick(tick);
     if (wasUnreliable) {
       this.referenceUnreliable.delete(tick.asset);
       this.referenceResyncRequested.delete(tick.asset);
     }
     this.metrics.referenceWindowEntries.set(this.triggerEngine.referenceWindowTotalEntries());
-    for (const trigger of triggers) this.admitTrigger(trigger);
+    for (const trigger of admission.triggers) this.admitTrigger(trigger);
     this.metrics.triggerDedupeEntries.set(this.triggerEngine.dedupeEntryCount());
     this.metrics.referenceTickProcessingDuration.observe((performance.now() - started) / 1000);
+  }
+
+  private async persistReferenceTick(tick: ReferenceTick): Promise<void> {
+    if (this.referenceTelemetryHoldForTest) await this.referenceTelemetryHoldForTest;
+    await this.writer.persist(createJournalEvent({
+      traceId: tick.traceId, type: "REFERENCE_TICK", aggregateType: "reference", aggregateId: tick.asset,
+      payload: tick, occurredAt: new Date(tick.sourceTimestamp), sourceEventId: tick.eventId,
+    }));
   }
 
   private admitTrigger(trigger: TriggerEvent): AdmitResult {
@@ -1327,15 +1361,17 @@ export class EngineService {
       return { admitted: false, reason: "fail_closed", done: Promise.resolve() };
     }
     const lane = triggerWorkLane(trigger.kind);
+    const marketEpochFence = this.captureMarketEpochFence(trigger);
     const result = this.supervisor.admit({
       id: trigger.id,
       lane,
       key: triggerWorkKey(trigger),
       estimatedBytes: RUNTIME_BOUNDS.triggerByteEstimate,
       critical: lane === "p0",
+      marketEpochFence,
       run: async (signal) => {
         if (signal.aborted) return;
-        await this.processTrigger(trigger, signal);
+        await this.processTrigger(trigger, signal, marketEpochFence);
       },
     });
     if (!result.admitted) {
@@ -1375,14 +1411,18 @@ export class EngineService {
     this.syncRuntimeState();
   }
 
-  private async processTrigger(trigger: TriggerEvent, signal?: AbortSignal): Promise<void> {
+  private async processTrigger(
+    trigger: TriggerEvent,
+    signal?: AbortSignal,
+    marketEpochFence: ReadonlyMap<string, number> | null = null,
+  ): Promise<void> {
     this.metrics.noteProcessTriggerStart();
     const started = performance.now();
     try {
     if (signal?.aborted) return;
     if (this.processTriggerHold) await this.processTriggerHold;
     if (signal?.aborted) return;
-    if (this.shouldSuppressStaleMarketTrigger(trigger)) {
+    if (this.shouldSuppressStaleMarketTrigger(trigger, marketEpochFence)) {
       this.metrics.triggersSuppressed.inc({ kind: trigger.kind, severity: String(trigger.severity) });
       return;
     }
@@ -2477,6 +2517,14 @@ export class EngineService {
   }
   setMaintenanceHoldForTest(hold: Promise<void> | null): void { this.maintenanceHold = hold; }
   setProcessTriggerHoldForTest(hold: Promise<void> | null): void { this.processTriggerHold = hold; }
+  setReferenceTelemetryHoldForTest(hold: Promise<void> | null): void { this.referenceTelemetryHoldForTest = hold; }
+  async flushReferenceRetryForTest(asset: string): Promise<void> {
+    this.clearReferenceRetry(asset);
+    await this.retryTransientReference(asset);
+  }
+  referenceRetryTimerCountForTest(): number { return this.referenceRetryTimers.size; }
+  referenceResyncRequestedForTest(asset: string): boolean { return this.referenceResyncRequested.has(asset); }
+  triggerDedupeScanCallsForTest(): number { return this.triggerEngine.dedupeScanCallsForTest(); }
   applyIngressGapForTest(tokenIds: readonly string[], reason: "explicit_resubscribe" | "reconnect" | "count_limit" = "explicit_resubscribe"): void {
     this.invalidateMarketProjections(tokenIds);
     this.metrics.noteIngressGap(reason);
@@ -2544,10 +2592,46 @@ export class EngineService {
     this.metrics.restingOrderTokenIndexEntries.set(this.restingIndex.entryCount());
   }
 
-  private shouldSuppressStaleMarketTrigger(trigger: TriggerEvent): boolean {
+  private shouldSuppressStaleMarketTrigger(
+    trigger: TriggerEvent,
+    fence: ReadonlyMap<string, number> | null = null,
+  ): boolean {
     if (!isMarketDataDerivedTrigger(trigger)) return false;
-    if (!trigger.marketId) return false;
-    return this.marketHasGappedToken(trigger.marketId);
+    if (trigger.marketId && this.marketHasGappedToken(trigger.marketId)) return true;
+    return this.marketEpochFenceStale(fence);
+  }
+
+  private captureMarketEpochFence(trigger: TriggerEvent): Map<string, number> | null {
+    if (!isMarketDataDerivedTrigger(trigger) || !trigger.marketId) return null;
+    const tokens = this.tokensForMarket(trigger.marketId);
+    if (tokens.length === 0) return null;
+    const fence = new Map<string, number>();
+    for (const tokenId of tokens) {
+      if (!this.adapterTokenSynchronized(tokenId)) return null;
+      fence.set(tokenId, this.adapterTokenEpoch(tokenId));
+    }
+    return fence;
+  }
+
+  private marketEpochFenceStale(fence: ReadonlyMap<string, number> | null): boolean {
+    if (!fence || fence.size === 0) return false;
+    for (const [tokenId, epoch] of fence) {
+      if (!this.adapterTokenSynchronized(tokenId) || this.adapterTokenEpoch(tokenId) !== epoch) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private tokensForMarket(marketId: string): string[] {
+    const discovered = this.marketsById.get(marketId)?.tokens.map((token) => token.tokenId) ?? [];
+    const pair = this.snapshots.get(marketId);
+    return uniqueStrings([
+      ...discovered,
+      pair?.UP?.tokenId,
+      pair?.DOWN?.tokenId,
+      ...[...this.state.marketSnapshots.values()].filter((item) => item.marketId === marketId).map((item) => item.tokenId),
+    ].filter((item): item is string => Boolean(item)));
   }
 
   private marketHasGappedToken(marketId: string): boolean {
@@ -2603,19 +2687,18 @@ export class EngineService {
   }
 
   private requestReferenceResync(asset: string): void {
-    if (this.referenceResyncRequested.has(asset) || this.referenceResyncInFlight.has(asset)) return;
-    this.referenceResyncRequested.add(asset);
+    if (this.referenceResyncInFlight.has(asset)) return;
+    if (this.referenceRetryTimers.has(asset)) return;
+    if (this.referenceResyncRequested.has(asset)) return;
     this.referenceResyncInFlight.add(asset);
     this.state.invalidateReferenceContext(asset);
     try {
       this.referenceRegistry.stop(asset);
     } catch { /* scripted registries may no-op */ }
-    void this.referenceRegistry.ensureRunning(asset, {
-      onTick: (tick) => this.onReferenceTick(tick),
-      onConnection: (event) => this.onConnection(event),
-      onError: (error) => this.onFeedError(`reference:${asset}`, error),
-    }, this.abort.signal).catch((error) => {
+    void this.reconcileReferenceFeed(asset).catch((error) => {
       this.logger.error({ err: error, asset }, "reference overflow resync failed");
+      this.referenceResyncRequested.delete(asset);
+      if (this.shouldRetryReferenceStart(asset)) this.scheduleReferenceRetry(asset, 50, 60_000);
     }).finally(() => {
       this.referenceResyncInFlight.delete(asset);
     });

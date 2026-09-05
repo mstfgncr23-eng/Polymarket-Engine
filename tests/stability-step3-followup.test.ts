@@ -5,12 +5,16 @@ import {
   MARKET_DATA_TRIGGER_KINDS,
   NON_SUPPRESSIBLE_ON_MARKET_GAP_KINDS,
   TRIGGER_STABILITY_BOUNDS,
+  TriggerEngine,
+  triggerConfigSchema,
+  type MarketSnapshot,
   type ReferenceTick,
   type TriggerEvent,
 } from "@pm/core";
 import { MemoryEventJournal } from "@pm/db";
 import {
   BoundedIngressQueue,
+  INGRESS_OBSERVER_BOUNDS,
   POLYMARKET_CLIENT_SUBSCRIBE_FINDINGS,
   PolymarketMarketDataAdapter,
   ScriptedBoundedMarketTransport,
@@ -426,11 +430,13 @@ describe("Blocker 10 — live ingress metrics and one-logical-overflow gap accou
     });
     expect(queue.tryEnqueue("aa").ok).toBe(true);
     expect(queue.tryEnqueue("bbbb").ok).toBe(true);
+    queue.flushObserver();
     expect(seen.at(-1)?.depth).toBe(2);
     expect(seen.at(-1)?.bytes).toBe(6);
     expect(seen.at(-1)?.highWaterEvents).toBe(2);
     expect(seen.at(-1)?.gapTotal).toBe(0);
     expect(queue.dequeue()).toBe("aa");
+    queue.flushObserver();
     expect(seen.at(-1)?.depth).toBe(1);
     expect(seen.at(-1)?.gapTotal).toBe(0);
     expect(queue.snapshot().accepted).toBe(2);
@@ -498,6 +504,459 @@ describe("Blocker 10 — live ingress metrics and one-logical-overflow gap accou
     const help = await engine.metrics.registry.getSingleMetric("reference_window_entries");
     const exposition = help ? await help.get() : { help: "" };
     expect(String((exposition as { help?: string }).help ?? "")).toMatch(/across all assets/i);
+    await engine.stop();
+  });
+});
+
+function liveBookEvent(tokenId: string, timestamp: number) {
+  return {
+    type: "book",
+    payload: {
+      tokenId, market: tokenId, timestamp,
+      bids: [{ price: "0.47", size: "10" }],
+      asks: [{ price: "0.48", size: "5" }],
+      lastTradePrice: "0.48",
+    },
+  };
+}
+
+async function startLiveAdapter(tokenId = "tok-up") {
+  const transport = new ScriptedBoundedMarketTransport();
+  const adapter = new PolymarketMarketDataAdapter(undefined, { transport, ingress: transport.queue });
+  adapter.registerManualToken(tokenId, tokenId, "UP", "BTC");
+  const ac = new AbortController();
+  const gaps: string[] = [];
+  const connections: string[] = [];
+  const running = adapter.run([tokenId], {
+    onSnapshot: () => undefined,
+    onConnection: (event) => { connections.push(event.state); },
+    onError: () => undefined,
+    onGap: (event) => { gaps.push(event.reason); },
+  }, ac.signal);
+  await waitFor(() => connections.includes("CONNECTED"));
+  return { adapter, transport, ac, running, gaps, connections };
+}
+
+describe("Step-3 follow-up 1 — unexpected market stream loss gaps before backoff", () => {
+  it("A: synchronized books then unexpected stream end gaps before reconnect delay", async () => {
+    const journal = new MemoryEventJournal();
+    const transport = new ScriptedBoundedMarketTransport();
+    const adapter = new PolymarketMarketDataAdapter(undefined, { transport, ingress: transport.queue });
+    const engine = new EngineService(qualifiedPaperEnv({ POLYMARKET_TOKEN_IDS: "tok-up" }), journal, { error: () => undefined }, {
+      market: adapter,
+      referenceRegistry: new ScriptedReferenceRegistry() as never,
+      activation: new NoopGrokActivationBridge(),
+    });
+    await engine.start();
+    await waitFor(() => transport.subscribeCalls >= 1 && adapter.tokenSyncState("tok-up") === "AWAITING_BOOK");
+    expect(transport.push(liveBookEvent("tok-up", 1_000)).ok).toBe(true);
+    await waitFor(() => adapter.isTokenSynchronized("tok-up") && engine.state.marketSnapshots.has("tok-up"));
+    expect(mcpVisibleOrderbook(engine.state, "tok-up", (id) => engine.isTokenSynchronized(id))?.asks[0]?.price).toBe("0.48");
+
+    const before = Date.now();
+    transport.current().endRemote();
+    await waitFor(() => adapter.tokenSyncState("tok-up") === "GAPPED");
+    expect(Date.now() - before).toBeLessThan(400);
+    expect(adapter.bookState("tok-up")).toBeUndefined();
+    expect(engine.state.marketSnapshots.get("tok-up")).toBeUndefined();
+    expect(mcpVisibleOrderbook(engine.state, "tok-up", (id) => engine.isTokenSynchronized(id))).toBeNull();
+    await engine.stop();
+  });
+
+  it("B: malformed JSON gaps immediately with malformed reason before retry", async () => {
+    const { adapter, transport, ac, running, gaps } = await startLiveAdapter();
+    expect(transport.push(liveBookEvent("tok-up", 1_000)).ok).toBe(true);
+    await waitFor(() => adapter.isTokenSynchronized("tok-up"));
+    const before = Date.now();
+    transport.current().fail(new Error("MARKET_INGRESS_MALFORMED"));
+    await waitFor(() => adapter.tokenSyncState("tok-up") === "GAPPED");
+    expect(Date.now() - before).toBeLessThan(400);
+    expect(gaps).toEqual(["malformed"]);
+    expect(adapter.bookState("tok-up")).toBeUndefined();
+    ac.abort();
+    await running;
+  });
+
+  it("C: stale WebSocket gaps immediately before retry", async () => {
+    const { adapter, transport, ac, running, gaps } = await startLiveAdapter();
+    expect(transport.push(liveBookEvent("tok-up", 1_000)).ok).toBe(true);
+    await waitFor(() => adapter.isTokenSynchronized("tok-up"));
+    const before = Date.now();
+    transport.current().fail(new Error("CLOB_MARKET_WS_STALE"));
+    await waitFor(() => adapter.tokenSyncState("tok-up") === "GAPPED");
+    expect(Date.now() - before).toBeLessThan(400);
+    expect(gaps).toEqual(["reconnect"]);
+    ac.abort();
+    await running;
+  });
+
+  it("D: one logical disconnect emits one gap, not two, and initial connect failure is not a fake gap", async () => {
+    const { adapter, transport, ac, running, gaps } = await startLiveAdapter();
+    expect(transport.push(liveBookEvent("tok-up", 1_000)).ok).toBe(true);
+    await waitFor(() => adapter.isTokenSynchronized("tok-up"));
+    transport.current().endRemote();
+    await waitFor(() => adapter.tokenSyncState("tok-up") === "GAPPED");
+    expect(gaps).toEqual(["reconnect"]);
+    await waitFor(() => transport.subscribeCalls >= 2);
+    expect(gaps).toEqual(["reconnect"]);
+    ac.abort();
+    await running;
+
+    const second = await startLiveAdapter("tok-init");
+    second.transport.current().fail(new Error("POLYMARKET_STREAM_ENDED"));
+    await waitFor(() => second.connections.includes("DISCONNECTED"));
+    expect(second.gaps).toEqual([]);
+    expect(second.adapter.tokenSyncState("tok-init")).toBe("AWAITING_BOOK");
+    second.ac.abort();
+    await second.running;
+  });
+});
+
+describe("Step-3 follow-up 2 — queued market triggers are epoch-fenced", () => {
+  it("A: epoch N held through gap/resync does not journal after epoch N+1", async () => {
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => { release = resolve; });
+    const { engine, market, journal } = await startQualifiedEngine();
+    await market.waitForHandlers();
+    await market.emitSnapshot(book("UP", "0.48"));
+    await market.emitSnapshot(book("DOWN", "0.51"));
+    try {
+      engine.setProcessTriggerHoldForTest(hold);
+      const stale = marketTrigger({ id: "epoch-n-stale" });
+      expect(engine.enqueueTriggerStormForTest([stale]).admitted).toBe(1);
+      await waitFor(() => engine.runtimeSupervisorSnapshot().totalInFlight >= 1);
+      market.emitGap(["btc-up", "btc-down"]);
+      market.markTokenSync("btc-up", "SYNCED");
+      market.markTokenSync("btc-down", "SYNCED");
+      await market.emitSnapshot(book("UP", "0.47", { sequence: 2, eventId: createId("market") }));
+      await market.emitSnapshot(book("DOWN", "0.52", { sequence: 2, eventId: createId("market") }));
+      engine.setProcessTriggerHoldForTest(null);
+      release();
+      await drainRuntime(engine);
+      const events = await journal.queryEvents({ types: ["TRIGGER_EVENT", "GROK_ACTIVATION_DECISION"] });
+      expect(events.some((event) => event.payload.id === "epoch-n-stale" || event.payload.triggerId === "epoch-n-stale")).toBe(false);
+    } finally {
+      engine.setProcessTriggerHoldForTest(null);
+      release();
+      await engine.stop();
+    }
+  });
+
+  it("B: current-epoch trigger after resync does process", async () => {
+    const { engine, market, journal } = await startQualifiedEngine();
+    await market.waitForHandlers();
+    await market.emitSnapshot(book("UP", "0.48"));
+    await market.emitSnapshot(book("DOWN", "0.51"));
+    market.emitGap(["btc-up", "btc-down"]);
+    market.markTokenSync("btc-up", "SYNCED");
+    market.markTokenSync("btc-down", "SYNCED");
+    await market.emitSnapshot(book("UP", "0.47", { sequence: 2, eventId: createId("market") }));
+    await market.emitSnapshot(book("DOWN", "0.52", { sequence: 2, eventId: createId("market") }));
+    const fresh = marketTrigger({ id: "epoch-n1-fresh" });
+    engine.enqueueTriggerStormForTest([fresh]);
+    await drainRuntime(engine);
+    const events = await journal.queryEvents({ types: ["TRIGGER_EVENT"] });
+    expect(events.some((event) => event.payload.id === "epoch-n1-fresh")).toBe(true);
+    await engine.stop();
+  });
+
+  it("C: risk P0 survives the same epoch change", async () => {
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => { release = resolve; });
+    const { engine, market, journal } = await startQualifiedEngine();
+    await market.waitForHandlers();
+    await market.emitSnapshot(book("UP", "0.48"));
+    try {
+      engine.setProcessTriggerHoldForTest(hold);
+      const risk = riskTrigger({ id: "risk-epoch" });
+      expect(engine.enqueueTriggerStormForTest([risk]).admitted).toBe(1);
+      await waitFor(() => engine.runtimeSupervisorSnapshot().totalInFlight >= 1);
+      market.emitGap(["btc-up", "btc-down"]);
+      market.markTokenSync("btc-up", "SYNCED");
+      market.markTokenSync("btc-down", "SYNCED");
+      engine.setProcessTriggerHoldForTest(null);
+      release();
+      await drainRuntime(engine);
+      const events = await journal.queryEvents({ types: ["TRIGGER_EVENT"] });
+      expect(events.some((event) => event.payload.id === "risk-epoch")).toBe(true);
+    } finally {
+      engine.setProcessTriggerHoldForTest(null);
+      release();
+      await engine.stop();
+    }
+  });
+
+  it("D: AWAITING_BOOK after reconnect cannot validate an old epoch trigger", async () => {
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => { release = resolve; });
+    const { engine, market, journal } = await startQualifiedEngine();
+    await market.waitForHandlers();
+    await market.emitSnapshot(book("UP", "0.48"));
+    await market.emitSnapshot(book("DOWN", "0.51"));
+    try {
+      engine.setProcessTriggerHoldForTest(hold);
+      const stale = marketTrigger({ id: "awaiting-old" });
+      expect(engine.enqueueTriggerStormForTest([stale]).admitted).toBe(1);
+      await waitFor(() => engine.runtimeSupervisorSnapshot().totalInFlight >= 1);
+      market.emitGap(["btc-up", "btc-down"]);
+      market.markTokenSync("btc-up", "AWAITING_BOOK");
+      market.markTokenSync("btc-down", "AWAITING_BOOK");
+      expect(market.tokenSyncState("btc-up")).toBe("AWAITING_BOOK");
+      engine.setProcessTriggerHoldForTest(null);
+      release();
+      await drainRuntime(engine);
+      const events = await journal.queryEvents({ types: ["TRIGGER_EVENT", "GROK_ACTIVATION_DECISION"] });
+      expect(events.some((event) => event.payload.id === "awaiting-old" || event.payload.triggerId === "awaiting-old")).toBe(false);
+    } finally {
+      engine.setProcessTriggerHoldForTest(null);
+      release();
+      await engine.stop();
+    }
+  });
+});
+
+describe("Step-3 follow-up 3 — reference overflow fail-closed before trusted publish", () => {
+  it("overflow-causing tick is never trusted while telemetry persist is held", async () => {
+    const market = new ScriptedMarketAdapter();
+    market.queue(discoveryReport([qualified("eth-mkt", "ETH", "eth-up", "eth-down")]));
+    const journal = new MemoryEventJournal();
+    const referenceRegistry = new ScriptedReferenceRegistry();
+    const engine = new EngineService(qualifiedPaperEnv(), journal, { error: () => undefined }, {
+      market: market as never,
+      referenceRegistry: referenceRegistry as never,
+      activation: new NoopGrokActivationBridge(),
+    });
+    await engine.start();
+    await market.waitForHandlers();
+    await market.emitSnapshot({
+      ...book("UP", "0.48", { marketId: "eth-mkt", tokenId: "eth-up", asset: "ETH", eventId: createId("market") }),
+      outcome: "UP",
+    } as MarketSnapshot);
+    engine.attachReferenceWindowForTest("ETH", 4);
+    const t0 = Date.parse("2026-08-31T12:00:00.000Z");
+    for (let i = 0; i < 4; i += 1) {
+      await engine.ingestReferenceTickForTest(refTick("ETH", "2000", t0 + i * 100));
+    }
+    expect(engine.state.getReferenceContext("ETH", t0 + 400).latestPrice).toBe("2000");
+
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => { release = resolve; });
+    engine.setReferenceTelemetryHoldForTest(hold);
+    const pending = engine.ingestReferenceTickForTest(refTick("ETH", "9999", t0 + 500));
+    await Promise.resolve();
+    expect(engine.referenceWindowOverflowedForTest("ETH")).toBe(true);
+    expect(engine.referenceUnreliableForTest("ETH")).toBe(true);
+    expect(engine.openFirstLegBlockedByUnreliableReferenceForTest("eth-mkt")).toBe(true);
+    expect(engine.state.getReferenceContext("ETH", t0 + 500).latestPrice).not.toBe("9999");
+    expect(engine.state.getReferenceContext("ETH", t0 + 500).latestPrice).toBeNull();
+    engine.setReferenceTelemetryHoldForTest(null);
+    release();
+    await pending;
+    expect(engine.state.getReferenceContext("ETH", t0 + 600).latestPrice).not.toBe("9999");
+    await engine.stop();
+  });
+});
+
+describe("Step-3 follow-up 4 — reference resync recovers from transient start failure", () => {
+  it("A: overflow → transient start → later retry restores on first trusted tick", async () => {
+    const market = new ScriptedMarketAdapter();
+    market.queue(discoveryReport([qualified("eth-mkt", "ETH", "eth-up", "eth-down")]));
+    const journal = new MemoryEventJournal();
+    const referenceRegistry = new ScriptedReferenceRegistry();
+    const engine = new EngineService(qualifiedPaperEnv(), journal, { error: () => undefined }, {
+      market: market as never,
+      referenceRegistry: referenceRegistry as never,
+      activation: new NoopGrokActivationBridge(),
+    });
+    await engine.start();
+    await market.waitForHandlers();
+    await market.emitSnapshot({
+      ...book("UP", "0.48", { marketId: "eth-mkt", tokenId: "eth-up", asset: "ETH", eventId: createId("market") }),
+      outcome: "UP",
+    } as MarketSnapshot);
+    engine.attachReferenceWindowForTest("ETH", 4);
+    referenceRegistry.queueEnsureOutcome("ETH", "transient");
+    const t0 = Date.parse("2026-08-31T12:00:00.000Z");
+    for (let i = 0; i < 5; i += 1) {
+      await engine.ingestReferenceTickForTest(refTick("ETH", "2000", t0 + i * 100));
+    }
+    expect(engine.referenceUnreliableForTest("ETH")).toBe(true);
+    await waitFor(() => (referenceRegistry.ensureCalls.get("ETH") ?? 0) >= 2);
+    referenceRegistry.queueEnsureOutcome("ETH", "started");
+    await engine.flushReferenceRetryForTest("ETH");
+    expect(engine.referenceResyncRequestedForTest("ETH")).toBe(true);
+    await engine.applyReferenceConnectionForTest("ETH", "CONNECTED", 1);
+    await engine.ingestReferenceTickForTest(refTick("ETH", "2100", t0 + 1_000));
+    expect(engine.referenceUnreliableForTest("ETH")).toBe(false);
+    expect(engine.state.getReferenceContext("ETH", t0 + 1_000).latestPrice).toBe("2100");
+    await engine.stop();
+  });
+
+  it("B: overflow → ensureRunning throws → bounded retry remains possible", async () => {
+    const market = new ScriptedMarketAdapter();
+    market.queue(discoveryReport([qualified("eth-mkt", "ETH", "eth-up", "eth-down")]));
+    const journal = new MemoryEventJournal();
+    const referenceRegistry = new ScriptedReferenceRegistry();
+    const engine = new EngineService(qualifiedPaperEnv(), journal, { error: () => undefined }, {
+      market: market as never,
+      referenceRegistry: referenceRegistry as never,
+      activation: new NoopGrokActivationBridge(),
+    });
+    await engine.start();
+    await market.waitForHandlers();
+    await market.emitSnapshot({
+      ...book("UP", "0.48", { marketId: "eth-mkt", tokenId: "eth-up", asset: "ETH", eventId: createId("market") }),
+      outcome: "UP",
+    } as MarketSnapshot);
+    engine.attachReferenceWindowForTest("ETH", 4);
+    referenceRegistry.queueEnsureOutcome("ETH", "throw");
+    const t0 = Date.parse("2026-08-31T12:00:00.000Z");
+    for (let i = 0; i < 5; i += 1) {
+      await engine.ingestReferenceTickForTest(refTick("ETH", "2000", t0 + i * 100));
+    }
+    expect(engine.referenceUnreliableForTest("ETH")).toBe(true);
+    await waitFor(() => (referenceRegistry.ensureCalls.get("ETH") ?? 0) >= 2);
+    referenceRegistry.queueEnsureOutcome("ETH", "started");
+    await engine.flushReferenceRetryForTest("ETH");
+    expect(engine.referenceResyncRequestedForTest("ETH")).toBe(true);
+    await engine.stop();
+  });
+
+  it("C: multiple overflow/resync requests do not create parallel sessions or timers", async () => {
+    const market = new ScriptedMarketAdapter();
+    market.queue(discoveryReport([qualified("eth-mkt", "ETH", "eth-up", "eth-down")]));
+    const journal = new MemoryEventJournal();
+    const referenceRegistry = new ScriptedReferenceRegistry();
+    const engine = new EngineService(qualifiedPaperEnv(), journal, { error: () => undefined }, {
+      market: market as never,
+      referenceRegistry: referenceRegistry as never,
+      activation: new NoopGrokActivationBridge(),
+    });
+    await engine.start();
+    await market.waitForHandlers();
+    await market.emitSnapshot({
+      ...book("UP", "0.48", { marketId: "eth-mkt", tokenId: "eth-up", asset: "ETH", eventId: createId("market") }),
+      outcome: "UP",
+    } as MarketSnapshot);
+    engine.attachReferenceWindowForTest("ETH", 2);
+    const t0 = Date.parse("2026-08-31T12:00:00.000Z");
+    await engine.ingestReferenceTickForTest(refTick("ETH", "2000", t0));
+    await engine.ingestReferenceTickForTest(refTick("ETH", "2000", t0 + 100));
+    await engine.ingestReferenceTickForTest(refTick("ETH", "2000", t0 + 200));
+    await engine.ingestReferenceTickForTest(refTick("ETH", "2000", t0 + 300));
+    await engine.ingestReferenceTickForTest(refTick("ETH", "2000", t0 + 400));
+    expect(referenceRegistry.maxConcurrentEnsure.value).toBe(1);
+    expect(engine.referenceRetryTimerCountForTest()).toBeLessThanOrEqual(1);
+    expect(referenceRegistry.stopCounts.get("ETH")).toBe(1);
+    await engine.stop();
+  });
+
+  it("D: asset removed while retry pending does not restart", async () => {
+    const market = new ScriptedMarketAdapter();
+    market.queue(discoveryReport([
+      qualified("btc-mkt", "BTC", "btc-up", "btc-down"),
+      qualified("eth-mkt", "ETH", "eth-up", "eth-down"),
+    ]));
+    const journal = new MemoryEventJournal();
+    const referenceRegistry = new ScriptedReferenceRegistry();
+    const engine = new EngineService(qualifiedPaperEnv(), journal, { error: () => undefined }, {
+      market: market as never,
+      referenceRegistry: referenceRegistry as never,
+      activation: new NoopGrokActivationBridge(),
+    });
+    await engine.start();
+    await market.waitForHandlers();
+    await market.emitSnapshot(book("UP", "0.48"));
+    await market.emitSnapshot({
+      ...book("UP", "0.48", { marketId: "eth-mkt", tokenId: "eth-up", asset: "ETH", eventId: createId("market") }),
+      outcome: "UP",
+    } as MarketSnapshot);
+    engine.attachReferenceWindowForTest("ETH", 2);
+    referenceRegistry.queueEnsureOutcome("ETH", "transient");
+    const t0 = Date.parse("2026-08-31T12:00:00.000Z");
+    await engine.ingestReferenceTickForTest(refTick("ETH", "2000", t0));
+    await engine.ingestReferenceTickForTest(refTick("ETH", "2000", t0 + 100));
+    await engine.ingestReferenceTickForTest(refTick("ETH", "2000", t0 + 200));
+    await waitFor(() => (referenceRegistry.ensureCalls.get("ETH") ?? 0) >= 2);
+    const callsAfterOverflow = referenceRegistry.ensureCalls.get("ETH") ?? 0;
+    market.queue(discoveryReport([qualified("btc-mkt", "BTC", "btc-up", "btc-down")]));
+    await engine.reconcileDiscovery();
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(referenceRegistry.ensureCalls.get("ETH")).toBe(callsAfterOverflow);
+    await engine.stop();
+  });
+});
+
+describe("Step-3 follow-up 5 — coalesced ingress metrics and O(1) dedupe count", () => {
+  it("A: live ingress gauges eventually reflect enqueue/dequeue/high-water under coalescing", async () => {
+    const metrics = new EngineMetrics();
+    const queue = new BoundedIngressQueue(64, 100_000);
+    queue.setObserver({ onChange: (snapshot) => metrics.noteIngressSnapshot(snapshot) });
+    for (let i = 0; i < 20; i += 1) expect(queue.tryEnqueue(`e${i}`)).toEqual({ ok: true });
+    expect(queue.dequeue()).toBe("e0");
+    await new Promise((resolve) => setTimeout(resolve, INGRESS_OBSERVER_BOUNDS.coalesceMinIntervalMs + 5));
+    expect(queue.tryEnqueue("late").ok).toBe(true);
+    expect(await metricValue(metrics, "market_ingress_queue_depth")).toBe(queue.snapshot().depth);
+    expect(await metricValue(metrics, "market_ingress_high_water_total")).toBe(queue.snapshot().highWaterEvents);
+    queue.flushObserver();
+    expect(await metricValue(metrics, "market_ingress_queue_depth")).toBe(queue.depth);
+  });
+
+  it("B: overflow metrics publish immediately", () => {
+    let lastGap = 0;
+    const queue = new BoundedIngressQueue(2, 64);
+    queue.setObserver({ onChange: (snapshot) => { lastGap = snapshot.gapTotal; } });
+    expect(queue.tryEnqueue("a").ok).toBe(true);
+    expect(queue.tryEnqueue("b").ok).toBe(true);
+    const before = queue.observerPublishCount;
+    expect(queue.tryEnqueue("c").ok).toBe(false);
+    expect(queue.observerPublishCount).toBeGreaterThan(before);
+    expect(lastGap).toBe(1);
+    expect(queue.snapshot().gapTotal).toBe(1);
+  });
+
+  it("C: observer invocations stay far below 100k queue mutations", () => {
+    const queue = new BoundedIngressQueue(200_000, 10_000_000);
+    let observerCalls = 0;
+    queue.setObserver({ onChange: () => { observerCalls += 1; } });
+    for (let i = 0; i < 50_000; i += 1) queue.tryEnqueue(i);
+    for (let i = 0; i < 50_000; i += 1) queue.dequeue();
+    expect(queue.accepted + queue.processed).toBe(100_000);
+    expect(observerCalls).toBeLessThan(4_000);
+    expect(queue.observerPublishCount).toBe(observerCalls);
+  });
+
+  it("D: incremental dedupe counter equals a map scan under churn/expiry/removal", () => {
+    let now = Date.parse("2026-08-31T12:00:00.000Z");
+    const engine = new TriggerEngine(triggerConfigSchema.parse({
+      cooldownMs: 0, imbalanceThreshold: 0.01, spreadChangeThreshold: 0.0001, depthChangeThreshold: 0.01,
+    }), () => new Date(now));
+    for (let i = 0; i < 40; i += 1) {
+      engine.ingestMarket({
+        ...book("UP", "0.40", { marketId: `m${i}`, tokenId: `u${i}`, eventId: createId("market"), sequence: 1 }),
+        outcome: "UP",
+      } as MarketSnapshot);
+    }
+    expect(engine.dedupeEntryCount()).toBe(engine.dedupeEntryCountScanForTest());
+    now += TRIGGER_STABILITY_BOUNDS.dedupeRetentionMs + 1;
+    engine.ingestMarket({
+      ...book("UP", "0.40", { marketId: "m-late", tokenId: "u-late", eventId: createId("market"), sequence: 1 }),
+      outcome: "UP",
+    } as MarketSnapshot);
+    expect(engine.dedupeEntryCount()).toBe(engine.dedupeEntryCountScanForTest());
+    engine.dropMarket("m-late");
+    expect(engine.dedupeEntryCount()).toBe(engine.dedupeEntryCountScanForTest());
+  });
+
+  it("E: onMarketSnapshot does not scan all dedupe buckets", async () => {
+    const { engine, market } = await startQualifiedEngine();
+    await market.waitForHandlers();
+    const before = engine.triggerDedupeScanCallsForTest();
+    await market.emitSnapshot(book("UP", "0.48"));
+    await market.emitSnapshot(book("DOWN", "0.51"));
+    await market.emitSnapshot(book("UP", "0.30", { sequence: 2, eventId: createId("market") }));
+    await drainRuntime(engine);
+    expect(engine.triggerDedupeScanCallsForTest()).toBe(before);
     await engine.stop();
   });
 });
