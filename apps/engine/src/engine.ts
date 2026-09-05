@@ -2060,9 +2060,6 @@ export class EngineService {
     const critical = isCriticalPersistenceType(event.type);
     const journalClass = classifyJournalMetricClass(event.type);
     const reportInput = isReportInputEventType(event.type) && !isSourceSealExemptType(event.type);
-    if (reportInput && this.sourceSealBlocksAdmission()) {
-      throw new JournalAdmissionRejected(journalClass, critical, "SOURCE_SEALED");
-    }
     try {
       await this.journalAdmission.run(journalClass, critical, async () => {
         if (signal?.aborted) throw new JournalAdmissionRejected(journalClass, critical, "JOURNAL_ADMISSION_CLOSED");
@@ -2490,7 +2487,7 @@ export class EngineService {
   }
 
   private sourceSealBlocksAdmission(): boolean {
-    return this.sourceSealing || this.sourceSealed;
+    return this.sourceSealing && !this.sourceSealed;
   }
 
   private async restoreSourceSealState(): Promise<void> {

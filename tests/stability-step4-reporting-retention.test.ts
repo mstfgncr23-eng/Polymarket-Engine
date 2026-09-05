@@ -785,14 +785,15 @@ describe("Step-4 acceptance: application-level source seal", () => {
     const journal = new MemoryEventJournal();
     const adapter = new ScriptedMarketAdapter();
     adapter.queue(discoveryReport([qualified("btc-mkt", "BTC", "btc-up", "btc-down")]));
-    const engine = new EngineService(qualifiedPaperEnv({ GROK_ACTIVATION_PROVIDER: "noop" }), journal, { error: () => undefined }, {
+    const engine = new EngineService(qualifiedPaperEnv(), journal, { error: () => undefined }, {
       market: adapter as never,
       referenceRegistry: new ScriptedReferenceRegistry() as never,
       activation: new NoopGrokActivationBridge(),
     });
     await engine.start();
     try {
-      expect((await engine.beginExperiment()).ok).toBe(true);
+      const started = await engine.beginExperiment();
+      expect(started).toMatchObject({ ok: true });
       const experimentId = engine.experimentManifest()!.id;
       engine.setSourceSealTimeoutForTest(80);
       let release!: () => void;
@@ -818,15 +819,31 @@ describe("Step-4 acceptance: application-level source seal", () => {
       expect(await loadSourceSeal(journal, experimentId)).toBeTruthy();
       const first = await journal.loadExperimentReport(experimentId);
       expect(first && isCanonicalFinalReport(first)).toBe(true);
+      const canonical = first!.canonicalSummary as {
+        status?: string; closePolicy?: string; unresolvedPositionCount?: number; metricsScope?: string;
+      };
       const streamed = await streamExperimentSummary(journal, {
         id: experimentId,
         startedAt: engine.experimentManifest()?.startedAt,
         completedAt: engine.experimentManifest()?.completedAt,
-      }, { reportKind: "final", complete: true, truncated: false, generatedAt: first!.generatedAt });
+      }, {
+        status: canonical.status,
+        closePolicy: canonical.closePolicy,
+        reportKind: "final",
+        unresolvedPositionCount: canonical.unresolvedPositionCount,
+        metricsScope: "complete",
+        complete: true,
+        truncated: false,
+        generatedAt: first!.generatedAt,
+      });
       streamed.summary.complete = true;
       streamed.summary.truncated = false;
       expect(toDurableReportInput({ summary: streamed.summary, scan: streamed.scan }).contentHash).toBe(first!.contentHash);
       expect(streamed.scan.scanned).toBe(first!.sourceEventCount);
+      expect(streamed.scan.fence.through).toEqual({
+        occurredAt: first!.sourceFenceOccurredAt,
+        id: first!.sourceFenceId,
+      });
       expect((await journal.queryEvents({
         types: ["TRIGGER_EVENT"],
         from: engine.experimentManifest()?.startedAt ? new Date(engine.experimentManifest()!.startedAt!) : undefined,
@@ -835,7 +852,7 @@ describe("Step-4 acceptance: application-level source seal", () => {
       await engine.stop();
       const adapter2 = new ScriptedMarketAdapter();
       adapter2.queue(discoveryReport([qualified("btc-mkt", "BTC", "btc-up", "btc-down")]));
-      const restarted = new EngineService(qualifiedPaperEnv({ GROK_ACTIVATION_PROVIDER: "noop" }), journal, { error: () => undefined }, {
+      const restarted = new EngineService(qualifiedPaperEnv(), journal, { error: () => undefined }, {
         market: adapter2 as never,
         referenceRegistry: new ScriptedReferenceRegistry() as never,
         activation: new NoopGrokActivationBridge(),
@@ -858,16 +875,18 @@ describe("Step-4 acceptance: application-level source seal", () => {
     const journal = new MemoryEventJournal();
     const adapter = new ScriptedMarketAdapter();
     adapter.queue(discoveryReport([qualified("btc-mkt", "BTC", "btc-up", "btc-down")]));
-    const engine = new EngineService(qualifiedPaperEnv({ GROK_ACTIVATION_PROVIDER: "noop" }), journal, { error: () => undefined }, {
+    const engine = new EngineService(qualifiedPaperEnv(), journal, { error: () => undefined }, {
       market: adapter as never,
       referenceRegistry: new ScriptedReferenceRegistry() as never,
       activation: new NoopGrokActivationBridge(),
     });
     await engine.start();
+    let release!: () => void;
     try {
-      expect((await engine.beginExperiment()).ok).toBe(true);
+      const started = await engine.beginExperiment();
+      expect(started).toMatchObject({ ok: true });
       engine.setSourceSealTimeoutForTest(40);
-      engine.setTriggerEventPersistHoldForTest(new Promise<void>(() => undefined));
+      engine.setTriggerEventPersistHoldForTest(new Promise<void>((resolve) => { release = resolve; }));
       engine.enqueueTriggerStormForTest([triggerEventSchema.parse({
         id: "trig-timeout", traceId: "tr-timeout", marketId: "btc-mkt", asset: "BTC",
         kind: "BOOK_IMBALANCE", severity: 2, score: 1, dedupeKey: "timeout", evidence: {},
@@ -880,7 +899,10 @@ describe("Step-4 acceptance: application-level source seal", () => {
       expect(seal.sealed).toBe(false);
       expect(seal.reason).toBe("SOURCE_SEAL_TIMEOUT");
       expect(await journal.loadExperimentReport(engine.experimentManifest()!.id)).toBeNull();
+      expect(await loadSourceSeal(journal, engine.experimentManifest()!.id)).toBeNull();
     } finally {
+      release?.();
+      engine.setTriggerEventPersistHoldForTest(null);
       await engine.stop();
     }
   });
