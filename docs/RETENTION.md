@@ -16,14 +16,17 @@ This PR does not change production Fly secrets.
 
 ## Journal access modes
 
-| Mode | Who | Migrate / DDL | Schema verify | Data mutation |
-|---|---|---|---|---|
-| `boot-migrate` | Engine `initialize()` | Yes | Yes | Yes (runtime journal) |
-| `verify-only` | Readiness / inspect required schema | **No** | Yes | No deletes |
-| `readonly` | Dry-run cleanup, report inspect | **No** | **No** | No deletes/prunes |
-| `maintenance` | APPLY cleanup | **No** | Yes | Bounded deletes only |
+These are capability boundaries, not labels. Every EventJournal mutator asserts the mode before DML/DDL.
 
-Operator `journal-cleanup` (dry-run) and `report` construct the journal with `readonly` / `maintenance` and call `connectWithoutMigrate`. They **never** call `initialize()` / Drizzle migrate. A `DATABASE_URL` alone must not apply `0004`/`0005` or create `__drizzle_migrations` history.
+| Mode | Who | Migrate / DDL | Schema verify | Runtime writes (`append`, claim, durable, checkpoint) | Canonical report persist | Bounded maintenance deletes |
+|---|---|---|---|---|---|---|
+| `boot-migrate` | Engine `initialize()` | Yes | Yes | Yes | Yes | Yes |
+| `verify-only` | Readiness / inspect required schema | **No** | Yes | **No** | **No** | **No** |
+| `readonly` | Dry-run cleanup, report inspect | **No** | **No** | **No** | **No** | **No** |
+| `maintenance` | APPLY cleanup | **No** | Yes | **No** | **No** | Bounded deletes / prunes only |
+| `report-write` | Operator `report` with `REPORT_PERSIST=1` | **No** | Yes | **No** | Yes (report row only) | **No** |
+
+Operator `journal-cleanup` (dry-run) uses `readonly`. APPLY uses `maintenance`. `pnpm report` stays `readonly` unless `REPORT_PERSIST=1`/`true` selects `report-write`. They call `connectWithoutMigrate` and **never** call `initialize()` / Drizzle migrate. A `DATABASE_URL` alone must not apply `0004`/`0005`, create `__drizzle_migrations` history, or persist a report.
 
 Engine boot is unchanged: `boot-migrate` + `initialize()` then `verifyRequiredSchema()`.
 
@@ -38,7 +41,18 @@ A durable `reportKind=final` row may be persisted only when:
 
 - the **exact** target experiment id is found via `EXPERIMENT_STARTED` + `EXPERIMENT_COMPLETED` for that id (payload or aggregateId)
 - the experiment is authoritatively `COMPLETED` (not inferred from `ENGINE_STARTED` or another experiment’s window)
+- an application-level **source seal** (`EXPERIMENT_SOURCE_SEALED`, id `sourceseal:<experimentId>`) exists for that experiment
 - the scan used a **commit-stable** source fence and finished complete / non-truncated / not interrupted
+
+A Postgres `REPEATABLE READ` snapshot is internally consistent; it does **not** prove that every report-input event belonging to the completed experiment has reached Postgres. Canonical persist therefore requires the source seal, not merely `EXPERIMENT_COMPLETED`. Interim / inspect reports may run without a seal. On seal timeout or failure the canonical row must not persist.
+
+Seal procedure (bounded; does not stop market monitoring):
+
+1. Stop admitting new report-input work attributable to the completed experiment (`source_sealed`).
+2. Wait without cancelling for already-admitted supervisor work and report-input journal writes (telemetry is ignored).
+3. Append the durable seal event. Restart recovers a completed experiment without a seal by resuming sealing.
+
+Dry-run / APPLY retention uses the same `retentionConfigFromEnv` / `retentionConfigFromEngineEnv` path as `RetentionManager`. Dry-run output includes `effectiveConfig` (TTLs, grace, batch, cycle limits). Do not parse retention env in a second place.
 
 `RUNNING` and `ENTRY_CLOSED` may write an interim diagnostic export. They must not persist an immutable final.
 
@@ -77,9 +91,18 @@ Sequence (not executed by this PR):
 
 1. Let engine boot apply additive `0004` then `0005` (tables; no large-table lock).
 2. Run the CONCURRENTLY script in autocommit against the same database.
-3. Restart / wait for schema verification. Readiness refuses missing or `INVALID` indexes.
+3. Restart / wait for schema verification. Readiness refuses missing or `INVALID` indexes. Failure to query `pg_index` is fail-closed (`index validity not inspected`), not an empty invalid list.
 
-Do not apply Step-4 SQL to production from this PR.
+### Interrupted `CREATE INDEX CONCURRENTLY` (INVALID index)
+
+`CREATE INDEX CONCURRENTLY IF NOT EXISTS` cannot repair an existing **INVALID** index with the same name. An interrupted build leaves `pg_index.indisvalid = false`. Schema verification fails closed until the operator repairs it. Safe recovery (not executed by this PR):
+
+1. Confirm: `SELECT c.relname, i.indisvalid, i.indisready FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relname IN ('journal_occurred_id_idx','journal_type_occurred_id_idx');`
+2. `DROP INDEX CONCURRENTLY IF EXISTS journal_occurred_id_idx;` (and/or `journal_type_occurred_id_idx`) — **CONCURRENTLY**, not inside a transaction, not a plain `DROP INDEX` on the live large table if it would block writers longer than the operator accepts.
+3. Recreate with the operator script (`CREATE INDEX CONCURRENTLY IF NOT EXISTS …`).
+4. Re-check `indisvalid` / `indisready`. Restart / wait for schema verification.
+
+Do not reintroduce a transactional `CREATE INDEX` on live `journal_events` inside `0005`. Do not apply this recovery against production from this PR.
 
 ## Retention classes
 

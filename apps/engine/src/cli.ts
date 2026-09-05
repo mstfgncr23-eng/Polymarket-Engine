@@ -13,6 +13,7 @@ import {
 import { MemoryEventJournal, PostgresEventJournal, type JournalAccessMode } from "@pm/db";
 import { applyJournalCleanup, dryRunJournalCleanup } from "./journal-cleanup.js";
 import { generateOperatorReport } from "./operator-report.js";
+import { retentionConfigFromEnv } from "./retention-manager.js";
 import { PolymarketMarketDataAdapter, ReferenceFeedRegistry, createRestProbe } from "@pm/market-data";
 import { startRuntime } from "./runtime.js";
 
@@ -25,15 +26,18 @@ if (command === "experiment:start") {
   const result = await runtime.engine.beginExperiment();
   console.log(JSON.stringify({ status: result.ok ? "running" : "blocked", mode: "paper", durationHours: Number(process.env.EXPERIMENT_DURATION_HOURS ?? 48), ...result }));
 } else if (command === "report") {
+  const persistCanonical = process.env.REPORT_PERSIST === "1" || process.env.REPORT_PERSIST === "true";
+  const mode: JournalAccessMode = persistCanonical ? "report-write" : "readonly";
   const journal = process.env.DATABASE_URL
-    ? new PostgresEventJournal(process.env.DATABASE_URL, process.env.DB_MIGRATIONS_DIR ?? resolve(process.cwd(), "packages/db/migrations"), { access: "readonly" })
+    ? new PostgresEventJournal(process.env.DATABASE_URL, process.env.DB_MIGRATIONS_DIR ?? resolve(process.cwd(), "packages/db/migrations"), { access: mode })
     : new MemoryEventJournal();
-  if (journal.connectWithoutMigrate) await journal.connectWithoutMigrate("readonly");
+  if (journal.connectWithoutMigrate) await journal.connectWithoutMigrate(mode);
+  if (journal instanceof MemoryEventJournal) journal.access = persistCanonical ? "report-write" : "readonly";
   try {
     const result = await generateOperatorReport(journal, {
       experimentId: process.env.EXPERIMENT_ID,
       reportDirectory: resolve(process.cwd(), "reports"),
-      allowPersist: Boolean(process.env.DATABASE_URL),
+      allowPersist: persistCanonical,
     });
     console.log(JSON.stringify(result));
   } finally {
@@ -49,13 +53,14 @@ if (command === "experiment:start") {
   const experiment = process.env.EXPERIMENT_ID
     ? { id: process.env.EXPERIMENT_ID, status: process.env.EXPERIMENT_STATUS ?? "UNKNOWN", startedAt: process.env.EXPERIMENT_STARTED_AT ?? null }
     : null;
+  const retention = retentionConfigFromEnv(process.env);
   try {
     if (!apply) {
-      console.log(JSON.stringify(await dryRunJournalCleanup(journal, new Date(), experiment), null, 2));
+      console.log(JSON.stringify(await dryRunJournalCleanup(journal, new Date(), experiment, retention), null, 2));
     } else {
       if (!confirm) throw new Error("JOURNAL_CLEANUP_APPLY_REQUIRES_--i-understand-destructive");
       console.log(JSON.stringify(await applyJournalCleanup(journal, {
-        experiment, confirm: "I_UNDERSTAND_DESTRUCTIVE_CLEANUP",
+        experiment, confirm: "I_UNDERSTAND_DESTRUCTIVE_CLEANUP", config: retention,
       }), null, 2));
     }
   } finally {

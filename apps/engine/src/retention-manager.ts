@@ -5,6 +5,8 @@ import {
   TELEMETRY_EVENT_TYPES,
   assertMcpIdempotencyTtlSafe,
   clampRetentionBatchSize,
+  engineEnvSchema,
+  type EngineEnv,
 } from "@pm/core";
 import { isCanonicalFinalReport, type EventJournal } from "@pm/db";
 
@@ -44,6 +46,38 @@ export interface RetentionCycleResult {
   monitorOnlyEligible: boolean;
   durableTransitionsPruned: false;
   eligibleBacklog: number;
+}
+
+type RetentionEnv = Pick<EngineEnv,
+  | "RETENTION_ENABLED"
+  | "RETENTION_TELEMETRY_TTL_MS"
+  | "RETENTION_MONITOR_TTL_MS"
+  | "RETENTION_COMPLETED_GRACE_MS"
+  | "RETENTION_MCP_IDEMPOTENCY_TTL_MS"
+  | "RETENTION_CHECKPOINT_KEEP"
+  | "RETENTION_BATCH_SIZE"
+  | "RETENTION_CYCLE_BUDGET_MS"
+  | "RETENTION_MAX_BATCHES_PER_CYCLE"
+  | "RETENTION_MAX_ROWS_PER_CYCLE"
+>;
+
+export function retentionConfigFromEngineEnv(env: RetentionEnv): RetentionConfig {
+  return defaultRetentionConfig({
+    enabled: env.RETENTION_ENABLED,
+    telemetryTtlMs: env.RETENTION_TELEMETRY_TTL_MS,
+    monitorTtlMs: env.RETENTION_MONITOR_TTL_MS,
+    completedGraceMs: env.RETENTION_COMPLETED_GRACE_MS,
+    mcpIdempotencyTtlMs: env.RETENTION_MCP_IDEMPOTENCY_TTL_MS,
+    checkpointKeep: env.RETENTION_CHECKPOINT_KEEP,
+    batchSize: env.RETENTION_BATCH_SIZE,
+    cycleBudgetMs: env.RETENTION_CYCLE_BUDGET_MS,
+    maxBatchesPerCycle: env.RETENTION_MAX_BATCHES_PER_CYCLE,
+    maxRowsPerCycle: env.RETENTION_MAX_ROWS_PER_CYCLE,
+  });
+}
+
+export function retentionConfigFromEnv(env: NodeJS.ProcessEnv = process.env): RetentionConfig {
+  return retentionConfigFromEngineEnv(engineEnvSchema.parse(env));
 }
 
 export function defaultRetentionConfig(overrides: Partial<RetentionConfig> = {}): RetentionConfig {
@@ -155,12 +189,15 @@ export class RetentionManager {
       );
       const monitorOnlyEligible = experimentIsMonitorOnly(context.experiment);
       const budgetEnd = started + this.config.cycleBudgetMs;
-      const runBatch = async (cls: string, work: () => Promise<{ deleted: number }>): Promise<number> => {
+      const remainingRows = (): number => this.config.maxRowsPerCycle - totalDeleted;
+      const runBatch = async (cls: string, work: (limit: number) => Promise<{ deleted: number }>): Promise<number> => {
+        const remaining = remainingRows();
         if (Date.now() >= budgetEnd) return 0;
         if (batchCount >= this.config.maxBatchesPerCycle) return 0;
-        if (totalDeleted >= this.config.maxRowsPerCycle) return 0;
+        if (remaining <= 0) return 0;
+        const limit = Math.min(this.config.batchSize, remaining);
         const t0 = Date.now();
-        const result = await work();
+        const result = await work(limit);
         lastBatchSize = result.deleted;
         lastBatchDurationMs = Date.now() - t0;
         // Zero-delete probes exhaust that class; they must not consume the
@@ -188,14 +225,14 @@ export class RetentionManager {
         ? await this.journal.countEligible([...MONITOR_CONTROL_EVENT_TYPES], monitorBefore)
         : { count: 0, oldestOccurredAt: null };
 
-      const drains: Array<{ cls: string; exhausted: boolean; work: () => Promise<{ deleted: number }> }> = [
+      const drains: Array<{ cls: string; exhausted: boolean; work: (limit: number) => Promise<{ deleted: number }> }> = [
         {
           cls: "raw_telemetry",
           exhausted: false,
-          work: () => this.journal.deleteJournalEventsBounded({
+          work: (limit) => this.journal.deleteJournalEventsBounded({
             types: TELEMETRY_EVENT_TYPES,
             occurredBefore: telemetryBefore,
-            limit: this.config.batchSize,
+            limit,
           }),
         },
       ];
@@ -203,19 +240,19 @@ export class RetentionManager {
         drains.push({
           cls: "monitor_control",
           exhausted: false,
-          work: () => this.journal.deleteJournalEventsBounded({
+          work: (limit) => this.journal.deleteJournalEventsBounded({
             types: MONITOR_CONTROL_EVENT_TYPES,
             occurredBefore: monitorBefore,
-            limit: this.config.batchSize,
+            limit,
           }),
         });
       }
       drains.push({
         cls: "mcp_idempotency",
         exhausted: false,
-        work: () => this.journal.pruneIdempotencyKeys(
+        work: (limit) => this.journal.pruneIdempotencyKeys(
           new Date(context.now.getTime() - this.config.mcpIdempotencyTtlMs),
-          this.config.batchSize,
+          limit,
         ),
       });
       drains.push({
@@ -230,8 +267,10 @@ export class RetentionManager {
         for (const drain of drains) {
           if (drain.exhausted) continue;
           if (Date.now() >= budgetEnd || batchCount >= this.config.maxBatchesPerCycle || totalDeleted >= this.config.maxRowsPerCycle) break;
+          const remaining = this.config.maxRowsPerCycle - totalDeleted;
+          const requested = Math.min(this.config.batchSize, Math.max(0, remaining));
           const deleted = await runBatch(drain.cls, drain.work);
-          if (deleted < this.config.batchSize) drain.exhausted = true;
+          if (requested <= 0 || deleted < requested) drain.exhausted = true;
           if (deleted > 0) progressed = true;
         }
         if (drains.every((item) => item.exhausted)) break;

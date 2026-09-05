@@ -54,6 +54,9 @@ export function evaluateSchemaInspection(found: SchemaInspection): void {
   for (const index of REQUIRED_INDEXES) {
     if (!found.indexes.includes(index)) missing.push(`missing index ${index}`);
   }
+  if (found.invalidIndexes == null) {
+    missing.push("index validity not inspected");
+  }
   for (const index of found.invalidIndexes ?? []) {
     missing.push(`invalid index ${index}`);
   }
@@ -87,7 +90,7 @@ export async function inspectPublicSchema(
      JOIN pg_class c ON c.oid = i.indexrelid
      JOIN pg_namespace n ON n.oid = c.relnamespace
      WHERE n.nspname = 'public' AND NOT i.indisvalid`,
-  ).catch(() => [] as { indexname: string }[]);
+  );
   return {
     tables: tables.map((row) => row.tablename),
     indexes: indexes.map((row) => row.indexname),

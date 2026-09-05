@@ -1,16 +1,17 @@
 import {
   AUDIT_CRITICAL_EVENT_TYPES,
   MONITOR_CONTROL_EVENT_TYPES,
-  RETENTION_DEFAULTS,
   TELEMETRY_EVENT_TYPES,
   clampRetentionBatchSize,
 } from "@pm/core";
 import { createJournalEvent, type EventJournal } from "@pm/db";
 import {
   completedReportUnlocksTransient,
+  defaultRetentionConfig,
   experimentIsActive,
   experimentIsMonitorOnly,
   monitorCutoff,
+  type RetentionConfig,
 } from "./retention-manager.js";
 
 export interface CleanupClassEstimate {
@@ -40,6 +41,16 @@ export interface CleanupDryRun {
   monitorCandidates: number;
   estimatedBoundedBatches: number;
   refuseUnsafeExperimentCleanup: boolean;
+  effectiveConfig: {
+    enabled: boolean;
+    telemetryTtlMs: number;
+    monitorTtlMs: number;
+    completedGraceMs: number;
+    batchSize: number;
+    maxBatchesPerCycle: number;
+    maxRowsPerCycle: number;
+    cycleBudgetMs: number;
+  };
   notes: string[];
 }
 
@@ -66,6 +77,7 @@ export async function dryRunJournalCleanup(
   journal: EventJournal,
   now = new Date(),
   experiment?: { id: string; status: string; startedAt?: string | null } | null,
+  config: RetentionConfig = defaultRetentionConfig(),
 ): Promise<CleanupDryRun> {
   const counts = await journal.countByType();
   const oldest = await journal.queryEventsKeyset({ limit: 1 });
@@ -77,12 +89,12 @@ export async function dryRunJournalCleanup(
   const active = experimentIsActive(experiment ?? null);
   const monitorOnlyEligible = experimentIsMonitorOnly(experiment ?? null);
   const unlocked = experiment
-    ? await completedReportUnlocksTransient(journal, experiment, now, RETENTION_DEFAULTS.completedGraceMs)
+    ? await completedReportUnlocksTransient(journal, experiment, now, config.completedGraceMs)
     : false;
-  const telemetryCutoff = new Date(now.getTime() - RETENTION_DEFAULTS.telemetryTtlMs);
+  const telemetryCutoff = new Date(now.getTime() - config.telemetryTtlMs);
   const monitorBefore = monitorCutoff({
     now,
-    monitorTtlMs: RETENTION_DEFAULTS.monitorTtlMs,
+    monitorTtlMs: config.monitorTtlMs,
     experiment: experiment ?? null,
     monitorOnlyEligible,
     transientEligible: unlocked,
@@ -91,8 +103,8 @@ export async function dryRunJournalCleanup(
   const monitorEligible = monitorBefore
     ? await journal.countEligible([...MONITOR_CONTROL_EVENT_TYPES], monitorBefore)
     : { count: 0, oldestOccurredAt: null };
-  const telemetry = estimate(telemetryTotal, telemetryEligible, telemetryCutoff, RETENTION_DEFAULTS.batchSize);
-  const monitor = estimate(monitorTotal, monitorEligible, monitorBefore, RETENTION_DEFAULTS.batchSize);
+  const telemetry = estimate(telemetryTotal, telemetryEligible, telemetryCutoff, config.batchSize);
+  const monitor = estimate(monitorTotal, monitorEligible, monitorBefore, config.batchSize);
   const notes = [
     "Dry run: zero mutation. No migrate, no DDL, no DML.",
     "Deletes do not shrink PostgreSQL relation size immediately (no VACUUM FULL).",
@@ -121,6 +133,16 @@ export async function dryRunJournalCleanup(
     monitorCandidates: monitor.eligible,
     estimatedBoundedBatches: telemetry.estimatedBatches + monitor.estimatedBatches,
     refuseUnsafeExperimentCleanup: active && !experiment?.startedAt,
+    effectiveConfig: {
+      enabled: config.enabled,
+      telemetryTtlMs: config.telemetryTtlMs,
+      monitorTtlMs: config.monitorTtlMs,
+      completedGraceMs: config.completedGraceMs,
+      batchSize: config.batchSize,
+      maxBatchesPerCycle: config.maxBatchesPerCycle,
+      maxRowsPerCycle: config.maxRowsPerCycle,
+      cycleBudgetMs: config.cycleBudgetMs,
+    },
     notes,
   };
 }
@@ -133,21 +155,23 @@ export async function applyJournalCleanup(
     batchSize?: number;
     confirm: "I_UNDERSTAND_DESTRUCTIVE_CLEANUP";
     maxBatches?: number;
+    config?: RetentionConfig;
   },
 ): Promise<CleanupApplyResult> {
   if (input.confirm !== "I_UNDERSTAND_DESTRUCTIVE_CLEANUP") {
     return { mode: "apply", deletedByClass: {}, refused: true, reason: "CONFIRMATION_REQUIRED", durableTransitionsDeleted: 0, batches: 0 };
   }
   const now = input.now ?? new Date();
-  const dry = await dryRunJournalCleanup(journal, now, input.experiment);
-  const limit = clampRetentionBatchSize(input.batchSize ?? RETENTION_DEFAULTS.batchSize);
-  const maxBatches = Math.max(1, input.maxBatches ?? 20);
+  const config = input.config ?? defaultRetentionConfig();
+  const dry = await dryRunJournalCleanup(journal, now, input.experiment, config);
+  const limit = clampRetentionBatchSize(input.batchSize ?? config.batchSize);
+  const maxBatches = Math.max(1, input.maxBatches ?? config.maxBatchesPerCycle);
   const deletedByClass: Record<string, number> = { raw_telemetry: 0, monitor_control: 0 };
   let batches = 0;
   for (let i = 0; i < maxBatches; i += 1) {
     const tel = await journal.deleteJournalEventsBounded({
       types: TELEMETRY_EVENT_TYPES,
-      occurredBefore: new Date(now.getTime() - RETENTION_DEFAULTS.telemetryTtlMs),
+      occurredBefore: new Date(now.getTime() - config.telemetryTtlMs),
       limit,
     });
     deletedByClass.raw_telemetry = (deletedByClass.raw_telemetry ?? 0) + tel.deleted;

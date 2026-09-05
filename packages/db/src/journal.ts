@@ -28,10 +28,13 @@ import {
 } from "./reports.js";
 import { durableTransitions, engineCheckpoints, experimentReports, journalEvents, mcpIdempotencyKeys } from "./schema.js";
 import {
+  journalMayMaintain,
   journalMayMigrate,
-  journalMayMutateData,
+  journalMayPersistReport,
+  journalMayRuntimeWrite,
   journalMustVerifySchema,
   JournalMigrateForbiddenError,
+  JournalMutateForbiddenError,
   LARGE_JOURNAL_KEYSET_INDEXES,
   LARGE_JOURNAL_SYNC_INDEX_MAX_ROWS,
   type JournalAccessMode,
@@ -114,6 +117,7 @@ export class MemoryEventJournal implements EventJournal {
   }
   async healthCheck(): Promise<boolean> { return this.available; }
   async append(event: JournalEvent): Promise<void> {
+    assertJournalCapability(this.access, "runtime-write", "append");
     if (!this.available) throw new Error("DATABASE_UNAVAILABLE");
     const parsed = journalEventSchema.parse(event);
     if (this.failAppendTypes.has(parsed.type)) throw new Error("JOURNAL_APPEND_FAILED");
@@ -141,6 +145,7 @@ export class MemoryEventJournal implements EventJournal {
     this.mutations.push(`commit:${event.type}`);
   }
   async appendMany(events: readonly JournalEvent[]): Promise<void> {
+    assertJournalCapability(this.access, "runtime-write", "appendMany");
     for (const event of events) await this.append(event);
   }
   async readTrace(traceId: string): Promise<JournalEvent[]> { return structuredClone(this.events.filter((event) => event.traceId === traceId)); }
@@ -192,6 +197,7 @@ export class MemoryEventJournal implements EventJournal {
     return last ? { occurredAt: last.occurredAt, id: last.id } : null;
   }
   async claimIdempotency(scope: string, key: string): Promise<boolean> {
+    assertJournalCapability(this.access, "runtime-write", "claimIdempotency");
     if (!this.available) throw new Error("DATABASE_UNAVAILABLE");
     const composite = `${scope}\u0000${key}`;
     if (this.idempotencyKeys.has(composite)) return false;
@@ -199,7 +205,7 @@ export class MemoryEventJournal implements EventJournal {
     return true;
   }
   async pruneIdempotencyKeys(olderThan: Date, limit: number): Promise<{ deleted: number }> {
-    assertJournalMayMutate(this.access, "pruneIdempotencyKeys");
+    assertJournalCapability(this.access, "maintenance", "pruneIdempotencyKeys");
     const cutoff = olderThan.toISOString();
     const victims = [...this.idempotencyKeys.entries()]
       .filter(([, createdAt]) => createdAt < cutoff)
@@ -212,6 +218,7 @@ export class MemoryEventJournal implements EventJournal {
     return this.idempotencyKeys.get(`${scope}\u0000${key}`) ?? null;
   }
   async persistExperimentReport(input: DurableExperimentReportInput): Promise<PersistReportResult> {
+    assertJournalCapability(this.access, "report-write", "persistExperimentReport");
     return this.withPersistLock(() => persistReportConflictSafe(input, {
       insert: async (stored) => {
         const key = `${stored.experimentId}:${stored.reportKind}`;
@@ -231,7 +238,7 @@ export class MemoryEventJournal implements EventJournal {
     return existing ? structuredClone(existing) : null;
   }
   async deleteJournalEventsBounded(input: { types: readonly string[]; occurredBefore: Date; limit: number }): Promise<{ deleted: number }> {
-    assertJournalMayMutate(this.access, "deleteJournalEventsBounded");
+    assertJournalCapability(this.access, "maintenance", "deleteJournalEventsBounded");
     if (input.types.some((type) => isProtectedJournalType(type))) {
       throw new Error("RETENTION_REFUSED_PROTECTED_TYPES");
     }
@@ -280,7 +287,7 @@ export class MemoryEventJournal implements EventJournal {
     return { value: await work(snap), stable: true };
   }
   async pruneOldCheckpoints(keepLatest: number): Promise<{ deleted: number; latestSequence: number | null }> {
-    assertJournalMayMutate(this.access, "pruneOldCheckpoints");
+    assertJournalCapability(this.access, "maintenance", "pruneOldCheckpoints");
     const keep = Math.max(1, keepLatest);
     const ordered = [...this.checkpoints].sort((a, b) => b.sequence - a.sequence);
     const latest = ordered[0]?.sequence ?? null;
@@ -301,6 +308,7 @@ export class MemoryEventJournal implements EventJournal {
   }
 
   async commitDurableTransition(input: DurableTransitionInput, expectedPreviousSequence: number): Promise<DurableCommitResult> {
+    assertJournalCapability(this.access, "runtime-write", "commitDurableTransition");
     return this.withDurableLock(() => this.commitDurableTransitionUnlocked(input, expectedPreviousSequence));
   }
   async readDurableTransitionsAfter(sequence: number, limit: number): Promise<DurableTransition[]> {
@@ -315,6 +323,7 @@ export class MemoryEventJournal implements EventJournal {
     return this.durableRows.length === 0 ? 0 : this.durableRows[this.durableRows.length - 1]!.sequence;
   }
   async saveCheckpoint(checkpoint: Omit<EngineCheckpoint, "id" | "createdAt">): Promise<EngineCheckpoint> {
+    assertJournalCapability(this.access, "runtime-write", "saveCheckpoint");
     return this.withDurableLock(() => {
       const cursor = typeof checkpoint.payload.durableCursor === "number" ? checkpoint.payload.durableCursor : null;
       if (cursor != null) {
@@ -462,12 +471,14 @@ export class PostgresEventJournal implements EventJournal {
     try { await this.client`select 1`; return true; } catch { return false; }
   }
   async append(event: JournalEvent): Promise<void> {
+    assertJournalCapability(this.access, "runtime-write", "append");
     const value = journalEventSchema.parse(event);
     await this.db.insert(journalEvents).values({
       ...value, occurredAt: new Date(value.occurredAt), recordedAt: new Date(value.recordedAt),
     }).onConflictDoNothing({ target: journalEvents.id });
   }
   async appendMany(events: readonly JournalEvent[]): Promise<void> {
+    assertJournalCapability(this.access, "runtime-write", "appendMany");
     if (events.length === 0) return;
     const values = events.map((raw) => {
       const value = journalEventSchema.parse(raw);
@@ -552,12 +563,13 @@ export class PostgresEventJournal implements EventJournal {
     return row ? { occurredAt: row.occurredAt.toISOString(), id: row.id } : null;
   }
   async claimIdempotency(scope: string, key: string): Promise<boolean> {
+    assertJournalCapability(this.access, "runtime-write", "claimIdempotency");
     const rows = await this.db.insert(mcpIdempotencyKeys).values({ scope, key })
       .onConflictDoNothing({ target: [mcpIdempotencyKeys.scope, mcpIdempotencyKeys.key] }).returning({ key: mcpIdempotencyKeys.key });
     return rows.length === 1;
   }
   async pruneIdempotencyKeys(olderThan: Date, limit: number): Promise<{ deleted: number }> {
-    assertJournalMayMutate(this.access, "pruneIdempotencyKeys");
+    assertJournalCapability(this.access, "maintenance", "pruneIdempotencyKeys");
     const cap = Math.max(1, Math.min(limit, 500));
     const result = await this.client`
       DELETE FROM mcp_idempotency_keys
@@ -578,6 +590,7 @@ export class PostgresEventJournal implements EventJournal {
     return rows[0]?.createdAt.toISOString() ?? null;
   }
   async persistExperimentReport(input: DurableExperimentReportInput): Promise<PersistReportResult> {
+    assertJournalCapability(this.access, "report-write", "persistExperimentReport");
     const hash = input.contentHash || hashExperimentReport(input);
     const values = {
       experimentId: input.experimentId,
@@ -623,7 +636,7 @@ export class PostgresEventJournal implements EventJournal {
     return rows[0] ? toExperimentReport(rows[0]) : null;
   }
   async deleteJournalEventsBounded(input: { types: readonly string[]; occurredBefore: Date; limit: number }): Promise<{ deleted: number }> {
-    assertJournalMayMutate(this.access, "deleteJournalEventsBounded");
+    assertJournalCapability(this.access, "maintenance", "deleteJournalEventsBounded");
     if (input.types.length === 0) return { deleted: 0 };
     if (input.types.some((type) => isProtectedJournalType(type))) {
       throw new Error("RETENTION_REFUSED_PROTECTED_TYPES");
@@ -642,7 +655,7 @@ export class PostgresEventJournal implements EventJournal {
     return { deleted: result.count ?? 0 };
   }
   async pruneOldCheckpoints(keepLatest: number): Promise<{ deleted: number; latestSequence: number | null }> {
-    assertJournalMayMutate(this.access, "pruneOldCheckpoints");
+    assertJournalCapability(this.access, "maintenance", "pruneOldCheckpoints");
     const keep = Math.max(1, keepLatest);
     const latestRows = await this.db.select({
       max: sql<number>`coalesce(max(${engineCheckpoints.sequence}), 0)`,
@@ -673,6 +686,7 @@ export class PostgresEventJournal implements EventJournal {
     }));
   }
   async commitDurableTransition(input: DurableTransitionInput, expectedPreviousSequence: number): Promise<DurableCommitResult> {
+    assertJournalCapability(this.access, "runtime-write", "commitDurableTransition");
     const parsed = durableTransitionInputSchema.parse(input);
     const payloadHash = hashDurablePayload(parsed.payload);
     const occurredAt = parsed.occurredAt ?? new Date();
@@ -748,6 +762,7 @@ export class PostgresEventJournal implements EventJournal {
     return Number(rows[0]?.max ?? 0);
   }
   async saveCheckpoint(checkpoint: Omit<EngineCheckpoint, "id" | "createdAt">): Promise<EngineCheckpoint> {
+    assertJournalCapability(this.access, "runtime-write", "saveCheckpoint");
     const id = createId("checkpoint");
     const cursor = typeof checkpoint.payload.durableCursor === "number" ? checkpoint.payload.durableCursor : null;
     const toCheckpoint = (row: typeof engineCheckpoints.$inferSelect): EngineCheckpoint => ({
@@ -915,10 +930,11 @@ function toExperimentReport(row: typeof experimentReports.$inferSelect): Durable
   };
 }
 
-function assertJournalMayMutate(mode: JournalAccessMode, operation: string): void {
-  if (!journalMayMutateData(mode)) {
-    throw new Error(`JOURNAL_MUTATE_FORBIDDEN: ${operation} access=${mode}`);
-  }
+function assertJournalCapability(mode: JournalAccessMode, capability: "runtime-write" | "report-write" | "maintenance", operation: string): void {
+  const allowed = capability === "runtime-write" ? journalMayRuntimeWrite(mode)
+    : capability === "report-write" ? journalMayPersistReport(mode)
+    : journalMayMaintain(mode);
+  if (!allowed) throw new JournalMutateForbiddenError(mode, operation);
 }
 
 function toJournalEvent(row: typeof journalEvents.$inferSelect): JournalEvent {
@@ -996,4 +1012,4 @@ export function createJournalEvent(input: {
   };
 }
 
-export { CheckpointFenceError, DurableCursorBehindError, IdempotencyConflictError, ExperimentReportConflictError, SchemaVerificationError };
+export { CheckpointFenceError, DurableCursorBehindError, IdempotencyConflictError, ExperimentReportConflictError, SchemaVerificationError, JournalMutateForbiddenError };

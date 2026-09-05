@@ -22,6 +22,7 @@ import {
   includeCurrentExperimentEvent,
   type ExperimentSummaryExtras,
 } from "./report.js";
+import { loadSourceSeal } from "./source-seal.js";
 
 export interface StreamedExperimentSummary {
   summary: ExperimentSummary;
@@ -95,6 +96,7 @@ export async function persistCanonicalFinalReport(
   if (!isCanonicalFinalReport({ reportKind: "final", complete: input.summary.complete, truncated: input.summary.truncated })) {
     return null;
   }
+  if (!(await loadSourceSeal(journal, input.summary.experimentId))) return null;
   return journal.persistExperimentReport(toDurableReportInput(input));
 }
 

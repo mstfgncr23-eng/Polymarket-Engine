@@ -48,6 +48,7 @@ export const REJECTION_REASONS = [
   "overload_shed",
   "fail_closed",
   "reserved_capacity",
+  "source_sealed",
 ] as const;
 export type RejectionReason = (typeof REJECTION_REASONS)[number];
 
@@ -360,6 +361,18 @@ export class RuntimeSupervisor {
     return { drained: true, unresolved: 0, timedOut: false };
   }
 
+  /** Wait for in-flight/queued work without cancelling on timeout (source seal). */
+  async waitUnresolved(deadlineMs: number): Promise<JoinResult> {
+    const started = Date.now();
+    while (this.unresolved() > 0) {
+      if (Date.now() - started >= deadlineMs) {
+        return { drained: false, unresolved: this.unresolved(), timedOut: true };
+      }
+      await delay(5);
+    }
+    return { drained: true, unresolved: 0, timedOut: false };
+  }
+
   observedFailures(): ObservedFailure[] {
     const cap = RUNTIME_BOUNDS.failureHistory;
     const out: ObservedFailure[] = [];
@@ -520,6 +533,7 @@ export class JournalAdmissionRejected extends Error {
 interface JournalWaiter<T> {
   journalClass: string;
   critical: boolean;
+  reportInput: boolean;
   enqueuedAt: number;
   run: () => Promise<T>;
   resolve: (value: T) => void;
@@ -541,6 +555,8 @@ export class DirectJournalAdmission {
   private active = 0;
   private activeCritical = 0;
   private activeNoncritical = 0;
+  private reportInputActive = 0;
+  private reportInputWaiting = 0;
   private readonly criticalWaiting: Array<JournalWaiter<unknown>> = [];
   private readonly noncriticalWaiting: Array<JournalWaiter<unknown>> = [];
   private criticalRejects = 0;
@@ -556,15 +572,17 @@ export class DirectJournalAdmission {
   get activeNoncriticalCount(): number { return this.activeNoncritical; }
   get admissionClosed(): boolean { return this.closed; }
   get criticalRejectionCount(): number { return this.criticalRejects; }
+  get reportInputUnresolved(): number { return this.reportInputActive + this.reportInputWaiting; }
 
   closeAdmission(): void { this.closed = true; }
 
-  async run<T>(journalClass: string, critical: boolean, work: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+  async run<T>(journalClass: string, critical: boolean, work: () => Promise<T>, signal?: AbortSignal, flags?: { reportInput?: boolean }): Promise<T> {
+    const reportInput = Boolean(flags?.reportInput);
     if (this.closed || signal?.aborted) {
       this.rejectNow(journalClass, critical, "JOURNAL_ADMISSION_CLOSED");
     }
     if (this.canStartNow(critical)) {
-      return this.execute(work, critical);
+      return this.execute(work, critical, reportInput);
     }
     const queue = critical ? this.criticalWaiting : this.noncriticalWaiting;
     const limit = critical ? RUNTIME_BOUNDS.journal.criticalWaiting : RUNTIME_BOUNDS.journal.noncriticalWaiting;
@@ -573,9 +591,10 @@ export class DirectJournalAdmission {
     }
     return new Promise<T>((resolve, reject) => {
       const waiter: JournalWaiter<T> = {
-        journalClass, critical, enqueuedAt: Date.now(), run: work, resolve, reject,
+        journalClass, critical, reportInput, enqueuedAt: Date.now(), run: work, resolve, reject,
       };
       queue.push(waiter as JournalWaiter<unknown>);
+      if (reportInput) this.reportInputWaiting += 1;
       if (this.oldestAt == null) this.oldestAt = waiter.enqueuedAt;
       this.publish();
       this.pump();
@@ -588,6 +607,18 @@ export class DirectJournalAdmission {
       if (Date.now() - started >= deadlineMs) {
         this.rejectWaiting("JOURNAL_ADMISSION_CLOSED");
         return { drained: this.active === 0, unresolved: this.active + this.waitingCount, timedOut: true };
+      }
+      await delay(5);
+    }
+    return { drained: true, unresolved: 0, timedOut: false };
+  }
+
+  /** Wait only for report-input journal writes. Telemetry may continue. Does not reject on timeout. */
+  async waitReportInput(deadlineMs: number): Promise<JoinResult> {
+    const started = Date.now();
+    while (this.reportInputUnresolved > 0) {
+      if (Date.now() - started >= deadlineMs) {
+        return { drained: false, unresolved: this.reportInputUnresolved, timedOut: true };
       }
       await delay(5);
     }
@@ -614,10 +645,11 @@ export class DirectJournalAdmission {
     throw new JournalAdmissionRejected(journalClass, critical, message);
   }
 
-  private async execute<T>(work: () => Promise<T>, critical: boolean): Promise<T> {
+  private async execute<T>(work: () => Promise<T>, critical: boolean, reportInput = false): Promise<T> {
     this.active += 1;
     if (critical) this.activeCritical += 1;
     else this.activeNoncritical += 1;
+    if (reportInput) this.reportInputActive += 1;
     this.publish();
     try {
       return await work();
@@ -625,6 +657,7 @@ export class DirectJournalAdmission {
       this.active -= 1;
       if (critical) this.activeCritical -= 1;
       else this.activeNoncritical -= 1;
+      if (reportInput) this.reportInputActive -= 1;
       this.publish();
       this.pump();
     }
@@ -640,14 +673,16 @@ export class DirectJournalAdmission {
         const next = this.criticalWaiting.shift();
         if (!next) break;
         this.refreshOldest();
-        void this.execute(next.run, true).then(next.resolve, next.reject);
+        if (next.reportInput) this.reportInputWaiting = Math.max(0, this.reportInputWaiting - 1);
+        void this.execute(next.run, true, next.reportInput).then(next.resolve, next.reject);
         continue;
       }
       if (this.noncriticalWaiting.length > 0 && this.hasCapacity(false)) {
         const next = this.noncriticalWaiting.shift();
         if (!next) break;
         this.refreshOldest();
-        void this.execute(next.run, false).then(next.resolve, next.reject);
+        if (next.reportInput) this.reportInputWaiting = Math.max(0, this.reportInputWaiting - 1);
+        void this.execute(next.run, false, next.reportInput).then(next.resolve, next.reject);
         continue;
       }
       break;
@@ -660,6 +695,7 @@ export class DirectJournalAdmission {
     const leftover = [...this.criticalWaiting.splice(0), ...this.noncriticalWaiting.splice(0)];
     this.oldestAt = null;
     for (const waiter of leftover) {
+      if (waiter.reportInput) this.reportInputWaiting = Math.max(0, this.reportInputWaiting - 1);
       this.metrics?.incRejected(waiter.journalClass);
       if (waiter.critical) this.criticalRejects += 1;
       waiter.reject(new JournalAdmissionRejected(waiter.journalClass, waiter.critical, message));

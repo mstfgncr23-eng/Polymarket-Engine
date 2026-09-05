@@ -39,6 +39,7 @@ import {
   experimentAllowsHedge,
   openPositionsRemain,
   shouldWriteFinalReport,
+  isReportInputEventType,
   type ExternalAgentRoleId,
   type Direction,
   type GrokActivationBridge,
@@ -86,7 +87,8 @@ import { SseHub } from "./server.js";
 import { EngineStateStore } from "./state.js";
 import { ensureReportGeneratedAudit, persistCanonicalFinalReport, streamExperimentSummary, summaryFromDurableReport } from "./final-report.js";
 import { writeExperimentSummary } from "./report.js";
-import { defaultRetentionConfig, RetentionManager } from "./retention-manager.js";
+import { retentionConfigFromEngineEnv, RetentionManager } from "./retention-manager.js";
+import { createSourceSealEvent, loadSourceSeal, SOURCE_SEAL_TIMEOUT_MS, isSourceSealExemptType } from "./source-seal.js";
 import { GrokActivationCoordinator, persistableActivation } from "./activation/coordinator.js";
 import { createGrokActivationBridge } from "./activation/index.js";
 import { BoundedJournalWriter } from "./journal-writer.js";
@@ -207,6 +209,9 @@ export class EngineService {
   private maintenanceHold: Promise<void> | null = null;
   private processTriggerHold: Promise<void> | null = null;
   private triggerEventPersistHold: Promise<void> | null = null;
+  private sourceSealing = false;
+  private sourceSealed = false;
+  private sourceSealTimeoutMs = SOURCE_SEAL_TIMEOUT_MS;
   private referenceTelemetryHoldForTest: Promise<void> | null = null;
   private lastAdmittedMarketEpochFence: ReadonlyMap<string, number> | null = null;
   private discoveryGenerationApplied = 0;
@@ -268,18 +273,7 @@ export class EngineService {
       onCoalesced: () => this.metrics.maintenanceSingleflightCoalesced.inc(),
       onDirty: (dirty) => this.metrics.maintenanceSingleflightDirty.set(dirty ? 1 : 0),
     });
-    this.retention = new RetentionManager(journal, defaultRetentionConfig({
-      enabled: env.RETENTION_ENABLED,
-      telemetryTtlMs: env.RETENTION_TELEMETRY_TTL_MS,
-      monitorTtlMs: env.RETENTION_MONITOR_TTL_MS,
-      completedGraceMs: env.RETENTION_COMPLETED_GRACE_MS,
-      mcpIdempotencyTtlMs: env.RETENTION_MCP_IDEMPOTENCY_TTL_MS,
-      checkpointKeep: env.RETENTION_CHECKPOINT_KEEP,
-      batchSize: env.RETENTION_BATCH_SIZE,
-      cycleBudgetMs: env.RETENTION_CYCLE_BUDGET_MS,
-      maxBatchesPerCycle: env.RETENTION_MAX_BATCHES_PER_CYCLE,
-      maxRowsPerCycle: env.RETENTION_MAX_ROWS_PER_CYCLE,
-    }), {
+    this.retention = new RetentionManager(journal, retentionConfigFromEngineEnv(env), {
       noteDeleted: (cls, n) => { if (n > 0) this.metrics.retentionDeleted.inc({ retention_class: cls }, n); },
       noteFailure: () => this.metrics.retentionFailures.inc(),
       noteRun: () => this.metrics.retentionRuns.inc(),
@@ -305,6 +299,7 @@ export class EngineService {
     this.started = true;
     await this.initializeJournalWithRetry();
     await this.restoreAndRecover();
+    await this.restoreSourceSealState();
     this.state.recoveryComplete = true;
     const configuredTokens = splitList(this.env.POLYMARKET_TOKEN_IDS);
     if (configuredTokens.length > 0) {
@@ -1420,6 +1415,9 @@ export class EngineService {
     if (this.started && !this.state.recoveryComplete) {
       return { admitted: false, reason: "fail_closed", done: Promise.resolve() };
     }
+    if (this.sourceSealBlocksAdmission()) {
+      return { admitted: false, reason: "source_sealed", done: Promise.resolve() };
+    }
     const resolved = provenance ?? this.captureProvenance(trigger);
     const lane = triggerWorkLane(trigger.kind);
     const marketEpochFence = resolved.kind === "MARKET" && Object.keys(resolved.tokenEpochs).length > 0
@@ -2061,6 +2059,10 @@ export class EngineService {
   private async safeAppend(event: ReturnType<typeof createJournalEvent>, signal?: AbortSignal): Promise<void> {
     const critical = isCriticalPersistenceType(event.type);
     const journalClass = classifyJournalMetricClass(event.type);
+    const reportInput = isReportInputEventType(event.type) && !isSourceSealExemptType(event.type);
+    if (reportInput && this.sourceSealBlocksAdmission()) {
+      throw new JournalAdmissionRejected(journalClass, critical, "SOURCE_SEALED");
+    }
     try {
       await this.journalAdmission.run(journalClass, critical, async () => {
         if (signal?.aborted) throw new JournalAdmissionRejected(journalClass, critical, "JOURNAL_ADMISSION_CLOSED");
@@ -2069,7 +2071,7 @@ export class EngineService {
           await this.journal.append(event);
           if (critical) this.state.database = "UP";
         });
-      }, signal);
+      }, signal, { reportInput });
       if (!critical) this.state.journalDegraded = false;
     } catch (error) {
       if (critical) {
@@ -2484,12 +2486,63 @@ export class EngineService {
       }),
       checkpoint: true,
     });
+    if (next.status === "COMPLETED") this.sourceSealing = true;
+  }
+
+  private sourceSealBlocksAdmission(): boolean {
+    return this.sourceSealing || this.sourceSealed;
+  }
+
+  private async restoreSourceSealState(): Promise<void> {
+    const experiment = this.experiment;
+    if (!experiment || experiment.status !== "COMPLETED") return;
+    const existing = await loadSourceSeal(this.journal, experiment.id);
+    if (existing) {
+      this.sourceSealed = true;
+      this.sourceSealing = false;
+      return;
+    }
+    this.sourceSealing = true;
+  }
+
+  async ensureSourceSeal(experiment: { id: string; startedAt?: string | null; completedAt?: string | null } = this.experiment!): Promise<{ sealed: boolean; reason: string | null }> {
+    const existing = await loadSourceSeal(this.journal, experiment.id);
+    if (existing) {
+      this.sourceSealed = true;
+      this.sourceSealing = false;
+      return { sealed: true, reason: null };
+    }
+    this.sourceSealing = true;
+    const started = Date.now();
+    const work = await this.supervisor.waitUnresolved(this.sourceSealTimeoutMs);
+    const remaining = Math.max(0, this.sourceSealTimeoutMs - (Date.now() - started));
+    const journal = await this.journalAdmission.waitReportInput(remaining);
+    if (!work.drained || !journal.drained || work.timedOut || journal.timedOut) {
+      return { sealed: false, reason: "SOURCE_SEAL_TIMEOUT" };
+    }
+    await this.safeAppend(createSourceSealEvent({
+      experimentId: experiment.id,
+      startedAt: experiment.startedAt,
+      completedAt: experiment.completedAt,
+    }));
+    const persisted = await loadSourceSeal(this.journal, experiment.id);
+    if (!persisted) return { sealed: false, reason: "SOURCE_SEAL_PERSIST_FAILED" };
+    this.sourceSealed = true;
+    this.sourceSealing = false;
+    return { sealed: true, reason: null };
   }
 
   private async writeFinalReport(): Promise<void> {
     if (!this.experiment || this.reportGenerated) return;
     const experiment = this.experiment;
     try {
+      if (experiment.status === "COMPLETED") {
+        const seal = await this.ensureSourceSeal(experiment);
+        if (!seal.sealed) {
+          this.reportGenerated = false;
+          return;
+        }
+      }
       const existing = await this.journal.loadExperimentReport(experiment.id, "final");
       if (existing && isCanonicalFinalReport(existing)) {
         await ensureReportGeneratedAudit(this.journal, existing, { reportDirectory: process.env.REPORT_DIRECTORY ?? "reports" });
@@ -2655,6 +2708,20 @@ export class EngineService {
   setMaintenanceHoldForTest(hold: Promise<void> | null): void { this.maintenanceHold = hold; }
   setProcessTriggerHoldForTest(hold: Promise<void> | null): void { this.processTriggerHold = hold; }
   setTriggerEventPersistHoldForTest(hold: Promise<void> | null): void { this.triggerEventPersistHold = hold; }
+  setSourceSealTimeoutForTest(ms: number): void { this.sourceSealTimeoutMs = Math.max(1, ms); }
+  sourceSealStateForTest() { return { sealing: this.sourceSealing, sealed: this.sourceSealed }; }
+  async completeExperimentForTest(): Promise<void> {
+    if (!this.experiment) throw new Error("NO_EXPERIMENT");
+    await this.commitExperimentStatus({
+      ...this.experiment,
+      status: "COMPLETED",
+      completedAt: this.nowFn().toISOString(),
+    });
+  }
+  async ensureSourceSealForTest() {
+    if (!this.experiment) throw new Error("NO_EXPERIMENT");
+    return this.ensureSourceSeal(this.experiment);
+  }
   setReferenceTelemetryHoldForTest(hold: Promise<void> | null): void { this.referenceTelemetryHoldForTest = hold; }
   isTriggerActionable(triggerId: string): boolean {
     const trigger = this.activeTriggers.get(triggerId);

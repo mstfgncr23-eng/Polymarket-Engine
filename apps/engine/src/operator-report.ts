@@ -1,4 +1,5 @@
 import { persistCanonicalFinalReport, resolveAuthoritativeExperiment, streamExperimentSummary } from "./final-report.js";
+import { loadSourceSeal } from "./source-seal.js";
 import { writeExperimentSummary } from "./report.js";
 import type { EventJournal } from "@pm/db";
 
@@ -47,11 +48,16 @@ export async function generateOperatorReport(
   }, extras);
   streamed.summary.complete = Boolean(authoritative.provenCompleted && streamed.scan.complete && streamed.scan.fence.stable && !streamed.scan.interrupted);
   streamed.summary.truncated = streamed.scan.truncated || streamed.scan.interrupted || !streamed.scan.fence.stable || !authoritative.provenCompleted;
-  if (!authoritative.provenCompleted || !input.allowPersist || !streamed.summary.complete) {
+  const sealed = Boolean(await loadSourceSeal(journal, authoritative.id));
+  if (!authoritative.provenCompleted || !input.allowPersist || !streamed.summary.complete || !sealed) {
     const paths = await writeExperimentSummary(streamed.summary, input.reportDirectory);
     return {
       persisted: false,
-      reason: authoritative.provenCompleted ? (streamed.summary.truncated ? streamed.summary.truncatedReason : "PERSIST_NOT_REQUESTED") : `NOT_COMPLETED:${authoritative.status}`,
+      reason: !authoritative.provenCompleted
+        ? `NOT_COMPLETED:${authoritative.status}`
+        : !sealed
+          ? "SOURCE_SEAL_MISSING"
+          : streamed.summary.truncated ? streamed.summary.truncatedReason : "PERSIST_NOT_REQUESTED",
       complete: streamed.summary.complete,
       pages: streamed.scan.pages,
       scanned: streamed.scan.scanned,

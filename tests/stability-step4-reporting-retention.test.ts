@@ -16,16 +16,20 @@ import {
   createId,
   engineEnvSchema,
   grokSignalSubmissionSchema,
+  triggerEventSchema,
   type JournalEvent,
 } from "@pm/core";
 import {
   ExperimentReportConflictError,
   JournalMigrateForbiddenError,
+  JournalMutateForbiddenError,
   MemoryEventJournal,
   PostgresEventJournal,
   createJournalEvent,
   evaluateSchemaInspection,
+  inspectPublicSchema,
   hashExperimentReport,
+  verifyRequiredSchema,
   isCanonicalFinalReport,
   persistReportConflictSafe,
   reportGeneratedAuditId,
@@ -38,6 +42,7 @@ import { ensureReportGeneratedAudit, persistCanonicalFinalReport, resolveAuthori
 import { applyJournalCleanup, dryRunJournalCleanup } from "../apps/engine/src/journal-cleanup.js";
 import { generateOperatorReport } from "../apps/engine/src/operator-report.js";
 import { defaultRetentionConfig, experimentIsActive, experimentIsMonitorOnly, RetentionManager } from "../apps/engine/src/retention-manager.js";
+import { loadSourceSeal } from "../apps/engine/src/source-seal.js";
 import { completeMetricsFlightKey, resetStrategyMetricsCacheForTest } from "../apps/engine/src/mcp.js";
 import { KeyedResultFlight } from "../apps/engine/src/runtime-supervisor.js";
 import { EngineMetrics } from "../apps/engine/src/metrics.js";
@@ -87,6 +92,7 @@ function fixtureEvents(): JournalEvent[] {
       marketId: "m1", asset: "BTC", realizedDelta: 6, upQuantity: "10", downQuantity: "10", grossOutcome: "POSITION_WIN",
     }, "e-set"),
     ev("EXPERIMENT_COMPLETED", "2026-09-01T00:00:08.000Z", { status: "COMPLETED" }, "e-done"),
+    ev("EXPERIMENT_SOURCE_SEALED", "2026-09-01T00:00:09.000Z", { experimentId: "exp-1", sealed: true }, "sourceseal:exp-1"),
   ];
 }
 
@@ -463,6 +469,7 @@ describe("Step-4 schema verification fails closed", () => {
       indexes: [],
       rlsEnabled: [],
       rlsForced: [],
+      invalidIndexes: [],
     })).toThrow(SchemaVerificationError);
     try {
       evaluateSchemaInspection({
@@ -470,6 +477,7 @@ describe("Step-4 schema verification fails closed", () => {
         indexes: [],
         rlsEnabled: [],
         rlsForced: [],
+        invalidIndexes: [],
       });
     } catch (error) {
       expect(String(error)).toMatch(/durable_transitions/);
@@ -484,6 +492,7 @@ describe("Step-4 schema verification fails closed", () => {
       ],
       rlsEnabled: ["journal_events", "engine_checkpoints", "mcp_idempotency_keys", "durable_transitions", "experiment_reports"],
       rlsForced: [],
+      invalidIndexes: [],
     })).not.toThrow();
     expect(() => evaluateSchemaInspection({
       tables: ["journal_events", "engine_checkpoints", "mcp_idempotency_keys", "durable_transitions", "experiment_reports"],
@@ -536,7 +545,7 @@ describe("Step-4 acceptance: operator access never migrates", () => {
       types: TELEMETRY_EVENT_TYPES,
       occurredBefore: new Date(),
       limit: 10,
-    })).rejects.toThrow(/JOURNAL_MUTATE_FORBIDDEN/);
+    })).rejects.toBeInstanceOf(JournalMutateForbiddenError);
     const pg = new PostgresEventJournal("postgres://operator:operator@127.0.0.1:1/none", "/tmp", { access: "readonly" });
     await expect(pg.initialize()).rejects.toBeInstanceOf(JournalMigrateForbiddenError);
     expect(pg.migrateInvocations).toBe(0);
@@ -569,6 +578,11 @@ describe("Step-4 acceptance: operator report CLI gates", () => {
     const missing = await generateOperatorReport(journal, { experimentId: "exp-missing", reportDirectory: dir, allowPersist: true });
     expect(missing.persisted).toBe(false);
     expect(missing.reason).toBe("EXPERIMENT_IDENTITY_MISSING");
+    const unsealed = new MemoryEventJournal();
+    await unsealed.appendMany(fixtureEvents().filter((event) => event.type !== "EXPERIMENT_SOURCE_SEALED"));
+    const noSeal = await generateOperatorReport(unsealed, { experimentId: "exp-1", reportDirectory: dir, allowPersist: true });
+    expect(noSeal.persisted).toBe(false);
+    expect(noSeal.reason).toBe("SOURCE_SEAL_MISSING");
     const resolved = await resolveAuthoritativeExperiment(journal, "exp-1");
     expect(resolved?.startedAt).toBe("2026-09-01T00:00:00.000Z");
     expect(resolved?.startedAt).not.toBe("2026-08-01T00:00:00.000Z");
@@ -757,4 +771,262 @@ describe("Step-4 acceptance: retention opt-in, persist races, audit repair, MCP 
     expect(acc.highWaterMarkBytes).toBeGreaterThan(0);
   });
 });
+
+async function waitUntil(predicate: () => boolean | Promise<boolean>, timeoutMs = 2_000): Promise<void> {
+  const started = Date.now();
+  while (!(await predicate())) {
+    if (Date.now() - started > timeoutMs) throw new Error("WAIT_TIMEOUT");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+describe("Step-4 acceptance: application-level source seal", () => {
+  it("holds a pre-completion TRIGGER_EVENT until the source seal drains", async () => {
+    const journal = new MemoryEventJournal();
+    const adapter = new ScriptedMarketAdapter();
+    adapter.queue(discoveryReport([qualified("btc-mkt", "BTC", "btc-up", "btc-down")]));
+    const engine = new EngineService(qualifiedPaperEnv({ GROK_ACTIVATION_PROVIDER: "noop" }), journal, { error: () => undefined }, {
+      market: adapter as never,
+      referenceRegistry: new ScriptedReferenceRegistry() as never,
+      activation: new NoopGrokActivationBridge(),
+    });
+    await engine.start();
+    try {
+      expect((await engine.beginExperiment()).ok).toBe(true);
+      const experimentId = engine.experimentManifest()!.id;
+      engine.setSourceSealTimeoutForTest(80);
+      let release!: () => void;
+      engine.setTriggerEventPersistHoldForTest(new Promise<void>((resolve) => { release = resolve; }));
+      const trigger = triggerEventSchema.parse({
+        id: "trig-seal-1", traceId: "tr-seal-1", marketId: "btc-mkt", asset: "BTC",
+        kind: "BOOK_IMBALANCE", severity: 2, score: 1, dedupeKey: "seal", evidence: {},
+        sourceEventIds: ["e-seal"], source: "polymarket",
+        createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 30_000).toISOString(),
+      });
+      engine.enqueueTriggerStormForTest([trigger]);
+      await waitUntil(() => engine.journalAdmissionSnapshot().active > 0);
+      await engine.completeExperimentForTest();
+      await engine.writeFinalReportForTest();
+      expect(await journal.loadExperimentReport(experimentId)).toBeNull();
+      expect(await loadSourceSeal(journal, experimentId)).toBeNull();
+      expect(engine.reportGeneratedForTest()).toBe(false);
+      release();
+      engine.setTriggerEventPersistHoldForTest(null);
+      engine.setSourceSealTimeoutForTest(5_000);
+      await waitUntil(async () => (await journal.queryEvents({ types: ["TRIGGER_EVENT"] })).some((event) => event.payload.id === "trig-seal-1"));
+      await engine.writeFinalReportForTest();
+      expect(await loadSourceSeal(journal, experimentId)).toBeTruthy();
+      const first = await journal.loadExperimentReport(experimentId);
+      expect(first && isCanonicalFinalReport(first)).toBe(true);
+      const streamed = await streamExperimentSummary(journal, {
+        id: experimentId,
+        startedAt: engine.experimentManifest()?.startedAt,
+        completedAt: engine.experimentManifest()?.completedAt,
+      }, { reportKind: "final", complete: true, truncated: false, generatedAt: first!.generatedAt });
+      streamed.summary.complete = true;
+      streamed.summary.truncated = false;
+      expect(toDurableReportInput({ summary: streamed.summary, scan: streamed.scan }).contentHash).toBe(first!.contentHash);
+      expect(streamed.scan.scanned).toBe(first!.sourceEventCount);
+      expect((await journal.queryEvents({
+        types: ["TRIGGER_EVENT"],
+        from: engine.experimentManifest()?.startedAt ? new Date(engine.experimentManifest()!.startedAt!) : undefined,
+        to: engine.experimentManifest()?.completedAt ? new Date(engine.experimentManifest()!.completedAt!) : undefined,
+      })).some((event) => event.payload.id === "trig-seal-1")).toBe(true);
+      await engine.stop();
+      const adapter2 = new ScriptedMarketAdapter();
+      adapter2.queue(discoveryReport([qualified("btc-mkt", "BTC", "btc-up", "btc-down")]));
+      const restarted = new EngineService(qualifiedPaperEnv({ GROK_ACTIVATION_PROVIDER: "noop" }), journal, { error: () => undefined }, {
+        market: adapter2 as never,
+        referenceRegistry: new ScriptedReferenceRegistry() as never,
+        activation: new NoopGrokActivationBridge(),
+      });
+      await restarted.start();
+      try {
+        const recovered = await journal.loadExperimentReport(experimentId);
+        expect(recovered?.contentHash).toBe(first!.contentHash);
+        await restarted.writeFinalReportForTest();
+        expect((await journal.loadExperimentReport(experimentId))?.contentHash).toBe(first!.contentHash);
+      } finally {
+        await restarted.stop();
+      }
+    } finally {
+      if (!engine.state.draining) await engine.stop();
+    }
+  });
+
+  it("source-seal timeout refuses a canonical final", async () => {
+    const journal = new MemoryEventJournal();
+    const adapter = new ScriptedMarketAdapter();
+    adapter.queue(discoveryReport([qualified("btc-mkt", "BTC", "btc-up", "btc-down")]));
+    const engine = new EngineService(qualifiedPaperEnv({ GROK_ACTIVATION_PROVIDER: "noop" }), journal, { error: () => undefined }, {
+      market: adapter as never,
+      referenceRegistry: new ScriptedReferenceRegistry() as never,
+      activation: new NoopGrokActivationBridge(),
+    });
+    await engine.start();
+    try {
+      expect((await engine.beginExperiment()).ok).toBe(true);
+      engine.setSourceSealTimeoutForTest(40);
+      engine.setTriggerEventPersistHoldForTest(new Promise<void>(() => undefined));
+      engine.enqueueTriggerStormForTest([triggerEventSchema.parse({
+        id: "trig-timeout", traceId: "tr-timeout", marketId: "btc-mkt", asset: "BTC",
+        kind: "BOOK_IMBALANCE", severity: 2, score: 1, dedupeKey: "timeout", evidence: {},
+        sourceEventIds: ["e-timeout"], source: "polymarket",
+        createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 30_000).toISOString(),
+      })]);
+      await waitUntil(() => engine.journalAdmissionSnapshot().active > 0);
+      await engine.completeExperimentForTest();
+      const seal = await engine.ensureSourceSealForTest();
+      expect(seal.sealed).toBe(false);
+      expect(seal.reason).toBe("SOURCE_SEAL_TIMEOUT");
+      expect(await journal.loadExperimentReport(engine.experimentManifest()!.id)).toBeNull();
+    } finally {
+      await engine.stop();
+    }
+  });
+});
+
+describe("Step-4 acceptance: journal access capability matrix", () => {
+  it("rejects every mutating method under readonly and verify-only", async () => {
+    const report = {
+      experimentId: "exp-1", reportKind: "final" as const, schemaVersion: 1, generatedAt: "2026-09-01T00:00:00.000Z",
+      complete: true, truncated: false, sourceEventCount: 1,
+      sourceWindowStart: null, sourceWindowEnd: null, sourceFenceOccurredAt: null, sourceFenceId: null,
+      earliestIncludedAt: null, latestIncludedAt: null, canonicalSummary: {}, renderedMarkdown: "x",
+      contentHash: "x",
+    };
+    const event = ev("MARKET_SNAPSHOT", "2026-09-01T00:00:00.000Z", {}, "snap-mut");
+    for (const mode of ["readonly", "verify-only"] as const) {
+      const journal = new MemoryEventJournal();
+      await journal.connectWithoutMigrate(mode);
+      await expect(journal.append(event)).rejects.toBeInstanceOf(JournalMutateForbiddenError);
+      await expect(journal.appendMany([event])).rejects.toBeInstanceOf(JournalMutateForbiddenError);
+      await expect(journal.claimIdempotency("s", "k")).rejects.toBeInstanceOf(JournalMutateForbiddenError);
+      await expect(journal.persistExperimentReport(report)).rejects.toBeInstanceOf(JournalMutateForbiddenError);
+      await expect(journal.deleteJournalEventsBounded({ types: TELEMETRY_EVENT_TYPES, occurredBefore: new Date(), limit: 1 }))
+        .rejects.toBeInstanceOf(JournalMutateForbiddenError);
+      await expect(journal.pruneIdempotencyKeys(new Date(), 1)).rejects.toBeInstanceOf(JournalMutateForbiddenError);
+      await expect(journal.pruneOldCheckpoints(1)).rejects.toBeInstanceOf(JournalMutateForbiddenError);
+      await expect(journal.saveCheckpoint({ experimentId: "e", sequence: 1, payload: {} }))
+        .rejects.toBeInstanceOf(JournalMutateForbiddenError);
+      await expect(journal.commitDurableTransition({
+        operationKey: "op", type: "EXPERIMENT_STARTED", aggregateType: "experiment", aggregateId: "e", payload: {},
+      }, 0)).rejects.toBeInstanceOf(JournalMutateForbiddenError);
+    }
+    const writer = new MemoryEventJournal();
+    await writer.connectWithoutMigrate("report-write");
+    await expect(writer.append(event)).rejects.toBeInstanceOf(JournalMutateForbiddenError);
+    await expect(writer.deleteJournalEventsBounded({ types: TELEMETRY_EVENT_TYPES, occurredBefore: new Date(), limit: 1 }))
+      .rejects.toBeInstanceOf(JournalMutateForbiddenError);
+    await expect(writer.persistExperimentReport(report)).resolves.toMatchObject({ inserted: true });
+  });
+});
+
+describe("Step-4 acceptance: hard maxRowsPerCycle and effective retention config", () => {
+  it("never deletes more than maxRowsPerCycle for non-divisible budgets", async () => {
+    const seed = async (journal: MemoryEventJournal, n: number) => {
+      for (let i = 0; i < n; i += 1) {
+        await journal.append(ev("MARKET_SNAPSHOT", "2026-01-01T00:00:00.000Z", { i }, `cap-${n}-${i}`));
+      }
+    };
+    const run = async (batchSize: number, maxRowsPerCycle: number) => {
+      const journal = new MemoryEventJournal();
+      await seed(journal, 400);
+      const manager = new RetentionManager(journal, defaultRetentionConfig({
+        enabled: true, telemetryTtlMs: 1, monitorTtlMs: 1, batchSize, maxRowsPerCycle,
+        maxBatchesPerCycle: 20, cycleBudgetMs: 10_000,
+      }));
+      return manager.runCycle({ experiment: null, now: new Date(), degraded: false, failClosed: false, databaseUp: true });
+    };
+    const a = await run(200, 250);
+    expect(a.deletedByClass.raw_telemetry).toBeLessThanOrEqual(250);
+    expect(a.deletedByClass.raw_telemetry).toBe(250);
+    const b = await run(200, 350);
+    expect(b.deletedByClass.raw_telemetry).toBe(350);
+    const c = await run(200, 100);
+    expect(c.deletedByClass.raw_telemetry).toBe(100);
+  });
+
+  it("dry-run cutoffs match RetentionManager for a non-default config", async () => {
+    const journal = new MemoryEventJournal();
+    const now = new Date("2026-09-08T00:00:00.000Z");
+    await journal.append(ev("MARKET_SNAPSHOT", "2026-09-07T21:00:00.000Z", {}, "tel-2h"));
+    await journal.append(ev("TRIGGER_EVENT", "2026-09-07T10:00:00.000Z", {}, "mon-12h"));
+    const config = defaultRetentionConfig({
+      enabled: true,
+      telemetryTtlMs: 2 * 60 * 60_000,
+      monitorTtlMs: 12 * 60 * 60_000,
+      completedGraceMs: 2 * 24 * 60 * 60_000,
+      batchSize: 50,
+      maxBatchesPerCycle: 7,
+      maxRowsPerCycle: 150,
+    });
+    const dry = await dryRunJournalCleanup(journal, now, null, config);
+    expect(dry.effectiveConfig.telemetryTtlMs).toBe(2 * 60 * 60_000);
+    expect(dry.effectiveConfig.monitorTtlMs).toBe(12 * 60 * 60_000);
+    expect(dry.effectiveConfig.completedGraceMs).toBe(2 * 24 * 60 * 60_000);
+    expect(dry.effectiveConfig.batchSize).toBe(50);
+    expect(dry.telemetry.cutoff).toBe(new Date(now.getTime() - config.telemetryTtlMs).toISOString());
+    expect(dry.monitor.cutoff).toBe(new Date(now.getTime() - config.monitorTtlMs).toISOString());
+    expect(dry.telemetry.eligible).toBe(1);
+    expect(dry.monitor.eligible).toBe(1);
+    const manager = new RetentionManager(journal, config);
+    const cycle = await manager.runCycle({ experiment: null, now, degraded: false, failClosed: false, databaseUp: true });
+    expect(cycle.eligibleBacklog).toBe(dry.telemetry.eligible + dry.monitor.eligible);
+    const applyJournal = new MemoryEventJournal();
+    await applyJournal.append(ev("MARKET_SNAPSHOT", "2026-09-07T21:00:00.000Z", {}, "tel-2h"));
+    await applyJournal.append(ev("TRIGGER_EVENT", "2026-09-07T10:00:00.000Z", {}, "mon-12h"));
+    const apply = await applyJournalCleanup(applyJournal, {
+      now, experiment: null, confirm: "I_UNDERSTAND_DESTRUCTIVE_CLEANUP", config,
+    });
+    expect(apply.deletedByClass.raw_telemetry).toBe(1);
+    expect(apply.deletedByClass.monitor_control).toBe(1);
+  });
+});
+
+describe("Step-4 acceptance: invalid index inspection fail-closed", () => {
+  const required = {
+    tables: ["journal_events", "engine_checkpoints", "mcp_idempotency_keys", "durable_transitions", "experiment_reports"],
+    indexes: [
+      "journal_trace_idx", "journal_aggregate_idx", "journal_type_time_idx", "journal_experiment_idx",
+      "journal_occurred_id_idx", "journal_type_occurred_id_idx", "checkpoint_sequence_idx",
+      "mcp_idempotency_scope_key_idx", "durable_transitions_operation_key_uidx", "durable_transitions_sequence_idx",
+      "experiment_reports_pkey", "experiment_reports_hash_idx", "experiment_reports_complete_idx",
+    ],
+    rlsEnabled: ["journal_events", "engine_checkpoints", "mcp_idempotency_keys", "durable_transitions", "experiment_reports"],
+    rlsForced: [] as string[],
+  };
+
+  it("fails when a required index is missing", () => {
+    expect(() => evaluateSchemaInspection({
+      ...required,
+      indexes: required.indexes.filter((name) => name !== "journal_occurred_id_idx"),
+      invalidIndexes: [],
+    })).toThrow(/missing index journal_occurred_id_idx/);
+  });
+
+  it("fails when a required index is INVALID", () => {
+    expect(() => evaluateSchemaInspection({
+      ...required,
+      invalidIndexes: ["journal_occurred_id_idx"],
+    })).toThrow(/invalid index journal_occurred_id_idx/);
+  });
+
+  it("fails closed when index-validity inspection throws", async () => {
+    await expect(inspectPublicSchema(async (sql) => {
+      if (sql.includes("indisvalid")) throw new Error("pg_index unavailable");
+      return [];
+    })).rejects.toThrow(/pg_index unavailable/);
+    await expect(verifyRequiredSchema(async (sql) => {
+      if (sql.includes("indisvalid")) throw new Error("pg_index unavailable");
+      return [];
+    })).rejects.toThrow(/pg_index unavailable/);
+    expect(() => evaluateSchemaInspection(required)).toThrow(/index validity not inspected/);
+  });
+
+  it("passes when every required index is present and valid", () => {
+    expect(() => evaluateSchemaInspection({ ...required, invalidIndexes: [] })).not.toThrow();
+  });
+});
+
 
