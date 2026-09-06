@@ -98,14 +98,15 @@ export async function streamExperimentSummary(
   if (rollupSnapshot) {
     try { acc.restore({ ...rollupSnapshot, extras }); } catch { /* stale/incompatible rollups are ignored */ }
   }
-  const rollupFenceAt = rollup?.sourceFenceOccurredAt ? Date.parse(rollup.sourceFenceOccurredAt) : Number.NaN;
-  const rollupFenceId = rollup?.sourceFenceId ?? null;
-  const rollupRecordedAt = rollup?.sourceRecordedAt ? Date.parse(rollup.sourceRecordedAt) : Number.NaN;
   let tailScanned = 0;
   const scan = await scanJournalEvents(journal, {
     types: CANONICAL_REPORT_INPUT_EVENT_TYPES,
     from: experiment.startedAt ? new Date(experiment.startedAt) : undefined,
     to: experiment.completedAt ? new Date(experiment.completedAt) : undefined,
+    // Commit sequence is the authoritative prefix boundary. Do not use the
+    // prior rollup's occurredAt cursor: a newly committed event may carry an
+    // older occurredAt and still belongs to the uncovered tail.
+    ...(rollup ? { commitSeqAfter: rollup.sourceCommitSeq ?? 0 } : {}),
   }, {
     pageSize: options.pageSize,
     ceiling: options.ceiling,
@@ -113,17 +114,9 @@ export async function streamExperimentSummary(
     onPage: async (page) => {
       for (const event of page) {
         if (!includeCurrentExperimentEvent(event, experiment)) continue;
-        // A verified rollup already covers its source fence. Fold only the
-        // bounded tail so a report remains equivalent after raw cleanup.
-        const occurredAt = Date.parse(event.occurredAt);
-        const occurredCovered = Number.isFinite(rollupFenceAt) && (occurredAt < rollupFenceAt
-          || (occurredAt === rollupFenceAt && rollupFenceId != null && event.id <= rollupFenceId));
-        const recordedCovered = Number.isFinite(rollupRecordedAt) ? Date.parse(event.recordedAt) <= rollupRecordedAt : true;
-        const eventCommitSeq = journal.eventCommitSeq ? await journal.eventCommitSeq(event.id) : null;
-        const committedCovered = rollup?.sourceCommitSeq != null && eventCommitSeq != null
-          ? eventCommitSeq <= rollup.sourceCommitSeq
-          : recordedCovered;
-        if (occurredCovered && committedCovered) continue;
+        // The query already excludes the verified rollup prefix by commit_seq.
+        // Folding the returned page is therefore O(pages), with no per-event
+        // commit-sequence lookup or DB fanout.
         acc.fold(event);
         tailScanned += 1;
       }
@@ -134,8 +127,15 @@ export async function streamExperimentSummary(
   summary.truncated = scan.truncated || scan.interrupted || summary.truncated;
   summary.truncatedReason = summary.truncated ? (extras.truncatedReason ?? scan.truncatedReason ?? "SCAN_CEILING") : null;
   if (scan.interrupted) summary.complete = false;
-  const effectiveFence = rollup && !scan.fence.through && rollup.sourceFenceId && rollup.sourceFenceOccurredAt
-    ? { ...scan.fence, through: { id: rollup.sourceFenceId, occurredAt: rollup.sourceFenceOccurredAt }, recordedAtTo: rollup.sourceRecordedAt ? new Date(rollup.sourceRecordedAt) : scan.fence.recordedAtTo, commitSeqTo: rollup.sourceCommitSeq ?? scan.fence.commitSeqTo }
+  const baseThrough = rollup && rollup.sourceFenceId && rollup.sourceFenceOccurredAt
+    ? { id: rollup.sourceFenceId, occurredAt: rollup.sourceFenceOccurredAt }
+    : null;
+  const effectiveThrough = baseThrough && scan.fence.through
+    ? (Date.parse(scan.fence.through.occurredAt) > Date.parse(baseThrough.occurredAt)
+      || (scan.fence.through.occurredAt === baseThrough.occurredAt && scan.fence.through.id > baseThrough.id) ? scan.fence.through : baseThrough)
+    : baseThrough ?? scan.fence.through;
+  const effectiveFence = rollup && effectiveThrough
+    ? { ...scan.fence, through: effectiveThrough }
     : scan.fence;
   const effectiveScan = { ...scan, fence: effectiveFence, scanned: (rollup?.sourceEventCount ?? 0) + tailScanned };
   return { summary, scan: effectiveScan, accumulatorHighWaterBytes: acc.highWaterMarkBytes, accumulatorSnapshot: acc.serialize(), baseRollupContentHash: rollup?.contentHash ?? null };

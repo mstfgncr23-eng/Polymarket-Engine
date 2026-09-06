@@ -207,6 +207,8 @@ export interface CompactedOperationKey {
   type: string;
   aggregateType: string;
   aggregateId: string;
+  /** Small lifecycle scope used to close related identities in bulk. */
+  scopeId?: string | null;
   payloadHash: string;
   sequence: number;
   occurredAt: string;

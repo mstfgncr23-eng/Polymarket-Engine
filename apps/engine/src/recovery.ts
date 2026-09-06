@@ -220,7 +220,9 @@ const reservePayloadSchema = z.object({
 
 const releasePayloadSchema = z.object({
   orderId: z.string().min(1),
-  released: z.string(),
+  // Released amount is an execution-time projection; the authoritative
+  // recovery effect is derived from the reservation map at this sequence.
+  released: z.string().optional(),
   cancel: z.boolean().optional(),
   reason: z.string().optional(),
 });

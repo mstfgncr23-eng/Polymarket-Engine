@@ -166,13 +166,15 @@ export const durableReplayKeys = pgTable("durable_replay_keys", {
   type: text("type").notNull(),
   aggregateType: text("aggregate_type").notNull(),
   aggregateId: text("aggregate_id").notNull(),
+  /** Compact lifecycle scope (market/order/experiment); never full payload. */
+  scopeId: text("scope_id"),
   payloadHash: text("payload_hash").notNull(),
   sequence: bigint("sequence", { mode: "number" }).notNull(),
   occurredAt: timestamp("occurred_at", { withTimezone: true }).notNull(),
   recordedAt: timestamp("recorded_at", { withTimezone: true }).notNull(),
   expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
   lifecycleState: text("lifecycle_state").notNull().default("closed"),
-}, (table) => [index("durable_replay_keys_sequence_idx").on(table.sequence), index("durable_replay_keys_expiry_idx").on(table.expiresAt)]);
+}, (table) => [index("durable_replay_keys_sequence_idx").on(table.sequence), index("durable_replay_keys_expiry_idx").on(table.expiresAt), index("durable_replay_keys_scope_idx").on(table.scopeId, table.lifecycleState)]);
 
 /** Versioned, verified analytics accumulator; raw source may be deleted only after this row is durable. */
 export const experimentReportRollups = pgTable("experiment_report_rollups", {

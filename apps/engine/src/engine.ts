@@ -73,6 +73,7 @@ import {
   isJournalAppendAbortedError,
   isJournalAppendDeadlineError,
   hashCheckpointPayload,
+  hashDurablePayload,
   type DurableCommitResult,
   type DurableTransition,
   type EventJournal,
@@ -1203,7 +1204,12 @@ export class EngineService {
       const applied = this.applyCommitted(commit.transition);
       this.syncRestingIndexFromOrders();
       this.crashInjector.maybeCrash("AFTER_APPLY_BEFORE_DERIVED_AUDIT", input.operationKey);
-      await this.emitStoredDerivedAudit(commit.transition);
+      // Compacted replay identities intentionally carry no payload/derived
+      // audit. The hash was already proven by resolveDurablePayload and this
+      // existing sequence cannot be applied again.
+      if (Object.keys(commit.transition.payload).length > 0) {
+        await this.emitStoredDerivedAudit(commit.transition);
+      }
       if (applied && input.afterApply) await input.afterApply(commit.transition);
       this.crashInjector.maybeCrash("AFTER_DERIVED_AUDIT_BEFORE_CHECKPOINT", input.operationKey);
       if (input.checkpoint) await this.checkpointInsideGate();
@@ -1264,6 +1270,17 @@ export class EngineService {
       || (Object.keys(existing.payload).length > 0 && durableIdentityConflicts(input.type, existing.payload, computed))
     ) {
       throw new IdempotencyConflictError(input.operationKey, existing.type, input.type);
+    }
+    // Compaction deliberately retains only the authoritative identity and its
+    // payload hash. Rebuild the full payload from the current operation plan
+    // after proving that it is byte-for-byte equivalent to that identity. The
+    // caller will receive inserted=false and the original sequence, so the
+    // economic transition is never applied again.
+    if (Object.keys(existing.payload).length === 0) {
+      if (existing.payloadHash !== hashDurablePayload(computed)) {
+        throw new IdempotencyConflictError(input.operationKey, existing.type, input.type);
+      }
+      return computed;
     }
     return existing.payload;
   }
@@ -2163,10 +2180,14 @@ export class EngineService {
     intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" = "OPEN_FIRST_LEG",
   ): Promise<void> {
     const notional = makerReserveNotional(order.quantity, order.requestedPrice, snapshot.feeSchedule);
-    if (this.ledger.availableCash().lt(notional) && !(await this.journal.readDurableByOperationKey(`maker:${order.id}:reserve`))) {
+    const priorReserve = await this.journal.readDurableByOperationKey(`maker:${order.id}:reserve`);
+    const compactedRetry = Boolean(priorReserve && Object.keys(priorReserve.payload).length === 0);
+    if (this.ledger.availableCash().lt(notional) && !priorReserve) {
       throw new Error("INSUFFICIENT_CASH");
     }
-    const resting = createRestingMakerOrder(order, snapshot);
+    const resting = compactedRetry
+      ? (this.restingOrders.get(order.id) ?? createRestingMakerOrder(order, snapshot))
+      : createRestingMakerOrder(order, snapshot);
     const auth = { orderId: order.id, reserved: notional, resting, intent };
     await this.commitAuthoritative({
       operationKey: `maker:${order.id}:reserve`,
@@ -2211,7 +2232,10 @@ export class EngineService {
       aggregateType: "paper_order",
       aggregateId: orderId,
       buildPayload: (occurredAt) => ({
-        orderId, released, cancel: options.cancel === true, reason: options.reason,
+        // The released amount is represented by the authoritative reservation
+        // state and is kept in derived audit only, so compacted retries remain
+        // hash-stable after the reservation has already been released.
+        orderId, cancel: options.cancel === true, reason: options.reason,
         derivedAudit: [{
           id: derivedAuditEventId(type, orderId),
           type,
@@ -2242,13 +2266,25 @@ export class EngineService {
   }
 
   private async applyFill(fill: Parameters<PaperLedger["applyFill"]>[0], extras: { restingAfter?: RestingPaperOrder | null } = {}): Promise<void> {
+    // A settlement is the terminal authority for this market. The live bit
+    // is normally restored from the verified checkpoint; the durable lookup
+    // covers a rediscovery/retry after bounded replay-key pressure evicted the
+    // settlement identity. Never let an old fill recreate a settled position.
+    if (this.settledMarkets.has(fill.marketId)) return;
+    const settlementAuthority = await this.journal.readDurableByOperationKey(`settlement:${fill.marketId}:${this.experiment?.id ?? "paper"}`);
+    if (settlementAuthority?.type === "POSITION_SETTLED") {
+      this.settledMarkets.add(fill.marketId);
+      return;
+    }
+    const priorFillAuthority = await this.journal.readDurableByOperationKey(`fill:${fill.id}`);
+    const compactedRetry = Boolean(priorFillAuthority && Object.keys(priorFillAuthority.payload).length === 0);
     // A fill with no existing position is a first leg. The post-commit start
     // validation fence must reject it while the experiment identity is still
     // pending; hedges for pre-existing positions remain admissible.
     if (this.experimentStartPending && !this.ledger.positions.has(fill.marketId)) return;
     const reserved = this.makerReservations.get(fill.orderId);
     let reservationAfter: string | null = reserved ?? null;
-    if (reserved && fill.liquidityRole === "MAKER") {
+    if (reserved && fill.liquidityRole === "MAKER" && !compactedRetry) {
       const fillCost = d(fill.quantity).mul(fill.fillPrice).plus(fill.feeUsd);
       const next = d(reserved).minus(fillCost);
       reservationAfter = next.gt(0) ? decimal(next) : null;
@@ -2256,14 +2292,20 @@ export class EngineService {
     const previous = this.ledger.positions.get(fill.marketId);
     const wasEmpty = !previous || (!d(previous.upQuantity).gt(0) && !d(previous.downQuantity).gt(0));
     const positionId = previous?.id ?? stablePositionId(fill.marketId);
-    const restingAfter = this.computeMakerRestingAfter(fill, extras);
+    const restingAfter = compactedRetry
+      ? (this.restingOrders.get(fill.orderId) ?? null)
+      : this.computeMakerRestingAfter(fill, extras);
     await this.commitAuthoritative({
       operationKey: `fill:${fill.id}`,
       type: "PAPER_FILL",
       aggregateType: "paper_fill",
       aggregateId: fill.id,
       buildPayload: (occurredAt) => {
-        const auth = { fill, positionId, reservationAfter, restingAfter, wasEmpty };
+        // wasEmpty only drives derived audit classification and is deliberately
+        // excluded from the authoritative transition payload. Keeping the
+        // replay payload to stable operation facts lets a compacted retry
+        // reconstruct the same hash after the live projection has advanced.
+        const auth = { fill, positionId, reservationAfter, restingAfter };
         return {
           ...auth,
           derivedAudit: this.projectDerivedAudit(
@@ -2721,6 +2763,10 @@ export class EngineService {
 
   private async settleMarket(marketId: string, market: DiscoveredMarket): Promise<void> {
     if (this.settledMarkets.has(marketId)) return;
+    // There is no economic obligation to settle when no position remains. In
+    // particular this prevents an old rediscovered market from creating a new
+    // durable settlement transition after its bounded replay identity expires.
+    if (!this.ledger.positions.has(marketId)) return;
     const operationKey = `settlement:${marketId}:${this.experiment?.id ?? "paper"}`;
     const durableSettlement = await this.journal.readDurableByOperationKey(operationKey);
     if (durableSettlement?.type === "POSITION_SETTLED") {

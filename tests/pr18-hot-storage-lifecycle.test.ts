@@ -24,6 +24,9 @@ import {
 } from "../apps/engine/src/final-report.js";
 import { defaultRetentionConfig, RetentionManager } from "../apps/engine/src/retention-manager.js";
 import { resolveCleanupLifecycle } from "../apps/engine/src/cleanup-lifecycle.js";
+import { EngineService } from "../apps/engine/src/engine.js";
+import { paperFill, book, qualifiedPaperEnv, startQualifiedEngine } from "./paper-engine-testkit.js";
+import { order as fixtureOrder } from "./fixtures.js";
 
 function event(type: string, id: string, occurredAt: string, payload: Record<string, unknown> = {}): JournalEvent {
   return createJournalEvent({
@@ -53,6 +56,107 @@ async function durableRows(journal: MemoryEventJournal): Promise<number> {
 }
 
 describe("PR18 hot operational storage lifecycle", () => {
+  it("reconstructs compacted payloads in EngineService without reapplying them", async () => {
+    const journal = new MemoryEventJournal();
+    const engine = new EngineService(qualifiedPaperEnv(), journal, { error: () => undefined });
+    const resolve = (engine as unknown as { resolveDurablePayload: (input: unknown, occurredAt: Date) => Promise<Record<string, unknown>> }).resolveDurablePayload.bind(engine);
+    const lanes = [
+      { operationKey: "fill:compacted", type: "PAPER_FILL", aggregateType: "paper_fill", aggregateId: "fill-compacted", payload: { fill: { id: "fill-compacted", marketId: "m" }, positionId: "pos:m", reservationAfter: null, restingAfter: null } },
+      { operationKey: "maker:order-compacted:reserve", type: "PAPER_MAKER_RESERVED", aggregateType: "paper_order", aggregateId: "order-compacted", payload: { orderId: "order-compacted", reserved: "1", resting: { order: { id: "order-compacted" } } } },
+      { operationKey: "maker:order-compacted:release", type: "PAPER_MAKER_RELEASED", aggregateType: "paper_order", aggregateId: "order-compacted", payload: { orderId: "order-compacted", released: "1", cancel: false } },
+      { operationKey: "settlement:m:paper", type: "POSITION_SETTLED", aggregateType: "position", aggregateId: "pos:m", payload: { marketId: "m", upPayoff: "1", downPayoff: "0", settledAt: "2026-01-01T00:00:00.000Z" } },
+      { operationKey: "experiment:compacted:start", type: "EXPERIMENT_STARTED", aggregateType: "experiment", aggregateId: "exp-compacted", payload: { experiment: { id: "exp-compacted", status: "RUNNING", startedAt: "2026-01-01T00:00:00.000Z", entryClosesAt: null, completedAt: null, markToMarketAt: null, durationHours: 48, strategyVersion: "test", riskConfiguration: {}, modelConfiguration: {}, startingBalance: "100", systemVersion: "test", gitSha: "test", closePolicy: "observe_until_settlement", startValidationPending: false } } },
+    ] as const;
+    let cursor = 0;
+    for (const lane of lanes) {
+      const first = await journal.commitDurableTransition(lane, cursor);
+      cursor = first.sequence;
+    }
+    await journal.saveCheckpoint({ experimentId: "exp-compacted", sequence: 1, payload: checkpointPayload(cursor) });
+    await journal.compactDurableTransitionsThrough(cursor, { maxRows: lanes.length, batchSize: lanes.length, maxReplayKeys: 100, maxBatches: 1, budgetMs: 1000 });
+    let retryCursor = cursor;
+    for (const lane of lanes) {
+      const rebuilt = await resolve({ ...lane, buildPayload: () => lane.payload }, new Date("2026-01-01T00:00:00.000Z"));
+      const retry = await journal.commitDurableTransition({ ...lane, payload: rebuilt }, retryCursor);
+      expect(retry.inserted).toBe(false);
+      expect(retry.existing).toBe(true);
+      expect(retry.sequence).toBeGreaterThan(0);
+      retryCursor = Math.max(retryCursor, retry.sequence);
+    }
+    expect(await journal.latestDurableSequence()).toBe(cursor);
+  });
+
+  it("uses a commit-sequence tail lower fence and makes no per-event commit lookup", async () => {
+    const journal = new MemoryEventJournal();
+    const first = event("RISK_EVALUATION", "rollup-base", "2026-01-01T00:00:10.000Z", { accepted: true, marketId: "m1", asset: "BTC" });
+    await journal.append(first);
+    const initial = await streamExperimentSummary(journal, { id: "exp-pr18", startedAt: "2026-01-01T00:00:00.000Z" }, { status: "RUNNING", complete: false, reportKind: "interim", metricsScope: "rolling" });
+    await persistVerifiedAnalyticsRollup(journal, {
+      experimentId: "exp-pr18", sourceCursor: 0, sourceFenceId: first.id, sourceFenceOccurredAt: first.occurredAt,
+      sourceEventCount: initial.accumulatorSnapshot?.eventCount ?? 1, sourceCommitSeq: initial.scan.fence.commitSeqTo,
+      sourceRecordedAt: initial.scan.fence.recordedAtTo.toISOString(), stableRead: initial.scan.fence.stable,
+      sourceCoverageComplete: initial.scan.complete, accumulator: initial.accumulatorSnapshot as unknown as Record<string, unknown>,
+    });
+    let lookups = 0;
+    (journal as unknown as { eventCommitSeq: (id: string) => Promise<number | null> }).eventCommitSeq = async () => { lookups += 1; throw new Error("per-event lookup forbidden"); };
+    const late = event("RISK_EVALUATION", "rollup-old-occurred", "2026-01-01T00:00:05.000Z", { accepted: true, marketId: "m2", asset: "BTC" });
+    await journal.append(late);
+    const rebuilt = await streamExperimentSummary(journal, { id: "exp-pr18", startedAt: "2026-01-01T00:00:00.000Z" }, { status: "RUNNING", complete: false, reportKind: "interim", metricsScope: "rolling" });
+    expect(lookups).toBe(0);
+    expect(rebuilt.scan.scanned).toBe(2);
+    expect(rebuilt.summary.totalOpportunities).toBe(2);
+  });
+
+  it("keeps a live engine fill duplicate safe while closed replay keys churn", async () => {
+    const setup = await startQualifiedEngine({ ESTIMATED_INFRA_COST_PER_HOUR_USD: "0" });
+    const { engine, journal } = setup;
+    try {
+      expect((await engine.beginExperiment()).ok).toBe(true);
+      const fill = paperFill("btc-mkt", "UP", "0.40", { id: "fill-pressure", sourceMarketEventId: "event-pressure" });
+      await engine.applyObservedFill(fill);
+      const before = { ledger: engine.ledger.snapshot(), positions: [...engine.ledger.positions.values()] };
+      await engine.checkpointForTest();
+      let cursor = await journal.latestDurableSequence();
+      for (let i = 0; i < 40; i += 1) {
+        const row = await journal.commitDurableTransition({ operationKey: `pressure:${i}`, type: "POSITION_SETTLED", aggregateType: "position", aggregateId: `pressure:${i}`, payload: { marketId: `pressure:${i}`, upPayoff: "1", downPayoff: "0", settledAt: "2026-01-01T00:00:00.000Z" } }, cursor);
+        cursor = row.sequence;
+      }
+      await journal.compactDurableTransitionsThrough(cursor, { maxRows: 200, batchSize: 200, maxBatches: 1, maxReplayKeys: 2, budgetMs: 1000 });
+      const replay = await journal.readDurableByOperationKey("fill:fill-pressure");
+      expect(replay).toMatchObject({ type: "PAPER_FILL", payload: {} });
+      await engine.applyObservedFill(fill);
+      expect(engine.ledger.snapshot()).toEqual(before.ledger);
+      expect([...engine.ledger.positions.values()]).toEqual(before.positions);
+      expect(await journal.latestDurableSequence()).toBe(cursor);
+    } finally {
+      await engine.stop();
+    }
+  });
+
+  it("retries a compacted maker release without a second reservation mutation", async () => {
+    const setup = await startQualifiedEngine({ ESTIMATED_INFRA_COST_PER_HOUR_USD: "0" });
+    const { engine, journal } = setup;
+    try {
+      expect((await engine.beginExperiment()).ok).toBe(true);
+      const maker = fixtureOrder("MAKER", { id: "order-pressure", marketId: "btc-mkt", tokenId: "btc-up", outcome: "UP" });
+      await engine.restMakerForTest(maker, book({ marketId: "btc-mkt", tokenId: "btc-up" }));
+      await engine.cancelMakerForTest(maker.id, "PRESSURE_CANCEL");
+      const before = { ledger: engine.ledger.snapshot(), reserved: engine.reservedCash() };
+      let cursor = await journal.latestDurableSequence();
+      for (let i = 0; i < 30; i += 1) {
+        const row = await journal.commitDurableTransition({ operationKey: `release-pressure:${i}`, type: "POSITION_SETTLED", aggregateType: "position", aggregateId: `release-pressure:${i}`, payload: { marketId: `release-pressure:${i}`, upPayoff: "1", downPayoff: "0", settledAt: "2026-01-01T00:00:00.000Z" } }, cursor);
+        cursor = row.sequence;
+      }
+      await journal.compactDurableTransitionsThrough(cursor, { maxRows: 200, batchSize: 200, maxBatches: 1, maxReplayKeys: 100, budgetMs: 1000 });
+      expect(await journal.readDurableByOperationKey(`maker:${maker.id}:cancel`)).toMatchObject({ payload: {} });
+      await engine.cancelMakerForTest(maker.id, "PRESSURE_CANCEL");
+      expect(engine.ledger.snapshot()).toEqual(before.ledger);
+      expect(engine.reservedCash()).toBe(before.reserved);
+    } finally {
+      await engine.stop();
+    }
+  });
+
   it("uses verified snapshots as a fallback and keeps the durable high-water monotonic after compaction", async () => {
     const journal = new MemoryEventJournal();
     let cursor = 0;
@@ -383,6 +487,57 @@ describe("PR18 hot operational storage lifecycle", () => {
     }
   });
 
+  it.skipIf(!process.env.STEP4_TEST_DATABASE_URL)("PG17 rollup tails use commit_seq lower fencing without event fanout", { timeout: 60_000 }, async () => {
+    const migrations = fileURLToPath(new URL("../packages/db/migrations", import.meta.url));
+    const journal = new PostgresEventJournal(process.env.STEP4_TEST_DATABASE_URL!, migrations);
+    const experimentId = `exp-pr18-tail-${Date.now()}`;
+    await journal.initialize();
+    try {
+      const base = createJournalEvent({ id: `pg-tail-base-${Date.now()}`, traceId: experimentId, type: "RISK_EVALUATION", aggregateType: "risk", aggregateId: experimentId, payload: { experimentId, accepted: true, marketId: "base" }, occurredAt: new Date("2026-01-01T00:00:10.000Z") });
+      await journal.append(base);
+      const initial = await streamExperimentSummary(journal, { id: experimentId, startedAt: "2026-01-01T00:00:00.000Z" }, { status: "RUNNING", complete: false, reportKind: "interim", metricsScope: "rolling" }, { pageSize: 100 });
+      await persistVerifiedAnalyticsRollup(journal, { experimentId, sourceCursor: 0, sourceFenceId: initial.scan.fence.through?.id ?? null, sourceFenceOccurredAt: initial.scan.fence.through?.occurredAt ?? null, sourceEventCount: initial.accumulatorSnapshot?.eventCount ?? 1, sourceCommitSeq: initial.scan.fence.commitSeqTo, sourceRecordedAt: initial.scan.fence.recordedAtTo.toISOString(), stableRead: initial.scan.fence.stable, sourceCoverageComplete: initial.scan.complete, accumulator: initial.accumulatorSnapshot as unknown as Record<string, unknown> });
+      for (let i = 0; i < 2_000; i += 1) {
+        const row = createJournalEvent({ id: `pg-tail-${Date.now()}-${i}`, traceId: experimentId, type: "RISK_EVALUATION", aggregateType: "risk", aggregateId: experimentId, payload: { experimentId, accepted: true, marketId: `tail-${i}` }, occurredAt: new Date(i === 0 ? "2026-01-01T00:00:05.000Z" : "2026-01-01T00:00:11.000Z") });
+        await journal.append(row);
+      }
+      let fanout = 0;
+      (journal as unknown as { eventCommitSeq: (id: string) => Promise<number | null> }).eventCommitSeq = async () => { fanout += 1; throw new Error("eventCommitSeq fanout"); };
+      const rebuilt = await streamExperimentSummary(journal, { id: experimentId, startedAt: "2026-01-01T00:00:00.000Z" }, { status: "RUNNING", complete: false, reportKind: "interim", metricsScope: "rolling" }, { pageSize: 100 });
+      expect(fanout).toBe(0);
+      expect(rebuilt.scan.scanned).toBe(2_001);
+      expect(rebuilt.summary.totalOpportunities).toBe(2_001);
+      expect(rebuilt.scan.pages).toBeGreaterThan(1);
+      expect(rebuilt.scan.pages).toBeLessThan(30);
+    } finally {
+      await journal.close();
+    }
+  });
+
+  it.skipIf(!process.env.STEP4_TEST_DATABASE_URL)("PG17 compacts a bounded 200-row durable batch in one bulk write", { timeout: 60_000 }, async () => {
+    const migrations = fileURLToPath(new URL("../packages/db/migrations", import.meta.url));
+    const journal = new PostgresEventJournal(process.env.STEP4_TEST_DATABASE_URL!, migrations);
+    await journal.initialize();
+    const prefix = `pg-bulk-${Date.now()}`;
+    try {
+      let cursor = await journal.latestDurableSequence();
+      for (let i = 0; i < 200; i += 1) {
+        const row = await journal.commitDurableTransition({ operationKey: `${prefix}:${i}`, type: "REPORT_SOURCE_INTEGRITY_FAULT", aggregateType: "report", aggregateId: `${prefix}:${i}`, payload: { experimentId: prefix, fault: i } }, cursor);
+        cursor = row.sequence;
+      }
+      const before = await journal.latestDurableSequence();
+      const result = await journal.compactDurableTransitionsThrough(cursor, { maxRows: 200, batchSize: 200, maxBatches: 1, maxReplayKeys: 512, budgetMs: 10_000 });
+      expect(result.deleted).toBe(200);
+      expect(result.highWater).toBe(before);
+      expect(await journal.latestDurableSequence()).toBe(before);
+      expect((await journal.readDurableByOperationKey(`${prefix}:0`))?.payload).toEqual({});
+      const next = await journal.commitDurableTransition({ operationKey: `${prefix}:next`, type: "REPORT_SOURCE_INTEGRITY_FAULT", aggregateType: "report", aggregateId: prefix, payload: { experimentId: prefix, fault: "next" } }, before);
+      expect(next.sequence).toBe(before + 1);
+    } finally {
+      await journal.close();
+    }
+  });
+
   it("uses a verified rollup for report reconstruction after canonical source cleanup", async () => {
     const journal = new MemoryEventJournal();
     const startedAt = "2026-01-01T00:00:00.000Z";
@@ -479,5 +634,23 @@ describe("PR18 hot operational storage lifecycle", () => {
     expect(footprint.durable_transitions.rows).toBe(0);
     expect(footprint.journal_events.rows).toBe(0);
     expect(footprint.durable_replay_keys.rows).toBeLessThanOrEqual(64);
+  });
+
+  it("holds the checkpoint footprint at keep after twelve completed cycles", async () => {
+    const journal = new MemoryEventJournal();
+    const keep = 8;
+    for (let cycle = 0; cycle < 12; cycle += 1) {
+      await journal.saveCheckpoint({
+        experimentId: `exp-plateau-${cycle}`, sequence: cycle + 1,
+        payload: { ...checkpointPayload(0), experiment: { id: `exp-plateau-${cycle}`, status: "COMPLETED", startedAt: "2026-01-01T00:00:00.000Z", completedAt: "2026-01-01T00:01:00.000Z" } },
+      });
+      await journal.pruneOldCheckpoints(keep);
+    }
+    const checkpoints = await journal.listCheckpoints();
+    expect(checkpoints).toHaveLength(keep);
+    const footprint = journal.storageFootprintForTest();
+    expect(footprint.engine_checkpoints.rows).toBe(keep);
+    expect(footprint.journal_events.rows).toBe(0);
+    expect(footprint.durable_transitions.rows).toBe(0);
   });
 });

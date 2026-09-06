@@ -586,7 +586,7 @@ export class MemoryEventJournal implements EventJournal {
     const victims = this.durableRows.filter((row) => row.sequence <= target).slice(0, rowCap);
     const now = Date.now();
     for (const row of victims) {
-      if (maxKeys > 0) this.compactedByKey.set(row.operationKey, { operationKey: row.operationKey, type: row.type, aggregateType: row.aggregateType, aggregateId: row.aggregateId, payloadHash: row.payloadHash, sequence: row.sequence, occurredAt: row.occurredAt, recordedAt: row.recordedAt, expiresAt: new Date(now + ttl).toISOString(), lifecycleState: replayLifecycleState(row) });
+      if (maxKeys > 0) this.compactedByKey.set(row.operationKey, { operationKey: row.operationKey, type: row.type, aggregateType: row.aggregateType, aggregateId: row.aggregateId, scopeId: replayScopeId(row), payloadHash: row.payloadHash, sequence: row.sequence, occurredAt: row.occurredAt, recordedAt: row.recordedAt, expiresAt: new Date(now + ttl).toISOString(), lifecycleState: replayLifecycleState(row) });
       this.durableByKey.delete(row.operationKey);
     }
     const closedOrders = new Set(victims.filter((row) => row.type === "PAPER_MAKER_RELEASED" || row.type === "PAPER_ORDER_CANCELLED").map((row) => row.aggregateId));
@@ -604,6 +604,11 @@ export class MemoryEventJournal implements EventJournal {
       for (const row of this.compactedByKey.values()) {
         if (row.type === "REPORT_SOURCE_INTEGRITY_FAULT" && row.aggregateId === experimentId) row.lifecycleState = "closed";
       }
+    }
+    const settledScopes = new Set(victims.filter((row) => row.type === "POSITION_SETTLED")
+      .map((row) => replayScopeId(row)).filter((scope): scope is string => Boolean(scope)));
+    for (const row of this.compactedByKey.values()) {
+      if (row.type === "PAPER_FILL" && row.lifecycleState === "open" && row.scopeId && settledScopes.has(row.scopeId)) row.lifecycleState = "closed";
     }
     while (this.compactedByKey.size > maxKeys) {
       const oldest = [...this.compactedByKey.values()].filter((row) => row.lifecycleState !== "open").sort((a, b) => a.sequence - b.sequence)[0];
@@ -759,6 +764,9 @@ function filterKeysetRows(
   if (query.recordedAtTo) rows = rows.filter((event) => new Date(event.recordedAt).getTime() <= query.recordedAtTo!.getTime());
   if (query.commitSeqTo != null) {
     rows = rows.filter((event) => (commitSeqById.get(event.id) ?? Number.POSITIVE_INFINITY) <= query.commitSeqTo!);
+  }
+  if (query.commitSeqAfter != null) {
+    rows = rows.filter((event) => (commitSeqById.get(event.id) ?? Number.NEGATIVE_INFINITY) > query.commitSeqAfter!);
   }
   if (query.after) rows = rows.filter((event) => compareJournalEventOrder(event, query.after!) > 0);
   if (query.through) rows = rows.filter((event) => compareJournalEventOrder(event, query.through!) <= 0);
@@ -1222,20 +1230,37 @@ export class PostgresEventJournal implements EventJournal {
       if (rowCap <= 0) return { deleted: 0, cursor: target, highWater, compactedOperationKeys: 0 };
       const rows = await tx.select().from(durableTransitions).where(lte(durableTransitions.sequence, target)).orderBy(asc(durableTransitions.sequence)).limit(Math.min(rowCap, 10_000));
       const expiresAt = new Date(Date.now() + ttl).toISOString();
-      for (const row of rows) {
-        if (Date.now() >= deadline) throw new Error("RETENTION_CYCLE_BUDGET_EXCEEDED");
-        await tx.insert(durableReplayKeys).values({ operationKey: row.operationKey, type: row.type, aggregateType: row.aggregateType, aggregateId: row.aggregateId, payloadHash: row.payloadHash, sequence: row.sequence, occurredAt: row.occurredAt, recordedAt: row.recordedAt, expiresAt: new Date(expiresAt), lifecycleState: replayLifecycleState(toDurableTransition(row)) }).onConflictDoUpdate({ target: durableReplayKeys.operationKey, set: { expiresAt: new Date(expiresAt) } });
+      if (Date.now() >= deadline) throw new Error("RETENTION_CYCLE_BUDGET_EXCEEDED");
+      if (rows.length > 0) {
+        // One bounded multi-row statement replaces the old N+1 insert loop.
+        await tx.insert(durableReplayKeys).values(rows.map((row) => {
+          const transition = toDurableTransition(row);
+          return {
+            operationKey: row.operationKey, type: row.type, aggregateType: row.aggregateType,
+            aggregateId: row.aggregateId, scopeId: replayScopeId(transition), payloadHash: row.payloadHash,
+            sequence: row.sequence, occurredAt: row.occurredAt, recordedAt: row.recordedAt,
+            expiresAt: new Date(expiresAt), lifecycleState: replayLifecycleState(transition),
+          };
+        })).onConflictDoUpdate({ target: durableReplayKeys.operationKey, set: { expiresAt: new Date(expiresAt) } });
       }
-      for (const row of rows.filter((item) => item.type === "PAPER_MAKER_RELEASED" || item.type === "PAPER_ORDER_CANCELLED")) {
-        await tx.execute(sql`UPDATE durable_replay_keys SET lifecycle_state = 'closed' WHERE operation_key = ${`maker:${row.aggregateId}:reserve`}`);
+      const closedReserveKeys = rows.filter((item) => item.type === "PAPER_MAKER_RELEASED" || item.type === "PAPER_ORDER_CANCELLED").map((row) => `maker:${row.aggregateId}:reserve`);
+      if (closedReserveKeys.length > 0) {
+        await tx.update(durableReplayKeys).set({ lifecycleState: "closed" }).where(inArray(durableReplayKeys.operationKey, closedReserveKeys));
       }
-      for (const row of rows.filter((item) => item.type === "EXPERIMENT_COMPLETED" || item.type === "EXPERIMENT_START_ABORTED")) {
-        await tx.update(durableReplayKeys).set({ lifecycleState: "closed" }).where(and(eq(durableReplayKeys.type, "EXPERIMENT_STARTED"), eq(durableReplayKeys.aggregateId, row.aggregateId)));
+      const closedExperimentIds = rows.filter((item) => item.type === "EXPERIMENT_COMPLETED" || item.type === "EXPERIMENT_START_ABORTED").map((row) => row.aggregateId);
+      if (closedExperimentIds.length > 0) {
+        await tx.update(durableReplayKeys).set({ lifecycleState: "closed" }).where(and(eq(durableReplayKeys.type, "EXPERIMENT_STARTED"), inArray(durableReplayKeys.aggregateId, closedExperimentIds)));
       }
-      for (const row of rows.filter((item) => item.type === "REPORT_SOURCE_INTEGRITY_REPAIRED")) {
+      const repairedExperimentIds = rows.filter((item) => item.type === "REPORT_SOURCE_INTEGRITY_REPAIRED").map((row) => {
         const payload = row.payload as Record<string, unknown>;
-        const experimentId = typeof payload.experimentId === "string" ? payload.experimentId : row.aggregateId;
-        await tx.update(durableReplayKeys).set({ lifecycleState: "closed" }).where(and(eq(durableReplayKeys.type, "REPORT_SOURCE_INTEGRITY_FAULT"), eq(durableReplayKeys.aggregateId, experimentId)));
+        return typeof payload.experimentId === "string" ? payload.experimentId : row.aggregateId;
+      });
+      if (repairedExperimentIds.length > 0) {
+        await tx.update(durableReplayKeys).set({ lifecycleState: "closed" }).where(and(eq(durableReplayKeys.type, "REPORT_SOURCE_INTEGRITY_FAULT"), inArray(durableReplayKeys.aggregateId, repairedExperimentIds)));
+      }
+      const settledScopes = rows.filter((item) => item.type === "POSITION_SETTLED").map((row) => replayScopeId(toDurableTransition(row))).filter((scope): scope is string => Boolean(scope));
+      if (settledScopes.length > 0) {
+        await tx.update(durableReplayKeys).set({ lifecycleState: "closed" }).where(and(eq(durableReplayKeys.type, "PAPER_FILL"), eq(durableReplayKeys.lifecycleState, "open"), inArray(durableReplayKeys.scopeId, settledScopes)));
       }
       if (maxKeys > 0) {
         await tx.execute(sql`DELETE FROM durable_replay_keys WHERE operation_key IN (SELECT operation_key FROM durable_replay_keys WHERE lifecycle_state <> 'open' ORDER BY (expires_at <= now()) DESC, sequence ASC LIMIT GREATEST(0, (SELECT count(*) FROM durable_replay_keys WHERE lifecycle_state <> 'open') - ${maxKeys}))`);
@@ -1466,6 +1491,7 @@ export function buildJournalKeysetSql(query: JournalKeysetQuery & { orderDesc?: 
   if (query.to) push(`occurred_at <= ?`, query.to);
   if (query.recordedAtTo) push(`recorded_at <= ?`, query.recordedAtTo);
   if (query.commitSeqTo != null) push(`commit_seq <= ?`, query.commitSeqTo);
+  if (query.commitSeqAfter != null) push(`commit_seq > ?`, query.commitSeqAfter);
   if (query.after) {
     values.push(sqlBindValue(query.after.occurredAt), query.after.id);
     clauses.push(`(occurred_at, id) > ($${values.length - 1}::timestamptz, $${values.length})`);
@@ -1493,6 +1519,7 @@ function journalKeysetFilters(query: Omit<JournalKeysetQuery, "limit">): ReturnT
   if (query.to) filters.push(lte(journalEvents.occurredAt, query.to));
   if (query.recordedAtTo) filters.push(lte(journalEvents.recordedAt, query.recordedAtTo));
   if (query.commitSeqTo != null) filters.push(lte(journalEvents.commitSeq, query.commitSeqTo));
+  if (query.commitSeqAfter != null) filters.push(gt(journalEvents.commitSeq, query.commitSeqAfter));
   if (query.after) {
     filters.push(sql`(${journalEvents.occurredAt}, ${journalEvents.id}) > (${query.after.occurredAt}::timestamptz, ${query.after.id})`);
   }
@@ -1550,12 +1577,28 @@ function toDurableTransition(row: typeof durableTransitions.$inferSelect): Durab
 }
 
 function replayLifecycleState(row: Pick<DurableTransition, "type" | "payload">): "open" | "closed" | "historical" {
-  // Fill and settlement effects are terminal once the resulting state has
-  // reached a verified checkpoint. They remain bounded TTL tombstones rather
-  // than permanently pinned historical identities.
+  // A full engine fill is pinned while its market/position obligation remains
+  // live. A later POSITION_SETTLED scope update closes it, after which normal
+  // bounded pressure/TTL eviction is safe. Minimal fixtures without a fill
+  // payload retain the historical closed behavior.
+  if (row.type === "PAPER_FILL" && row.payload && typeof row.payload === "object" && "fill" in row.payload) return "open";
   if (row.type === "PAPER_MAKER_RESERVED" || row.type === "EXPERIMENT_STARTED") return "open";
   if (row.type === "REPORT_SOURCE_INTEGRITY_FAULT") return "open";
   return "closed";
+}
+
+function replayScopeId(row: Pick<DurableTransition, "type" | "payload" | "aggregateId">): string | null {
+  const payload = row.payload as Record<string, unknown>;
+  if (row.type === "PAPER_FILL" && payload.fill && typeof payload.fill === "object") {
+    const marketId = (payload.fill as Record<string, unknown>).marketId;
+    return typeof marketId === "string" ? marketId : null;
+  }
+  if (row.type === "POSITION_SETTLED" && typeof payload.marketId === "string") return payload.marketId;
+  if (row.type === "PAPER_MAKER_RESERVED" || row.type === "PAPER_MAKER_RELEASED" || row.type === "PAPER_ORDER_CANCELLED") {
+    return typeof payload.orderId === "string" ? payload.orderId : row.aggregateId;
+  }
+  if (row.type.startsWith("EXPERIMENT_")) return typeof payload.experimentId === "string" ? payload.experimentId : row.aggregateId;
+  return null;
 }
 
 export { EVENT_PAGE_SIZE, EVENT_SCAN_CEILING };
