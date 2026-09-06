@@ -538,7 +538,7 @@ describe("PR18 hot operational storage lifecycle", () => {
       // This test deletes the whole durable prefix; publish a checkpoint at
       // the retained high-water so other PG17 tests recover from the fence.
       await fencePgRecovery(journal, before);
-      const next = await journal.commitDurableTransition({ operationKey: `${prefix}:next`, type: "REPORT_SOURCE_INTEGRITY_FAULT", aggregateType: "report", aggregateId: prefix, payload: { experimentId: prefix, fault: "next" } }, before);
+      const next = await journal.commitDurableTransition({ operationKey: `${prefix}:next`, type: "REPORT_SOURCE_INTEGRITY_FAULT", aggregateType: "report", aggregateId: prefix, payload: { experimentId: prefix, fault: "next", derivedAudit: [] } }, before);
       expect(next.sequence).toBe(before + 1);
     } finally {
       await journal.close();
