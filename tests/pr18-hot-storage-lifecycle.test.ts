@@ -340,6 +340,49 @@ describe("PR18 hot operational storage lifecycle", () => {
     }
   });
 
+  it.skipIf(!process.env.STEP4_TEST_DATABASE_URL)("PG17 journal commit fence remains monotonic across journal restart", { timeout: 30_000 }, async () => {
+    const url = new URL(process.env.STEP4_TEST_DATABASE_URL!);
+    expect(["localhost", "127.0.0.1"]).toContain(url.hostname);
+    const migrations = fileURLToPath(new URL("../packages/db/migrations", import.meta.url));
+    const first = new PostgresEventJournal(process.env.STEP4_TEST_DATABASE_URL!, migrations);
+    const experimentId = `exp-pr18-restart-fence-${Date.now()}`;
+    const firstEvent = createJournalEvent({
+      id: `pg-restart-fence-1-${Date.now()}`,
+      traceId: experimentId,
+      type: "RISK_EVALUATION",
+      aggregateType: "risk",
+      aggregateId: experimentId,
+      payload: { experimentId, accepted: true, marketId: "restart-fence-1" },
+    });
+    await first.initialize();
+    try {
+      await first.append(firstEvent);
+      const beforeRestart = await first.latestCommitSeq();
+      expect(await first.eventCommitSeq(firstEvent.id)).toBe(beforeRestart);
+      await first.close();
+
+      const second = new PostgresEventJournal(process.env.STEP4_TEST_DATABASE_URL!, migrations);
+      await second.initialize();
+      try {
+        expect(await second.latestCommitSeq()).toBeGreaterThanOrEqual(beforeRestart);
+        const secondEvent = createJournalEvent({
+          id: `pg-restart-fence-2-${Date.now()}`,
+          traceId: experimentId,
+          type: "RISK_EVALUATION",
+          aggregateType: "risk",
+          aggregateId: experimentId,
+          payload: { experimentId, accepted: true, marketId: "restart-fence-2" },
+        });
+        await second.append(secondEvent);
+        expect(await second.eventCommitSeq(secondEvent.id)).toBeGreaterThan(beforeRestart);
+      } finally {
+        await second.close();
+      }
+    } finally {
+      await first.close().catch(() => undefined);
+    }
+  });
+
   it("uses a verified rollup for report reconstruction after canonical source cleanup", async () => {
     const journal = new MemoryEventJournal();
     const startedAt = "2026-01-01T00:00:00.000Z";
