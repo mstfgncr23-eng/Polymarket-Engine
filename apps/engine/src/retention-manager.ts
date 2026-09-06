@@ -178,7 +178,7 @@ export class RetentionManager {
   async runCycle(context: RetentionContext): Promise<RetentionCycleResult> {
     const started = Date.now();
     const deletedByClass: Record<string, number> = {
-      raw_telemetry: 0, monitor_control: 0, mcp_idempotency: 0, checkpoint: 0, canonical_report_input: 0,
+      raw_telemetry: 0, monitor_control: 0, mcp_idempotency: 0, checkpoint: 0, canonical_report_input: 0, durable_transition: 0,
     };
     const empty: RetentionCycleResult = {
       skipped: true, skipReason: null, deletedByClass, failures: 0, durationMs: 0,
@@ -361,6 +361,7 @@ export class RetentionManager {
         const cursorValue = compactionCheckpoint?.payload.durableCursor;
         const cursor = typeof cursorValue === "number" && Number.isInteger(cursorValue) ? cursorValue : null;
         if (cursor != null && cursor > 0) {
+          const compactionStarted = Date.now();
           durableCompaction = await this.journal.compactDurableTransitionsThrough(cursor, {
             ttlMs: this.config.compactionReplayKeyTtlMs,
             maxReplayKeys: this.config.compactionReplayKeyLimit,
@@ -369,6 +370,15 @@ export class RetentionManager {
             batchSize: this.config.batchSize,
             budgetMs: Math.max(0, budgetEnd - Date.now()),
           });
+          if (durableCompaction.deleted > 0) {
+            batchCount += 1;
+            totalDeleted += durableCompaction.deleted;
+            deletedByClass.durable_transition = (deletedByClass.durable_transition ?? 0) + durableCompaction.deleted;
+            lastBatchSize = durableCompaction.deleted;
+            lastBatchDurationMs = Date.now() - compactionStarted;
+            this.metrics?.noteDeleted?.("durable_transition", durableCompaction.deleted);
+            this.metrics?.noteBatch?.(durableCompaction.deleted, lastBatchDurationMs);
+          }
         }
       }
 

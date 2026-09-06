@@ -148,6 +148,21 @@ describe("PR18 hot operational storage lifecycle", () => {
     expect(first!.sourceEventCount).toBe(1);
   });
 
+  it("enforces report-write capability for rollup persistence", async () => {
+    const journal = new MemoryEventJournal();
+    const rollup = {
+      experimentId: "exp-pr18", rollupKind: "canonical", schemaVersion: 1,
+      sourceCursor: 0, sourceFenceId: null, sourceFenceOccurredAt: null,
+      sourceEventCount: 0, sourceCommitSeq: 0, sourceRecordedAt: null, stableRead: true,
+      accumulator: { eventCount: 0 }, contentHash: "hash", verified: true,
+      createdAt: "2026-01-01T00:00:00.000Z",
+    };
+    await journal.connectWithoutMigrate("readonly");
+    await expect(journal.persistAnalyticsRollup!(rollup)).rejects.toMatchObject({ code: "JOURNAL_MUTATE_FORBIDDEN" });
+    await journal.connectWithoutMigrate("report-write");
+    await expect(journal.persistAnalyticsRollup!(rollup)).resolves.toMatchObject({ experimentId: "exp-pr18" });
+  });
+
   it("rolls active canonical input into a bounded hot set before completion", async () => {
     const journal = new MemoryEventJournal();
     const manager = new RetentionManager(journal, defaultRetentionConfig({ enabled: true, analyticsRollupEnabled: true, maxRowsPerCycle: 500, maxBatchesPerCycle: 20, batchSize: 100 }));

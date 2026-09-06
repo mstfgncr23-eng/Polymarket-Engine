@@ -598,6 +598,7 @@ export class MemoryEventJournal implements EventJournal {
     return { deleted: victims.length, cursor: target, highWater: this.durableHighWater, compactedOperationKeys: this.compactedByKey.size };
   }
   async persistAnalyticsRollup(rollup: AnalyticsRollup): Promise<AnalyticsRollup> {
+    assertJournalCapability(this.access, "report-write", "persistAnalyticsRollup");
     const stored = structuredClone(rollup);
     // Memory journal keeps one versioned row per experiment/kind.
     const map = this.rollups;
@@ -1207,6 +1208,7 @@ export class PostgresEventJournal implements EventJournal {
     });
   }
   async persistAnalyticsRollup(rollup: AnalyticsRollup): Promise<AnalyticsRollup> {
+    assertJournalCapability(this.access, "report-write", "persistAnalyticsRollup");
     const row = await this.db.transaction(async (tx) => {
       const existingRows = await tx.select().from(experimentReportRollups).where(and(eq(experimentReportRollups.experimentId, rollup.experimentId), eq(experimentReportRollups.rollupKind, rollup.rollupKind))).limit(1);
       const existing = existingRows[0];
@@ -1241,7 +1243,12 @@ export class PostgresEventJournal implements EventJournal {
       return inserted[0] ?? (await tx.select().from(experimentReportRollups).where(and(eq(experimentReportRollups.experimentId, rollup.experimentId), eq(experimentReportRollups.rollupKind, rollup.rollupKind))).limit(1))[0];
     });
     if (!row) throw new Error("ANALYTICS_ROLLUP_WRITE_FAILED");
-    if (row.contentHash !== rollup.contentHash && Number(row.sourceEventCount ?? 0) <= (rollup.sourceEventCount ?? 0)) throw new Error("ANALYTICS_ROLLUP_CONFLICT");
+    const rowCount = Number(row.sourceEventCount ?? 0);
+    const rowSeq = Number(row.sourceCommitSeq ?? 0);
+    const requestedCount = rollup.sourceEventCount ?? 0;
+    const requestedSeq = rollup.sourceCommitSeq ?? 0;
+    const rowIsStrictlyNewer = rowCount > requestedCount || (rowCount === requestedCount && rowSeq > requestedSeq);
+    if (row.contentHash !== rollup.contentHash && !rowIsStrictlyNewer) throw new Error("ANALYTICS_ROLLUP_CONFLICT");
     return {
       experimentId: row.experimentId, rollupKind: row.rollupKind, schemaVersion: row.schemaVersion, sourceCursor: Number(row.sourceCursor),
       sourceFenceId: row.sourceFenceId, sourceFenceOccurredAt: row.sourceFenceOccurredAt?.toISOString() ?? null, sourceEventCount: Number(row.sourceEventCount ?? 0), sourceCommitSeq: Number(row.sourceCommitSeq ?? 0), sourceRecordedAt: row.sourceRecordedAt?.toISOString() ?? null, stableRead: row.stableRead, previousContentHash: row.previousContentHash, ...(row.coverageHash ? { coverageHash: row.coverageHash } : {}),
@@ -1257,6 +1264,10 @@ export class PostgresEventJournal implements EventJournal {
     assertJournalCapability(this.access, "maintenance", "deleteCanonicalEventsThrough");
     const cap = Math.max(0, Math.min(500, Math.floor(input.limit)));
     if (cap <= 0) return { deleted: 0 };
+    // Postgres persists the source coverage boundary as recorded_at. A
+    // process-local commit sequence is unavailable across restarts, so never
+    // treat a sequence-only fence as proof of journal-event inclusion.
+    if (input.sourceCommitSeq != null && input.sourceRecordedAt == null) return { deleted: 0 };
     const before = input.occurredBefore ?? new Date();
     const types = [...CANONICAL_REPORT_INPUT_EVENT_TYPES] as string[];
     const result = await this.client`
