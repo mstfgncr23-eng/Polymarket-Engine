@@ -156,6 +156,10 @@ function isJournalAdmissionRejectedError(error: unknown): boolean {
 const IDLE_GROK_IDEMPOTENCY_MAX = 4_096;
 const IDLE_GROK_IDEMPOTENCY_TTL_MS = 5 * 60_000;
 type IdleGrokSubmission = { observedAt: number; pending: boolean };
+type GrokSubmissionResult = {
+  status: "accepted" | "duplicate" | "stale" | "unknown_trigger" | "trace_mismatch" | "market_mismatch" | "asset_mismatch" | "replay_rejected" | "malformed" | "identity_mismatch" | "source_sealed";
+  signalId?: string;
+};
 
 export class EngineService {
   readonly metrics = new EngineMetrics();
@@ -210,6 +214,8 @@ export class EngineService {
   private lastAppliedDurableCursor = 0;
   private derivedAuditCursor = 0;
   private readonly durableGate = new DurableMutationGate();
+  /** Serializes the IDLE -> RUNNING boundary with idle Grok acceptance only. */
+  private readonly experimentBoundaryGate = new DurableMutationGate();
   private readonly crashInjector = new CrashInjector();
   private recoveryPageSize = 256;
   private lastTradeAt: Date | null = null;
@@ -250,6 +256,7 @@ export class EngineService {
   private sourceSealFlight: Promise<{ sealed: boolean; reason: string | null }> | null = null;
   private researchIngressInFlight = 0;
   private grokClaimHold: Promise<void> | null = null;
+  private idleGrokAcceptanceHoldForTest: Promise<void> | null = null;
   /**
    * Idle monitoring deliberately has no durable canonical Grok fact. Keep a
    * bounded process-local claim set for exact live retries and concurrent
@@ -536,7 +543,7 @@ export class EngineService {
       gitSha: process.env.GIT_SHA ?? process.env.FLY_IMAGE_REF ?? "unknown", now,
       closePolicy: this.env.EXPERIMENT_CLOSE_POLICY,
     });
-    await this.commitAuthoritative({
+    await this.experimentBoundaryGate.run(() => this.commitAuthoritative({
       operationKey: `experiment:${next.id}:started`,
       type: "EXPERIMENT_STARTED",
       aggregateType: "experiment",
@@ -556,7 +563,7 @@ export class EngineService {
         this.clearReportSourceIntegrity(next.id);
         this.record("EXPERIMENT_STARTED", next.id, null, { status: next.status });
       },
-    });
+    }));
     return { ok: true, experiment: this.experiment, preflight };
   }
 
@@ -1622,7 +1629,7 @@ export class EngineService {
   }
 
   /** The only ingress for external Grok research; it cannot create orders directly. */
-  async submitGrokSignal(raw: GrokSignalSubmission, clientId: string): Promise<{ status: "accepted" | "duplicate" | "stale" | "unknown_trigger" | "trace_mismatch" | "market_mismatch" | "asset_mismatch" | "replay_rejected" | "malformed" | "identity_mismatch" | "source_sealed"; signalId?: string }> {
+  async submitGrokSignal(raw: GrokSignalSubmission, clientId: string): Promise<GrokSubmissionResult> {
     this.assertResearchIntegrity();
     let submission: GrokSignalSubmission;
     try { submission = grokSignalSubmissionSchema.parse(raw); }
@@ -1688,46 +1695,37 @@ export class EngineService {
         const claimed = await this.journal.claimIdempotency("grok_signal_submission", idempotencyKey);
         this.assertResearchIntegrity();
         if (!claimed) {
-          // A claim proves admission only, including across a crash before append.
-          // Check every canonical fact required by this submission with bounded trace
-          // pages (also works for old IDs). The proposal is linked to the accepted
-          // signal by the same trace and aggregate identity.
-          const requiresStrategyProposal = submission.agentId === "strategy_supervisor"
-            && submission.output.proposedChange !== null;
-          let acceptedEvent: JournalEvent | undefined;
-          const strategyProposalAggregateIds = new Set<string>();
-          let after: Parameters<EventJournal["readTracePage"]>[1]["after"];
-          do {
-            const page = await this.journal.readTracePage(submission.traceId, { after, limit: 128 });
-            for (const event of page.events) {
-              if (event.type === "STRATEGY_CHANGE_PROPOSED" && event.traceId === submission.traceId) {
-                strategyProposalAggregateIds.add(event.aggregateId);
-              }
-              if (!acceptedEvent && event.type === "GROK_SIGNAL_ACCEPTED"
-                && event.traceId === submission.traceId
-                && event.payload.clientId === clientId && event.payload.submissionId === submission.submissionId) {
-                acceptedEvent = event;
-              }
-            }
-            after = page.nextCursor ?? undefined;
-            const proposalPersisted = acceptedEvent !== undefined && strategyProposalAggregateIds.has(acceptedEvent.aggregateId);
-            if (acceptedEvent !== undefined && (!requiresStrategyProposal || proposalPersisted)) break;
-          } while (after);
-          this.assertResearchIntegrity();
-          const proposalPersisted = acceptedEvent !== undefined && strategyProposalAggregateIds.has(acceptedEvent.aggregateId);
-          if (acceptedEvent === undefined || (requiresStrategyProposal && !proposalPersisted)) {
-            // This can also be a concurrent claim whose first caller is still
-            // persisting one of its canonical facts. Reject the unproven duplicate
-            // without poisoning that caller. An actual total persistence failure
-            // installs the sticky fail-closed state in safeAppend; restart still
-            // cannot accept this claim.
-            throw new Error("GROK_SUBMISSION_CANONICAL_FACT_MISSING");
-          }
+          await this.proveGrokSubmissionCanonicalFacts(submission, clientId);
           return duplicate();
         }
       }
 
-      try {
+      const acceptSubmission = async (): Promise<GrokSubmissionResult> => {
+        // An idle reservation may have waited while beginExperiment committed.
+        // The boundary gate makes this recheck atomic with EXPERIMENT_STARTED:
+        // either the idle submission accepts before the transition, or it is
+        // promoted to the durable active claim before any canonical append.
+        let promotedToActive = false;
+        if (idleReservation && this.isExperimentWindowOpen()) {
+          this.releaseIdleGrokSubmission(idempotencyKey);
+          idleReservation = false;
+          const promoted = await this.journal.claimIdempotency("grok_signal_submission", idempotencyKey);
+          this.assertResearchIntegrity();
+          if (!promoted) {
+            await this.proveGrokSubmissionCanonicalFacts(submission, clientId);
+            return duplicate();
+          }
+          promotedToActive = true;
+        }
+
+        try {
+        if (promotedToActive) {
+          // beginExperiment aborts any stale source-seal persistence and bumps
+          // that generation. The promoted submission is now an active ingress;
+          // continue from the post-transition generation under the boundary
+          // gate, while completion/source-seal fences still reject it.
+          ingress.generation = this.sourceSealGeneration;
+        }
         // Recheck the experiment-scoped fence immediately before irreversible accept.
         if (this.researchIngressStale(ingress.generation) || !this.isTriggerActionable(trigger.id)) {
           if (idleReservation) this.releaseIdleGrokSubmission(idempotencyKey);
@@ -1768,8 +1766,57 @@ export class EngineService {
         if (idleReservation) this.releaseIdleGrokSubmission(idempotencyKey);
         throw error;
       }
+      };
+      if (idleReservation) {
+        try {
+          if (this.idleGrokAcceptanceHoldForTest) await this.idleGrokAcceptanceHoldForTest;
+        } catch (error) {
+          this.releaseIdleGrokSubmission(idempotencyKey);
+          throw error;
+        }
+        return this.experimentBoundaryGate.run(acceptSubmission);
+      }
+      return acceptSubmission();
     } finally {
       this.endResearchIngress();
+    }
+  }
+
+  private async proveGrokSubmissionCanonicalFacts(submission: GrokSignalSubmission, clientId: string): Promise<void> {
+    // A claim proves admission only, including across a crash before append.
+    // Check every canonical fact required by this submission with bounded trace
+    // pages (also works for old IDs). The proposal is linked to the accepted
+    // signal by the same trace and aggregate identity.
+    const requiresStrategyProposal = submission.agentId === "strategy_supervisor"
+      && submission.output.proposedChange !== null;
+    let acceptedEvent: JournalEvent | undefined;
+    const strategyProposalAggregateIds = new Set<string>();
+    let after: Parameters<EventJournal["readTracePage"]>[1]["after"];
+    do {
+      const page = await this.journal.readTracePage(submission.traceId, { after, limit: 128 });
+      for (const event of page.events) {
+        if (event.type === "STRATEGY_CHANGE_PROPOSED" && event.traceId === submission.traceId) {
+          strategyProposalAggregateIds.add(event.aggregateId);
+        }
+        if (!acceptedEvent && event.type === "GROK_SIGNAL_ACCEPTED"
+          && event.traceId === submission.traceId
+          && event.payload.clientId === clientId && event.payload.submissionId === submission.submissionId) {
+          acceptedEvent = event;
+        }
+      }
+      after = page.nextCursor ?? undefined;
+      const proposalPersisted = acceptedEvent !== undefined && strategyProposalAggregateIds.has(acceptedEvent.aggregateId);
+      if (acceptedEvent !== undefined && (!requiresStrategyProposal || proposalPersisted)) break;
+    } while (after);
+    this.assertResearchIntegrity();
+    const proposalPersisted = acceptedEvent !== undefined && strategyProposalAggregateIds.has(acceptedEvent.aggregateId);
+    if (acceptedEvent === undefined || (requiresStrategyProposal && !proposalPersisted)) {
+      // This can also be a concurrent claim whose first caller is still
+      // persisting one of its canonical facts. Reject the unproven duplicate
+      // without poisoning that caller. An actual total persistence failure
+      // installs the sticky fail-closed state in safeAppend; restart still
+      // cannot accept this claim.
+      throw new Error("GROK_SUBMISSION_CANONICAL_FACT_MISSING");
     }
   }
 
@@ -3231,6 +3278,7 @@ export class EngineService {
   setSourceSealPersistHoldForTest(hold: Promise<void> | null): void { this.sourceSealPersistHold = hold; }
   sourceSealPersistInFlightForTest() { return this.sourceSealPersistInFlight; }
   setGrokClaimHoldForTest(hold: Promise<void> | null): void { this.grokClaimHold = hold; }
+  setIdleGrokAcceptanceHoldForTest(hold: Promise<void> | null): void { this.idleGrokAcceptanceHoldForTest = hold; }
   researchIngressInFlightForTest() { return this.researchIngressInFlight; }
   sourceSealStateForTest() { return { sealing: this.sourceSealing, sealed: this.sourceSealed, generation: this.sourceSealGeneration }; }
   async completeExperimentForTest(): Promise<void> {

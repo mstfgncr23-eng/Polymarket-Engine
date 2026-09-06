@@ -215,6 +215,57 @@ describe("persistence admission keeps live inputs in memory", () => {
     }
   });
 
+  it("promotes an in-flight idle submission before active canonical persistence", async () => {
+    const { engine, journal } = await startQualifiedEngine();
+    let release!: () => void;
+    try {
+      const trigger = monitoringTrigger("idle-boundary-trigger");
+      const idleSubmission = fairSubmission(trigger, "idle-boundary-submission");
+      await engine.registerTriggerForResearch(trigger);
+      engine.setIdleGrokAcceptanceHoldForTest(new Promise<void>((resolve) => { release = resolve; }));
+      const first = engine.submitGrokSignal(idleSubmission, "fair_probability_analyst");
+
+      expect((await engine.beginExperiment()).ok).toBe(true);
+      release();
+
+      expect(await first).toMatchObject({ status: "accepted" });
+      expect(await journal.idempotencyCreatedAt("grok_signal_submission", "fair_probability_analyst:idle-boundary-submission")).toBeTruthy();
+      const accepted = await journal.queryEvents({ types: ["GROK_SIGNAL_ACCEPTED"] });
+      expect(accepted).toHaveLength(1);
+      expect(accepted[0]?.payload.experimentId).toBe(engine.experimentManifest()?.id);
+      expect(await engine.submitGrokSignal(idleSubmission, "fair_probability_analyst")).toEqual({ status: "duplicate" });
+      expect(await journal.queryEvents({ types: ["GROK_SIGNAL_ACCEPTED"] })).toHaveLength(1);
+    } finally {
+      release?.();
+      engine.setIdleGrokAcceptanceHoldForTest(null);
+      await engine.stop();
+    }
+  });
+
+  it("keeps concurrent retries around the experiment boundary single-fact", async () => {
+    const { engine, journal } = await startQualifiedEngine();
+    let release!: () => void;
+    try {
+      const trigger = monitoringTrigger("idle-boundary-concurrent-trigger");
+      const idleSubmission = fairSubmission(trigger, "idle-boundary-concurrent-submission");
+      await engine.registerTriggerForResearch(trigger);
+      engine.setIdleGrokAcceptanceHoldForTest(new Promise<void>((resolve) => { release = resolve; }));
+      const first = engine.submitGrokSignal(idleSubmission, "fair_probability_analyst");
+      const retry = engine.submitGrokSignal(idleSubmission, "fair_probability_analyst");
+      expect(await retry).toEqual({ status: "duplicate" });
+      expect((await engine.beginExperiment()).ok).toBe(true);
+      release();
+      expect(await first).toMatchObject({ status: "accepted" });
+      expect(await engine.submitGrokSignal(idleSubmission, "fair_probability_analyst")).toEqual({ status: "duplicate" });
+      expect(await journal.idempotencyCreatedAt("grok_signal_submission", "fair_probability_analyst:idle-boundary-concurrent-submission")).toBeTruthy();
+      expect(await journal.queryEvents({ types: ["GROK_SIGNAL_ACCEPTED"] })).toHaveLength(1);
+    } finally {
+      release?.();
+      engine.setIdleGrokAcceptanceHoldForTest(null);
+      await engine.stop();
+    }
+  });
+
   it("boots cleanly from an empty journal without recovery artifacts", async () => {
     const journal = new MemoryEventJournal();
     const market = new ScriptedMarketAdapter();
