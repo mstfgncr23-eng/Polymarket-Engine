@@ -519,52 +519,54 @@ export class EngineService {
   }
 
   async beginExperiment(): Promise<Record<string, unknown>> {
-    if (this.experiment?.status === "RUNNING" || this.experiment?.status === "ENTRY_CLOSED") {
-      return { ok: false, blockers: ["EXPERIMENT_ALREADY_ACTIVE"], experiment: this.experiment };
-    }
-    if (this.experiment?.status === "COMPLETED" || this.experiment?.status === "FAILED") {
-      return { ok: false, blockers: ["EXPERIMENT_ALREADY_COMPLETED"], experiment: this.experiment };
-    }
-    if (!this.state.newPaperEntryAllowed() || this.overload.state === "FAIL_CLOSED") {
+    return this.experimentBoundaryGate.run(async () => {
+      if (this.experiment?.status === "RUNNING" || this.experiment?.status === "ENTRY_CLOSED") {
+        return { ok: false, blockers: ["EXPERIMENT_ALREADY_ACTIVE"], experiment: this.experiment };
+      }
+      if (this.experiment?.status === "COMPLETED" || this.experiment?.status === "FAILED") {
+        return { ok: false, blockers: ["EXPERIMENT_ALREADY_COMPLETED"], experiment: this.experiment };
+      }
+      if (!this.state.newPaperEntryAllowed() || this.overload.state === "FAIL_CLOSED") {
+        const preflight = this.preflight("48H_GROK_PAPER_EXPERIMENT");
+        return { ...preflight, ok: false, blockers: [...new Set([...preflight.blockers, "OVERLOAD_FAIL_CLOSED"])] };
+      }
       const preflight = this.preflight("48H_GROK_PAPER_EXPERIMENT");
-      return { ...preflight, ok: false, blockers: [...new Set([...preflight.blockers, "OVERLOAD_FAIL_CLOSED"])] };
-    }
-    const preflight = this.preflight("48H_GROK_PAPER_EXPERIMENT");
-    await this.safeAppend(createJournalEvent({
-      traceId: createId("trace"), type: "EXPERIMENT_PREFLIGHT", aggregateType: "experiment", aggregateId: "preflight",
-      payload: preflight as unknown as Record<string, unknown>,
-    }));
-    if (!preflight.ok) return { ...preflight, ok: false };
-    const now = this.nowFn();
-    const next = startExperiment({
-      id: this.experiment?.id, durationHours: this.env.EXPERIMENT_DURATION_HOURS, strategyVersion: this.strategy.version,
-      riskConfiguration: this.riskLimits, modelConfiguration: { provider: "external_grok_bot_mcp", logicalRoles: 6, localModelExecution: false },
-      startingBalance: this.ledger.snapshot().startingBalance, systemVersion: "0.1.0",
-      gitSha: process.env.GIT_SHA ?? process.env.FLY_IMAGE_REF ?? "unknown", now,
-      closePolicy: this.env.EXPERIMENT_CLOSE_POLICY,
+      await this.safeAppend(createJournalEvent({
+        traceId: createId("trace"), type: "EXPERIMENT_PREFLIGHT", aggregateType: "experiment", aggregateId: "preflight",
+        payload: preflight as unknown as Record<string, unknown>,
+      }));
+      if (!preflight.ok) return { ...preflight, ok: false };
+      const now = this.nowFn();
+      const next = startExperiment({
+        id: this.experiment?.id, durationHours: this.env.EXPERIMENT_DURATION_HOURS, strategyVersion: this.strategy.version,
+        riskConfiguration: this.riskLimits, modelConfiguration: { provider: "external_grok_bot_mcp", logicalRoles: 6, localModelExecution: false },
+        startingBalance: this.ledger.snapshot().startingBalance, systemVersion: "0.1.0",
+        gitSha: process.env.GIT_SHA ?? process.env.FLY_IMAGE_REF ?? "unknown", now,
+        closePolicy: this.env.EXPERIMENT_CLOSE_POLICY,
+      });
+      await this.commitAuthoritative({
+        operationKey: `experiment:${next.id}:started`,
+        type: "EXPERIMENT_STARTED",
+        aggregateType: "experiment",
+        aggregateId: next.id,
+        occurredAt: now,
+        buildPayload: () => ({
+          experiment: next,
+          derivedAudit: [this.experimentDerivedAudit("EXPERIMENT_STARTED", next)],
+        }),
+        checkpoint: true,
+        afterApply: async () => {
+          this.idleGrokSubmissions.clear();
+          this.reportGenerated = false;
+          this.abortSourceSealPersist();
+          this.sourceSealed = false;
+          this.sourceSealing = false;
+          this.clearReportSourceIntegrity(next.id);
+          this.record("EXPERIMENT_STARTED", next.id, null, { status: next.status });
+        },
+      });
+      return { ok: true, experiment: this.experiment, preflight };
     });
-    await this.experimentBoundaryGate.run(() => this.commitAuthoritative({
-      operationKey: `experiment:${next.id}:started`,
-      type: "EXPERIMENT_STARTED",
-      aggregateType: "experiment",
-      aggregateId: next.id,
-      occurredAt: now,
-      buildPayload: () => ({
-        experiment: next,
-        derivedAudit: [this.experimentDerivedAudit("EXPERIMENT_STARTED", next)],
-      }),
-      checkpoint: true,
-      afterApply: async () => {
-        this.idleGrokSubmissions.clear();
-        this.reportGenerated = false;
-        this.abortSourceSealPersist();
-        this.sourceSealed = false;
-        this.sourceSealing = false;
-        this.clearReportSourceIntegrity(next.id);
-        this.record("EXPERIMENT_STARTED", next.id, null, { status: next.status });
-      },
-    }));
-    return { ok: true, experiment: this.experiment, preflight };
   }
 
   preflight(mode: "MONITOR_ONLY" | "48H_GROK_PAPER_EXPERIMENT" = "MONITOR_ONLY") {

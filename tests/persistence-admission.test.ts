@@ -28,6 +28,14 @@ async function drainRuntime(engine: EngineService): Promise<void> {
   }
 }
 
+async function waitForJournalAppend(journal: MemoryEventJournal): Promise<void> {
+  const started = Date.now();
+  while (journal.inFlightAppends === 0) {
+    if (Date.now() - started > 1_000) throw new Error("journal append did not start");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
 function marketSnapshot(sequence: number, tokenId = "btc-up"): MarketSnapshot {
   const at = new Date(Date.parse("2026-08-31T12:00:00.000Z") + sequence).toISOString();
   return snapshot({
@@ -262,6 +270,78 @@ describe("persistence admission keeps live inputs in memory", () => {
     } finally {
       release?.();
       engine.setIdleGrokAcceptanceHoldForTest(null);
+      await engine.stop();
+    }
+  });
+
+  it("serializes concurrent experiment starts to one authoritative lifecycle", async () => {
+    const { engine, journal } = await startQualifiedEngine();
+    let release!: () => void;
+    try {
+      journal.setAppendInFlightHoldForTest(new Promise<void>((resolve) => { release = resolve; }), ["EXPERIMENT_PREFLIGHT"]);
+      const first = engine.beginExperiment();
+      await waitForJournalAppend(journal);
+      const second = engine.beginExperiment();
+      release();
+      const results = await Promise.all([first, second]);
+      expect(results.filter((result) => result.ok)).toHaveLength(1);
+      expect(results.filter((result) => !result.ok)).toHaveLength(1);
+      expect(results.find((result) => !result.ok)).toMatchObject({ blockers: ["EXPERIMENT_ALREADY_ACTIVE"] });
+
+      const started = await journal.queryDurableTransitions({ types: ["EXPERIMENT_STARTED"], limit: 8 });
+      expect(started).toHaveLength(1);
+      const experimentId = started[0]!.aggregateId;
+      expect(engine.experimentManifest()?.id).toBe(experimentId);
+      expect(await journal.queryEvents({ types: ["EXPERIMENT_STARTED"] })).toHaveLength(1);
+
+      await engine.stop();
+      const restartMarket = new ScriptedMarketAdapter();
+      restartMarket.queue(discoveryReport([qualified("btc-mkt", "BTC", "btc-up", "btc-down")]));
+      const restarted = new EngineService(qualifiedPaperEnv(), journal, { error: () => undefined }, {
+        market: restartMarket as never,
+        referenceRegistry: new ScriptedReferenceRegistry() as never,
+        activation: new NoopGrokActivationBridge(),
+      });
+      await restarted.start();
+      try {
+        expect(restarted.experimentManifest()?.id).toBe(experimentId);
+        expect(restarted.experimentManifest()?.status).toBe("RUNNING");
+        expect(await journal.queryDurableTransitions({ types: ["EXPERIMENT_STARTED"], limit: 8 })).toHaveLength(1);
+      } finally {
+        await restarted.stop();
+      }
+    } finally {
+      release?.();
+      journal.setAppendInFlightHoldForTest(null);
+      await engine.stop();
+    }
+  });
+
+  it("releases the lifecycle gate after a failed start so a later start can proceed", async () => {
+    const { engine, journal } = await startQualifiedEngine();
+    try {
+      engine.setCrashInjectionForTest("BEFORE_DURABLE_COMMIT");
+      await expect(engine.beginExperiment()).rejects.toThrow("CRASH_INJECTED");
+      expect(engine.experimentManifest()?.status).toBe("IDLE");
+      expect((await journal.queryDurableTransitions({ types: ["EXPERIMENT_STARTED"], limit: 8 }))).toEqual([]);
+      expect((await engine.beginExperiment()).ok).toBe(true);
+      expect(await journal.queryDurableTransitions({ types: ["EXPERIMENT_STARTED"], limit: 8 })).toHaveLength(1);
+    } finally {
+      await engine.stop();
+    }
+  });
+
+  it("releases the lifecycle gate after a thrown preflight append", async () => {
+    const { engine, journal } = await startQualifiedEngine();
+    try {
+      journal.failAppendTypes.add("EXPERIMENT_PREFLIGHT");
+      await expect(engine.beginExperiment()).rejects.toThrow("JOURNAL_APPEND_FAILED");
+      journal.failAppendTypes.delete("EXPERIMENT_PREFLIGHT");
+      const retry = await engine.beginExperiment();
+      expect(retry.ok).toBe(false);
+      expect(retry.blockers).toContain("OVERLOAD_FAIL_CLOSED");
+    } finally {
+      journal.failAppendTypes.delete("EXPERIMENT_PREFLIGHT");
       await engine.stop();
     }
   });
