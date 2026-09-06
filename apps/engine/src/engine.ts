@@ -556,7 +556,6 @@ export class EngineService {
         }),
         checkpoint: true,
         afterApply: async () => {
-          this.idleGrokSubmissions.clear();
           this.reportGenerated = false;
           this.abortSourceSealPersist();
           this.sourceSealed = false;
@@ -1694,6 +1693,12 @@ export class EngineService {
         if (!idleReservation) return duplicate();
         this.assertResearchIntegrity();
       } else {
+        // A completed idle acceptance remains a bounded process-local tombstone
+        // across the lifecycle boundary. It has no durable canonical fact by
+        // design, so do not let the first active retry create a second claim
+        // and accepted fact for the same submission.
+        this.pruneIdleGrokSubmissions(now.getTime());
+        if (this.idleGrokSubmissions.has(idempotencyKey)) return duplicate();
         const claimed = await this.journal.claimIdempotency("grok_signal_submission", idempotencyKey);
         this.assertResearchIntegrity();
         if (!claimed) {

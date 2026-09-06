@@ -274,6 +274,23 @@ describe("persistence admission keeps live inputs in memory", () => {
     }
   });
 
+  it("keeps an accepted idle tombstone across start without an active duplicate", async () => {
+    const { engine, journal } = await startQualifiedEngine();
+    try {
+      const trigger = monitoringTrigger("idle-tombstone-trigger");
+      const submission = fairSubmission(trigger, "idle-tombstone-submission");
+      await engine.registerTriggerForResearch(trigger);
+      expect(await engine.submitGrokSignal(submission, "fair_probability_analyst")).toMatchObject({ status: "accepted" });
+      expect((await engine.beginExperiment()).ok).toBe(true);
+
+      expect(await engine.submitGrokSignal(submission, "fair_probability_analyst")).toEqual({ status: "duplicate" });
+      expect(await journal.idempotencyCreatedAt("grok_signal_submission", "fair_probability_analyst:idle-tombstone-submission")).toBeNull();
+      expect(await journal.queryEvents({ types: ["GROK_SIGNAL_ACCEPTED"] })).toEqual([]);
+    } finally {
+      await engine.stop();
+    }
+  });
+
   it("serializes concurrent experiment starts to one authoritative lifecycle", async () => {
     const { engine, journal } = await startQualifiedEngine();
     let release!: () => void;
