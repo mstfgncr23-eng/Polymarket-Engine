@@ -1375,7 +1375,9 @@ export class EngineService {
       this.metrics.assetMarketIndexEntries.set(this.assetIndex.entryCount());
     }
     this.updateReady();
-    await this.writer.persist(createJournalEvent({ traceId: snapshot.traceId, type: "MARKET_SNAPSHOT", aggregateType: "market", aggregateId: snapshot.marketId, payload: snapshot, occurredAt: new Date(snapshot.sourceTimestamp), sourceEventId: snapshot.eventId }));
+    // Market snapshots are live processing inputs. The current snapshot/state
+    // maps above remain the source for trigger, maker, risk, and dashboard work;
+    // raw observations are intentionally not permanent journal records.
     this.record("MARKET_EVENT", snapshot.traceId, snapshot.marketId, { tokenId: snapshot.tokenId, outcome: snapshot.outcome, sequence: snapshot.sequence }, snapshot.asset ?? null);
 
     if (synchronized && previous) {
@@ -1417,7 +1419,8 @@ export class EngineService {
       this.noteReferenceLogicalLoss(tick.asset);
       this.state.invalidateReferenceContext(tick.asset);
       this.requestReferenceResync(tick.asset);
-      await this.persistReferenceTick(tick);
+      // Test-only processing hold; raw reference observations are never journaled.
+      if (this.referenceTelemetryHoldForTest) await this.referenceTelemetryHoldForTest;
       this.metrics.referenceWindowEntries.set(this.triggerEngine.referenceWindowTotalEntries());
       this.metrics.referenceTickProcessingDuration.observe((performance.now() - started) / 1000);
       return;
@@ -1436,7 +1439,6 @@ export class EngineService {
       this.state.connections.btc.lastMessageAt = tick.receivedAt;
     }
     this.updateReady();
-    await this.persistReferenceTick(tick);
     if (wasUnreliable) {
       this.referenceUnreliable.delete(tick.asset);
       this.referenceResyncRequested.delete(tick.asset);
@@ -1445,14 +1447,6 @@ export class EngineService {
     for (const trigger of admission.triggers) this.admitTrigger(trigger, this.provenanceForGenerated(trigger, "REFERENCE", tick.asset));
     this.metrics.triggerDedupeEntries.set(this.triggerEngine.dedupeEntryCount());
     this.metrics.referenceTickProcessingDuration.observe((performance.now() - started) / 1000);
-  }
-
-  private async persistReferenceTick(tick: ReferenceTick): Promise<void> {
-    if (this.referenceTelemetryHoldForTest) await this.referenceTelemetryHoldForTest;
-    await this.writer.persist(createJournalEvent({
-      traceId: tick.traceId, type: "REFERENCE_TICK", aggregateType: "reference", aggregateId: tick.asset,
-      payload: tick, occurredAt: new Date(tick.sourceTimestamp), sourceEventId: tick.eventId,
-    }));
   }
 
   private admitTrigger(trigger: TriggerEvent, provenance?: TriggerProvenance): AdmitResult {
@@ -1540,7 +1534,7 @@ export class EngineService {
     }
     this.metrics.triggers.inc({ kind: trigger.kind, severity: String(trigger.severity) });
     this.record(`TRIGGER_LEVEL_${trigger.severity}`, trigger.traceId, trigger.marketId, { triggerId: trigger.id, kind: trigger.kind, asset: trigger.asset ?? null }, trigger.asset ?? null);
-    await this.safeAppend(createJournalEvent({ traceId: trigger.traceId, type: "TRIGGER_EVENT", aggregateType: "trigger", aggregateId: trigger.id, payload: trigger, sourceEventId: trigger.sourceEventIds[0] ?? null }), signal);
+    await this.persistReportInput(createJournalEvent({ traceId: trigger.traceId, type: "TRIGGER_EVENT", aggregateType: "trigger", aggregateId: trigger.id, payload: trigger, sourceEventId: trigger.sourceEventIds[0] ?? null }), signal);
     this.rememberProvenance(trigger.id, provenance);
     this.activeTriggers.set(trigger.id, trigger);
     if (!this.isProvenanceCurrentlyValid(trigger.id, provenance)) {
@@ -1562,7 +1556,7 @@ export class EngineService {
       const bookkeepingStarted = performance.now();
       this.activation.ensureLatency(trigger);
       this.state.setActivationLatency(this.activation.snapshot());
-      await this.safeAppend(createJournalEvent({
+      await this.persistReportInput(createJournalEvent({
         traceId: trigger.traceId, type: "GROK_ACTIVATION_DECISION", aggregateType: "activation", aggregateId: trigger.id,
         payload: { triggerId: trigger.id, marketId: trigger.marketId, asset: trigger.asset ?? null, reason: "EXPERIMENT_NOT_ACTIVE", activate: false },
       }));
@@ -1571,7 +1565,7 @@ export class EngineService {
       return;
     }
     if (status === "ENTRY_CLOSED" && !isRiskHedgeSettlementTrigger(trigger.kind)) {
-      await this.safeAppend(createJournalEvent({
+      await this.persistReportInput(createJournalEvent({
         traceId: trigger.traceId, type: "GROK_ACTIVATION_DECISION", aggregateType: "activation", aggregateId: trigger.id,
         payload: { triggerId: trigger.id, marketId: trigger.marketId, asset: trigger.asset ?? null, reason: "ENTRY_CLOSED", activate: false },
       }));
@@ -1579,7 +1573,7 @@ export class EngineService {
       return;
     }
     if (!this.isTriggerActionable(trigger.id)) {
-      await this.safeAppend(createJournalEvent({
+      await this.persistReportInput(createJournalEvent({
         traceId: trigger.traceId, type: "GROK_ACTIVATION_DECISION", aggregateType: "activation", aggregateId: trigger.id,
         payload: { triggerId: trigger.id, marketId: trigger.marketId, asset: trigger.asset ?? null, reason: "PROVENANCE_STALE", activate: false },
       }));
@@ -1587,7 +1581,7 @@ export class EngineService {
       return;
     }
     const decision = this.activation.decide(trigger);
-    await this.safeAppend(createJournalEvent({
+    await this.persistReportInput(createJournalEvent({
       traceId: trigger.traceId, type: "GROK_ACTIVATION_DECISION", aggregateType: "activation", aggregateId: trigger.id,
       payload: { triggerId: trigger.id, marketId: trigger.marketId, asset: trigger.asset ?? null, reason: decision.reason, activate: decision.activate },
     }));
@@ -1604,7 +1598,7 @@ export class EngineService {
     const results = await this.activation.dispatch(decision.request);
     for (const result of results) {
       this.metrics.activations.inc({ provider: result.provider, status: result.ok ? "ok" : "failed" });
-      await this.safeAppend(createJournalEvent({
+      await this.persistReportInput(createJournalEvent({
         traceId: trigger.traceId, type: "GROK_ACTIVATION_RESULT", aggregateType: "activation", aggregateId: trigger.id,
         payload: persistableActivation(result, trigger.id, decision.reason),
       }));
@@ -1720,9 +1714,9 @@ export class EngineService {
         receivedAt: now.toISOString(), timestamp: submission.timestamp, output: submission.output, resultingDecision: null,
       });
       if (this.researchIngressStale(ingress.generation)) return rejectSealed();
-      await this.safeAppend(createJournalEvent({ traceId: signal.traceId, type: "GROK_SIGNAL_ACCEPTED", aggregateType: "grok_signal", aggregateId: signal.signalId, payload: signal }));
+      await this.persistReportInput(createJournalEvent({ traceId: signal.traceId, type: "GROK_SIGNAL_ACCEPTED", aggregateType: "grok_signal", aggregateId: signal.signalId, payload: signal }));
       if (submission.agentId === "strategy_supervisor" && submission.output.proposedChange) {
-        await this.safeAppend(createJournalEvent({ traceId: signal.traceId, type: "STRATEGY_CHANGE_PROPOSED", aggregateType: "strategy_change", aggregateId: signal.signalId, payload: submission.output.proposedChange }));
+        await this.persistReportInput(createJournalEvent({ traceId: signal.traceId, type: "STRATEGY_CHANGE_PROPOSED", aggregateType: "strategy_change", aggregateId: signal.signalId, payload: submission.output.proposedChange }));
       }
       this.assertResearchIntegrity();
       const byRole = this.signalsByTrigger.get(trigger.id) ?? new Map<ExternalAgentRoleId, GrokSignalEnvelope>();
@@ -1768,7 +1762,7 @@ export class EngineService {
     const consensus = buildConsensus({ traceId: trigger.traceId, triggerId: trigger.id, signals: directional, deterministicEdge: 0, now: this.nowFn(), config: defaultConsensusConfig });
     this.state.latestConsensus = consensus;
     this.record("CONSENSUS_COMPLETE", trigger.traceId, trigger.marketId, { direction: consensus.consensusDirection, confidence: consensus.consensusConfidence, conflicts: consensus.conflicts, triggerId: trigger.id, estimatedEdgeIgnored: fair.estimatedEdge ?? null }, trigger.asset ?? null);
-    await this.safeAppend(createJournalEvent({ traceId: trigger.traceId, type: "CONSENSUS_DECISION", aggregateType: "consensus", aggregateId: consensus.id, payload: { ...consensus, marketId: trigger.marketId, asset: trigger.asset ?? null } }));
+    await this.persistReportInput(createJournalEvent({ traceId: trigger.traceId, type: "CONSENSUS_DECISION", aggregateType: "consensus", aggregateId: consensus.id, payload: { ...consensus, marketId: trigger.marketId, asset: trigger.asset ?? null } }));
     for (const disagreement of this.triggerEngine.ingestConsensus(consensus, trigger.marketId, trigger.asset ?? null)) this.admitTrigger(disagreement);
     if (trigger.marketId) await this.evaluateTrade(trigger, consensus, outputs);
   }
@@ -1855,7 +1849,7 @@ export class EngineService {
       },
     });
     this.state.latestRisk = decision.risk;
-    await this.safeAppend(createJournalEvent({ traceId: trigger.traceId, type: "RISK_EVALUATION", aggregateType: "risk", aggregateId: decision.risk.id, payload: { ...decision.risk, marketId: trigger.marketId, asset } }));
+    await this.persistReportInput(createJournalEvent({ traceId: trigger.traceId, type: "RISK_EVALUATION", aggregateType: "risk", aggregateId: decision.risk.id, payload: { ...decision.risk, marketId: trigger.marketId, asset } }));
     if (!decision.accepted || !decision.order) {
       for (const reason of decision.risk.vetoes) this.metrics.riskVetoes.inc({ reason });
       this.record("RISK_VETO", trigger.traceId, trigger.marketId, { reasons: decision.risk.vetoes, netExpectedEdge: decision.netExpectedEdge }, asset);
@@ -1868,7 +1862,7 @@ export class EngineService {
   private async submitPaperOrder(order: PaperOrder, decisionSnapshot: MarketSnapshot, duplicateKey: string, intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" = "OPEN_FIRST_LEG"): Promise<void> {
     this.metrics.paperOrders.inc({ type: order.orderType });
     this.record("PAPER_ORDER_CREATED", order.traceId, order.marketId, { orderId: order.id, type: order.orderType, intent }, decisionSnapshot.asset ?? null);
-    await this.safeAppend(createJournalEvent({
+    await this.persistReportInput(createJournalEvent({
       id: derivedAuditEventId("PAPER_ORDER_CREATED", order.id),
       traceId: order.traceId, type: "PAPER_ORDER_CREATED", aggregateType: "paper_order", aggregateId: order.id,
       payload: { ...order, intent },
@@ -1888,7 +1882,7 @@ export class EngineService {
       if (this.overload.hasIntegrityFault || error instanceof IdempotencyConflictError || error instanceof CrashInjectedError || (error instanceof JournalAdmissionRejected && error.critical)) throw error;
       this.executionErrors.push(Date.now());
       this.record("PAPER_EXECUTION_ERROR", order.traceId, order.marketId, { orderId: order.id, message: error instanceof Error ? error.message : String(error) });
-      await this.safeAppend(createJournalEvent({ traceId: order.traceId, type: "PAPER_EXECUTION_ERROR", aggregateType: "paper_order", aggregateId: order.id, payload: { message: error instanceof Error ? error.message : String(error) } }));
+      await this.persistReportInput(createJournalEvent({ traceId: order.traceId, type: "PAPER_EXECUTION_ERROR", aggregateType: "paper_order", aggregateId: order.id, payload: { message: error instanceof Error ? error.message : String(error) } }));
     }
   }
 
@@ -2175,12 +2169,32 @@ export class EngineService {
     return isReportInputEventType(type) && !isSourceSealExemptType(type) && this.isExperimentWindowOpen();
   }
 
-  async persistReportInput(event: JournalEvent): Promise<void> {
+  /**
+   * Canonical report inputs are durable only while an experiment window is
+   * open. Lifecycle exceptions remain durable at the boundaries; raw market
+   * and reference observations never come through this path.
+   */
+  private isReportInputPersistenceAdmitted(type: string): boolean {
+    // These are live processing inputs, never durable facts. Keep this guard
+    // here as a second line of defense if a future producer reaches the
+    // report-input helper directly.
+    if (type === "MARKET_SNAPSHOT" || type === "REFERENCE_TICK") return false;
+    // MCP_INTERACTION is an always-on security/audit trail. It is classified
+    // as a report input for source-integrity accounting, but it must remain
+    // durable for authenticated and rejected calls while the engine monitors.
+    return type === "MCP_INTERACTION"
+      || !isReportInputEventType(type)
+      || isSourceSealExemptType(type)
+      || this.isExperimentWindowOpen();
+  }
+
+  async persistReportInput(event: JournalEvent, signal?: AbortSignal, extra?: { deadlineAt?: number }): Promise<void> {
+    if (!this.isReportInputPersistenceAdmitted(event.type)) return;
     const experimentId = this.experiment?.id;
     const stamped = this.isExperimentWindowOpen() && experimentId && typeof event.payload.experimentId !== "string"
       ? { ...event, payload: { ...event.payload, experimentId } }
       : event;
-    await this.safeAppend(stamped);
+    await this.safeAppend(stamped, signal, extra);
   }
 
   private async safeAppend(event: ReturnType<typeof createJournalEvent>, signal?: AbortSignal, extra?: { deadlineAt?: number }): Promise<void> {
@@ -3219,7 +3233,10 @@ export class EngineService {
     );
   }
   async persistEventForTest(event: ReturnType<typeof createJournalEvent>): Promise<void> {
-    await this.persistReportInput(event);
+    // Test hook for direct journal/integrity failure scenarios. Production
+    // canonical producers use persistReportInput, which applies lifecycle
+    // admission before reaching safeAppend.
+    await this.safeAppend(event);
   }
   reportSourceIntegrityForTest() { return [...this.reportSourceIntegrity.values()]; }
   enqueueTriggerStormForTest(triggers: TriggerEvent[]): { admitted: number; rejected: number; reasons: Record<string, number> } {

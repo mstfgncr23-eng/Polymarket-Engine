@@ -258,7 +258,9 @@ describe("processTrigger and journal in-flight gauges return to zero", () => {
       await engine.registerTriggerForResearch(researchTrigger({ id: createId("trigger") }));
       expect(await metricValue(engine.metrics, "process_trigger_in_flight")).toBe(0);
       expect(await metricValue(engine.metrics, "journal_direct_in_flight")).toBe(0);
-      expect(await metricValue(engine.metrics, "journal_direct_failures_total", { class: "trigger" })).toBeGreaterThanOrEqual(1);
+      // Idle canonical trigger traffic is admitted to the live supervisor but
+      // intentionally bypasses durable journal admission.
+      expect(await metricValue(engine.metrics, "journal_direct_failures_total", { class: "trigger" })).toBe(0);
     } finally {
       await engine.stop();
     }
@@ -342,8 +344,8 @@ describe("existing paper / SSE / discovery / journal semantics remain unchanged"
       expect(engine.experimentManifest()?.status).toBe("IDLE");
       await engine.registerTriggerForResearch(researchTrigger());
       const events = await journal.queryEvents({ types: ["TRIGGER_EVENT", "GROK_ACTIVATION_DECISION", "PAPER_ORDER_CREATED"] });
-      expect(events.some((event) => event.type === "TRIGGER_EVENT")).toBe(true);
-      expect(events.some((event) => event.type === "GROK_ACTIVATION_DECISION" && (event.payload as { reason?: string }).reason === "EXPERIMENT_NOT_ACTIVE")).toBe(true);
+      expect(events.some((event) => event.type === "TRIGGER_EVENT")).toBe(false);
+      expect(events.some((event) => event.type === "GROK_ACTIVATION_DECISION")).toBe(false);
       expect(events.some((event) => event.type === "PAPER_ORDER_CREATED")).toBe(false);
       const taker = executePaperTaker({ order: order(), snapshotAfterLatency: snapshot(), measuredLatencyMs: 150 });
       expect(taker.fillPrice).toBe("0.49");
@@ -515,9 +517,9 @@ describe("market normalization and trigger/reference/telemetry metrics", () => {
     const writer = new BoundedJournalWriter(journal, () => undefined, { error: () => undefined }, {
       queueLimit: 2, batchSize: 2, sampleEvery: 1, maxConcurrent: 2,
     }, metrics);
-    await writer.persist(createJournalEvent({ traceId: createId("trace"), type: "MARKET_SNAPSHOT", aggregateType: "market", aggregateId: "m", payload: {} }));
-    await writer.persist(createJournalEvent({ traceId: createId("trace"), type: "MARKET_SNAPSHOT", aggregateType: "market", aggregateId: "m", payload: {} }));
-    await writer.persist(createJournalEvent({ traceId: createId("trace"), type: "MARKET_SNAPSHOT", aggregateType: "market", aggregateId: "m", payload: {} }));
+    await writer.persist(createJournalEvent({ traceId: createId("trace"), type: "MARKET_EVENT", aggregateType: "market", aggregateId: "m", payload: {} }));
+    await writer.persist(createJournalEvent({ traceId: createId("trace"), type: "MARKET_EVENT", aggregateType: "market", aggregateId: "m", payload: {} }));
+    await writer.persist(createJournalEvent({ traceId: createId("trace"), type: "MARKET_EVENT", aggregateType: "market", aggregateId: "m", payload: {} }));
     await writer.flush();
     expect(await metricValue(metrics, "telemetry_events_dropped_total")).toBeGreaterThan(0);
     expect(await metricValue(metrics, "telemetry_batch_failures_total")).toBeGreaterThan(0);

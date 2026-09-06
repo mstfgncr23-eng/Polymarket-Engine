@@ -232,13 +232,13 @@ describe("Grok activation 16-29", () => {
     expect(decision).toMatchObject({ activate: false, reason: "EXPIRED" });
   });
 
-  it("23 duplicate trigger+role activations are suppressed and persisted as a decision", async () => {
+  it("23 duplicate trigger+role activations are suppressed without an idle journal decision", async () => {
     const { engine, journal } = await makeEngine();
     const event = trigger();
     await engine.registerTriggerForResearch(event);
     await engine.registerTriggerForResearch(event);
     const decisions = (await journal.readAll()).filter((item) => item.type === "GROK_ACTIVATION_DECISION");
-    expect(decisions.length).toBeGreaterThan(0);
+    expect(decisions).toHaveLength(0);
   });
 
   it("24 severity-aware suppression does not wake Grok on a weaker repeat", () => {
