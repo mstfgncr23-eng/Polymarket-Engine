@@ -7,6 +7,7 @@ import {
 } from "@pm/core";
 import {
   createJournalEvent,
+  canonicalJson,
   hashExperimentReport,
   isCanonicalFinalReport,
   isTransientJournalError,
@@ -21,15 +22,45 @@ import {
 import {
   ExperimentSummaryAccumulator,
   includeCurrentExperimentEvent,
+  type ExperimentSummaryAccumulatorSnapshot,
   type ExperimentSummaryExtras,
 } from "./report.js";
 import { loadSourceSeal } from "./source-seal.js";
 import { loadUnresolvedReportSourceIntegrity } from "./report-source-integrity.js";
+import { createHash } from "node:crypto";
 
 export interface StreamedExperimentSummary {
   summary: ExperimentSummary;
   scan: ScanStats;
   accumulatorHighWaterBytes: number;
+  accumulatorSnapshot?: ExperimentSummaryAccumulatorSnapshot;
+}
+
+export const ANALYTICS_ROLLUP_SCHEMA_VERSION = 1;
+
+export function hashAnalyticsRollup(accumulator: Record<string, unknown>): string {
+  return createHash("sha256").update(canonicalJson(accumulator)).digest("hex");
+}
+
+export async function persistVerifiedAnalyticsRollup(
+  journal: EventJournal,
+  input: { experimentId: string; sourceCursor: number; sourceFenceId?: string | null; sourceFenceOccurredAt?: string | null; accumulator: Record<string, unknown>; rollupKind?: string },
+): Promise<import("@pm/db").AnalyticsRollup | null> {
+  if (!journal.persistAnalyticsRollup) return null;
+  const contentHash = hashAnalyticsRollup(input.accumulator);
+  const rollup = {
+    experimentId: input.experimentId, rollupKind: input.rollupKind ?? "canonical", schemaVersion: ANALYTICS_ROLLUP_SCHEMA_VERSION,
+    sourceCursor: input.sourceCursor, sourceFenceId: input.sourceFenceId ?? null, sourceFenceOccurredAt: input.sourceFenceOccurredAt ?? null,
+    accumulator: input.accumulator, contentHash, verified: true, createdAt: new Date().toISOString(),
+  };
+  return journal.persistAnalyticsRollup(rollup);
+}
+
+export async function loadVerifiedAnalyticsRollup(journal: EventJournal, experimentId: string, rollupKind = "canonical"): Promise<import("@pm/db").AnalyticsRollup | null> {
+  if (!journal.loadAnalyticsRollup) return null;
+  const row = await journal.loadAnalyticsRollup(experimentId, rollupKind);
+  if (!row || !row.verified || row.schemaVersion !== ANALYTICS_ROLLUP_SCHEMA_VERSION || hashAnalyticsRollup(row.accumulator) !== row.contentHash) return null;
+  return row;
 }
 
 export async function streamExperimentSummary(
@@ -38,7 +69,14 @@ export async function streamExperimentSummary(
   extras: ExperimentSummaryExtras,
   options: { signal?: AbortSignal; pageSize?: number; ceiling?: number } = {},
 ): Promise<StreamedExperimentSummary> {
+  const rollup = await loadVerifiedAnalyticsRollup(journal, experiment.id);
   const acc = new ExperimentSummaryAccumulator(experiment.id, extras);
+  const rollupSnapshot = rollup?.accumulator as unknown as ExperimentSummaryAccumulatorSnapshot | undefined;
+  if (rollupSnapshot) {
+    try { acc.restore({ ...rollupSnapshot, extras }); } catch { /* stale/incompatible rollups are ignored */ }
+  }
+  const rollupFenceAt = rollup?.sourceFenceOccurredAt ? Date.parse(rollup.sourceFenceOccurredAt) : Number.NaN;
+  const rollupFenceId = rollup?.sourceFenceId ?? null;
   const scan = await scanJournalEvents(journal, {
     types: CANONICAL_REPORT_INPUT_EVENT_TYPES,
     from: experiment.startedAt ? new Date(experiment.startedAt) : undefined,
@@ -49,7 +87,13 @@ export async function streamExperimentSummary(
     signal: options.signal,
     onPage: (page) => {
       for (const event of page) {
-        if (includeCurrentExperimentEvent(event, experiment)) acc.fold(event);
+        if (!includeCurrentExperimentEvent(event, experiment)) continue;
+        // A verified rollup already covers its source fence. Fold only the
+        // bounded tail so a report remains equivalent after raw cleanup.
+        const occurredAt = Date.parse(event.occurredAt);
+        if (Number.isFinite(rollupFenceAt) && (occurredAt < rollupFenceAt
+          || (occurredAt === rollupFenceAt && rollupFenceId != null && event.id <= rollupFenceId))) continue;
+        acc.fold(event);
       }
     },
   });
@@ -58,7 +102,7 @@ export async function streamExperimentSummary(
   summary.truncated = scan.truncated || scan.interrupted || summary.truncated;
   summary.truncatedReason = summary.truncated ? (extras.truncatedReason ?? scan.truncatedReason ?? "SCAN_CEILING") : null;
   if (scan.interrupted) summary.complete = false;
-  return { summary, scan, accumulatorHighWaterBytes: acc.highWaterMarkBytes };
+  return { summary, scan, accumulatorHighWaterBytes: acc.highWaterMarkBytes, accumulatorSnapshot: acc.serialize() };
 }
 
 export function toDurableReportInput(input: {

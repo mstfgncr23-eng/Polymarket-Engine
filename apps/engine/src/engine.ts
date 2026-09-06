@@ -72,6 +72,7 @@ import {
   JournalAppendAbortedError,
   isJournalAppendAbortedError,
   isJournalAppendDeadlineError,
+  hashCheckpointPayload,
   type DurableCommitResult,
   type DurableTransition,
   type EventJournal,
@@ -89,7 +90,7 @@ import { EngineMetrics, classifyJournalMetricClass } from "./metrics.js";
 import { RestingOrderTokenIndex } from "./resting-order-index.js";
 import { SseHub } from "./server.js";
 import { EngineStateStore } from "./state.js";
-import { ensureReportGeneratedAudit, persistCanonicalFinalReport, streamExperimentSummary, summaryFromDurableReport } from "./final-report.js";
+import { ensureReportGeneratedAudit, persistCanonicalFinalReport, persistVerifiedAnalyticsRollup, streamExperimentSummary, summaryFromDurableReport } from "./final-report.js";
 import { writeExperimentSummary } from "./report.js";
 import { retentionConfigFromEngineEnv, RetentionManager } from "./retention-manager.js";
 import { createSourceSealEvent, loadSourceSeal, remainingSealMs, SOURCE_SEAL_TIMEOUT_MS, isSourceSealExemptType } from "./source-seal.js";
@@ -1270,10 +1271,14 @@ export class EngineService {
   private async restoreAndRecover(): Promise<void> {
     const started = performance.now();
     try {
-      const checkpoint = await this.journal.loadLatestCheckpoint();
+      const verifiedCheckpoints = this.journal.listVerifiedCheckpoints ? await this.journal.listVerifiedCheckpoints() : [];
+      const checkpoint = verifiedCheckpoints[0] ?? await this.journal.loadLatestCheckpoint();
       if (checkpoint) {
-        const restored = this.hydrateCheckpointPayload(checkpoint.payload as Record<string, unknown>);
         const payload = checkpoint.payload as Record<string, unknown>;
+        if (checkpoint.verified && checkpoint.contentHash && hashCheckpointPayload(payload) !== checkpoint.contentHash) {
+          throw new RecoveryFailClosedError("malformed", "checkpoint content hash mismatch");
+        }
+        const restored = this.hydrateCheckpointPayload(payload);
         if (isLegacyCheckpointPayload(payload)) {
           const safety = assessLegacyCheckpointSafety({
             experiment: this.experiment,
@@ -3364,6 +3369,15 @@ export class EngineService {
           this.reportGenerated = false;
           return;
         }
+      }
+      if (streamed.accumulatorSnapshot) {
+        await persistVerifiedAnalyticsRollup(this.journal, {
+          experimentId: experiment.id,
+          sourceCursor: await this.journal.latestDurableSequence(),
+          sourceFenceId: streamed.scan.fence.through?.id ?? null,
+          sourceFenceOccurredAt: streamed.scan.fence.through?.occurredAt ?? null,
+          accumulator: streamed.accumulatorSnapshot as unknown as Record<string, unknown>,
+        });
       }
       let persisted;
       try {

@@ -28,6 +28,64 @@ export type ExperimentSummaryExtras = Partial<Pick<ExperimentSummary,
   "status" | "closePolicy" | "reportKind" | "unresolvedPositionCount" | "metricsScope" | "complete" | "truncated" | "truncatedReason" | "generatedAt"
 >>;
 
+export interface ExperimentSummaryAccumulatorSnapshot {
+  schemaVersion: number;
+  experimentId: string;
+  extras: ExperimentSummaryExtras;
+  eventCount: number;
+  earliestOccurredAt: string | null;
+  latestOccurredAt: string | null;
+  fillReplay: Array<{ marketId: string; upQty: string; downQty: string; upCost: string; downCost: string; realized: string; fees: string; slippage: string; fills: number }>;
+  latestPositions: Array<[string, Position]>;
+  settledMarketIds: string[];
+  settledPositionIds: string[];
+  settlementCount: number;
+  settlementPnlUsd: number;
+  settlementBothQty: number;
+  lastLedger?: LedgerState;
+  maxDrawdown: number;
+  riskCount: number;
+  accepted: number;
+  paperOrders: number;
+  makerOrders: number;
+  takerOrders: number;
+  fillCount: number;
+  makerFills: number;
+  takerFills: number;
+  firstLegCount: number;
+  hedgeCompleteCount: number;
+  hedgeDurationSum: number;
+  hedgeDurationN: number;
+  pairRealizedNetSum: number;
+  pairRealizedNetN: number;
+  pairRealizedGrossSum: number;
+  pairRealizedGrossN: number;
+  modelCounts: Record<string, number>;
+  modelCosts: Record<string, number>;
+  failureStatistics: Record<string, number>;
+  eventCountByMarket: Record<string, number>;
+  eventCountByAsset: Record<string, number>;
+  assetByMarket: Array<[string, string]>;
+  byMarket: Record<string, MarketAssetAttribution>;
+  byAsset: Record<string, MarketAssetAttribution>;
+  failedHedgeOpen: string[];
+  failedHedgeCount: number;
+  positionWins: number;
+  positionLosses: number;
+  positionBreakeven: number;
+  grossWins: number;
+  grossLosses: number;
+  grossBreakeven: number;
+  grossSeen: string[];
+  rejectedWouldHaveWon: number;
+  acceptedLost: number;
+  worstUnhedgedEvent: Record<string, unknown> | null;
+  worstUnhedgedUsd: number;
+  agentSignals: Record<string, unknown>;
+  regimes: Record<string, unknown>;
+  hours: Record<string, unknown>;
+}
+
 export class ExperimentSummaryAccumulator {
   private readonly extras: ExperimentSummaryExtras;
   private readonly experimentId: string;
@@ -102,6 +160,43 @@ export class ExperimentSummaryAccumulator {
     return new Set([...this.fillReplay.keys(), ...this.latestPositions.values()].map((item) => typeof item === "string" ? item : item.marketId)).size
       || Object.keys(this.byMarket).length;
   }
+
+  /** JSON-safe bounded rollup state. No raw JournalEvent objects are retained. */
+  serialize(): ExperimentSummaryAccumulatorSnapshot {
+    return {
+      schemaVersion: 1, experimentId: this.experimentId, extras: structuredClone(this.extras), eventCount: this.eventCount,
+      earliestOccurredAt: this.earliestOccurredAt, latestOccurredAt: this.latestOccurredAt,
+      fillReplay: [...this.fillReplay.entries()].map(([marketId, s]) => ({ marketId, upQty: s.upQty.toString(), downQty: s.downQty.toString(), upCost: s.upCost.toString(), downCost: s.downCost.toString(), realized: s.realized.toString(), fees: s.fees.toString(), slippage: s.slippage.toString(), fills: s.fills })),
+      latestPositions: [...this.latestPositions.entries()].map(([id, position]) => [id, structuredClone(position)]),
+      settledMarketIds: [...this.settledMarketIds], settledPositionIds: [...this.settledPositionIds], settlementCount: this.settlementCount,
+      settlementPnlUsd: this.settlementPnlUsd, settlementBothQty: this.settlementBothQty, lastLedger: this.lastLedger ? structuredClone(this.lastLedger) : undefined,
+      maxDrawdown: this.maxDrawdown, riskCount: this.riskCount, accepted: this.accepted, paperOrders: this.paperOrders,
+      makerOrders: this.makerOrders, takerOrders: this.takerOrders, fillCount: this.fillCount, makerFills: this.makerFills, takerFills: this.takerFills,
+      firstLegCount: this.firstLegCount, hedgeCompleteCount: this.hedgeCompleteCount, hedgeDurationSum: this.hedgeDurationSum, hedgeDurationN: this.hedgeDurationN,
+      pairRealizedNetSum: this.pairRealizedNetSum, pairRealizedNetN: this.pairRealizedNetN, pairRealizedGrossSum: this.pairRealizedGrossSum, pairRealizedGrossN: this.pairRealizedGrossN,
+      modelCounts: structuredClone(this.modelCounts), modelCosts: structuredClone(this.modelCosts), failureStatistics: structuredClone(this.failureStatistics),
+      eventCountByMarket: structuredClone(this.eventCountByMarket), eventCountByAsset: structuredClone(this.eventCountByAsset), assetByMarket: [...this.assetByMarket.entries()],
+      byMarket: structuredClone(this.byMarket), byAsset: structuredClone(this.byAsset), failedHedgeOpen: [...this.failedHedgeOpen], failedHedgeCount: this.failedHedgeCount,
+      positionWins: this.positionWins, positionLosses: this.positionLosses, positionBreakeven: this.positionBreakeven, grossWins: this.grossWins, grossLosses: this.grossLosses, grossBreakeven: this.grossBreakeven, grossSeen: [...this.grossSeen],
+      rejectedWouldHaveWon: this.rejectedWouldHaveWon, acceptedLost: this.acceptedLost, worstUnhedgedEvent: this.worstUnhedgedEvent ? structuredClone(this.worstUnhedgedEvent) : null, worstUnhedgedUsd: this.worstUnhedgedUsd,
+      agentSignals: structuredClone(this.agentSignals), regimes: structuredClone(this.regimes), hours: structuredClone(this.hours),
+    };
+  }
+  snapshot(): ExperimentSummaryAccumulatorSnapshot { return this.serialize(); }
+  restore(snapshot: ExperimentSummaryAccumulatorSnapshot): void {
+    if (snapshot.schemaVersion !== 1 || snapshot.experimentId !== this.experimentId) throw new Error("ANALYTICS_ROLLUP_SCHEMA_MISMATCH");
+    const assign = (key: keyof ExperimentSummaryAccumulatorSnapshot, fallback: unknown = undefined) => (snapshot[key] ?? fallback) as never;
+    this.eventCount = assign("eventCount", 0); this.earliestOccurredAt = assign("earliestOccurredAt", null); this.latestOccurredAt = assign("latestOccurredAt", null);
+    this.fillReplay.clear(); for (const item of snapshot.fillReplay ?? []) { const s = createFillReplay(); s.upQty = d(item.upQty); s.downQty = d(item.downQty); s.upCost = d(item.upCost); s.downCost = d(item.downCost); s.realized = d(item.realized); s.fees = d(item.fees); s.slippage = d(item.slippage); s.fills = item.fills; this.fillReplay.set(item.marketId, s); }
+    this.latestPositions.clear(); for (const [id, position] of snapshot.latestPositions ?? []) this.latestPositions.set(id, structuredClone(position));
+    this.settledMarketIds.clear(); for (const id of snapshot.settledMarketIds ?? []) this.settledMarketIds.add(id); this.settledPositionIds.clear(); for (const id of snapshot.settledPositionIds ?? []) this.settledPositionIds.add(id);
+    this.settlementCount = assign("settlementCount", 0); this.settlementPnlUsd = assign("settlementPnlUsd", 0); this.settlementBothQty = assign("settlementBothQty", 0); this.lastLedger = snapshot.lastLedger ? structuredClone(snapshot.lastLedger) : undefined;
+    for (const key of ["maxDrawdown","riskCount","accepted","paperOrders","makerOrders","takerOrders","fillCount","makerFills","takerFills","firstLegCount","hedgeCompleteCount","hedgeDurationSum","hedgeDurationN","pairRealizedNetSum","pairRealizedNetN","pairRealizedGrossSum","pairRealizedGrossN","failedHedgeCount","positionWins","positionLosses","positionBreakeven","grossWins","grossLosses","grossBreakeven","rejectedWouldHaveWon","acceptedLost","worstUnhedgedUsd"] as const) (this as unknown as Record<string, unknown>)[key] = snapshot[key];
+    const replaceRecord = (target: Record<string, unknown>, source: Record<string, unknown> | undefined) => { for (const key of Object.keys(target)) delete target[key]; Object.assign(target, structuredClone(source ?? {})); };
+    replaceRecord(this.modelCounts, snapshot.modelCounts); replaceRecord(this.modelCosts, snapshot.modelCosts); replaceRecord(this.failureStatistics, snapshot.failureStatistics); replaceRecord(this.eventCountByMarket, snapshot.eventCountByMarket); replaceRecord(this.eventCountByAsset, snapshot.eventCountByAsset); replaceRecord(this.byMarket, snapshot.byMarket); replaceRecord(this.byAsset, snapshot.byAsset); replaceRecord(this.agentSignals, snapshot.agentSignals); replaceRecord(this.regimes, snapshot.regimes); replaceRecord(this.hours, snapshot.hours);
+    this.assetByMarket.clear(); for (const [key, value] of snapshot.assetByMarket ?? []) this.assetByMarket.set(key, value); this.failedHedgeOpen.clear(); for (const key of snapshot.failedHedgeOpen ?? []) this.failedHedgeOpen.add(key); this.grossSeen.clear(); for (const key of snapshot.grossSeen ?? []) this.grossSeen.add(key); this.worstUnhedgedEvent = snapshot.worstUnhedgedEvent ? structuredClone(snapshot.worstUnhedgedEvent) : null; this.highWaterBytes = 0; this.refreshHighWater();
+  }
+  static fromSnapshot(snapshot: ExperimentSummaryAccumulatorSnapshot): ExperimentSummaryAccumulator { const acc = new ExperimentSummaryAccumulator(snapshot.experimentId, snapshot.extras); acc.restore(snapshot); return acc; }
 
   fold(event: JournalEvent): void {
     this.eventCount += 1;

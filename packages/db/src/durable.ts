@@ -30,6 +30,9 @@ export function durableMetricType(type: string): DurableMetricType {
 
 export const CHECKPOINT_SCHEMA_VERSION = 2;
 
+/** Version for the verifiable recovery-snapshot envelope used by compaction. */
+export const RECOVERY_SNAPSHOT_SCHEMA_VERSION = 1;
+
 /** Postgres advisory lock key for the durable-mutation + checkpoint fence. */
 export const DURABLE_MUTATION_LOCK_ID = 872_314_001;
 
@@ -115,6 +118,23 @@ export function authoritativeDurablePayload(payload: Record<string, unknown>): R
 
 export function hashDurablePayload(payload: Record<string, unknown>): string {
   return createHash("sha256").update(canonicalJson(authoritativeDurablePayload(payload))).digest("hex");
+}
+
+/** Deterministic integrity proof for a checkpoint payload. */
+export function hashCheckpointPayload(payload: Record<string, unknown>): string {
+  const { contentHash: _contentHash, checkpointContentHash: _checkpointContentHash, ...content } = payload;
+  return createHash("sha256").update(canonicalJson(content)).digest("hex");
+}
+
+export interface CompactedOperationKey extends DurableTransition {
+  expiresAt: string;
+}
+
+export interface DurableCompactionResult {
+  deleted: number;
+  cursor: number;
+  highWater: number;
+  compactedOperationKeys: number;
 }
 
 export function derivedAuditEventId(kind: string, authorityId: string): string {

@@ -113,6 +113,14 @@ export const engineEnvSchema = z.object({
   RETENTION_CYCLE_BUDGET_MS: z.coerce.number().int().positive().default(250),
   RETENTION_MAX_BATCHES_PER_CYCLE: z.coerce.number().int().positive().default(20),
   RETENTION_MAX_ROWS_PER_CYCLE: z.coerce.number().int().positive().default(4_000),
+  RETENTION_COMPACTION_ENABLED: z.preprocess(
+    (value) => value === undefined ? undefined : value === true || value === "true" || value === "1",
+    z.boolean().optional(),
+  ).default(false),
+  RETENTION_ANALYTICS_ROLLUP_ENABLED: z.preprocess(
+    (value) => value === undefined ? undefined : value === true || value === "true" || value === "1",
+    z.boolean().optional(),
+  ).default(false),
 });
 export type EngineEnv = z.infer<typeof engineEnvSchema>;
 

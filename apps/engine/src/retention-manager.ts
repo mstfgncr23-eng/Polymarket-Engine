@@ -9,6 +9,7 @@ import {
   type EngineEnv,
 } from "@pm/core";
 import { isCanonicalFinalReport, type EventJournal } from "@pm/db";
+import { loadVerifiedAnalyticsRollup } from "./final-report.js";
 
 export interface RetentionConfig {
   enabled: boolean;
@@ -21,6 +22,10 @@ export interface RetentionConfig {
   cycleBudgetMs: number;
   maxBatchesPerCycle: number;
   maxRowsPerCycle: number;
+  compactionEnabled: boolean;
+  analyticsRollupEnabled: boolean;
+  compactionReplayKeyTtlMs: number;
+  compactionReplayKeyLimit: number;
 }
 
 export type RetentionExperiment = { id: string; status: string; startedAt?: string | null } | null;
@@ -44,7 +49,8 @@ export interface RetentionCycleResult {
   lastBatchDurationMs: number;
   transientEligible: boolean;
   monitorOnlyEligible: boolean;
-  durableTransitionsPruned: false;
+  durableTransitionsPruned: boolean;
+  durableCompaction?: { deleted: number; cursor: number; highWater: number; compactedOperationKeys: number };
   eligibleBacklog: number;
 }
 
@@ -59,6 +65,8 @@ type RetentionEnv = Pick<EngineEnv,
   | "RETENTION_CYCLE_BUDGET_MS"
   | "RETENTION_MAX_BATCHES_PER_CYCLE"
   | "RETENTION_MAX_ROWS_PER_CYCLE"
+  | "RETENTION_COMPACTION_ENABLED"
+  | "RETENTION_ANALYTICS_ROLLUP_ENABLED"
 >;
 
 export function retentionConfigFromEngineEnv(env: RetentionEnv): RetentionConfig {
@@ -73,6 +81,8 @@ export function retentionConfigFromEngineEnv(env: RetentionEnv): RetentionConfig
     cycleBudgetMs: env.RETENTION_CYCLE_BUDGET_MS,
     maxBatchesPerCycle: env.RETENTION_MAX_BATCHES_PER_CYCLE,
     maxRowsPerCycle: env.RETENTION_MAX_ROWS_PER_CYCLE,
+    compactionEnabled: env.RETENTION_COMPACTION_ENABLED,
+    analyticsRollupEnabled: env.RETENTION_ANALYTICS_ROLLUP_ENABLED,
   });
 }
 
@@ -92,6 +102,10 @@ export function defaultRetentionConfig(overrides: Partial<RetentionConfig> = {})
     cycleBudgetMs: overrides.cycleBudgetMs ?? RETENTION_DEFAULTS.cycleBudgetMs,
     maxBatchesPerCycle: overrides.maxBatchesPerCycle ?? RETENTION_DEFAULTS.maxBatchesPerCycle,
     maxRowsPerCycle: overrides.maxRowsPerCycle ?? RETENTION_DEFAULTS.maxRowsPerCycle,
+    compactionEnabled: overrides.compactionEnabled ?? false,
+    analyticsRollupEnabled: overrides.analyticsRollupEnabled ?? false,
+    compactionReplayKeyTtlMs: overrides.compactionReplayKeyTtlMs ?? 7 * 24 * 60 * 60_000,
+    compactionReplayKeyLimit: overrides.compactionReplayKeyLimit ?? 4_096,
   };
   assertMcpIdempotencyTtlSafe(config.mcpIdempotencyTtlMs);
   return config;
@@ -164,7 +178,7 @@ export class RetentionManager {
   async runCycle(context: RetentionContext): Promise<RetentionCycleResult> {
     const started = Date.now();
     const deletedByClass: Record<string, number> = {
-      raw_telemetry: 0, monitor_control: 0, mcp_idempotency: 0, checkpoint: 0,
+      raw_telemetry: 0, monitor_control: 0, mcp_idempotency: 0, checkpoint: 0, canonical_report_input: 0,
     };
     const empty: RetentionCycleResult = {
       skipped: true, skipReason: null, deletedByClass, failures: 0, durationMs: 0,
@@ -277,12 +291,54 @@ export class RetentionManager {
         if (drains.every((item) => item.exhausted)) break;
       }
 
+      // A completed experiment's canonical detail is eligible only after a
+      // verified accumulator rollup covers a source fence. Leave the fence
+      // event and all newer tail rows hot for report reconstruction.
+      if (
+        this.config.analyticsRollupEnabled
+        && context.experiment?.status === "COMPLETED"
+        && this.journal.loadAnalyticsRollup
+        && this.journal.deleteCanonicalEventsThrough
+      ) {
+        const rollup = await loadVerifiedAnalyticsRollup(this.journal, context.experiment.id, "canonical");
+        if (rollup?.verified && rollup.sourceFenceOccurredAt && rollup.sourceCursor >= 0) {
+          await runBatch("canonical_report_input", (limit) => this.journal.deleteCanonicalEventsThrough!({
+            experimentId: context.experiment!.id,
+            occurredBefore: new Date(rollup.sourceFenceOccurredAt!),
+            limit,
+            sourceCursor: rollup.sourceCursor,
+          }));
+        }
+      }
+
+      // Durable transitions may be compacted only behind a verified recovery
+      // snapshot. Keep the newest two verified snapshots so recovery always
+      // has a rollback point while allowing the durable hot tail to drain.
+      let durableCompaction: RetentionCycleResult["durableCompaction"];
+      if (
+        this.config.compactionEnabled
+        && this.journal.compactDurableTransitionsThrough
+        && this.journal.listVerifiedCheckpoints
+      ) {
+        const verified = await this.journal.listVerifiedCheckpoints();
+        const compactionCheckpoint = verified[1];
+        const cursorValue = compactionCheckpoint?.payload.durableCursor;
+        const cursor = typeof cursorValue === "number" && Number.isInteger(cursorValue) ? cursorValue : null;
+        if (cursor != null && cursor > 0) {
+          durableCompaction = await this.journal.compactDurableTransitionsThrough(cursor, {
+            ttlMs: this.config.compactionReplayKeyTtlMs,
+            maxReplayKeys: this.config.compactionReplayKeyLimit,
+          });
+        }
+      }
+
       this.lastSuccessAt.value = context.now.toISOString();
       this.metrics?.noteLastSuccess?.(this.lastSuccessAt.value);
       return {
         skipped: false, skipReason: null, deletedByClass, failures, durationMs: Date.now() - started,
         batchCount, lastBatchSize, lastBatchDurationMs, transientEligible, monitorOnlyEligible,
-        durableTransitionsPruned: false,
+        durableTransitionsPruned: Boolean(durableCompaction?.deleted),
+        durableCompaction,
         eligibleBacklog: telemetryEligible.count + monitorEligibleCount.count,
       };
     } catch (error) {
@@ -302,6 +358,6 @@ export class RetentionManager {
 }
 
 export const PROTECTED_FROM_CLEANUP = {
-  durableTransitions: "NEVER — recovery-authoritative; no DELETE in Step-4",
+  durableTransitions: "Only behind verified recovery snapshots; compacted operation-key authority is retained",
   auditCritical: AUDIT_CRITICAL_EVENT_TYPES,
 } as const;

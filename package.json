@@ -19,6 +19,7 @@
     "smoke:live": "pnpm --filter @pm/engine smoke:live",
     "experiment:start": "pnpm --filter @pm/engine experiment:start",
     "report": "pnpm --filter @pm/engine report",
+    "archive:export": "pnpm --filter @pm/engine archive:export",
     "bench:stability": "tsx scripts/stability-hot-path-bench.ts",
     "bench:sustained": "tsx scripts/sustained-capacity-harness.ts",
     "bench:retention": "tsx scripts/report-retention-bench.ts"

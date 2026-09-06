@@ -141,3 +141,28 @@ export const durableTransitions = pgTable("durable_transitions", {
   uniqueIndex("durable_transitions_operation_key_uidx").on(table.operationKey),
   index("durable_transitions_sequence_idx").on(table.sequence),
 ]);
+
+/** Singleton monotonic high-water and bounded compaction-key index. */
+export const durableSequenceMetadata = pgTable("durable_sequence_metadata", {
+  id: integer("id").primaryKey(),
+  highWater: bigint("high_water", { mode: "number" }).notNull().default(0),
+  compactedOperationKeys: jsonb("compacted_operation_keys").notNull().default({}),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+/** Versioned, verified analytics accumulator; raw source may be deleted only after this row is durable. */
+export const experimentReportRollups = pgTable("experiment_report_rollups", {
+  experimentId: text("experiment_id").notNull(),
+  rollupKind: text("rollup_kind").notNull(),
+  schemaVersion: integer("schema_version").notNull(),
+  sourceCursor: bigint("source_cursor", { mode: "number" }).notNull(),
+  sourceFenceId: text("source_fence_id"),
+  sourceFenceOccurredAt: timestamp("source_fence_occurred_at", { withTimezone: true }),
+  accumulator: jsonb("accumulator").notNull(),
+  contentHash: text("content_hash").notNull(),
+  verified: boolean("verified").notNull().default(false),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  primaryKey({ name: "experiment_report_rollups_pkey", columns: [table.experimentId, table.rollupKind] }),
+  index("experiment_report_rollups_cursor_idx").on(table.sourceCursor),
+]);

@@ -3,6 +3,7 @@ import { drizzle } from "drizzle-orm/postgres-js";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
 import postgres from "postgres";
 import {
+  CANONICAL_REPORT_INPUT_EVENT_TYPES,
   compareJournalEventOrder, createId, EVENT_PAGE_SIZE, EVENT_SCAN_CEILING, isProtectedJournalType,
   journalEventSchema, sortJournalEventsChronologically,
   type JournalEvent, type JournalKeysetCursor, type JournalKeysetQuery, type JournalQuery,
@@ -11,10 +12,13 @@ import {
   CheckpointFenceError,
   DURABLE_MUTATION_LOCK_ID,
   DurableCursorBehindError,
+  hashCheckpointPayload,
   durableTransitionInputSchema,
   hashDurablePayload,
   IdempotencyConflictError,
   type DurableCommitResult,
+  type CompactedOperationKey,
+  type DurableCompactionResult,
   type DurableTransition,
   type DurableTransitionInput,
 } from "./durable.js";
@@ -26,7 +30,7 @@ import {
   type DurableExperimentReportInput,
   type PersistReportResult,
 } from "./reports.js";
-import { durableTransitions, engineCheckpoints, experimentReports, journalEvents, mcpIdempotencyKeys } from "./schema.js";
+import { durableSequenceMetadata, durableTransitions, engineCheckpoints, experimentReportRollups, experimentReports, journalEvents, mcpIdempotencyKeys } from "./schema.js";
 import {
   journalMayMaintain,
   journalMayMigrate,
@@ -47,6 +51,22 @@ export interface EngineCheckpoint {
   experimentId: string | null;
   sequence: number;
   payload: Record<string, unknown>;
+  createdAt: string;
+  /** Present for PR18 verified snapshots; absent on legacy checkpoints. */
+  contentHash?: string;
+  verified?: boolean;
+}
+
+export interface AnalyticsRollup {
+  experimentId: string;
+  rollupKind: string;
+  schemaVersion: number;
+  sourceCursor: number;
+  sourceFenceId: string | null;
+  sourceFenceOccurredAt: string | null;
+  accumulator: Record<string, unknown>;
+  contentHash: string;
+  verified: boolean;
   createdAt: string;
 }
 
@@ -155,6 +175,12 @@ export interface EventJournal {
   latestDurableSequence(): Promise<number>;
   saveCheckpoint(checkpoint: Omit<EngineCheckpoint, "id" | "createdAt">): Promise<EngineCheckpoint>;
   loadLatestCheckpoint(): Promise<EngineCheckpoint | null>;
+  /** Snapshot/compaction APIs are optional so legacy journal adapters remain valid. */
+  compactDurableTransitionsThrough?(cursor: number, options?: { maxReplayKeys?: number; ttlMs?: number }): Promise<DurableCompactionResult>;
+  listVerifiedCheckpoints?(): Promise<EngineCheckpoint[]>;
+  persistAnalyticsRollup?(rollup: AnalyticsRollup): Promise<AnalyticsRollup>;
+  loadAnalyticsRollup?(experimentId: string, rollupKind?: string): Promise<AnalyticsRollup | null>;
+  deleteCanonicalEventsThrough?(input: { experimentId: string; occurredBefore?: Date; limit: number; sourceCursor: number }): Promise<{ deleted: number }>;
   countEligible(types: readonly string[], occurredBefore: Date): Promise<{ count: number; oldestOccurredAt: string | null }>;
   withReadSnapshot<T>(work: (journal: EventJournalKeyset) => Promise<T>): Promise<{ value: T; stable: boolean }>;
   latestCommitSeq(): Promise<number>;
@@ -182,8 +208,11 @@ export class MemoryEventJournal implements EventJournal {
   private readonly checkpoints: EngineCheckpoint[] = [];
   private readonly idempotencyKeys = new Map<string, string>();
   private readonly reports = new Map<string, DurableExperimentReport>();
+  private readonly rollups = new Map<string, AnalyticsRollup>();
   private readonly durableRows: DurableTransition[] = [];
   private readonly durableByKey = new Map<string, DurableTransition>();
+  private readonly compactedByKey = new Map<string, CompactedOperationKey>();
+  private durableHighWater = 0;
   private readonly maxEvents: number;
   private readonly maxMutations: number;
   private durableChain = Promise.resolve();
@@ -473,7 +502,7 @@ export class MemoryEventJournal implements EventJournal {
     return structuredClone(this.durableRows.filter((row) => row.sequence > sequence).slice(0, cap));
   }
   async readDurableByOperationKey(operationKey: string): Promise<DurableTransition | null> {
-    const existing = this.durableByKey.get(operationKey);
+    const existing = this.durableByKey.get(operationKey) ?? this.compactedByKey.get(operationKey);
     return existing ? structuredClone(existing) : null;
   }
   async queryDurableTransitions(query: { types?: readonly string[]; afterSequence?: number; limit: number }): Promise<DurableTransition[]> {
@@ -488,17 +517,20 @@ export class MemoryEventJournal implements EventJournal {
     return event ? structuredClone(event) : null;
   }
   async latestDurableSequence(): Promise<number> {
-    return this.durableRows.length === 0 ? 0 : this.durableRows[this.durableRows.length - 1]!.sequence;
+    return this.durableHighWater;
   }
   async saveCheckpoint(checkpoint: Omit<EngineCheckpoint, "id" | "createdAt">): Promise<EngineCheckpoint> {
     assertJournalCapability(this.access, "runtime-write", "saveCheckpoint");
     return this.withDurableLock(() => {
       const cursor = typeof checkpoint.payload.durableCursor === "number" ? checkpoint.payload.durableCursor : null;
       if (cursor != null) {
-        const latest = this.durableRows.length === 0 ? 0 : this.durableRows[this.durableRows.length - 1]!.sequence;
+        const latest = this.durableHighWater;
         if (cursor !== latest) throw new CheckpointFenceError(cursor, latest);
       }
-      const stored = { ...structuredClone(checkpoint), id: createId("checkpoint"), createdAt: new Date().toISOString() };
+      const payload = structuredClone(checkpoint.payload);
+      const contentHash = hashCheckpointPayload(payload);
+      payload.checkpointContentHash = contentHash;
+      const stored = { ...structuredClone(checkpoint), payload, contentHash, verified: true, id: createId("checkpoint"), createdAt: new Date().toISOString() };
       this.checkpoints.push(stored);
       return structuredClone(stored);
     });
@@ -506,6 +538,67 @@ export class MemoryEventJournal implements EventJournal {
   async loadLatestCheckpoint(): Promise<EngineCheckpoint | null> {
     const latest = this.checkpoints.toSorted((a, b) => b.sequence - a.sequence)[0];
     return latest ? structuredClone(latest) : null;
+  }
+  async listVerifiedCheckpoints(): Promise<EngineCheckpoint[]> {
+    const rows = this.checkpoints.filter((row) => row.verified && row.contentHash && hashCheckpointPayload(row.payload) === row.contentHash);
+    return structuredClone(rows.sort((a, b) => b.sequence - a.sequence));
+  }
+  async compactDurableTransitionsThrough(cursor: number, options: { maxReplayKeys?: number; ttlMs?: number } = {}): Promise<DurableCompactionResult> {
+    assertJournalCapability(this.access, "maintenance", "compactDurableTransitionsThrough");
+    const target = Math.max(0, Math.floor(cursor));
+    if (target <= 0) return { deleted: 0, cursor: target, highWater: this.durableHighWater, compactedOperationKeys: 0 };
+    if (target > this.durableHighWater) throw new CheckpointFenceError(target, this.durableHighWater);
+    const ttl = Math.max(60_000, options.ttlMs ?? 7 * 24 * 60 * 60_000);
+    const maxKeys = Math.max(0, Math.floor(options.maxReplayKeys ?? 4_096));
+    const victims = this.durableRows.filter((row) => row.sequence <= target);
+    const now = Date.now();
+    for (const row of victims) {
+      if (maxKeys > 0) this.compactedByKey.set(row.operationKey, { ...row, expiresAt: new Date(now + ttl).toISOString() });
+      this.durableByKey.delete(row.operationKey);
+    }
+    while (this.compactedByKey.size > maxKeys) {
+      const oldest = [...this.compactedByKey.values()].sort((a, b) => a.sequence - b.sequence)[0];
+      if (!oldest) break;
+      this.compactedByKey.delete(oldest.operationKey);
+    }
+    for (const [key, row] of [...this.compactedByKey.entries()]) {
+      if (Date.parse(row.expiresAt) <= now) this.compactedByKey.delete(key);
+    }
+    if (victims.length > 0) {
+      this.durableRows.splice(0, victims.length);
+      this.recordMutation(`compactDurableTransitionsThrough:${victims.length}`);
+    }
+    return { deleted: victims.length, cursor: target, highWater: this.durableHighWater, compactedOperationKeys: this.compactedByKey.size };
+  }
+  async persistAnalyticsRollup(rollup: AnalyticsRollup): Promise<AnalyticsRollup> {
+    const stored = structuredClone(rollup);
+    // Memory journal keeps one versioned row per experiment/kind.
+    const map = this.rollups;
+    const key = `${stored.experimentId}:${stored.rollupKind}`;
+    const existing = map.get(key);
+    if (existing && existing.contentHash !== stored.contentHash) throw new Error("ANALYTICS_ROLLUP_CONFLICT");
+    map.set(key, stored);
+    return structuredClone(existing ?? stored);
+  }
+  async loadAnalyticsRollup(experimentId: string, rollupKind = "canonical"): Promise<AnalyticsRollup | null> {
+    const row = this.rollups.get(`${experimentId}:${rollupKind}`);
+    return row ? structuredClone(row) : null;
+  }
+  async deleteCanonicalEventsThrough(input: { experimentId: string; occurredBefore?: Date; limit: number; sourceCursor: number }): Promise<{ deleted: number }> {
+    assertJournalCapability(this.access, "maintenance", "deleteCanonicalEventsThrough");
+    const cap = Math.max(0, Math.floor(input.limit));
+    const before = input.occurredBefore?.getTime() ?? Number.POSITIVE_INFINITY;
+    const victims = this.events.filter((event) => CANONICAL_REPORT_INPUT_EVENT_TYPES.includes(event.type as (typeof CANONICAL_REPORT_INPUT_EVENT_TYPES)[number]))
+      .filter((event) => (event.payload as { experimentId?: unknown }).experimentId === input.experimentId && Date.parse(event.occurredAt) < before)
+      .slice(0, cap);
+    const ids = new Set(victims.map((event) => event.id));
+    for (let i = this.events.length - 1; i >= 0; i -= 1) if (ids.has(this.events[i]!.id)) {
+      this.eventIds.delete(this.events[i]!.id);
+      this.commitSeqById.delete(this.events[i]!.id);
+      this.events.splice(i, 1);
+    }
+    this.recordMutation(`deleteCanonicalEventsThrough:${victims.length}`);
+    return { deleted: victims.length };
   }
   async close(): Promise<void> {}
 
@@ -533,7 +626,7 @@ export class MemoryEventJournal implements EventJournal {
   private commitDurableTransitionUnlocked(input: DurableTransitionInput, expectedPreviousSequence: number): DurableCommitResult {
     const parsed = durableTransitionInputSchema.parse(input);
     const payloadHash = hashDurablePayload(parsed.payload);
-    const existing = this.durableByKey.get(parsed.operationKey);
+    const existing = this.durableByKey.get(parsed.operationKey) ?? this.compactedByKey.get(parsed.operationKey);
     if (existing) {
       if (
         existing.type !== parsed.type
@@ -551,7 +644,7 @@ export class MemoryEventJournal implements EventJournal {
         transition: structuredClone(existing),
       };
     }
-    const latest = this.durableRows.length === 0 ? 0 : this.durableRows[this.durableRows.length - 1]!.sequence;
+    const latest = this.durableHighWater;
     if (latest !== expectedPreviousSequence) {
       throw new DurableCursorBehindError(expectedPreviousSequence, latest);
     }
@@ -574,6 +667,7 @@ export class MemoryEventJournal implements EventJournal {
     };
     this.durableRows.push(row);
     this.durableByKey.set(parsed.operationKey, row);
+    this.durableHighWater = row.sequence;
     return {
       sequence: row.sequence,
       operationKey: parsed.operationKey,
@@ -913,10 +1007,20 @@ export class PostgresEventJournal implements EventJournal {
   }
   async listCheckpoints(): Promise<EngineCheckpoint[]> {
     const rows = await this.db.select().from(engineCheckpoints).orderBy(desc(engineCheckpoints.sequence)).limit(64);
-    return rows.map((row) => ({
-      id: row.id, experimentId: row.experimentId, sequence: row.sequence,
-      payload: row.payload as Record<string, unknown>, createdAt: row.createdAt.toISOString(),
-    }));
+    return rows.map((row) => {
+      const payload = row.payload as Record<string, unknown>;
+      const contentHash = typeof payload.checkpointContentHash === "string" ? payload.checkpointContentHash : undefined;
+      return {
+        id: row.id, experimentId: row.experimentId, sequence: row.sequence, payload,
+        createdAt: row.createdAt.toISOString(),
+        ...(contentHash ? { contentHash } : {}),
+        verified: Boolean(contentHash && hashCheckpointPayload(payload) === contentHash),
+      };
+    });
+  }
+  async listVerifiedCheckpoints(): Promise<EngineCheckpoint[]> {
+    const rows = await this.listCheckpoints();
+    return rows.filter((row) => row.verified && row.contentHash).sort((a, b) => b.sequence - a.sequence);
   }
   async commitDurableTransition(input: DurableTransitionInput, expectedPreviousSequence: number): Promise<DurableCommitResult> {
     assertJournalCapability(this.access, "runtime-write", "commitDurableTransition");
@@ -928,6 +1032,16 @@ export class PostgresEventJournal implements EventJournal {
       const existingRows = await tx.select().from(durableTransitions)
         .where(eq(durableTransitions.operationKey, parsed.operationKey)).limit(1);
       const existing = existingRows[0];
+      const compactedRows = existing ? [] : await tx.select({ compacted: durableSequenceMetadata.compactedOperationKeys })
+        .from(durableSequenceMetadata).where(eq(durableSequenceMetadata.id, 1)).limit(1);
+      const compacted = compactedRows[0]?.compacted as Record<string, CompactedOperationKey> | undefined;
+      const compactedExisting = compacted?.[parsed.operationKey];
+      if (!existing && compactedExisting && Date.parse(compactedExisting.expiresAt) > Date.now()) {
+        if (compactedExisting.type !== parsed.type || compactedExisting.aggregateType !== parsed.aggregateType || compactedExisting.aggregateId !== parsed.aggregateId || compactedExisting.payloadHash !== payloadHash) {
+          throw new IdempotencyConflictError(parsed.operationKey, compactedExisting.type, parsed.type);
+        }
+        return { sequence: compactedExisting.sequence, operationKey: parsed.operationKey, inserted: false, existing: true, transition: structuredClone(compactedExisting) };
+      }
       if (existing) {
         if (
           existing.type !== parsed.type
@@ -945,10 +1059,9 @@ export class PostgresEventJournal implements EventJournal {
           transition: toDurableTransition(existing),
         };
       }
-      const latestRows = await tx.select({
-        max: sql<number>`coalesce(max(${durableTransitions.sequence}), 0)`,
-      }).from(durableTransitions);
-      const latest = Number(latestRows[0]?.max ?? 0);
+      await tx.insert(durableSequenceMetadata).values({ id: 1, highWater: 0 }).onConflictDoNothing();
+      const latestRows = await tx.select({ highWater: durableSequenceMetadata.highWater }).from(durableSequenceMetadata).where(eq(durableSequenceMetadata.id, 1)).limit(1);
+      const latest = Number(latestRows[0]?.highWater ?? 0);
       if (latest !== expectedPreviousSequence) {
         throw new DurableCursorBehindError(expectedPreviousSequence, latest);
       }
@@ -965,6 +1078,7 @@ export class PostgresEventJournal implements EventJournal {
       const row = inserted[0];
       if (!row) throw new Error("DURABLE_TRANSITION_INSERT_FAILED");
       const transition = toDurableTransition(row);
+      await tx.update(durableSequenceMetadata).set({ highWater: latest + 1, updatedAt: new Date() }).where(eq(durableSequenceMetadata.id, 1));
       return {
         sequence: transition.sequence,
         operationKey: parsed.operationKey,
@@ -986,7 +1100,13 @@ export class PostgresEventJournal implements EventJournal {
     const rows = await this.db.select().from(durableTransitions)
       .where(eq(durableTransitions.operationKey, operationKey)).limit(1);
     const row = rows[0];
-    return row ? toDurableTransition(row) : null;
+    if (row) return toDurableTransition(row);
+    const meta = await this.db.select({ compacted: durableSequenceMetadata.compactedOperationKeys })
+      .from(durableSequenceMetadata).where(eq(durableSequenceMetadata.id, 1)).limit(1);
+    const map = meta[0]?.compacted as Record<string, CompactedOperationKey> | undefined;
+    const compacted = map?.[operationKey];
+    if (!compacted || Date.parse(compacted.expiresAt) <= Date.now()) return null;
+    return structuredClone(compacted);
   }
   async queryDurableTransitions(query: { types?: readonly string[]; afterSequence?: number; limit: number }): Promise<DurableTransition[]> {
     const after = query.afterSequence ?? 0;
@@ -1005,33 +1125,100 @@ export class PostgresEventJournal implements EventJournal {
     return row ? toJournalEvent(row) : null;
   }
   async latestDurableSequence(): Promise<number> {
-    const rows = await this.db.select({
-      max: sql<number>`coalesce(max(${durableTransitions.sequence}), 0)`,
-    }).from(durableTransitions);
-    return Number(rows[0]?.max ?? 0);
+    const rows = await this.db.select({ highWater: durableSequenceMetadata.highWater }).from(durableSequenceMetadata).where(eq(durableSequenceMetadata.id, 1)).limit(1);
+    if (rows[0]) return Number(rows[0].highWater);
+    const fallback = await this.db.select({ max: sql<number>`coalesce(max(${durableTransitions.sequence}), 0)` }).from(durableTransitions);
+    return Number(fallback[0]?.max ?? 0);
+  }
+  async compactDurableTransitionsThrough(cursor: number, options: { maxReplayKeys?: number; ttlMs?: number } = {}): Promise<DurableCompactionResult> {
+    assertJournalCapability(this.access, "maintenance", "compactDurableTransitionsThrough");
+    const target = Math.max(0, Math.floor(cursor));
+    const ttl = Math.max(60_000, options.ttlMs ?? 7 * 24 * 60 * 60_000);
+    const maxKeys = Math.max(0, Math.floor(options.maxReplayKeys ?? 4_096));
+    return this.db.transaction(async (tx) => {
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(${DURABLE_MUTATION_LOCK_ID})`);
+      await tx.insert(durableSequenceMetadata).values({ id: 1, highWater: 0 }).onConflictDoNothing();
+      const current = await tx.select({ compacted: durableSequenceMetadata.compactedOperationKeys, highWater: durableSequenceMetadata.highWater }).from(durableSequenceMetadata).where(eq(durableSequenceMetadata.id, 1)).limit(1);
+      const highWater = Number(current[0]?.highWater ?? 0);
+      if (target > highWater) throw new CheckpointFenceError(target, highWater);
+      const rows = await tx.select().from(durableTransitions).where(lte(durableTransitions.sequence, target)).orderBy(asc(durableTransitions.sequence)).limit(Math.min(maxKeys || 10_000, 10_000));
+      const map: Record<string, CompactedOperationKey> = (current[0]?.compacted as Record<string, CompactedOperationKey> | null) ?? {};
+      const expiresAt = new Date(Date.now() + ttl).toISOString();
+      for (const row of rows) {
+        map[row.operationKey] = { ...toDurableTransition(row), expiresAt };
+      }
+      const eligible = Object.entries(map).filter(([, row]) => Date.parse(row.expiresAt) > Date.now()).sort((a, b) => a[1].sequence - b[1].sequence);
+      const entries = maxKeys > 0 ? eligible.slice(-maxKeys) : [];
+      const bounded = Object.fromEntries(entries);
+      if (rows.length > 0) {
+        await tx.delete(durableTransitions).where(inArray(durableTransitions.operationKey, rows.map((row) => row.operationKey)));
+        await tx.update(durableSequenceMetadata).set({ compactedOperationKeys: bounded, updatedAt: new Date() }).where(eq(durableSequenceMetadata.id, 1));
+      }
+      return { deleted: rows.length, cursor: target, highWater, compactedOperationKeys: Object.keys(bounded).length };
+    });
+  }
+  async persistAnalyticsRollup(rollup: AnalyticsRollup): Promise<AnalyticsRollup> {
+    const rows = await this.db.insert(experimentReportRollups).values({
+      experimentId: rollup.experimentId, rollupKind: rollup.rollupKind, schemaVersion: rollup.schemaVersion,
+      sourceCursor: rollup.sourceCursor, sourceFenceId: rollup.sourceFenceId,
+      sourceFenceOccurredAt: rollup.sourceFenceOccurredAt ? new Date(rollup.sourceFenceOccurredAt) : null,
+      accumulator: rollup.accumulator, contentHash: rollup.contentHash, verified: rollup.verified,
+      createdAt: new Date(rollup.createdAt),
+    }).onConflictDoNothing({ target: [experimentReportRollups.experimentId, experimentReportRollups.rollupKind] }).returning();
+    const row = rows[0] ?? (await this.db.select().from(experimentReportRollups).where(and(eq(experimentReportRollups.experimentId, rollup.experimentId), eq(experimentReportRollups.rollupKind, rollup.rollupKind))).limit(1))[0];
+    if (!row) throw new Error("ANALYTICS_ROLLUP_WRITE_FAILED");
+    if (row.contentHash !== rollup.contentHash) throw new Error("ANALYTICS_ROLLUP_CONFLICT");
+    return {
+      experimentId: row.experimentId, rollupKind: row.rollupKind, schemaVersion: row.schemaVersion, sourceCursor: Number(row.sourceCursor),
+      sourceFenceId: row.sourceFenceId, sourceFenceOccurredAt: row.sourceFenceOccurredAt?.toISOString() ?? null,
+      accumulator: row.accumulator as Record<string, unknown>, contentHash: row.contentHash, verified: row.verified, createdAt: row.createdAt.toISOString(),
+    };
+  }
+  async loadAnalyticsRollup(experimentId: string, rollupKind = "canonical"): Promise<AnalyticsRollup | null> {
+    const rows = await this.db.select().from(experimentReportRollups).where(and(eq(experimentReportRollups.experimentId, experimentId), eq(experimentReportRollups.rollupKind, rollupKind))).limit(1);
+    const row = rows[0];
+    return row ? { experimentId: row.experimentId, rollupKind: row.rollupKind, schemaVersion: row.schemaVersion, sourceCursor: Number(row.sourceCursor), sourceFenceId: row.sourceFenceId, sourceFenceOccurredAt: row.sourceFenceOccurredAt?.toISOString() ?? null, accumulator: row.accumulator as Record<string, unknown>, contentHash: row.contentHash, verified: row.verified, createdAt: row.createdAt.toISOString() } : null;
+  }
+  async deleteCanonicalEventsThrough(input: { experimentId: string; occurredBefore?: Date; limit: number; sourceCursor: number }): Promise<{ deleted: number }> {
+    assertJournalCapability(this.access, "maintenance", "deleteCanonicalEventsThrough");
+    const cap = Math.max(0, Math.min(500, Math.floor(input.limit)));
+    if (cap <= 0) return { deleted: 0 };
+    const before = input.occurredBefore ?? new Date();
+    const types = [...CANONICAL_REPORT_INPUT_EVENT_TYPES] as string[];
+    const result = await this.client`
+      DELETE FROM journal_events
+      WHERE id IN (
+        SELECT id FROM journal_events
+        WHERE type = ANY(${types}) AND (payload->>'experimentId') = ${input.experimentId}
+          AND occurred_at < ${before}
+        ORDER BY occurred_at ASC, id ASC LIMIT ${cap}
+      )`;
+    return { deleted: result.count ?? 0 };
   }
   async saveCheckpoint(checkpoint: Omit<EngineCheckpoint, "id" | "createdAt">): Promise<EngineCheckpoint> {
     assertJournalCapability(this.access, "runtime-write", "saveCheckpoint");
     const id = createId("checkpoint");
-    const cursor = typeof checkpoint.payload.durableCursor === "number" ? checkpoint.payload.durableCursor : null;
+    const payload = structuredClone(checkpoint.payload);
+    const contentHash = hashCheckpointPayload(payload);
+    payload.checkpointContentHash = contentHash;
+    const cursor = typeof payload.durableCursor === "number" ? payload.durableCursor : null;
     const toCheckpoint = (row: typeof engineCheckpoints.$inferSelect): EngineCheckpoint => ({
       id: row.id, experimentId: row.experimentId, sequence: row.sequence,
-      payload: row.payload as Record<string, unknown>, createdAt: row.createdAt.toISOString(),
+      payload: row.payload as Record<string, unknown>, createdAt: row.createdAt.toISOString(), contentHash, verified: true,
     });
     if (cursor == null) {
-      const rows = await this.db.insert(engineCheckpoints).values({ id, ...checkpoint }).returning();
+      const rows = await this.db.insert(engineCheckpoints).values({ id, ...checkpoint, payload }).returning();
       const row = rows[0];
       if (!row) throw new Error("CHECKPOINT_WRITE_FAILED");
       return toCheckpoint(row);
     }
     return this.db.transaction(async (tx) => {
       await tx.execute(sql`SELECT pg_advisory_xact_lock(${DURABLE_MUTATION_LOCK_ID})`);
-      const latestRows = await tx.select({
-        max: sql<number>`coalesce(max(${durableTransitions.sequence}), 0)`,
-      }).from(durableTransitions);
-      const latest = Number(latestRows[0]?.max ?? 0);
+      await tx.insert(durableSequenceMetadata).values({ id: 1, highWater: 0 }).onConflictDoNothing();
+      const latestRows = await tx.select({ highWater: durableSequenceMetadata.highWater }).from(durableSequenceMetadata).where(eq(durableSequenceMetadata.id, 1)).limit(1);
+      const latest = Number(latestRows[0]?.highWater ?? 0);
       if (cursor !== latest) throw new CheckpointFenceError(cursor, latest);
-      const rows = await tx.insert(engineCheckpoints).values({ id, ...checkpoint }).returning();
+      const rows = await tx.insert(engineCheckpoints).values({ id, ...checkpoint, payload }).returning();
       const row = rows[0];
       if (!row) throw new Error("CHECKPOINT_WRITE_FAILED");
       return toCheckpoint(row);
@@ -1040,7 +1227,15 @@ export class PostgresEventJournal implements EventJournal {
   async loadLatestCheckpoint(): Promise<EngineCheckpoint | null> {
     const rows = await this.db.select().from(engineCheckpoints).orderBy(desc(engineCheckpoints.sequence)).limit(1);
     const row = rows[0];
-    return row ? { id: row.id, experimentId: row.experimentId, sequence: row.sequence, payload: row.payload as Record<string, unknown>, createdAt: row.createdAt.toISOString() } : null;
+    if (!row) return null;
+    const payload = row.payload as Record<string, unknown>;
+    const contentHash = typeof payload.checkpointContentHash === "string" ? payload.checkpointContentHash : undefined;
+    return {
+      id: row.id, experimentId: row.experimentId, sequence: row.sequence, payload,
+      createdAt: row.createdAt.toISOString(),
+      ...(contentHash ? { contentHash } : {}),
+      verified: Boolean(contentHash && hashCheckpointPayload(payload) === contentHash),
+    };
   }
   async countEligible(types: readonly string[], occurredBefore: Date): Promise<{ count: number; oldestOccurredAt: string | null }> {
     if (types.length === 0) return { count: 0, oldestOccurredAt: null };

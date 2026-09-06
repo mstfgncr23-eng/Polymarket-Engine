@@ -23,7 +23,7 @@ export interface CleanupLifecycleHints {
 
 export interface CleanupLifecycle {
   state: CleanupLifecycleState;
-  source: "durable_transitions" | "hint_verified" | "unresolved" | "legacy_journal";
+  source: "durable_transitions" | "verified_snapshot" | "hint_verified" | "unresolved" | "legacy_journal";
   experimentId: string | null;
   status: string | null;
   startedAt: string | null;
@@ -77,6 +77,36 @@ function applyLifecycleEvent(byId: Map<string, ExperimentRow>, type: string, id:
 
 async function loadDurableExperimentRows(journal: EventJournal): Promise<ExperimentRow[] | null> {
   try {
+    // Once the historical lifecycle prefix is compacted, the latest verified
+    // recovery snapshot plus its durable tail remains authoritative.
+    if (journal.listVerifiedCheckpoints) {
+      const checkpoints = await journal.listVerifiedCheckpoints();
+      const checkpoint = checkpoints[0];
+      if (checkpoint) {
+        const payload = checkpoint.payload;
+        const raw = payload.experiment;
+        const experiment = raw && typeof raw === "object" ? raw as Record<string, unknown> : null;
+        const id = typeof experiment?.id === "string" ? experiment.id : checkpoint.experimentId;
+        const byId = new Map<string, ExperimentRow>();
+        if (id) {
+          const status = typeof experiment?.status === "string" ? experiment.status : "";
+          const startedAt = typeof experiment?.startedAt === "string" ? experiment.startedAt : null;
+          const entryClosedAt = status === "ENTRY_CLOSED" && typeof experiment?.entryClosedAt === "string" ? experiment.entryClosedAt : null;
+          const completedAt = status === "COMPLETED" && typeof experiment?.completedAt === "string" ? experiment.completedAt : null;
+          const abortedAt = status === "ABORTED_START" && typeof experiment?.abortedAt === "string" ? experiment.abortedAt : null;
+          const validatedAt = status !== "ABORTED_START" && status !== "IDLE" ? (typeof experiment?.startValidatedAt === "string" ? experiment.startValidatedAt : startedAt) : null;
+          byId.set(id, { id, startedAt, entryClosedAt, completedAt, abortedAt, validatedAt });
+        }
+        const cursorValue = payload.durableCursor;
+        const cursor = typeof cursorValue === "number" && Number.isInteger(cursorValue) ? cursorValue : checkpoint.sequence;
+        const tail = await journal.readDurableTransitionsAfter(cursor, 10_000);
+        for (const row of tail) {
+          const rowId = experimentIdFromPayload(row.payload, row.aggregateId);
+          if (rowId) applyLifecycleEvent(byId, row.type, rowId, row.occurredAt, row.payload);
+        }
+        return [...byId.values()];
+      }
+    }
     const page = await pageDurableTransitionsByTypes(journal, LIFECYCLE_TYPES);
     if (page.overflow) return null;
     const byId = new Map<string, ExperimentRow>();
@@ -295,7 +325,7 @@ export async function resolveCleanupLifecycle(
     }
     return {
       state: "PROVEN_NO_ACTIVE_EXPERIMENT",
-      source: "durable_transitions",
+    source: "durable_transitions",
       experimentId: null,
       status: null,
       startedAt: null,

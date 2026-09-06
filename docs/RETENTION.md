@@ -119,12 +119,12 @@ Do not reintroduce a transactional `CREATE INDEX` on live `journal_events` insid
 
 | Class | What | Default | Delete? |
 |---|---|---|---|
-| Recovery-authoritative | `durable_transitions` | **PROTECTED** | **Never** in Step-4 |
+| Recovery-authoritative | verified checkpoints + `durable_transitions` tail | **BOUNDED** | Compact rows only at a fenced verified snapshot cursor; retain bounded expiring operation-key replay authority |
 | Checkpoints | `engine_checkpoints` | keep latest 8 | Only after a newer checkpoint is committed; never the latest usable row |
 | MCP idempotency | `mcp_idempotency_keys` | 24h TTL | Only after TTL > signal timestamp skew (5m) + trigger TTL (30s) + 1h margin |
 | Raw telemetry | `MARKET_SNAPSHOT`, `REFERENCE_TICK`, `MARKET_EVENT` | 6h (legacy rows only; the engine does not insert raw observations) | Yes. Paper fills/settlements are self-contained and are not in this class |
 | Monitor / control-plane | `TRIGGER_*`, `GROK_*`, `MCP_INTERACTION`, `SYSTEM_HEALTH_*`, `DISCOVERY_RECONCILED`, reference lifecycle | 24h | Canonical research is admitted only during an experiment window; see monitor lifecycle below |
-| Long-lived audit | Experiment lifecycle, `PAPER_*`, `POSITION_*`, `PAIR_REALIZED`, `PNL_SNAPSHOT`, risk/consensus/hedge/settlement, strategy change | retain | **No time-prune**. Uncertainty retains |
+| Long-lived audit | Experiment lifecycle, `PAPER_*`, `POSITION_*`, `PAIR_REALIZED`, `PNL_SNAPSHOT`, risk/consensus/hedge/settlement, strategy change | rollup/report or bounded tail | Delete only after verified rollup/final-report authority; uncertainty retains |
 
 ### Monitor lifecycle
 
@@ -136,7 +136,7 @@ Do not reintroduce a transactional `CREATE INDEX` on live `journal_events` insid
 | `ABORTED_START` | Terminal invalidated start; no in-window report-input remains and monitor cleanup is eligible |
 | `FAILED` / `UNKNOWN` / `CONFLICTING` | Monitor delete **forbidden**. `UNKNOWN` is never `PROVEN_NO_ACTIVE_EXPERIMENT`. |
 
-Operator `journal-cleanup` **always** resolves this table from durable journal rows (`EXPERIMENT_STARTED` / `EXPERIMENT_START_VALIDATED` / `EXPERIMENT_START_ABORTED` / `ENTRY_CLOSED` / `COMPLETED`). Env `EXPERIMENT_ID` / `EXPERIMENT_STATUS` / `EXPERIMENT_STARTED_AT` are hints verified against that state; mismatch fail-closes. Missing `EXPERIMENT_ID` is **not** treated as monitor-only. A query failure or incomplete lifecycle scan is `UNKNOWN` (fail closed), not no-active. In-process `RetentionManager` tests may still pass a caller-asserted `experiment=null` without lifecycle; the CLI never does.
+Operator `journal-cleanup` resolves this table from a verified recovery snapshot plus its durable tail when historical lifecycle rows have been compacted, and otherwise from durable journal rows (`EXPERIMENT_STARTED` / `EXPERIMENT_START_VALIDATED` / `EXPERIMENT_START_ABORTED` / `ENTRY_CLOSED` / `COMPLETED`). Env `EXPERIMENT_ID` / `EXPERIMENT_STATUS` / `EXPERIMENT_STARTED_AT` are hints verified against that state; mismatch fail-closes. Missing `EXPERIMENT_ID` is **not** treated as monitor-only. A query failure or incomplete lifecycle scan is `UNKNOWN` (fail closed), not no-active. In-process `RetentionManager` tests may still pass a caller-asserted `experiment=null` without lifecycle; the CLI never does.
 
 `REPORT_SOURCE_INTEGRITY_FAULT` / `REPAIRED` are `unknown_retain` control-plane events (not report-input, not hash contributors, never pruned).
 
@@ -173,7 +173,7 @@ Dry-run reports actual eligible candidates under configured horizons, still `mut
 - experiment protection state / monitor-only eligibility
 - canonical report + grace gate
 - protected audit count
-- `durable_transitions=PROTECTED_NO_DELETE`
+- verified snapshot cursor and bounded durable tail/compaction status
 - estimated bounded batches (`min(class estimates, applyBounds.maxBatches)`, not a per-class sum uncapped by APPLY)
 - `applyBounds`: global APPLY `maxBatches` / `maxRows` / `cycleBudgetMs` / `batchSize`
 
@@ -189,7 +189,7 @@ DATABASE_URL=… pnpm --filter @pm/engine exec tsx src/cli.ts journal-cleanup
 DATABASE_URL=… pnpm --filter @pm/engine exec tsx src/cli.ts journal-cleanup --apply --i-understand-destructive
 ```
 
-APPLY never touches `durable_transitions` or audit-critical paper/execution rows. It does **not** migrate. Operator cleanup **resolves experiment lifecycle from recovery-authoritative `durable_transitions`**. Derived journal `EXPERIMENT_STARTED` / `ENTRY_CLOSED` / `COMPLETED` rows are a cross-check only and must not override durable authority. Durable `EXPERIMENT_STARTED` without a derived journal audit (the `AFTER_APPLY_BEFORE_DERIVED_AUDIT` window) is still `ACTIVE_*`. Journal-only legacy lifecycle without durable rows is `UNKNOWN`, never `PROVEN_NO_ACTIVE_EXPERIMENT`. Only the absence of both durable lifecycle and legacy journal lifecycle is `PROVEN_NO_ACTIVE_EXPERIMENT`. `EXPERIMENT_ID` / `EXPERIMENT_STATUS` / `EXPERIMENT_STARTED_AT` are hints verified against durable state; mismatch fail-closes. Missing `EXPERIMENT_ID` is **not** monitor-only. `UNKNOWN` is never `PROVEN_NO_ACTIVE_EXPERIMENT`, forbids monitor delete, and refuses APPLY (query/scan could not prove lifecycle). `RUNNING` / `ENTRY_CLOSED` protect in-window report-input (missing `startedAt` forbids monitor delete). `COMPLETED` requires a canonical complete+non-truncated final plus grace. Only `PROVEN_NO_ACTIVE_EXPERIMENT` (and idle-without-start) is monitor-TTL eligible. Dry-run prints lifecycle `state/source/id/status/times/monitorDeleteAllowed/reason`. A `DATABASE_URL`-only APPLY while an experiment is active — including in the after-apply-before-derived-audit window — is SAFE: lifecycle resolves `ACTIVE_RUNNING` from `durable_transitions`; telemetry may drain; in-window monitor/report-input does not.
+APPLY does **not** migrate. It leaves the recovery-authoritative durable tail untouched unless the separately gated verified-snapshot compaction path is enabled; that path is fenced, bounded, and retains replay authority. Audit-critical paper/execution rows are never blindly deleted. Operator cleanup resolves experiment lifecycle from a verified recovery snapshot plus durable tail when available, otherwise from durable transitions. Derived journal `EXPERIMENT_STARTED` / `ENTRY_CLOSED` / `COMPLETED` rows are a cross-check only and must not override durable authority. Durable `EXPERIMENT_STARTED` without a derived journal audit (the `AFTER_APPLY_BEFORE_DERIVED_AUDIT` window) is still `ACTIVE_*`. Journal-only legacy lifecycle without durable rows is `UNKNOWN`, never `PROVEN_NO_ACTIVE_EXPERIMENT`. Only the absence of both durable lifecycle and legacy journal lifecycle is `PROVEN_NO_ACTIVE_EXPERIMENT`. `EXPERIMENT_ID` / `EXPERIMENT_STATUS` / `EXPERIMENT_STARTED_AT` are hints verified against durable state; mismatch fail-closes. Missing `EXPERIMENT_ID` is **not** monitor-only. `UNKNOWN` is never `PROVEN_NO_ACTIVE_EXPERIMENT`, forbids monitor delete, and refuses APPLY (query/scan could not prove lifecycle). `RUNNING` / `ENTRY_CLOSED` protect in-window report-input (missing `startedAt` forbids monitor delete). `COMPLETED` requires a canonical complete+non-truncated final plus grace. Only `PROVEN_NO_ACTIVE_EXPERIMENT` (and idle-without-start) is monitor-TTL eligible. Dry-run prints lifecycle `state/source/id/status/times/monitorDeleteAllowed/reason`. A `DATABASE_URL`-only APPLY while an experiment is active — including in the after-apply-before-derived-audit window — is SAFE: lifecycle resolves `ACTIVE_RUNNING` from the verified snapshot/tail authority; telemetry may drain; in-window monitor/report-input does not.
 
 APPLY is **globally** bounded for the whole invocation: telemetry and monitor share one `applyBounds` budget (total batches, total deleted rows, wall-clock `cycleBudgetMs`). `maxBatches=3` means at most 3 deletes across both classes, not 3 per class. Dry-run `applyBounds` is the budget APPLY will actually use.
 
@@ -203,4 +203,4 @@ APPLY is **globally** bounded for the whole invocation: telemetry and monitor sh
 2. Monitor-only / no experiment: older than monitor TTL.
 3. Active experiment: only pre-start monitor older than `min(ttl, startedAt)`.
 4. Completed experiment transient report-input: canonical final exists, `complete=true`, `truncated=false`, and `persisted_at` older than the completed-report grace (default 7 days).
-5. Never audit. Never `durable_transitions`.
+5. Never delete recovery state without verified snapshot authority. Durable transitions may be compacted only behind that cursor; bounded replay keys remain for their configured horizon.

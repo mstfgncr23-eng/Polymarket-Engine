@@ -227,7 +227,7 @@ Dashboard: `http://localhost:3000`; engine liveness/readiness/metrics: `http://l
 | `ENGINE_REGION` | Runtime metadata; `fra` default |
 | `GIT_SHA` | Recorded in experiment manifest |
 | `REPORT_DIRECTORY` | Optional ephemeral 48h JSON/Markdown export; canonical final report is `experiment_reports` in Postgres |
-| `RETENTION_*` | Bounded journal/checkpoint/idempotency TTLs. See [docs/RETENTION.md](docs/RETENTION.md). `RETENTION_ENABLED` defaults **false** until operator review. Defaults: telemetry 6h, monitor 24h, completed grace 7d, max 20 batches / 4000 rows per cycle. `durable_transitions` is never pruned. |
+| `RETENTION_*` | Bounded journal/checkpoint/idempotency TTLs and optional verified-snapshot compaction. See [docs/RETENTION.md](docs/RETENTION.md). `RETENTION_ENABLED`, `RETENTION_COMPACTION_ENABLED`, and `RETENTION_ANALYTICS_ROLLUP_ENABLED` default **false** until operator review. Defaults: telemetry 6h, monitor 24h, completed grace 7d, max 20 batches / 4000 rows per cycle. Durable transitions compact only behind two verified recovery snapshots; compact replay keys are bounded and expiring. |
 
 Do not put wallet keys, signing keys, OpenAI keys, or Polymarket private credentials in this milestone. This repository does not create or provision xAI credentials and does not call an xAI inference API.
 

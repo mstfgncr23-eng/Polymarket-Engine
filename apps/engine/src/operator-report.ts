@@ -1,4 +1,4 @@
-import { persistCanonicalFinalReport, resolveAuthoritativeExperiment, streamExperimentSummary } from "./final-report.js";
+import { persistCanonicalFinalReport, persistVerifiedAnalyticsRollup, resolveAuthoritativeExperiment, streamExperimentSummary } from "./final-report.js";
 import { loadSourceSeal } from "./source-seal.js";
 import { loadUnresolvedReportSourceIntegrity } from "./report-source-integrity.js";
 import { writeExperimentSummary } from "./report.js";
@@ -80,6 +80,15 @@ export async function generateOperatorReport(
       status: authoritative.status,
       paths,
     };
+  }
+  if (streamed.accumulatorSnapshot) {
+    await persistVerifiedAnalyticsRollup(journal, {
+      experimentId: authoritative.id,
+      sourceCursor: await journal.latestDurableSequence(),
+      sourceFenceId: streamed.scan.fence.through?.id ?? null,
+      sourceFenceOccurredAt: streamed.scan.fence.through?.occurredAt ?? null,
+      accumulator: streamed.accumulatorSnapshot as unknown as Record<string, unknown>,
+    });
   }
   const persisted = await persistCanonicalFinalReport(journal, {
     summary: streamed.summary,

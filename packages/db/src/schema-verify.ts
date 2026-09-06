@@ -30,6 +30,21 @@ export const REQUIRED_RLS_TABLES = [
   "experiment_reports",
 ] as const;
 
+/** PR18 additions are verified separately so older read-only tooling remains compatible. */
+export const COMPACTION_TABLES = ["durable_sequence_metadata", "experiment_report_rollups"] as const;
+export const COMPACTION_INDEXES = ["durable_sequence_metadata_pkey", "experiment_report_rollups_pkey", "experiment_report_rollups_cursor_idx"] as const;
+
+export function evaluateCompactionSchemaInspection(found: SchemaInspection): void {
+  const missing: string[] = [];
+  for (const table of COMPACTION_TABLES) if (!found.tables.includes(table)) missing.push(`missing relation public.${table}`);
+  for (const index of COMPACTION_INDEXES) if (!found.indexes.includes(index)) missing.push(`missing index ${index}`);
+  for (const table of COMPACTION_TABLES) {
+    if (found.tables.includes(table) && !found.rlsEnabled.includes(table)) missing.push(`rls disabled on public.${table}`);
+    if (found.rlsForced.includes(table)) missing.push(`rls forced on public.${table}`);
+  }
+  if (missing.length > 0) throw new SchemaVerificationError(missing);
+}
+
 export class SchemaVerificationError extends Error {
   readonly code = "SCHEMA_VERIFICATION_FAILED";
   constructor(readonly missing: readonly string[]) {
@@ -103,5 +118,7 @@ export async function inspectPublicSchema(
 export async function verifyRequiredSchema(
   query: <T extends Record<string, unknown>>(sql: string) => Promise<T[]>,
 ): Promise<void> {
-  evaluateSchemaInspection(await inspectPublicSchema(query));
+  const inspection = await inspectPublicSchema(query);
+  evaluateSchemaInspection(inspection);
+  evaluateCompactionSchemaInspection(inspection);
 }

@@ -148,7 +148,7 @@ export async function dryRunJournalCleanup(
   const notes = [
     "Dry run: zero mutation. No migrate, no DDL, no DML.",
     "Deletes do not shrink PostgreSQL relation size immediately (no VACUUM FULL).",
-    "durable_transitions is never deleted.",
+    "durable_transitions compact only behind verified recovery snapshots; no blind delete.",
     "No automatic startup purge. RETENTION_ENABLED defaults false until operator review.",
   ];
   if (lifecycle) notes.push(`Authoritative lifecycle: ${lifecycle.state} source=${lifecycle.source} id=${lifecycle.experimentId ?? "none"} status=${lifecycle.status ?? "none"} startedAt=${lifecycle.startedAt ?? "none"} completedAt=${lifecycle.completedAt ?? "none"} monitorDeleteAllowed=${lifecycle.monitorDeleteAllowed} reason=${lifecycle.reason}`);
