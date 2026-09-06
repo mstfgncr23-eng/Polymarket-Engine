@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   CANONICAL_REPORT_INPUT_EVENT_TYPES,
+  createIdleExperiment,
   type JournalEvent,
 } from "@pm/core";
 import {
@@ -203,7 +204,10 @@ describe("PR18 hot operational storage lifecycle", () => {
       // removes the row itself.  Leave a valid idle checkpoint at that fence so
       // later tests sharing this disposable database do not attempt to replay a
       // compacted prefix from cursor zero.
-      const idle = engine.experimentManifest()!;
+      const idle = createIdleExperiment({
+        id: "exp-pr18-idle", durationHours: 48, strategyVersion: "pr18-test",
+        riskConfiguration: {}, modelConfiguration: {}, startingBalance: "100", systemVersion: "test", gitSha: "test",
+      });
       const checkpoints = await journal.listCheckpoints();
       await journal.saveCheckpoint({
         experimentId: idle.id,
@@ -211,7 +215,12 @@ describe("PR18 hot operational storage lifecycle", () => {
         payload: {
           schemaVersion: 2,
           durableCursor: commit.sequence,
-          ledger: engine.ledger.snapshot(),
+          ledger: {
+            startingBalance: "100", cash: "100", reservedCash: "0", positionValue: "0", equity: "100",
+            realizedPnl: "0", unrealizedPnl: "0", grossPnl: "0", fees: "0", slippage: "0", aiCost: "0",
+            infrastructureCost: "0", netTradingPnl: "0", netEconomicPnl: "0", highWaterMark: "100", drawdown: "0",
+            updatedAt: new Date().toISOString(),
+          },
           positions: [], restingOrders: [], activeTriggers: [], grokSignals: [],
           activationLatency: [], makerReservations: {}, managedMarkets: [], settledMarkets: [], marketMetadata: [],
           lastInfrastructureAccrualAt: Date.now(), derivedAuditCursor: commit.sequence, reportSourceIntegrity: [],
