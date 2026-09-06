@@ -193,6 +193,28 @@ describe("persistence admission keeps live inputs in memory", () => {
     }
   });
 
+  it("suppresses concurrent idle retries without creating a durable claim", async () => {
+    const { engine, journal } = await startQualifiedEngine();
+    let release!: () => void;
+    try {
+      const trigger = monitoringTrigger("idle-concurrent-trigger");
+      const idleSubmission = fairSubmission(trigger, "idle-concurrent-submission");
+      await engine.registerTriggerForResearch(trigger);
+      engine.setGrokClaimHoldForTest(new Promise<void>((resolve) => { release = resolve; }));
+      const first = engine.submitGrokSignal(idleSubmission, "fair_probability_analyst");
+      const second = engine.submitGrokSignal(idleSubmission, "fair_probability_analyst");
+      release();
+      const results = await Promise.all([first, second]);
+      expect(results.map((result) => result.status).sort()).toEqual(["accepted", "duplicate"]);
+      expect(await journal.idempotencyCreatedAt("grok_signal_submission", "fair_probability_analyst:idle-concurrent-submission")).toBeNull();
+      expect(await journal.queryEvents({ types: ["GROK_SIGNAL_ACCEPTED"] })).toEqual([]);
+    } finally {
+      release?.();
+      engine.setGrokClaimHoldForTest(null);
+      await engine.stop();
+    }
+  });
+
   it("boots cleanly from an empty journal without recovery artifacts", async () => {
     const journal = new MemoryEventJournal();
     const market = new ScriptedMarketAdapter();
