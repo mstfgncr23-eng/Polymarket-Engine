@@ -30,7 +30,7 @@ flowchart LR
   API --> D[Separate Next.js dashboard]
 ```
 
-The pnpm workspace contains `apps/engine`, `apps/dashboard`, and focused `packages/core`, `packages/db`, and `packages/market-data`. PostgreSQL journal events are the canonical audit trail.
+The pnpm workspace contains `apps/engine`, `apps/dashboard`, and focused `packages/core`, `packages/db`, and `packages/market-data`. PostgreSQL journal events are the canonical audit trail for durable experiment, trading, and recovery facts. Live `MARKET_SNAPSHOT` and `REFERENCE_TICK` observations are processed in memory and are deliberately not permanent journal records; the report-input admission path stores ordinary canonical research events only while an experiment window is open, with lifecycle boundary events retained separately.
 
 Every important event carries a `traceId`. Journal/dashboard records also carry `marketId` and `asset` when known. `/api/traces/:traceId` reconstructs the source market evidence, participating Grok roles, consensus, risk result, order/fill, and resulting position from the append-only journal. Secrets are never written to that trail.
 
@@ -104,7 +104,7 @@ flowchart TD
 
 Triggers identify `triggerId`, `traceId`, `marketId`, underlying asset, source, kind, severity, created/expiry, and evidence IDs. They are isolated by market/asset. Deterministic trigger math is unchanged except for per-asset reference windows. BTC rapid-move math still emits `BTC_RAPID_MOVE` for BTC; other assets emit `CRYPTO_REFERENCE_RAPID_MOVE`.
 
-Activation is **non-fatal**: monitoring continues, the trigger stays persisted, failures are journaled, no crash, no fake Grok signal, no invented consensus, no paper order from missing research.
+Activation is **non-fatal**: monitoring continues, the trigger remains available in live engine state, active experiment triggers are persisted, failures are journaled when applicable, no crash, no fake Grok signal, no invented consensus, no paper order from missing research.
 
 ### Official Grok activation (re-verified 2026-09-01)
 

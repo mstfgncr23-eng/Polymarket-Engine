@@ -257,7 +257,7 @@ describe("5 experiment IDLE vs Grok paper activation policy", () => {
       await engine.tickMaintenance();
       expect(Number(engine.ledger.snapshot().infrastructureCost)).toBe(0);
       expect((await journal.queryEvents({ types: ["GROK_ACTIVATION_RESULT"] })).length).toBe(0);
-      expect((await journal.queryEvents({ types: ["GROK_ACTIVATION_DECISION"] })).some((event) => (event.payload as { reason?: string }).reason === "EXPERIMENT_NOT_ACTIVE")).toBe(true);
+      expect((await journal.queryEvents({ types: ["GROK_ACTIVATION_DECISION"] })).some((event) => (event.payload as { reason?: string }).reason === "EXPERIMENT_NOT_ACTIVE")).toBe(false);
       expect((await engine.beginExperiment()).ok).toBe(true);
       nowMs += 3_600_000;
       await engine.tickMaintenance();

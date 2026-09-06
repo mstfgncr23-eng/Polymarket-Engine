@@ -82,6 +82,7 @@ class DelayedDiscoveryAdapter extends ScriptedMarketAdapter {
 }
 
 async function startNoopEngine(opts?: {
+  active?: boolean;
   holdAppend?: Promise<void>;
   appendHook?: (event: { type: string; payload: Record<string, unknown> }) => void | Promise<void>;
   shutdownJoinDeadlineMs?: number;
@@ -107,12 +108,16 @@ async function startNoopEngine(opts?: {
   };
   const market = new ScriptedMarketAdapter();
   market.queue(discoveryReport([qualified("btc-mkt", "BTC", "btc-up", "btc-down")]));
-  const engine = new EngineService(qualifiedPaperEnv({ GROK_ACTIVATION_PROVIDER: "noop" }), journal, { error: () => undefined }, {
+  const engine = new EngineService(qualifiedPaperEnv(opts?.active ? {} : { GROK_ACTIVATION_PROVIDER: "noop" }), journal, { error: () => undefined }, {
     market: market as never,
     referenceRegistry: new ScriptedReferenceRegistry() as never,
     shutdownJoinDeadlineMs: opts?.shutdownJoinDeadlineMs,
   });
   await engine.start();
+  if (opts?.active) {
+    const started = await engine.beginExperiment();
+    if (!started.ok) throw new Error(`active test experiment preflight failed: ${JSON.stringify(started)}`);
+  }
   return { engine, journal, market, appendPeak: () => appendPeak, appendCalls: () => appendCalls, appendActive: () => appendActive };
 }
 
@@ -331,6 +336,7 @@ describe("B queue drain after release", () => {
     const hold = new Promise<void>((resolve) => { release = resolve; });
     const executed: string[] = [];
     const { engine } = await startNoopEngine({
+      active: true,
       holdAppend: hold,
       appendHook: (event) => { if (event.type === "TRIGGER_EVENT") executed.push(event.type); },
     });
@@ -357,6 +363,7 @@ describe("C same-market ordering", () => {
     const hold = new Promise<void>((resolve) => { release = resolve; });
       const seen: string[] = [];
     const { engine } = await startNoopEngine({
+      active: true,
       holdAppend: hold,
       appendHook: (event) => {
         if (event.type === "TRIGGER_EVENT" && typeof event.payload.id === "string") seen.push(event.payload.id);
@@ -493,7 +500,7 @@ describe("H shutdown mid-work", () => {
   it("closes admission, joins with a finite deadline, and does not hang", async () => {
     let release!: () => void;
     const hold = new Promise<void>((resolve) => { release = resolve; });
-    const { engine } = await startNoopEngine({ holdAppend: hold, shutdownJoinDeadlineMs: 80 });
+    const { engine } = await startNoopEngine({ active: true, holdAppend: hold, shutdownJoinDeadlineMs: 80 });
     engine.enqueueTriggerStormForTest([researchTrigger({ id: createId("trigger") })]);
     await waitFor(() => engine.runtimeSupervisorSnapshot().totalInFlight >= 1);
     const started = Date.now();
@@ -574,7 +581,7 @@ describe("J readiness distinction", () => {
         onTelemetryDegraded: (degraded) => { engine.state.telemetryDegraded = degraded; },
       }, engine.metrics);
       await writer.persist(createJournalEvent({
-        traceId: createId("trace"), type: "MARKET_SNAPSHOT", aggregateType: "market", aggregateId: "m", payload: {},
+        traceId: createId("trace"), type: "MARKET_EVENT", aggregateType: "market", aggregateId: "m", payload: {},
       }));
       await writer.flush();
       expect(engine.state.telemetryDegraded).toBe(true);
@@ -628,13 +635,13 @@ describe("J readiness distinction", () => {
 });
 
 describe("normal-load trigger semantics remain journaled", () => {
-  it("still writes TRIGGER_EVENT and IDLE activation decision under the supervisor", async () => {
+  it("keeps idle canonical trigger traffic out of the supervisor journal", async () => {
     const { engine, journal } = await startQualifiedEngine({ GROK_ACTIVATION_PROVIDER: "noop" });
     try {
       await engine.registerTriggerForResearch(researchTrigger());
       const events = await journal.queryEvents({ types: ["TRIGGER_EVENT", "GROK_ACTIVATION_DECISION", "PAPER_ORDER_CREATED"] });
-      expect(events.some((event) => event.type === "TRIGGER_EVENT")).toBe(true);
-      expect(events.some((event) => event.type === "GROK_ACTIVATION_DECISION")).toBe(true);
+      expect(events.some((event) => event.type === "TRIGGER_EVENT")).toBe(false);
+      expect(events.some((event) => event.type === "GROK_ACTIVATION_DECISION")).toBe(false);
       expect(events.some((event) => event.type === "PAPER_ORDER_CREATED")).toBe(false);
     } finally {
       await engine.stop();
@@ -951,7 +958,7 @@ describe("blocker 4-6 journal reservation, integrity, shutdown", () => {
   it("admitted trigger can still journal after shutdown begins", async () => {
     let release!: () => void;
     const hold = new Promise<void>((resolve) => { release = resolve; });
-    const { engine, journal } = await startNoopEngine();
+    const { engine, journal } = await startNoopEngine({ active: true });
     try {
       engine.setProcessTriggerHoldForTest(hold);
       const trigger = researchTrigger({ id: "drain-t", marketId: "drain-mkt" });

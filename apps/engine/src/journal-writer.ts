@@ -40,6 +40,13 @@ export class BoundedJournalWriter {
   }
 
   async persist(event: JournalEvent): Promise<void> {
+    // Raw market/reference observations are live inputs, never durable
+    // telemetry. Keep this guard at the writer boundary so a future producer
+    // cannot accidentally reintroduce permanent rows through this helper.
+    if (event.type === "MARKET_SNAPSHOT" || event.type === "REFERENCE_TICK") {
+      this.sampled += 1;
+      return;
+    }
     if (!isTelemetryEventType(event.type)) {
       await this.writeDecision(event);
       return;

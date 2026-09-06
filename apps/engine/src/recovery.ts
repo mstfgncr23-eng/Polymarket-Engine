@@ -38,9 +38,11 @@ import { z, ZodError } from "zod";
  *    MARKET_RESOLUTION_OBSERVED, EXPERIMENT_PREFLIGHT, EXPERIMENT_REPORT_GENERATED,
  *    PAPER_MAKER_RESERVED/RELEASED/FILL/SETTLED mirrored copies, STATE_RECOVERED
  *
- * C  NONCRITICAL research/telemetry (PR #12 journal admission, not replayed):
- *    MARKET_SNAPSHOT, REFERENCE_TICK, TRIGGER_EVENT, GROK_*, CONSENSUS,
- *    RISK_EVALUATION, activation, SYSTEM_HEALTH, MCP, STRATEGY_CHANGE_PROPOSED
+ * C  NONCRITICAL research/telemetry (not replayed):
+ *    TRIGGER_EVENT, GROK_*, CONSENSUS, RISK_EVALUATION, activation,
+ *    SYSTEM_HEALTH, MCP, STRATEGY_CHANGE_PROPOSED. Ordinary canonical
+ *    research is journaled only inside an experiment window; raw
+ *    MARKET_SNAPSHOT and REFERENCE_TICK inputs stay live and in-memory.
  *
  * D  EPHEMERAL / reconstructed live (not durable, not replayed):
  *    trigger windows, recentTrades cooldown, signal inbox, book snapshots,
