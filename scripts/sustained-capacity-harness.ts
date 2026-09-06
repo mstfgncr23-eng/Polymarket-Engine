@@ -10,7 +10,7 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { monitorEventLoopDelay, performance } from "node:perf_hooks";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createId, engineEnvSchema, feeScheduleSchema, type EngineEnv, type ReferenceTick } from "../packages/core/src/index.ts";
 import { MemoryEventJournal } from "../packages/db/src/index.ts";
@@ -410,7 +410,10 @@ if (process.argv[1] && fileURLToPath(import.meta.url).toLowerCase() === process.
   const output = await runSustainedCapacityHarness(options);
   const outDir = join(tmpdir(), "polymarket-engine-capacity");
   mkdirSync(outDir, { recursive: true });
-  const out = options.json ? join(process.cwd(), options.json) : join(outDir, `sustained-capacity-${Date.now()}.json`);
+  const out = options.json
+    ? (isAbsolute(options.json) ? options.json : join(process.cwd(), options.json))
+    : join(outDir, `sustained-capacity-${Date.now()}.json`);
+  mkdirSync(dirname(out), { recursive: true });
   writeFileSync(out, JSON.stringify(output, null, 2));
   console.log(JSON.stringify(output, null, 2));
   console.log(`wrote ${out}`);
