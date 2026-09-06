@@ -622,6 +622,9 @@ export class EngineService {
             if (this.experiment?.id !== next.id || this.experiment.status !== "RUNNING" || !this.experiment.startValidationPending) {
               throw new RecoveryFailClosedError("invariant", "start validation state changed before durable validation");
             }
+            if (this.experimentFeedGeneration !== startFeedGeneration || this.experimentFeedBlockers().length > 0) {
+              throw new ExperimentStartGuardRejectedError();
+            }
           },
           afterApply: async () => this.record("EXPERIMENT_START_VALIDATED", next.id, null, { status: "RUNNING" }),
         });
@@ -651,6 +654,16 @@ export class EngineService {
         }
       } catch (error) {
         if (!(error instanceof ExperimentStartGuardRejectedError)) throw error;
+        const currentExperiment = this.experiment;
+        if (currentExperiment?.id === next.id && currentExperiment.status === "RUNNING" && currentExperiment.startValidationPending) {
+          const blockers = this.experimentFeedBlockers();
+          await this.commitAbortedStart(next, "EXPERIMENT_FEED_INVALIDATED_DURING_START");
+          return {
+            ok: false,
+            blockers: [...new Set([...blockers, "EXPERIMENT_FEED_INVALIDATED_DURING_START"])],
+            experiment: this.experiment,
+          };
+        }
         const current = this.preflight("48H_GROK_PAPER_EXPERIMENT");
         const blockers = [...new Set([...current.blockers, ...this.experimentFeedBlockers()])];
         return { ...current, ok: false, blockers };

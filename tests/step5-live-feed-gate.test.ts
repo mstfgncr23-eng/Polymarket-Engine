@@ -298,6 +298,48 @@ describe("Step 5 live-feed experiment start gate", () => {
     }
   });
 
+  it("fails closed when feed truth changes before the final START_VALIDATED beforeCommit", async () => {
+    const setup = await startRealFeedEngine();
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => { release = resolve; });
+    let validationLookupComplete = false;
+    const originalRead = setup.journal.readDurableByOperationKey.bind(setup.journal);
+    setup.journal.readDurableByOperationKey = async (operationKey) => {
+      const existing = await originalRead(operationKey);
+      if (operationKey.endsWith(":start_validated")) {
+        // The durable payload/idempotency lookup has completed, but the
+        // commit has not reached its final beforeCommit guard yet.
+        validationLookupComplete = true;
+        await hold;
+      }
+      return existing;
+    };
+    try {
+      await establishTrustedBaseline(setup);
+      const pending = setup.engine.beginExperiment();
+      await waitFor(() => validationLookupComplete);
+      expect(setup.engine.experimentManifest()?.status).toBe("RUNNING");
+      expect(setup.engine.experimentManifest()?.startValidationPending).toBe(true);
+      expect(await setup.journal.queryDurableTransitions({ types: ["EXPERIMENT_START_VALIDATED"], limit: 8 })).toHaveLength(0);
+
+      await setup.engine.applyReferenceConnectionForTest("BTC", "STALE");
+      release();
+      const result = await pending;
+
+      expect(result.ok).toBe(false);
+      expect(result.blockers).toContain("REFERENCE_FEED_STALE");
+      expect(result.blockers).toContain("EXPERIMENT_FEED_INVALIDATED_DURING_START");
+      expect(await setup.journal.queryDurableTransitions({ types: ["EXPERIMENT_START_VALIDATED"], limit: 8 })).toHaveLength(0);
+      expect(await setup.journal.queryDurableTransitions({ types: ["EXPERIMENT_START_ABORTED"], limit: 8 })).toHaveLength(1);
+      expect(setup.engine.experimentManifest()?.status).toBe("ABORTED_START");
+      expect(setup.engine.experimentManifest()?.startValidationPending).toBe(false);
+      expect((await setup.engine.beginExperiment()).ok).toBe(false);
+    } finally {
+      release();
+      await setup.engine.stop();
+    }
+  });
+
   it("treats disconnect after the validation linearization point as runtime feed loss", async () => {
     const setup = await startRealFeedEngine();
     try {
