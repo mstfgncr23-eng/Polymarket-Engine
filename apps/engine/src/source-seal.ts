@@ -16,6 +16,7 @@ export function isSourceSealExemptType(type: string): boolean {
   return type === EXPERIMENT_SOURCE_SEALED
     || type === "EXPERIMENT_REPORT_GENERATED"
     || type === "EXPERIMENT_COMPLETED"
+    || type === "EXPERIMENT_START_ABORTED"
     || type === "EXPERIMENT_ENTRY_CLOSED"
     || type === "EXPERIMENT_STARTED"
     || type === "EXPERIMENT_PREFLIGHT";

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { eventLoopUtilizationDelta, runSustainedCapacityHarness } from "../scripts/sustained-capacity-harness.ts";
+import { classifyMemoryMetric, eventLoopUtilizationDelta, runSustainedCapacityHarness } from "../scripts/sustained-capacity-harness.ts";
 
 describe("Step 5 sustained capacity harness", () => {
   it("reaches a bounded plateau under multi-market normal, burst, reference and reconnect traffic", async () => {
@@ -20,6 +20,8 @@ describe("Step 5 sustained capacity harness", () => {
     expect(report.plateau.metrics.triggerQueue.classification).not.toBe("monotonic_growth");
     expect(report.plateau.metrics.journalWaiting.classification).not.toBe("monotonic_growth");
     expect(report.plateau.metrics.ingressDepth.classification).not.toBe("monotonic_growth");
+    expect(report.plateau.metrics.marketCache.classification).not.toBe("monotonic_growth");
+    expect(report.plateau.metrics.activeTriggers.classification).not.toBe("monotonic_growth");
   }, 15_000);
 
   it("keeps admission bounded during slow journal writes and a slow dashboard client", async () => {
@@ -78,4 +80,17 @@ describe("Step 5 sustained capacity harness", () => {
     expect(report.verdict.blockers).toContain("INSUFFICIENT_LOCAL_EVIDENCE:memory");
     expect(report.verdict.localMemory).toBe("INSUFFICIENT_LOCAL_EVIDENCE");
   }, 15_000);
+
+  it("classifies stable GC noise as plateau and byte growth as monotonic", () => {
+    const elapsed = Array.from({ length: 20 }, (_, index) => index * 500);
+    const noisy = elapsed.map((_, index) => 200_000_000 + [0, 180_000, -120_000, 90_000, -80_000][index % 5]!);
+    expect(classifyMemoryMetric(noisy, elapsed).classification).toBe("plateau");
+    const fastLeak = elapsed.map((at) => 200_000_000 + at * 1_024);
+    expect(classifyMemoryMetric(fastLeak, elapsed).classification).toBe("monotonic_growth");
+    const longerElapsed = Array.from({ length: 40 }, (_, index) => index * 500);
+    const slowLeak = longerElapsed.map((at) => 200_000_000 + at * 600);
+    expect(classifyMemoryMetric(slowLeak, longerElapsed).classification).toBe("monotonic_growth");
+    const shortNoisy = [200_000_000, 201_000_000, 199_000_000, 200_500_000, 199_500_000, 200_000_000];
+    expect(classifyMemoryMetric(shortNoisy, shortNoisy.map((_, index) => index * 100)).classification).toBe("insufficient_samples");
+  });
 });

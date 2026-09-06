@@ -7,6 +7,7 @@ export const CLEANUP_LIFECYCLE_STATES = [
   "ACTIVE_ENTRY_CLOSED",
   "COMPLETED",
   "FAILED",
+  "ABORTED_START",
   "IDLE",
   "UNKNOWN",
   "CONFLICTING",
@@ -40,9 +41,10 @@ interface ExperimentRow {
   startedAt: string | null;
   entryClosedAt: string | null;
   completedAt: string | null;
+  abortedAt: string | null;
 }
 
-const LIFECYCLE_TYPES = ["EXPERIMENT_STARTED", "EXPERIMENT_ENTRY_CLOSED", "EXPERIMENT_COMPLETED"] as const;
+const LIFECYCLE_TYPES = ["EXPERIMENT_STARTED", "EXPERIMENT_START_ABORTED", "EXPERIMENT_ENTRY_CLOSED", "EXPERIMENT_COMPLETED"] as const;
 
 function experimentIdFromPayload(payload: Record<string, unknown>, aggregateId: string): string | null {
   const nested = payload.experiment;
@@ -63,10 +65,11 @@ function startedAtFrom(payload: Record<string, unknown>, occurredAt: string): st
 }
 
 function applyLifecycleEvent(byId: Map<string, ExperimentRow>, type: string, id: string, occurredAt: string, payload: Record<string, unknown>): void {
-  const current = byId.get(id) ?? { id, startedAt: null, entryClosedAt: null, completedAt: null };
+  const current = byId.get(id) ?? { id, startedAt: null, entryClosedAt: null, completedAt: null, abortedAt: null };
   if (type === "EXPERIMENT_STARTED") current.startedAt = current.startedAt ?? startedAtFrom(payload, occurredAt);
   if (type === "EXPERIMENT_ENTRY_CLOSED") current.entryClosedAt = current.entryClosedAt ?? occurredAt;
   if (type === "EXPERIMENT_COMPLETED") current.completedAt = current.completedAt ?? occurredAt;
+  if (type === "EXPERIMENT_START_ABORTED") current.abortedAt = current.abortedAt ?? occurredAt;
   byId.set(id, current);
 }
 
@@ -88,7 +91,7 @@ async function loadDurableExperimentRows(journal: EventJournal): Promise<Experim
 
 async function loadJournalExperimentRows(journal: EventJournal): Promise<ExperimentRow[] | null> {
   try {
-    const startedPage = await pageJournalEventsByTypes(journal, ["EXPERIMENT_STARTED"]);
+    const startedPage = await pageJournalEventsByTypes(journal, ["EXPERIMENT_STARTED", "EXPERIMENT_START_ABORTED"]);
     const closedPage = await pageJournalEventsByTypes(journal, ["EXPERIMENT_ENTRY_CLOSED"]);
     const completedPage = await pageJournalEventsByTypes(journal, ["EXPERIMENT_COMPLETED"]);
     if (startedPage.overflow || closedPage.overflow || completedPage.overflow) return null;
@@ -105,6 +108,7 @@ async function loadJournalExperimentRows(journal: EventJournal): Promise<Experim
 }
 
 function stateFor(row: ExperimentRow): Exclude<CleanupLifecycleState, "PROVEN_NO_ACTIVE_EXPERIMENT" | "UNKNOWN" | "CONFLICTING"> {
+  if (row.abortedAt) return "ABORTED_START";
   if (row.completedAt) return "COMPLETED";
   if (row.entryClosedAt) return "ACTIVE_ENTRY_CLOSED";
   if (row.startedAt) return "ACTIVE_RUNNING";
@@ -116,7 +120,7 @@ function monitorAllowed(state: CleanupLifecycleState, startedAt: string | null):
   if (state === "IDLE") return true;
   if (state === "UNKNOWN" || state === "CONFLICTING") return false;
   if (state === "ACTIVE_RUNNING" || state === "ACTIVE_ENTRY_CLOSED") return Boolean(startedAt);
-  if (state === "COMPLETED" || state === "FAILED") return false;
+  if (state === "COMPLETED" || state === "FAILED" || state === "ABORTED_START") return true;
   return false;
 }
 
@@ -136,6 +140,8 @@ function reasonFor(state: CleanupLifecycleState, startedAt: string | null, sourc
       return "COMPLETED experiment from durable_transitions: monitor delete requires canonical complete+non-truncated final plus grace.";
     case "FAILED":
       return "FAILED experiment: monitor delete forbidden until an operator-proven no-active state.";
+    case "ABORTED_START":
+      return "Feed-invalidated experiment start is durably terminal; no active experiment identity remains.";
     case "IDLE":
       return "IDLE experiment identity with no start; monitor TTL eligible.";
     case "CONFLICTING":
@@ -148,7 +154,7 @@ function reasonFor(state: CleanupLifecycleState, startedAt: string | null, sourc
 }
 
 function chooseRow(rows: ExperimentRow[], hintId: string | null): { chosen: ExperimentRow | null; state: CleanupLifecycleState } {
-  const active = rows.filter((row) => !row.completedAt && row.startedAt);
+  const active = rows.filter((row) => !row.completedAt && !row.abortedAt && row.startedAt);
   if (active.length > 1) {
     return { state: "CONFLICTING", chosen: hintId ? active.find((row) => row.id === hintId) ?? null : null };
   }
@@ -206,7 +212,7 @@ function journalCrossCheck(durable: ExperimentRow[], journal: ExperimentRow[] | 
   if (!journal) return "none";
   if (durable.length === 0 && journal.length > 0) return "legacy_only";
   if (!chosen) return "none";
-  const journalActive = journal.filter((row) => !row.completedAt && row.startedAt && row.id !== chosen.id);
+  const journalActive = journal.filter((row) => !row.completedAt && !row.abortedAt && row.startedAt && row.id !== chosen.id);
   if (journalActive.length > 0) return "conflict";
   const journalRow = journal.find((row) => row.id === chosen.id);
   if (!journalRow) return "missing_audit";
@@ -311,6 +317,7 @@ export async function resolveCleanupLifecycle(
 
   const status = state === "ACTIVE_RUNNING" ? "RUNNING"
     : state === "ACTIVE_ENTRY_CLOSED" ? "ENTRY_CLOSED"
+      : state === "ABORTED_START" ? "ABORTED_START"
       : state === "PROVEN_NO_ACTIVE_EXPERIMENT" ? null
         : state;
   const startedAt = chosen?.startedAt ?? null;

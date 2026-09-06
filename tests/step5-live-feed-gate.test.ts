@@ -3,8 +3,9 @@ import { type ReferenceTick } from "@pm/core";
 import { MemoryEventJournal } from "@pm/db";
 import { PolymarketMarketDataAdapter, ScriptedBoundedMarketTransport } from "@pm/market-data";
 import { EngineService } from "../apps/engine/src/engine.js";
+import { CrashInjectedError } from "../apps/engine/src/crash-injection.js";
 import { NoopGrokActivationBridge } from "../apps/engine/src/activation/noop.js";
-import { discoveryReport, qualified, ScriptedReferenceRegistry, qualifiedPaperEnv } from "./paper-engine-testkit.js";
+import { discoveryReport, qualified, ScriptedReferenceRegistry, qualifiedPaperEnv, paperFill } from "./paper-engine-testkit.js";
 
 const waitFor = async (predicate: () => boolean, timeoutMs = 2_000): Promise<void> => {
   const started = Date.now();
@@ -146,9 +147,9 @@ describe("Step 5 live-feed experiment start gate", () => {
       const rejected = await held.pending;
       expect(rejected.ok).toBe(false);
       expect(rejected.blockers).toContain("EXPERIMENT_FEED_INVALIDATED_DURING_START");
-      expect(setup.engine.experimentManifest()?.status).toBe("ENTRY_CLOSED");
+      expect(setup.engine.experimentManifest()?.status).toBe("ABORTED_START");
       expect(await setup.journal.queryDurableTransitions({ types: ["EXPERIMENT_STARTED"], limit: 8 })).toHaveLength(1);
-      expect(await setup.journal.queryDurableTransitions({ types: ["EXPERIMENT_ENTRY_CLOSED"], limit: 8 })).toHaveLength(1);
+      expect(await setup.journal.queryDurableTransitions({ types: ["EXPERIMENT_START_ABORTED"], limit: 8 })).toHaveLength(1);
       await waitFor(() => setup.transport.streams.length >= 2 && setup.engine.state.connections.polymarket.state === "CONNECTED", 4_000);
       await establishTrustedBaseline(setup);
       const retried = await setup.engine.beginExperiment();
@@ -176,7 +177,7 @@ describe("Step 5 live-feed experiment start gate", () => {
       expect(rejected.ok).toBe(false);
       expect(rejected.blockers).toContain("REFERENCE_FEED_STALE");
       expect(rejected.blockers).toContain("EXPERIMENT_FEED_INVALIDATED_DURING_START");
-      expect(setup.engine.experimentManifest()?.status).toBe("ENTRY_CLOSED");
+      expect(setup.engine.experimentManifest()?.status).toBe("ABORTED_START");
     } finally {
       await setup.engine.stop();
     }
@@ -197,10 +198,84 @@ describe("Step 5 live-feed experiment start gate", () => {
       const rejected = await held.pending;
       expect(rejected.ok).toBe(false);
       expect(rejected.blockers).toContain("EXPERIMENT_FEED_INVALIDATED_DURING_START");
-      expect(setup.engine.experimentManifest()?.status).toBe("ENTRY_CLOSED");
+      expect(setup.engine.experimentManifest()?.status).toBe("ABORTED_START");
       expect(await setup.journal.queryDurableTransitions({ types: ["EXPERIMENT_STARTED"], limit: 8 })).toHaveLength(1);
-      expect(await setup.journal.queryDurableTransitions({ types: ["EXPERIMENT_ENTRY_CLOSED"], limit: 8 })).toHaveLength(1);
+      expect(await setup.journal.queryDurableTransitions({ types: ["EXPERIMENT_START_ABORTED"], limit: 8 })).toHaveLength(1);
     } finally {
+      await setup.engine.stop();
+    }
+  });
+
+  it("recovers a committed but unvalidated start as an aborted terminal identity", async () => {
+    const setup = await startRealFeedEngine();
+    try {
+      await establishTrustedBaseline(setup);
+      setup.engine.setCrashInjectionForTest("AFTER_DURABLE_COMMIT_BEFORE_APPLY");
+      await expect(setup.engine.beginExperiment()).rejects.toBeInstanceOf(CrashInjectedError);
+      await setup.engine.stop();
+      const recovered = new EngineService(
+        qualifiedPaperEnv(), setup.journal, { error: () => undefined },
+        { market: setup.adapter, referenceRegistry: new ScriptedReferenceRegistry() as never, activation: new NoopGrokActivationBridge() },
+      );
+      await recovered.start();
+      try {
+        expect(recovered.experimentManifest()?.status).toBe("ABORTED_START");
+        expect(await setup.journal.queryDurableTransitions({ types: ["EXPERIMENT_STARTED"], limit: 8 })).toHaveLength(1);
+        expect(await setup.journal.queryDurableTransitions({ types: ["EXPERIMENT_START_ABORTED"], limit: 8 })).toHaveLength(1);
+        await waitFor(() => setup.transport.streams.length >= 2 && recovered.state.connections.polymarket.state === "CONNECTED", 4_000);
+        await establishTrustedBaseline({ ...setup, engine: recovered });
+        const retry = await recovered.beginExperiment();
+        expect(retry.ok).toBe(true);
+        const starts = await setup.journal.queryDurableTransitions({ types: ["EXPERIMENT_STARTED"], limit: 8 });
+        expect(starts).toHaveLength(2);
+        const lifecycle = await import("../apps/engine/src/cleanup-lifecycle.js").then(({ resolveCleanupLifecycle }) => resolveCleanupLifecycle(setup.journal));
+        expect(lifecycle.state).toBe("ACTIVE_RUNNING");
+        expect(lifecycle.experimentId).toBe(recovered.experimentManifest()?.id);
+      } finally {
+        await recovered.stop();
+      }
+    } finally {
+      if (setup.engine.lastShutdownResult() === null) await setup.engine.stop();
+    }
+  });
+
+  it("does not let maintenance auto-complete an aborted start before retry", async () => {
+    const setup = await startRealFeedEngine();
+    try {
+      await establishTrustedBaseline(setup);
+      const held = await holdDurableStart(setup);
+      await waitFor(() => held.entered());
+      setup.transport.current().endRemote();
+      await waitFor(() => setup.adapter.unsynchronizedTokenCount() > 0, 3_000);
+      held.release();
+      await held.pending;
+      await setup.engine.tickMaintenance();
+      expect(setup.engine.experimentManifest()?.status).toBe("ABORTED_START");
+      expect((await setup.engine.beginExperiment()).ok).toBe(false);
+    } finally {
+      await setup.engine.stop();
+    }
+  });
+
+  it("fences first-leg fills while the post-commit start validation is pending", async () => {
+    const setup = await startRealFeedEngine();
+    try {
+      await establishTrustedBaseline(setup);
+      let release!: () => void;
+      const hold = new Promise<void>((resolve) => { release = resolve; });
+      setup.engine.setStartPostCommitValidationHoldForTest(hold);
+      const pending = setup.engine.beginExperiment();
+      await waitFor(() => setup.engine.experimentManifest()?.status === "RUNNING");
+      const fill = paperFill(setup.market.id, "UP", "0.40", { id: "pending-first-leg" });
+      await setup.engine.applyObservedFill(fill);
+      expect(setup.engine.state.snapshot().positions).toHaveLength(0);
+      expect(await setup.journal.queryDurableTransitions({ types: ["PAPER_FILL"], limit: 8 })).toHaveLength(0);
+      release();
+      expect((await pending).ok).toBe(true);
+      await setup.engine.applyObservedFill(fill);
+      expect(setup.engine.state.snapshot().positions).toHaveLength(1);
+    } finally {
+      setup.engine.setStartPostCommitValidationHoldForTest(null);
       await setup.engine.stop();
     }
   });

@@ -53,7 +53,7 @@ export const REJECTION_REASONS = [
 export type RejectionReason = (typeof REJECTION_REASONS)[number];
 
 export type OverloadState = "NORMAL" | "DEGRADED" | "FAIL_CLOSED";
-export type ExperimentWorkStatus = "IDLE" | "RUNNING" | "ENTRY_CLOSED" | "COMPLETED" | "FAILED" | string;
+export type ExperimentWorkStatus = "IDLE" | "RUNNING" | "ENTRY_CLOSED" | "COMPLETED" | "FAILED" | "ABORTED_START" | string;
 
 export const RUNTIME_BOUNDS = {
   trigger: {
@@ -177,7 +177,7 @@ export function triggerWorkKey(input: { marketId?: string | null; asset?: string
 }
 
 export function isIdleLikeStatus(status: ExperimentWorkStatus | null | undefined): boolean {
-  return status == null || status === "IDLE" || status === "COMPLETED" || status === "FAILED";
+  return status == null || status === "IDLE" || status === "COMPLETED" || status === "FAILED" || status === "ABORTED_START";
 }
 
 /** Persistence whose failure must not be treated as a successful mutation. */

@@ -360,7 +360,8 @@ describe("A-T critical durability matrix", () => {
     expect(first.engine.experimentManifest()?.status).toBe("IDLE");
     await first.engine.stop();
     const running = await startPaper(journal, { now: () => new Date(nowMs) });
-    expect(running.engine.experimentManifest()?.status).toBe("RUNNING");
+    expect(running.engine.experimentManifest()?.status).toBe("ABORTED_START");
+    expect((await running.engine.beginExperiment()).ok).toBe(true);
     nowMs += 48 * 3_600_000 + 1;
     running.engine.setCrashInjectionForTest("AFTER_DURABLE_COMMIT_BEFORE_APPLY");
     await expect(running.engine.tickMaintenance()).rejects.toBeInstanceOf(CrashInjectedError);
@@ -1132,9 +1133,12 @@ describe("golden equivalence control vs crashed", () => {
     expect(crashedNorm.snap.settledMarkets).toEqual(controlNorm.snap.settledMarkets);
     expect(crashedNorm.snap.reserved).toEqual(controlNorm.snap.reserved);
     expect(crashedNorm.snap.experiment).toEqual(controlNorm.snap.experiment);
-    expect(crashedNorm.snap.cursor).toEqual(controlNorm.snap.cursor);
-    expect(crashedNorm.audit.counts).toEqual(controlNorm.audit.counts);
-    expect(crashedNorm.audit.derived).toEqual(controlNorm.audit.derived);
+    expect(crashedNorm.snap.cursor).toBeGreaterThanOrEqual(controlNorm.snap.cursor);
+    const omitStartRecoveryRows = (audit: typeof controlNorm.audit) => ({
+      counts: Object.fromEntries(Object.entries(audit.counts).filter(([type]) => !type.startsWith("EXPERIMENT_START"))),
+      derived: audit.derived.filter((item) => !item.type.startsWith("EXPERIMENT_START")),
+    });
+    expect(omitStartRecoveryRows(crashedNorm.audit)).toEqual(omitStartRecoveryRows(controlNorm.audit));
   });
 });
 

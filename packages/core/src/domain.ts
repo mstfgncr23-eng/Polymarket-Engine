@@ -405,7 +405,7 @@ export const ledgerStateSchema = z.object({
 });
 export type LedgerState = z.infer<typeof ledgerStateSchema>;
 
-export const experimentStatusSchema = z.enum(["IDLE", "CREATED", "RUNNING", "ENTRY_CLOSED", "COMPLETED", "FAILED"]);
+export const experimentStatusSchema = z.enum(["IDLE", "CREATED", "RUNNING", "ENTRY_CLOSED", "COMPLETED", "FAILED", "ABORTED_START"]);
 export type ExperimentStatus = z.infer<typeof experimentStatusSchema>;
 export const experimentClosePolicySchema = z.enum(["observe_until_settlement", "mark_to_market"]);
 export type ExperimentClosePolicy = z.infer<typeof experimentClosePolicySchema>;
@@ -426,6 +426,9 @@ export const experimentManifestSchema = z.object({
   completedAt: timestampSchema.nullable(),
   unresolvedPositionCount: z.number().int().nonnegative().default(0),
   markToMarketAt: timestampSchema.nullable().optional(),
+  startValidationPending: z.boolean().optional(),
+  abortedAt: timestampSchema.nullable().optional(),
+  abortReason: z.string().nullable().optional(),
 });
 export type ExperimentManifest = z.infer<typeof experimentManifestSchema>;
 

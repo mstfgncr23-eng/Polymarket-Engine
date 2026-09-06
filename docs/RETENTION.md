@@ -133,9 +133,10 @@ Do not reintroduce a transactional `CREATE INDEX` on live `journal_events` insid
 | `PROVEN_NO_ACTIVE_EXPERIMENT` / IDLE (no start) / MONITOR_ONLY | Rows older than monitor TTL are eligible |
 | `ACTIVE_RUNNING` / `ACTIVE_ENTRY_CLOSED` | Protect in-window report-input. Pre-start monitor older than `min(now-ttl, startedAt)` may delete. No `startedAt` → do not delete monitor |
 | `COMPLETED` | Require canonical complete/non-truncated final **and** 7d grace before deleting transient report-input |
+| `ABORTED_START` | Terminal invalidated start; no in-window report-input remains and monitor cleanup is eligible |
 | `FAILED` / `UNKNOWN` / `CONFLICTING` | Monitor delete **forbidden**. `UNKNOWN` is never `PROVEN_NO_ACTIVE_EXPERIMENT`. |
 
-Operator `journal-cleanup` **always** resolves this table from durable journal rows (`EXPERIMENT_STARTED` / `ENTRY_CLOSED` / `COMPLETED`). Env `EXPERIMENT_ID` / `EXPERIMENT_STATUS` / `EXPERIMENT_STARTED_AT` are hints verified against that state; mismatch fail-closes. Missing `EXPERIMENT_ID` is **not** treated as monitor-only. A query failure or incomplete lifecycle scan is `UNKNOWN` (fail closed), not no-active. In-process `RetentionManager` tests may still pass a caller-asserted `experiment=null` without lifecycle; the CLI never does.
+Operator `journal-cleanup` **always** resolves this table from durable journal rows (`EXPERIMENT_STARTED` / `EXPERIMENT_START_ABORTED` / `ENTRY_CLOSED` / `COMPLETED`). Env `EXPERIMENT_ID` / `EXPERIMENT_STATUS` / `EXPERIMENT_STARTED_AT` are hints verified against that state; mismatch fail-closes. Missing `EXPERIMENT_ID` is **not** treated as monitor-only. A query failure or incomplete lifecycle scan is `UNKNOWN` (fail closed), not no-active. In-process `RetentionManager` tests may still pass a caller-asserted `experiment=null` without lifecycle; the CLI never does.
 
 `REPORT_SOURCE_INTEGRITY_FAULT` / `REPAIRED` are `unknown_retain` control-plane events (not report-input, not hash contributors, never pruned).
 

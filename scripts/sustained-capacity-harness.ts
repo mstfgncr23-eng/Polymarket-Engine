@@ -63,7 +63,7 @@ export interface CapacitySample {
   reference: { accepted: number; windowEntries: number; retryTimers: number };
   supervisor: { queued: number; inFlight: number; busyKeys: number; failures: number };
   sse: { subscribers: number; tracked: number; bufferedBytes: number };
-  state: { marketSnapshots: number; marketCache: number; settledMarkets: number; activations: number; grokSignals: number; idleTombstones: number };
+    state: { marketSnapshots: number; marketCache: number; settledMarkets: number; settlementBackoff: number; activations: number; grokSignals: number; idleTombstones: number };
 }
 
 export interface CapacityReport {
@@ -220,15 +220,45 @@ export function eventLoopUtilizationDelta(
   return { active, idle, utilization: total > 0 ? active / total : 0 };
 }
 
-function classifyMetric(samples: CapacitySample[], key: string, value: (sample: CapacitySample) => number, warmupSamples: number): CapacityReport["plateau"]["metrics"][string] {
+type MetricClassification = CapacityReport["plateau"]["metrics"][string];
+
+function median(values: number[]): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0 ? ((sorted[middle - 1] ?? 0) + (sorted[middle] ?? 0)) / 2 : sorted[middle] ?? 0;
+}
+
+export function classifyMemoryMetric(values: number[], elapsedMs: number[]): { finalSlopePerSecond: number; classification: MetricClassification["classification"] } {
+  if (values.length < 6 || elapsedMs.length !== values.length) return { finalSlopePerSecond: 0, classification: "insufficient_samples" };
+  const durationSeconds = Math.max(0, ((elapsedMs.at(-1) ?? 0) - (elapsedMs[0] ?? 0)) / 1000);
+  if (durationSeconds < 3) return { finalSlopePerSecond: 0, classification: "insufficient_samples" };
+  const half = Math.max(2, Math.floor(values.length / 2));
+  const start = median(values.slice(0, half));
+  const end = median(values.slice(-half));
+  const growth = end - start;
+  const slope = numericSlope(values, elapsedMs);
+  const deltas = values.slice(1).map((value, index) => value - (values[index] ?? value));
+  const positiveFraction = deltas.filter((delta) => delta >= 0).length / Math.max(1, deltas.length);
+  const absoluteFloor = 512 * 1024;
+  // A 4% whole-window change is material for long-lived memory; the
+  // absolute floor filters allocator/GC noise on small heaps.
+  const relativeFloor = Math.max(1, Math.abs(start)) * 0.04;
+  const materialGrowth = growth >= Math.max(absoluteFloor, relativeFloor) || slope * durationSeconds >= Math.max(absoluteFloor, relativeFloor);
+  const classification = materialGrowth && positiveFraction >= 0.6 ? "monotonic_growth" : "plateau";
+  return { finalSlopePerSecond: Number(slope.toFixed(4)), classification };
+}
+
+export function classifyMetric(samples: CapacitySample[], key: string, value: (sample: CapacitySample) => number, warmupSamples: number, policy: "count" | "memory" = "count"): MetricClassification {
   const steady = samples.slice(warmupSamples);
   const finalWindow = steady.slice(-Math.max(3, Math.floor(steady.length / 2)));
   if (steady.length < 3 || finalWindow.length < 3) return { warmupHighWater: Math.max(0, ...samples.slice(0, warmupSamples).map(value)), plateauHighWater: Math.max(0, ...steady.map(value)), finalSlopePerSecond: 0, classification: "insufficient_samples" };
   const slope = numericSlope(finalWindow.map(value), finalWindow.map((sample) => sample.elapsedMs));
   const highWater = Math.max(0, ...steady.map(value));
-  const baseline = Math.max(1, Math.max(...finalWindow.map(value)));
-  const classification = slope > Math.max(0.5, baseline * 0.05) ? "monotonic_growth" : "plateau";
-  return { warmupHighWater: Math.max(0, ...samples.slice(0, warmupSamples).map(value)), plateauHighWater: highWater, finalSlopePerSecond: Number(slope.toFixed(4)), classification };
+  const memory = policy === "memory" ? classifyMemoryMetric(finalWindow.map(value), finalWindow.map((sample) => sample.elapsedMs)) : null;
+  const baseline = Math.max(1, median(finalWindow.map(value)));
+  const classification = memory?.classification ?? (slope > Math.max(0.5, baseline * 0.05) ? "monotonic_growth" : "plateau");
+  return { warmupHighWater: Math.max(0, ...samples.slice(0, warmupSamples).map(value)), plateauHighWater: highWater, finalSlopePerSecond: memory?.finalSlopePerSecond ?? Number(slope.toFixed(4)), classification };
 }
 
 export async function runSustainedCapacityHarness(input: CapacityHarnessOptions = {}): Promise<CapacityReport> {
@@ -308,7 +338,7 @@ export async function runSustainedCapacityHarness(input: CapacityHarnessOptions 
       reference: { accepted: workload.referenceTicksSent, windowEntries: engine.referenceWindowTotalEntriesForTest(), retryTimers: engine.referenceRetryTimerCountForTest() },
       supervisor: { queued: supervisor.totalQueued, inFlight: supervisor.totalInFlight, busyKeys: supervisor.busyKeys, failures: supervisor.failureCount },
       sse: { subscribers: sse.subscribers, tracked: sse.tracked, bufferedBytes: sse.bufferedBytes },
-      state: { marketSnapshots: engine.state.marketSnapshots.size, marketCache: engine.monitoredMarketIds().length + engine.assetMarketIndexEntries(), settledMarkets: engine.settledMarketsForTest().size, activations: engine.activationFootprint().latency, grokSignals: engine.state.grokActivity.acceptedSignals, idleTombstones: engine.idleGrokSubmissionCountForTest() },
+      state: { marketSnapshots: engine.state.marketSnapshots.size, marketCache: engine.monitoredMarketIds().length + engine.assetMarketIndexEntries(), settledMarkets: engine.settledMarketsForTest().size, settlementBackoff: engine.settlementBackoffCountForTest(), activations: engine.activationFootprint().latency, grokSignals: engine.state.grokActivity.acceptedSignals, idleTombstones: engine.idleGrokSubmissionCountForTest() },
     });
     eventLoop.reset();
   };
@@ -420,16 +450,28 @@ export async function runSustainedCapacityHarness(input: CapacityHarnessOptions 
   const steadySamples = samples.filter((item) => item.phase !== "warmup").length;
   const finalWindowSamples = Math.max(0, Math.floor(steadySamples / 2));
   const metrics: CapacityReport["plateau"]["metrics"] = {
-    rss: classifyMetric(samples, "rss", (item) => item.memory.rss, warmupSamples),
-    heapUsed: classifyMetric(samples, "heapUsed", (item) => item.memory.heapUsed, warmupSamples),
-    heapTotal: classifyMetric(samples, "heapTotal", (item) => item.memory.heapTotal, warmupSamples),
-    external: classifyMetric(samples, "external", (item) => item.memory.external, warmupSamples),
-    arrayBuffers: classifyMetric(samples, "arrayBuffers", (item) => item.memory.arrayBuffers, warmupSamples),
+    rss: classifyMetric(samples, "rss", (item) => item.memory.rss, warmupSamples, "memory"),
+    heapUsed: classifyMetric(samples, "heapUsed", (item) => item.memory.heapUsed, warmupSamples, "memory"),
+    heapTotal: classifyMetric(samples, "heapTotal", (item) => item.memory.heapTotal, warmupSamples, "memory"),
+    external: classifyMetric(samples, "external", (item) => item.memory.external, warmupSamples, "memory"),
+    arrayBuffers: classifyMetric(samples, "arrayBuffers", (item) => item.memory.arrayBuffers, warmupSamples, "memory"),
     triggerQueue: classifyMetric(samples, "triggerQueue", (item) => item.trigger.queued, warmupSamples),
     journalWaiting: classifyMetric(samples, "journalWaiting", (item) => item.journal.waiting, warmupSamples),
     ingressDepth: classifyMetric(samples, "ingressDepth", (item) => item.ingress.depth, warmupSamples),
     sseBufferedBytes: classifyMetric(samples, "sseBufferedBytes", (item) => item.sse.bufferedBytes, warmupSamples),
     retryTimers: classifyMetric(samples, "retryTimers", (item) => item.reference.retryTimers, warmupSamples),
+    activeTriggers: classifyMetric(samples, "activeTriggers", (item) => item.trigger.active, warmupSamples),
+    triggerProvenance: classifyMetric(samples, "triggerProvenance", (item) => item.trigger.provenance, warmupSamples),
+    triggerDedupe: classifyMetric(samples, "triggerDedupe", (item) => item.trigger.dedupe, warmupSamples),
+    marketSnapshots: classifyMetric(samples, "marketSnapshots", (item) => item.state.marketSnapshots, warmupSamples),
+    marketCache: classifyMetric(samples, "marketCache", (item) => item.state.marketCache, warmupSamples),
+    referenceWindowEntries: classifyMetric(samples, "referenceWindowEntries", (item) => item.reference.windowEntries, warmupSamples),
+    activations: classifyMetric(samples, "activations", (item) => item.state.activations, warmupSamples),
+    idleGrokTombstones: classifyMetric(samples, "idleGrokTombstones", (item) => item.state.idleTombstones, warmupSamples),
+    settledMarkets: classifyMetric(samples, "settledMarkets", (item) => item.state.settledMarkets, warmupSamples),
+    settlementBackoff: classifyMetric(samples, "settlementBackoff", (item) => item.state.settlementBackoff, warmupSamples),
+    supervisorFailures: classifyMetric(samples, "supervisorFailures", (item) => item.supervisor.failures, warmupSamples),
+    supervisorBusyKeys: classifyMetric(samples, "supervisorBusyKeys", (item) => item.supervisor.busyKeys, warmupSamples),
   };
   const last = samples.at(-1)!;
   const max = (selector: (item: CapacitySample) => number) => Math.max(0, ...samples.map(selector));
@@ -439,7 +481,19 @@ export async function runSustainedCapacityHarness(input: CapacityHarnessOptions 
     boundedJournalAdmission: max((item) => item.journal.waiting) <= 128,
     boundedReferenceWindow: max((item) => item.reference.windowEntries) <= 16_384,
     boundedSse: max((item) => item.sse.bufferedBytes) <= 262_144 * Math.max(1, options.dashboard === "slow" ? 2 : 1),
-    boundedRuntimeBookkeeping: max((item) => item.state.marketSnapshots) <= Math.max(2, options.markets * 2),
+    boundedRuntimeBookkeeping: max((item) => item.state.marketSnapshots) <= Math.max(2, options.markets * 2)
+      && max((item) => item.state.marketCache) <= Math.max(3, options.markets * 3)
+      && max((item) => item.trigger.active) <= 500
+      && max((item) => item.trigger.provenance) <= 500
+      && max((item) => item.trigger.dedupe) <= 2_000
+      && max((item) => item.reference.windowEntries) <= 16_384
+      && max((item) => item.reference.retryTimers) <= 256
+      && max((item) => item.state.activations) <= 500
+      && max((item) => item.state.idleTombstones) <= 5_000
+      && max((item) => item.state.settledMarkets) <= Math.max(2, options.markets * 2)
+      && max((item) => item.state.settlementBackoff) <= Math.max(2, options.markets * 2)
+      && max((item) => item.supervisor.failures) <= 32
+      && max((item) => item.supervisor.busyKeys) <= 1_280,
     finalMarketTruthTrusted,
     ingressOverflowObserved: !options.ingressOverflow || finalIngress.gapTotal > 0,
     resyncRecovered: !options.ingressOverflow && !options.reconnectStorm || finalMarketTruthTrusted,
@@ -458,10 +512,18 @@ export async function runSustainedCapacityHarness(input: CapacityHarnessOptions 
     if (classification === "monotonic_growth") blockers.push(`REQUIRED_QUEUE_MONOTONIC_GROWTH:${name}`);
     if (classification === "insufficient_samples") blockers.push(`INSUFFICIENT_LOCAL_EVIDENCE:${name}`);
   }
+  // Hard-bounded windows/registries are checked by their architectural
+  // invariant above; only lifecycle-retained identities must plateau.
+  const retainedGrowthMetrics = ["activeTriggers", "triggerProvenance", "triggerDedupe", "settledMarkets", "settlementBackoff"];
+  for (const name of retainedGrowthMetrics) {
+    const classification = metrics[name]?.classification;
+    if (classification === "monotonic_growth") blockers.push(`REQUIRED_RETAINED_STATE_MONOTONIC_GROWTH:${name}`);
+    if (classification === "insufficient_samples" && options.durationMs >= 3_000) blockers.push(`INSUFFICIENT_LOCAL_EVIDENCE:${name}`);
+  }
   const memoryMetrics = ["rss", "heapUsed", "heapTotal", "external", "arrayBuffers"];
   const memoryInsufficient = options.durationMs < 3_000 || finalWindowSamples < 10
     || memoryMetrics.some((name) => metrics[name]?.classification === "insufficient_samples");
-  const memoryFailed = memoryMetrics.some((name) => metrics[name]?.classification === "monotonic_growth");
+  const memoryFailed = !memoryInsufficient && memoryMetrics.some((name) => metrics[name]?.classification === "monotonic_growth");
   const localMemory: CapacityReport["verdict"]["localMemory"] = memoryFailed
     ? "FAIL" : memoryInsufficient ? "INSUFFICIENT_LOCAL_EVIDENCE" : "MEASURED";
   if (memoryFailed) blockers.push("REQUIRED_MEMORY_MONOTONIC_GROWTH");

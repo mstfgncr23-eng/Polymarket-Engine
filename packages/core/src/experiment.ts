@@ -21,6 +21,7 @@ export function createIdleExperiment(input: Omit<ExperimentStartInput, "now"> & 
     systemVersion: input.systemVersion, gitSha: input.gitSha,
     closePolicy: input.closePolicy ?? "observe_until_settlement",
     startedAt: null, entryClosesAt: null, completedAt: null, unresolvedPositionCount: 0, markToMarketAt: null,
+    startValidationPending: false, abortedAt: null, abortReason: null,
   };
 }
 
@@ -34,6 +35,7 @@ export function startExperiment(input: ExperimentStartInput): ExperimentManifest
     closePolicy: input.closePolicy ?? "observe_until_settlement",
     startedAt, entryClosesAt: new Date(input.now.getTime() + input.durationHours * 3_600_000).toISOString(),
     completedAt: null, unresolvedPositionCount: 0, markToMarketAt: null,
+    startValidationPending: true, abortedAt: null, abortReason: null,
   };
 }
 
@@ -46,7 +48,7 @@ export function refreshExperiment(
   now: Date,
   options: { openPositions?: boolean; unresolvedCount?: number; markToMarketReady?: boolean } = {},
 ): ExperimentManifest {
-  if (manifest.status === "IDLE" || manifest.status === "COMPLETED" || manifest.status === "FAILED") return manifest;
+  if (manifest.status === "IDLE" || manifest.status === "COMPLETED" || manifest.status === "FAILED" || manifest.status === "ABORTED_START") return manifest;
   if (manifest.status === "RUNNING" && manifest.entryClosesAt && now.getTime() >= new Date(manifest.entryClosesAt).getTime()) {
     return { ...manifest, status: "ENTRY_CLOSED" };
   }

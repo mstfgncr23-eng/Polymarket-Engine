@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { MemoryEventJournal } from "@pm/db";
 import { EngineService } from "../apps/engine/src/engine.js";
 import { NoopGrokActivationBridge } from "../apps/engine/src/activation/index.js";
-import { discoveryReport, qualified, qualifiedPaperEnv, ScriptedMarketAdapter, ScriptedReferenceRegistry } from "./paper-engine-testkit.js";
+import { discoveryReport, qualified, qualifiedPaperEnv, ScriptedMarketAdapter, ScriptedReferenceRegistry, paperFill } from "./paper-engine-testkit.js";
 
 const logger = { error: () => undefined };
 
@@ -58,6 +58,46 @@ describe("Step 5 durable DB fault path", () => {
       const rows = await journal.queryDurableTransitions({ limit: 20 });
       expect(rows.filter((row) => row.operationKey === outageInput.operationKey)).toHaveLength(1);
       expect(rows).toHaveLength(2);
+    } finally {
+      await engine.stop();
+    }
+  }, 15_000);
+
+  it("gates an actual engine fill on durable success and replays it exactly once", async () => {
+    const journal = new MemoryEventJournal();
+    const engine = await startPaper(journal);
+    const fill = paperFill("step5-durable", "UP", "0.40", { id: "step5-product-fill" });
+    try {
+      let release!: () => void;
+      let entered = false;
+      const hold = new Promise<void>((resolve) => { release = resolve; });
+      const original = journal.commitDurableTransition.bind(journal);
+      journal.commitDurableTransition = async (input, expected) => {
+        if (input.operationKey === `fill:${fill.id}`) { entered = true; await hold; }
+        return original(input, expected);
+      };
+      const pending = engine.applyObservedFill(fill);
+      while (!entered) await new Promise((resolve) => setTimeout(resolve, 1));
+      expect(engine.state.snapshot().positions).toHaveLength(0);
+      release();
+      await pending;
+      const accepted = engine.state.snapshot().positions.find((position) => position.marketId === fill.marketId);
+      expect(accepted?.upQuantity).toBe(fill.quantity);
+      const beforeOutage = engine.state.snapshot().balance;
+      const outage = paperFill("step5-durable", "DOWN", "0.48", { id: "step5-product-outage" });
+      journal.available = false;
+      await expect(engine.applyObservedFill(outage)).rejects.toThrow("DATABASE_UNAVAILABLE");
+      expect(engine.state.snapshot().balance).toEqual(beforeOutage);
+      journal.available = true;
+      await engine.applyObservedFill(outage);
+      await engine.applyObservedFill(outage);
+      expect((await journal.queryDurableTransitions({ types: ["PAPER_FILL"], limit: 20 })).filter((row) => row.operationKey === `fill:${outage.id}`)).toHaveLength(1);
+      const recovered = await startPaper(journal);
+      try {
+        expect(recovered.state.snapshot().balance).toEqual(engine.state.snapshot().balance);
+      } finally {
+        await recovered.stop();
+      }
     } finally {
       await engine.stop();
     }

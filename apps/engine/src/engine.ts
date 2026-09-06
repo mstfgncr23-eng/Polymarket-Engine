@@ -218,8 +218,6 @@ export class EngineService {
   private experimentFeedGeneration = 0;
   /** Keeps ingress out of the transient post-commit/start-validation window. */
   private experimentStartPending = false;
-  /** A feed-invalidated start is terminal but permits a fresh retry window. */
-  private restartableAfterFeedInvalidation = false;
   private checkpointSequence = 0;
   private lastAppliedDurableCursor = 0;
   private derivedAuditCursor = 0;
@@ -273,6 +271,7 @@ export class EngineService {
    * duplicate suppression; active experiment submissions use the journal.
    */
   private readonly idleGrokSubmissions = new Map<string, IdleGrokSubmission>();
+  private startPostCommitValidationHoldForTest: Promise<void> | null = null;
   private readonly reportSourceIntegrity = new Map<string, ReportSourceIntegrityFault>();
   private readonly persistedIntegrityFaults = new WeakSet<ReportSourceIntegrityFault>();
   private referenceTelemetryHoldForTest: Promise<void> | null = null;
@@ -474,6 +473,7 @@ export class EngineService {
     snapshot: MarketSnapshot,
     intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" = "OPEN_FIRST_LEG",
   ): Promise<void> {
+    if (intent === "OPEN_FIRST_LEG" && this.experimentStartPending) return;
     await this.reserveMaker(order, snapshot, intent);
   }
   async cancelMakerForTest(orderId: string, reason = "TEST_RELEASE"): Promise<void> {
@@ -511,6 +511,7 @@ export class EngineService {
   triggerDedupeEntryCount(): number { return this.triggerEngine.dedupeEntryCount(); }
   makerReservationsForTest() { return new Map(this.makerReservations); }
   settledMarketsForTest() { return new Set(this.settledMarkets); }
+  settlementBackoffCountForTest(): number { return this.settlementBackoff.size; }
   async latestDurableSequenceForTest(): Promise<number> { return this.journal.latestDurableSequence(); }
   async readDurableAfterForTest(sequence: number, limit: number) {
     return this.journal.readDurableTransitionsAfter(sequence, limit);
@@ -530,8 +531,7 @@ export class EngineService {
 
   async beginExperiment(): Promise<Record<string, unknown>> {
     return this.experimentBoundaryGate.run(async () => {
-      const retryableFeedBoundary = this.restartableAfterFeedInvalidation && this.experiment?.status === "ENTRY_CLOSED";
-      if ((this.experiment?.status === "RUNNING" || this.experiment?.status === "ENTRY_CLOSED") && !retryableFeedBoundary) {
+      if (this.experiment?.status === "RUNNING" || this.experiment?.status === "ENTRY_CLOSED") {
         return { ok: false, blockers: ["EXPERIMENT_ALREADY_ACTIVE"], experiment: this.experiment };
       }
       if (this.experiment?.status === "COMPLETED" || this.experiment?.status === "FAILED") {
@@ -553,7 +553,7 @@ export class EngineService {
       if (!gatedPreflight.ok) return { ...gatedPreflight, ok: false };
       const now = this.nowFn();
       const next = startExperiment({
-        id: retryableFeedBoundary ? undefined : this.experiment?.id, durationHours: this.env.EXPERIMENT_DURATION_HOURS, strategyVersion: this.strategy.version,
+        id: undefined, durationHours: this.env.EXPERIMENT_DURATION_HOURS, strategyVersion: this.strategy.version,
         riskConfiguration: this.riskLimits, modelConfiguration: { provider: "external_grok_bot_mcp", logicalRoles: 6, localModelExecution: false },
         startingBalance: this.ledger.snapshot().startingBalance, systemVersion: "0.1.0",
         gitSha: process.env.GIT_SHA ?? process.env.FLY_IMAGE_REF ?? "unknown", now,
@@ -572,7 +572,7 @@ export class EngineService {
             experiment: next,
             derivedAudit: [this.experimentDerivedAudit("EXPERIMENT_STARTED", next)],
           }),
-          checkpoint: true,
+          checkpoint: false,
           beforeCommit: () => {
             if (this.experimentFeedGeneration !== startFeedGeneration || this.experimentFeedBlockers().length > 0) {
               throw new ExperimentStartGuardRejectedError();
@@ -587,26 +587,23 @@ export class EngineService {
             this.record("EXPERIMENT_STARTED", next.id, null, { status: next.status });
           },
         });
+        if (this.startPostCommitValidationHoldForTest) await this.startPostCommitValidationHoldForTest;
         const postCommitBlockers = this.experimentFeedBlockers();
         if (this.experimentFeedGeneration !== startFeedGeneration || postCommitBlockers.length > 0) {
           // The durable start may already have crossed the database boundary.
-          // Keep the boundary gate and start-pending fence held, then close
-          // entry immediately so no caller can observe an entry-capable
-          // experiment from invalidated truth. This is a deliberately
-          // fail-closed STARTED -> ENTRY_CLOSED lifecycle, not a third check
-          // presented as atomic insertion.
-          const closed: ExperimentManifest = {
-            ...next, status: "ENTRY_CLOSED", entryClosesAt: next.startedAt, completedAt: null, markToMarketAt: null,
-          };
-          await this.commitExperimentStatus(closed);
-          this.restartableAfterFeedInvalidation = true;
+          // Keep the boundary gate and start-pending fence held, then commit a
+          // terminal aborted-start state so no caller can observe an
+          // entry-capable experiment from invalidated truth.
+          await this.commitAbortedStart(next, "EXPERIMENT_FEED_INVALIDATED_DURING_START");
           return {
             ok: false,
             blockers: [...new Set([...postCommitBlockers, "EXPERIMENT_FEED_INVALIDATED_DURING_START"])],
             experiment: this.experiment,
           };
         }
-        this.restartableAfterFeedInvalidation = false;
+        this.experiment = { ...next, startValidationPending: false };
+        this.syncExperimentWindow();
+        await this.checkpoint();
       } catch (error) {
         if (!(error instanceof ExperimentStartGuardRejectedError)) throw error;
         const current = this.preflight("48H_GROK_PAPER_EXPERIMENT");
@@ -842,6 +839,12 @@ export class EngineService {
 
   private dropRemovedMarketState(removedMarkets: readonly string[], removedAssets: readonly string[]): void {
     for (const marketId of removedMarkets) {
+      // POSITION_SETTLED is durable authority. The in-memory marker only
+      // suppresses duplicate polling while the market remains in the live
+      // obligation set; once discovery removes it, drop the marker so
+      // historical turnover cannot accumulate in checkpoints/RAM.
+      this.settledMarkets.delete(marketId);
+      this.settlementBackoff.delete(marketId);
       this.snapshots.delete(marketId);
       this.triggerEngine.dropMarket(marketId);
       this.assetIndex.removeMarket(marketId);
@@ -1250,6 +1253,10 @@ export class EngineService {
         this.syncRecoveredProjection();
       }
       this.syncExperimentWindow();
+      if (this.experiment?.status === "RUNNING" && this.experiment.startValidationPending) {
+        await this.commitAbortedStart(this.experiment, "EXPERIMENT_START_VALIDATION_INCOMPLETE_RECOVERY");
+      }
+      this.syncExperimentWindow();
       if (this.experiment?.id) {
         const existing = await this.journal.loadExperimentReport(this.experiment.id, "final");
         if (existing && isCanonicalFinalReport(existing)) {
@@ -1413,7 +1420,7 @@ export class EngineService {
     }
   }
 
-  private experimentDerivedAudit(type: "EXPERIMENT_STARTED" | "EXPERIMENT_ENTRY_CLOSED" | "EXPERIMENT_COMPLETED", experiment: ExperimentManifest): DerivedAuditRecord {
+  private experimentDerivedAudit(type: "EXPERIMENT_STARTED" | "EXPERIMENT_START_ABORTED" | "EXPERIMENT_ENTRY_CLOSED" | "EXPERIMENT_COMPLETED", experiment: ExperimentManifest): DerivedAuditRecord {
     return {
       id: derivedAuditEventId(type, experiment.id),
       type,
@@ -1648,7 +1655,7 @@ export class EngineService {
 
   private async requestActivation(trigger: TriggerEvent): Promise<void> {
     const status = this.experiment?.status ?? "IDLE";
-    if (status === "IDLE" || status === "COMPLETED" || status === "FAILED") {
+    if (status === "IDLE" || status === "COMPLETED" || status === "FAILED" || status === "ABORTED_START") {
       const bookkeepingStarted = performance.now();
       this.activation.ensureLatency(trigger);
       this.state.setActivationLatency(this.activation.snapshot());
@@ -1951,6 +1958,9 @@ export class EngineService {
       maxOrderSizeUsd: this.riskLimits.maxOrderSizeUsd, minimumLockedPairEdge: this.riskLimits.minExpectedEdge,
     });
     if (!candidate) return;
+    // EXPERIMENT_STARTED is applied before its post-commit validation. Keep
+    // first-leg admission fenced until the validation marker is durable.
+    if (candidate.intent === "OPEN_FIRST_LEG" && this.experimentStartPending) return;
     if (!this.adapterTokenSynchronized(candidate.tokenId)) return;
     if (candidate.intent === "OPEN_FIRST_LEG" && this.overload.state === "FAIL_CLOSED") return;
     if (candidate.intent === "OPEN_FIRST_LEG" && !experimentAllowsFirstLeg(this.experiment)) return;
@@ -2029,6 +2039,7 @@ export class EngineService {
   }
 
   private async submitPaperOrder(order: PaperOrder, decisionSnapshot: MarketSnapshot, duplicateKey: string, intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" = "OPEN_FIRST_LEG"): Promise<void> {
+    if (intent === "OPEN_FIRST_LEG" && this.experimentStartPending) return;
     this.metrics.paperOrders.inc({ type: order.orderType });
     this.record("PAPER_ORDER_CREATED", order.traceId, order.marketId, { orderId: order.id, type: order.orderType, intent }, decisionSnapshot.asset ?? null);
     await this.persistReportInput(createJournalEvent({
@@ -2140,6 +2151,10 @@ export class EngineService {
   }
 
   private async applyFill(fill: Parameters<PaperLedger["applyFill"]>[0], extras: { restingAfter?: RestingPaperOrder | null } = {}): Promise<void> {
+    // A fill with no existing position is a first leg. The post-commit start
+    // validation fence must reject it while the experiment identity is still
+    // pending; hedges for pre-existing positions remain admissible.
+    if (this.experimentStartPending && !this.ledger.positions.has(fill.marketId)) return;
     const reserved = this.makerReservations.get(fill.orderId);
     let reservationAfter: string | null = reserved ?? null;
     if (reserved && fill.liquidityRole === "MAKER") {
@@ -2581,7 +2596,7 @@ export class EngineService {
 
   private async maybeScheduledReview(): Promise<void> {
     const status = this.experiment?.status;
-    if (status === "IDLE" || status === "COMPLETED" || status === "FAILED" || status == null) return;
+    if (status === "IDLE" || status === "COMPLETED" || status === "FAILED" || status === "ABORTED_START" || status == null) return;
     const triggers = this.triggerEngine.ingestScheduledReview(this.experiment?.id ?? createId("review"));
     for (const trigger of triggers) this.admitTrigger(trigger);
   }
@@ -2615,6 +2630,15 @@ export class EngineService {
 
   private async settleMarket(marketId: string, market: DiscoveredMarket): Promise<void> {
     if (this.settledMarkets.has(marketId)) return;
+    const operationKey = `settlement:${marketId}:${this.experiment?.id ?? "paper"}`;
+    const durableSettlement = await this.journal.readDurableByOperationKey(operationKey);
+    if (durableSettlement?.type === "POSITION_SETTLED") {
+      // Rediscovery may occur after the live marker was evicted. Rehydrate
+      // the short-lived suppression bit from durable authority without
+      // replaying cash or settlement effects.
+      this.settledMarkets.add(marketId);
+      return;
+    }
     const raw = await this.resolutionFetcher(market.id) ?? (market.slug ? await this.resolutionFetcher(market.slug) : null);
     if (!raw) {
       this.bumpSettlementBackoff(marketId);
@@ -2637,7 +2661,7 @@ export class EngineService {
     const asset = this.assetByMarket.get(marketId) ?? market.asset;
     const experimentId = this.experiment?.id ?? null;
     await this.commitAuthoritative({
-      operationKey: `settlement:${marketId}:${this.experiment?.id ?? "paper"}`,
+      operationKey,
       type: "POSITION_SETTLED",
       aggregateType: "position",
       aggregateId: positionBefore?.id ?? marketId,
@@ -2682,6 +2706,7 @@ export class EngineService {
     auth: Record<string, unknown>;
   }): DerivedAuditRecord[] {
     const { marketId, asset, experimentId, parsed, positionBefore, upPayoff, downPayoff, occurredAt, auth } = input;
+    const operationKey = `settlement:${marketId}:${experimentId ?? "paper"}`;
     const records: DerivedAuditRecord[] = [{
       id: derivedAuditEventId("MARKET_RESOLUTION_OBSERVED", marketId),
       type: "MARKET_RESOLUTION_OBSERVED",
@@ -2692,7 +2717,7 @@ export class EngineService {
     }];
     const projected = this.projectDerivedAudit(
       {
-        operationKey: `settlement:${marketId}:${experimentId ?? "paper"}`,
+        operationKey,
         type: "POSITION_SETTLED",
         aggregateType: "position",
         aggregateId: positionBefore?.id ?? marketId,
@@ -2823,6 +2848,26 @@ export class EngineService {
       },
     });
     return true;
+  }
+
+  private async commitAbortedStart(start: ExperimentManifest, reason: string): Promise<void> {
+    const aborted: ExperimentManifest = {
+      ...start,
+      status: "ABORTED_START",
+      startValidationPending: false,
+      abortedAt: this.nowFn().toISOString(),
+      abortReason: reason,
+      completedAt: null,
+      markToMarketAt: null,
+    };
+    await this.commitAuthoritative({
+      operationKey: `experiment:${start.id}:start_aborted`,
+      type: "EXPERIMENT_START_ABORTED",
+      aggregateType: "experiment",
+      aggregateId: start.id,
+      buildPayload: () => ({ experiment: aborted, reason, derivedAudit: [this.experimentDerivedAudit("EXPERIMENT_START_ABORTED", aborted)] }),
+      checkpoint: true,
+    });
   }
 
   private async commitExperimentStatus(next: ExperimentManifest): Promise<void> {
@@ -3371,6 +3416,7 @@ export class EngineService {
   sourceSealPersistInFlightForTest() { return this.sourceSealPersistInFlight; }
   setGrokClaimHoldForTest(hold: Promise<void> | null): void { this.grokClaimHold = hold; }
   setIdleGrokAcceptanceHoldForTest(hold: Promise<void> | null): void { this.idleGrokAcceptanceHoldForTest = hold; }
+  setStartPostCommitValidationHoldForTest(hold: Promise<void> | null): void { this.startPostCommitValidationHoldForTest = hold; }
   researchIngressInFlightForTest() { return this.researchIngressInFlight; }
   idleGrokSubmissionCountForTest(): number { return this.idleGrokSubmissions.size; }
   sourceSealStateForTest() { return { sealing: this.sourceSealing, sealed: this.sourceSealed, generation: this.sourceSealGeneration }; }
