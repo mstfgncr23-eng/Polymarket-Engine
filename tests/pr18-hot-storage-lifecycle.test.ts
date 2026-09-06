@@ -194,11 +194,14 @@ describe("PR18 hot operational storage lifecycle", () => {
     await journal.initialize();
     const key = `pr18-pg-${Date.now()}`;
     try {
-      const commit = await journal.commitDurableTransition({ operationKey: key, type: "POSITION_SETTLED", aggregateType: "position", aggregateId: key, payload: { experimentId: key, marketId: key } }, 0);
-      await journal.saveCheckpoint({ experimentId: key, sequence: 1, payload: { durableCursor: commit.sequence, ledger: { cash: "100", reservedCash: "0", startingBalance: "100" }, positions: [] } });
+      // Use a valid no-op authoritative payload so this disposable CI
+      // database can be shared with other Postgres integration tests without
+      // poisoning their recovery replay with an intentionally partial fixture.
+      const previous = await journal.latestDurableSequence();
+      const commit = await journal.commitDurableTransition({ operationKey: key, type: "REPORT_SOURCE_INTEGRITY_FAULT", aggregateType: "report", aggregateId: key, payload: { derivedAudit: [] } }, previous);
       const compacted = await journal.compactDurableTransitionsThrough(commit.sequence, { maxRows: 1, batchSize: 1, maxReplayKeys: 8, maxBatches: 1, budgetMs: 1000 });
       expect(compacted.deleted).toBe(1);
-      expect((await journal.readDurableByOperationKey(key))?.type).toBe("POSITION_SETTLED");
+      expect((await journal.readDurableByOperationKey(key))?.type).toBe("REPORT_SOURCE_INTEGRITY_FAULT");
     } finally {
       await journal.close();
     }
