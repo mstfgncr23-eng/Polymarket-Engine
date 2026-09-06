@@ -333,7 +333,7 @@ describe("PR18 hot operational storage lifecycle", () => {
       await journal.deleteCanonicalEventsThrough!({ experimentId, occurredBefore: new Date("2026-01-01T00:00:03.000Z"), limit: 100, sourceCursor: 0, sourceCommitSeq: rollup!.sourceCommitSeq, sourceRecordedAt: new Date(rollup!.sourceRecordedAt!) });
       expect(await journal.readJournalEventById(late.id)).not.toBeNull();
       const next = await streamExperimentSummary(journal, { id: experimentId, startedAt }, { status: "RUNNING", complete: false, reportKind: "interim", metricsScope: "rolling" });
-      expect(next.summary.sourceEventCount).toBe(1);
+      expect(next.scan.scanned).toBe(1);
     } finally {
       releaseResolve();
       await journal.close();
