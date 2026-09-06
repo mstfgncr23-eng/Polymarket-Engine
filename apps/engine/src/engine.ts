@@ -148,6 +148,10 @@ import {
   type JoinResult,
 } from "./runtime-supervisor.js";
 
+class ExperimentStartGuardRejectedError extends Error {
+  constructor() { super("EXPERIMENT_START_MARKET_TRUTH_CHANGED"); }
+}
+
 function isJournalAdmissionRejectedError(error: unknown): boolean {
   return error instanceof JournalAdmissionRejected
     || (Boolean(error) && typeof error === "object" && (error as { name?: string }).name === "JournalAdmissionRejected");
@@ -531,11 +535,15 @@ export class EngineService {
         return { ...preflight, ok: false, blockers: [...new Set([...preflight.blockers, "OVERLOAD_FAIL_CLOSED"])] };
       }
       const preflight = this.preflight("48H_GROK_PAPER_EXPERIMENT");
+      const feedBlockers = this.experimentFeedBlockers();
+      const gatedPreflight = feedBlockers.length > 0
+        ? { ...preflight, ok: false, blockers: [...new Set([...preflight.blockers, ...feedBlockers])] }
+        : preflight;
       await this.safeAppend(createJournalEvent({
         traceId: createId("trace"), type: "EXPERIMENT_PREFLIGHT", aggregateType: "experiment", aggregateId: "preflight",
-        payload: preflight as unknown as Record<string, unknown>,
+        payload: gatedPreflight as unknown as Record<string, unknown>,
       }));
-      if (!preflight.ok) return { ...preflight, ok: false };
+      if (!gatedPreflight.ok) return { ...gatedPreflight, ok: false };
       const now = this.nowFn();
       const next = startExperiment({
         id: this.experiment?.id, durationHours: this.env.EXPERIMENT_DURATION_HOURS, strategyVersion: this.strategy.version,
@@ -544,28 +552,59 @@ export class EngineService {
         gitSha: process.env.GIT_SHA ?? process.env.FLY_IMAGE_REF ?? "unknown", now,
         closePolicy: this.env.EXPERIMENT_CLOSE_POLICY,
       });
-      await this.commitAuthoritative({
-        operationKey: `experiment:${next.id}:started`,
-        type: "EXPERIMENT_STARTED",
-        aggregateType: "experiment",
-        aggregateId: next.id,
-        occurredAt: now,
-        buildPayload: () => ({
-          experiment: next,
-          derivedAudit: [this.experimentDerivedAudit("EXPERIMENT_STARTED", next)],
-        }),
-        checkpoint: true,
-        afterApply: async () => {
-          this.reportGenerated = false;
-          this.abortSourceSealPersist();
-          this.sourceSealed = false;
-          this.sourceSealing = false;
-          this.clearReportSourceIntegrity(next.id);
-          this.record("EXPERIMENT_STARTED", next.id, null, { status: next.status });
-        },
-      });
+      try {
+        await this.commitAuthoritative({
+          operationKey: `experiment:${next.id}:started`,
+          type: "EXPERIMENT_STARTED",
+          aggregateType: "experiment",
+          aggregateId: next.id,
+          occurredAt: now,
+          buildPayload: () => ({
+            experiment: next,
+            derivedAudit: [this.experimentDerivedAudit("EXPERIMENT_STARTED", next)],
+          }),
+          checkpoint: true,
+          beforeCommit: () => {
+            if (this.experimentFeedBlockers().length > 0) throw new ExperimentStartGuardRejectedError();
+          },
+          afterApply: async () => {
+            this.reportGenerated = false;
+            this.abortSourceSealPersist();
+            this.sourceSealed = false;
+            this.sourceSealing = false;
+            this.clearReportSourceIntegrity(next.id);
+            this.record("EXPERIMENT_STARTED", next.id, null, { status: next.status });
+          },
+        });
+      } catch (error) {
+        if (!(error instanceof ExperimentStartGuardRejectedError)) throw error;
+        const current = this.preflight("48H_GROK_PAPER_EXPERIMENT");
+        const blockers = [...new Set([...current.blockers, ...this.experimentFeedBlockers()])];
+        return { ...current, ok: false, blockers };
+      }
       return { ok: true, experiment: this.experiment, preflight };
     });
+  }
+
+  /**
+   * A real experiment may only start with at least one currently trusted
+   * market candidate. Synthetic/test adapters intentionally opt out because
+   * they do not model the live transport trust state.
+   */
+  private experimentFeedBlockers(): string[] {
+    if (!(this.marketAdapter instanceof PolymarketMarketDataAdapter)) return [];
+    if (this.state.connections.polymarket.state !== "CONNECTED") return ["MARKET_FEED_NOT_READY"];
+    const candidates = [...this.entryQualified].map((marketId) => {
+      const market = this.marketsById.get(marketId);
+      const asset = this.assetByMarket.get(marketId) ?? market?.asset ?? null;
+      const referenceReady = !asset || this.referenceRequired.get(marketId) !== true
+        || (!this.referenceUnreliable.has(asset)
+          && this.state.getReferenceContext(asset, this.nowFn().getTime(), this.riskLimits.staleFeedTimeoutMs).freshness === "fresh");
+      return { marketId, trusted: this.isMarketSynchronized(marketId), referenceReady };
+    });
+    if (candidates.some((candidate) => candidate.trusted && candidate.referenceReady)) return [];
+    if (candidates.some((candidate) => candidate.trusted)) return ["REFERENCE_FEED_STALE"];
+    return ["MARKET_BOOK_NOT_TRUSTED"];
   }
 
   preflight(mode: "MONITOR_ONLY" | "48H_GROK_PAPER_EXPERIMENT" = "MONITOR_ONLY") {
@@ -1005,6 +1044,7 @@ export class EngineService {
     aggregateId: string;
     buildPayload: (occurredAt: Date) => Record<string, unknown>;
     occurredAt?: Date;
+    beforeCommit?: () => void;
     afterApply?: (transition: DurableTransition) => Promise<void>;
     checkpoint?: boolean;
   }): Promise<DurableCommitResult> {
@@ -1014,6 +1054,7 @@ export class EngineService {
       let commit: DurableCommitResult;
       try {
         const payload = await this.resolveDurablePayload(input, occurredAt);
+        input.beforeCommit?.();
         commit = await this.journal.commitDurableTransition({
           operationKey: input.operationKey,
           type: input.type,
@@ -1025,6 +1066,7 @@ export class EngineService {
         this.metrics.noteDurableCommit(input.type, commit.inserted);
       } catch (error) {
         if (error instanceof CrashInjectedError) throw error;
+        if (error instanceof ExperimentStartGuardRejectedError) throw error;
         if (error instanceof DurableCursorBehindError) {
           commit = await this.catchUpOrRejectStalePlan(input.operationKey, input.type, error);
         } else if (error instanceof IdempotencyConflictError) {
@@ -3287,6 +3329,7 @@ export class EngineService {
   setGrokClaimHoldForTest(hold: Promise<void> | null): void { this.grokClaimHold = hold; }
   setIdleGrokAcceptanceHoldForTest(hold: Promise<void> | null): void { this.idleGrokAcceptanceHoldForTest = hold; }
   researchIngressInFlightForTest() { return this.researchIngressInFlight; }
+  idleGrokSubmissionCountForTest(): number { return this.idleGrokSubmissions.size; }
   sourceSealStateForTest() { return { sealing: this.sourceSealing, sealed: this.sourceSealed, generation: this.sourceSealGeneration }; }
   async completeExperimentForTest(): Promise<void> {
     if (!this.experiment) throw new Error("NO_EXPERIMENT");

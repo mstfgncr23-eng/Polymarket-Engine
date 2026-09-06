@@ -20,6 +20,7 @@
     "experiment:start": "pnpm --filter @pm/engine experiment:start",
     "report": "pnpm --filter @pm/engine report",
     "bench:stability": "tsx scripts/stability-hot-path-bench.ts",
+    "bench:sustained": "tsx scripts/sustained-capacity-harness.ts",
     "bench:retention": "tsx scripts/report-retention-bench.ts"
   },
   "devDependencies": {

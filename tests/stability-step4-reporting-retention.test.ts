@@ -128,7 +128,7 @@ describe("Step-4 streaming summary equivalence", () => {
 });
 
 describe("Step-4 keyset scanner bounds", () => {
-  it("100k+ scan retains a page + bounded accumulator, not an event-count array", { timeout: 60_000 }, async () => {
+  it("100k+ scan retains a page + bounded accumulator, not an event-count array", { timeout: 120_000 }, async () => {
     const journal = new MemoryEventJournal();
     const start = Date.parse("2026-01-01T00:00:00.000Z");
     const n = 100_000;

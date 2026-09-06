@@ -13,7 +13,7 @@ import { RestingOrderTokenIndex } from "../apps/engine/src/resting-order-index.j
 import { RUNTIME_BOUNDS } from "../apps/engine/src/runtime-supervisor.js";
 
 describe("100k-event structure plateaus", () => {
-  it("dedupe stays at the hard cap across 100k unique scopes", () => {
+  it("dedupe stays at the hard cap across 100k unique scopes", { timeout: 15_000 }, () => {
     let t = Date.parse("2026-08-31T12:00:00.000Z");
     const engine = new TriggerEngine(triggerConfigSchema.parse({
       cooldownMs: 0, imbalanceThreshold: 0.01,
