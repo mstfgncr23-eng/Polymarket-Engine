@@ -1316,9 +1316,9 @@ export class PostgresEventJournal implements EventJournal {
       WHERE id IN (
         SELECT id FROM journal_events
         WHERE type = ANY(${types}) AND (payload->>'experimentId') = ${input.experimentId}
-          AND occurred_at < ${before}
+          AND occurred_at < ${before.toISOString()}
           AND commit_seq <= ${input.sourceCommitSeq}
-          AND (${input.sourceRecordedAt == null} OR recorded_at <= ${input.sourceRecordedAt ?? new Date()})
+          AND (${input.sourceRecordedAt == null} OR recorded_at <= ${(input.sourceRecordedAt ?? new Date()).toISOString()})
         ORDER BY occurred_at ASC, id ASC LIMIT ${cap}
       )`;
     return { deleted: result.count ?? 0 };
