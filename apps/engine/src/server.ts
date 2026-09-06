@@ -35,6 +35,22 @@ export class SseHub {
     return () => this.remove(subscriber);
   }
 
+  /** Read-only runtime counters used by the capacity harness and diagnostics. */
+  statsForTest(): { subscribers: number; tracked: number; bufferedBytes: number; pendingSnapshot: boolean; snapshotTimerActive: boolean } {
+    let bufferedBytes = 0;
+    for (const state of this.tracked.values()) {
+      const reported = typeof state.subscriber.writableLength === "number" ? state.subscriber.writableLength : state.bytes;
+      bufferedBytes += Math.max(0, reported);
+    }
+    return {
+      subscribers: this.subscribers.size,
+      tracked: this.tracked.size,
+      bufferedBytes,
+      pendingSnapshot: this.pendingSnapshot !== null,
+      snapshotTimerActive: this.snapshotTimer !== null,
+    };
+  }
+
   private remove(subscriber: Subscriber, reason?: SlowClientReason): void {
     if (!this.subscribers.delete(subscriber)) return;
     this.tracked.delete(subscriber);

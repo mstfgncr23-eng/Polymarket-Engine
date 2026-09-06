@@ -26,7 +26,8 @@ import { z, ZodError } from "zod";
  * MUTATION INVENTORY (Step 2 — replay-authoritative vs derived)
  *
  * A  CRITICAL / replay-authoritative (this log is the recovery source):
- *    EXPERIMENT_STARTED, EXPERIMENT_ENTRY_CLOSED, EXPERIMENT_COMPLETED
+ *    EXPERIMENT_STARTED, EXPERIMENT_START_VALIDATED, EXPERIMENT_START_ABORTED,
+ *    EXPERIMENT_ENTRY_CLOSED, EXPERIMENT_COMPLETED
  *    PAPER_MAKER_RESERVED, PAPER_MAKER_RELEASED, PAPER_ORDER_CANCELLED
  *    PAPER_FILL (taker + maker partial/full)
  *    POSITION_SETTLED (includes resolution payoffs; no provider call on replay)
@@ -183,6 +184,7 @@ export function durableIdentityConflicts(
       return hashDurablePayload(pick(existing, ["aiCost", "infrastructureCost", "accrualKey"]))
         !== hashDurablePayload(pick(incoming, ["aiCost", "infrastructureCost", "accrualKey"]));
     case "EXPERIMENT_STARTED":
+    case "EXPERIMENT_START_VALIDATED":
     case "EXPERIMENT_ENTRY_CLOSED":
     case "EXPERIMENT_COMPLETED":
     case "LEDGER_MARK_TO_MARKET":
@@ -252,9 +254,11 @@ export function applyDurableTransition(state: RecoverableEngineState, transition
   }
   try {
     switch (transition.type) {
-      case "EXPERIMENT_STARTED":
-      case "EXPERIMENT_ENTRY_CLOSED":
-      case "EXPERIMENT_COMPLETED":
+    case "EXPERIMENT_STARTED":
+    case "EXPERIMENT_START_VALIDATED":
+    case "EXPERIMENT_START_ABORTED":
+    case "EXPERIMENT_ENTRY_CLOSED":
+    case "EXPERIMENT_COMPLETED":
         state.experiment = experimentManifestSchema.parse(transition.payload.experiment ?? transition.payload);
         if (transition.type === "EXPERIMENT_STARTED") {
           const at = state.experiment.startedAt ? new Date(state.experiment.startedAt) : new Date(transition.occurredAt);
@@ -298,7 +302,6 @@ export function applyDurableTransition(state: RecoverableEngineState, transition
       case "POSITION_SETTLED": {
         const payload = settlementPayloadSchema.parse(transition.payload);
         state.ledger.settlePosition(payload.marketId, payload.upPayoff, payload.downPayoff, new Date(payload.settledAt));
-        state.settledMarkets.add(payload.marketId);
         return;
       }
       case "LEDGER_MARK_TO_MARKET": {
@@ -387,7 +390,7 @@ export function validatePostReplayInvariants(
     reasons.push(`reserved_cash_mismatch:${reserved.toFixed()}!=${reservationSum.toFixed()}`);
   }
   const status = state.experiment?.status;
-  if (status && !["IDLE", "CREATED", "RUNNING", "ENTRY_CLOSED", "COMPLETED", "FAILED"].includes(status)) {
+  if (status && !["IDLE", "CREATED", "RUNNING", "ENTRY_CLOSED", "COMPLETED", "FAILED", "ABORTED_START"].includes(status)) {
     reasons.push("experiment_status_invalid");
   }
   if (lastApplied !== expectedCursor) reasons.push(`cursor_mismatch:${lastApplied}!=${expectedCursor}`);
@@ -456,6 +459,8 @@ export const CRITICAL_AUDIT_TYPES = [
   "PAIR_REALIZED",
   "MARKET_RESOLUTION_OBSERVED",
   "EXPERIMENT_STARTED",
+  "EXPERIMENT_START_VALIDATED",
+  "EXPERIMENT_START_ABORTED",
   "EXPERIMENT_ENTRY_CLOSED",
   "EXPERIMENT_COMPLETED",
   "LEDGER_MARK_TO_MARKET",

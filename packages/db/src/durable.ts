@@ -4,6 +4,8 @@ import { z } from "zod";
 /** Closed set of replay-authoritative paper-state transitions. */
 export const DURABLE_TRANSITION_TYPES = [
   "EXPERIMENT_STARTED",
+  "EXPERIMENT_START_VALIDATED",
+  "EXPERIMENT_START_ABORTED",
   "EXPERIMENT_ENTRY_CLOSED",
   "EXPERIMENT_COMPLETED",
   "PAPER_MAKER_RESERVED",

@@ -1,0 +1,169 @@
+import { triggerEventSchema } from "@pm/core";
+import { createJournalEvent, MemoryEventJournal } from "@pm/db";
+import { describe, expect, it } from "vitest";
+import { classifyMemoryMetric, classifyMetric, classifyRetainedCleanupCycles, eventLoopUtilizationDelta, runSustainedCapacityHarness, type CapacitySample, type RetainedCleanupCycleObservation } from "../scripts/sustained-capacity-harness.ts";
+import { startQualifiedEngine } from "./paper-engine-testkit.js";
+
+describe("Step 5 sustained capacity harness", () => {
+  it("reaches a bounded plateau under multi-market normal, burst, reference and reconnect traffic", async () => {
+    const report = await runSustainedCapacityHarness({
+      durationMs: 900, warmupMs: 150, sampleIntervalMs: 40, markets: 3,
+      marketRatePerSec: 22, referenceRatePerSec: 8, dashboard: "connected",
+    });
+    expect(report.locality).toBe("local-synthetic");
+    expect(report.workload.sourceEventsSent).toBeGreaterThan(0);
+    expect(report.workload.burstEvents).toBeGreaterThan(0);
+    expect(report.workload.referenceTicksSent).toBeGreaterThan(0);
+    expect(report.workload.discoveryRefreshes).toBe(1);
+    expect(report.invariants).toMatchObject({
+      boundedIngress: true, boundedSupervisor: true, boundedJournalAdmission: true,
+      boundedReferenceWindow: true, boundedSse: true, boundedRuntimeBookkeeping: true,
+      boundedHarnessInstrumentation: true,
+      rawMarketAndReferenceEventsPersisted: 0,
+    });
+    expect(report.memoryProbe.source).toBe("bounded-process-sampling");
+    expect(report.memoryProbe.sampleRingCapacity).toBe(2048);
+    expect(report.samples.every((sample) => sample.instrumentation.sampleRingSize <= 2048)).toBe(true);
+    expect(report.memoryProbe.postWarmup.rss.highWater).toBeGreaterThanOrEqual(report.memoryProbe.postWarmup.rss.floor);
+    expect(report.plateau.metrics.triggerQueue.classification).not.toBe("monotonic_growth");
+    expect(report.plateau.metrics.journalWaiting.classification).not.toBe("monotonic_growth");
+    expect(report.plateau.metrics.ingressDepth.classification).not.toBe("monotonic_growth");
+    expect(report.plateau.metrics.marketCache.classification).not.toBe("monotonic_growth");
+    expect(report.plateau.metrics.activeTriggers.classification).not.toBe("monotonic_growth");
+  }, 15_000);
+
+  it("keeps admission bounded during slow journal writes and a slow dashboard client", async () => {
+    const report = await runSustainedCapacityHarness({
+      durationMs: 850, warmupMs: 150, sampleIntervalMs: 40, markets: 2,
+      marketRatePerSec: 30, referenceRatePerSec: 10, dashboard: "slow", database: "delayed", databaseDelayMs: 4,
+    });
+    expect(report.invariants.boundedJournalAdmission).toBe(true);
+    expect(report.invariants.boundedSse).toBe(true);
+    expect(report.invariants.dashboardSlowClientDisconnected).toBe(true);
+    expect(report.plateau.metrics.sseBufferedBytes.classification).not.toBe("monotonic_growth");
+  }, 15_000);
+
+  it("recovers from a bounded journal outage without persisting raw observations", async () => {
+    const report = await runSustainedCapacityHarness({
+      durationMs: 900, warmupMs: 150, sampleIntervalMs: 40, markets: 2,
+      marketRatePerSec: 18, referenceRatePerSec: 8, dashboard: "disconnected", database: "unavailable",
+    });
+    expect(report.invariants.rawMarketAndReferenceEventsPersisted).toBe(0);
+    expect(report.invariants.boundedIngress).toBe(true);
+    expect(report.invariants.boundedSupervisor).toBe(true);
+    expect(report.invariants.boundedJournalAdmission).toBe(true);
+    expect(report.plateau.metrics.journalWaiting.classification).not.toBe("monotonic_growth");
+  }, 15_000);
+
+  it("exercises overflow -> gap -> full-book resync and returns to trusted processing", async () => {
+    const report = await runSustainedCapacityHarness({
+      durationMs: 1_600, warmupMs: 200, sampleIntervalMs: 40, markets: 2,
+      marketRatePerSec: 18, referenceRatePerSec: 8, dashboard: "disconnected",
+      database: "healthy", reconnectStorm: false, ingressOverflow: true,
+    });
+    expect(report.workload.sourceEventsRejected).toBeGreaterThan(0);
+    expect(report.invariants.ingressOverflowObserved).toBe(true);
+    expect(report.invariants.resyncRecovered).toBe(true);
+    expect(report.invariants.finalMarketTruthTrusted).toBe(true);
+  }, 15_000);
+
+  it("runs multiple reconnect cycles without retaining stale generations", async () => {
+    const report = await runSustainedCapacityHarness({
+      durationMs: 5_000, warmupMs: 250, sampleIntervalMs: 50, markets: 2,
+      marketRatePerSec: 16, referenceRatePerSec: 8, dashboard: "disconnected",
+      reconnectStorm: true, reconnectCycles: 2,
+    });
+    expect(report.workload.reconnectsRequested).toBeGreaterThan(1);
+    expect(report.workload.reconnectCyclesCompleted).toBeGreaterThan(1);
+    expect(report.invariants.finalMarketTruthTrusted).toBe(true);
+    expect(report.invariants.resyncRecovered).toBe(true);
+    expect(report.invariants.boundedRuntimeBookkeeping).toBe(true);
+  }, 15_000);
+
+  it("uses absolute ELU snapshots and labels short memory runs insufficient", async () => {
+    expect(eventLoopUtilizationDelta({ active: 100, idle: 100, utilization: 0.5 }, { active: 150, idle: 150, utilization: 0.5 }).utilization).toBe(0.5);
+    expect(eventLoopUtilizationDelta({ active: 150, idle: 150, utilization: 0.5 }, { active: 180, idle: 220, utilization: 0.45 }).utilization).toBe(0.3);
+    const report = await runSustainedCapacityHarness({ durationMs: 500, warmupMs: 100, sampleIntervalMs: 40, markets: 1, reconnectStorm: false, dashboard: "disconnected" });
+    expect(report.verdict.status).toBe("NOT_READY");
+    expect(report.verdict.blockers).toContain("INSUFFICIENT_LOCAL_EVIDENCE:memory");
+    expect(report.verdict.localMemory).toBe("INSUFFICIENT_LOCAL_EVIDENCE");
+  }, 15_000);
+
+  it("classifies stable GC noise as plateau and byte growth as monotonic", () => {
+    const elapsed = Array.from({ length: 20 }, (_, index) => index * 500);
+    const noisy = elapsed.map((_, index) => 200_000_000 + [0, 180_000, -120_000, 90_000, -80_000][index % 5]!);
+    expect(classifyMemoryMetric(noisy, elapsed).classification).toBe("plateau");
+    const fastLeak = elapsed.map((at) => 200_000_000 + at * 1_024);
+    expect(classifyMemoryMetric(fastLeak, elapsed).classification).toBe("monotonic_growth");
+    const longerElapsed = Array.from({ length: 40 }, (_, index) => index * 500);
+    const slowLeak = longerElapsed.map((at) => 200_000_000 + at * 600);
+    expect(classifyMemoryMetric(slowLeak, longerElapsed).classification).toBe("monotonic_growth");
+    const shortNoisy = [200_000_000, 201_000_000, 199_000_000, 200_500_000, 199_500_000, 200_000_000];
+    expect(classifyMemoryMetric(shortNoisy, shortNoisy.map((_, index) => index * 100)).classification).toBe("insufficient_samples");
+  });
+
+  it("bounds measurement-only journal internals without changing the default journal", async () => {
+    const journal = new MemoryEventJournal({ maxEvents: 3, maxMutations: 4 });
+    for (let index = 0; index < 12; index += 1) {
+      await journal.append(createJournalEvent({
+        traceId: `trace-${index}`, type: "SYSTEM_HEALTH_EVENT", aggregateType: "test", aggregateId: String(index), payload: { index },
+      }));
+    }
+    expect(journal.memoryFootprintForTest()).toEqual({ events: 3, eventIds: 3, commitSeqById: 3, mutations: 4 });
+    expect(await journal.readAll()).toHaveLength(3);
+    expect(new MemoryEventJournal().memoryFootprintForTest()).toEqual({ events: 0, eventIds: 0, commitSeqById: 0, mutations: 0 });
+  });
+
+  it("uses sustained absolute growth for lifecycle-retained counts", () => {
+    const elapsed = Array.from({ length: 36 }, (_, index) => index * 1_000);
+    const samples = elapsed.map((elapsedMs, index) => ({ elapsedMs, index } as unknown as CapacitySample));
+    const retainedLeak = classifyMetric(samples, "activeTriggers", (sample) => 1_000 + (sample as unknown as { index: number }).index, 0, "retained");
+    expect(retainedLeak.classification).toBe("monotonic_growth");
+
+    const noise = samples.map((sample, index) => ({ ...sample, index: 1_000 + [0, 1, -1, 1, -1, 0][index % 6]! } as unknown as CapacitySample));
+    const stable = classifyMetric(noise, "activeTriggers", (sample) => (sample as unknown as { index: number }).index, 0, "retained");
+    expect(stable.classification).toBe("plateau");
+
+    const short = elapsed.slice(0, 5).map((elapsedMs, index) => ({ elapsedMs, index } as unknown as CapacitySample));
+    expect(classifyMetric(short, "activeTriggers", (sample) => (sample as unknown as { index: number }).index, 0, "retained").classification).toBe("insufficient_samples");
+  });
+
+  it("classifies retained state from completed cleanup cycles", () => {
+    const cycle = (atMs: number, value: number, before = value + 5): RetainedCleanupCycleObservation => ({
+      atMs,
+      before: { activeTriggers: before, triggerProvenance: before, provenanceInvalid: 0, signalsByTrigger: before, lastEvaluatedSignalCount: before },
+      after: { activeTriggers: value, triggerProvenance: value, provenanceInvalid: 0, signalsByTrigger: value, lastEvaluatedSignalCount: value },
+    });
+    expect(classifyRetainedCleanupCycles([cycle(0, 1)], "activeTriggers").classification).toBe("insufficient_samples");
+    expect(classifyRetainedCleanupCycles([cycle(0, 1), cycle(60_000, 1), cycle(120_000, 1), cycle(180_000, 1)], "activeTriggers").classification).toBe("plateau");
+    expect(classifyRetainedCleanupCycles([cycle(0, 1), cycle(60_000, 62), cycle(120_000, 123), cycle(180_000, 184)], "activeTriggers").classification).toBe("monotonic_growth");
+    expect(classifyRetainedCleanupCycles([cycle(0, 1), cycle(60_000, 1), cycle(120_000, 2), cycle(180_000, 1)], "activeTriggers").classification).toBe("plateau");
+  });
+
+  it("records four controlled prune cycles and removes companion bookkeeping together", async () => {
+    let nowMs = Date.now();
+    const setup = await startQualifiedEngine({}, () => new Date(nowMs));
+    try {
+      const trigger = triggerEventSchema.parse({
+        id: "expired-cycle-trigger", traceId: "expired-cycle-trace", marketId: "btc-mkt", asset: "BTC",
+        kind: "NEARING_EXPIRY", severity: 1, score: 1, dedupeKey: "expired-cycle", evidence: {},
+        sourceEventIds: ["cycle-source"], source: "system", createdAt: new Date(nowMs - 120_000).toISOString(),
+        expiresAt: new Date(nowMs - 1).toISOString(),
+      });
+      setup.engine.seedRuntimeBookkeepingForTest({ trigger });
+      for (let cycle = 0; cycle < 4; cycle += 1) {
+        nowMs += 60_000;
+        setup.engine.pruneRuntimeBookkeepingForTest();
+      }
+      const cycles = setup.engine.retainedCleanupCyclesForTest();
+      expect(cycles).toHaveLength(4);
+      expect(cycles[0]?.before.activeTriggers).toBe(1);
+      expect(cycles[0]?.after).toEqual({ activeTriggers: 0, triggerProvenance: 0, provenanceInvalid: 0, signalsByTrigger: 0, lastEvaluatedSignalCount: 0 });
+      for (const cycle of cycles.slice(1)) expect(cycle.after).toEqual(cycles[0]!.after);
+      expect(classifyRetainedCleanupCycles(cycles, "activeTriggers").classification).toBe("plateau");
+      expect(classifyRetainedCleanupCycles(cycles, "triggerProvenance").classification).toBe("plateau");
+    } finally {
+      await setup.engine.stop();
+    }
+  }, 15_000);
+});

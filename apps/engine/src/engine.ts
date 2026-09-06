@@ -148,6 +148,10 @@ import {
   type JoinResult,
 } from "./runtime-supervisor.js";
 
+class ExperimentStartGuardRejectedError extends Error {
+  constructor() { super("EXPERIMENT_START_MARKET_TRUTH_CHANGED"); }
+}
+
 function isJournalAdmissionRejectedError(error: unknown): boolean {
   return error instanceof JournalAdmissionRejected
     || (Boolean(error) && typeof error === "object" && (error as { name?: string }).name === "JournalAdmissionRejected");
@@ -156,6 +160,14 @@ function isJournalAdmissionRejectedError(error: unknown): boolean {
 const IDLE_GROK_IDEMPOTENCY_MAX = 4_096;
 const IDLE_GROK_IDEMPOTENCY_TTL_MS = 5 * 60_000;
 type IdleGrokSubmission = { observedAt: number; pending: boolean };
+type RetainedBookkeepingCounts = {
+  activeTriggers: number;
+  triggerProvenance: number;
+  provenanceInvalid: number;
+  signalsByTrigger: number;
+  lastEvaluatedSignalCount: number;
+};
+type RetainedCleanupCycle = { atMs: number; before: RetainedBookkeepingCounts; after: RetainedBookkeepingCounts };
 type GrokSubmissionResult = {
   status: "accepted" | "duplicate" | "stale" | "unknown_trigger" | "trace_mismatch" | "market_mismatch" | "asset_mismatch" | "replay_rejected" | "malformed" | "identity_mismatch" | "source_sealed";
   signalId?: string;
@@ -210,6 +222,10 @@ export class EngineService {
   private tokenIdSet = new Set<string>();
   private marketLoopStarted = false;
   private experiment: ExperimentManifest | null = null;
+  /** Monotonic fence for feed/discovery invalidations racing experiment start. */
+  private experimentFeedGeneration = 0;
+  /** Keeps ingress out of the transient post-commit/start-validation window. */
+  private experimentStartPending = false;
   private checkpointSequence = 0;
   private lastAppliedDurableCursor = 0;
   private derivedAuditCursor = 0;
@@ -263,6 +279,8 @@ export class EngineService {
    * duplicate suppression; active experiment submissions use the journal.
    */
   private readonly idleGrokSubmissions = new Map<string, IdleGrokSubmission>();
+  private readonly retainedCleanupCycles: RetainedCleanupCycle[] = [];
+  private startPostCommitValidationHoldForTest: Promise<void> | null = null;
   private readonly reportSourceIntegrity = new Map<string, ReportSourceIntegrityFault>();
   private readonly persistedIntegrityFaults = new WeakSet<ReportSourceIntegrityFault>();
   private referenceTelemetryHoldForTest: Promise<void> | null = null;
@@ -464,6 +482,7 @@ export class EngineService {
     snapshot: MarketSnapshot,
     intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" = "OPEN_FIRST_LEG",
   ): Promise<void> {
+    if (intent === "OPEN_FIRST_LEG" && this.experimentStartPending) return;
     await this.reserveMaker(order, snapshot, intent);
   }
   async cancelMakerForTest(orderId: string, reason = "TEST_RELEASE"): Promise<void> {
@@ -501,6 +520,7 @@ export class EngineService {
   triggerDedupeEntryCount(): number { return this.triggerEngine.dedupeEntryCount(); }
   makerReservationsForTest() { return new Map(this.makerReservations); }
   settledMarketsForTest() { return new Set(this.settledMarkets); }
+  settlementBackoffCountForTest(): number { return this.settlementBackoff.size; }
   async latestDurableSequenceForTest(): Promise<number> { return this.journal.latestDurableSequence(); }
   async readDurableAfterForTest(sequence: number, limit: number) {
     return this.journal.readDurableTransitionsAfter(sequence, limit);
@@ -531,40 +551,167 @@ export class EngineService {
         return { ...preflight, ok: false, blockers: [...new Set([...preflight.blockers, "OVERLOAD_FAIL_CLOSED"])] };
       }
       const preflight = this.preflight("48H_GROK_PAPER_EXPERIMENT");
+      const feedBlockers = this.experimentFeedBlockers();
+      const gatedPreflight = feedBlockers.length > 0
+        ? { ...preflight, ok: false, blockers: [...new Set([...preflight.blockers, ...feedBlockers])] }
+        : preflight;
       await this.safeAppend(createJournalEvent({
         traceId: createId("trace"), type: "EXPERIMENT_PREFLIGHT", aggregateType: "experiment", aggregateId: "preflight",
-        payload: preflight as unknown as Record<string, unknown>,
+        payload: gatedPreflight as unknown as Record<string, unknown>,
       }));
-      if (!preflight.ok) return { ...preflight, ok: false };
+      if (!gatedPreflight.ok) return { ...gatedPreflight, ok: false };
       const now = this.nowFn();
       const next = startExperiment({
-        id: this.experiment?.id, durationHours: this.env.EXPERIMENT_DURATION_HOURS, strategyVersion: this.strategy.version,
+        id: undefined, durationHours: this.env.EXPERIMENT_DURATION_HOURS, strategyVersion: this.strategy.version,
         riskConfiguration: this.riskLimits, modelConfiguration: { provider: "external_grok_bot_mcp", logicalRoles: 6, localModelExecution: false },
         startingBalance: this.ledger.snapshot().startingBalance, systemVersion: "0.1.0",
         gitSha: process.env.GIT_SHA ?? process.env.FLY_IMAGE_REF ?? "unknown", now,
         closePolicy: this.env.EXPERIMENT_CLOSE_POLICY,
       });
-      await this.commitAuthoritative({
-        operationKey: `experiment:${next.id}:started`,
-        type: "EXPERIMENT_STARTED",
-        aggregateType: "experiment",
-        aggregateId: next.id,
-        occurredAt: now,
-        buildPayload: () => ({
-          experiment: next,
-          derivedAudit: [this.experimentDerivedAudit("EXPERIMENT_STARTED", next)],
-        }),
-        checkpoint: true,
-        afterApply: async () => {
-          this.reportGenerated = false;
-          this.abortSourceSealPersist();
-          this.sourceSealed = false;
-          this.sourceSealing = false;
-          this.clearReportSourceIntegrity(next.id);
-          this.record("EXPERIMENT_STARTED", next.id, null, { status: next.status });
-        },
-      });
+      const startFeedGeneration = this.experimentFeedGeneration;
+      this.experimentStartPending = true;
+      try {
+        await this.commitAuthoritative({
+          operationKey: `experiment:${next.id}:started`,
+          type: "EXPERIMENT_STARTED",
+          aggregateType: "experiment",
+          aggregateId: next.id,
+          occurredAt: now,
+          buildPayload: () => ({
+            experiment: next,
+            derivedAudit: [this.experimentDerivedAudit("EXPERIMENT_STARTED", next)],
+          }),
+          checkpoint: false,
+          beforeCommit: () => {
+            if (this.experimentFeedGeneration !== startFeedGeneration || this.experimentFeedBlockers().length > 0) {
+              throw new ExperimentStartGuardRejectedError();
+            }
+          },
+          afterApply: async () => {
+            this.reportGenerated = false;
+            this.abortSourceSealPersist();
+            this.sourceSealed = false;
+            this.sourceSealing = false;
+            this.clearReportSourceIntegrity(next.id);
+            this.record("EXPERIMENT_STARTED", next.id, null, { status: next.status });
+          },
+        });
+        if (this.startPostCommitValidationHoldForTest) await this.startPostCommitValidationHoldForTest;
+        const postCommitBlockers = this.experimentFeedBlockers();
+        if (this.experimentFeedGeneration !== startFeedGeneration || postCommitBlockers.length > 0) {
+          // The durable start may already have crossed the database boundary.
+          // Keep the boundary gate and start-pending fence held, then commit a
+          // terminal aborted-start state so no caller can observe an
+          // entry-capable experiment from invalidated truth.
+          await this.commitAbortedStart(next, "EXPERIMENT_FEED_INVALIDATED_DURING_START");
+          return {
+            ok: false,
+            blockers: [...new Set([...postCommitBlockers, "EXPERIMENT_FEED_INVALIDATED_DURING_START"])],
+            experiment: this.experiment,
+          };
+        }
+        const validated: ExperimentManifest = { ...next, startValidationPending: false };
+        await this.commitAuthoritative({
+          operationKey: `experiment:${next.id}:start_validated`,
+          type: "EXPERIMENT_START_VALIDATED",
+          aggregateType: "experiment",
+          aggregateId: next.id,
+          buildPayload: () => ({ experiment: validated, derivedAudit: [this.experimentDerivedAudit("EXPERIMENT_START_VALIDATED", validated)] }),
+          checkpoint: false,
+          beforeCommit: () => {
+            if (this.experiment?.id !== next.id || this.experiment.status !== "RUNNING" || !this.experiment.startValidationPending) {
+              throw new RecoveryFailClosedError("invariant", "start validation state changed before durable validation");
+            }
+            if (this.experimentFeedGeneration !== startFeedGeneration || this.experimentFeedBlockers().length > 0) {
+              throw new ExperimentStartGuardRejectedError();
+            }
+          },
+          afterApply: async () => this.record("EXPERIMENT_START_VALIDATED", next.id, null, { status: "RUNNING" }),
+        });
+        // The final feed/generation check in the validation commit's
+        // beforeCommit hook is the explicit linearization point.  Once
+        // START_VALIDATED is durable, later feed loss is ordinary runtime
+        // feed-loss semantics; there is no compensating transition to race
+        // with recovery.
+        this.crashInjector.maybeCrash("AFTER_START_VALIDATED_BEFORE_RUNTIME_ADMISSION", `experiment:${next.id}:start_validated`);
+        this.syncExperimentWindow();
+        try {
+          await this.checkpoint();
+        } catch (error) {
+          // START_VALIDATED is authoritative.  A checkpoint failure is an
+          // explicit degradation, not a failed start with a RUNNING identity.
+          this.state.journalDegraded = true;
+          this.record("EXPERIMENT_START_CHECKPOINT_DEGRADED", next.id, null, {
+            status: "RUNNING", message: error instanceof Error ? error.message : String(error),
+          });
+          return {
+            ok: true,
+            experiment: this.experiment,
+            preflight,
+            checkpoint: "degraded",
+            warnings: ["CHECKPOINT_DEGRADED"],
+          };
+        }
+      } catch (error) {
+        if (!(error instanceof ExperimentStartGuardRejectedError)) throw error;
+        const currentExperiment = this.experiment;
+        if (currentExperiment?.id === next.id && currentExperiment.status === "RUNNING" && currentExperiment.startValidationPending) {
+          const blockers = this.experimentFeedBlockers();
+          await this.commitAbortedStart(next, "EXPERIMENT_FEED_INVALIDATED_DURING_START");
+          return {
+            ok: false,
+            blockers: [...new Set([...blockers, "EXPERIMENT_FEED_INVALIDATED_DURING_START"])],
+            experiment: this.experiment,
+          };
+        }
+        const current = this.preflight("48H_GROK_PAPER_EXPERIMENT");
+        const blockers = [...new Set([...current.blockers, ...this.experimentFeedBlockers()])];
+        return { ...current, ok: false, blockers };
+      } finally {
+        this.experimentStartPending = false;
+      }
       return { ok: true, experiment: this.experiment, preflight };
+    });
+  }
+  /** Test-only view of current entry-feed eligibility. */
+  experimentFeedBlockersForTest(): string[] { return this.experimentFeedBlockers(); }
+
+  /**
+   * A real experiment may only start with at least one currently trusted
+   * market candidate. Synthetic/test adapters intentionally opt out because
+   * they do not model the live transport trust state.
+   */
+  private experimentFeedBlockers(): string[] {
+    if (this.state.discoveryStatus === "RECONCILING") return ["DISCOVERY_RECONCILING"];
+    if (!(this.marketAdapter instanceof PolymarketMarketDataAdapter)) return [];
+    if (this.state.connections.polymarket.state !== "CONNECTED") return ["MARKET_FEED_NOT_READY"];
+    const candidates = [...this.entryQualified].map((marketId) => {
+      const market = this.marketsById.get(marketId);
+      const asset = this.assetByMarket.get(marketId) ?? market?.asset ?? null;
+      const referenceReady = !asset || this.referenceRequired.get(marketId) !== true
+        || (!this.referenceUnreliable.has(asset)
+          && this.state.getReferenceContext(asset, this.nowFn().getTime(), this.riskLimits.staleFeedTimeoutMs).freshness === "fresh");
+      const trusted = this.isMarketSynchronized(marketId);
+      const marketFresh = this.marketBooksFresh(marketId);
+      return { marketId, trusted: trusted && marketFresh, referenceReady };
+    });
+    if (candidates.some((candidate) => candidate.trusted && candidate.referenceReady)) return [];
+    if (candidates.some((candidate) => candidate.trusted)) return ["REFERENCE_FEED_STALE"];
+    return ["MARKET_BOOK_NOT_TRUSTED"];
+  }
+
+  private marketBooksFresh(marketId: string): boolean {
+    const market = this.marketsById.get(marketId);
+    if (!market) return false;
+    const pair = this.snapshots.get(marketId);
+    const nowMs = this.nowFn().getTime();
+    const maxAge = this.riskLimits.staleFeedTimeoutMs;
+    return (['UP', 'DOWN'] as const).every((outcome) => {
+      const snapshot = pair?.[outcome];
+      if (!snapshot) return false;
+      const receivedAt = Date.parse(snapshot.receivedAt);
+      const age = nowMs - receivedAt;
+      return Number.isFinite(receivedAt) && age >= 0 && age <= maxAge;
     });
   }
 
@@ -608,6 +755,7 @@ export class EngineService {
       onError: (error) => this.onFeedError("polymarket", error),
       onAnomaly: (anomaly) => this.onPolymarketAnomaly(anomaly),
       onGap: (event) => {
+        this.noteExperimentFeedInvalidation();
         this.invalidateMarketProjections(event.tokenIds);
         this.metrics.noteIngressGap(event.reason);
         this.metrics.marketUnsynchronizedTokens.set(this.unsynchronizedTokenCount());
@@ -697,6 +845,7 @@ export class EngineService {
     this.tokenIds = nextTokens;
     this.tokenIdSet = new Set(nextTokens);
     this.marketAdapter.setTokenIds(nextTokens);
+    this.noteExperimentFeedInvalidation();
     this.dropRemovedMarketState(removedMarkets, removedAssets);
     this.state.setDiscovery({
       qualified: report.qualified.map((market) => ({ marketId: market.id, slug: market.slug, asset: market.asset, tokens: market.tokens.map((token) => token.tokenId) })),
@@ -768,6 +917,12 @@ export class EngineService {
 
   private dropRemovedMarketState(removedMarkets: readonly string[], removedAssets: readonly string[]): void {
     for (const marketId of removedMarkets) {
+      // POSITION_SETTLED is durable authority. The in-memory marker only
+      // suppresses duplicate polling while the market remains in the live
+      // obligation set; once discovery removes it, drop the marker so
+      // historical turnover cannot accumulate in checkpoints/RAM.
+      this.settledMarkets.delete(marketId);
+      this.settlementBackoff.delete(marketId);
       this.snapshots.delete(marketId);
       this.triggerEngine.dropMarket(marketId);
       this.assetIndex.removeMarket(marketId);
@@ -1005,6 +1160,7 @@ export class EngineService {
     aggregateId: string;
     buildPayload: (occurredAt: Date) => Record<string, unknown>;
     occurredAt?: Date;
+    beforeCommit?: () => void;
     afterApply?: (transition: DurableTransition) => Promise<void>;
     checkpoint?: boolean;
   }): Promise<DurableCommitResult> {
@@ -1014,6 +1170,7 @@ export class EngineService {
       let commit: DurableCommitResult;
       try {
         const payload = await this.resolveDurablePayload(input, occurredAt);
+        input.beforeCommit?.();
         commit = await this.journal.commitDurableTransition({
           operationKey: input.operationKey,
           type: input.type,
@@ -1025,6 +1182,7 @@ export class EngineService {
         this.metrics.noteDurableCommit(input.type, commit.inserted);
       } catch (error) {
         if (error instanceof CrashInjectedError) throw error;
+        if (error instanceof ExperimentStartGuardRejectedError) throw error;
         if (error instanceof DurableCursorBehindError) {
           commit = await this.catchUpOrRejectStalePlan(input.operationKey, input.type, error);
         } else if (error instanceof IdempotencyConflictError) {
@@ -1171,6 +1329,10 @@ export class EngineService {
         const report = validatePostReplayInvariants(this.recoverableBag(), this.lastAppliedDurableCursor, latest);
         if (!report.ok) throw new RecoveryFailClosedError("invariant", report.reasons.join(","));
         this.syncRecoveredProjection();
+      }
+      this.syncExperimentWindow();
+      if (this.experiment?.status === "RUNNING" && this.experiment.startValidationPending) {
+        await this.commitAbortedStart(this.experiment, "EXPERIMENT_START_VALIDATION_INCOMPLETE_RECOVERY");
       }
       this.syncExperimentWindow();
       if (this.experiment?.id) {
@@ -1336,7 +1498,7 @@ export class EngineService {
     }
   }
 
-  private experimentDerivedAudit(type: "EXPERIMENT_STARTED" | "EXPERIMENT_ENTRY_CLOSED" | "EXPERIMENT_COMPLETED", experiment: ExperimentManifest): DerivedAuditRecord {
+  private experimentDerivedAudit(type: "EXPERIMENT_STARTED" | "EXPERIMENT_START_VALIDATED" | "EXPERIMENT_START_ABORTED" | "EXPERIMENT_ENTRY_CLOSED" | "EXPERIMENT_COMPLETED", experiment: ExperimentManifest): DerivedAuditRecord {
     return {
       id: derivedAuditEventId(type, experiment.id),
       type,
@@ -1547,6 +1709,10 @@ export class EngineService {
     if (signal?.aborted) return;
     if (this.processTriggerHold) await this.processTriggerHold;
     if (signal?.aborted) return;
+    // A trigger emitted while a start is pending cannot begin an active
+    // canonical research chain. Existing hedge/settlement obligations remain
+    // governed by their normal lane.
+    if (this.experimentStartPending && !isRiskHedgeSettlementTrigger(trigger.kind)) return;
     if (this.shouldSuppressStaleMarketTrigger(trigger, marketEpochFence, provenance)) {
       this.metrics.triggersSuppressed.inc({ kind: trigger.kind, severity: String(trigger.severity) });
       return;
@@ -1570,8 +1736,12 @@ export class EngineService {
   }
 
   private async requestActivation(trigger: TriggerEvent): Promise<void> {
+    if (this.experimentStartPending && !isRiskHedgeSettlementTrigger(trigger.kind)) {
+      this.state.addActivation({ triggerId: trigger.id, reason: "EXPERIMENT_START_PENDING", at: this.nowFn().toISOString(), provider: this.env.GROK_ACTIVATION_PROVIDER, grokWakeObserved: false });
+      return;
+    }
     const status = this.experiment?.status ?? "IDLE";
-    if (status === "IDLE" || status === "COMPLETED" || status === "FAILED") {
+    if (status === "IDLE" || status === "COMPLETED" || status === "FAILED" || status === "ABORTED_START") {
       const bookkeepingStarted = performance.now();
       this.activation.ensureLatency(trigger);
       this.state.setActivationLatency(this.activation.snapshot());
@@ -1874,6 +2044,9 @@ export class EngineService {
       maxOrderSizeUsd: this.riskLimits.maxOrderSizeUsd, minimumLockedPairEdge: this.riskLimits.minExpectedEdge,
     });
     if (!candidate) return;
+    // EXPERIMENT_STARTED is applied before its post-commit validation. Keep
+    // first-leg admission fenced until the validation marker is durable.
+    if (candidate.intent === "OPEN_FIRST_LEG" && this.experimentStartPending) return;
     if (!this.adapterTokenSynchronized(candidate.tokenId)) return;
     if (candidate.intent === "OPEN_FIRST_LEG" && this.overload.state === "FAIL_CLOSED") return;
     if (candidate.intent === "OPEN_FIRST_LEG" && !experimentAllowsFirstLeg(this.experiment)) return;
@@ -1952,6 +2125,7 @@ export class EngineService {
   }
 
   private async submitPaperOrder(order: PaperOrder, decisionSnapshot: MarketSnapshot, duplicateKey: string, intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" = "OPEN_FIRST_LEG"): Promise<void> {
+    if (intent === "OPEN_FIRST_LEG" && this.experimentStartPending) return;
     this.metrics.paperOrders.inc({ type: order.orderType });
     this.record("PAPER_ORDER_CREATED", order.traceId, order.marketId, { orderId: order.id, type: order.orderType, intent }, decisionSnapshot.asset ?? null);
     await this.persistReportInput(createJournalEvent({
@@ -2063,6 +2237,10 @@ export class EngineService {
   }
 
   private async applyFill(fill: Parameters<PaperLedger["applyFill"]>[0], extras: { restingAfter?: RestingPaperOrder | null } = {}): Promise<void> {
+    // A fill with no existing position is a first leg. The post-commit start
+    // validation fence must reject it while the experiment identity is still
+    // pending; hedges for pre-existing positions remain admissible.
+    if (this.experimentStartPending && !this.ledger.positions.has(fill.marketId)) return;
     const reserved = this.makerReservations.get(fill.orderId);
     let reservationAfter: string | null = reserved ?? null;
     if (reserved && fill.liquidityRole === "MAKER") {
@@ -2168,6 +2346,7 @@ export class EngineService {
 
   private async onConnection(event: FeedConnectionEvent): Promise<void> {
     if (event.feed === "polymarket") {
+      if (event.state !== "CONNECTED") this.noteExperimentFeedInvalidation();
       const connection = this.state.connections.polymarket;
       if (event.reconnectCount > connection.reconnects) this.metrics.wsReconnects.inc({ feed: "polymarket" }, event.reconnectCount - connection.reconnects);
       connection.state = event.state;
@@ -2182,11 +2361,13 @@ export class EngineService {
         connection.reconnects = event.reconnectCount;
       }
       if (event.state === "STALE") {
+        this.noteExperimentFeedInvalidation();
         this.noteReferenceLogicalLoss(asset);
         this.state.invalidateReferenceContext(asset);
         this.triggerEngine.resetReferenceAfterReconnect(asset);
         if (event.message?.includes("REFERENCE_INGRESS_OVERFLOW")) this.requestReferenceResync(asset);
       } else if (event.state === "DISCONNECTED") {
+        this.noteExperimentFeedInvalidation();
         const kind = /kind=([a-z_]+)/.exec(event.message ?? "")?.[1] ?? "unknown";
         this.metrics.referenceCloses.inc({ kind });
         if (event.reconnectCount > 0) this.metrics.wsReconnects.inc({ feed: "reference" });
@@ -2253,8 +2434,13 @@ export class EngineService {
   }
 
   private isExperimentWindowOpen(): boolean {
+    if (this.experimentStartPending || this.experiment?.startValidationPending === true) return false;
     const status = this.experiment?.status;
     return status === "RUNNING" || status === "ENTRY_CLOSED";
+  }
+
+  private noteExperimentFeedInvalidation(): void {
+    this.experimentFeedGeneration += 1;
   }
 
   private pruneIdleGrokSubmissions(nowMs: number): void {
@@ -2496,7 +2682,7 @@ export class EngineService {
 
   private async maybeScheduledReview(): Promise<void> {
     const status = this.experiment?.status;
-    if (status === "IDLE" || status === "COMPLETED" || status === "FAILED" || status == null) return;
+    if (status === "IDLE" || status === "COMPLETED" || status === "FAILED" || status === "ABORTED_START" || status == null) return;
     const triggers = this.triggerEngine.ingestScheduledReview(this.experiment?.id ?? createId("review"));
     for (const trigger of triggers) this.admitTrigger(trigger);
   }
@@ -2530,6 +2716,15 @@ export class EngineService {
 
   private async settleMarket(marketId: string, market: DiscoveredMarket): Promise<void> {
     if (this.settledMarkets.has(marketId)) return;
+    const operationKey = `settlement:${marketId}:${this.experiment?.id ?? "paper"}`;
+    const durableSettlement = await this.journal.readDurableByOperationKey(operationKey);
+    if (durableSettlement?.type === "POSITION_SETTLED") {
+      // Rediscovery may occur after the live marker was evicted. Rehydrate
+      // the short-lived suppression bit from durable authority without
+      // replaying cash or settlement effects.
+      this.settledMarkets.add(marketId);
+      return;
+    }
     const raw = await this.resolutionFetcher(market.id) ?? (market.slug ? await this.resolutionFetcher(market.slug) : null);
     if (!raw) {
       this.bumpSettlementBackoff(marketId);
@@ -2552,7 +2747,7 @@ export class EngineService {
     const asset = this.assetByMarket.get(marketId) ?? market.asset;
     const experimentId = this.experiment?.id ?? null;
     await this.commitAuthoritative({
-      operationKey: `settlement:${marketId}:${this.experiment?.id ?? "paper"}`,
+      operationKey,
       type: "POSITION_SETTLED",
       aggregateType: "position",
       aggregateId: positionBefore?.id ?? marketId,
@@ -2575,6 +2770,7 @@ export class EngineService {
         };
       },
       afterApply: async () => {
+        this.settledMarkets.add(marketId);
         this.settlementBackoff.delete(marketId);
         if (!positionBefore) return;
         const realizedDelta = settlementRealizedDelta(positionBefore, upPayoff, downPayoff);
@@ -2597,6 +2793,7 @@ export class EngineService {
     auth: Record<string, unknown>;
   }): DerivedAuditRecord[] {
     const { marketId, asset, experimentId, parsed, positionBefore, upPayoff, downPayoff, occurredAt, auth } = input;
+    const operationKey = `settlement:${marketId}:${experimentId ?? "paper"}`;
     const records: DerivedAuditRecord[] = [{
       id: derivedAuditEventId("MARKET_RESOLUTION_OBSERVED", marketId),
       type: "MARKET_RESOLUTION_OBSERVED",
@@ -2607,7 +2804,7 @@ export class EngineService {
     }];
     const projected = this.projectDerivedAudit(
       {
-        operationKey: `settlement:${marketId}:${experimentId ?? "paper"}`,
+        operationKey,
         type: "POSITION_SETTLED",
         aggregateType: "position",
         aggregateId: positionBefore?.id ?? marketId,
@@ -2738,6 +2935,26 @@ export class EngineService {
       },
     });
     return true;
+  }
+
+  private async commitAbortedStart(start: ExperimentManifest, reason: string): Promise<void> {
+    const aborted: ExperimentManifest = {
+      ...start,
+      status: "ABORTED_START",
+      startValidationPending: false,
+      abortedAt: this.nowFn().toISOString(),
+      abortReason: reason,
+      completedAt: null,
+      markToMarketAt: null,
+    };
+    await this.commitAuthoritative({
+      operationKey: `experiment:${start.id}:start_aborted`,
+      type: "EXPERIMENT_START_ABORTED",
+      aggregateType: "experiment",
+      aggregateId: start.id,
+      buildPayload: () => ({ experiment: aborted, reason, derivedAudit: [this.experimentDerivedAudit("EXPERIMENT_START_ABORTED", aborted)] }),
+      checkpoint: true,
+    });
   }
 
   private async commitExperimentStatus(next: ExperimentManifest): Promise<void> {
@@ -3192,6 +3409,7 @@ export class EngineService {
 
   private pruneRuntimeBookkeeping(now = this.nowFn()): void {
     const nowMs = now.getTime();
+    const before = this.retainedBookkeepingSnapshot();
     const signalCutoff = nowMs - 60_000;
     while (this.signalReceivedTimes[0] !== undefined && this.signalReceivedTimes[0] < signalCutoff) this.signalReceivedTimes.shift();
     this.executionErrors = this.executionErrors.filter((at) => nowMs - at < 3_600_000);
@@ -3203,6 +3421,19 @@ export class EngineService {
       if (new Date(trigger.expiresAt).getTime() > nowMs) continue;
       this.forgetTrigger(triggerId);
     }
+    const after = this.retainedBookkeepingSnapshot();
+    this.retainedCleanupCycles.push({ atMs: nowMs, before, after });
+    if (this.retainedCleanupCycles.length > 32) this.retainedCleanupCycles.splice(0, this.retainedCleanupCycles.length - 32);
+  }
+
+  private retainedBookkeepingSnapshot(): RetainedBookkeepingCounts {
+    return {
+      activeTriggers: this.activeTriggers.size,
+      triggerProvenance: this.triggerProvenance.size,
+      provenanceInvalid: this.provenanceInvalid.size,
+      signalsByTrigger: this.signalsByTrigger.size,
+      lastEvaluatedSignalCount: this.lastEvaluatedSignalCount.size,
+    };
   }
 
   runtimeBookkeepingForTest() {
@@ -3216,6 +3447,13 @@ export class EngineService {
       signalsByTrigger: this.signalsByTrigger.size,
       lastEvaluatedSignalCount: this.lastEvaluatedSignalCount.size,
     };
+  }
+  retainedCleanupCyclesForTest(): RetainedCleanupCycle[] {
+    return this.retainedCleanupCycles.map((cycle) => ({
+      atMs: cycle.atMs,
+      before: { ...cycle.before },
+      after: { ...cycle.after },
+    }));
   }
 
   seedRuntimeBookkeepingForTest(input: {
@@ -3286,7 +3524,9 @@ export class EngineService {
   sourceSealPersistInFlightForTest() { return this.sourceSealPersistInFlight; }
   setGrokClaimHoldForTest(hold: Promise<void> | null): void { this.grokClaimHold = hold; }
   setIdleGrokAcceptanceHoldForTest(hold: Promise<void> | null): void { this.idleGrokAcceptanceHoldForTest = hold; }
+  setStartPostCommitValidationHoldForTest(hold: Promise<void> | null): void { this.startPostCommitValidationHoldForTest = hold; }
   researchIngressInFlightForTest() { return this.researchIngressInFlight; }
+  idleGrokSubmissionCountForTest(): number { return this.idleGrokSubmissions.size; }
   sourceSealStateForTest() { return { sealing: this.sourceSealing, sealed: this.sourceSealed, generation: this.sourceSealGeneration }; }
   async completeExperimentForTest(): Promise<void> {
     if (!this.experiment) throw new Error("NO_EXPERIMENT");

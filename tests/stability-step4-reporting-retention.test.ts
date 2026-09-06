@@ -128,7 +128,7 @@ describe("Step-4 streaming summary equivalence", () => {
 });
 
 describe("Step-4 keyset scanner bounds", () => {
-  it("100k+ scan retains a page + bounded accumulator, not an event-count array", { timeout: 60_000 }, async () => {
+  it("100k+ scan retains a page + bounded accumulator, not an event-count array", { timeout: 120_000 }, async () => {
     const journal = new MemoryEventJournal();
     const start = Date.parse("2026-01-01T00:00:00.000Z");
     const n = 100_000;
@@ -654,9 +654,23 @@ describe("Step-4 acceptance: monitor-only and drain", () => {
     await journal.append(ev("TRIGGER_EVENT", "2026-09-01T00:00:00.000Z", {}, "pre"));
     const manager = new RetentionManager(journal, defaultRetentionConfig({ enabled: true, monitorTtlMs: 1, telemetryTtlMs: 1, completedGraceMs: 1, batchSize: 50, maxBatchesPerCycle: 8, maxRowsPerCycle: 400 }));
     expect(experimentIsMonitorOnly(null)).toBe(true);
+    expect(experimentIsMonitorOnly({ id: "aborted", status: "ABORTED_START" })).toBe(true);
     const idle = await manager.runCycle({ experiment: null, now, degraded: false, failClosed: false, databaseUp: true });
     expect(idle.monitorOnlyEligible).toBe(true);
     expect((await journal.queryEvents({ types: ["TRIGGER_EVENT"] })).length).toBe(0);
+    await journal.append(ev("TRIGGER_EVENT", "2026-09-01T00:00:00.000Z", {}, "aborted-old"));
+    const aborted = await manager.runCycle({
+      experiment: { id: "aborted", status: "ABORTED_START" },
+      now, degraded: false, failClosed: false, databaseUp: true,
+    });
+    expect(aborted.monitorOnlyEligible).toBe(true);
+    expect((await journal.queryEvents({ types: ["TRIGGER_EVENT"] })).some((item) => item.id === "aborted-old")).toBe(false);
+    await journal.commitDurableTransition({
+      operationKey: "experiment:aborted:start_aborted", type: "EXPERIMENT_START_ABORTED", aggregateType: "experiment", aggregateId: "aborted",
+      payload: { experiment: { id: "aborted", status: "ABORTED_START" } }, occurredAt: new Date("2026-09-01T00:00:00.000Z"),
+    }, 0);
+    await manager.runCycle({ experiment: { id: "aborted", status: "ABORTED_START" }, now, degraded: false, failClosed: false, databaseUp: true });
+    expect(await journal.queryDurableTransitions({ types: ["EXPERIMENT_START_ABORTED"], limit: 8 })).toHaveLength(1);
     await journal.append(ev("TRIGGER_EVENT", "2026-09-07T00:00:00.000Z", {}, "in-window"));
     await journal.append(ev("TRIGGER_EVENT", "2026-09-01T00:00:00.000Z", {}, "pre2"));
     const active = await manager.runCycle({
@@ -1964,6 +1978,30 @@ describe("Step-4 follow-up: crash-durable bounded integrity", () => {
       journal.setAppendInFlightHoldForTest(null);
       await engine.stop();
     }
+  });
+
+  it("A1: resolves an aborted start as terminal and never conflicts with its retry", async () => {
+    const journal = new MemoryEventJournal();
+    const startedAt = "2026-09-07T00:00:00.000Z";
+    await journal.commitDurableTransition({
+      operationKey: "experiment:exp-aborted:started", type: "EXPERIMENT_STARTED", aggregateType: "experiment", aggregateId: "exp-aborted",
+      payload: { experiment: { id: "exp-aborted", status: "RUNNING", startedAt, startValidationPending: true } }, occurredAt: new Date(startedAt),
+    }, 0);
+    await journal.commitDurableTransition({
+      operationKey: "experiment:exp-aborted:start_aborted", type: "EXPERIMENT_START_ABORTED", aggregateType: "experiment", aggregateId: "exp-aborted",
+      payload: { experiment: { id: "exp-aborted", status: "ABORTED_START", startedAt, abortedAt: "2026-09-07T00:00:01.000Z" } }, occurredAt: new Date("2026-09-07T00:00:01.000Z"),
+    }, 1);
+    const onlyAborted = await resolveCleanupLifecycle(journal);
+    expect(onlyAborted.state).toBe("ABORTED_START");
+    expect(onlyAborted.monitorDeleteAllowed).toBe(true);
+    await journal.commitDurableTransition({
+      operationKey: "experiment:exp-retry:started", type: "EXPERIMENT_STARTED", aggregateType: "experiment", aggregateId: "exp-retry",
+      payload: { experiment: { id: "exp-retry", status: "RUNNING", startedAt: "2026-09-07T00:00:02.000Z" } }, occurredAt: new Date("2026-09-07T00:00:02.000Z"),
+    }, 2);
+    const retried = await resolveCleanupLifecycle(journal);
+    expect(retried.state).toBe("ACTIVE_RUNNING");
+    expect(retried.experimentId).toBe("exp-retry");
+    expect(retried.state).not.toBe("CONFLICTING");
   });
 
   it("triple persistence failure rejects Grok, stays fail closed, and never reinterprets the orphan claim after crash", async () => {

@@ -245,6 +245,121 @@ describe("A managed vs entry-qualified markets", () => {
 });
 
 describe("B/D/R/T settlement, close policy, recovery, accelerated lifecycle", () => {
+  it("bounds settled-market tracking across 10k turnover and preserves durable settlement authority", async () => {
+    let nowMs = Date.parse("2026-09-01T00:00:00.000Z");
+    const market = new ScriptedMarketAdapter();
+    const resolutions = new Map<string, Record<string, unknown>>();
+    const turnover = 10_000;
+    const markets = Array.from({ length: turnover }, (_, index) => qualified(
+      `turnover-${index}`, "BTC", `turnover-${index}-up`, `turnover-${index}-down`,
+      new Date(nowMs + 1_000).toISOString(),
+    ));
+    market.queue(report([markets[0]]));
+    const journal = new MemoryEventJournal();
+    const env = engineEnvSchema.parse({
+      NODE_ENV: "test", JOURNAL_MODE: "memory", TRADING_MODE: "paper", ...grokPaperEnv(),
+      MAX_QUALIFIED_MARKETS: String(turnover), DISCOVERY_INTERVAL_MS: "3600000", SETTLEMENT_POLL_MS: "1",
+    });
+    const engine = new EngineService(env, journal, logger, {
+      market: market as never, referenceRegistry: new ScriptedReferenceRegistry() as never,
+      now: () => new Date(nowMs), resolutionFetcher: async (id) => resolutions.get(id) ?? null,
+      activation: new NoopGrokActivationBridge(),
+    });
+    await engine.start();
+    try {
+      expect((await engine.beginExperiment()).ok).toBe(true);
+      for (const [index, item] of markets.entries()) {
+        if (index > 0) {
+          market.queue(report([item]));
+          await engine.reconcileDiscovery();
+        }
+        await engine.applyObservedFill({
+          ...paperFill(item.id, "UP", "0.01"),
+          id: `turnover-fill-${item.id}`,
+          orderId: `turnover-order-${item.id}`,
+          quantity: "1",
+          tokenId: item.tokens[0].tokenId,
+        });
+        nowMs += 2_000;
+        if (index === 0) {
+          await engine.tickMaintenance();
+          expect(engine.settlementBackoffCountForTest()).toBe(1);
+        }
+        resolutions.set(item.id, {
+          state: { closed: true, endDate: item.endDate },
+          resolution: { umaResolutionStatus: "resolved" },
+          outcomes: { yes: { label: "Up", price: "1" }, no: { label: "Down", price: "0" } },
+        });
+        if (index === 0) nowMs += 10;
+        await engine.tickMaintenance();
+        expect(engine.ledger.positions.size).toBe(0);
+        market.queue(report([]));
+        await engine.reconcileDiscovery();
+        if (index % 250 === 0) expect(engine.settledMarketsForTest().size).toBeLessThanOrEqual(1);
+      }
+      expect(engine.ledger.positions.size).toBe(0);
+      expect(engine.settledMarketsForTest().size).toBeLessThanOrEqual(1);
+      expect(engine.settlementBackoffCountForTest()).toBe(0);
+
+      market.queue(report([]));
+      await engine.reconcileDiscovery();
+      expect(engine.settledMarketsForTest().size).toBe(0);
+      const settledRows = await journal.queryEvents({ types: ["POSITION_SETTLED"] });
+      expect(settledRows).toHaveLength(turnover);
+      const cashAfterSettlement = engine.ledger.snapshot().cash;
+      const durableBeforeRestart = await journal.latestDurableSequence();
+      const checkpointsBeforeCrash = (await journal.listCheckpoints()).length;
+
+      // Discovery itself performs no historical settlement fanout; operation
+      // keys are consulted only at the actual settlement admission boundary.
+      let discoverySettlementReads = 0;
+      const readByOperationKey = journal.readDurableByOperationKey.bind(journal);
+      journal.readDurableByOperationKey = async (...args) => {
+        discoverySettlementReads += 1;
+        return readByOperationKey(...args);
+      };
+      market.queue(report([markets[0]]));
+      await engine.reconcileDiscovery();
+      await engine.tickMaintenance();
+      expect(discoverySettlementReads).toBe(0);
+      expect(engine.settledMarketsForTest().size).toBeLessThanOrEqual(1);
+      expect(await journal.queryEvents({ types: ["POSITION_SETTLED"] })).toHaveLength(turnover);
+
+      // Simulate a crash before a clean-stop checkpoint can capture turnover.
+      journal.available = false;
+      await engine.stop().catch(() => undefined);
+      expect((await journal.listCheckpoints()).length).toBe(checkpointsBeforeCrash);
+      journal.available = true;
+      const restartMarket = new ScriptedMarketAdapter();
+      restartMarket.queue(report([]));
+      const recovered = new EngineService(env, journal, logger, {
+        market: restartMarket as never, referenceRegistry: new ScriptedReferenceRegistry() as never,
+        now: () => new Date(nowMs), resolutionFetcher: async (id) => resolutions.get(id) ?? null,
+        activation: new NoopGrokActivationBridge(),
+      });
+      await recovered.start();
+      try {
+        await recovered.tickMaintenance();
+        expect(recovered.ledger.positions.size).toBe(0);
+        expect(recovered.ledger.snapshot().cash).toBe(cashAfterSettlement);
+        expect(recovered.settledMarketsForTest().size).toBe(0);
+        expect(await journal.queryEvents({ types: ["POSITION_SETTLED"] })).toHaveLength(turnover);
+        expect(await journal.queryDurableTransitions({ types: ["POSITION_SETTLED"], limit: turnover + 1 })).toHaveLength(turnover);
+        expect(await journal.latestDurableSequence()).toBeGreaterThanOrEqual(durableBeforeRestart);
+        restartMarket.queue(report([markets[0]]));
+        await recovered.reconcileDiscovery();
+        await recovered.tickMaintenance();
+        expect(recovered.ledger.snapshot().cash).toBe(cashAfterSettlement);
+        expect(recovered.settledMarketsForTest().size).toBeLessThanOrEqual(1);
+        expect(await journal.queryDurableTransitions({ types: ["POSITION_SETTLED"], limit: turnover + 1 })).toHaveLength(turnover);
+      } finally {
+        await recovered.stop();
+      }
+    } finally {
+      if (engine.lastShutdownResult() === null) await engine.stop();
+    }
+  }, 120_000);
+
   it("settles from a public resolution fixture, waits at ENTRY_CLOSED, then completes", async () => {
     let nowMs = Date.parse("2026-09-01T00:00:00.000Z");
     const resolutions = new Map<string, Record<string, unknown>>();

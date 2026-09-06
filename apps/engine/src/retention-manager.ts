@@ -106,6 +106,7 @@ export function experimentIsMonitorOnly(experiment: RetentionExperiment): boolea
   return experiment == null
     || experiment.status === "IDLE"
     || experiment.status === "MONITOR_ONLY"
+    || experiment.status === "ABORTED_START"
     || experiment.status === "";
 }
 

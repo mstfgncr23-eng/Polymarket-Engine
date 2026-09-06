@@ -4,8 +4,9 @@
  *
  *   pnpm exec tsx scripts/stability-hot-path-bench.ts
  */
-import { writeFileSync } from "node:fs";
-import { cpus } from "node:os";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { cpus, tmpdir } from "node:os";
+import { join } from "node:path";
 import { performance } from "node:perf_hooks";
 import { GrokActivationCoordinator } from "../apps/engine/src/activation/coordinator.ts";
 import { NoopGrokActivationBridge } from "../apps/engine/src/activation/noop.ts";
@@ -262,7 +263,9 @@ const report = {
   rows,
 };
 
-const out = `/tmp/stability-hot-path-bench-${Date.now()}.json`;
+const outDir = join(tmpdir(), "polymarket-engine-bench");
+mkdirSync(outDir, { recursive: true });
+const out = join(outDir, `stability-hot-path-bench-${Date.now()}.json`);
 writeFileSync(out, JSON.stringify(report, null, 2));
 console.log(JSON.stringify(report, null, 2));
 console.log(`wrote ${out}`);
