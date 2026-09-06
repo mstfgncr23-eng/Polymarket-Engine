@@ -319,7 +319,7 @@ describe("PR18 hot operational storage lifecycle", () => {
       await inserted;
       const startedAt = "2026-01-01T00:00:00.000Z";
       const snapshot = await streamExperimentSummary(journal, { id: experimentId, startedAt }, { status: "RUNNING", complete: false, reportKind: "interim", metricsScope: "rolling" });
-      expect(snapshot.summary.sourceEventCount).toBe(0);
+      expect(snapshot.scan.scanned).toBe(0);
       const rollup = await persistVerifiedAnalyticsRollup(journal, {
         experimentId, sourceCursor: 0, sourceFenceId: snapshot.scan.fence.through?.id ?? null,
         sourceFenceOccurredAt: snapshot.scan.fence.through?.occurredAt ?? null, sourceEventCount: snapshot.accumulatorSnapshot?.eventCount ?? 0,
