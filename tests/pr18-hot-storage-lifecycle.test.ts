@@ -55,6 +55,32 @@ async function durableRows(journal: MemoryEventJournal): Promise<number> {
   return (await journal.queryDurableTransitions({ limit: 10_000 })).length;
 }
 
+async function fencePgRecovery(journal: PostgresEventJournal, durableCursor: number): Promise<void> {
+  const idle = createIdleExperiment({
+    id: `exp-pr18-idle-${Date.now()}`, durationHours: 48, strategyVersion: "pr18-test",
+    riskConfiguration: {}, modelConfiguration: {}, startingBalance: "100", systemVersion: "test", gitSha: "test",
+  });
+  const checkpoints = await journal.listCheckpoints();
+  await journal.saveCheckpoint({
+    experimentId: idle.id,
+    sequence: (checkpoints[0]?.sequence ?? 0) + 1,
+    payload: {
+      schemaVersion: 2,
+      durableCursor,
+      ledger: {
+        startingBalance: "100", cash: "100", reservedCash: "0", positionValue: "0", equity: "100",
+        realizedPnl: "0", unrealizedPnl: "0", grossPnl: "0", fees: "0", slippage: "0", aiCost: "0",
+        infrastructureCost: "0", netTradingPnl: "0", netEconomicPnl: "0", highWaterMark: "100", drawdown: "0",
+        updatedAt: new Date().toISOString(),
+      },
+      positions: [], restingOrders: [], activeTriggers: [], grokSignals: [],
+      activationLatency: [], makerReservations: {}, managedMarkets: [], settledMarkets: [], marketMetadata: [],
+      lastInfrastructureAccrualAt: Date.now(), derivedAuditCursor: durableCursor, reportSourceIntegrity: [],
+      experiment: idle,
+    },
+  });
+}
+
 describe("PR18 hot operational storage lifecycle", () => {
   it("reconstructs compacted payloads in EngineService without reapplying them", async () => {
     const journal = new MemoryEventJournal();
@@ -371,31 +397,7 @@ describe("PR18 hot operational storage lifecycle", () => {
       // removes the row itself.  Leave a valid idle checkpoint at that fence so
       // later tests sharing this disposable database do not attempt to replay a
       // compacted prefix from cursor zero.
-      const idle = createIdleExperiment({
-        id: "exp-pr18-idle", durationHours: 48, strategyVersion: "pr18-test",
-        riskConfiguration: {}, modelConfiguration: {}, startingBalance: "100", systemVersion: "test", gitSha: "test",
-      });
-      const checkpoints = await journal.listCheckpoints();
-      await journal.saveCheckpoint({
-        experimentId: idle.id,
-        // listCheckpoints is newest-first; advance from the newest sequence so
-        // this fence is the authoritative recovery checkpoint in a shared CI DB.
-        sequence: (checkpoints[0]?.sequence ?? 0) + 1,
-        payload: {
-          schemaVersion: 2,
-          durableCursor: commit.sequence,
-          ledger: {
-            startingBalance: "100", cash: "100", reservedCash: "0", positionValue: "0", equity: "100",
-            realizedPnl: "0", unrealizedPnl: "0", grossPnl: "0", fees: "0", slippage: "0", aiCost: "0",
-            infrastructureCost: "0", netTradingPnl: "0", netEconomicPnl: "0", highWaterMark: "100", drawdown: "0",
-            updatedAt: new Date().toISOString(),
-          },
-          positions: [], restingOrders: [], activeTriggers: [], grokSignals: [],
-          activationLatency: [], makerReservations: {}, managedMarkets: [], settledMarkets: [], marketMetadata: [],
-          lastInfrastructureAccrualAt: Date.now(), derivedAuditCursor: commit.sequence, reportSourceIntegrity: [],
-          experiment: idle,
-        },
-      });
+      await fencePgRecovery(journal, commit.sequence);
       const compacted = await journal.compactDurableTransitionsThrough(commit.sequence, { maxRows: 1, batchSize: 1, maxReplayKeys: 8, maxBatches: 1, budgetMs: 1000 });
       expect(compacted.deleted).toBe(1);
       expect((await journal.readDurableByOperationKey(key))?.type).toBe("REPORT_SOURCE_INTEGRITY_FAULT");
@@ -533,6 +535,9 @@ describe("PR18 hot operational storage lifecycle", () => {
       expect(result.highWater).toBe(before);
       expect(await journal.latestDurableSequence()).toBe(before);
       expect((await journal.readDurableByOperationKey(`${prefix}:0`))?.payload).toEqual({});
+      // This test deletes the whole durable prefix; publish a checkpoint at
+      // the retained high-water so other PG17 tests recover from the fence.
+      await fencePgRecovery(journal, before);
       const next = await journal.commitDurableTransition({ operationKey: `${prefix}:next`, type: "REPORT_SOURCE_INTEGRITY_FAULT", aggregateType: "report", aggregateId: prefix, payload: { experimentId: prefix, fault: "next" } }, before);
       expect(next.sequence).toBe(before + 1);
     } finally {
