@@ -34,6 +34,8 @@ export interface StreamedExperimentSummary {
   scan: ScanStats;
   accumulatorHighWaterBytes: number;
   accumulatorSnapshot?: ExperimentSummaryAccumulatorSnapshot;
+  /** Content hash of the rollup actually restored before scanning the tail. */
+  baseRollupContentHash: string | null;
 }
 
 export const ANALYTICS_ROLLUP_SCHEMA_VERSION = 1;
@@ -48,10 +50,11 @@ function hashAnalyticsCoverage(input: { experimentId: string; schemaVersion: num
 
 export async function persistVerifiedAnalyticsRollup(
   journal: EventJournal,
-  input: { experimentId: string; sourceCursor: number; sourceFenceId?: string | null; sourceFenceOccurredAt?: string | null; sourceEventCount?: number; sourceCommitSeq?: number | null; sourceRecordedAt?: string | null; stableRead?: boolean; previousContentHash?: string | null; accumulator: Record<string, unknown>; rollupKind?: string },
+  input: { experimentId: string; sourceCursor: number; sourceFenceId?: string | null; sourceFenceOccurredAt?: string | null; sourceEventCount?: number; sourceCommitSeq?: number | null; sourceRecordedAt?: string | null; stableRead?: boolean; sourceCoverageComplete?: boolean; previousContentHash?: string | null; baseContentHash?: string | null; accumulator: Record<string, unknown>; rollupKind?: string },
 ): Promise<import("@pm/db").AnalyticsRollup | null> {
   if (!journal.persistAnalyticsRollup) return null;
   if (input.stableRead === false) return null;
+  if (input.sourceCoverageComplete === false) return null;
   const coveredCount = input.sourceEventCount ?? 0;
   if (coveredCount > 0 && (!input.sourceFenceId || !input.sourceFenceOccurredAt)) return null;
   if (input.sourceFenceId && journal.readJournalEventById) {
@@ -67,7 +70,8 @@ export async function persistVerifiedAnalyticsRollup(
     experimentId: input.experimentId, rollupKind: input.rollupKind ?? "canonical", schemaVersion: ANALYTICS_ROLLUP_SCHEMA_VERSION,
     sourceCursor: input.sourceCursor, sourceFenceId: input.sourceFenceId ?? null, sourceFenceOccurredAt: input.sourceFenceOccurredAt ?? null,
     sourceEventCount: coveredCount, sourceCommitSeq: input.sourceCommitSeq ?? 0, sourceRecordedAt: input.sourceRecordedAt ?? null,
-    stableRead: input.stableRead ?? true, previousContentHash: input.previousContentHash ?? existing?.contentHash ?? null,
+    stableRead: input.stableRead ?? true,
+    previousContentHash: input.baseContentHash !== undefined ? input.baseContentHash : (input.previousContentHash !== undefined ? input.previousContentHash : existing?.contentHash ?? null),
     accumulator: input.accumulator, contentHash, verified: true, createdAt: new Date().toISOString(),
   };
   (rollup as { coverageHash?: string }).coverageHash = hashAnalyticsCoverage({ experimentId: rollup.experimentId, schemaVersion: rollup.schemaVersion, sourceEventCount: rollup.sourceEventCount, sourceCommitSeq: rollup.sourceCommitSeq, sourceFenceId: rollup.sourceFenceId, sourceFenceOccurredAt: rollup.sourceFenceOccurredAt, sourceRecordedAt: rollup.sourceRecordedAt, stableRead: rollup.stableRead, accumulatorHash: contentHash });
@@ -134,7 +138,7 @@ export async function streamExperimentSummary(
     ? { ...scan.fence, through: { id: rollup.sourceFenceId, occurredAt: rollup.sourceFenceOccurredAt }, recordedAtTo: rollup.sourceRecordedAt ? new Date(rollup.sourceRecordedAt) : scan.fence.recordedAtTo, commitSeqTo: rollup.sourceCommitSeq ?? scan.fence.commitSeqTo }
     : scan.fence;
   const effectiveScan = { ...scan, fence: effectiveFence, scanned: (rollup?.sourceEventCount ?? 0) + tailScanned };
-  return { summary, scan: effectiveScan, accumulatorHighWaterBytes: acc.highWaterMarkBytes, accumulatorSnapshot: acc.serialize() };
+  return { summary, scan: effectiveScan, accumulatorHighWaterBytes: acc.highWaterMarkBytes, accumulatorSnapshot: acc.serialize(), baseRollupContentHash: rollup?.contentHash ?? null };
 }
 
 export function toDurableReportInput(input: {

@@ -227,6 +227,19 @@ export class RetentionManager {
         return result.deleted;
       };
 
+      const drainCanonical = async (input: { experimentId: string; occurredBefore: Date; sourceCursor: number; sourceCommitSeq?: number; sourceRecordedAt?: Date }): Promise<number> => {
+        let deletedTotal = 0;
+        for (;;) {
+          if (Date.now() >= budgetEnd || batchCount >= this.config.maxBatchesPerCycle || totalDeleted >= this.config.maxRowsPerCycle) break;
+          const requested = Math.min(this.config.batchSize, Math.max(0, remainingRows()));
+          if (requested <= 0) break;
+          const deleted = await runBatch("canonical_report_input", (limit) => this.journal.deleteCanonicalEventsThrough!({ ...input, limit }));
+          deletedTotal += deleted;
+          if (deleted < requested) break;
+        }
+        return deletedTotal;
+      };
+
       const telemetryBefore = new Date(context.now.getTime() - this.config.telemetryTtlMs);
       const monitorBefore = monitorCutoff({
         now: context.now,
@@ -302,8 +315,15 @@ export class RetentionManager {
         && context.experiment.startedAt
         && Date.now() < budgetEnd
       ) {
-        const streamed = await streamExperimentSummary(this.journal, { id: context.experiment.id, startedAt: context.experiment.startedAt }, { status: context.experiment.status === "RUNNING" ? "RUNNING" : "ENTRY_CLOSED", reportKind: "interim", metricsScope: "rolling", complete: false });
-        if (streamed.scan.fence.stable && streamed.accumulatorSnapshot) {
+        const scanAbort = new AbortController();
+        const scanTimer = setTimeout(() => scanAbort.abort(), Math.max(0, budgetEnd - Date.now()));
+        let streamed: Awaited<ReturnType<typeof streamExperimentSummary>>;
+        try {
+          streamed = await streamExperimentSummary(this.journal, { id: context.experiment.id, startedAt: context.experiment.startedAt }, { status: context.experiment.status === "RUNNING" ? "RUNNING" : "ENTRY_CLOSED", reportKind: "interim", metricsScope: "rolling", complete: false }, { signal: scanAbort.signal });
+        } finally {
+          clearTimeout(scanTimer);
+        }
+        if (streamed.scan.fence.stable && streamed.scan.complete && !streamed.scan.truncated && !streamed.scan.interrupted && streamed.accumulatorSnapshot) {
           const rollup = await persistVerifiedAnalyticsRollup(this.journal, {
             experimentId: context.experiment.id,
             sourceCursor: await this.journal.latestDurableSequence(),
@@ -313,17 +333,18 @@ export class RetentionManager {
             sourceCommitSeq: streamed.scan.fence.commitSeqTo,
             sourceRecordedAt: streamed.scan.fence.recordedAtTo.toISOString(),
             stableRead: streamed.scan.fence.stable,
+            sourceCoverageComplete: streamed.scan.complete && !streamed.scan.truncated && !streamed.scan.interrupted,
+            baseContentHash: streamed.baseRollupContentHash,
             accumulator: streamed.accumulatorSnapshot as unknown as Record<string, unknown>,
           });
           if (rollup?.verified && rollup.sourceFenceOccurredAt) {
-            await runBatch("canonical_report_input", (limit) => this.journal.deleteCanonicalEventsThrough!({
+            await drainCanonical({
               experimentId: context.experiment!.id,
               occurredBefore: new Date(rollup.sourceFenceOccurredAt!),
-              limit,
               sourceCursor: rollup.sourceCursor,
               sourceCommitSeq: rollup.sourceCommitSeq,
               sourceRecordedAt: rollup.sourceRecordedAt ? new Date(rollup.sourceRecordedAt) : undefined,
-            }));
+            });
           }
         }
       }
@@ -336,14 +357,13 @@ export class RetentionManager {
       ) {
         const rollup = await loadVerifiedAnalyticsRollup(this.journal, context.experiment.id, "canonical");
         if (rollup?.verified && rollup.sourceFenceOccurredAt && rollup.sourceCursor >= 0) {
-          await runBatch("canonical_report_input", (limit) => this.journal.deleteCanonicalEventsThrough!({
+          await drainCanonical({
             experimentId: context.experiment!.id,
             occurredBefore: new Date(rollup.sourceFenceOccurredAt!),
-            limit,
             sourceCursor: rollup.sourceCursor,
             sourceCommitSeq: rollup.sourceCommitSeq,
             sourceRecordedAt: rollup.sourceRecordedAt ? new Date(rollup.sourceRecordedAt) : undefined,
-          }));
+          });
         }
       }
 

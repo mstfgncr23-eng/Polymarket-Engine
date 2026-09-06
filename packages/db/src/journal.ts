@@ -31,7 +31,7 @@ import {
   type DurableExperimentReportInput,
   type PersistReportResult,
 } from "./reports.js";
-import { durableReplayKeys, durableSequenceMetadata, durableTransitions, engineCheckpoints, experimentReportRollups, experimentReports, journalEvents, mcpIdempotencyKeys } from "./schema.js";
+import { durableReplayKeys, durableSequenceMetadata, durableTransitions, engineCheckpoints, experimentReportRollups, experimentReports, journalCommitMetadata, journalEvents, mcpIdempotencyKeys } from "./schema.js";
 import {
   journalMayMaintain,
   journalMayMigrate,
@@ -249,6 +249,20 @@ export class MemoryEventJournal implements EventJournal {
       eventIds: this.eventIds.size,
       commitSeqById: this.commitSeqById.size,
       mutations: this.mutations.length,
+    };
+  }
+
+  /** Read-only hot-table approximation for deterministic plateau evidence. */
+  storageFootprintForTest(): Record<string, { rows: number; bytes: number }> {
+    const size = (value: unknown): number => Buffer.byteLength(JSON.stringify(value) ?? "null");
+    return {
+      journal_events: { rows: this.events.length, bytes: this.events.reduce((n, row) => n + size(row), 0) },
+      durable_transitions: { rows: this.durableRows.length, bytes: this.durableRows.reduce((n, row) => n + size(row), 0) },
+      durable_replay_keys: { rows: this.compactedByKey.size, bytes: [...this.compactedByKey.values()].reduce((n, row) => n + size(row), 0) },
+      engine_checkpoints: { rows: this.checkpoints.length, bytes: this.checkpoints.reduce((n, row) => n + size(row), 0) },
+      mcp_idempotency: { rows: this.idempotencyKeys.size, bytes: [...this.idempotencyKeys].reduce((n, row) => n + size(row), 0) },
+      experiment_report_rollups: { rows: this.rollups.size, bytes: [...this.rollups.values()].reduce((n, row) => n + size(row), 0) },
+      experiment_reports: { rows: this.reports.size, bytes: [...this.reports.values()].reduce((n, row) => n + size(row), 0) },
     };
   }
 
@@ -555,7 +569,8 @@ export class MemoryEventJournal implements EventJournal {
     return latest ? structuredClone(latest) : null;
   }
   async listVerifiedCheckpoints(): Promise<EngineCheckpoint[]> {
-    const rows = this.checkpoints.filter((row) => row.verified && row.contentHash && hashCheckpointPayload(row.payload) === row.contentHash && isSemanticallyValidCheckpointPayload(row.payload));
+    const rows = this.checkpoints.filter((row) => row.verified && row.contentHash && hashCheckpointPayload(row.payload) === row.contentHash && isSemanticallyValidCheckpointPayload(row.payload)
+      && (typeof row.payload.durableCursor !== "number" || row.payload.durableCursor <= this.durableHighWater));
     return structuredClone(rows.sort((a, b) => b.sequence - a.sequence));
   }
   async compactDurableTransitionsThrough(cursor: number, options: { maxReplayKeys?: number; ttlMs?: number; maxRows?: number; maxBatches?: number; batchSize?: number; budgetMs?: number } = {}): Promise<DurableCompactionResult> {
@@ -582,6 +597,13 @@ export class MemoryEventJournal implements EventJournal {
     const closedExperiments = new Set(victims.filter((row) => row.type === "EXPERIMENT_COMPLETED" || row.type === "EXPERIMENT_START_ABORTED").map((row) => row.aggregateId));
     for (const experimentId of closedExperiments) {
       for (const row of this.compactedByKey.values()) if (row.type === "EXPERIMENT_STARTED" && row.aggregateId === experimentId) row.lifecycleState = "closed";
+    }
+    const repairedExperiments = new Set(victims.filter((row) => row.type === "REPORT_SOURCE_INTEGRITY_REPAIRED")
+      .map((row) => typeof row.payload.experimentId === "string" ? row.payload.experimentId : row.aggregateId));
+    for (const experimentId of repairedExperiments) {
+      for (const row of this.compactedByKey.values()) {
+        if (row.type === "REPORT_SOURCE_INTEGRITY_FAULT" && row.aggregateId === experimentId) row.lifecycleState = "closed";
+      }
     }
     while (this.compactedByKey.size > maxKeys) {
       const oldest = [...this.compactedByKey.values()].filter((row) => row.lifecycleState !== "open").sort((a, b) => a.sequence - b.sequence)[0];
@@ -838,11 +860,10 @@ export class PostgresEventJournal implements EventJournal {
   async appendMany(events: readonly JournalEvent[]): Promise<void> {
     assertJournalCapability(this.access, "runtime-write", "appendMany");
     if (events.length === 0) return;
-    const values = events.map((raw) => {
-      const value = journalEventSchema.parse(raw);
-      return { ...value, occurredAt: new Date(value.occurredAt), recordedAt: new Date(value.recordedAt) };
-    });
-    await this.db.insert(journalEvents).values(values).onConflictDoNothing({ target: journalEvents.id });
+    const values = events.map((raw) => journalEventSchema.parse(raw));
+    await this.db.insert(journalEvents).values(values.map((value) => ({
+      ...value, occurredAt: new Date(value.occurredAt), recordedAt: new Date(value.recordedAt),
+    }))).onConflictDoNothing({ target: journalEvents.id });
   }
   async readTrace(traceId: string): Promise<JournalEvent[]> {
     const rows = await this.db.select().from(journalEvents)
@@ -899,6 +920,16 @@ export class PostgresEventJournal implements EventJournal {
       count: sql<number>`count(*)::int`,
     }).from(journalEvents).where(filters.length > 0 ? and(...filters) : undefined).groupBy(journalEvents.type);
     return Object.fromEntries(rows.map((row) => [row.type, Number(row.count)]));
+  }
+  /** Read-only physical footprint for storage soak diagnostics. */
+  async storageFootprintForTest(): Promise<Record<string, { rows: number; bytes: number }>> {
+    const names = ["journal_events", "durable_transitions", "durable_replay_keys", "engine_checkpoints", "mcp_idempotency_keys", "experiment_report_rollups", "experiment_reports"] as const;
+    const result: Record<string, { rows: number; bytes: number }> = {};
+    for (const name of names) {
+      const rows = await this.client.unsafe(`SELECT count(*)::bigint AS rows, pg_total_relation_size('public.${name}')::bigint AS bytes`);
+      result[name === "mcp_idempotency_keys" ? "mcp_idempotency" : name] = { rows: Number(rows[0]?.rows ?? 0), bytes: Number(rows[0]?.bytes ?? 0) };
+    }
+    return result;
   }
   async queryEventsKeyset(query: JournalKeysetQuery): Promise<JournalEvent[]> {
     const filters = journalKeysetFilters(query);
@@ -1063,7 +1094,9 @@ export class PostgresEventJournal implements EventJournal {
   }
   async listVerifiedCheckpoints(): Promise<EngineCheckpoint[]> {
     const rows = await this.listCheckpoints();
-    return rows.filter((row) => row.verified && row.contentHash && isSemanticallyValidCheckpointPayload(row.payload)).sort((a, b) => b.sequence - a.sequence);
+    const highWater = await this.latestDurableSequence();
+    return rows.filter((row) => row.verified && row.contentHash && isSemanticallyValidCheckpointPayload(row.payload)
+      && (typeof row.payload.durableCursor !== "number" || row.payload.durableCursor <= highWater)).sort((a, b) => b.sequence - a.sequence);
   }
   async commitDurableTransition(input: DurableTransitionInput, expectedPreviousSequence: number): Promise<DurableCommitResult> {
     assertJournalCapability(this.access, "runtime-write", "commitDurableTransition");
@@ -1176,8 +1209,11 @@ export class PostgresEventJournal implements EventJournal {
     const ttl = Math.max(60_000, options.ttlMs ?? 7 * 24 * 60 * 60_000);
     const maxKeys = Math.max(0, Math.floor(options.maxReplayKeys ?? 4_096));
     if ((options.maxBatches ?? 1) <= 0 || (options.budgetMs ?? 1) <= 0) return { deleted: 0, cursor: target, highWater: await this.latestDurableSequence(), compactedOperationKeys: 0 };
+    const deadline = Date.now() + Math.max(0, options.budgetMs ?? 1);
     return this.db.transaction(async (tx) => {
       await tx.execute(sql`SELECT pg_advisory_xact_lock(${DURABLE_MUTATION_LOCK_ID})`);
+      const remaining = Math.max(1, deadline - Date.now());
+      await tx.execute(sql`SELECT set_config('statement_timeout', ${String(remaining)}, true)`);
       await tx.insert(durableSequenceMetadata).values({ id: 1, highWater: 0 }).onConflictDoNothing();
       const current = await tx.select({ highWater: durableSequenceMetadata.highWater }).from(durableSequenceMetadata).where(eq(durableSequenceMetadata.id, 1)).limit(1);
       const highWater = Number(current[0]?.highWater ?? 0);
@@ -1187,6 +1223,7 @@ export class PostgresEventJournal implements EventJournal {
       const rows = await tx.select().from(durableTransitions).where(lte(durableTransitions.sequence, target)).orderBy(asc(durableTransitions.sequence)).limit(Math.min(rowCap, 10_000));
       const expiresAt = new Date(Date.now() + ttl).toISOString();
       for (const row of rows) {
+        if (Date.now() >= deadline) throw new Error("RETENTION_CYCLE_BUDGET_EXCEEDED");
         await tx.insert(durableReplayKeys).values({ operationKey: row.operationKey, type: row.type, aggregateType: row.aggregateType, aggregateId: row.aggregateId, payloadHash: row.payloadHash, sequence: row.sequence, occurredAt: row.occurredAt, recordedAt: row.recordedAt, expiresAt: new Date(expiresAt), lifecycleState: replayLifecycleState(toDurableTransition(row)) }).onConflictDoUpdate({ target: durableReplayKeys.operationKey, set: { expiresAt: new Date(expiresAt) } });
       }
       for (const row of rows.filter((item) => item.type === "PAPER_MAKER_RELEASED" || item.type === "PAPER_ORDER_CANCELLED")) {
@@ -1194,6 +1231,11 @@ export class PostgresEventJournal implements EventJournal {
       }
       for (const row of rows.filter((item) => item.type === "EXPERIMENT_COMPLETED" || item.type === "EXPERIMENT_START_ABORTED")) {
         await tx.update(durableReplayKeys).set({ lifecycleState: "closed" }).where(and(eq(durableReplayKeys.type, "EXPERIMENT_STARTED"), eq(durableReplayKeys.aggregateId, row.aggregateId)));
+      }
+      for (const row of rows.filter((item) => item.type === "REPORT_SOURCE_INTEGRITY_REPAIRED")) {
+        const payload = row.payload as Record<string, unknown>;
+        const experimentId = typeof payload.experimentId === "string" ? payload.experimentId : row.aggregateId;
+        await tx.update(durableReplayKeys).set({ lifecycleState: "closed" }).where(and(eq(durableReplayKeys.type, "REPORT_SOURCE_INTEGRITY_FAULT"), eq(durableReplayKeys.aggregateId, experimentId)));
       }
       if (maxKeys > 0) {
         await tx.execute(sql`DELETE FROM durable_replay_keys WHERE operation_key IN (SELECT operation_key FROM durable_replay_keys WHERE lifecycle_state <> 'open' ORDER BY (expires_at <= now()) DESC, sequence ASC LIMIT GREATEST(0, (SELECT count(*) FROM durable_replay_keys WHERE lifecycle_state <> 'open') - ${maxKeys}))`);
@@ -1264,10 +1306,9 @@ export class PostgresEventJournal implements EventJournal {
     assertJournalCapability(this.access, "maintenance", "deleteCanonicalEventsThrough");
     const cap = Math.max(0, Math.min(500, Math.floor(input.limit)));
     if (cap <= 0) return { deleted: 0 };
-    // Postgres persists the source coverage boundary as recorded_at. A
-    // process-local commit sequence is unavailable across restarts, so never
-    // treat a sequence-only fence as proof of journal-event inclusion.
-    if (input.sourceCommitSeq != null && input.sourceRecordedAt == null) return { deleted: 0 };
+    // A cleanup-authoritative rollup must prove both the durable commit fence
+    // and the recorded-at fence. recorded_at alone is not commit authority.
+    if (input.sourceCommitSeq == null) return { deleted: 0 };
     const before = input.occurredBefore ?? new Date();
     const types = [...CANONICAL_REPORT_INPUT_EVENT_TYPES] as string[];
     const result = await this.client`
@@ -1276,6 +1317,7 @@ export class PostgresEventJournal implements EventJournal {
         SELECT id FROM journal_events
         WHERE type = ANY(${types}) AND (payload->>'experimentId') = ${input.experimentId}
           AND occurred_at < ${before}
+          AND commit_seq <= ${input.sourceCommitSeq}
           AND (${input.sourceRecordedAt == null} OR recorded_at <= ${input.sourceRecordedAt ?? new Date()})
         ORDER BY occurred_at ASC, id ASC LIMIT ${cap}
       )`;
@@ -1337,9 +1379,16 @@ export class PostgresEventJournal implements EventJournal {
     };
   }
   async latestCommitSeq(): Promise<number> {
-    return 0;
+    const rows = await this.db.select({ highWater: journalCommitMetadata.highWater })
+      .from(journalCommitMetadata).where(eq(journalCommitMetadata.id, 1)).limit(1);
+    return Number(rows[0]?.highWater ?? 0);
   }
-  async eventCommitSeq(_id: string): Promise<number | null> { return null; }
+  async eventCommitSeq(id: string): Promise<number | null> {
+    const rows = await this.db.select({ commitSeq: journalEvents.commitSeq }).from(journalEvents)
+      .where(eq(journalEvents.id, id)).limit(1);
+    const value = rows[0]?.commitSeq;
+    return value == null ? null : Number(value);
+  }
   async withReadSnapshot<T>(work: (journal: EventJournalKeyset) => Promise<T>): Promise<{ value: T; stable: boolean }> {
     // The caller owns the accumulator. Retrying a partially executed callback
     // here would fold its earlier pages twice; retry must start a fresh report.
@@ -1369,7 +1418,10 @@ export class PostgresEventJournal implements EventJournal {
           const row = rows[0];
           return row ? { occurredAt: new Date(row.occurred_at).toISOString(), id: row.id } : null;
         },
-        latestCommitSeq: async () => 0,
+        latestCommitSeq: async () => {
+          const rows = await sql`SELECT high_water FROM journal_commit_metadata WHERE id = 1`;
+          return Number(rows[0]?.high_water ?? 0);
+        },
       };
       value = await work(snap);
     });
@@ -1413,6 +1465,7 @@ export function buildJournalKeysetSql(query: JournalKeysetQuery & { orderDesc?: 
   if (query.from) push(`occurred_at >= ?`, query.from);
   if (query.to) push(`occurred_at <= ?`, query.to);
   if (query.recordedAtTo) push(`recorded_at <= ?`, query.recordedAtTo);
+  if (query.commitSeqTo != null) push(`commit_seq <= ?`, query.commitSeqTo);
   if (query.after) {
     values.push(sqlBindValue(query.after.occurredAt), query.after.id);
     clauses.push(`(occurred_at, id) > ($${values.length - 1}::timestamptz, $${values.length})`);
@@ -1425,7 +1478,7 @@ export function buildJournalKeysetSql(query: JournalKeysetQuery & { orderDesc?: 
   const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
   const order = query.orderDesc ? "occurred_at DESC, id DESC" : "occurred_at ASC, id ASC";
   return {
-    text: `SELECT id, trace_id, correlation_id, type, aggregate_type, aggregate_id, payload, occurred_at, recorded_at, source_event_id FROM journal_events ${where} ORDER BY ${order} LIMIT $${values.length}`,
+    text: `SELECT id, trace_id, correlation_id, type, aggregate_type, aggregate_id, payload, occurred_at, recorded_at, commit_seq, source_event_id FROM journal_events ${where} ORDER BY ${order} LIMIT $${values.length}`,
     values,
   };
 }
@@ -1439,6 +1492,7 @@ function journalKeysetFilters(query: Omit<JournalKeysetQuery, "limit">): ReturnT
   if (query.from) filters.push(gte(journalEvents.occurredAt, query.from));
   if (query.to) filters.push(lte(journalEvents.occurredAt, query.to));
   if (query.recordedAtTo) filters.push(lte(journalEvents.recordedAt, query.recordedAtTo));
+  if (query.commitSeqTo != null) filters.push(lte(journalEvents.commitSeq, query.commitSeqTo));
   if (query.after) {
     filters.push(sql`(${journalEvents.occurredAt}, ${journalEvents.id}) > (${query.after.occurredAt}::timestamptz, ${query.after.id})`);
   }
@@ -1496,7 +1550,10 @@ function toDurableTransition(row: typeof durableTransitions.$inferSelect): Durab
 }
 
 function replayLifecycleState(row: Pick<DurableTransition, "type" | "payload">): "open" | "closed" | "historical" {
-  if (row.type === "PAPER_FILL" || row.type === "PAPER_MAKER_RESERVED" || row.type === "POSITION_SETTLED" || row.type === "EXPERIMENT_STARTED") return "open";
+  // Fill and settlement effects are terminal once the resulting state has
+  // reached a verified checkpoint. They remain bounded TTL tombstones rather
+  // than permanently pinned historical identities.
+  if (row.type === "PAPER_MAKER_RESERVED" || row.type === "EXPERIMENT_STARTED") return "open";
   if (row.type === "REPORT_SOURCE_INTEGRITY_FAULT") return "open";
   return "closed";
 }

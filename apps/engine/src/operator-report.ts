@@ -91,6 +91,8 @@ export async function generateOperatorReport(
       sourceCommitSeq: streamed.scan.fence.commitSeqTo,
       sourceRecordedAt: streamed.scan.fence.recordedAtTo.toISOString(),
       stableRead: streamed.scan.fence.stable,
+      sourceCoverageComplete: streamed.scan.complete && !streamed.scan.truncated && !streamed.scan.interrupted,
+      baseContentHash: streamed.baseRollupContentHash,
       accumulator: streamed.accumulatorSnapshot as unknown as Record<string, unknown>,
     });
   }

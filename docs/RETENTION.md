@@ -75,9 +75,9 @@ Completed MCP `get_strategy_metrics(scope=complete)` prefers the persisted row. 
 
 Application `recordedAt` is assigned in memory **before** commit. A time-only fence can mix snapshots if a row is created before the fence, the fence query runs, and the row commits during later pages.
 
-Report scans use a commit-stable snapshot:
+Report scans use a commit-stable snapshot and a persistent journal commit fence:
 
-- Postgres: `REPEATABLE READ` transaction; every page of one scan runs on that snapshot
+- Postgres: `REPEATABLE READ` transaction; every page of one scan runs on that snapshot. Each `journal_events` row carries a monotonic `commit_seq` advanced with the singleton `journal_commit_metadata` row in the same transaction. Cleanup requires `commit_seq <= sourceCommitSeq`; `recorded_at` is only an additional bound.
 - Memory: frozen committed set + `commitSeq` assigned only when the row becomes visible
 
 For one fence, every eligible event is deterministically IN or OUT regardless of when page queries execute. Canonical persist is refused when `fence.stable` is false.
@@ -124,7 +124,7 @@ Do not reintroduce a transactional `CREATE INDEX` on live `journal_events` insid
 | MCP idempotency | `mcp_idempotency_keys` | 24h TTL | Only after TTL > signal timestamp skew (5m) + trigger TTL (30s) + 1h margin |
 | Raw telemetry | `MARKET_SNAPSHOT`, `REFERENCE_TICK`, `MARKET_EVENT` | 6h (legacy rows only; the engine does not insert raw observations) | Yes. Paper fills/settlements are self-contained and are not in this class |
 | Monitor / control-plane | `TRIGGER_*`, `GROK_*`, `MCP_INTERACTION`, `SYSTEM_HEALTH_*`, `DISCOVERY_RECONCILED`, reference lifecycle | 24h | Canonical research is admitted only during an experiment window; see monitor lifecycle below |
-| Long-lived audit | Experiment lifecycle, `PAPER_*`, `POSITION_*`, `PAIR_REALIZED`, `PNL_SNAPSHOT`, risk/consensus/hedge/settlement, strategy change | rollup/report or bounded tail | RUNNING and ENTRY_CLOSED canonical detail rolls periodically into a verified monotonic accumulator. Delete only rows covered by the same stable snapshot's keyset and recorded-at/commit fence; uncertainty retains. |
+| Long-lived audit | Experiment lifecycle, `PAPER_*`, `POSITION_*`, `PAIR_REALIZED`, `PNL_SNAPSHOT`, risk/consensus/hedge/settlement, strategy change | rollup/report or bounded tail | RUNNING and ENTRY_CLOSED canonical detail rolls periodically into a verified monotonic accumulator. Delete only rows covered by the same stable snapshot's keyset and recorded-at/commit fence; uncertainty retains. Terminal fill/settlement replay identities are closed and bounded by TTL/pressure; only live obligations remain pinned. |
 
 ### Monitor lifecycle
 

@@ -90,8 +90,18 @@ export const journalEvents = pgTable("journal_events", {
   id: text("id").primaryKey(), traceId: text("trace_id").notNull(), correlationId: text("correlation_id").notNull(),
   type: text("type").notNull(), aggregateType: text("aggregate_type").notNull(), aggregateId: text("aggregate_id").notNull(),
   payload: jsonb("payload").notNull(), occurredAt: timestamp("occurred_at", { withTimezone: true }).notNull(),
-  recordedAt: timestamp("recorded_at", { withTimezone: true }).notNull().defaultNow(), sourceEventId: text("source_event_id"),
+  recordedAt: timestamp("recorded_at", { withTimezone: true }).notNull().defaultNow(),
+  /** Database-persistent admission/commit fence. Never inferred from recorded_at. */
+  commitSeq: bigint("commit_seq", { mode: "number" }).notNull().default(0),
+  sourceEventId: text("source_event_id"),
 }, (table) => [index("journal_trace_idx").on(table.traceId), index("journal_aggregate_idx").on(table.aggregateType, table.aggregateId, table.occurredAt), index("journal_type_time_idx").on(table.type, table.occurredAt)]);
+
+/** Singleton commit fence for journal_events. Updated in the same transaction as each event. */
+export const journalCommitMetadata = pgTable("journal_commit_metadata", {
+  id: integer("id").primaryKey(),
+  highWater: bigint("high_water", { mode: "number" }).notNull().default(0),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
 
 export const engineCheckpoints = pgTable("engine_checkpoints", {
   id: text("id").primaryKey(), experimentId: text("experiment_id"), sequence: integer("sequence").notNull(),

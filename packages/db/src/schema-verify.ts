@@ -31,8 +31,8 @@ export const REQUIRED_RLS_TABLES = [
 ] as const;
 
 /** PR18 additions are verified separately so older read-only tooling remains compatible. */
-export const COMPACTION_TABLES = ["durable_sequence_metadata", "experiment_report_rollups", "durable_replay_keys"] as const;
-export const COMPACTION_INDEXES = ["durable_sequence_metadata_pkey", "experiment_report_rollups_pkey", "experiment_report_rollups_cursor_idx", "durable_replay_keys_sequence_idx", "durable_replay_keys_expiry_idx"] as const;
+export const COMPACTION_TABLES = ["durable_sequence_metadata", "experiment_report_rollups", "durable_replay_keys", "journal_commit_metadata"] as const;
+export const COMPACTION_INDEXES = ["durable_sequence_metadata_pkey", "experiment_report_rollups_pkey", "experiment_report_rollups_cursor_idx", "durable_replay_keys_sequence_idx", "durable_replay_keys_expiry_idx", "journal_commit_metadata_pkey", "journal_commit_seq_idx"] as const;
 
 export function evaluateCompactionSchemaInspection(found: SchemaInspection): void {
   const missing: string[] = [];

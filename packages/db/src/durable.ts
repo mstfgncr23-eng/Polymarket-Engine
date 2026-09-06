@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
+import { d, experimentManifestSchema, ledgerStateSchema, positionSchema, restingPaperOrderSchema } from "@pm/core";
 
 /** Closed set of replay-authoritative paper-state transitions. */
 export const DURABLE_TRANSITION_TYPES = [
@@ -35,6 +36,8 @@ export const RECOVERY_SNAPSHOT_SCHEMA_VERSION = 1;
 
 /** Postgres advisory lock key for the durable-mutation + checkpoint fence. */
 export const DURABLE_MUTATION_LOCK_ID = 872_314_001;
+/** Separate advisory lock for the journal event admission fence. */
+export const JOURNAL_COMMIT_LOCK_ID = 872_314_002;
 
 export const durableTransitionInputSchema = z.object({
   operationKey: z.string().min(1).max(160),
@@ -135,14 +138,65 @@ export function isSemanticallyValidCheckpointPayload(payload: Record<string, unk
   if (ledger == null) return true; // legacy checkpoints had no projected ledger
   if (typeof ledger !== "object") return false;
   const l = ledger as Record<string, unknown>;
-  for (const keys of [["cash", "cashUsd"], ["reservedCash", "reservedUsd"], ["startingBalance", "startingBalanceUsd"]]) {
-    const raw = l[keys[0]!] ?? l[keys[1]!];
-    if (raw == null) continue;
-    const value = Number(raw);
-    if (!Number.isFinite(value) || value < 0) return false;
+  // Full schema-v2 snapshots use the same parsers as recovery. Older compact
+  // fixtures are accepted only when they do not claim a full recoverable state.
+  const fullLedger = Object.prototype.hasOwnProperty.call(l, "cash") && Object.prototype.hasOwnProperty.call(l, "reservedCash");
+  if (fullLedger) {
+    try { ledgerStateSchema.parse(l); } catch { return false; }
+  } else {
+    for (const keys of [["cash", "cashUsd"], ["reservedCash", "reservedUsd"], ["startingBalance", "startingBalanceUsd"]]) {
+      const raw = l[keys[0]!] ?? l[keys[1]!];
+      if (raw == null) continue;
+      const value = Number(raw);
+      if (!Number.isFinite(value) || value < 0) return false;
+    }
+  }
+  if (fullLedger && payload.schemaVersion === CHECKPOINT_SCHEMA_VERSION) {
+    for (const key of ["positions", "restingOrders", "activeTriggers", "grokSignals", "settledMarkets"]) {
+      if (!Array.isArray(payload[key])) return false;
+    }
   }
   for (const key of ["positions", "restingOrders", "activeTriggers", "grokSignals"]) {
     if (payload[key] != null && !Array.isArray(payload[key])) return false;
+  }
+  if (Array.isArray(payload.positions) && payload.positions.length > 0 && fullLedger) {
+    try { payload.positions.forEach((row) => positionSchema.parse(row)); } catch { return false; }
+  }
+  const reservations = payload.makerReservations;
+  const resting = payload.restingOrders;
+  if (fullLedger && Array.isArray(resting)) {
+    try { resting.forEach((row) => restingPaperOrderSchema.parse(row)); } catch { return false; }
+    if (reservations == null || typeof reservations !== "object" || Array.isArray(reservations)) return false;
+    const reservationMap = reservations as Record<string, unknown>;
+    let sum = d(0);
+    for (const [orderId, amount] of Object.entries(reservationMap)) {
+      try { const n = d(String(amount)); if (!n.gt(0)) return false; sum = sum.plus(n); } catch { return false; }
+      if (!resting.some((row) => row && typeof row === "object" && (row as { order?: { id?: unknown } }).order?.id === orderId)) return false;
+    }
+    for (const row of resting) {
+      const orderId = row && typeof row === "object" ? (row as { order?: { id?: unknown } }).order?.id : null;
+      const remaining = row && typeof row === "object" ? (row as { remaining?: unknown }).remaining : null;
+      if (typeof orderId !== "string" || !(orderId in reservationMap)) return false;
+      try { if (!d(String(remaining)).gt(0)) return false; } catch { return false; }
+    }
+    try {
+      const reserved = d(String(l.reservedCash));
+      if (!sum.eq(reserved)) return false;
+    } catch { return false; }
+  }
+  if (payload.experiment != null && fullLedger) {
+    try { experimentManifestSchema.parse(payload.experiment); } catch { return false; }
+  }
+  if (Array.isArray(payload.positions) && Array.isArray(payload.settledMarkets)) {
+    const settled = new Set(payload.settledMarkets.filter((id): id is string => typeof id === "string"));
+    for (const row of payload.positions) {
+      if (!row || typeof row !== "object") continue;
+      const position = row as { marketId?: unknown; upQuantity?: unknown; downQuantity?: unknown };
+      try {
+        if (typeof position.marketId === "string" && settled.has(position.marketId)
+          && (d(String(position.upQuantity ?? 0)).gt(0) || d(String(position.downQuantity ?? 0)).gt(0))) return false;
+      } catch { return false; }
+    }
   }
   return true;
 }

@@ -42,17 +42,22 @@ export async function exportExperimentArchive(
   const directory = resolve(input.directory);
   await mkdir(directory, { recursive: true });
   const persistedAt = report?.persistedAt ?? new Date().toISOString();
+  // Archive callers normally have no manifest input. Recover the compact
+  // historical configuration from durable lifecycle evidence/checkpoints when
+  // available; the archive remains human-only and is never recovery authority.
+  const automatic = await deriveHistoricalManifest(journal, input.experimentId);
   const baseManifest: Record<string, unknown> = {
     archiveSchemaVersion: 1, experimentId: input.experimentId, reportSchemaVersion, contentHash,
     canonicalReportContentHash: report?.contentHash ?? contentHash,
     generatedAt: summary.generatedAt, persistedAt, sourceEventCount, sourceFenceId, sourceFenceOccurredAt,
-    experimentStatus: summary.status,
-    strategyVersion: input.manifest?.strategyVersion ?? null,
-    riskConfiguration: input.manifest?.riskConfiguration ?? null,
-    modelConfiguration: input.manifest?.modelConfiguration ?? null,
-    systemVersion: input.manifest?.systemVersion ?? null,
-    experimentStart: input.manifest?.experimentStart ?? null,
-    experimentEnd: input.manifest?.experimentEnd ?? null,
+    strategyVersion: automatic.strategyVersion ?? input.manifest?.strategyVersion ?? null,
+    riskConfiguration: automatic.riskConfiguration ?? input.manifest?.riskConfiguration ?? null,
+    modelConfiguration: automatic.modelConfiguration ?? input.manifest?.modelConfiguration ?? null,
+    systemVersion: automatic.systemVersion ?? input.manifest?.systemVersion ?? null,
+    gitSha: automatic.gitSha ?? input.manifest?.gitSha ?? null,
+    experimentStart: automatic.experimentStart ?? input.manifest?.experimentStart ?? null,
+    experimentEnd: automatic.experimentEnd ?? input.manifest?.experimentEnd ?? null,
+    experimentStatus: automatic.experimentStatus ?? summary.status,
     ...(input.manifest ?? {}),
   };
   const archiveBundleHash = createHash("sha256").update(canonicalJson({ manifest: baseManifest, summary, rendered })).digest("hex");
@@ -64,4 +69,39 @@ export async function exportExperimentArchive(
   await writeFile(summaryPath, `${JSON.stringify(summary, null, 2)}\n`, "utf8");
   await writeFile(reportPath, rendered, "utf8");
   return { directory, manifestPath, summaryPath, reportPath, contentHash };
+}
+
+async function deriveHistoricalManifest(journal: EventJournal, experimentId: string): Promise<Record<string, unknown>> {
+  const result: Record<string, unknown> = {};
+  try {
+    const rows = await journal.queryDurableTransitions({
+      types: ["EXPERIMENT_STARTED", "EXPERIMENT_ENTRY_CLOSED", "EXPERIMENT_COMPLETED", "EXPERIMENT_START_ABORTED"],
+      limit: 10_000,
+    });
+    const own = rows.filter((row) => row.aggregateId === experimentId || row.payload.experimentId === experimentId);
+    const start = own.find((row) => row.type === "EXPERIMENT_STARTED");
+    const terminal = [...own].reverse().find((row) => row.type === "EXPERIMENT_COMPLETED" || row.type === "EXPERIMENT_START_ABORTED");
+    const manifest = start?.payload.experiment && typeof start.payload.experiment === "object"
+      ? start.payload.experiment as Record<string, unknown> : start?.payload;
+    if (manifest && typeof manifest === "object") {
+      for (const key of ["strategyVersion", "riskConfiguration", "modelConfiguration", "systemVersion", "gitSha", "startedAt", "completedAt", "status"] as const) {
+        if (manifest[key] != null) result[key === "startedAt" ? "experimentStart" : key === "completedAt" ? "experimentEnd" : key === "status" ? "experimentStatus" : key] = manifest[key];
+      }
+    }
+    if (terminal?.type === "EXPERIMENT_COMPLETED") result.experimentStatus = "COMPLETED";
+    if (terminal?.type === "EXPERIMENT_START_ABORTED") result.experimentStatus = "ABORTED_START";
+  } catch { /* read-only archive export remains best-effort */ }
+  if (Object.keys(result).length === 0 && journal.listVerifiedCheckpoints) {
+    try {
+      const checkpoint = (await journal.listVerifiedCheckpoints()).find((row) => row.experimentId === experimentId || row.payload.experiment && typeof row.payload.experiment === "object" && (row.payload.experiment as { id?: unknown }).id === experimentId);
+      const manifest = checkpoint?.payload.experiment;
+      if (manifest && typeof manifest === "object") {
+        const m = manifest as Record<string, unknown>;
+        for (const key of ["strategyVersion", "riskConfiguration", "modelConfiguration", "systemVersion", "gitSha", "startedAt", "completedAt", "status"] as const) {
+          if (m[key] != null) result[key === "startedAt" ? "experimentStart" : key === "completedAt" ? "experimentEnd" : key === "status" ? "experimentStatus" : key] = m[key];
+        }
+      }
+    } catch { /* archive metadata is optional */ }
+  }
+  return result;
 }
