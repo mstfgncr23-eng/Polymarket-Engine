@@ -566,7 +566,9 @@ describe("A-T critical durability matrix", () => {
     await first.engine.stop();
     const recovered = await startPaper(journal, { now: () => new Date(nowMs), resolutions, endDate: new Date(nowMs - 60_000).toISOString() });
     expect(recovered.engine.ledger.positions.has("btc-mkt")).toBe(false);
-    expect(recovered.engine.settledMarketsForTest().has("btc-mkt")).toBe(true);
+    // POSITION_SETTLED remains durable authority; historical market IDs are
+    // intentionally not rehydrated into the bounded live suppression cache.
+    expect(recovered.engine.settledMarketsForTest().has("btc-mkt")).toBe(false);
     const audit = await reportCriticalAudit(journal);
     expect(audit.counts.MARKET_RESOLUTION_OBSERVED).toBeGreaterThanOrEqual(1);
     expect(audit.counts.POSITION_SETTLED).toBeGreaterThanOrEqual(1);
@@ -1130,13 +1132,26 @@ describe("golden equivalence control vs crashed", () => {
     expect(crashedNorm.snap.positions).toEqual(controlNorm.snap.positions);
     expect(crashedNorm.snap.restingOrders).toEqual(controlNorm.snap.restingOrders);
     expect(crashedNorm.snap.makerReservations).toEqual(controlNorm.snap.makerReservations);
-    expect(crashedNorm.snap.settledMarkets).toEqual(controlNorm.snap.settledMarkets);
+    // Crash-only delta: the clean control has a live settled marker, while
+    // replay intentionally omits historical IDs from the bounded cache.
+    expect(controlNorm.snap.settledMarkets).toEqual(["btc-mkt"]);
+    expect(crashedNorm.snap.settledMarkets).toEqual([]);
     expect(crashedNorm.snap.reserved).toEqual(controlNorm.snap.reserved);
     expect(crashedNorm.snap.experiment).toEqual(controlNorm.snap.experiment);
     expect(crashedNorm.snap.cursor).toBeGreaterThanOrEqual(controlNorm.snap.cursor);
+    const lifecycleTypes = new Set(["EXPERIMENT_STARTED", "EXPERIMENT_START_VALIDATED", "EXPERIMENT_START_ABORTED"]);
+    expect(controlNorm.audit.counts.EXPERIMENT_STARTED).toBe(1);
+    expect(controlNorm.audit.counts.EXPERIMENT_START_VALIDATED).toBe(1);
+    expect(controlNorm.audit.counts.EXPERIMENT_START_ABORTED).toBe(0);
+    expect(crashedNorm.audit.counts.EXPERIMENT_STARTED).toBe(2);
+    expect(crashedNorm.audit.counts.EXPERIMENT_START_VALIDATED).toBe(1);
+    expect(crashedNorm.audit.counts.EXPERIMENT_START_ABORTED).toBe(1);
+    expect(crashedNorm.audit.derived.filter((item) => item.type === "EXPERIMENT_START_ABORTED")).toHaveLength(1);
+    expect(crashedNorm.audit.derived.filter((item) => item.type === "EXPERIMENT_STARTED")).toHaveLength(2);
+    expect(crashedNorm.audit.derived.filter((item) => item.type === "EXPERIMENT_START_VALIDATED")).toHaveLength(1);
     const omitStartRecoveryRows = (audit: typeof controlNorm.audit) => ({
-      counts: Object.fromEntries(Object.entries(audit.counts).filter(([type]) => !type.startsWith("EXPERIMENT_START"))),
-      derived: audit.derived.filter((item) => !item.type.startsWith("EXPERIMENT_START")),
+      counts: Object.fromEntries(Object.entries(audit.counts).filter(([type]) => !lifecycleTypes.has(type))),
+      derived: audit.derived.filter((item) => !lifecycleTypes.has(item.type)),
     });
     expect(omitStartRecoveryRows(crashedNorm.audit)).toEqual(omitStartRecoveryRows(controlNorm.audit));
   });

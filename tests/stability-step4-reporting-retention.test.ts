@@ -654,9 +654,23 @@ describe("Step-4 acceptance: monitor-only and drain", () => {
     await journal.append(ev("TRIGGER_EVENT", "2026-09-01T00:00:00.000Z", {}, "pre"));
     const manager = new RetentionManager(journal, defaultRetentionConfig({ enabled: true, monitorTtlMs: 1, telemetryTtlMs: 1, completedGraceMs: 1, batchSize: 50, maxBatchesPerCycle: 8, maxRowsPerCycle: 400 }));
     expect(experimentIsMonitorOnly(null)).toBe(true);
+    expect(experimentIsMonitorOnly({ id: "aborted", status: "ABORTED_START" })).toBe(true);
     const idle = await manager.runCycle({ experiment: null, now, degraded: false, failClosed: false, databaseUp: true });
     expect(idle.monitorOnlyEligible).toBe(true);
     expect((await journal.queryEvents({ types: ["TRIGGER_EVENT"] })).length).toBe(0);
+    await journal.append(ev("TRIGGER_EVENT", "2026-09-01T00:00:00.000Z", {}, "aborted-old"));
+    const aborted = await manager.runCycle({
+      experiment: { id: "aborted", status: "ABORTED_START" },
+      now, degraded: false, failClosed: false, databaseUp: true,
+    });
+    expect(aborted.monitorOnlyEligible).toBe(true);
+    expect((await journal.queryEvents({ types: ["TRIGGER_EVENT"] })).some((item) => item.id === "aborted-old")).toBe(false);
+    await journal.commitDurableTransition({
+      operationKey: "experiment:aborted:start_aborted", type: "EXPERIMENT_START_ABORTED", aggregateType: "experiment", aggregateId: "aborted",
+      payload: { experiment: { id: "aborted", status: "ABORTED_START" } }, occurredAt: new Date("2026-09-01T00:00:00.000Z"),
+    }, 0);
+    await manager.runCycle({ experiment: { id: "aborted", status: "ABORTED_START" }, now, degraded: false, failClosed: false, databaseUp: true });
+    expect(await journal.queryDurableTransitions({ types: ["EXPERIMENT_START_ABORTED"], limit: 8 })).toHaveLength(1);
     await journal.append(ev("TRIGGER_EVENT", "2026-09-07T00:00:00.000Z", {}, "in-window"));
     await journal.append(ev("TRIGGER_EVENT", "2026-09-01T00:00:00.000Z", {}, "pre2"));
     const active = await manager.runCycle({

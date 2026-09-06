@@ -71,7 +71,10 @@ export function refreshExperiment(
 }
 
 export function experimentAllowsFirstLeg(manifest: ExperimentManifest | null): boolean {
-  return manifest?.status === "RUNNING";
+  // A durable EXPERIMENT_STARTED row is intentionally pending until the
+  // feed/reference validation transition is authoritative.  Legacy manifests
+  // without the optional field remain compatible.
+  return manifest?.status === "RUNNING" && manifest.startValidationPending !== true;
 }
 
 export function experimentAllowsHedge(manifest: ExperimentManifest | null): boolean {

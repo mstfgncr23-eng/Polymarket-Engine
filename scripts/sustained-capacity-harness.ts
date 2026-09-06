@@ -57,13 +57,21 @@ export interface CapacitySample {
     utilization: number;
   };
   cpu: { processMs: number; userMs: number; systemMs: number };
-  trigger: { queued: number; inFlight: number; active: number; provenance: number; dedupe: number };
+  trigger: { queued: number; inFlight: number; active: number; provenance: number; provenanceInvalid: number; signalsByTrigger: number; lastEvaluatedSignalCount: number; dedupe: number };
   journal: { active: number; waiting: number; criticalWaiting: number; noncriticalWaiting: number };
   ingress: { depth: number; bytes: number; highWaterEvents: number; highWaterBytes: number; accepted: number; processed: number; gaps: number };
   reference: { accepted: number; windowEntries: number; retryTimers: number };
   supervisor: { queued: number; inFlight: number; busyKeys: number; failures: number };
   sse: { subscribers: number; tracked: number; bufferedBytes: number };
-    state: { marketSnapshots: number; marketCache: number; settledMarkets: number; settlementBackoff: number; activations: number; grokSignals: number; idleTombstones: number };
+  cleanup: { completedCycles: number };
+  state: { marketSnapshots: number; marketCache: number; settledMarkets: number; settlementBackoff: number; activations: number; grokSignals: number; idleTombstones: number };
+}
+
+export type RetainedCleanupMetric = "activeTriggers" | "triggerProvenance" | "provenanceInvalid" | "signalsByTrigger" | "lastEvaluatedSignalCount";
+export interface RetainedCleanupCycleObservation {
+  atMs: number;
+  before: Record<RetainedCleanupMetric, number>;
+  after: Record<RetainedCleanupMetric, number>;
 }
 
 export interface CapacityReport {
@@ -80,6 +88,7 @@ export interface CapacityReport {
     finalWindowSamples: number;
     metrics: Record<string, { warmupHighWater: number; plateauHighWater: number; finalSlopePerSecond: number; classification: "plateau" | "monotonic_growth" | "insufficient_samples" }>;
   };
+  cleanupCycles: RetainedCleanupCycleObservation[];
   invariants: {
     boundedIngress: boolean;
     boundedSupervisor: boolean;
@@ -250,6 +259,25 @@ function classifyRetainedMetric(values: number[], elapsedMs: number[]): { finalS
   };
 }
 
+export function classifyRetainedCleanupCycles(
+  cycles: RetainedCleanupCycleObservation[],
+  metric: RetainedCleanupMetric,
+): { finalSlopePerSecond: number; classification: MetricClassification["classification"] } {
+  if (cycles.length < 2) return { finalSlopePerSecond: 0, classification: "insufficient_samples" };
+  const after = cycles.map((cycle) => cycle.after[metric]);
+  const before = cycles.map((cycle) => cycle.before[metric]);
+  const elapsedMs = cycles.map((cycle) => cycle.atMs);
+  const slope = numericSlope(after, elapsedMs);
+  const floorGrowth = after.at(-1)! - after[0]!;
+  const highWaterGrowth = before.at(-1)! - before[0]!;
+  const durationSeconds = Math.max(1, ((elapsedMs.at(-1)! - elapsedMs[0]!) / 1000));
+  const materialFloor = Math.max(2, durationSeconds * 0.05);
+  const monotonic = (floorGrowth >= materialFloor || highWaterGrowth >= materialFloor)
+    && slope > 0
+    && after.slice(1).filter((value, index) => value >= after[index]!).length / Math.max(1, after.length - 1) >= 0.6;
+  return { finalSlopePerSecond: Number(slope.toFixed(4)), classification: monotonic ? "monotonic_growth" : "plateau" };
+}
+
 export function classifyMemoryMetric(values: number[], elapsedMs: number[]): { finalSlopePerSecond: number; classification: MetricClassification["classification"] } {
   if (values.length < 6 || elapsedMs.length !== values.length) return { finalSlopePerSecond: 0, classification: "insufficient_samples" };
   const durationSeconds = Math.max(0, ((elapsedMs.at(-1) ?? 0) - (elapsedMs[0] ?? 0)) / 1000);
@@ -355,12 +383,13 @@ export async function runSustainedCapacityHarness(input: CapacityHarnessOptions 
       memory: { rss: memory.rss, heapUsed: memory.heapUsed, heapTotal: memory.heapTotal, external: memory.external, arrayBuffers: memory.arrayBuffers ?? 0 },
       eventLoop: { delayP99Ms, delayMaxMs, delayP99HighWaterMs, delayMaxHighWaterMs, utilization: Number(utilization.utilization.toFixed(5)) },
       cpu: { processMs: (cpu.user + cpu.system) / 1000, userMs: cpu.user / 1000, systemMs: cpu.system / 1000 },
-      trigger: { queued: supervisor.totalQueued, inFlight: supervisor.totalInFlight, active: bookkeeping.activeTriggers, provenance: bookkeeping.triggerProvenance, dedupe: engine.triggerDedupeEntryCount() },
+      trigger: { queued: supervisor.totalQueued, inFlight: supervisor.totalInFlight, active: bookkeeping.activeTriggers, provenance: bookkeeping.triggerProvenance, provenanceInvalid: bookkeeping.provenanceInvalid, signalsByTrigger: bookkeeping.signalsByTrigger, lastEvaluatedSignalCount: bookkeeping.lastEvaluatedSignalCount, dedupe: engine.triggerDedupeEntryCount() },
       journal: { active: admission.active, waiting: admission.waiting, criticalWaiting: admission.criticalWaiting, noncriticalWaiting: admission.noncriticalWaiting },
       ingress: { depth: ingress.depth, bytes: ingress.bytes, highWaterEvents: ingress.highWaterEvents, highWaterBytes: ingress.highWaterBytes, accepted: ingress.accepted, processed: ingress.processed, gaps: ingress.gapTotal },
       reference: { accepted: workload.referenceTicksSent, windowEntries: engine.referenceWindowTotalEntriesForTest(), retryTimers: engine.referenceRetryTimerCountForTest() },
       supervisor: { queued: supervisor.totalQueued, inFlight: supervisor.totalInFlight, busyKeys: supervisor.busyKeys, failures: supervisor.failureCount },
       sse: { subscribers: sse.subscribers, tracked: sse.tracked, bufferedBytes: sse.bufferedBytes },
+      cleanup: { completedCycles: engine.retainedCleanupCyclesForTest().length },
       state: { marketSnapshots: engine.state.marketSnapshots.size, marketCache: engine.monitoredMarketIds().length + engine.assetMarketIndexEntries(), settledMarkets: engine.settledMarketsForTest().size, settlementBackoff: engine.settlementBackoffCountForTest(), activations: engine.activationFootprint().latency, grokSignals: engine.state.grokActivity.acceptedSignals, idleTombstones: engine.idleGrokSubmissionCountForTest() },
     });
     eventLoop.reset();
@@ -485,6 +514,9 @@ export async function runSustainedCapacityHarness(input: CapacityHarnessOptions 
     retryTimers: classifyMetric(samples, "retryTimers", (item) => item.reference.retryTimers, warmupSamples),
     activeTriggers: classifyMetric(samples, "activeTriggers", (item) => item.trigger.active, warmupSamples, "retained"),
     triggerProvenance: classifyMetric(samples, "triggerProvenance", (item) => item.trigger.provenance, warmupSamples, "retained"),
+    provenanceInvalid: classifyMetric(samples, "provenanceInvalid", (item) => item.trigger.provenanceInvalid, warmupSamples, "retained"),
+    signalsByTrigger: classifyMetric(samples, "signalsByTrigger", (item) => item.trigger.signalsByTrigger, warmupSamples, "retained"),
+    lastEvaluatedSignalCount: classifyMetric(samples, "lastEvaluatedSignalCount", (item) => item.trigger.lastEvaluatedSignalCount, warmupSamples, "retained"),
     triggerDedupe: classifyMetric(samples, "triggerDedupe", (item) => item.trigger.dedupe, warmupSamples, "retained"),
     marketSnapshots: classifyMetric(samples, "marketSnapshots", (item) => item.state.marketSnapshots, warmupSamples),
     marketCache: classifyMetric(samples, "marketCache", (item) => item.state.marketCache, warmupSamples),
@@ -498,6 +530,14 @@ export async function runSustainedCapacityHarness(input: CapacityHarnessOptions 
     supervisorFailures: classifyMetric(samples, "supervisorFailures", (item) => item.supervisor.failures, warmupSamples),
     supervisorBusyKeys: classifyMetric(samples, "supervisorBusyKeys", (item) => item.supervisor.busyKeys, warmupSamples),
   };
+  const cleanupCycles = engine.retainedCleanupCyclesForTest() as RetainedCleanupCycleObservation[];
+  const retainedMetrics: RetainedCleanupMetric[] = ["activeTriggers", "triggerProvenance", "provenanceInvalid", "signalsByTrigger", "lastEvaluatedSignalCount"];
+  for (const name of retainedMetrics) {
+    const metric = metrics[name];
+    if (!metric) continue;
+    metric.classification = classifyRetainedCleanupCycles(cleanupCycles, name).classification;
+    metric.finalSlopePerSecond = classifyRetainedCleanupCycles(cleanupCycles, name).finalSlopePerSecond;
+  }
   const last = samples.at(-1)!;
   const max = (selector: (item: CapacitySample) => number) => Math.max(0, ...samples.map(selector));
   const invariants: CapacityReport["invariants"] = {
@@ -539,11 +579,11 @@ export async function runSustainedCapacityHarness(input: CapacityHarnessOptions 
   }
   // Hard-bounded windows/registries are checked by their architectural
   // invariant above; only lifecycle-retained identities must plateau.
-  const retainedGrowthMetrics = ["activeTriggers", "triggerProvenance", "triggerDedupe", "settledMarkets", "settlementBackoff"];
+  const retainedGrowthMetrics = ["activeTriggers", "triggerProvenance", "provenanceInvalid", "signalsByTrigger", "lastEvaluatedSignalCount", "triggerDedupe", "settledMarkets", "settlementBackoff"];
+  if (options.durationMs >= 3_000 && cleanupCycles.length < 2) blockers.push("INSUFFICIENT_LOCAL_EVIDENCE:retained_cleanup_cycles");
   for (const name of retainedGrowthMetrics) {
     const classification = metrics[name]?.classification;
-    if (classification === "monotonic_growth") blockers.push(`REQUIRED_RETAINED_STATE_MONOTONIC_GROWTH:${name}`);
-    if (classification === "insufficient_samples" && options.durationMs >= 3_000) blockers.push(`INSUFFICIENT_LOCAL_EVIDENCE:${name}`);
+    if (cleanupCycles.length >= 2 && classification === "monotonic_growth") blockers.push(`REQUIRED_RETAINED_STATE_MONOTONIC_GROWTH:${name}`);
   }
   const memoryMetrics = ["rss", "heapUsed", "heapTotal", "external", "arrayBuffers"];
   const memoryInsufficient = options.durationMs < 3_000 || finalWindowSamples < 10
@@ -565,6 +605,7 @@ export async function runSustainedCapacityHarness(input: CapacityHarnessOptions 
     schemaVersion: 1, capturedAt: new Date().toISOString(), locality: "local-synthetic", target: "Fly shared-cpu-2x 512MB FRA singleton", options,
     workload, samples,
     plateau: { warmupSamples, steadySamples, finalWindowSamples, metrics },
+    cleanupCycles,
     invariants,
     cpuModel: {
       measuredLocal: { processCpuMs: samples.reduce((sum, item) => sum + item.cpu.processMs, 0), elapsedMs: last.elapsedMs },

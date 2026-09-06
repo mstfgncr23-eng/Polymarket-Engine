@@ -310,10 +310,18 @@ describe("B/D/R/T settlement, close policy, recovery, accelerated lifecycle", ()
       const durableBeforeRestart = await journal.latestDurableSequence();
       const checkpointsBeforeCrash = (await journal.listCheckpoints()).length;
 
-      // Rediscovery rehydrates only a bounded marker from the durable operation key.
+      // Discovery itself performs no historical settlement fanout; operation
+      // keys are consulted only at the actual settlement admission boundary.
+      let discoverySettlementReads = 0;
+      const readByOperationKey = journal.readDurableByOperationKey.bind(journal);
+      journal.readDurableByOperationKey = async (...args) => {
+        discoverySettlementReads += 1;
+        return readByOperationKey(...args);
+      };
       market.queue(report([markets[0]]));
       await engine.reconcileDiscovery();
       await engine.tickMaintenance();
+      expect(discoverySettlementReads).toBe(0);
       expect(engine.settledMarketsForTest().size).toBeLessThanOrEqual(1);
       expect(await journal.queryEvents({ types: ["POSITION_SETTLED"] })).toHaveLength(turnover);
 

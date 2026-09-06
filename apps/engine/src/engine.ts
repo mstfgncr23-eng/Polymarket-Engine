@@ -160,6 +160,14 @@ function isJournalAdmissionRejectedError(error: unknown): boolean {
 const IDLE_GROK_IDEMPOTENCY_MAX = 4_096;
 const IDLE_GROK_IDEMPOTENCY_TTL_MS = 5 * 60_000;
 type IdleGrokSubmission = { observedAt: number; pending: boolean };
+type RetainedBookkeepingCounts = {
+  activeTriggers: number;
+  triggerProvenance: number;
+  provenanceInvalid: number;
+  signalsByTrigger: number;
+  lastEvaluatedSignalCount: number;
+};
+type RetainedCleanupCycle = { atMs: number; before: RetainedBookkeepingCounts; after: RetainedBookkeepingCounts };
 type GrokSubmissionResult = {
   status: "accepted" | "duplicate" | "stale" | "unknown_trigger" | "trace_mismatch" | "market_mismatch" | "asset_mismatch" | "replay_rejected" | "malformed" | "identity_mismatch" | "source_sealed";
   signalId?: string;
@@ -271,6 +279,7 @@ export class EngineService {
    * duplicate suppression; active experiment submissions use the journal.
    */
   private readonly idleGrokSubmissions = new Map<string, IdleGrokSubmission>();
+  private readonly retainedCleanupCycles: RetainedCleanupCycle[] = [];
   private startPostCommitValidationHoldForTest: Promise<void> | null = null;
   private readonly reportSourceIntegrity = new Map<string, ReportSourceIntegrityFault>();
   private readonly persistedIntegrityFaults = new WeakSet<ReportSourceIntegrityFault>();
@@ -616,8 +625,54 @@ export class EngineService {
           },
           afterApply: async () => this.record("EXPERIMENT_START_VALIDATED", next.id, null, { status: "RUNNING" }),
         });
+        // The validation transition itself is asynchronous.  Feed truth can
+        // change while its durable commit is in flight; keep the pending
+        // fence held and terminate the attempt before releasing admission.
+        const validatedBlockers = this.experimentFeedBlockers();
+        if (this.experimentFeedGeneration !== startFeedGeneration || validatedBlockers.length > 0) {
+          await this.commitAbortedStart(next, "EXPERIMENT_FEED_INVALIDATED_AFTER_VALIDATION");
+          return {
+            ok: false,
+            blockers: [...new Set([...validatedBlockers, "EXPERIMENT_FEED_INVALIDATED_AFTER_VALIDATION"])],
+            experiment: this.experiment,
+          };
+        }
         this.syncExperimentWindow();
-        await this.checkpoint();
+        try {
+          await this.checkpoint();
+        } catch (error) {
+          const checkpointRaceBlockers = this.experimentFeedBlockers();
+          if (this.experimentFeedGeneration !== startFeedGeneration || checkpointRaceBlockers.length > 0) {
+            await this.commitAbortedStart(next, "EXPERIMENT_FEED_INVALIDATED_AFTER_VALIDATION");
+            return {
+              ok: false,
+              blockers: [...new Set([...checkpointRaceBlockers, "EXPERIMENT_FEED_INVALIDATED_AFTER_VALIDATION"])],
+              experiment: this.experiment,
+            };
+          }
+          // START_VALIDATED is authoritative.  A checkpoint failure is an
+          // explicit degradation, not a failed start with a RUNNING identity.
+          this.state.journalDegraded = true;
+          this.record("EXPERIMENT_START_CHECKPOINT_DEGRADED", next.id, null, {
+            status: "RUNNING", message: error instanceof Error ? error.message : String(error),
+          });
+          return {
+            ok: true,
+            experiment: this.experiment,
+            preflight,
+            checkpoint: "degraded",
+            warnings: ["CHECKPOINT_DEGRADED"],
+          };
+        }
+        const finalBlockers = this.experimentFeedBlockers();
+        if (this.experimentFeedGeneration !== startFeedGeneration || finalBlockers.length > 0) {
+          await this.commitAbortedStart(next, "EXPERIMENT_FEED_INVALIDATED_AFTER_VALIDATION");
+          return {
+            ok: false,
+            blockers: [...new Set([...finalBlockers, "EXPERIMENT_FEED_INVALIDATED_AFTER_VALIDATION"])],
+            experiment: this.experiment,
+          };
+        }
       } catch (error) {
         if (!(error instanceof ExperimentStartGuardRejectedError)) throw error;
         const current = this.preflight("48H_GROK_PAPER_EXPERIMENT");
@@ -636,6 +691,7 @@ export class EngineService {
    * they do not model the live transport trust state.
    */
   private experimentFeedBlockers(): string[] {
+    if (this.state.discoveryStatus === "RECONCILING") return ["DISCOVERY_RECONCILING"];
     if (!(this.marketAdapter instanceof PolymarketMarketDataAdapter)) return [];
     if (this.state.connections.polymarket.state !== "CONNECTED") return ["MARKET_FEED_NOT_READY"];
     const candidates = [...this.entryQualified].map((marketId) => {
@@ -644,11 +700,28 @@ export class EngineService {
       const referenceReady = !asset || this.referenceRequired.get(marketId) !== true
         || (!this.referenceUnreliable.has(asset)
           && this.state.getReferenceContext(asset, this.nowFn().getTime(), this.riskLimits.staleFeedTimeoutMs).freshness === "fresh");
-      return { marketId, trusted: this.isMarketSynchronized(marketId), referenceReady };
+      const trusted = this.isMarketSynchronized(marketId);
+      const marketFresh = this.marketBooksFresh(marketId);
+      return { marketId, trusted: trusted && marketFresh, referenceReady };
     });
     if (candidates.some((candidate) => candidate.trusted && candidate.referenceReady)) return [];
     if (candidates.some((candidate) => candidate.trusted)) return ["REFERENCE_FEED_STALE"];
     return ["MARKET_BOOK_NOT_TRUSTED"];
+  }
+
+  private marketBooksFresh(marketId: string): boolean {
+    const market = this.marketsById.get(marketId);
+    if (!market) return false;
+    const pair = this.snapshots.get(marketId);
+    const nowMs = this.nowFn().getTime();
+    const maxAge = this.riskLimits.staleFeedTimeoutMs;
+    return (['UP', 'DOWN'] as const).every((outcome) => {
+      const snapshot = pair?.[outcome];
+      if (!snapshot) return false;
+      const receivedAt = Date.parse(snapshot.receivedAt);
+      const age = nowMs - receivedAt;
+      return Number.isFinite(receivedAt) && age >= 0 && age <= maxAge;
+    });
   }
 
   preflight(mode: "MONITOR_ONLY" | "48H_GROK_PAPER_EXPERIMENT" = "MONITOR_ONLY") {
@@ -783,7 +856,6 @@ export class EngineService {
     this.marketAdapter.setTokenIds(nextTokens);
     this.noteExperimentFeedInvalidation();
     this.dropRemovedMarketState(removedMarkets, removedAssets);
-    await this.rehydrateLiveSettledMarketMarkers();
     this.state.setDiscovery({
       qualified: report.qualified.map((market) => ({ marketId: market.id, slug: market.slug, asset: market.asset, tokens: market.tokens.map((token) => token.tokenId) })),
       rejected: report.rejected.slice(0, 100),
@@ -1646,6 +1718,10 @@ export class EngineService {
     if (signal?.aborted) return;
     if (this.processTriggerHold) await this.processTriggerHold;
     if (signal?.aborted) return;
+    // A trigger emitted while a start is pending cannot begin an active
+    // canonical research chain. Existing hedge/settlement obligations remain
+    // governed by their normal lane.
+    if (this.experimentStartPending && !isRiskHedgeSettlementTrigger(trigger.kind)) return;
     if (this.shouldSuppressStaleMarketTrigger(trigger, marketEpochFence, provenance)) {
       this.metrics.triggersSuppressed.inc({ kind: trigger.kind, severity: String(trigger.severity) });
       return;
@@ -1669,6 +1745,10 @@ export class EngineService {
   }
 
   private async requestActivation(trigger: TriggerEvent): Promise<void> {
+    if (this.experimentStartPending && !isRiskHedgeSettlementTrigger(trigger.kind)) {
+      this.state.addActivation({ triggerId: trigger.id, reason: "EXPERIMENT_START_PENDING", at: this.nowFn().toISOString(), provider: this.env.GROK_ACTIVATION_PROVIDER, grokWakeObserved: false });
+      return;
+    }
     const status = this.experiment?.status ?? "IDLE";
     if (status === "IDLE" || status === "COMPLETED" || status === "FAILED" || status === "ABORTED_START") {
       const bookkeepingStarted = performance.now();
@@ -1886,20 +1966,6 @@ export class EngineService {
     } finally {
       this.endResearchIngress();
     }
-  }
-
-  /** Rehydrate only currently discovered markets; durable operation keys remain authority. */
-  private async rehydrateLiveSettledMarketMarkers(): Promise<void> {
-    const experimentKey = this.experiment?.id ?? "paper";
-    await Promise.all([...this.marketsById.keys()].map(async (marketId) => {
-      try {
-        const durable = await this.journal.readDurableByOperationKey(`settlement:${marketId}:${experimentKey}`);
-        if (durable?.type === "POSITION_SETTLED") this.settledMarkets.add(marketId);
-      } catch {
-        // Discovery remains live during a transient journal outage; the
-        // durable lookup is retried by settlement admission when needed.
-      }
-    }));
   }
 
   private async proveGrokSubmissionCanonicalFacts(submission: GrokSignalSubmission, clientId: string): Promise<void> {
@@ -2377,7 +2443,7 @@ export class EngineService {
   }
 
   private isExperimentWindowOpen(): boolean {
-    if (this.experimentStartPending) return false;
+    if (this.experimentStartPending || this.experiment?.startValidationPending === true) return false;
     const status = this.experiment?.status;
     return status === "RUNNING" || status === "ENTRY_CLOSED";
   }
@@ -3352,6 +3418,7 @@ export class EngineService {
 
   private pruneRuntimeBookkeeping(now = this.nowFn()): void {
     const nowMs = now.getTime();
+    const before = this.retainedBookkeepingSnapshot();
     const signalCutoff = nowMs - 60_000;
     while (this.signalReceivedTimes[0] !== undefined && this.signalReceivedTimes[0] < signalCutoff) this.signalReceivedTimes.shift();
     this.executionErrors = this.executionErrors.filter((at) => nowMs - at < 3_600_000);
@@ -3363,6 +3430,19 @@ export class EngineService {
       if (new Date(trigger.expiresAt).getTime() > nowMs) continue;
       this.forgetTrigger(triggerId);
     }
+    const after = this.retainedBookkeepingSnapshot();
+    this.retainedCleanupCycles.push({ atMs: nowMs, before, after });
+    if (this.retainedCleanupCycles.length > 32) this.retainedCleanupCycles.splice(0, this.retainedCleanupCycles.length - 32);
+  }
+
+  private retainedBookkeepingSnapshot(): RetainedBookkeepingCounts {
+    return {
+      activeTriggers: this.activeTriggers.size,
+      triggerProvenance: this.triggerProvenance.size,
+      provenanceInvalid: this.provenanceInvalid.size,
+      signalsByTrigger: this.signalsByTrigger.size,
+      lastEvaluatedSignalCount: this.lastEvaluatedSignalCount.size,
+    };
   }
 
   runtimeBookkeepingForTest() {
@@ -3376,6 +3456,13 @@ export class EngineService {
       signalsByTrigger: this.signalsByTrigger.size,
       lastEvaluatedSignalCount: this.lastEvaluatedSignalCount.size,
     };
+  }
+  retainedCleanupCyclesForTest(): RetainedCleanupCycle[] {
+    return this.retainedCleanupCycles.map((cycle) => ({
+      atMs: cycle.atMs,
+      before: { ...cycle.before },
+      after: { ...cycle.after },
+    }));
   }
 
   seedRuntimeBookkeepingForTest(input: {

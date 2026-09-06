@@ -1,5 +1,7 @@
+import { triggerEventSchema } from "@pm/core";
 import { describe, expect, it } from "vitest";
-import { classifyMemoryMetric, classifyMetric, eventLoopUtilizationDelta, runSustainedCapacityHarness, type CapacitySample } from "../scripts/sustained-capacity-harness.ts";
+import { classifyMemoryMetric, classifyMetric, classifyRetainedCleanupCycles, eventLoopUtilizationDelta, runSustainedCapacityHarness, type CapacitySample, type RetainedCleanupCycleObservation } from "../scripts/sustained-capacity-harness.ts";
+import { startQualifiedEngine } from "./paper-engine-testkit.js";
 
 describe("Step 5 sustained capacity harness", () => {
   it("reaches a bounded plateau under multi-market normal, burst, reference and reconnect traffic", async () => {
@@ -107,4 +109,43 @@ describe("Step 5 sustained capacity harness", () => {
     const short = elapsed.slice(0, 5).map((elapsedMs, index) => ({ elapsedMs, index } as unknown as CapacitySample));
     expect(classifyMetric(short, "activeTriggers", (sample) => (sample as unknown as { index: number }).index, 0, "retained").classification).toBe("insufficient_samples");
   });
+
+  it("classifies retained state from completed cleanup cycles", () => {
+    const cycle = (atMs: number, value: number, before = value + 5): RetainedCleanupCycleObservation => ({
+      atMs,
+      before: { activeTriggers: before, triggerProvenance: before, provenanceInvalid: 0, signalsByTrigger: before, lastEvaluatedSignalCount: before },
+      after: { activeTriggers: value, triggerProvenance: value, provenanceInvalid: 0, signalsByTrigger: value, lastEvaluatedSignalCount: value },
+    });
+    expect(classifyRetainedCleanupCycles([cycle(0, 1)], "activeTriggers").classification).toBe("insufficient_samples");
+    expect(classifyRetainedCleanupCycles([cycle(0, 1), cycle(60_000, 1), cycle(120_000, 1), cycle(180_000, 1)], "activeTriggers").classification).toBe("plateau");
+    expect(classifyRetainedCleanupCycles([cycle(0, 1), cycle(60_000, 62), cycle(120_000, 123), cycle(180_000, 184)], "activeTriggers").classification).toBe("monotonic_growth");
+    expect(classifyRetainedCleanupCycles([cycle(0, 1), cycle(60_000, 1), cycle(120_000, 2), cycle(180_000, 1)], "activeTriggers").classification).toBe("plateau");
+  });
+
+  it("records four controlled prune cycles and removes companion bookkeeping together", async () => {
+    let nowMs = Date.now();
+    const setup = await startQualifiedEngine({}, () => new Date(nowMs));
+    try {
+      const trigger = triggerEventSchema.parse({
+        id: "expired-cycle-trigger", traceId: "expired-cycle-trace", marketId: "btc-mkt", asset: "BTC",
+        kind: "NEARING_EXPIRY", severity: 1, score: 1, dedupeKey: "expired-cycle", evidence: {},
+        sourceEventIds: ["cycle-source"], source: "system", createdAt: new Date(nowMs - 120_000).toISOString(),
+        expiresAt: new Date(nowMs - 1).toISOString(),
+      });
+      setup.engine.seedRuntimeBookkeepingForTest({ trigger });
+      for (let cycle = 0; cycle < 4; cycle += 1) {
+        nowMs += 60_000;
+        setup.engine.pruneRuntimeBookkeepingForTest();
+      }
+      const cycles = setup.engine.retainedCleanupCyclesForTest();
+      expect(cycles).toHaveLength(4);
+      expect(cycles[0]?.before.activeTriggers).toBe(1);
+      expect(cycles[0]?.after).toEqual({ activeTriggers: 0, triggerProvenance: 0, provenanceInvalid: 0, signalsByTrigger: 0, lastEvaluatedSignalCount: 0 });
+      for (const cycle of cycles.slice(1)) expect(cycle.after).toEqual(cycles[0]!.after);
+      expect(classifyRetainedCleanupCycles(cycles, "activeTriggers").classification).toBe("plateau");
+      expect(classifyRetainedCleanupCycles(cycles, "triggerProvenance").classification).toBe("plateau");
+    } finally {
+      await setup.engine.stop();
+    }
+  }, 15_000);
 });
