@@ -1,39 +1,71 @@
-# Step 5 capacity evidence
+# Step 5 capacity and fault evidence
 
-This repository contains two different performance tools. `scripts/stability-hot-path-bench.ts` remains the isolated trigger, reference, normalization, and ingress microbenchmark. `scripts/sustained-capacity-harness.ts` drives the real `EngineService` through a bounded scripted market transport, discovery reconciliation, reference ingress, runtime supervisor, journal admission, and `SseHub`.
+Step 5 has two separate local tools. `scripts/stability-hot-path-bench.ts` is an isolated trigger, reference, normalization, and ingress microbenchmark. `scripts/sustained-capacity-harness.ts` drives the real `EngineService` through bounded market ingress, discovery reconciliation, reference ingress, runtime supervision, journal admission, and `SseHub`.
 
-Run a local probe with:
+Run the evidence profile with:
 
 ```text
-pnpm bench:sustained -- --duration-ms 10000 --markets 6 --market-rate 30 --reference-rate 12 --dashboard slow --database delayed
+pnpm bench:sustained -- --duration-ms 10000 --warmup-ms 1500 --markets 6 --market-rate 30 --reference-rate 12 --reconnect-storm true --reconnect-cycles 2 --dashboard slow --database delayed
 ```
 
-The default deterministic profile uses four markets across multiple assets, 30 market source events per market-second, 12 reference ticks per second, a reconnect/gap burst, one discovery refresh, and a 750 ms warm-up. It emits full books on first observation and multi-entry `price_change` frames thereafter. The dashboard profile can be disconnected, connected, or slow; the database profile can be healthy, delayed, or temporarily unavailable. Tests use shorter durations while retaining the same phases.
+The default profile uses four markets, synthetic market and reference rates, a burst, two reconnect cycles, one discovery refresh, and a warm-up. `--ingress-overflow true` is a separate scenario: it intentionally fills the bounded source queue and must observe overflow, a gap, full-book resynchronization, and a trusted final market state. The normal profile may have zero gaps and zero rejections.
 
-Each sample records process memory (`rss`, `heapUsed`, `heapTotal`, `external`, `arrayBuffers`), event-loop delay and utilization, process CPU, supervisor and journal admission, bounded market ingress, reference-window entries and retry timers, SSE subscribers and buffered bytes, active triggers/provenance/dedupe, market snapshots and caches, activation bookkeeping, settled-market tracking, and idle Grok tombstones. The report also counts source events, reconnect requests, reference ticks, burst events, raw observation rows, and durable transitions.
+Every sample records process memory (`rss`, `heapUsed`, `heapTotal`, `external`, `arrayBuffers`), event-loop delay, event-loop utilization, process CPU, supervisor and journal admission, bounded ingress, reference-window entries and retry timers, SSE subscribers and buffered bytes, active triggers/provenance/dedupe, market snapshots and caches, activation bookkeeping, settled-market tracking, and idle Grok tombstones. The report also counts source events, rejected source events, reconnect requests and completed cycles, reference ticks, burst events, raw observation rows, and durable transitions.
 
-Plateau classification discards the warm-up window, evaluates the final half of the steady/recovery samples, and uses linear regression slope plus high-water marks. A queue is `monotonic_growth` only when its final slope exceeds both an absolute and relative threshold; a V8 heap expansion by itself is therefore not treated as a leak. The harness reports raw samples so reviewers can inspect the warm-up, burst, recovery, and plateau windows.
+The event-loop sampler takes two absolute `performance.eventLoopUtilization()` snapshots and computes a delta from those snapshots; a delta is never reused as the next baseline. `monitorEventLoopDelay` is reset after each sample, so `delayP99Ms` and `delayMaxMs` describe that window. `delayP99HighWaterMs` and `delayMaxHighWaterMs` preserve whole-run high-water values. This exposes warm-up, steady, burst, and recovery windows separately.
 
-The current local evidence keeps these structures inside their architectural bounds:
+## Capacity verdict
 
-| Collection | Domain and bound | Cleanup or saturation behavior |
-| --- | --- | --- |
-| `RuntimeSupervisor` lane queues | p0 256, p3 1024 events; bounded bytes and concurrency | admission rejects at the cap; failures retained at 32 |
-| `DirectJournalAdmission` | 4 active, 32 critical waiters, 96 noncritical waiters | critical/noncritical rejection follows existing fail-closed policy |
-| market ingress queue | bounded by event count and 16 MB | gap + resync; no silent coalescing |
-| trigger/reference windows | trigger dedupe 8192; reference window 60 seconds/16384 | TTL/rolling eviction; overflow invalidates context and requests resync |
-| Engine snapshots and recent state | per discovered/managed market; recent triggers 500 | discovery reconciliation removes vanished state; open-position obligations are retained |
-| activation coordinator | configurable memory limit (500 in production defaults) | TTL/LRU-style ordered eviction and cooldown pruning |
-| reference registry sessions/chains | one session per discovered asset | serialized start/stop; assets leave when no market requires them |
-| SSE subscribers | bounded subscriber count policy and 256 KiB backpressure threshold | slow clients are closed after the byte or persistent-backpressure threshold |
-| idle Grok tombstones | process-local exact retry map, bounded count and TTL | oldest entries evicted; no idle canonical journal row is written |
-| settled markets | business-lifecycle set for markets with settlement obligations | cleared only when recovery/settlement lifecycle no longer needs the obligation |
-| checkpoints/reports | retention policy and report identity keys | bounded retention; durable transitions are protected from deletion |
+The harness emits a machine-readable `verdict`:
 
-`settledMarkets` is intentionally business-lifecycle bounded by open position obligations, rather than an arbitrary timer. A production soak must confirm that obligation closure matches expected market turnover.
+* `READY_FOR_PRODUCTION_SOAK` requires every structural invariant, storage-admission invariant, required queue/retained-state plateau, bounded slow-client behavior, and acceptable local memory evidence.
+* `NOT_READY` includes blocker names such as `INVARIANT_FAILED:<name>`, `REQUIRED_QUEUE_MONOTONIC_GROWTH:<name>`, `REQUIRED_MEMORY_MONOTONIC_GROWTH`, `STORAGE_ADMISSION_FAILED:RAW_OBSERVATIONS_PERSISTED`, or `INSUFFICIENT_LOCAL_EVIDENCE:memory`.
+* Runs shorter than 3 seconds or with fewer than ten final-window samples report `localMemory: INSUFFICIENT_LOCAL_EVIDENCE`; this is not a pass. Structural boundedness remains independently visible as `structural: PASS` or `FAIL`.
 
-The real Polymarket adapter also has an experiment-start gate. A 48-hour start requires a connected feed, a synchronized trusted book for at least one entry-qualified candidate, and a fresh required reference. The same checks run immediately before the durable transition; a feed gap observed while preflight is in flight returns a deterministic blocker and does not create `EXPERIMENT_STARTED`. Test doubles that do not model transport trust retain their existing lifecycle semantics.
+Plateau classification discards warm-up and evaluates the final half of the remaining samples. A metric is `monotonic_growth` only when its final linear slope exceeds both an absolute and relative threshold. Required queues and retained-state metrics fail the verdict when monotonic; short local memory evidence remains insufficient rather than being inferred from V8 expansion noise.
 
-CPU numbers in the harness are measured on the local host. The rate-to-demand text is synthetic/estimated and must not be read as a Fly utilization percentage. The final `shared-cpu-2x` verdict remains unknown until a controlled paper-only Fly soak measures CPU utilization and steal, RSS/heap, event-loop delay, ingress rates, supervisor/journal waiters, database latency, reconnects, SSE clients/buffers, and storage over the agreed soak interval.
+## Feed-start boundary
 
-The Step 5 code-level verdict is `READY_FOR_PRODUCTION_SOAK` when the focused capacity/fault tests, the existing crash/recovery suites, and the full CI-equivalent commands pass. This does not authorize a deploy, production database mutation, experiment start, or live trading.
+For the real Polymarket adapter, an experiment start requires a connected feed, a synchronized trusted book for an entry-qualified candidate, and a fresh required reference. Those checks run before the durable transition and again in `commitAuthoritative` immediately before it enters the journal. `experimentFeedGeneration` is incremented by gaps, disconnects, stale references, and discovery/token changes.
+
+The boundary gate serializes lifecycle start and idle Grok acceptance. `experimentStartPending` keeps research ingress out while the start is in flight. If a feed generation or freshness check changes after the durable `EXPERIMENT_STARTED` row becomes authoritative, the engine immediately commits `EXPERIMENT_ENTRY_CLOSED` while the gate is still held and returns a deterministic `EXPERIMENT_FEED_INVALIDATED_DURING_START` rejection. This deliberately fail-closed `STARTED -> ENTRY_CLOSED` transition prevents an invalidated feed from becoming entry-capable. A fresh trusted baseline may then retry with a new experiment identity. Test doubles that do not model transport trust retain their existing lifecycle behavior.
+
+## Long-lived state inventory
+
+The following inventory covers mutable collections owned by the touched runtime lifecycle. Bounds are architectural limits or business-lifecycle limits; no correctness-bearing state is evicted solely to make a capacity report pass.
+
+| Owner / state | Purpose and lifecycle bound | Cleanup / saturation | Evidence |
+| --- | --- | --- | --- |
+| `EngineService.snapshots`, `restingOrders`, `makerReservations`, `recentTrades` | Current market books; open paper orders; maker ownership; recent trade timestamps. One entry per managed market/order/token and open obligation. | Discovery reconciliation removes vanished markets after obligations close; fills/cancels remove orders and reservations; recent trades follow existing time window. | MEASURED_LOCAL + STRUCTURALLY_PROVEN |
+| `activeTriggers`, `triggerProvenance`, `provenanceInvalid`, `signalsByTrigger`, `lastEvaluatedSignalCount`, `signalReceivedTimes` | Actionable trigger lifecycle, provenance, invalidation, per-role signals, consensus dedupe, rate window. Trigger dedupe is bounded (8192) and signal rate uses the configured rolling limit. | Trigger expiry/settlement and dedupe eviction prune entries; admission rejects at supervisor/journal caps. | DETERMINISTIC_TEST + MEASURED_LOCAL |
+| `marketsById`, `entryQualified`, `managedMarketIds`, `assetByMarket`, `assetIndex` | Discovery truth and managed/entry indexes. Cardinality follows discovered markets and open obligations. | Reconciliation removes vanished non-obligation markets and their index entries; obligation markets remain until settlement. | MEASURED_LOCAL + STRUCTURALLY_PROVEN |
+| `settledMarkets`, `settlementBackoff` | Settlement obligations and retry backoff. Business-lifecycle bounded by unresolved positions/orders. | Cleared after settlement/recovery; backoff advances on failure and is removed when resolved. | DETERMINISTIC_TEST; Fly soak required for turnover |
+| `snapshotEpoch`, `tokenIds`, `tokenIdSet` | Source generation and subscribed token identity. | Replaced on discovery; gaps invalidate projections and require a new full-book epoch. | DETERMINISTIC_TEST + MEASURED_LOCAL |
+| `referenceUnreliable`, `referenceEpoch`, `referenceLogicalGapped`, `referenceResyncInFlight`, `referenceResyncRequested`, `referenceRequired`, `referenceBlocked` | Reference trust, generation, gap and resync state per asset/market. | Reconciliation and feed recovery clear/advance state; duplicate requests coalesce; overflow marks the asset unreliable. | DETERMINISTIC_TEST + MEASURED_LOCAL |
+| `referenceRetryTimers`, `referenceRetryDeadlines` | One retry timer/deadline per reference asset. | Timer is cleared on success, stop, or asset removal; retries are coalesced. | MEASURED_LOCAL |
+| `idleGrokSubmissions` | Process-local exact retry and concurrent duplicate suppression while IDLE; no durable idle claim or canonical accepted row. | TTL and count bound (`IDLE_GROK_IDEMPOTENCY_MAX`); active promotion removes the reservation before durable claim. | DETERMINISTIC_TEST |
+| `reportSourceIntegrity`, source-seal fields (`sourceSealing`, `sourceSealed`, generation, deadline, attempt, flight, abort) | Integrity faults and completion/source-seal coordination. | Faults are sticky and fail closed; seal attempts are cancelled by generation/deadline and persisted once. | DETERMINISTIC_TEST; Fly soak required for outage duration |
+| `RuntimeSupervisor` queues, busy keys, failure ring | Bounded p0/p3 work and per-key serialization. | p0=256 and p3=1024 event caps; failures retained at 32; admission rejects at cap. | MEASURED_LOCAL + DETERMINISTIC_TEST |
+| `DirectJournalAdmission` active/waiting queues | Bounded append admission with critical reservation. | Four active slots, 32 critical waiters, 96 noncritical waiters; deterministic rejection/fail-closed policy. | MEASURED_LOCAL + DETERMINISTIC_TEST |
+| `TriggerEngine` books, pairs, reference windows, market windows, emitted dedupe/order | Trigger calculation and event dedupe. | Reference window is 60 seconds/16384 entries; trigger dedupe is 8192; market-window expiry prunes state. | DETERMINISTIC_TEST + MEASURED_LOCAL |
+| `PolymarketMarketDataAdapter` token sync, books, timestamp map, token waiters | Per-token source synchronization and full-book generations. | Discovery replaces token set; gaps clear books and wake resync; waiters are resolved/rejected on stop. | DETERMINISTIC_TEST + MEASURED_LOCAL |
+| `ReferenceFeedRegistry` adapters, resolution cache, sessions, chains, stop epochs, backoff | One feed session per required asset and serialized lifecycle. | Assets leave when no market requires them; chains coalesce and stop epochs prevent stale sessions. | DETERMINISTIC_TEST; Fly soak required for reconnect turnover |
+| activation coordinator sent/order/recent/latency/retry maps | MCP activation dedupe, cooldown and latency history. | Configured memory limit (500 production default), cooldown pruning, ordered eviction. | MEASURED_LOCAL |
+| `SseHub` subscribers/tracked clients/timer | Dashboard fan-out and backpressure tracking. | Subscriber policy and 256 KiB buffer threshold close slow clients; timer stops when empty. | MEASURED_LOCAL + DETERMINISTIC_TEST |
+| checkpoints, durable transitions, report identities | Recovery and canonical lifecycle facts. | Existing retention and operation keys; durable rows are never removed by the harness. | DETERMINISTIC_TEST; Fly storage soak required |
+
+`settledMarkets` remains obligation-based rather than timer-evicted. Production soak must confirm that business obligation closure matches market turnover.
+
+## Database profiles and evidence labels
+
+`database=delayed|unavailable` in the sustained harness exercises monitor-only `APPEND` admission while raw market/reference observations remain non-durable. It is reported as `MEASURED_LOCAL` for that path and is not a durable-DB stress claim. `tests/step5-durable-fault.test.ts` separately exercises `DURABLE` commit delay, temporary unavailability, recovery, idempotent retry, and no duplicate durable rows through the existing journal/recovery API. `CHECKPOINT` and `IDEMPOTENCY` crash/replay behavior is covered by the existing Step 4/PR #13-15 suites and the focused persistence tests.
+
+Evidence labels in review are explicit:
+
+* `MEASURED_LOCAL`: observed by the local harness or test runtime.
+* `DETERMINISTIC_TEST`: asserted with a controlled clock, transport, hold, or fault.
+* `STRUCTURALLY_PROVEN`: follows from bounded queues, generation fences, and lifecycle code.
+* `REQUIRES_FLY_SOAK`: CPU/steal, RSS over 48 hours, real reconnect rates, database latency/pool waiters, storage growth, and real SSE population.
+* `NOT_EXERCISED`: a scenario not run by a particular profile (for example, overflow in the normal profile).
+
+Local CPU values are process measurements on the host. Synthetic rates and payloads are not Fly CPU percentages. The final `shared-cpu-2x 512MB FRA singleton` capacity decision requires a controlled paper-only Fly soak; this code-level verdict does not authorize deployment, production database mutation, a 48-hour experiment, or live trading.

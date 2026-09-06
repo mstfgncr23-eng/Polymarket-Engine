@@ -15,6 +15,7 @@ import { fileURLToPath } from "node:url";
 import { createId, engineEnvSchema, feeScheduleSchema, type EngineEnv, type ReferenceTick } from "../packages/core/src/index.ts";
 import { MemoryEventJournal } from "../packages/db/src/index.ts";
 import {
+  BoundedIngressQueue,
   PolymarketMarketDataAdapter,
   ScriptedBoundedMarketTransport,
   type DiscoveryReport,
@@ -36,7 +37,9 @@ export interface CapacityHarnessOptions {
   marketRatePerSec?: number;
   referenceRatePerSec?: number;
   reconnectStorm?: boolean;
+  reconnectCycles?: number;
   discoveryRefresh?: boolean;
+  ingressOverflow?: boolean;
   dashboard?: DashboardMode;
   database?: DatabaseMode;
   databaseDelayMs?: number;
@@ -46,7 +49,13 @@ export interface CapacitySample {
   elapsedMs: number;
   phase: "warmup" | "steady" | "burst" | "recovery";
   memory: { rss: number; heapUsed: number; heapTotal: number; external: number; arrayBuffers: number };
-  eventLoop: { delayP99Ms: number; delayMaxMs: number; utilization: number };
+  eventLoop: {
+    delayP99Ms: number;
+    delayMaxMs: number;
+    delayP99HighWaterMs: number;
+    delayMaxHighWaterMs: number;
+    utilization: number;
+  };
   cpu: { processMs: number; userMs: number; systemMs: number };
   trigger: { queued: number; inFlight: number; active: number; provenance: number; dedupe: number };
   journal: { active: number; waiting: number; criticalWaiting: number; noncriticalWaiting: number };
@@ -63,7 +72,7 @@ export interface CapacityReport {
   locality: "local-synthetic";
   target: "Fly shared-cpu-2x 512MB FRA singleton";
   options: Required<CapacityHarnessOptions>;
-  workload: { sourceEventsSent: number; sourceEventsRejected: number; reconnectsRequested: number; referenceTicksSent: number; burstEvents: number; discoveryRefreshes: number };
+  workload: { sourceEventsSent: number; sourceEventsRejected: number; reconnectsRequested: number; reconnectCyclesCompleted: number; referenceTicksSent: number; burstEvents: number; discoveryRefreshes: number };
   samples: CapacitySample[];
   plateau: {
     warmupSamples: number;
@@ -78,6 +87,9 @@ export interface CapacityReport {
     boundedReferenceWindow: boolean;
     boundedSse: boolean;
     boundedRuntimeBookkeeping: boolean;
+    finalMarketTruthTrusted: boolean;
+    ingressOverflowObserved: boolean;
+    resyncRecovered: boolean;
     rawMarketAndReferenceEventsPersisted: number;
     durableTransitions: number;
     dashboardSlowClientDisconnected: boolean;
@@ -86,6 +98,12 @@ export interface CapacityReport {
     measuredLocal: { processCpuMs: number; elapsedMs: number };
     syntheticEstimate: string;
     flySoakRequired: string[];
+  };
+  verdict: {
+    status: "READY_FOR_PRODUCTION_SOAK" | "NOT_READY";
+    blockers: string[];
+    structural: "PASS" | "FAIL";
+    localMemory: "MEASURED" | "INSUFFICIENT_LOCAL_EVIDENCE" | "FAIL";
   };
 }
 
@@ -97,7 +115,9 @@ const DEFAULTS: Required<CapacityHarnessOptions> = {
   marketRatePerSec: 30,
   referenceRatePerSec: 12,
   reconnectStorm: true,
+  reconnectCycles: 2,
   discoveryRefresh: true,
+  ingressOverflow: false,
   dashboard: "slow",
   database: "healthy",
   databaseDelayMs: 8,
@@ -187,6 +207,19 @@ function numericSlope(values: number[], elapsedMs: number[]): number {
   return x.reduce((sum, item, index) => sum + (item - meanX) * ((values[index] ?? meanY) - meanY), 0) / denominator;
 }
 
+export interface EventLoopUtilizationSnapshot { active: number; idle: number; utilization: number }
+
+/** Compute a delta from two absolute snapshots; never feed a delta back as a baseline. */
+export function eventLoopUtilizationDelta(
+  previous: EventLoopUtilizationSnapshot,
+  current: EventLoopUtilizationSnapshot,
+): { active: number; idle: number; utilization: number } {
+  const active = Math.max(0, current.active - previous.active);
+  const idle = Math.max(0, current.idle - previous.idle);
+  const total = active + idle;
+  return { active, idle, utilization: total > 0 ? active / total : 0 };
+}
+
 function classifyMetric(samples: CapacitySample[], key: string, value: (sample: CapacitySample) => number, warmupSamples: number): CapacityReport["plateau"]["metrics"][string] {
   const steady = samples.slice(warmupSamples);
   const finalWindow = steady.slice(-Math.max(3, Math.floor(steady.length / 2)));
@@ -200,7 +233,7 @@ function classifyMetric(samples: CapacitySample[], key: string, value: (sample: 
 
 export async function runSustainedCapacityHarness(input: CapacityHarnessOptions = {}): Promise<CapacityReport> {
   const options: Required<CapacityHarnessOptions> = { ...DEFAULTS, ...input };
-  const transport = new ScriptedBoundedMarketTransport();
+  const transport = new ScriptedBoundedMarketTransport(options.ingressOverflow ? new BoundedIngressQueue(8, 16_000) : undefined);
   const adapter = new PolymarketMarketDataAdapter(undefined, { transport });
   const markets = Array.from({ length: Math.max(1, Math.min(20, Math.floor(options.markets))) }, (_, index) => {
     const asset = ["BTC", "ETH", "SOL", "XRP", "DOGE", "ADA"][index % 6]!;
@@ -228,12 +261,14 @@ export async function runSustainedCapacityHarness(input: CapacityHarnessOptions 
     referenceRegistry: referenceRegistry as never,
     activation: new NoopGrokActivationBridge(),
   });
-  const workload = { sourceEventsSent: 0, sourceEventsRejected: 0, reconnectsRequested: 0, referenceTicksSent: 0, burstEvents: 0, discoveryRefreshes: 0 };
+  const workload = { sourceEventsSent: 0, sourceEventsRejected: 0, reconnectsRequested: 0, reconnectCyclesCompleted: 0, referenceTicksSent: 0, burstEvents: 0, discoveryRefreshes: 0 };
   const samples: CapacitySample[] = [];
   const eventLoop = monitorEventLoopDelay({ resolution: 10 });
   eventLoop.enable();
   let previousUtilization = performance.eventLoopUtilization();
   let previousCpu = process.cpuUsage();
+  let delayP99HighWaterMs = 0;
+  let delayMaxHighWaterMs = 0;
   let fastBytes = 0;
   let slowEnded = false;
   if (options.dashboard !== "disconnected") {
@@ -250,17 +285,22 @@ export async function runSustainedCapacityHarness(input: CapacityHarnessOptions 
     const ingress = adapter.ingressSnapshot();
     const supervisor = engine.runtimeSupervisorSnapshot();
     const admission = engine.journalAdmissionSnapshot();
-    const utilization = performance.eventLoopUtilization(previousUtilization);
-    previousUtilization = utilization;
+    const currentUtilization = performance.eventLoopUtilization();
+    const utilization = eventLoopUtilizationDelta(previousUtilization, currentUtilization);
+    previousUtilization = currentUtilization;
     const cpu = process.cpuUsage(previousCpu);
     previousCpu = process.cpuUsage();
     const memory = process.memoryUsage();
     const sse = engine.sse.statsForTest();
     const bookkeeping = engine.runtimeBookkeepingForTest();
+    const delayP99Ms = Number((eventLoop.percentile(99) / 1e6).toFixed(3));
+    const delayMaxMs = Number((eventLoop.max / 1e6).toFixed(3));
+    delayP99HighWaterMs = Math.max(delayP99HighWaterMs, delayP99Ms);
+    delayMaxHighWaterMs = Math.max(delayMaxHighWaterMs, delayMaxMs);
     samples.push({
       elapsedMs: Date.now() - startedAt, phase,
       memory: { rss: memory.rss, heapUsed: memory.heapUsed, heapTotal: memory.heapTotal, external: memory.external, arrayBuffers: memory.arrayBuffers ?? 0 },
-      eventLoop: { delayP99Ms: Number((eventLoop.percentile(99) / 1e6).toFixed(3)), delayMaxMs: Number((eventLoop.max / 1e6).toFixed(3)), utilization: Number(utilization.utilization.toFixed(5)) },
+      eventLoop: { delayP99Ms, delayMaxMs, delayP99HighWaterMs, delayMaxHighWaterMs, utilization: Number(utilization.utilization.toFixed(5)) },
       cpu: { processMs: (cpu.user + cpu.system) / 1000, userMs: cpu.user / 1000, systemMs: cpu.system / 1000 },
       trigger: { queued: supervisor.totalQueued, inFlight: supervisor.totalInFlight, active: bookkeeping.activeTriggers, provenance: bookkeeping.triggerProvenance, dedupe: engine.triggerDedupeEntryCount() },
       journal: { active: admission.active, waiting: admission.waiting, criticalWaiting: admission.criticalWaiting, noncriticalWaiting: admission.noncriticalWaiting },
@@ -270,6 +310,7 @@ export async function runSustainedCapacityHarness(input: CapacityHarnessOptions 
       sse: { subscribers: sse.subscribers, tracked: sse.tracked, bufferedBytes: sse.bufferedBytes },
       state: { marketSnapshots: engine.state.marketSnapshots.size, marketCache: engine.monitoredMarketIds().length + engine.assetMarketIndexEntries(), settledMarkets: engine.settledMarketsForTest().size, activations: engine.activationFootprint().latency, grokSignals: engine.state.grokActivity.acceptedSignals, idleTombstones: engine.idleGrokSubmissionCountForTest() },
     });
+    eventLoop.reset();
   };
   const sampler = (async () => {
     while (Date.now() < endAt) { sample(); await sleep(Math.max(10, options.sampleIntervalMs)); }
@@ -279,10 +320,20 @@ export async function runSustainedCapacityHarness(input: CapacityHarnessOptions 
     let nextMarketAt = Date.now();
     let nextReferenceAt = Date.now();
     let didBurst = false;
-    let didReconnect = false;
     let didDiscovery = false;
+    let didOverflow = false;
+    let lastStream: unknown = null;
+    let lastEndedStream: unknown = null;
+    let nextReconnectAt = startedAt + Math.max(options.warmupMs + 250, Math.floor(options.durationMs / Math.max(2, options.reconnectCycles + 1)));
+    const targetReconnects = options.reconnectStorm ? Math.max(2, Math.min(8, Math.floor(options.reconnectCycles))) : 0;
     while (Date.now() < endAt) {
       const now = Date.now();
+      const currentStream = transport.stream;
+      if (currentStream && currentStream !== lastStream) {
+        lastStream = currentStream;
+        firstBooks.clear();
+        workload.reconnectCyclesCompleted = Math.max(0, transport.streams.length - 1);
+      }
       if (now - startedAt >= options.warmupMs) phase = "steady";
       if (!didBurst && now - startedAt >= Math.max(options.warmupMs, Math.floor(options.durationMs * 0.35))) {
         didBurst = true; phase = "burst";
@@ -299,8 +350,28 @@ export async function runSustainedCapacityHarness(input: CapacityHarnessOptions 
         }
         phase = "steady";
       }
-      if (options.reconnectStorm && !didReconnect && now - startedAt >= Math.floor(options.durationMs * 0.55)) {
-        didReconnect = true; workload.reconnectsRequested += 1; transport.stream?.endRemote();
+      if (options.reconnectStorm && workload.reconnectsRequested < targetReconnects && now >= nextReconnectAt
+        && currentStream?.alive && currentStream !== lastEndedStream) {
+        workload.reconnectsRequested += 1;
+        lastEndedStream = currentStream;
+        currentStream.endRemote();
+        nextReconnectAt = now + Math.max(350, Math.floor(options.durationMs / Math.max(2, targetReconnects + 1)));
+      }
+      if (options.ingressOverflow && !didOverflow && now - startedAt >= Math.max(options.warmupMs, Math.floor(options.durationMs * 0.45))) {
+        didOverflow = true;
+        phase = "burst";
+        const stream = transport.stream;
+        if (stream?.alive) {
+          for (let burst = 0; burst < Math.max(32, options.markets * 32); burst += 1) {
+            for (const market of markets) {
+              const result = stream.push(rawPriceChange(market.tokens.map((token) => token.tokenId), Date.now() + sequence, sequence));
+              if (result.ok) { workload.sourceEventsSent += 1; workload.burstEvents += 1; }
+              else workload.sourceEventsRejected += 1;
+              sequence += 1;
+            }
+          }
+        }
+        phase = "steady";
       }
       if (options.discoveryRefresh && !didDiscovery && now - startedAt >= Math.floor(options.durationMs * 0.7)) {
         didDiscovery = true; workload.discoveryRefreshes += 1; await engine.reconcileDiscovery();
@@ -311,13 +382,13 @@ export async function runSustainedCapacityHarness(input: CapacityHarnessOptions 
           const outcomeTokens = market.tokens.map((token) => token.tokenId);
           if (!firstBooks.has(market.id)) {
             for (const token of market.tokens) {
-              const result = transport.stream ? transport.push(rawBook(token.tokenId, market.id, Date.now() + sequence, 5)) : { ok: false as const, reason: "count_limit" as const };
+              const result = transport.stream?.alive ? transport.push(rawBook(token.tokenId, market.id, Date.now() + sequence, 5)) : { ok: false as const, reason: "count_limit" as const };
               if (result.ok) workload.sourceEventsSent += 1; else workload.sourceEventsRejected += 1;
               sequence += 1;
             }
             firstBooks.add(market.id);
           } else {
-            const result = transport.stream ? transport.push(rawPriceChange(outcomeTokens, Date.now() + sequence, sequence)) : { ok: false as const, reason: "count_limit" as const };
+            const result = transport.stream?.alive ? transport.push(rawPriceChange(outcomeTokens, Date.now() + sequence, sequence)) : { ok: false as const, reason: "count_limit" as const };
             if (result.ok) workload.sourceEventsSent += 1; else workload.sourceEventsRejected += 1;
             sequence += 1;
           }
@@ -343,12 +414,17 @@ export async function runSustainedCapacityHarness(input: CapacityHarnessOptions 
   eventLoop.disable();
   const rawEvents = await journal.queryEvents({ types: ["MARKET_SNAPSHOT", "REFERENCE_TICK"] });
   const durable = await journal.queryDurableTransitions({ limit: 10_000 });
+  const finalIngress = adapter.ingressSnapshot();
+  const finalMarketTruthTrusted = markets.every((market) => engine.isMarketSynchronized(market.id));
   const warmupSamples = samples.filter((item) => item.phase === "warmup").length;
   const steadySamples = samples.filter((item) => item.phase !== "warmup").length;
   const finalWindowSamples = Math.max(0, Math.floor(steadySamples / 2));
   const metrics: CapacityReport["plateau"]["metrics"] = {
     rss: classifyMetric(samples, "rss", (item) => item.memory.rss, warmupSamples),
     heapUsed: classifyMetric(samples, "heapUsed", (item) => item.memory.heapUsed, warmupSamples),
+    heapTotal: classifyMetric(samples, "heapTotal", (item) => item.memory.heapTotal, warmupSamples),
+    external: classifyMetric(samples, "external", (item) => item.memory.external, warmupSamples),
+    arrayBuffers: classifyMetric(samples, "arrayBuffers", (item) => item.memory.arrayBuffers, warmupSamples),
     triggerQueue: classifyMetric(samples, "triggerQueue", (item) => item.trigger.queued, warmupSamples),
     journalWaiting: classifyMetric(samples, "journalWaiting", (item) => item.journal.waiting, warmupSamples),
     ingressDepth: classifyMetric(samples, "ingressDepth", (item) => item.ingress.depth, warmupSamples),
@@ -357,25 +433,62 @@ export async function runSustainedCapacityHarness(input: CapacityHarnessOptions 
   };
   const last = samples.at(-1)!;
   const max = (selector: (item: CapacitySample) => number) => Math.max(0, ...samples.map(selector));
+  const invariants: CapacityReport["invariants"] = {
+    boundedIngress: max((item) => item.ingress.depth) <= 10_000 && max((item) => item.ingress.bytes) <= 16_000_000,
+    boundedSupervisor: max((item) => item.supervisor.queued) <= 1_280,
+    boundedJournalAdmission: max((item) => item.journal.waiting) <= 128,
+    boundedReferenceWindow: max((item) => item.reference.windowEntries) <= 16_384,
+    boundedSse: max((item) => item.sse.bufferedBytes) <= 262_144 * Math.max(1, options.dashboard === "slow" ? 2 : 1),
+    boundedRuntimeBookkeeping: max((item) => item.state.marketSnapshots) <= Math.max(2, options.markets * 2),
+    finalMarketTruthTrusted,
+    ingressOverflowObserved: !options.ingressOverflow || finalIngress.gapTotal > 0,
+    resyncRecovered: !options.ingressOverflow && !options.reconnectStorm || finalMarketTruthTrusted,
+    rawMarketAndReferenceEventsPersisted: rawEvents.length,
+    durableTransitions: durable.length,
+    dashboardSlowClientDisconnected: options.dashboard !== "slow" || slowEnded,
+  };
+  const blockers: string[] = [];
+  for (const [name, value] of Object.entries(invariants)) {
+    if (typeof value === "boolean" && !value) blockers.push(`INVARIANT_FAILED:${name}`);
+  }
+  if (invariants.rawMarketAndReferenceEventsPersisted !== 0) blockers.push("STORAGE_ADMISSION_FAILED:RAW_OBSERVATIONS_PERSISTED");
+  const requiredQueueMetrics = ["triggerQueue", "journalWaiting", "ingressDepth", "sseBufferedBytes", "retryTimers"];
+  for (const name of requiredQueueMetrics) {
+    const classification = metrics[name]?.classification;
+    if (classification === "monotonic_growth") blockers.push(`REQUIRED_QUEUE_MONOTONIC_GROWTH:${name}`);
+    if (classification === "insufficient_samples") blockers.push(`INSUFFICIENT_LOCAL_EVIDENCE:${name}`);
+  }
+  const memoryMetrics = ["rss", "heapUsed", "heapTotal", "external", "arrayBuffers"];
+  const memoryInsufficient = options.durationMs < 3_000 || finalWindowSamples < 10
+    || memoryMetrics.some((name) => metrics[name]?.classification === "insufficient_samples");
+  const memoryFailed = memoryMetrics.some((name) => metrics[name]?.classification === "monotonic_growth");
+  const localMemory: CapacityReport["verdict"]["localMemory"] = memoryFailed
+    ? "FAIL" : memoryInsufficient ? "INSUFFICIENT_LOCAL_EVIDENCE" : "MEASURED";
+  if (memoryFailed) blockers.push("REQUIRED_MEMORY_MONOTONIC_GROWTH");
+  else if (memoryInsufficient) blockers.push("INSUFFICIENT_LOCAL_EVIDENCE:memory");
+  const structural = !blockers.some((blocker) => blocker.startsWith("INVARIANT_FAILED:")
+    || blocker.startsWith("STORAGE_ADMISSION_FAILED:")
+    || blocker.startsWith("REQUIRED_QUEUE_MONOTONIC_GROWTH:")
+    || blocker.startsWith("INSUFFICIENT_LOCAL_EVIDENCE:triggerQueue")
+    || blocker.startsWith("INSUFFICIENT_LOCAL_EVIDENCE:journalWaiting")
+    || blocker.startsWith("INSUFFICIENT_LOCAL_EVIDENCE:ingressDepth")
+    || blocker.startsWith("INSUFFICIENT_LOCAL_EVIDENCE:sseBufferedBytes")
+    || blocker.startsWith("INSUFFICIENT_LOCAL_EVIDENCE:retryTimers"));
   const result: CapacityReport = {
     schemaVersion: 1, capturedAt: new Date().toISOString(), locality: "local-synthetic", target: "Fly shared-cpu-2x 512MB FRA singleton", options,
     workload, samples,
     plateau: { warmupSamples, steadySamples, finalWindowSamples, metrics },
-    invariants: {
-      boundedIngress: max((item) => item.ingress.depth) <= 10_000 && max((item) => item.ingress.bytes) <= 16_000_000,
-      boundedSupervisor: max((item) => item.supervisor.queued) <= 1_280,
-      boundedJournalAdmission: max((item) => item.journal.waiting) <= 128,
-      boundedReferenceWindow: max((item) => item.reference.windowEntries) <= 16_384,
-      boundedSse: max((item) => item.sse.bufferedBytes) <= 262_144 * Math.max(1, options.dashboard === "slow" ? 2 : 1),
-      boundedRuntimeBookkeeping: max((item) => item.state.marketSnapshots) <= Math.max(2, options.markets * 2),
-      rawMarketAndReferenceEventsPersisted: rawEvents.length,
-      durableTransitions: durable.length,
-      dashboardSlowClientDisconnected: options.dashboard !== "slow" || slowEnded,
-    },
+    invariants,
     cpuModel: {
       measuredLocal: { processCpuMs: samples.reduce((sum, item) => sum + item.cpu.processMs, 0), elapsedMs: last.elapsedMs },
       syntheticEstimate: "Measured on the local host only; rates and payloads are synthetic and are not a Fly CPU percentage.",
       flySoakRequired: ["shared-cpu-2x CPU utilization and steal", "RSS/heap/event-loop delay over 48h", "DB latency and pool waiters", "market/reference ingress and reconnect rate", "SSE client count and writable buffers"],
+    },
+    verdict: {
+      status: blockers.length === 0 ? "READY_FOR_PRODUCTION_SOAK" : "NOT_READY",
+      blockers,
+      structural: structural ? "PASS" : "FAIL",
+      localMemory,
     },
   };
   await engine.stop();
@@ -400,7 +513,9 @@ function parseArgs(argv: string[]): CapacityHarnessOptions & { json?: string } {
     else if (key === "database") result.database = value as DatabaseMode;
     else if (key === "database-delay-ms") result.databaseDelayMs = Number(value);
     else if (key === "reconnect-storm") result.reconnectStorm = value !== "false";
+    else if (key === "reconnect-cycles") result.reconnectCycles = Number(value);
     else if (key === "discovery-refresh") result.discoveryRefresh = value !== "false";
+    else if (key === "ingress-overflow") result.ingressOverflow = value !== "false";
   }
   return result;
 }

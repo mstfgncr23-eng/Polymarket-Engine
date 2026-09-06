@@ -214,6 +214,12 @@ export class EngineService {
   private tokenIdSet = new Set<string>();
   private marketLoopStarted = false;
   private experiment: ExperimentManifest | null = null;
+  /** Monotonic fence for feed/discovery invalidations racing experiment start. */
+  private experimentFeedGeneration = 0;
+  /** Keeps ingress out of the transient post-commit/start-validation window. */
+  private experimentStartPending = false;
+  /** A feed-invalidated start is terminal but permits a fresh retry window. */
+  private restartableAfterFeedInvalidation = false;
   private checkpointSequence = 0;
   private lastAppliedDurableCursor = 0;
   private derivedAuditCursor = 0;
@@ -524,7 +530,8 @@ export class EngineService {
 
   async beginExperiment(): Promise<Record<string, unknown>> {
     return this.experimentBoundaryGate.run(async () => {
-      if (this.experiment?.status === "RUNNING" || this.experiment?.status === "ENTRY_CLOSED") {
+      const retryableFeedBoundary = this.restartableAfterFeedInvalidation && this.experiment?.status === "ENTRY_CLOSED";
+      if ((this.experiment?.status === "RUNNING" || this.experiment?.status === "ENTRY_CLOSED") && !retryableFeedBoundary) {
         return { ok: false, blockers: ["EXPERIMENT_ALREADY_ACTIVE"], experiment: this.experiment };
       }
       if (this.experiment?.status === "COMPLETED" || this.experiment?.status === "FAILED") {
@@ -546,12 +553,14 @@ export class EngineService {
       if (!gatedPreflight.ok) return { ...gatedPreflight, ok: false };
       const now = this.nowFn();
       const next = startExperiment({
-        id: this.experiment?.id, durationHours: this.env.EXPERIMENT_DURATION_HOURS, strategyVersion: this.strategy.version,
+        id: retryableFeedBoundary ? undefined : this.experiment?.id, durationHours: this.env.EXPERIMENT_DURATION_HOURS, strategyVersion: this.strategy.version,
         riskConfiguration: this.riskLimits, modelConfiguration: { provider: "external_grok_bot_mcp", logicalRoles: 6, localModelExecution: false },
         startingBalance: this.ledger.snapshot().startingBalance, systemVersion: "0.1.0",
         gitSha: process.env.GIT_SHA ?? process.env.FLY_IMAGE_REF ?? "unknown", now,
         closePolicy: this.env.EXPERIMENT_CLOSE_POLICY,
       });
+      const startFeedGeneration = this.experimentFeedGeneration;
+      this.experimentStartPending = true;
       try {
         await this.commitAuthoritative({
           operationKey: `experiment:${next.id}:started`,
@@ -565,7 +574,9 @@ export class EngineService {
           }),
           checkpoint: true,
           beforeCommit: () => {
-            if (this.experimentFeedBlockers().length > 0) throw new ExperimentStartGuardRejectedError();
+            if (this.experimentFeedGeneration !== startFeedGeneration || this.experimentFeedBlockers().length > 0) {
+              throw new ExperimentStartGuardRejectedError();
+            }
           },
           afterApply: async () => {
             this.reportGenerated = false;
@@ -576,11 +587,33 @@ export class EngineService {
             this.record("EXPERIMENT_STARTED", next.id, null, { status: next.status });
           },
         });
+        const postCommitBlockers = this.experimentFeedBlockers();
+        if (this.experimentFeedGeneration !== startFeedGeneration || postCommitBlockers.length > 0) {
+          // The durable start may already have crossed the database boundary.
+          // Keep the boundary gate and start-pending fence held, then close
+          // entry immediately so no caller can observe an entry-capable
+          // experiment from invalidated truth. This is a deliberately
+          // fail-closed STARTED -> ENTRY_CLOSED lifecycle, not a third check
+          // presented as atomic insertion.
+          const closed: ExperimentManifest = {
+            ...next, status: "ENTRY_CLOSED", entryClosesAt: next.startedAt, completedAt: null, markToMarketAt: null,
+          };
+          await this.commitExperimentStatus(closed);
+          this.restartableAfterFeedInvalidation = true;
+          return {
+            ok: false,
+            blockers: [...new Set([...postCommitBlockers, "EXPERIMENT_FEED_INVALIDATED_DURING_START"])],
+            experiment: this.experiment,
+          };
+        }
+        this.restartableAfterFeedInvalidation = false;
       } catch (error) {
         if (!(error instanceof ExperimentStartGuardRejectedError)) throw error;
         const current = this.preflight("48H_GROK_PAPER_EXPERIMENT");
         const blockers = [...new Set([...current.blockers, ...this.experimentFeedBlockers()])];
         return { ...current, ok: false, blockers };
+      } finally {
+        this.experimentStartPending = false;
       }
       return { ok: true, experiment: this.experiment, preflight };
     });
@@ -647,6 +680,7 @@ export class EngineService {
       onError: (error) => this.onFeedError("polymarket", error),
       onAnomaly: (anomaly) => this.onPolymarketAnomaly(anomaly),
       onGap: (event) => {
+        this.noteExperimentFeedInvalidation();
         this.invalidateMarketProjections(event.tokenIds);
         this.metrics.noteIngressGap(event.reason);
         this.metrics.marketUnsynchronizedTokens.set(this.unsynchronizedTokenCount());
@@ -736,6 +770,7 @@ export class EngineService {
     this.tokenIds = nextTokens;
     this.tokenIdSet = new Set(nextTokens);
     this.marketAdapter.setTokenIds(nextTokens);
+    this.noteExperimentFeedInvalidation();
     this.dropRemovedMarketState(removedMarkets, removedAssets);
     this.state.setDiscovery({
       qualified: report.qualified.map((market) => ({ marketId: market.id, slug: market.slug, asset: market.asset, tokens: market.tokens.map((token) => token.tokenId) })),
@@ -2210,6 +2245,7 @@ export class EngineService {
 
   private async onConnection(event: FeedConnectionEvent): Promise<void> {
     if (event.feed === "polymarket") {
+      if (event.state !== "CONNECTED") this.noteExperimentFeedInvalidation();
       const connection = this.state.connections.polymarket;
       if (event.reconnectCount > connection.reconnects) this.metrics.wsReconnects.inc({ feed: "polymarket" }, event.reconnectCount - connection.reconnects);
       connection.state = event.state;
@@ -2224,11 +2260,13 @@ export class EngineService {
         connection.reconnects = event.reconnectCount;
       }
       if (event.state === "STALE") {
+        this.noteExperimentFeedInvalidation();
         this.noteReferenceLogicalLoss(asset);
         this.state.invalidateReferenceContext(asset);
         this.triggerEngine.resetReferenceAfterReconnect(asset);
         if (event.message?.includes("REFERENCE_INGRESS_OVERFLOW")) this.requestReferenceResync(asset);
       } else if (event.state === "DISCONNECTED") {
+        this.noteExperimentFeedInvalidation();
         const kind = /kind=([a-z_]+)/.exec(event.message ?? "")?.[1] ?? "unknown";
         this.metrics.referenceCloses.inc({ kind });
         if (event.reconnectCount > 0) this.metrics.wsReconnects.inc({ feed: "reference" });
@@ -2295,8 +2333,13 @@ export class EngineService {
   }
 
   private isExperimentWindowOpen(): boolean {
+    if (this.experimentStartPending) return false;
     const status = this.experiment?.status;
     return status === "RUNNING" || status === "ENTRY_CLOSED";
+  }
+
+  private noteExperimentFeedInvalidation(): void {
+    this.experimentFeedGeneration += 1;
   }
 
   private pruneIdleGrokSubmissions(nowMs: number): void {
