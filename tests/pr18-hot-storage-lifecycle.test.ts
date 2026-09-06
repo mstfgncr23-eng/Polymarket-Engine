@@ -199,6 +199,25 @@ describe("PR18 hot operational storage lifecycle", () => {
       // poisoning their recovery replay with an intentionally partial fixture.
       const previous = await journal.latestDurableSequence();
       const commit = await journal.commitDurableTransition({ operationKey: key, type: "REPORT_SOURCE_INTEGRITY_FAULT", aggregateType: "report", aggregateId: key, payload: { derivedAudit: [] } }, previous);
+      // Compaction preserves the durable high-water and indexed replay key but
+      // removes the row itself.  Leave a valid idle checkpoint at that fence so
+      // later tests sharing this disposable database do not attempt to replay a
+      // compacted prefix from cursor zero.
+      const idle = engine.experimentManifest()!;
+      const checkpoints = await journal.listCheckpoints();
+      await journal.saveCheckpoint({
+        experimentId: idle.id,
+        sequence: (checkpoints.at(-1)?.sequence ?? 0) + 1,
+        payload: {
+          schemaVersion: 2,
+          durableCursor: commit.sequence,
+          ledger: engine.ledger.snapshot(),
+          positions: [], restingOrders: [], activeTriggers: [], grokSignals: [],
+          activationLatency: [], makerReservations: {}, managedMarkets: [], settledMarkets: [], marketMetadata: [],
+          lastInfrastructureAccrualAt: Date.now(), derivedAuditCursor: commit.sequence, reportSourceIntegrity: [],
+          experiment: idle,
+        },
+      });
       const compacted = await journal.compactDurableTransitionsThrough(commit.sequence, { maxRows: 1, batchSize: 1, maxReplayKeys: 8, maxBatches: 1, budgetMs: 1000 });
       expect(compacted.deleted).toBe(1);
       expect((await journal.readDurableByOperationKey(key))?.type).toBe("REPORT_SOURCE_INTEGRITY_FAULT");
