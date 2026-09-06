@@ -1891,7 +1891,7 @@ export class EngineService {
   /** Rehydrate only currently discovered markets; durable operation keys remain authority. */
   private async rehydrateLiveSettledMarketMarkers(): Promise<void> {
     const experimentKey = this.experiment?.id ?? "paper";
-    for (const marketId of this.marketsById.keys()) {
+    await Promise.all([...this.marketsById.keys()].map(async (marketId) => {
       try {
         const durable = await this.journal.readDurableByOperationKey(`settlement:${marketId}:${experimentKey}`);
         if (durable?.type === "POSITION_SETTLED") this.settledMarkets.add(marketId);
@@ -1899,7 +1899,7 @@ export class EngineService {
         // Discovery remains live during a transient journal outage; the
         // durable lookup is retried by settlement admission when needed.
       }
-    }
+    }));
   }
 
   private async proveGrokSubmissionCanonicalFacts(submission: GrokSignalSubmission, clientId: string): Promise<void> {
