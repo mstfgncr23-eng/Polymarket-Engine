@@ -1138,7 +1138,9 @@ describe("golden equivalence control vs crashed", () => {
     expect(crashedNorm.snap.settledMarkets).toEqual([]);
     expect(crashedNorm.snap.reserved).toEqual(controlNorm.snap.reserved);
     expect(crashedNorm.snap.experiment).toEqual(controlNorm.snap.experiment);
-    expect(crashedNorm.snap.cursor).toBeGreaterThanOrEqual(controlNorm.snap.cursor);
+    // The crash run contains exactly one aborted start (STARTED + ABORTED),
+    // so its durable cursor is the control cursor plus those two rows.
+    expect(crashedNorm.snap.cursor).toBe(controlNorm.snap.cursor + 2);
     const lifecycleTypes = new Set(["EXPERIMENT_STARTED", "EXPERIMENT_START_VALIDATED", "EXPERIMENT_START_ABORTED"]);
     expect(controlNorm.audit.counts.EXPERIMENT_STARTED).toBe(1);
     expect(controlNorm.audit.counts.EXPERIMENT_START_VALIDATED).toBe(1);

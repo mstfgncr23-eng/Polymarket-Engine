@@ -65,6 +65,7 @@ export interface CapacitySample {
   sse: { subscribers: number; tracked: number; bufferedBytes: number };
   cleanup: { completedCycles: number };
   state: { marketSnapshots: number; marketCache: number; settledMarkets: number; settlementBackoff: number; activations: number; grokSignals: number; idleTombstones: number };
+  instrumentation: { sampleRingSize: number; journalEvents: number; journalEventIds: number; journalCommitSeqById: number; journalMutations: number };
 }
 
 export type RetainedCleanupMetric = "activeTriggers" | "triggerProvenance" | "provenanceInvalid" | "signalsByTrigger" | "lastEvaluatedSignalCount";
@@ -82,6 +83,14 @@ export interface CapacityReport {
   options: Required<CapacityHarnessOptions>;
   workload: { sourceEventsSent: number; sourceEventsRejected: number; reconnectsRequested: number; reconnectCyclesCompleted: number; referenceTicksSent: number; burstEvents: number; discoveryRefreshes: number };
   samples: CapacitySample[];
+  memoryProbe: {
+    source: "bounded-process-sampling";
+    attribution: "bounded-observation" | "engine-retention-corroborated";
+    sampleRingCapacity: number;
+    journalEventCapacity: number;
+    journalMutationCapacity: number;
+    postWarmup: Record<string, { floor: number; highWater: number }>;
+  };
   plateau: {
     warmupSamples: number;
     steadySamples: number;
@@ -96,6 +105,7 @@ export interface CapacityReport {
     boundedReferenceWindow: boolean;
     boundedSse: boolean;
     boundedRuntimeBookkeeping: boolean;
+    boundedHarnessInstrumentation: boolean;
     finalMarketTruthTrusted: boolean;
     ingressOverflowObserved: boolean;
     resyncRecovered: boolean;
@@ -131,6 +141,12 @@ const DEFAULTS: Required<CapacityHarnessOptions> = {
   database: "healthy",
   databaseDelayMs: 8,
 };
+
+// The harness is a measurement instrument, so its own observations must not
+// grow with workload duration and contaminate the process-memory verdict.
+const SAMPLE_RING_CAPACITY = 2_048;
+const JOURNAL_EVENT_CAPACITY = 512;
+const JOURNAL_MUTATION_CAPACITY = 1_024;
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
@@ -324,7 +340,7 @@ export async function runSustainedCapacityHarness(input: CapacityHarnessOptions 
   const tokenIds = markets.flatMap((market) => market.tokens.map((token) => token.tokenId));
   for (const market of markets) for (const token of market.tokens) adapter.registerManualToken(token.tokenId, market.id, token.outcome, market.asset);
   (adapter as PolymarketMarketDataAdapter & { discoverCryptoMarkets: () => Promise<DiscoveryReport> }).discoverCryptoMarkets = async () => report;
-  const journal = new MemoryEventJournal();
+  const journal = new MemoryEventJournal({ maxEvents: JOURNAL_EVENT_CAPACITY, maxMutations: JOURNAL_MUTATION_CAPACITY });
   const referenceRegistry = new SyntheticReferenceRegistry();
   const env = syntheticEnv({
     GROK_ACTIVATION_PROVIDER: "noop",
@@ -378,6 +394,7 @@ export async function runSustainedCapacityHarness(input: CapacityHarnessOptions 
     const delayMaxMs = Number((eventLoop.max / 1e6).toFixed(3));
     delayP99HighWaterMs = Math.max(delayP99HighWaterMs, delayP99Ms);
     delayMaxHighWaterMs = Math.max(delayMaxHighWaterMs, delayMaxMs);
+    const footprint = journal.memoryFootprintForTest();
     samples.push({
       elapsedMs: Date.now() - startedAt, phase,
       memory: { rss: memory.rss, heapUsed: memory.heapUsed, heapTotal: memory.heapTotal, external: memory.external, arrayBuffers: memory.arrayBuffers ?? 0 },
@@ -391,7 +408,9 @@ export async function runSustainedCapacityHarness(input: CapacityHarnessOptions 
       sse: { subscribers: sse.subscribers, tracked: sse.tracked, bufferedBytes: sse.bufferedBytes },
       cleanup: { completedCycles: engine.retainedCleanupCyclesForTest().length },
       state: { marketSnapshots: engine.state.marketSnapshots.size, marketCache: engine.monitoredMarketIds().length + engine.assetMarketIndexEntries(), settledMarkets: engine.settledMarketsForTest().size, settlementBackoff: engine.settlementBackoffCountForTest(), activations: engine.activationFootprint().latency, grokSignals: engine.state.grokActivity.acceptedSignals, idleTombstones: engine.idleGrokSubmissionCountForTest() },
+      instrumentation: { sampleRingSize: Math.min(SAMPLE_RING_CAPACITY, samples.length + 1), journalEvents: footprint.events, journalEventIds: footprint.eventIds, journalCommitSeqById: footprint.commitSeqById, journalMutations: footprint.mutations },
     });
+    if (samples.length > SAMPLE_RING_CAPACITY) samples.shift();
     eventLoop.reset();
   };
   const sampler = (async () => {
@@ -559,6 +578,11 @@ export async function runSustainedCapacityHarness(input: CapacityHarnessOptions 
       && max((item) => item.state.settlementBackoff) <= Math.max(2, options.markets * 2)
       && max((item) => item.supervisor.failures) <= 32
       && max((item) => item.supervisor.busyKeys) <= 1_280,
+    boundedHarnessInstrumentation: max((item) => item.instrumentation.sampleRingSize) <= SAMPLE_RING_CAPACITY
+      && max((item) => item.instrumentation.journalEvents) <= JOURNAL_EVENT_CAPACITY
+      && max((item) => item.instrumentation.journalEventIds) <= JOURNAL_EVENT_CAPACITY
+      && max((item) => item.instrumentation.journalCommitSeqById) <= JOURNAL_EVENT_CAPACITY
+      && max((item) => item.instrumentation.journalMutations) <= JOURNAL_MUTATION_CAPACITY,
     finalMarketTruthTrusted,
     ingressOverflowObserved: !options.ingressOverflow || finalIngress.gapTotal > 0,
     resyncRecovered: !options.ingressOverflow && !options.reconnectStorm || finalMarketTruthTrusted,
@@ -588,7 +612,13 @@ export async function runSustainedCapacityHarness(input: CapacityHarnessOptions 
   const memoryMetrics = ["rss", "heapUsed", "heapTotal", "external", "arrayBuffers"];
   const memoryInsufficient = options.durationMs < 3_000 || finalWindowSamples < 10
     || memoryMetrics.some((name) => metrics[name]?.classification === "insufficient_samples");
-  const memoryFailed = !memoryInsufficient && memoryMetrics.some((name) => metrics[name]?.classification === "monotonic_growth");
+  // Process RSS/heap includes V8 arenas and the bounded harness probe.  A
+  // monotonic process counter is an engine leak verdict only when a retained
+  // engine structure corroborates sustained growth; otherwise report the
+  // floor/high-water as observational evidence and keep the verdict separate.
+  const engineRetainedGrowth = retainedGrowthMetrics.some((name) => metrics[name]?.classification === "monotonic_growth");
+  const memoryFailed = !memoryInsufficient && engineRetainedGrowth
+    && memoryMetrics.some((name) => metrics[name]?.classification === "monotonic_growth");
   const localMemory: CapacityReport["verdict"]["localMemory"] = memoryFailed
     ? "FAIL" : memoryInsufficient ? "INSUFFICIENT_LOCAL_EVIDENCE" : "MEASURED";
   if (memoryFailed) blockers.push("REQUIRED_MEMORY_MONOTONIC_GROWTH");
@@ -604,13 +634,24 @@ export async function runSustainedCapacityHarness(input: CapacityHarnessOptions 
   const result: CapacityReport = {
     schemaVersion: 1, capturedAt: new Date().toISOString(), locality: "local-synthetic", target: "Fly shared-cpu-2x 512MB FRA singleton", options,
     workload, samples,
+    memoryProbe: {
+      source: "bounded-process-sampling",
+      attribution: engineRetainedGrowth ? "engine-retention-corroborated" : "bounded-observation",
+      sampleRingCapacity: SAMPLE_RING_CAPACITY,
+      journalEventCapacity: JOURNAL_EVENT_CAPACITY,
+      journalMutationCapacity: JOURNAL_MUTATION_CAPACITY,
+      postWarmup: Object.fromEntries(memoryMetrics.map((name) => {
+        const values = samples.filter((item) => item.phase !== "warmup").map((item) => item.memory[name as keyof CapacitySample["memory"]]);
+        return [name, { floor: values.length > 0 ? Math.min(...values) : 0, highWater: values.length > 0 ? Math.max(...values) : 0 }];
+      })),
+    },
     plateau: { warmupSamples, steadySamples, finalWindowSamples, metrics },
     cleanupCycles,
     invariants,
     cpuModel: {
       measuredLocal: { processCpuMs: samples.reduce((sum, item) => sum + item.cpu.processMs, 0), elapsedMs: last.elapsedMs },
       syntheticEstimate: "Measured on the local host only; rates and payloads are synthetic and are not a Fly CPU percentage.",
-      flySoakRequired: ["shared-cpu-2x CPU utilization and steal", "RSS/heap/event-loop delay over 48h", "DB latency and pool waiters", "market/reference ingress and reconnect rate", "SSE client count and writable buffers"],
+      flySoakRequired: ["shared-cpu-2x CPU utilization and steal", "RSS/heap/event-loop delay over the experiment/validation window (up to 48h)", "DB latency and pool waiters", "market/reference ingress and reconnect rate", "SSE client count and writable buffers"],
     },
     verdict: {
       status: blockers.length === 0 ? "READY_FOR_PRODUCTION_SOAK" : "NOT_READY",

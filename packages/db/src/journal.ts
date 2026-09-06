@@ -162,6 +162,17 @@ export interface EventJournal {
   close(): Promise<void>;
 }
 
+/**
+ * Optional bounded in-memory observability mode.  It is used by local
+ * capacity probes so their journal bookkeeping cannot masquerade as engine
+ * retained state.  The default remains unbounded for the deterministic
+ * memory journal used by correctness tests.
+ */
+export interface MemoryEventJournalOptions {
+  maxEvents?: number;
+  maxMutations?: number;
+}
+
 export class MemoryEventJournal implements EventJournal {
   private readonly events: JournalEvent[] = [];
   private readonly eventIds = new Set<string>();
@@ -173,6 +184,8 @@ export class MemoryEventJournal implements EventJournal {
   private readonly reports = new Map<string, DurableExperimentReport>();
   private readonly durableRows: DurableTransition[] = [];
   private readonly durableByKey = new Map<string, DurableTransition>();
+  private readonly maxEvents: number;
+  private readonly maxMutations: number;
   private durableChain = Promise.resolve();
   private persistChain = Promise.resolve();
   available = true;
@@ -186,6 +199,39 @@ export class MemoryEventJournal implements EventJournal {
   appendAcquireHold: Promise<void> | null = null;
   appendAcquireHoldTypes: string[] | null = null;
   inFlightAppends = 0;
+
+  constructor(options: MemoryEventJournalOptions = {}) {
+    this.maxEvents = options.maxEvents == null ? Number.POSITIVE_INFINITY : Math.max(1, Math.floor(options.maxEvents));
+    this.maxMutations = options.maxMutations == null ? Number.POSITIVE_INFINITY : Math.max(1, Math.floor(options.maxMutations));
+  }
+
+  /** Counts for local capacity evidence; this does not expose production state. */
+  memoryFootprintForTest(): { events: number; eventIds: number; commitSeqById: number; mutations: number } {
+    return {
+      events: this.events.length,
+      eventIds: this.eventIds.size,
+      commitSeqById: this.commitSeqById.size,
+      mutations: this.mutations.length,
+    };
+  }
+
+  private recordMutation(value: string): void {
+    this.mutations.push(value);
+    if (this.mutations.length > this.maxMutations) this.mutations.splice(0, this.mutations.length - this.maxMutations);
+  }
+
+  private retainEvent(event: JournalEvent): void {
+    this.eventIds.add(event.id);
+    this.events.push(event);
+    this.nextCommitSeq += 1;
+    this.commitSeqById.set(event.id, this.nextCommitSeq);
+    if (this.events.length <= this.maxEvents) return;
+    const evicted = this.events.splice(0, this.events.length - this.maxEvents);
+    for (const old of evicted) {
+      this.eventIds.delete(old.id);
+      this.commitSeqById.delete(old.id);
+    }
+  }
 
   setAppendInFlightHoldForTest(hold: Promise<void> | null, types?: string[]): void {
     this.appendInFlightHold = hold;
@@ -226,11 +272,8 @@ export class MemoryEventJournal implements EventJournal {
       if (options.signal?.aborted) throw new JournalAppendAbortedError("aborted");
       if (options.deadlineAt != null && Date.now() >= options.deadlineAt) throw new JournalAppendAbortedError("deadline");
       if (this.eventIds.has(parsed.id) || this.staged.has(parsed.id)) return;
-      this.eventIds.add(parsed.id);
-      this.events.push(structuredClone(parsed));
-      this.nextCommitSeq += 1;
-      this.commitSeqById.set(parsed.id, this.nextCommitSeq);
-      this.mutations.push(`append:${parsed.type}`);
+      this.retainEvent(structuredClone(parsed));
+      this.recordMutation(`append:${parsed.type}`);
     } finally {
       this.inFlightAppends = Math.max(0, this.inFlightAppends - 1);
     }
@@ -245,11 +288,8 @@ export class MemoryEventJournal implements EventJournal {
     if (!event) return;
     this.staged.delete(id);
     if (this.eventIds.has(id)) return;
-    this.eventIds.add(id);
-    this.events.push(event);
-    this.nextCommitSeq += 1;
-    this.commitSeqById.set(id, this.nextCommitSeq);
-    this.mutations.push(`commit:${event.type}`);
+    this.retainEvent(event);
+    this.recordMutation(`commit:${event.type}`);
   }
   async appendMany(events: readonly JournalEvent[]): Promise<void> {
     assertJournalCapability(this.access, "runtime-write", "appendMany");
@@ -333,7 +373,7 @@ export class MemoryEventJournal implements EventJournal {
         const key = `${stored.experimentId}:${stored.reportKind}`;
         if (this.reports.has(key)) return "conflict";
         this.reports.set(key, structuredClone(stored));
-        this.mutations.push("persistExperimentReport");
+        this.recordMutation("persistExperimentReport");
         return structuredClone(stored);
       },
       load: async () => {
@@ -363,10 +403,11 @@ export class MemoryEventJournal implements EventJournal {
       const id = this.events[index]!.id;
       if (ids.has(id)) {
         this.eventIds.delete(id);
+        this.commitSeqById.delete(id);
         this.events.splice(index, 1);
       }
     }
-    this.mutations.push(`deleteJournalEventsBounded:${victims.length}`);
+    this.recordMutation(`deleteJournalEventsBounded:${victims.length}`);
     return { deleted: victims.length };
   }
   async countEligible(types: readonly string[], occurredBefore: Date): Promise<{ count: number; oldestOccurredAt: string | null }> {

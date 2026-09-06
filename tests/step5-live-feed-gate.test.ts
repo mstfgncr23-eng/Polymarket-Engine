@@ -298,7 +298,7 @@ describe("Step 5 live-feed experiment start gate", () => {
     }
   });
 
-  it("holds the validation commit and aborts when Polymarket disconnects before it resolves", async () => {
+  it("treats disconnect after the validation linearization point as runtime feed loss", async () => {
     const setup = await startRealFeedEngine();
     try {
       await establishTrustedBaseline(setup);
@@ -308,17 +308,17 @@ describe("Step 5 live-feed experiment start gate", () => {
       await waitFor(() => setup.engine.state.connections.polymarket.state === "DISCONNECTED", 4_000);
       held.release();
       const result = await held.pending;
-      expect(result.ok).toBe(false);
-      expect(result.blockers).toContain("EXPERIMENT_FEED_INVALIDATED_AFTER_VALIDATION");
+      expect(result.ok).toBe(true);
       expect(await setup.journal.queryDurableTransitions({ types: ["EXPERIMENT_START_VALIDATED"], limit: 8 })).toHaveLength(1);
-      expect(await setup.journal.queryDurableTransitions({ types: ["EXPERIMENT_START_ABORTED"], limit: 8 })).toHaveLength(1);
-      expect(setup.engine.experimentManifest()?.status).toBe("ABORTED_START");
+      expect(await setup.journal.queryDurableTransitions({ types: ["EXPERIMENT_START_ABORTED"], limit: 8 })).toHaveLength(0);
+      expect(setup.engine.experimentManifest()?.status).toBe("RUNNING");
+      expect(setup.engine.experimentFeedBlockersForTest()).toContain("MARKET_FEED_NOT_READY");
     } finally {
       await setup.engine.stop();
     }
   });
 
-  it("holds the validation commit and aborts when discovery generation changes before it resolves", async () => {
+  it("treats discovery generation changes after validation as runtime feed loss", async () => {
     const setup = await startRealFeedEngine();
     try {
       await establishTrustedBaseline(setup);
@@ -331,17 +331,17 @@ describe("Step 5 live-feed experiment start gate", () => {
       await setup.engine.reconcileDiscovery();
       held.release();
       const result = await held.pending;
-      expect(result.ok).toBe(false);
-      expect(result.blockers).toContain("EXPERIMENT_FEED_INVALIDATED_AFTER_VALIDATION");
+      expect(result.ok).toBe(true);
       expect(await setup.journal.queryDurableTransitions({ types: ["EXPERIMENT_START_VALIDATED"], limit: 8 })).toHaveLength(1);
-      expect(await setup.journal.queryDurableTransitions({ types: ["EXPERIMENT_START_ABORTED"], limit: 8 })).toHaveLength(1);
-      expect(setup.engine.experimentManifest()?.status).toBe("ABORTED_START");
+      expect(await setup.journal.queryDurableTransitions({ types: ["EXPERIMENT_START_ABORTED"], limit: 8 })).toHaveLength(0);
+      expect(setup.engine.experimentManifest()?.status).toBe("RUNNING");
+      expect(setup.engine.experimentFeedBlockersForTest()).toContain("MARKET_BOOK_NOT_TRUSTED");
     } finally {
       await setup.engine.stop();
     }
   });
 
-  it("holds the validation commit and aborts when reference truth becomes stale before it resolves", async () => {
+  it("treats reference invalidation after validation as runtime feed loss", async () => {
     const setup = await startRealFeedEngine();
     try {
       await establishTrustedBaseline(setup);
@@ -350,14 +350,53 @@ describe("Step 5 live-feed experiment start gate", () => {
       await setup.engine.applyReferenceConnectionForTest("BTC", "STALE");
       held.release();
       const result = await held.pending;
-      expect(result.ok).toBe(false);
-      expect(result.blockers).toContain("REFERENCE_FEED_STALE");
-      expect(result.blockers).toContain("EXPERIMENT_FEED_INVALIDATED_AFTER_VALIDATION");
+      expect(result.ok).toBe(true);
       expect(await setup.journal.queryDurableTransitions({ types: ["EXPERIMENT_START_VALIDATED"], limit: 8 })).toHaveLength(1);
-      expect(await setup.journal.queryDurableTransitions({ types: ["EXPERIMENT_START_ABORTED"], limit: 8 })).toHaveLength(1);
-      expect(setup.engine.experimentManifest()?.status).toBe("ABORTED_START");
+      expect(await setup.journal.queryDurableTransitions({ types: ["EXPERIMENT_START_ABORTED"], limit: 8 })).toHaveLength(0);
+      expect(setup.engine.experimentManifest()?.status).toBe("RUNNING");
+      expect(setup.engine.experimentFeedBlockersForTest()).toContain("REFERENCE_FEED_STALE");
     } finally {
       await setup.engine.stop();
+    }
+  });
+
+  it("recovers a validation-linearized start safely after a crash at the runtime-admission boundary", async () => {
+    const setup = await startRealFeedEngine();
+    try {
+      await establishTrustedBaseline(setup);
+      const original = setup.journal.commitDurableTransition.bind(setup.journal);
+      setup.journal.commitDurableTransition = async (input, expected) => {
+        const result = await original(input, expected);
+        if (input.type === "EXPERIMENT_START_VALIDATED") {
+          // Invalidation occurs after the durable validation LP. The crash
+          // hook fires at the boundary where the old compensating abort would
+          // have run; recovery must use ordinary feed-loss admission.
+          await setup.engine.applyReferenceConnectionForTest("BTC", "STALE");
+        }
+        return result;
+      };
+      setup.engine.setCrashInjectionForTest("AFTER_START_VALIDATED_BEFORE_RUNTIME_ADMISSION");
+      await expect(setup.engine.beginExperiment()).rejects.toBeInstanceOf(CrashInjectedError);
+      expect(await setup.journal.queryDurableTransitions({ types: ["EXPERIMENT_START_VALIDATED"], limit: 8 })).toHaveLength(1);
+      expect(await setup.journal.queryDurableTransitions({ types: ["EXPERIMENT_START_ABORTED"], limit: 8 })).toHaveLength(0);
+      await setup.engine.stop().catch(() => undefined);
+      setup.journal.loadLatestCheckpoint = async () => null;
+      const recovered = new EngineService(
+        qualifiedPaperEnv(), setup.journal, { error: () => undefined },
+        { market: setup.adapter, referenceRegistry: new ScriptedReferenceRegistry() as never, activation: new NoopGrokActivationBridge() },
+      );
+      await recovered.start();
+      try {
+        expect(recovered.experimentManifest()?.status).toBe("RUNNING");
+        expect(recovered.experimentManifest()?.startValidationPending).toBe(false);
+        expect(recovered.experimentFeedBlockersForTest().length).toBeGreaterThan(0);
+        expect(await setup.journal.queryDurableTransitions({ types: ["EXPERIMENT_START_VALIDATED"], limit: 8 })).toHaveLength(1);
+        expect(await setup.journal.queryDurableTransitions({ types: ["EXPERIMENT_START_ABORTED"], limit: 8 })).toHaveLength(0);
+      } finally {
+        await recovered.stop();
+      }
+    } finally {
+      if (setup.engine.lastShutdownResult() === null) await setup.engine.stop();
     }
   });
 

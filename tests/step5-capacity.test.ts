@@ -1,4 +1,5 @@
 import { triggerEventSchema } from "@pm/core";
+import { createJournalEvent, MemoryEventJournal } from "@pm/db";
 import { describe, expect, it } from "vitest";
 import { classifyMemoryMetric, classifyMetric, classifyRetainedCleanupCycles, eventLoopUtilizationDelta, runSustainedCapacityHarness, type CapacitySample, type RetainedCleanupCycleObservation } from "../scripts/sustained-capacity-harness.ts";
 import { startQualifiedEngine } from "./paper-engine-testkit.js";
@@ -17,8 +18,13 @@ describe("Step 5 sustained capacity harness", () => {
     expect(report.invariants).toMatchObject({
       boundedIngress: true, boundedSupervisor: true, boundedJournalAdmission: true,
       boundedReferenceWindow: true, boundedSse: true, boundedRuntimeBookkeeping: true,
+      boundedHarnessInstrumentation: true,
       rawMarketAndReferenceEventsPersisted: 0,
     });
+    expect(report.memoryProbe.source).toBe("bounded-process-sampling");
+    expect(report.memoryProbe.sampleRingCapacity).toBe(2048);
+    expect(report.samples.every((sample) => sample.instrumentation.sampleRingSize <= 2048)).toBe(true);
+    expect(report.memoryProbe.postWarmup.rss.highWater).toBeGreaterThanOrEqual(report.memoryProbe.postWarmup.rss.floor);
     expect(report.plateau.metrics.triggerQueue.classification).not.toBe("monotonic_growth");
     expect(report.plateau.metrics.journalWaiting.classification).not.toBe("monotonic_growth");
     expect(report.plateau.metrics.ingressDepth.classification).not.toBe("monotonic_growth");
@@ -94,6 +100,18 @@ describe("Step 5 sustained capacity harness", () => {
     expect(classifyMemoryMetric(slowLeak, longerElapsed).classification).toBe("monotonic_growth");
     const shortNoisy = [200_000_000, 201_000_000, 199_000_000, 200_500_000, 199_500_000, 200_000_000];
     expect(classifyMemoryMetric(shortNoisy, shortNoisy.map((_, index) => index * 100)).classification).toBe("insufficient_samples");
+  });
+
+  it("bounds measurement-only journal internals without changing the default journal", async () => {
+    const journal = new MemoryEventJournal({ maxEvents: 3, maxMutations: 4 });
+    for (let index = 0; index < 12; index += 1) {
+      await journal.append(createJournalEvent({
+        traceId: `trace-${index}`, type: "SYSTEM_HEALTH_EVENT", aggregateType: "test", aggregateId: String(index), payload: { index },
+      }));
+    }
+    expect(journal.memoryFootprintForTest()).toEqual({ events: 3, eventIds: 3, commitSeqById: 3, mutations: 4 });
+    expect(await journal.readAll()).toHaveLength(3);
+    expect(new MemoryEventJournal().memoryFootprintForTest()).toEqual({ events: 0, eventIds: 0, commitSeqById: 0, mutations: 0 });
   });
 
   it("uses sustained absolute growth for lifecycle-retained counts", () => {

@@ -625,31 +625,16 @@ export class EngineService {
           },
           afterApply: async () => this.record("EXPERIMENT_START_VALIDATED", next.id, null, { status: "RUNNING" }),
         });
-        // The validation transition itself is asynchronous.  Feed truth can
-        // change while its durable commit is in flight; keep the pending
-        // fence held and terminate the attempt before releasing admission.
-        const validatedBlockers = this.experimentFeedBlockers();
-        if (this.experimentFeedGeneration !== startFeedGeneration || validatedBlockers.length > 0) {
-          await this.commitAbortedStart(next, "EXPERIMENT_FEED_INVALIDATED_AFTER_VALIDATION");
-          return {
-            ok: false,
-            blockers: [...new Set([...validatedBlockers, "EXPERIMENT_FEED_INVALIDATED_AFTER_VALIDATION"])],
-            experiment: this.experiment,
-          };
-        }
+        // The final feed/generation check in the validation commit's
+        // beforeCommit hook is the explicit linearization point.  Once
+        // START_VALIDATED is durable, later feed loss is ordinary runtime
+        // feed-loss semantics; there is no compensating transition to race
+        // with recovery.
+        this.crashInjector.maybeCrash("AFTER_START_VALIDATED_BEFORE_RUNTIME_ADMISSION", `experiment:${next.id}:start_validated`);
         this.syncExperimentWindow();
         try {
           await this.checkpoint();
         } catch (error) {
-          const checkpointRaceBlockers = this.experimentFeedBlockers();
-          if (this.experimentFeedGeneration !== startFeedGeneration || checkpointRaceBlockers.length > 0) {
-            await this.commitAbortedStart(next, "EXPERIMENT_FEED_INVALIDATED_AFTER_VALIDATION");
-            return {
-              ok: false,
-              blockers: [...new Set([...checkpointRaceBlockers, "EXPERIMENT_FEED_INVALIDATED_AFTER_VALIDATION"])],
-              experiment: this.experiment,
-            };
-          }
           // START_VALIDATED is authoritative.  A checkpoint failure is an
           // explicit degradation, not a failed start with a RUNNING identity.
           this.state.journalDegraded = true;
@@ -664,15 +649,6 @@ export class EngineService {
             warnings: ["CHECKPOINT_DEGRADED"],
           };
         }
-        const finalBlockers = this.experimentFeedBlockers();
-        if (this.experimentFeedGeneration !== startFeedGeneration || finalBlockers.length > 0) {
-          await this.commitAbortedStart(next, "EXPERIMENT_FEED_INVALIDATED_AFTER_VALIDATION");
-          return {
-            ok: false,
-            blockers: [...new Set([...finalBlockers, "EXPERIMENT_FEED_INVALIDATED_AFTER_VALIDATION"])],
-            experiment: this.experiment,
-          };
-        }
       } catch (error) {
         if (!(error instanceof ExperimentStartGuardRejectedError)) throw error;
         const current = this.preflight("48H_GROK_PAPER_EXPERIMENT");
@@ -684,6 +660,8 @@ export class EngineService {
       return { ok: true, experiment: this.experiment, preflight };
     });
   }
+  /** Test-only view of current entry-feed eligibility. */
+  experimentFeedBlockersForTest(): string[] { return this.experimentFeedBlockers(); }
 
   /**
    * A real experiment may only start with at least one currently trusted
