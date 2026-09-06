@@ -39,7 +39,7 @@ Engine boot is unchanged: `boot-migrate` + `initialize()` then `verifyRequiredSc
 
 A durable `reportKind=final` row may be persisted only when:
 
-- the **exact** target experiment id is found via `EXPERIMENT_STARTED` + `EXPERIMENT_COMPLETED` for that id (payload or aggregateId)
+- the **exact** target experiment id is found via `EXPERIMENT_STARTED` + lifecycle validation/completion events for that id (payload or aggregateId)
 - the experiment is authoritatively `COMPLETED` (not inferred from `ENGINE_STARTED` or another experiment’s window)
 - an application-level **source seal** (`EXPERIMENT_SOURCE_SEALED`, id `sourceseal:<experimentId>`) exists for that experiment
 - the scan used a **commit-stable** source fence and finished complete / non-truncated / not interrupted
@@ -55,7 +55,7 @@ Seal procedure (bounded; does not stop market monitoring):
 `REPORT_INPUT_EVENT_TYPES` is the **canonical** report-input set (not the broader dashboard `DECISION_EVENT_TYPES` list). Every decision type is classified once:
 
 - **A CANONICAL** — enters the complete-report hash / `sourceEventCount`, uses source-aware admission, and has fail-closed or sticky integrity semantics when attributable to the experiment window.
-- **B OPERATIONAL / MONITOR** — `ENGINE_*`, `STATE_RECOVERED`, `DISCOVERY_RECONCILED`, `REFERENCE_*`, `SYSTEM_HEALTH_EVENT`, `EXPERIMENT_REPORT_GENERATED`, `EXPERIMENT_SOURCE_SEALED`. These may stay on the dashboard and in retention, but they are excluded from the canonical source/hash/`sourceEventCount` and do not latch report-source integrity.
+- **B OPERATIONAL / MONITOR** — `ENGINE_*`, `STATE_RECOVERED`, `DISCOVERY_RECONCILED`, `REFERENCE_*`, `SYSTEM_HEALTH_EVENT`, `EXPERIMENT_START_VALIDATED`, `EXPERIMENT_REPORT_GENERATED`, `EXPERIMENT_SOURCE_SEALED`. These may stay on the dashboard and in retention, but they are excluded from the canonical source/hash/`sourceEventCount` and do not latch report-source integrity.
 
 Every canonical producer must use source-aware admission (`safeAppend` / `persistReportInput` / `appendAcknowledged`). `persistReportInput` admits ordinary canonical research traffic only during an open experiment window; lifecycle boundary events remain durable while idle or at the boundaries. `MCP_INTERACTION` remains an always-on security/audit record. `MARKET_SNAPSHOT` and `REFERENCE_TICK` are live inputs and are never permanently journaled; the writer boundary rejects them as a second guard. `EXPERIMENT_REPORT_GENERATED` is intentionally seal-exempt (written after canonical persist). Sampled telemetry and operational/monitor types stay outside the seal drain. After `COMPLETED`, post-window market/reference/discovery/health and unattributed MCP may continue; they must not starve that experiment’s seal or enter its hash.
 
@@ -136,7 +136,7 @@ Do not reintroduce a transactional `CREATE INDEX` on live `journal_events` insid
 | `ABORTED_START` | Terminal invalidated start; no in-window report-input remains and monitor cleanup is eligible |
 | `FAILED` / `UNKNOWN` / `CONFLICTING` | Monitor delete **forbidden**. `UNKNOWN` is never `PROVEN_NO_ACTIVE_EXPERIMENT`. |
 
-Operator `journal-cleanup` **always** resolves this table from durable journal rows (`EXPERIMENT_STARTED` / `EXPERIMENT_START_ABORTED` / `ENTRY_CLOSED` / `COMPLETED`). Env `EXPERIMENT_ID` / `EXPERIMENT_STATUS` / `EXPERIMENT_STARTED_AT` are hints verified against that state; mismatch fail-closes. Missing `EXPERIMENT_ID` is **not** treated as monitor-only. A query failure or incomplete lifecycle scan is `UNKNOWN` (fail closed), not no-active. In-process `RetentionManager` tests may still pass a caller-asserted `experiment=null` without lifecycle; the CLI never does.
+Operator `journal-cleanup` **always** resolves this table from durable journal rows (`EXPERIMENT_STARTED` / `EXPERIMENT_START_VALIDATED` / `EXPERIMENT_START_ABORTED` / `ENTRY_CLOSED` / `COMPLETED`). Env `EXPERIMENT_ID` / `EXPERIMENT_STATUS` / `EXPERIMENT_STARTED_AT` are hints verified against that state; mismatch fail-closes. Missing `EXPERIMENT_ID` is **not** treated as monitor-only. A query failure or incomplete lifecycle scan is `UNKNOWN` (fail closed), not no-active. In-process `RetentionManager` tests may still pass a caller-asserted `experiment=null` without lifecycle; the CLI never does.
 
 `REPORT_SOURCE_INTEGRITY_FAULT` / `REPAIRED` are `unknown_retain` control-plane events (not report-input, not hash contributors, never pruned).
 

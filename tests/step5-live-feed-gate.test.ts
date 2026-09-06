@@ -239,6 +239,65 @@ describe("Step 5 live-feed experiment start gate", () => {
     }
   });
 
+  it("recovers a validated start from durable transitions after total checkpoint loss", async () => {
+    const setup = await startRealFeedEngine();
+    await establishTrustedBaseline(setup);
+    try {
+      expect((await setup.engine.beginExperiment()).ok).toBe(true);
+      expect(await setup.journal.queryDurableTransitions({ types: ["EXPERIMENT_START_VALIDATED"], limit: 8 })).toHaveLength(1);
+      await setup.engine.stop();
+      setup.journal.loadLatestCheckpoint = async () => null;
+      const recovered = new EngineService(
+        qualifiedPaperEnv(), setup.journal, { error: () => undefined },
+        { market: setup.adapter, referenceRegistry: new ScriptedReferenceRegistry() as never, activation: new NoopGrokActivationBridge() },
+      );
+      await recovered.start();
+      try {
+        expect(recovered.experimentManifest()?.status).toBe("RUNNING");
+        expect(recovered.experimentManifest()?.startValidationPending).toBe(false);
+        expect(await setup.journal.queryDurableTransitions({ types: ["EXPERIMENT_START_VALIDATED"], limit: 8 })).toHaveLength(1);
+      } finally {
+        await recovered.stop();
+      }
+    } finally {
+      if (setup.engine.lastShutdownResult() === null) await setup.engine.stop();
+    }
+  });
+
+  it("recovers validated state after a crash before its checkpoint", async () => {
+    const setup = await startRealFeedEngine();
+    await establishTrustedBaseline(setup);
+    try {
+      const original = setup.journal.commitDurableTransition.bind(setup.journal);
+      let validatedKey = "";
+      setup.journal.commitDurableTransition = async (input, expected) => {
+        if (input.type === "EXPERIMENT_START_VALIDATED") {
+          validatedKey = input.operationKey;
+          setup.engine.setCrashInjectionForTest("AFTER_DERIVED_AUDIT_BEFORE_CHECKPOINT", { operationKey: input.operationKey });
+        }
+        return original(input, expected);
+      };
+      await expect(setup.engine.beginExperiment()).rejects.toBeInstanceOf(CrashInjectedError);
+      expect(validatedKey).toContain(":start_validated");
+      setup.journal.loadLatestCheckpoint = async () => null;
+      await setup.engine.stop().catch(() => undefined);
+      const recovered = new EngineService(
+        qualifiedPaperEnv(), setup.journal, { error: () => undefined },
+        { market: setup.adapter, referenceRegistry: new ScriptedReferenceRegistry() as never, activation: new NoopGrokActivationBridge() },
+      );
+      await recovered.start();
+      try {
+        expect(recovered.experimentManifest()?.status).toBe("RUNNING");
+        expect(recovered.experimentManifest()?.startValidationPending).toBe(false);
+        expect(await setup.journal.queryDurableTransitions({ types: ["EXPERIMENT_START_VALIDATED"], limit: 8 })).toHaveLength(1);
+      } finally {
+        await recovered.stop();
+      }
+    } finally {
+      if (setup.engine.lastShutdownResult() === null) await setup.engine.stop();
+    }
+  });
+
   it("does not let maintenance auto-complete an aborted start before retry", async () => {
     const setup = await startRealFeedEngine();
     try {

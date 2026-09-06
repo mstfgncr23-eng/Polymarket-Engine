@@ -42,9 +42,10 @@ interface ExperimentRow {
   entryClosedAt: string | null;
   completedAt: string | null;
   abortedAt: string | null;
+  validatedAt: string | null;
 }
 
-const LIFECYCLE_TYPES = ["EXPERIMENT_STARTED", "EXPERIMENT_START_ABORTED", "EXPERIMENT_ENTRY_CLOSED", "EXPERIMENT_COMPLETED"] as const;
+const LIFECYCLE_TYPES = ["EXPERIMENT_STARTED", "EXPERIMENT_START_VALIDATED", "EXPERIMENT_START_ABORTED", "EXPERIMENT_ENTRY_CLOSED", "EXPERIMENT_COMPLETED"] as const;
 
 function experimentIdFromPayload(payload: Record<string, unknown>, aggregateId: string): string | null {
   const nested = payload.experiment;
@@ -65,8 +66,9 @@ function startedAtFrom(payload: Record<string, unknown>, occurredAt: string): st
 }
 
 function applyLifecycleEvent(byId: Map<string, ExperimentRow>, type: string, id: string, occurredAt: string, payload: Record<string, unknown>): void {
-  const current = byId.get(id) ?? { id, startedAt: null, entryClosedAt: null, completedAt: null, abortedAt: null };
+  const current = byId.get(id) ?? { id, startedAt: null, entryClosedAt: null, completedAt: null, abortedAt: null, validatedAt: null };
   if (type === "EXPERIMENT_STARTED") current.startedAt = current.startedAt ?? startedAtFrom(payload, occurredAt);
+  if (type === "EXPERIMENT_START_VALIDATED") current.validatedAt = current.validatedAt ?? occurredAt;
   if (type === "EXPERIMENT_ENTRY_CLOSED") current.entryClosedAt = current.entryClosedAt ?? occurredAt;
   if (type === "EXPERIMENT_COMPLETED") current.completedAt = current.completedAt ?? occurredAt;
   if (type === "EXPERIMENT_START_ABORTED") current.abortedAt = current.abortedAt ?? occurredAt;
@@ -91,7 +93,7 @@ async function loadDurableExperimentRows(journal: EventJournal): Promise<Experim
 
 async function loadJournalExperimentRows(journal: EventJournal): Promise<ExperimentRow[] | null> {
   try {
-    const startedPage = await pageJournalEventsByTypes(journal, ["EXPERIMENT_STARTED", "EXPERIMENT_START_ABORTED"]);
+    const startedPage = await pageJournalEventsByTypes(journal, ["EXPERIMENT_STARTED", "EXPERIMENT_START_VALIDATED", "EXPERIMENT_START_ABORTED"]);
     const closedPage = await pageJournalEventsByTypes(journal, ["EXPERIMENT_ENTRY_CLOSED"]);
     const completedPage = await pageJournalEventsByTypes(journal, ["EXPERIMENT_COMPLETED"]);
     if (startedPage.overflow || closedPage.overflow || completedPage.overflow) return null;

@@ -26,7 +26,7 @@ import { z, ZodError } from "zod";
  * MUTATION INVENTORY (Step 2 — replay-authoritative vs derived)
  *
  * A  CRITICAL / replay-authoritative (this log is the recovery source):
- *    EXPERIMENT_STARTED, EXPERIMENT_START_ABORTED,
+ *    EXPERIMENT_STARTED, EXPERIMENT_START_VALIDATED, EXPERIMENT_START_ABORTED,
  *    EXPERIMENT_ENTRY_CLOSED, EXPERIMENT_COMPLETED
  *    PAPER_MAKER_RESERVED, PAPER_MAKER_RELEASED, PAPER_ORDER_CANCELLED
  *    PAPER_FILL (taker + maker partial/full)
@@ -184,6 +184,7 @@ export function durableIdentityConflicts(
       return hashDurablePayload(pick(existing, ["aiCost", "infrastructureCost", "accrualKey"]))
         !== hashDurablePayload(pick(incoming, ["aiCost", "infrastructureCost", "accrualKey"]));
     case "EXPERIMENT_STARTED":
+    case "EXPERIMENT_START_VALIDATED":
     case "EXPERIMENT_ENTRY_CLOSED":
     case "EXPERIMENT_COMPLETED":
     case "LEDGER_MARK_TO_MARKET":
@@ -254,6 +255,7 @@ export function applyDurableTransition(state: RecoverableEngineState, transition
   try {
     switch (transition.type) {
     case "EXPERIMENT_STARTED":
+    case "EXPERIMENT_START_VALIDATED":
     case "EXPERIMENT_START_ABORTED":
     case "EXPERIMENT_ENTRY_CLOSED":
     case "EXPERIMENT_COMPLETED":
@@ -300,7 +302,6 @@ export function applyDurableTransition(state: RecoverableEngineState, transition
       case "POSITION_SETTLED": {
         const payload = settlementPayloadSchema.parse(transition.payload);
         state.ledger.settlePosition(payload.marketId, payload.upPayoff, payload.downPayoff, new Date(payload.settledAt));
-        state.settledMarkets.add(payload.marketId);
         return;
       }
       case "LEDGER_MARK_TO_MARKET": {
@@ -458,6 +459,7 @@ export const CRITICAL_AUDIT_TYPES = [
   "PAIR_REALIZED",
   "MARKET_RESOLUTION_OBSERVED",
   "EXPERIMENT_STARTED",
+  "EXPERIMENT_START_VALIDATED",
   "EXPERIMENT_START_ABORTED",
   "EXPERIMENT_ENTRY_CLOSED",
   "EXPERIMENT_COMPLETED",

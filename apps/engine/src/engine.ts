@@ -601,7 +601,21 @@ export class EngineService {
             experiment: this.experiment,
           };
         }
-        this.experiment = { ...next, startValidationPending: false };
+        const validated: ExperimentManifest = { ...next, startValidationPending: false };
+        await this.commitAuthoritative({
+          operationKey: `experiment:${next.id}:start_validated`,
+          type: "EXPERIMENT_START_VALIDATED",
+          aggregateType: "experiment",
+          aggregateId: next.id,
+          buildPayload: () => ({ experiment: validated, derivedAudit: [this.experimentDerivedAudit("EXPERIMENT_START_VALIDATED", validated)] }),
+          checkpoint: false,
+          beforeCommit: () => {
+            if (this.experiment?.id !== next.id || this.experiment.status !== "RUNNING" || !this.experiment.startValidationPending) {
+              throw new RecoveryFailClosedError("invariant", "start validation state changed before durable validation");
+            }
+          },
+          afterApply: async () => this.record("EXPERIMENT_START_VALIDATED", next.id, null, { status: "RUNNING" }),
+        });
         this.syncExperimentWindow();
         await this.checkpoint();
       } catch (error) {
@@ -769,6 +783,7 @@ export class EngineService {
     this.marketAdapter.setTokenIds(nextTokens);
     this.noteExperimentFeedInvalidation();
     this.dropRemovedMarketState(removedMarkets, removedAssets);
+    await this.rehydrateLiveSettledMarketMarkers();
     this.state.setDiscovery({
       qualified: report.qualified.map((market) => ({ marketId: market.id, slug: market.slug, asset: market.asset, tokens: market.tokens.map((token) => token.tokenId) })),
       rejected: report.rejected.slice(0, 100),
@@ -1420,7 +1435,7 @@ export class EngineService {
     }
   }
 
-  private experimentDerivedAudit(type: "EXPERIMENT_STARTED" | "EXPERIMENT_START_ABORTED" | "EXPERIMENT_ENTRY_CLOSED" | "EXPERIMENT_COMPLETED", experiment: ExperimentManifest): DerivedAuditRecord {
+  private experimentDerivedAudit(type: "EXPERIMENT_STARTED" | "EXPERIMENT_START_VALIDATED" | "EXPERIMENT_START_ABORTED" | "EXPERIMENT_ENTRY_CLOSED" | "EXPERIMENT_COMPLETED", experiment: ExperimentManifest): DerivedAuditRecord {
     return {
       id: derivedAuditEventId(type, experiment.id),
       type,
@@ -1870,6 +1885,20 @@ export class EngineService {
       return acceptSubmission();
     } finally {
       this.endResearchIngress();
+    }
+  }
+
+  /** Rehydrate only currently discovered markets; durable operation keys remain authority. */
+  private async rehydrateLiveSettledMarketMarkers(): Promise<void> {
+    const experimentKey = this.experiment?.id ?? "paper";
+    for (const marketId of this.marketsById.keys()) {
+      try {
+        const durable = await this.journal.readDurableByOperationKey(`settlement:${marketId}:${experimentKey}`);
+        if (durable?.type === "POSITION_SETTLED") this.settledMarkets.add(marketId);
+      } catch {
+        // Discovery remains live during a transient journal outage; the
+        // durable lookup is retried by settlement admission when needed.
+      }
     }
   }
 
@@ -2684,6 +2713,7 @@ export class EngineService {
         };
       },
       afterApply: async () => {
+        this.settledMarkets.add(marketId);
         this.settlementBackoff.delete(marketId);
         if (!positionBefore) return;
         const realizedDelta = settlementRealizedDelta(positionBefore, upPayoff, downPayoff);

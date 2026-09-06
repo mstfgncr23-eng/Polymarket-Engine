@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { classifyMemoryMetric, eventLoopUtilizationDelta, runSustainedCapacityHarness } from "../scripts/sustained-capacity-harness.ts";
+import { classifyMemoryMetric, classifyMetric, eventLoopUtilizationDelta, runSustainedCapacityHarness, type CapacitySample } from "../scripts/sustained-capacity-harness.ts";
 
 describe("Step 5 sustained capacity harness", () => {
   it("reaches a bounded plateau under multi-market normal, burst, reference and reconnect traffic", async () => {
@@ -92,5 +92,19 @@ describe("Step 5 sustained capacity harness", () => {
     expect(classifyMemoryMetric(slowLeak, longerElapsed).classification).toBe("monotonic_growth");
     const shortNoisy = [200_000_000, 201_000_000, 199_000_000, 200_500_000, 199_500_000, 200_000_000];
     expect(classifyMemoryMetric(shortNoisy, shortNoisy.map((_, index) => index * 100)).classification).toBe("insufficient_samples");
+  });
+
+  it("uses sustained absolute growth for lifecycle-retained counts", () => {
+    const elapsed = Array.from({ length: 36 }, (_, index) => index * 1_000);
+    const samples = elapsed.map((elapsedMs, index) => ({ elapsedMs, index } as unknown as CapacitySample));
+    const retainedLeak = classifyMetric(samples, "activeTriggers", (sample) => 1_000 + (sample as unknown as { index: number }).index, 0, "retained");
+    expect(retainedLeak.classification).toBe("monotonic_growth");
+
+    const noise = samples.map((sample, index) => ({ ...sample, index: 1_000 + [0, 1, -1, 1, -1, 0][index % 6]! } as unknown as CapacitySample));
+    const stable = classifyMetric(noise, "activeTriggers", (sample) => (sample as unknown as { index: number }).index, 0, "retained");
+    expect(stable.classification).toBe("plateau");
+
+    const short = elapsed.slice(0, 5).map((elapsedMs, index) => ({ elapsedMs, index } as unknown as CapacitySample));
+    expect(classifyMetric(short, "activeTriggers", (sample) => (sample as unknown as { index: number }).index, 0, "retained").classification).toBe("insufficient_samples");
   });
 });

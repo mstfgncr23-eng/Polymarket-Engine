@@ -308,6 +308,7 @@ describe("B/D/R/T settlement, close policy, recovery, accelerated lifecycle", ()
       expect(settledRows).toHaveLength(turnover);
       const cashAfterSettlement = engine.ledger.snapshot().cash;
       const durableBeforeRestart = await journal.latestDurableSequence();
+      const checkpointsBeforeCrash = (await journal.listCheckpoints()).length;
 
       // Rediscovery rehydrates only a bounded marker from the durable operation key.
       market.queue(report([markets[0]]));
@@ -316,7 +317,11 @@ describe("B/D/R/T settlement, close policy, recovery, accelerated lifecycle", ()
       expect(engine.settledMarketsForTest().size).toBeLessThanOrEqual(1);
       expect(await journal.queryEvents({ types: ["POSITION_SETTLED"] })).toHaveLength(turnover);
 
-      await engine.stop();
+      // Simulate a crash before a clean-stop checkpoint can capture turnover.
+      journal.available = false;
+      await engine.stop().catch(() => undefined);
+      expect((await journal.listCheckpoints()).length).toBe(checkpointsBeforeCrash);
+      journal.available = true;
       const restartMarket = new ScriptedMarketAdapter();
       restartMarket.queue(report([]));
       const recovered = new EngineService(env, journal, logger, {
@@ -329,8 +334,16 @@ describe("B/D/R/T settlement, close policy, recovery, accelerated lifecycle", ()
         await recovered.tickMaintenance();
         expect(recovered.ledger.positions.size).toBe(0);
         expect(recovered.ledger.snapshot().cash).toBe(cashAfterSettlement);
+        expect(recovered.settledMarketsForTest().size).toBe(0);
         expect(await journal.queryEvents({ types: ["POSITION_SETTLED"] })).toHaveLength(turnover);
+        expect(await journal.queryDurableTransitions({ types: ["POSITION_SETTLED"], limit: turnover + 1 })).toHaveLength(turnover);
         expect(await journal.latestDurableSequence()).toBeGreaterThanOrEqual(durableBeforeRestart);
+        restartMarket.queue(report([markets[0]]));
+        await recovered.reconcileDiscovery();
+        await recovered.tickMaintenance();
+        expect(recovered.ledger.snapshot().cash).toBe(cashAfterSettlement);
+        expect(recovered.settledMarketsForTest().size).toBeLessThanOrEqual(1);
+        expect(await journal.queryDurableTransitions({ types: ["POSITION_SETTLED"], limit: turnover + 1 })).toHaveLength(turnover);
       } finally {
         await recovered.stop();
       }

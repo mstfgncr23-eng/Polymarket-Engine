@@ -229,6 +229,27 @@ function median(values: number[]): number {
   return sorted.length % 2 === 0 ? ((sorted[middle - 1] ?? 0) + (sorted[middle] ?? 0)) / 2 : sorted[middle] ?? 0;
 }
 
+function classifyRetainedMetric(values: number[], elapsedMs: number[]): { finalSlopePerSecond: number; classification: MetricClassification["classification"] } {
+  if (values.length < 6 || elapsedMs.length !== values.length) return { finalSlopePerSecond: 0, classification: "insufficient_samples" };
+  const durationSeconds = Math.max(0, ((elapsedMs.at(-1) ?? 0) - (elapsedMs[0] ?? 0)) / 1000);
+  if (durationSeconds < 3) return { finalSlopePerSecond: 0, classification: "insufficient_samples" };
+  const half = Math.max(3, Math.floor(values.length / 2));
+  const start = median(values.slice(0, half));
+  const end = median(values.slice(-half));
+  const growth = end - start;
+  const slope = numericSlope(values, elapsedMs);
+  const deltas = values.slice(1).map((item, index) => item - (values[index] ?? item));
+  const positiveFraction = deltas.filter((delta) => delta >= 0).length / Math.max(1, deltas.length);
+  // Lifecycle-retained identities need an absolute sustained-growth signal.
+  // A baseline-relative threshold would hide a slow leak in a large map.
+  const materialFloor = Math.max(4, durationSeconds * 0.25);
+  const materialGrowth = growth >= materialFloor || slope * durationSeconds >= materialFloor;
+  return {
+    finalSlopePerSecond: Number(slope.toFixed(4)),
+    classification: materialGrowth && positiveFraction >= 0.6 ? "monotonic_growth" : "plateau",
+  };
+}
+
 export function classifyMemoryMetric(values: number[], elapsedMs: number[]): { finalSlopePerSecond: number; classification: MetricClassification["classification"] } {
   if (values.length < 6 || elapsedMs.length !== values.length) return { finalSlopePerSecond: 0, classification: "insufficient_samples" };
   const durationSeconds = Math.max(0, ((elapsedMs.at(-1) ?? 0) - (elapsedMs[0] ?? 0)) / 1000);
@@ -249,16 +270,18 @@ export function classifyMemoryMetric(values: number[], elapsedMs: number[]): { f
   return { finalSlopePerSecond: Number(slope.toFixed(4)), classification };
 }
 
-export function classifyMetric(samples: CapacitySample[], key: string, value: (sample: CapacitySample) => number, warmupSamples: number, policy: "count" | "memory" = "count"): MetricClassification {
+export function classifyMetric(samples: CapacitySample[], key: string, value: (sample: CapacitySample) => number, warmupSamples: number, policy: "count" | "memory" | "retained" = "count"): MetricClassification {
   const steady = samples.slice(warmupSamples);
   const finalWindow = steady.slice(-Math.max(3, Math.floor(steady.length / 2)));
   if (steady.length < 3 || finalWindow.length < 3) return { warmupHighWater: Math.max(0, ...samples.slice(0, warmupSamples).map(value)), plateauHighWater: Math.max(0, ...steady.map(value)), finalSlopePerSecond: 0, classification: "insufficient_samples" };
   const slope = numericSlope(finalWindow.map(value), finalWindow.map((sample) => sample.elapsedMs));
   const highWater = Math.max(0, ...steady.map(value));
-  const memory = policy === "memory" ? classifyMemoryMetric(finalWindow.map(value), finalWindow.map((sample) => sample.elapsedMs)) : null;
+  const elapsedMs = finalWindow.map((sample) => sample.elapsedMs);
+  const memory = policy === "memory" ? classifyMemoryMetric(finalWindow.map(value), elapsedMs) : null;
+  const retained = policy === "retained" ? classifyRetainedMetric(finalWindow.map(value), elapsedMs) : null;
   const baseline = Math.max(1, median(finalWindow.map(value)));
-  const classification = memory?.classification ?? (slope > Math.max(0.5, baseline * 0.05) ? "monotonic_growth" : "plateau");
-  return { warmupHighWater: Math.max(0, ...samples.slice(0, warmupSamples).map(value)), plateauHighWater: highWater, finalSlopePerSecond: memory?.finalSlopePerSecond ?? Number(slope.toFixed(4)), classification };
+  const classification = memory?.classification ?? retained?.classification ?? (slope > Math.max(0.5, baseline * 0.05) ? "monotonic_growth" : "plateau");
+  return { warmupHighWater: Math.max(0, ...samples.slice(0, warmupSamples).map(value)), plateauHighWater: highWater, finalSlopePerSecond: memory?.finalSlopePerSecond ?? retained?.finalSlopePerSecond ?? Number(slope.toFixed(4)), classification };
 }
 
 export async function runSustainedCapacityHarness(input: CapacityHarnessOptions = {}): Promise<CapacityReport> {
@@ -460,16 +483,18 @@ export async function runSustainedCapacityHarness(input: CapacityHarnessOptions 
     ingressDepth: classifyMetric(samples, "ingressDepth", (item) => item.ingress.depth, warmupSamples),
     sseBufferedBytes: classifyMetric(samples, "sseBufferedBytes", (item) => item.sse.bufferedBytes, warmupSamples),
     retryTimers: classifyMetric(samples, "retryTimers", (item) => item.reference.retryTimers, warmupSamples),
-    activeTriggers: classifyMetric(samples, "activeTriggers", (item) => item.trigger.active, warmupSamples),
-    triggerProvenance: classifyMetric(samples, "triggerProvenance", (item) => item.trigger.provenance, warmupSamples),
-    triggerDedupe: classifyMetric(samples, "triggerDedupe", (item) => item.trigger.dedupe, warmupSamples),
+    activeTriggers: classifyMetric(samples, "activeTriggers", (item) => item.trigger.active, warmupSamples, "retained"),
+    triggerProvenance: classifyMetric(samples, "triggerProvenance", (item) => item.trigger.provenance, warmupSamples, "retained"),
+    triggerDedupe: classifyMetric(samples, "triggerDedupe", (item) => item.trigger.dedupe, warmupSamples, "retained"),
     marketSnapshots: classifyMetric(samples, "marketSnapshots", (item) => item.state.marketSnapshots, warmupSamples),
     marketCache: classifyMetric(samples, "marketCache", (item) => item.state.marketCache, warmupSamples),
     referenceWindowEntries: classifyMetric(samples, "referenceWindowEntries", (item) => item.reference.windowEntries, warmupSamples),
+    // Hard-capped coordinator/tombstone stores are judged by their explicit
+    // high-water invariants, not by lifecycle-retained growth slope.
     activations: classifyMetric(samples, "activations", (item) => item.state.activations, warmupSamples),
     idleGrokTombstones: classifyMetric(samples, "idleGrokTombstones", (item) => item.state.idleTombstones, warmupSamples),
-    settledMarkets: classifyMetric(samples, "settledMarkets", (item) => item.state.settledMarkets, warmupSamples),
-    settlementBackoff: classifyMetric(samples, "settlementBackoff", (item) => item.state.settlementBackoff, warmupSamples),
+    settledMarkets: classifyMetric(samples, "settledMarkets", (item) => item.state.settledMarkets, warmupSamples, "retained"),
+    settlementBackoff: classifyMetric(samples, "settlementBackoff", (item) => item.state.settlementBackoff, warmupSamples, "retained"),
     supervisorFailures: classifyMetric(samples, "supervisorFailures", (item) => item.supervisor.failures, warmupSamples),
     supervisorBusyKeys: classifyMetric(samples, "supervisorBusyKeys", (item) => item.supervisor.busyKeys, warmupSamples),
   };
