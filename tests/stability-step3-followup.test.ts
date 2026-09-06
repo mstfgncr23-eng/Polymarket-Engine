@@ -213,6 +213,7 @@ describe("Blockers 2-3 — gap invalidates projections and forbids mixed-epoch p
   it("sync UP+DOWN → gap both → fresh UP only → no PAIR_COST and stale DOWN not via MCP", async () => {
     const { engine, market, journal } = await startQualifiedEngine();
     await market.waitForHandlers();
+    expect((await engine.beginExperiment()).ok).toBe(true);
     await market.emitSnapshot(book("UP", "0.60", { sequence: 1 }));
     await market.emitSnapshot(book("DOWN", "0.47", { sequence: 1, eventId: createId("market") }));
     await drainRuntime(engine);
@@ -294,6 +295,7 @@ describe("Blocker 4 — pre-gap queued market triggers do not activate after gap
   it("risk P0 still journals after the market is GAPPED", async () => {
     const { engine, market, journal } = await startQualifiedEngine();
     await market.waitForHandlers();
+    expect((await engine.beginExperiment()).ok).toBe(true);
     market.emitGap(["btc-up", "btc-down"]);
     const risk = riskTrigger({ id: "risk-p0" });
     engine.enqueueTriggerStormForTest([risk]);
@@ -368,6 +370,7 @@ describe("Blockers 6-7 — reference overflow is sticky and CONNECTED is not tru
     });
     await engine.start();
     await market.waitForHandlers();
+    expect((await engine.beginExperiment()).ok).toBe(true);
     await market.emitSnapshot(book("UP", "0.48"));
     await market.emitSnapshot({
       ...book("UP", "0.48", { marketId: "eth-mkt", tokenId: "eth-up", asset: "ETH", eventId: createId("market") }),
@@ -623,6 +626,7 @@ describe("Step-3 follow-up 2 — queued market triggers are epoch-fenced", () =>
     const hold = new Promise<void>((resolve) => { release = resolve; });
     const { engine, market, journal } = await startQualifiedEngine();
     await market.waitForHandlers();
+    expect((await engine.beginExperiment()).ok).toBe(true);
     await market.emitSnapshot(book("UP", "0.48"));
     await market.emitSnapshot(book("DOWN", "0.51"));
     try {
@@ -650,6 +654,7 @@ describe("Step-3 follow-up 2 — queued market triggers are epoch-fenced", () =>
   it("B: current-epoch trigger after resync does process", async () => {
     const { engine, market, journal } = await startQualifiedEngine();
     await market.waitForHandlers();
+    expect((await engine.beginExperiment()).ok).toBe(true);
     await market.emitSnapshot(book("UP", "0.48"));
     await market.emitSnapshot(book("DOWN", "0.51"));
     market.emitGap(["btc-up", "btc-down"]);
@@ -670,6 +675,7 @@ describe("Step-3 follow-up 2 — queued market triggers are epoch-fenced", () =>
     const hold = new Promise<void>((resolve) => { release = resolve; });
     const { engine, market, journal } = await startQualifiedEngine();
     await market.waitForHandlers();
+    expect((await engine.beginExperiment()).ok).toBe(true);
     await market.emitSnapshot(book("UP", "0.48"));
     try {
       engine.setProcessTriggerHoldForTest(hold);
@@ -1029,6 +1035,7 @@ describe("Step-3 review — partial-sync epoch fence stays attached", () => {
     const hold = new Promise<void>((resolve) => { release = resolve; });
     const { engine, market, journal } = await startQualifiedEngine();
     await market.waitForHandlers();
+    expect((await engine.beginExperiment()).ok).toBe(true);
     await market.emitSnapshot(book("UP", "0.30"));
     try {
       engine.setProcessTriggerHoldForTest(hold);
@@ -1049,6 +1056,7 @@ describe("Step-3 review — partial-sync epoch fence stays attached", () => {
   it("D: PAIR_COST still requires a current trusted pair", async () => {
     const { engine, market, journal } = await startQualifiedEngine();
     await market.waitForHandlers();
+    expect((await engine.beginExperiment()).ok).toBe(true);
     await market.emitSnapshot(book("UP", "0.47"));
     await drainRuntime(engine);
     const afterUp = await journal.queryEvents({ types: ["TRIGGER_EVENT"] });

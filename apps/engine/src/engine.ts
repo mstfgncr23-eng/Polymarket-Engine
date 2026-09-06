@@ -153,6 +153,14 @@ function isJournalAdmissionRejectedError(error: unknown): boolean {
     || (Boolean(error) && typeof error === "object" && (error as { name?: string }).name === "JournalAdmissionRejected");
 }
 
+const IDLE_GROK_IDEMPOTENCY_MAX = 4_096;
+const IDLE_GROK_IDEMPOTENCY_TTL_MS = 5 * 60_000;
+type IdleGrokSubmission = { observedAt: number; pending: boolean };
+type GrokSubmissionResult = {
+  status: "accepted" | "duplicate" | "stale" | "unknown_trigger" | "trace_mismatch" | "market_mismatch" | "asset_mismatch" | "replay_rejected" | "malformed" | "identity_mismatch" | "source_sealed";
+  signalId?: string;
+};
+
 export class EngineService {
   readonly metrics = new EngineMetrics();
   readonly sse: SseHub;
@@ -206,6 +214,8 @@ export class EngineService {
   private lastAppliedDurableCursor = 0;
   private derivedAuditCursor = 0;
   private readonly durableGate = new DurableMutationGate();
+  /** Serializes the IDLE -> RUNNING boundary with idle Grok acceptance only. */
+  private readonly experimentBoundaryGate = new DurableMutationGate();
   private readonly crashInjector = new CrashInjector();
   private recoveryPageSize = 256;
   private lastTradeAt: Date | null = null;
@@ -246,6 +256,13 @@ export class EngineService {
   private sourceSealFlight: Promise<{ sealed: boolean; reason: string | null }> | null = null;
   private researchIngressInFlight = 0;
   private grokClaimHold: Promise<void> | null = null;
+  private idleGrokAcceptanceHoldForTest: Promise<void> | null = null;
+  /**
+   * Idle monitoring deliberately has no durable canonical Grok fact. Keep a
+   * bounded process-local claim set for exact live retries and concurrent
+   * duplicate suppression; active experiment submissions use the journal.
+   */
+  private readonly idleGrokSubmissions = new Map<string, IdleGrokSubmission>();
   private readonly reportSourceIntegrity = new Map<string, ReportSourceIntegrityFault>();
   private readonly persistedIntegrityFaults = new WeakSet<ReportSourceIntegrityFault>();
   private referenceTelemetryHoldForTest: Promise<void> | null = null;
@@ -502,51 +519,53 @@ export class EngineService {
   }
 
   async beginExperiment(): Promise<Record<string, unknown>> {
-    if (this.experiment?.status === "RUNNING" || this.experiment?.status === "ENTRY_CLOSED") {
-      return { ok: false, blockers: ["EXPERIMENT_ALREADY_ACTIVE"], experiment: this.experiment };
-    }
-    if (this.experiment?.status === "COMPLETED" || this.experiment?.status === "FAILED") {
-      return { ok: false, blockers: ["EXPERIMENT_ALREADY_COMPLETED"], experiment: this.experiment };
-    }
-    if (!this.state.newPaperEntryAllowed() || this.overload.state === "FAIL_CLOSED") {
+    return this.experimentBoundaryGate.run(async () => {
+      if (this.experiment?.status === "RUNNING" || this.experiment?.status === "ENTRY_CLOSED") {
+        return { ok: false, blockers: ["EXPERIMENT_ALREADY_ACTIVE"], experiment: this.experiment };
+      }
+      if (this.experiment?.status === "COMPLETED" || this.experiment?.status === "FAILED") {
+        return { ok: false, blockers: ["EXPERIMENT_ALREADY_COMPLETED"], experiment: this.experiment };
+      }
+      if (!this.state.newPaperEntryAllowed() || this.overload.state === "FAIL_CLOSED") {
+        const preflight = this.preflight("48H_GROK_PAPER_EXPERIMENT");
+        return { ...preflight, ok: false, blockers: [...new Set([...preflight.blockers, "OVERLOAD_FAIL_CLOSED"])] };
+      }
       const preflight = this.preflight("48H_GROK_PAPER_EXPERIMENT");
-      return { ...preflight, ok: false, blockers: [...new Set([...preflight.blockers, "OVERLOAD_FAIL_CLOSED"])] };
-    }
-    const preflight = this.preflight("48H_GROK_PAPER_EXPERIMENT");
-    await this.safeAppend(createJournalEvent({
-      traceId: createId("trace"), type: "EXPERIMENT_PREFLIGHT", aggregateType: "experiment", aggregateId: "preflight",
-      payload: preflight as unknown as Record<string, unknown>,
-    }));
-    if (!preflight.ok) return { ...preflight, ok: false };
-    const now = this.nowFn();
-    const next = startExperiment({
-      id: this.experiment?.id, durationHours: this.env.EXPERIMENT_DURATION_HOURS, strategyVersion: this.strategy.version,
-      riskConfiguration: this.riskLimits, modelConfiguration: { provider: "external_grok_bot_mcp", logicalRoles: 6, localModelExecution: false },
-      startingBalance: this.ledger.snapshot().startingBalance, systemVersion: "0.1.0",
-      gitSha: process.env.GIT_SHA ?? process.env.FLY_IMAGE_REF ?? "unknown", now,
-      closePolicy: this.env.EXPERIMENT_CLOSE_POLICY,
+      await this.safeAppend(createJournalEvent({
+        traceId: createId("trace"), type: "EXPERIMENT_PREFLIGHT", aggregateType: "experiment", aggregateId: "preflight",
+        payload: preflight as unknown as Record<string, unknown>,
+      }));
+      if (!preflight.ok) return { ...preflight, ok: false };
+      const now = this.nowFn();
+      const next = startExperiment({
+        id: this.experiment?.id, durationHours: this.env.EXPERIMENT_DURATION_HOURS, strategyVersion: this.strategy.version,
+        riskConfiguration: this.riskLimits, modelConfiguration: { provider: "external_grok_bot_mcp", logicalRoles: 6, localModelExecution: false },
+        startingBalance: this.ledger.snapshot().startingBalance, systemVersion: "0.1.0",
+        gitSha: process.env.GIT_SHA ?? process.env.FLY_IMAGE_REF ?? "unknown", now,
+        closePolicy: this.env.EXPERIMENT_CLOSE_POLICY,
+      });
+      await this.commitAuthoritative({
+        operationKey: `experiment:${next.id}:started`,
+        type: "EXPERIMENT_STARTED",
+        aggregateType: "experiment",
+        aggregateId: next.id,
+        occurredAt: now,
+        buildPayload: () => ({
+          experiment: next,
+          derivedAudit: [this.experimentDerivedAudit("EXPERIMENT_STARTED", next)],
+        }),
+        checkpoint: true,
+        afterApply: async () => {
+          this.reportGenerated = false;
+          this.abortSourceSealPersist();
+          this.sourceSealed = false;
+          this.sourceSealing = false;
+          this.clearReportSourceIntegrity(next.id);
+          this.record("EXPERIMENT_STARTED", next.id, null, { status: next.status });
+        },
+      });
+      return { ok: true, experiment: this.experiment, preflight };
     });
-    await this.commitAuthoritative({
-      operationKey: `experiment:${next.id}:started`,
-      type: "EXPERIMENT_STARTED",
-      aggregateType: "experiment",
-      aggregateId: next.id,
-      occurredAt: now,
-      buildPayload: () => ({
-        experiment: next,
-        derivedAudit: [this.experimentDerivedAudit("EXPERIMENT_STARTED", next)],
-      }),
-      checkpoint: true,
-      afterApply: async () => {
-        this.reportGenerated = false;
-        this.abortSourceSealPersist();
-        this.sourceSealed = false;
-        this.sourceSealing = false;
-        this.clearReportSourceIntegrity(next.id);
-        this.record("EXPERIMENT_STARTED", next.id, null, { status: next.status });
-      },
-    });
-    return { ok: true, experiment: this.experiment, preflight };
   }
 
   preflight(mode: "MONITOR_ONLY" | "48H_GROK_PAPER_EXPERIMENT" = "MONITOR_ONLY") {
@@ -1375,7 +1394,9 @@ export class EngineService {
       this.metrics.assetMarketIndexEntries.set(this.assetIndex.entryCount());
     }
     this.updateReady();
-    await this.writer.persist(createJournalEvent({ traceId: snapshot.traceId, type: "MARKET_SNAPSHOT", aggregateType: "market", aggregateId: snapshot.marketId, payload: snapshot, occurredAt: new Date(snapshot.sourceTimestamp), sourceEventId: snapshot.eventId }));
+    // Market snapshots are live processing inputs. The current snapshot/state
+    // maps above remain the source for trigger, maker, risk, and dashboard work;
+    // raw observations are intentionally not permanent journal records.
     this.record("MARKET_EVENT", snapshot.traceId, snapshot.marketId, { tokenId: snapshot.tokenId, outcome: snapshot.outcome, sequence: snapshot.sequence }, snapshot.asset ?? null);
 
     if (synchronized && previous) {
@@ -1417,7 +1438,8 @@ export class EngineService {
       this.noteReferenceLogicalLoss(tick.asset);
       this.state.invalidateReferenceContext(tick.asset);
       this.requestReferenceResync(tick.asset);
-      await this.persistReferenceTick(tick);
+      // Test-only processing hold; raw reference observations are never journaled.
+      if (this.referenceTelemetryHoldForTest) await this.referenceTelemetryHoldForTest;
       this.metrics.referenceWindowEntries.set(this.triggerEngine.referenceWindowTotalEntries());
       this.metrics.referenceTickProcessingDuration.observe((performance.now() - started) / 1000);
       return;
@@ -1436,7 +1458,6 @@ export class EngineService {
       this.state.connections.btc.lastMessageAt = tick.receivedAt;
     }
     this.updateReady();
-    await this.persistReferenceTick(tick);
     if (wasUnreliable) {
       this.referenceUnreliable.delete(tick.asset);
       this.referenceResyncRequested.delete(tick.asset);
@@ -1445,14 +1466,6 @@ export class EngineService {
     for (const trigger of admission.triggers) this.admitTrigger(trigger, this.provenanceForGenerated(trigger, "REFERENCE", tick.asset));
     this.metrics.triggerDedupeEntries.set(this.triggerEngine.dedupeEntryCount());
     this.metrics.referenceTickProcessingDuration.observe((performance.now() - started) / 1000);
-  }
-
-  private async persistReferenceTick(tick: ReferenceTick): Promise<void> {
-    if (this.referenceTelemetryHoldForTest) await this.referenceTelemetryHoldForTest;
-    await this.writer.persist(createJournalEvent({
-      traceId: tick.traceId, type: "REFERENCE_TICK", aggregateType: "reference", aggregateId: tick.asset,
-      payload: tick, occurredAt: new Date(tick.sourceTimestamp), sourceEventId: tick.eventId,
-    }));
   }
 
   private admitTrigger(trigger: TriggerEvent, provenance?: TriggerProvenance): AdmitResult {
@@ -1540,7 +1553,7 @@ export class EngineService {
     }
     this.metrics.triggers.inc({ kind: trigger.kind, severity: String(trigger.severity) });
     this.record(`TRIGGER_LEVEL_${trigger.severity}`, trigger.traceId, trigger.marketId, { triggerId: trigger.id, kind: trigger.kind, asset: trigger.asset ?? null }, trigger.asset ?? null);
-    await this.safeAppend(createJournalEvent({ traceId: trigger.traceId, type: "TRIGGER_EVENT", aggregateType: "trigger", aggregateId: trigger.id, payload: trigger, sourceEventId: trigger.sourceEventIds[0] ?? null }), signal);
+    await this.persistReportInput(createJournalEvent({ traceId: trigger.traceId, type: "TRIGGER_EVENT", aggregateType: "trigger", aggregateId: trigger.id, payload: trigger, sourceEventId: trigger.sourceEventIds[0] ?? null }), signal);
     this.rememberProvenance(trigger.id, provenance);
     this.activeTriggers.set(trigger.id, trigger);
     if (!this.isProvenanceCurrentlyValid(trigger.id, provenance)) {
@@ -1562,7 +1575,7 @@ export class EngineService {
       const bookkeepingStarted = performance.now();
       this.activation.ensureLatency(trigger);
       this.state.setActivationLatency(this.activation.snapshot());
-      await this.safeAppend(createJournalEvent({
+      await this.persistReportInput(createJournalEvent({
         traceId: trigger.traceId, type: "GROK_ACTIVATION_DECISION", aggregateType: "activation", aggregateId: trigger.id,
         payload: { triggerId: trigger.id, marketId: trigger.marketId, asset: trigger.asset ?? null, reason: "EXPERIMENT_NOT_ACTIVE", activate: false },
       }));
@@ -1571,7 +1584,7 @@ export class EngineService {
       return;
     }
     if (status === "ENTRY_CLOSED" && !isRiskHedgeSettlementTrigger(trigger.kind)) {
-      await this.safeAppend(createJournalEvent({
+      await this.persistReportInput(createJournalEvent({
         traceId: trigger.traceId, type: "GROK_ACTIVATION_DECISION", aggregateType: "activation", aggregateId: trigger.id,
         payload: { triggerId: trigger.id, marketId: trigger.marketId, asset: trigger.asset ?? null, reason: "ENTRY_CLOSED", activate: false },
       }));
@@ -1579,7 +1592,7 @@ export class EngineService {
       return;
     }
     if (!this.isTriggerActionable(trigger.id)) {
-      await this.safeAppend(createJournalEvent({
+      await this.persistReportInput(createJournalEvent({
         traceId: trigger.traceId, type: "GROK_ACTIVATION_DECISION", aggregateType: "activation", aggregateId: trigger.id,
         payload: { triggerId: trigger.id, marketId: trigger.marketId, asset: trigger.asset ?? null, reason: "PROVENANCE_STALE", activate: false },
       }));
@@ -1587,7 +1600,7 @@ export class EngineService {
       return;
     }
     const decision = this.activation.decide(trigger);
-    await this.safeAppend(createJournalEvent({
+    await this.persistReportInput(createJournalEvent({
       traceId: trigger.traceId, type: "GROK_ACTIVATION_DECISION", aggregateType: "activation", aggregateId: trigger.id,
       payload: { triggerId: trigger.id, marketId: trigger.marketId, asset: trigger.asset ?? null, reason: decision.reason, activate: decision.activate },
     }));
@@ -1604,7 +1617,7 @@ export class EngineService {
     const results = await this.activation.dispatch(decision.request);
     for (const result of results) {
       this.metrics.activations.inc({ provider: result.provider, status: result.ok ? "ok" : "failed" });
-      await this.safeAppend(createJournalEvent({
+      await this.persistReportInput(createJournalEvent({
         traceId: trigger.traceId, type: "GROK_ACTIVATION_RESULT", aggregateType: "activation", aggregateId: trigger.id,
         payload: persistableActivation(result, trigger.id, decision.reason),
       }));
@@ -1617,7 +1630,7 @@ export class EngineService {
   }
 
   /** The only ingress for external Grok research; it cannot create orders directly. */
-  async submitGrokSignal(raw: GrokSignalSubmission, clientId: string): Promise<{ status: "accepted" | "duplicate" | "stale" | "unknown_trigger" | "trace_mismatch" | "market_mismatch" | "asset_mismatch" | "replay_rejected" | "malformed" | "identity_mismatch" | "source_sealed"; signalId?: string }> {
+  async submitGrokSignal(raw: GrokSignalSubmission, clientId: string): Promise<GrokSubmissionResult> {
     this.assertResearchIntegrity();
     let submission: GrokSignalSubmission;
     try { submission = grokSignalSubmissionSchema.parse(raw); }
@@ -1663,81 +1676,154 @@ export class EngineService {
       if (this.researchIngressStale(ingress.generation)) return rejectSealed();
       if (this.grokClaimHold) await this.grokClaimHold;
       if (this.researchIngressStale(ingress.generation)) return rejectSealed();
-      const claimed = await this.journal.claimIdempotency("grok_signal_submission", `${clientId}:${submission.submissionId}`);
-      this.assertResearchIntegrity();
-      if (!claimed) {
-        // A claim proves admission only, including across a crash before append.
-        // Check every canonical fact required by this submission with bounded trace
-        // pages (also works for old IDs). The proposal is linked to the accepted
-        // signal by the same trace and aggregate identity.
-        const requiresStrategyProposal = submission.agentId === "strategy_supervisor"
-          && submission.output.proposedChange !== null;
-        let acceptedEvent: JournalEvent | undefined;
-        const strategyProposalAggregateIds = new Set<string>();
-        let after: Parameters<EventJournal["readTracePage"]>[1]["after"];
-        do {
-          const page = await this.journal.readTracePage(submission.traceId, { after, limit: 128 });
-          for (const event of page.events) {
-            if (event.type === "STRATEGY_CHANGE_PROPOSED" && event.traceId === submission.traceId) {
-              strategyProposalAggregateIds.add(event.aggregateId);
-            }
-            if (!acceptedEvent && event.type === "GROK_SIGNAL_ACCEPTED"
-              && event.traceId === submission.traceId
-              && event.payload.clientId === clientId && event.payload.submissionId === submission.submissionId) {
-              acceptedEvent = event;
-            }
-          }
-          after = page.nextCursor ?? undefined;
-          const proposalPersisted = acceptedEvent !== undefined && strategyProposalAggregateIds.has(acceptedEvent.aggregateId);
-          if (acceptedEvent !== undefined && (!requiresStrategyProposal || proposalPersisted)) break;
-        } while (after);
-        this.assertResearchIntegrity();
-        const proposalPersisted = acceptedEvent !== undefined && strategyProposalAggregateIds.has(acceptedEvent.aggregateId);
-        if (acceptedEvent === undefined || (requiresStrategyProposal && !proposalPersisted)) {
-          // This can also be a concurrent claim whose first caller is still
-          // persisting one of its canonical facts. Reject the unproven duplicate
-          // without poisoning that caller. An actual total persistence failure
-          // installs the sticky fail-closed state in safeAppend; restart still
-          // cannot accept this claim.
-          throw new Error("GROK_SUBMISSION_CANONICAL_FACT_MISSING");
-        }
+      const idempotencyKey = `${clientId}:${submission.submissionId}`;
+      const idleAdmission = !this.isExperimentWindowOpen();
+      let idleReservation = false;
+      const duplicate = (): { status: "duplicate" } => {
         this.state.recordGrokRejection("duplicate");
         this.metrics.grokSignals.inc({ agent: submission.agentId, status: "duplicate" });
         return { status: "duplicate" };
-      }
-      // Recheck the experiment-scoped fence immediately before irreversible accept.
-      if (this.researchIngressStale(ingress.generation) || !this.isTriggerActionable(trigger.id)) {
-        this.state.recordGrokRejection("rejected");
-        this.metrics.grokSignals.inc({ agent: submission.agentId, status: this.researchIngressStale(ingress.generation) ? "source_sealed" : "stale" });
-        return { status: this.researchIngressStale(ingress.generation) ? "source_sealed" : "stale" };
+      };
+      if (idleAdmission) {
+        // Idle monitoring intentionally does not create durable idempotency
+        // claims because its canonical accepted fact is not persisted. A
+        // bounded live reservation still makes exact retries deterministic and
+        // suppresses concurrent duplicates within this process.
+        idleReservation = this.reserveIdleGrokSubmission(idempotencyKey, now.getTime());
+        if (!idleReservation) return duplicate();
+        this.assertResearchIntegrity();
+      } else {
+        // A completed idle acceptance remains a bounded process-local tombstone
+        // across the lifecycle boundary. It has no durable canonical fact by
+        // design, so do not let the first active retry create a second claim
+        // and accepted fact for the same submission.
+        this.pruneIdleGrokSubmissions(now.getTime());
+        if (this.idleGrokSubmissions.has(idempotencyKey)) return duplicate();
+        const claimed = await this.journal.claimIdempotency("grok_signal_submission", idempotencyKey);
+        this.assertResearchIntegrity();
+        if (!claimed) {
+          await this.proveGrokSubmissionCanonicalFacts(submission, clientId);
+          return duplicate();
+        }
       }
 
-      const signal: GrokSignalEnvelope = grokSignalEnvelopeSchema.parse({
-        signalId: createId("grok_signal"), submissionId: submission.submissionId, traceId: submission.traceId,
-        triggerId: submission.triggerId, correlationId: submission.correlationId, marketId: submission.marketId,
-        asset: submission.asset ?? trigger.asset ?? null,
-        agentId: submission.agentId, role: submission.role, provider: "grok_bot_mcp", clientId,
-        receivedAt: now.toISOString(), timestamp: submission.timestamp, output: submission.output, resultingDecision: null,
-      });
-      if (this.researchIngressStale(ingress.generation)) return rejectSealed();
-      await this.safeAppend(createJournalEvent({ traceId: signal.traceId, type: "GROK_SIGNAL_ACCEPTED", aggregateType: "grok_signal", aggregateId: signal.signalId, payload: signal }));
-      if (submission.agentId === "strategy_supervisor" && submission.output.proposedChange) {
-        await this.safeAppend(createJournalEvent({ traceId: signal.traceId, type: "STRATEGY_CHANGE_PROPOSED", aggregateType: "strategy_change", aggregateId: signal.signalId, payload: submission.output.proposedChange }));
+      const acceptSubmission = async (): Promise<GrokSubmissionResult> => {
+        // An idle reservation may have waited while beginExperiment committed.
+        // The boundary gate makes this recheck atomic with EXPERIMENT_STARTED:
+        // either the idle submission accepts before the transition, or it is
+        // promoted to the durable active claim before any canonical append.
+        let promotedToActive = false;
+        if (idleReservation && this.isExperimentWindowOpen()) {
+          this.releaseIdleGrokSubmission(idempotencyKey);
+          idleReservation = false;
+          const promoted = await this.journal.claimIdempotency("grok_signal_submission", idempotencyKey);
+          this.assertResearchIntegrity();
+          if (!promoted) {
+            await this.proveGrokSubmissionCanonicalFacts(submission, clientId);
+            return duplicate();
+          }
+          promotedToActive = true;
+        }
+
+        try {
+        if (promotedToActive) {
+          // beginExperiment aborts any stale source-seal persistence and bumps
+          // that generation. The promoted submission is now an active ingress;
+          // continue from the post-transition generation under the boundary
+          // gate, while completion/source-seal fences still reject it.
+          ingress.generation = this.sourceSealGeneration;
+        }
+        // Recheck the experiment-scoped fence immediately before irreversible accept.
+        if (this.researchIngressStale(ingress.generation) || !this.isTriggerActionable(trigger.id)) {
+          if (idleReservation) this.releaseIdleGrokSubmission(idempotencyKey);
+          this.state.recordGrokRejection("rejected");
+          this.metrics.grokSignals.inc({ agent: submission.agentId, status: this.researchIngressStale(ingress.generation) ? "source_sealed" : "stale" });
+          return { status: this.researchIngressStale(ingress.generation) ? "source_sealed" : "stale" };
+        }
+
+        const signal: GrokSignalEnvelope = grokSignalEnvelopeSchema.parse({
+          signalId: createId("grok_signal"), submissionId: submission.submissionId, traceId: submission.traceId,
+          triggerId: submission.triggerId, correlationId: submission.correlationId, marketId: submission.marketId,
+          asset: submission.asset ?? trigger.asset ?? null,
+          agentId: submission.agentId, role: submission.role, provider: "grok_bot_mcp", clientId,
+          receivedAt: now.toISOString(), timestamp: submission.timestamp, output: submission.output, resultingDecision: null,
+        });
+        if (this.researchIngressStale(ingress.generation)) {
+          if (idleReservation) this.releaseIdleGrokSubmission(idempotencyKey);
+          return rejectSealed();
+        }
+        await this.persistReportInput(createJournalEvent({ traceId: signal.traceId, type: "GROK_SIGNAL_ACCEPTED", aggregateType: "grok_signal", aggregateId: signal.signalId, payload: signal }));
+        if (submission.agentId === "strategy_supervisor" && submission.output.proposedChange) {
+          await this.persistReportInput(createJournalEvent({ traceId: signal.traceId, type: "STRATEGY_CHANGE_PROPOSED", aggregateType: "strategy_change", aggregateId: signal.signalId, payload: submission.output.proposedChange }));
+        }
+        this.assertResearchIntegrity();
+        const byRole = this.signalsByTrigger.get(trigger.id) ?? new Map<ExternalAgentRoleId, GrokSignalEnvelope>();
+        byRole.set(signal.agentId, signal);
+        this.signalsByTrigger.set(trigger.id, byRole);
+        this.signalReceivedTimes.push(now.getTime());
+        this.state.addGrokSignal(signal);
+        this.activation.noteSignal(trigger.id, now);
+        this.state.setActivationLatency(this.activation.snapshot());
+        this.metrics.grokSignals.inc({ agent: signal.agentId, status: "accepted" });
+        this.record(`${signal.agentId.toUpperCase()}_COMPLETE`, signal.traceId, trigger.marketId, { signalId: signal.signalId, clientId, confidence: submission.output.confidence, expiresAt: submission.output.expiresAt }, trigger.asset ?? null);
+        await this.evaluateExternalConsensus(trigger);
+        if (idleReservation) this.completeIdleGrokSubmission(idempotencyKey, now.getTime());
+        return { status: "accepted", signalId: signal.signalId };
+      } catch (error) {
+        if (idleReservation) this.releaseIdleGrokSubmission(idempotencyKey);
+        throw error;
       }
-      this.assertResearchIntegrity();
-      const byRole = this.signalsByTrigger.get(trigger.id) ?? new Map<ExternalAgentRoleId, GrokSignalEnvelope>();
-      byRole.set(signal.agentId, signal);
-      this.signalsByTrigger.set(trigger.id, byRole);
-      this.signalReceivedTimes.push(now.getTime());
-      this.state.addGrokSignal(signal);
-      this.activation.noteSignal(trigger.id, now);
-      this.state.setActivationLatency(this.activation.snapshot());
-      this.metrics.grokSignals.inc({ agent: signal.agentId, status: "accepted" });
-      this.record(`${signal.agentId.toUpperCase()}_COMPLETE`, signal.traceId, trigger.marketId, { signalId: signal.signalId, clientId, confidence: submission.output.confidence, expiresAt: submission.output.expiresAt }, trigger.asset ?? null);
-      await this.evaluateExternalConsensus(trigger);
-      return { status: "accepted", signalId: signal.signalId };
+      };
+      if (idleReservation) {
+        try {
+          if (this.idleGrokAcceptanceHoldForTest) await this.idleGrokAcceptanceHoldForTest;
+        } catch (error) {
+          this.releaseIdleGrokSubmission(idempotencyKey);
+          throw error;
+        }
+        return this.experimentBoundaryGate.run(acceptSubmission);
+      }
+      return acceptSubmission();
     } finally {
       this.endResearchIngress();
+    }
+  }
+
+  private async proveGrokSubmissionCanonicalFacts(submission: GrokSignalSubmission, clientId: string): Promise<void> {
+    // A claim proves admission only, including across a crash before append.
+    // Check every canonical fact required by this submission with bounded trace
+    // pages (also works for old IDs). The proposal is linked to the accepted
+    // signal by the same trace and aggregate identity.
+    const requiresStrategyProposal = submission.agentId === "strategy_supervisor"
+      && submission.output.proposedChange !== null;
+    let acceptedEvent: JournalEvent | undefined;
+    const strategyProposalAggregateIds = new Set<string>();
+    let after: Parameters<EventJournal["readTracePage"]>[1]["after"];
+    do {
+      const page = await this.journal.readTracePage(submission.traceId, { after, limit: 128 });
+      for (const event of page.events) {
+        if (event.type === "STRATEGY_CHANGE_PROPOSED" && event.traceId === submission.traceId) {
+          strategyProposalAggregateIds.add(event.aggregateId);
+        }
+        if (!acceptedEvent && event.type === "GROK_SIGNAL_ACCEPTED"
+          && event.traceId === submission.traceId
+          && event.payload.clientId === clientId && event.payload.submissionId === submission.submissionId) {
+          acceptedEvent = event;
+        }
+      }
+      after = page.nextCursor ?? undefined;
+      const proposalPersisted = acceptedEvent !== undefined && strategyProposalAggregateIds.has(acceptedEvent.aggregateId);
+      if (acceptedEvent !== undefined && (!requiresStrategyProposal || proposalPersisted)) break;
+    } while (after);
+    this.assertResearchIntegrity();
+    const proposalPersisted = acceptedEvent !== undefined && strategyProposalAggregateIds.has(acceptedEvent.aggregateId);
+    if (acceptedEvent === undefined || (requiresStrategyProposal && !proposalPersisted)) {
+      // This can also be a concurrent claim whose first caller is still
+      // persisting one of its canonical facts. Reject the unproven duplicate
+      // without poisoning that caller. An actual total persistence failure
+      // installs the sticky fail-closed state in safeAppend; restart still
+      // cannot accept this claim.
+      throw new Error("GROK_SUBMISSION_CANONICAL_FACT_MISSING");
     }
   }
 
@@ -1768,7 +1854,7 @@ export class EngineService {
     const consensus = buildConsensus({ traceId: trigger.traceId, triggerId: trigger.id, signals: directional, deterministicEdge: 0, now: this.nowFn(), config: defaultConsensusConfig });
     this.state.latestConsensus = consensus;
     this.record("CONSENSUS_COMPLETE", trigger.traceId, trigger.marketId, { direction: consensus.consensusDirection, confidence: consensus.consensusConfidence, conflicts: consensus.conflicts, triggerId: trigger.id, estimatedEdgeIgnored: fair.estimatedEdge ?? null }, trigger.asset ?? null);
-    await this.safeAppend(createJournalEvent({ traceId: trigger.traceId, type: "CONSENSUS_DECISION", aggregateType: "consensus", aggregateId: consensus.id, payload: { ...consensus, marketId: trigger.marketId, asset: trigger.asset ?? null } }));
+    await this.persistReportInput(createJournalEvent({ traceId: trigger.traceId, type: "CONSENSUS_DECISION", aggregateType: "consensus", aggregateId: consensus.id, payload: { ...consensus, marketId: trigger.marketId, asset: trigger.asset ?? null } }));
     for (const disagreement of this.triggerEngine.ingestConsensus(consensus, trigger.marketId, trigger.asset ?? null)) this.admitTrigger(disagreement);
     if (trigger.marketId) await this.evaluateTrade(trigger, consensus, outputs);
   }
@@ -1855,7 +1941,7 @@ export class EngineService {
       },
     });
     this.state.latestRisk = decision.risk;
-    await this.safeAppend(createJournalEvent({ traceId: trigger.traceId, type: "RISK_EVALUATION", aggregateType: "risk", aggregateId: decision.risk.id, payload: { ...decision.risk, marketId: trigger.marketId, asset } }));
+    await this.persistReportInput(createJournalEvent({ traceId: trigger.traceId, type: "RISK_EVALUATION", aggregateType: "risk", aggregateId: decision.risk.id, payload: { ...decision.risk, marketId: trigger.marketId, asset } }));
     if (!decision.accepted || !decision.order) {
       for (const reason of decision.risk.vetoes) this.metrics.riskVetoes.inc({ reason });
       this.record("RISK_VETO", trigger.traceId, trigger.marketId, { reasons: decision.risk.vetoes, netExpectedEdge: decision.netExpectedEdge }, asset);
@@ -1868,7 +1954,7 @@ export class EngineService {
   private async submitPaperOrder(order: PaperOrder, decisionSnapshot: MarketSnapshot, duplicateKey: string, intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" = "OPEN_FIRST_LEG"): Promise<void> {
     this.metrics.paperOrders.inc({ type: order.orderType });
     this.record("PAPER_ORDER_CREATED", order.traceId, order.marketId, { orderId: order.id, type: order.orderType, intent }, decisionSnapshot.asset ?? null);
-    await this.safeAppend(createJournalEvent({
+    await this.persistReportInput(createJournalEvent({
       id: derivedAuditEventId("PAPER_ORDER_CREATED", order.id),
       traceId: order.traceId, type: "PAPER_ORDER_CREATED", aggregateType: "paper_order", aggregateId: order.id,
       payload: { ...order, intent },
@@ -1888,7 +1974,7 @@ export class EngineService {
       if (this.overload.hasIntegrityFault || error instanceof IdempotencyConflictError || error instanceof CrashInjectedError || (error instanceof JournalAdmissionRejected && error.critical)) throw error;
       this.executionErrors.push(Date.now());
       this.record("PAPER_EXECUTION_ERROR", order.traceId, order.marketId, { orderId: order.id, message: error instanceof Error ? error.message : String(error) });
-      await this.safeAppend(createJournalEvent({ traceId: order.traceId, type: "PAPER_EXECUTION_ERROR", aggregateType: "paper_order", aggregateId: order.id, payload: { message: error instanceof Error ? error.message : String(error) } }));
+      await this.persistReportInput(createJournalEvent({ traceId: order.traceId, type: "PAPER_EXECUTION_ERROR", aggregateType: "paper_order", aggregateId: order.id, payload: { message: error instanceof Error ? error.message : String(error) } }));
     }
   }
 
@@ -2171,16 +2257,67 @@ export class EngineService {
     return status === "RUNNING" || status === "ENTRY_CLOSED";
   }
 
+  private pruneIdleGrokSubmissions(nowMs: number): void {
+    for (const [key, entry] of this.idleGrokSubmissions) {
+      if (nowMs - entry.observedAt > IDLE_GROK_IDEMPOTENCY_TTL_MS) this.idleGrokSubmissions.delete(key);
+    }
+    while (this.idleGrokSubmissions.size > IDLE_GROK_IDEMPOTENCY_MAX) {
+      const oldest = this.idleGrokSubmissions.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.idleGrokSubmissions.delete(oldest);
+    }
+  }
+
+  private reserveIdleGrokSubmission(key: string, nowMs: number): boolean {
+    this.pruneIdleGrokSubmissions(nowMs);
+    if (this.idleGrokSubmissions.has(key)) return false;
+    this.idleGrokSubmissions.set(key, { observedAt: nowMs, pending: true });
+    this.pruneIdleGrokSubmissions(nowMs);
+    return this.idleGrokSubmissions.has(key);
+  }
+
+  private completeIdleGrokSubmission(key: string, nowMs: number): void {
+    const entry = this.idleGrokSubmissions.get(key);
+    if (entry?.pending) {
+      entry.pending = false;
+      entry.observedAt = nowMs;
+    }
+  }
+
+  private releaseIdleGrokSubmission(key: string): void {
+    if (this.idleGrokSubmissions.get(key)?.pending) this.idleGrokSubmissions.delete(key);
+  }
+
   private isCanonicalWindowAdmission(type: string): boolean {
     return isReportInputEventType(type) && !isSourceSealExemptType(type) && this.isExperimentWindowOpen();
   }
 
-  async persistReportInput(event: JournalEvent): Promise<void> {
+  /**
+   * Canonical report inputs are durable only while an experiment window is
+   * open. Lifecycle exceptions remain durable at the boundaries; raw market
+   * and reference observations never come through this path.
+   */
+  private isReportInputPersistenceAdmitted(type: string): boolean {
+    // These are live processing inputs, never durable facts. Keep this guard
+    // here as a second line of defense if a future producer reaches the
+    // report-input helper directly.
+    if (type === "MARKET_SNAPSHOT" || type === "REFERENCE_TICK") return false;
+    // MCP_INTERACTION is an always-on security/audit trail. It is classified
+    // as a report input for source-integrity accounting, but it must remain
+    // durable for authenticated and rejected calls while the engine monitors.
+    return type === "MCP_INTERACTION"
+      || !isReportInputEventType(type)
+      || isSourceSealExemptType(type)
+      || this.isExperimentWindowOpen();
+  }
+
+  async persistReportInput(event: JournalEvent, signal?: AbortSignal, extra?: { deadlineAt?: number }): Promise<void> {
+    if (!this.isReportInputPersistenceAdmitted(event.type)) return;
     const experimentId = this.experiment?.id;
     const stamped = this.isExperimentWindowOpen() && experimentId && typeof event.payload.experimentId !== "string"
       ? { ...event, payload: { ...event.payload, experimentId } }
       : event;
-    await this.safeAppend(stamped);
+    await this.safeAppend(stamped, signal, extra);
   }
 
   private async safeAppend(event: ReturnType<typeof createJournalEvent>, signal?: AbortSignal, extra?: { deadlineAt?: number }): Promise<void> {
@@ -3148,6 +3285,7 @@ export class EngineService {
   setSourceSealPersistHoldForTest(hold: Promise<void> | null): void { this.sourceSealPersistHold = hold; }
   sourceSealPersistInFlightForTest() { return this.sourceSealPersistInFlight; }
   setGrokClaimHoldForTest(hold: Promise<void> | null): void { this.grokClaimHold = hold; }
+  setIdleGrokAcceptanceHoldForTest(hold: Promise<void> | null): void { this.idleGrokAcceptanceHoldForTest = hold; }
   researchIngressInFlightForTest() { return this.researchIngressInFlight; }
   sourceSealStateForTest() { return { sealing: this.sourceSealing, sealed: this.sourceSealed, generation: this.sourceSealGeneration }; }
   async completeExperimentForTest(): Promise<void> {
@@ -3219,7 +3357,10 @@ export class EngineService {
     );
   }
   async persistEventForTest(event: ReturnType<typeof createJournalEvent>): Promise<void> {
-    await this.persistReportInput(event);
+    // Test hook for direct journal/integrity failure scenarios. Production
+    // canonical producers use persistReportInput, which applies lifecycle
+    // admission before reaching safeAppend.
+    await this.safeAppend(event);
   }
   reportSourceIntegrityForTest() { return [...this.reportSourceIntegrity.values()]; }
   enqueueTriggerStormForTest(triggers: TriggerEvent[]): { admitted: number; rejected: number; reasons: Record<string, number> } {

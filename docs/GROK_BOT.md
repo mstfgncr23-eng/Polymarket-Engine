@@ -108,7 +108,7 @@ The engine defines `GrokActivationBridge`. Core trigger/consensus/risk code does
 
 Bot-to-Bot fan-out is **not** used: MCP cannot send those messages, and a dispatcher Bot would add hops without validated product behavior. Role-specific Slack posts are used instead of waking all six Bots.
 
-Activation is non-fatal: feed loops continue, the trigger stays persisted, the failure is journaled, no crash, no invented research, no paper order from missing Grok.
+Activation is non-fatal: feed loops continue, the trigger remains available in live engine state, active experiment triggers are persisted, failures are journaled when applicable, and there is no invented research or paper order from missing Grok.
 
 A future official Grok webhook can replace the Slack provider without rewriting the trigger engine.
 

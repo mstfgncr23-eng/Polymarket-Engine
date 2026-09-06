@@ -530,6 +530,7 @@ describe("D+E+F — end-to-end trigger provenance", () => {
   it("3: BOOK_IMBALANCE and derived NEWS stay stale after gap/resync", async () => {
     const { engine, market, journal } = await startQualifiedEngine();
     await market.waitForHandlers();
+    expect((await engine.beginExperiment()).ok).toBe(true);
     await market.emitSnapshot(bookSnapshot("UP", "0.48"));
     await drainRuntime(engine);
     const before = await journal.queryEvents({ types: ["TRIGGER_EVENT"] });
@@ -580,6 +581,7 @@ describe("D+E+F — end-to-end trigger provenance", () => {
   it("5: journal-wait gap falsifies actionability after TRIGGER_EVENT persist", async () => {
     const { engine, market, journal } = await startQualifiedEngine();
     await market.waitForHandlers();
+    expect((await engine.beginExperiment()).ok).toBe(true);
     let release!: () => void;
     engine.setTriggerEventPersistHoldForTest(new Promise<void>((resolve) => { release = resolve; }));
     await market.emitSnapshot(bookSnapshot("UP", "0.48"));
@@ -594,7 +596,8 @@ describe("D+E+F — end-to-end trigger provenance", () => {
       return event.type === "TRIGGER_EVENT" && (kind === "BOOK_IMBALANCE" || kind === "NEWS_INFORMATION");
     });
     expect(triggers.length).toBeGreaterThan(0);
-    expect(events.some((event) => event.type === "GROK_ACTIVATION_DECISION" && event.payload.activate === true)).toBe(false);
+    const staleTriggerIds = new Set(triggers.map((event) => String(event.payload.id)));
+    expect(events.some((event) => event.type === "GROK_ACTIVATION_DECISION" && event.payload.activate === true && staleTriggerIds.has(String(event.payload.triggerId)))).toBe(false);
     for (const event of triggers) {
       expect(engine.isTriggerActionable(String(event.payload.id))).toBe(false);
       const trigger = engine.state.recentTriggers.find((item) => item.id === event.payload.id);
