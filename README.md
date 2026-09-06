@@ -1,6 +1,6 @@
 # Polymarket Research & Paper-Trading Engine
 
-Production-shaped, event-driven research system for a 48-hour experiment using **public live Polymarket crypto prediction markets** plus **generic external crypto reference prices** for the assets those markets need. It creates **paper orders only**. There is no wallet integration, signer, private CLOB client, or live-order path; `TRADING_MODE` accepts only `paper`, and the live adapter always throws `LIVE_TRADING_DISABLED`.
+Production-shaped, event-driven research system for a continuous engine with an explicit 48-hour experiment/validation window using **public live Polymarket crypto prediction markets** plus **generic external crypto reference prices** for the assets those markets need. It creates **paper orders only**. There is no wallet integration, signer, private CLOB client, or live-order path; `TRADING_MODE` accepts only `paper`, and the live adapter always throws `LIVE_TRADING_DISABLED`.
 
 The engine is **not Bitcoin-only**. It discovers whichever qualifying crypto prediction markets Polymarket currently offers, qualifies them with explicit reason codes, monitors them concurrently with isolated state, and only then opens reference feeds for those underlying assets. Research comes from **external Grok Bots** over a bearer-authenticated Streamable HTTP MCP endpoint. This repository does not call OpenAI, does not require `OPENAI_API_KEY`, does not call an xAI inference API, and does not place live Polymarket orders.
 
@@ -227,7 +227,7 @@ Dashboard: `http://localhost:3000`; engine liveness/readiness/metrics: `http://l
 | `ENGINE_REGION` | Runtime metadata; `fra` default |
 | `GIT_SHA` | Recorded in experiment manifest |
 | `REPORT_DIRECTORY` | Optional ephemeral 48h JSON/Markdown export; canonical final report is `experiment_reports` in Postgres |
-| `RETENTION_*` | Bounded journal/checkpoint/idempotency TTLs and optional verified-snapshot compaction. See [docs/RETENTION.md](docs/RETENTION.md). `RETENTION_ENABLED`, `RETENTION_COMPACTION_ENABLED`, and `RETENTION_ANALYTICS_ROLLUP_ENABLED` default **false** until operator review. Defaults: telemetry 6h, monitor 24h, completed grace 7d, max 20 batches / 4000 rows per cycle. Durable transitions compact only behind two verified recovery snapshots; compact replay keys are bounded and expiring. |
+| `RETENTION_*` | Bounded journal/checkpoint/idempotency TTLs and optional verified-snapshot compaction. See [docs/RETENTION.md](docs/RETENTION.md). `RETENTION_ENABLED`, `RETENTION_COMPACTION_ENABLED`, and `RETENTION_ANALYTICS_ROLLUP_ENABLED` default **false** until operator review. Defaults: telemetry 6h, monitor 24h, completed grace 7d, max 20 batches / 4000 rows per cycle. Active RUNNING/ENTRY_CLOSED canonical input rolls into a verified monotonic accumulator; cleanup is fenced by the stable read's recorded-at/commit coverage. Durable transitions compact only behind two verified recovery snapshots; indexed minimal replay identities remain lifecycle-pinned or bounded by TTL. |
 
 Do not put wallet keys, signing keys, OpenAI keys, or Polymarket private credentials in this milestone. This repository does not create or provision xAI credentials and does not call an xAI inference API.
 

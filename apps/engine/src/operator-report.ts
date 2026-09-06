@@ -87,6 +87,10 @@ export async function generateOperatorReport(
       sourceCursor: await journal.latestDurableSequence(),
       sourceFenceId: streamed.scan.fence.through?.id ?? null,
       sourceFenceOccurredAt: streamed.scan.fence.through?.occurredAt ?? null,
+      sourceEventCount: streamed.accumulatorSnapshot.eventCount,
+      sourceCommitSeq: streamed.scan.fence.commitSeqTo,
+      sourceRecordedAt: streamed.scan.fence.recordedAtTo.toISOString(),
+      stableRead: streamed.scan.fence.stable,
       accumulator: streamed.accumulatorSnapshot as unknown as Record<string, unknown>,
     });
   }

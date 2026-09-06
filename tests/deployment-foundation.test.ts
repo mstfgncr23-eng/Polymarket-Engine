@@ -359,7 +359,7 @@ describe("deployment foundation", () => {
     expect(step4).not.toMatch(/FORCE ROW LEVEL SECURITY/);
     expect(step4).not.toMatch(/CREATE POLICY/i);
     expect(journal.entries.map((entry) => entry.tag)).toEqual([
-      "0000_initial", "0001_grok_mcp", "0002_journal_query", "0003_rls_lockdown", "0004_critical_replay", "0005_step4_reports_retention", "0006_hot_storage_lifecycle",
+      "0000_initial", "0001_grok_mcp", "0002_journal_query", "0003_rls_lockdown", "0004_critical_replay", "0005_step4_reports_retention", "0006_hot_storage_lifecycle", "0007_storage_correctness",
     ]);
   });
 });

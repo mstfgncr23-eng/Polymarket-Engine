@@ -10,6 +10,8 @@ export interface ExperimentArchiveManifest {
   experimentId: string;
   reportSchemaVersion: number;
   contentHash: string;
+  canonicalReportContentHash: string;
+  archiveBundleHash: string;
   generatedAt: string;
   persistedAt: string;
   sourceEventCount: number;
@@ -39,11 +41,22 @@ export async function exportExperimentArchive(
   const contentHash = createHash("sha256").update(canonicalJson({ summary, rendered })).digest("hex");
   const directory = resolve(input.directory);
   await mkdir(directory, { recursive: true });
-  const persistedAt = new Date().toISOString();
-  const manifest: ExperimentArchiveManifest & Record<string, unknown> = {
+  const persistedAt = report?.persistedAt ?? new Date().toISOString();
+  const baseManifest: Record<string, unknown> = {
     archiveSchemaVersion: 1, experimentId: input.experimentId, reportSchemaVersion, contentHash,
-    generatedAt: summary.generatedAt, persistedAt, sourceEventCount, sourceFenceId, sourceFenceOccurredAt, ...(input.manifest ?? {}),
+    canonicalReportContentHash: report?.contentHash ?? contentHash,
+    generatedAt: summary.generatedAt, persistedAt, sourceEventCount, sourceFenceId, sourceFenceOccurredAt,
+    experimentStatus: summary.status,
+    strategyVersion: input.manifest?.strategyVersion ?? null,
+    riskConfiguration: input.manifest?.riskConfiguration ?? null,
+    modelConfiguration: input.manifest?.modelConfiguration ?? null,
+    systemVersion: input.manifest?.systemVersion ?? null,
+    experimentStart: input.manifest?.experimentStart ?? null,
+    experimentEnd: input.manifest?.experimentEnd ?? null,
+    ...(input.manifest ?? {}),
   };
+  const archiveBundleHash = createHash("sha256").update(canonicalJson({ manifest: baseManifest, summary, rendered })).digest("hex");
+  const manifest: ExperimentArchiveManifest & Record<string, unknown> = { ...baseManifest, archiveBundleHash } as ExperimentArchiveManifest & Record<string, unknown>;
   const manifestPath = resolve(directory, "manifest.json");
   const summaryPath = resolve(directory, "summary.json");
   const reportPath = resolve(directory, "report.md");

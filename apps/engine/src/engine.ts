@@ -1261,7 +1261,7 @@ export class EngineService {
       existing.type !== input.type
       || existing.aggregateType !== input.aggregateType
       || existing.aggregateId !== input.aggregateId
-      || durableIdentityConflicts(input.type, existing.payload, computed)
+      || (Object.keys(existing.payload).length > 0 && durableIdentityConflicts(input.type, existing.payload, computed))
     ) {
       throw new IdempotencyConflictError(input.operationKey, existing.type, input.type);
     }
@@ -3376,6 +3376,10 @@ export class EngineService {
           sourceCursor: await this.journal.latestDurableSequence(),
           sourceFenceId: streamed.scan.fence.through?.id ?? null,
           sourceFenceOccurredAt: streamed.scan.fence.through?.occurredAt ?? null,
+          sourceEventCount: streamed.accumulatorSnapshot.eventCount,
+          sourceCommitSeq: streamed.scan.fence.commitSeqTo,
+          sourceRecordedAt: streamed.scan.fence.recordedAtTo.toISOString(),
+          stableRead: streamed.scan.fence.stable,
           accumulator: streamed.accumulatorSnapshot as unknown as Record<string, unknown>,
         });
       }

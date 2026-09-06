@@ -119,12 +119,12 @@ Do not reintroduce a transactional `CREATE INDEX` on live `journal_events` insid
 
 | Class | What | Default | Delete? |
 |---|---|---|---|
-| Recovery-authoritative | verified checkpoints + `durable_transitions` tail | **BOUNDED** | Compact rows only at a fenced verified snapshot cursor; retain bounded expiring operation-key replay authority |
+| Recovery-authoritative | verified checkpoints + `durable_transitions` tail | **BOUNDED** | Compact rows only at a fenced verified snapshot cursor; retain indexed minimal replay identities (open obligations pinned, closed identities bounded by TTL/pressure) |
 | Checkpoints | `engine_checkpoints` | keep latest 8 | Only after a newer checkpoint is committed; never the latest usable row |
 | MCP idempotency | `mcp_idempotency_keys` | 24h TTL | Only after TTL > signal timestamp skew (5m) + trigger TTL (30s) + 1h margin |
 | Raw telemetry | `MARKET_SNAPSHOT`, `REFERENCE_TICK`, `MARKET_EVENT` | 6h (legacy rows only; the engine does not insert raw observations) | Yes. Paper fills/settlements are self-contained and are not in this class |
 | Monitor / control-plane | `TRIGGER_*`, `GROK_*`, `MCP_INTERACTION`, `SYSTEM_HEALTH_*`, `DISCOVERY_RECONCILED`, reference lifecycle | 24h | Canonical research is admitted only during an experiment window; see monitor lifecycle below |
-| Long-lived audit | Experiment lifecycle, `PAPER_*`, `POSITION_*`, `PAIR_REALIZED`, `PNL_SNAPSHOT`, risk/consensus/hedge/settlement, strategy change | rollup/report or bounded tail | Delete only after verified rollup/final-report authority; uncertainty retains |
+| Long-lived audit | Experiment lifecycle, `PAPER_*`, `POSITION_*`, `PAIR_REALIZED`, `PNL_SNAPSHOT`, risk/consensus/hedge/settlement, strategy change | rollup/report or bounded tail | RUNNING and ENTRY_CLOSED canonical detail rolls periodically into a verified monotonic accumulator. Delete only rows covered by the same stable snapshot's keyset and recorded-at/commit fence; uncertainty retains. |
 
 ### Monitor lifecycle
 

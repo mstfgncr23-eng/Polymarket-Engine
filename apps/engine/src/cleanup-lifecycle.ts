@@ -75,7 +75,7 @@ function applyLifecycleEvent(byId: Map<string, ExperimentRow>, type: string, id:
   byId.set(id, current);
 }
 
-async function loadDurableExperimentRows(journal: EventJournal): Promise<ExperimentRow[] | null> {
+async function loadDurableExperimentRows(journal: EventJournal): Promise<{ rows: ExperimentRow[]; source: "durable_transitions" | "verified_snapshot" } | null> {
   try {
     // Once the historical lifecycle prefix is compacted, the latest verified
     // recovery snapshot plus its durable tail remains authoritative.
@@ -99,12 +99,21 @@ async function loadDurableExperimentRows(journal: EventJournal): Promise<Experim
         }
         const cursorValue = payload.durableCursor;
         const cursor = typeof cursorValue === "number" && Number.isInteger(cursorValue) ? cursorValue : checkpoint.sequence;
-        const tail = await journal.readDurableTransitionsAfter(cursor, 10_000);
-        for (const row of tail) {
-          const rowId = experimentIdFromPayload(row.payload, row.aggregateId);
-          if (rowId) applyLifecycleEvent(byId, row.type, rowId, row.occurredAt, row.payload);
+        const highWater = await journal.latestDurableSequence();
+        const safetyCeiling = 100_000;
+        let after = cursor;
+        let pages = 0;
+        while (after < highWater) {
+          if (++pages > safetyCeiling) return null;
+          const tail = await journal.readDurableTransitionsAfter(after, 1_000);
+          if (tail.length === 0) return null;
+          for (const row of tail) {
+            const rowId = experimentIdFromPayload(row.payload, row.aggregateId);
+            if (rowId) applyLifecycleEvent(byId, row.type, rowId, row.occurredAt, row.payload);
+            after = Math.max(after, row.sequence);
+          }
         }
-        return [...byId.values()];
+        return { rows: [...byId.values()], source: "verified_snapshot" };
       }
     }
     const page = await pageDurableTransitionsByTypes(journal, LIFECYCLE_TYPES);
@@ -115,7 +124,7 @@ async function loadDurableExperimentRows(journal: EventJournal): Promise<Experim
       if (!id) continue;
       applyLifecycleEvent(byId, row.type, id, row.occurredAt, row.payload);
     }
-    return [...byId.values()];
+    return { rows: [...byId.values()], source: "durable_transitions" };
   } catch {
     return null;
   }
@@ -255,7 +264,8 @@ export async function resolveCleanupLifecycle(
   journal: EventJournal,
   hints: CleanupLifecycleHints = {},
 ): Promise<CleanupLifecycle> {
-  const durableRows = await loadDurableExperimentRows(journal);
+  const durableResult = await loadDurableExperimentRows(journal);
+  const durableRows = durableResult?.rows ?? null;
   const journalRows = await loadJournalExperimentRows(journal);
   if (durableRows == null) {
     return {
@@ -365,7 +375,7 @@ export async function resolveCleanupLifecycle(
 
   return {
     state,
-    source: hinted.hintMismatch ? "unresolved" : hintId && !hinted.hintMismatch ? "hint_verified" : "durable_transitions",
+    source: hinted.hintMismatch ? "unresolved" : hintId && !hinted.hintMismatch ? "hint_verified" : (durableResult?.source ?? "durable_transitions"),
     experimentId: chosen?.id ?? (state === "PROVEN_NO_ACTIVE_EXPERIMENT" ? null : hintId),
     status,
     startedAt,

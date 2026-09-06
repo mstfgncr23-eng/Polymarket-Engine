@@ -299,7 +299,12 @@ export class ExperimentSummaryAccumulator {
   }
 
   finalize(): ExperimentSummary {
-    this.applyFillAttribution();
+    // Attribution is derived from fillReplay for each projection. Keep the
+    // accumulator authoritative pre-finalize so finalize/serialize/restore/
+    // finalize is idempotent and cannot double count fills.
+    const attributedByMarket = structuredClone(this.byMarket);
+    const attributedByAsset = structuredClone(this.byAsset);
+    this.applyFillAttribution(attributedByMarket, attributedByAsset);
     const extras = this.extras;
     const extrasScope = extras.metricsScope ?? (extras.reportKind === "final" ? "complete" : "rolling");
     const truncated = extras.truncated === true;
@@ -352,14 +357,14 @@ export class ExperimentSummaryAccumulator {
       makerFillRate: rate(this.makerFills, this.makerOrders), takerFillRate: rate(this.takerFills, this.takerOrders),
       modelInvocationCounts: this.modelCounts, modelCostByAgentUsd: this.modelCosts,
       performanceByAgentSignal: this.agentSignals,
-      performanceByMarket: this.byMarket, performanceByAsset: this.byAsset,
+      performanceByMarket: attributedByMarket, performanceByAsset: attributedByAsset,
       eventCountByMarket: this.eventCountByMarket, eventCountByAsset: this.eventCountByAsset,
-      pnlByMarket: pick(this.byMarket, "netTradingPnlUsd"), pnlByAsset: pick(this.byAsset, "netTradingPnlUsd"),
-      fillsByMarket: pick(this.byMarket, "fills"), fillsByAsset: pick(this.byAsset, "fills"),
-      feesByMarket: pick(this.byMarket, "feesUsd"), feesByAsset: pick(this.byAsset, "feesUsd"),
-      slippageByMarket: pick(this.byMarket, "slippageUsd"), slippageByAsset: pick(this.byAsset, "slippageUsd"),
-      opportunitiesByMarket: pick(this.byMarket, "opportunities"), opportunitiesByAsset: pick(this.byAsset, "opportunities"),
-      vetoesByMarket: pick(this.byMarket, "vetoes"), vetoesByAsset: pick(this.byAsset, "vetoes"),
+      pnlByMarket: pick(attributedByMarket, "netTradingPnlUsd"), pnlByAsset: pick(attributedByAsset, "netTradingPnlUsd"),
+      fillsByMarket: pick(attributedByMarket, "fills"), fillsByAsset: pick(attributedByAsset, "fills"),
+      feesByMarket: pick(attributedByMarket, "feesUsd"), feesByAsset: pick(attributedByAsset, "feesUsd"),
+      slippageByMarket: pick(attributedByMarket, "slippageUsd"), slippageByAsset: pick(attributedByAsset, "slippageUsd"),
+      opportunitiesByMarket: pick(attributedByMarket, "opportunities"), opportunitiesByAsset: pick(attributedByAsset, "opportunities"),
+      vetoesByMarket: pick(attributedByMarket, "vetoes"), vetoesByAsset: pick(attributedByAsset, "vetoes"),
       performanceByMarketRegime: this.regimes,
       performanceByHour: this.hours,
       rejectedTradesThatWouldHaveWon: this.rejectedWouldHaveWon,
@@ -379,24 +384,24 @@ export class ExperimentSummaryAccumulator {
     };
   }
 
-  private applyFillAttribution(): void {
+  private applyFillAttribution(byMarket: Record<string, MarketAssetAttribution>, byAsset: Record<string, MarketAssetAttribution>): void {
     for (const [marketId, pnl] of this.fillReplay) {
-      const marketRow = bucket(this.byMarket, marketId);
+      const marketRow = bucket(byMarket, marketId);
       marketRow.realizedPnlUsd += pnl.realizedPnlUsd;
       marketRow.feesUsd += pnl.feesUsd;
       marketRow.slippageUsd += pnl.slippageUsd;
       marketRow.fills += pnl.fills;
       const asset = this.assetByMarket.get(marketId);
       if (asset) {
-        const assetRow = bucket(this.byAsset, asset);
+        const assetRow = bucket(byAsset, asset);
         assetRow.realizedPnlUsd += pnl.realizedPnlUsd;
         assetRow.feesUsd += pnl.feesUsd;
         assetRow.slippageUsd += pnl.slippageUsd;
         assetRow.fills += pnl.fills;
       }
     }
-    for (const row of Object.values(this.byMarket)) row.netTradingPnlUsd = d(row.realizedPnlUsd).minus(row.feesUsd).toNumber();
-    for (const row of Object.values(this.byAsset)) row.netTradingPnlUsd = d(row.realizedPnlUsd).minus(row.feesUsd).toNumber();
+    for (const row of Object.values(byMarket)) row.netTradingPnlUsd = d(row.realizedPnlUsd).minus(row.feesUsd).toNumber();
+    for (const row of Object.values(byAsset)) row.netTradingPnlUsd = d(row.realizedPnlUsd).minus(row.feesUsd).toNumber();
   }
 
   private addSettlementAttribution(event: JournalEvent, realized: number): void {

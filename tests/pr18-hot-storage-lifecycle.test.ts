@@ -1,4 +1,5 @@
 import { mkdtemp, readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -8,7 +9,9 @@ import {
 } from "@pm/core";
 import {
   MemoryEventJournal,
+  PostgresEventJournal,
   createJournalEvent,
+  hashCheckpointPayload,
 } from "@pm/db";
 import { ExperimentSummaryAccumulator } from "../apps/engine/src/report.js";
 import { exportExperimentArchive } from "../apps/engine/src/archive.js";
@@ -105,6 +108,87 @@ describe("PR18 hot operational storage lifecycle", () => {
     expect((await loadVerifiedAnalyticsRollup(journal, "exp-pr18"))?.contentHash).toBe(rollup!.contentHash);
   });
 
+  it("keeps finalize and restore idempotent after a persisted rollup", async () => {
+    const journal = new MemoryEventJournal();
+    const startedAt = "2026-01-01T00:00:00.000Z";
+    const fill = event("PAPER_FILL", "fill-idempotent", "2026-01-01T00:00:02.000Z", { marketId: "m1", asset: "BTC", side: "BUY", outcome: "UP", quantity: "2", fillPrice: "0.4", feeUsd: "0.01", slippageUsd: "0.02", liquidityRole: "TAKER" });
+    await journal.append(fill);
+    const acc = new ExperimentSummaryAccumulator("exp-pr18", { status: "RUNNING", generatedAt: startedAt, complete: false, reportKind: "interim", metricsScope: "rolling" });
+    acc.fold(fill);
+    const first = acc.finalize();
+    const persisted = await persistVerifiedAnalyticsRollup(journal, { experimentId: "exp-pr18", sourceCursor: 0, sourceFenceId: fill.id, sourceFenceOccurredAt: fill.occurredAt, sourceEventCount: 1, sourceRecordedAt: fill.recordedAt, stableRead: true, accumulator: acc.serialize() as unknown as Record<string, unknown> });
+    const restored = ExperimentSummaryAccumulator.fromSnapshot(persisted!.accumulator as unknown as Parameters<typeof ExperimentSummaryAccumulator.fromSnapshot>[0]);
+    expect({ ...restored.finalize(), generatedAt: startedAt }).toEqual({ ...first, generatedAt: startedAt });
+  });
+
+  it("does not delete a late old-timestamp event until the next rollup", async () => {
+    const journal = new MemoryEventJournal();
+    const first = event("RISK_EVALUATION", "late-base", "2026-01-01T00:00:10.000Z", { accepted: true, marketId: "m1" });
+    await journal.append(first);
+    const streamed = await streamExperimentSummary(journal, { id: "exp-pr18", startedAt: "2026-01-01T00:00:00.000Z" }, { status: "RUNNING", complete: false, reportKind: "interim", metricsScope: "rolling" });
+    const rollup = await persistVerifiedAnalyticsRollup(journal, { experimentId: "exp-pr18", sourceCursor: 0, sourceFenceId: streamed.scan.fence.through!.id, sourceFenceOccurredAt: streamed.scan.fence.through!.occurredAt, sourceEventCount: streamed.accumulatorSnapshot!.eventCount, sourceCommitSeq: streamed.scan.fence.commitSeqTo, sourceRecordedAt: streamed.scan.fence.recordedAtTo.toISOString(), stableRead: streamed.scan.fence.stable, accumulator: streamed.accumulatorSnapshot as unknown as Record<string, unknown> });
+    const late = event("RISK_EVALUATION", "late-after-snapshot", "2025-01-01T00:00:01.000Z", { accepted: true, marketId: "m2" });
+    await journal.append(late);
+    await journal.deleteCanonicalEventsThrough!({ experimentId: "exp-pr18", occurredBefore: new Date(rollup!.sourceFenceOccurredAt!), sourceCursor: 0, sourceCommitSeq: rollup!.sourceCommitSeq, sourceRecordedAt: new Date(rollup!.sourceRecordedAt!) });
+    expect(await journal.readJournalEventById(late.id)).not.toBeNull();
+    const next = await streamExperimentSummary(journal, { id: "exp-pr18", startedAt: "2025-01-01T00:00:00.000Z" }, { status: "RUNNING", complete: false, reportKind: "interim", metricsScope: "rolling" });
+    expect(next.summary.totalOpportunities).toBe(2);
+  });
+
+  it("advances rollups monotonically with CAS prefix checks", async () => {
+    const journal = new MemoryEventJournal();
+    const a = event("RISK_EVALUATION", "mono-a", "2026-01-01T00:00:01.000Z", { accepted: true, marketId: "m1" });
+    const b = event("RISK_EVALUATION", "mono-b", "2026-01-01T00:00:02.000Z", { accepted: true, marketId: "m2" });
+    await journal.appendMany([a, b]);
+    const first = await persistVerifiedAnalyticsRollup(journal, { experimentId: "exp-pr18", sourceCursor: 0, sourceFenceId: a.id, sourceFenceOccurredAt: a.occurredAt, sourceEventCount: 1, sourceCommitSeq: 1, sourceRecordedAt: a.recordedAt, accumulator: { eventCount: 1 } });
+    const second = await persistVerifiedAnalyticsRollup(journal, { experimentId: "exp-pr18", sourceCursor: 0, sourceFenceId: b.id, sourceFenceOccurredAt: b.occurredAt, sourceEventCount: 2, sourceCommitSeq: 2, sourceRecordedAt: b.recordedAt, accumulator: { eventCount: 2 } });
+    expect(second!.sourceEventCount).toBe(2);
+    const older = await persistVerifiedAnalyticsRollup(journal, { experimentId: "exp-pr18", sourceCursor: 0, sourceFenceId: a.id, sourceFenceOccurredAt: a.occurredAt, sourceEventCount: 1, sourceCommitSeq: 1, sourceRecordedAt: a.recordedAt, accumulator: { eventCount: 1 } });
+    expect(older!.contentHash).toBe(second!.contentHash);
+    expect(first!.sourceEventCount).toBe(1);
+  });
+
+  it("rolls active canonical input into a bounded hot set before completion", async () => {
+    const journal = new MemoryEventJournal();
+    const manager = new RetentionManager(journal, defaultRetentionConfig({ enabled: true, analyticsRollupEnabled: true, maxRowsPerCycle: 500, maxBatchesPerCycle: 20, batchSize: 100 }));
+    for (let cycle = 0; cycle < 4; cycle += 1) {
+      for (let i = 0; i < 20; i += 1) await journal.append(event("RISK_EVALUATION", `active-${cycle}-${i}`, `2026-01-01T00:0${cycle}:${String(i).padStart(2, "0")}.000Z`, { accepted: i % 2 === 0, marketId: `m${i}` }));
+      await manager.runCycle({ experiment: { id: "exp-pr18", status: "RUNNING", startedAt: "2026-01-01T00:00:00.000Z" }, now: new Date("2026-09-06T00:00:00.000Z"), degraded: false, failClosed: false, databaseUp: true });
+      const count = (await journal.countByType(CANONICAL_REPORT_INPUT_EVENT_TYPES)).RISK_EVALUATION ?? 0;
+      expect(count).toBeLessThanOrEqual(1);
+    }
+    expect((await journal.loadAnalyticsRollup!("exp-pr18"))?.verified).toBe(true);
+  });
+
+  it("falls back from a hash-valid but semantically invalid newest snapshot", async () => {
+    const journal = new MemoryEventJournal();
+    await journal.saveCheckpoint({ experimentId: "exp-pr18", sequence: 1, payload: { durableCursor: 0, ledger: { cashUsd: "100", reservedUsd: "0" }, positions: [] } });
+    await journal.saveCheckpoint({ experimentId: "exp-pr18", sequence: 2, payload: { durableCursor: 0, ledger: { cashUsd: "100", reservedUsd: "0" }, positions: [] } });
+    const internal = journal as unknown as { checkpoints: Array<{ sequence: number; payload: Record<string, unknown>; contentHash?: string }> };
+    const newest = internal.checkpoints.find((row) => row.sequence === 2)!;
+    newest.payload.ledger = { cashUsd: "-1", reservedUsd: "0" };
+    newest.payload.checkpointContentHash = hashCheckpointPayload(newest.payload);
+    newest.contentHash = newest.payload.checkpointContentHash as string;
+    expect((await journal.listVerifiedCheckpoints())[0]!.sequence).toBe(1);
+  });
+
+  it.skipIf(!process.env.STEP4_TEST_DATABASE_URL)("runs indexed replay-key compaction against disposable PG17", { timeout: 30_000 }, async () => {
+    const url = new URL(process.env.STEP4_TEST_DATABASE_URL!);
+    expect(["localhost", "127.0.0.1"]).toContain(url.hostname);
+    const journal = new PostgresEventJournal(process.env.STEP4_TEST_DATABASE_URL!, fileURLToPath(new URL("../packages/db/migrations", import.meta.url)));
+    await journal.initialize();
+    const key = `pr18-pg-${Date.now()}`;
+    try {
+      const commit = await journal.commitDurableTransition({ operationKey: key, type: "POSITION_SETTLED", aggregateType: "position", aggregateId: key, payload: { experimentId: key, marketId: key } }, 0);
+      await journal.saveCheckpoint({ experimentId: key, sequence: 1, payload: { durableCursor: commit.sequence, ledger: { cash: "100", reservedCash: "0", startingBalance: "100" }, positions: [] } });
+      const compacted = await journal.compactDurableTransitionsThrough(commit.sequence, { maxRows: 1, batchSize: 1, maxReplayKeys: 8, maxBatches: 1, budgetMs: 1000 });
+      expect(compacted.deleted).toBe(1);
+      expect((await journal.readDurableByOperationKey(key))?.type).toBe("POSITION_SETTLED");
+    } finally {
+      await journal.close();
+    }
+  });
+
   it("uses a verified rollup for report reconstruction after canonical source cleanup", async () => {
     const journal = new MemoryEventJournal();
     const startedAt = "2026-01-01T00:00:00.000Z";
@@ -161,7 +245,10 @@ describe("PR18 hot operational storage lifecycle", () => {
     const journal = new MemoryEventJournal();
     const directory = await mkdtemp(join(tmpdir(), "pr18-archive-"));
     const result = await exportExperimentArchive(journal, { experimentId: "exp-pr18", directory, manifest: { test: true } });
-    expect(JSON.parse(await readFile(result.manifestPath, "utf8")).contentHash).toBe(result.contentHash);
+    const manifest = JSON.parse(await readFile(result.manifestPath, "utf8")) as Record<string, unknown>;
+    expect(manifest.contentHash).toBe(result.contentHash);
+    expect(typeof manifest.canonicalReportContentHash).toBe("string");
+    expect(typeof manifest.archiveBundleHash).toBe("string");
     expect((await readFile(result.summaryPath, "utf8")).length).toBeGreaterThan(0);
     expect((await readFile(result.reportPath, "utf8")).length).toBeGreaterThan(0);
   });

@@ -150,6 +150,20 @@ export const durableSequenceMetadata = pgTable("durable_sequence_metadata", {
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
+/** Indexed replay identities; payloads are intentionally excluded. */
+export const durableReplayKeys = pgTable("durable_replay_keys", {
+  operationKey: text("operation_key").primaryKey(),
+  type: text("type").notNull(),
+  aggregateType: text("aggregate_type").notNull(),
+  aggregateId: text("aggregate_id").notNull(),
+  payloadHash: text("payload_hash").notNull(),
+  sequence: bigint("sequence", { mode: "number" }).notNull(),
+  occurredAt: timestamp("occurred_at", { withTimezone: true }).notNull(),
+  recordedAt: timestamp("recorded_at", { withTimezone: true }).notNull(),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  lifecycleState: text("lifecycle_state").notNull().default("closed"),
+}, (table) => [index("durable_replay_keys_sequence_idx").on(table.sequence), index("durable_replay_keys_expiry_idx").on(table.expiresAt)]);
+
 /** Versioned, verified analytics accumulator; raw source may be deleted only after this row is durable. */
 export const experimentReportRollups = pgTable("experiment_report_rollups", {
   experimentId: text("experiment_id").notNull(),
@@ -158,6 +172,12 @@ export const experimentReportRollups = pgTable("experiment_report_rollups", {
   sourceCursor: bigint("source_cursor", { mode: "number" }).notNull(),
   sourceFenceId: text("source_fence_id"),
   sourceFenceOccurredAt: timestamp("source_fence_occurred_at", { withTimezone: true }),
+  sourceEventCount: integer("source_event_count").notNull().default(0),
+  sourceCommitSeq: bigint("source_commit_seq", { mode: "number" }).notNull().default(0),
+  sourceRecordedAt: timestamp("source_recorded_at", { withTimezone: true }),
+  stableRead: boolean("stable_read").notNull().default(false),
+  previousContentHash: text("previous_content_hash"),
+  coverageHash: text("coverage_hash"),
   accumulator: jsonb("accumulator").notNull(),
   contentHash: text("content_hash").notNull(),
   verified: boolean("verified").notNull().default(false),

@@ -126,8 +126,40 @@ export function hashCheckpointPayload(payload: Record<string, unknown>): string 
   return createHash("sha256").update(canonicalJson(content)).digest("hex");
 }
 
-export interface CompactedOperationKey extends DurableTransition {
+/** Recovery authority requires structural state invariants in addition to a hash. */
+export function isSemanticallyValidCheckpointPayload(payload: Record<string, unknown>): boolean {
+  if (!payload || typeof payload !== "object") return false;
+  const cursor = payload.durableCursor;
+  if (cursor != null && (typeof cursor !== "number" || !Number.isInteger(cursor) || cursor < 0)) return false;
+  const ledger = payload.ledger;
+  if (ledger == null) return true; // legacy checkpoints had no projected ledger
+  if (typeof ledger !== "object") return false;
+  const l = ledger as Record<string, unknown>;
+  for (const keys of [["cash", "cashUsd"], ["reservedCash", "reservedUsd"], ["startingBalance", "startingBalanceUsd"]]) {
+    const raw = l[keys[0]!] ?? l[keys[1]!];
+    if (raw == null) continue;
+    const value = Number(raw);
+    if (!Number.isFinite(value) || value < 0) return false;
+  }
+  for (const key of ["positions", "restingOrders", "activeTriggers", "grokSignals"]) {
+    if (payload[key] != null && !Array.isArray(payload[key])) return false;
+  }
+  return true;
+}
+
+/** Minimal replay identity retained after durable transition compaction. */
+export interface CompactedOperationKey {
+  operationKey: string;
+  type: string;
+  aggregateType: string;
+  aggregateId: string;
+  payloadHash: string;
+  sequence: number;
+  occurredAt: string;
+  recordedAt: string;
   expiresAt: string;
+  /** OPEN identities are pinned independently of TTL/pressure. */
+  lifecycleState?: "open" | "closed" | "historical";
 }
 
 export interface DurableCompactionResult {

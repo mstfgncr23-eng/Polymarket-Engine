@@ -9,7 +9,7 @@ import {
   type EngineEnv,
 } from "@pm/core";
 import { isCanonicalFinalReport, type EventJournal } from "@pm/db";
-import { loadVerifiedAnalyticsRollup } from "./final-report.js";
+import { loadVerifiedAnalyticsRollup, persistVerifiedAnalyticsRollup, streamExperimentSummary } from "./final-report.js";
 
 export interface RetentionConfig {
   enabled: boolean;
@@ -296,6 +296,40 @@ export class RetentionManager {
       // event and all newer tail rows hot for report reconstruction.
       if (
         this.config.analyticsRollupEnabled
+        && (context.experiment?.status === "RUNNING" || context.experiment?.status === "ENTRY_CLOSED")
+        && this.journal.persistAnalyticsRollup
+        && this.journal.deleteCanonicalEventsThrough
+        && context.experiment.startedAt
+        && Date.now() < budgetEnd
+      ) {
+        const streamed = await streamExperimentSummary(this.journal, { id: context.experiment.id, startedAt: context.experiment.startedAt }, { status: context.experiment.status === "RUNNING" ? "RUNNING" : "ENTRY_CLOSED", reportKind: "interim", metricsScope: "rolling", complete: false });
+        if (streamed.scan.fence.stable && streamed.accumulatorSnapshot) {
+          const rollup = await persistVerifiedAnalyticsRollup(this.journal, {
+            experimentId: context.experiment.id,
+            sourceCursor: await this.journal.latestDurableSequence(),
+            sourceFenceId: streamed.scan.fence.through?.id ?? null,
+            sourceFenceOccurredAt: streamed.scan.fence.through?.occurredAt ?? null,
+            sourceEventCount: streamed.accumulatorSnapshot.eventCount,
+            sourceCommitSeq: streamed.scan.fence.commitSeqTo,
+            sourceRecordedAt: streamed.scan.fence.recordedAtTo.toISOString(),
+            stableRead: streamed.scan.fence.stable,
+            accumulator: streamed.accumulatorSnapshot as unknown as Record<string, unknown>,
+          });
+          if (rollup?.verified && rollup.sourceFenceOccurredAt) {
+            await runBatch("canonical_report_input", (limit) => this.journal.deleteCanonicalEventsThrough!({
+              experimentId: context.experiment!.id,
+              occurredBefore: new Date(rollup.sourceFenceOccurredAt!),
+              limit,
+              sourceCursor: rollup.sourceCursor,
+              sourceCommitSeq: rollup.sourceCommitSeq,
+              sourceRecordedAt: rollup.sourceRecordedAt ? new Date(rollup.sourceRecordedAt) : undefined,
+            }));
+          }
+        }
+      }
+
+      if (
+        this.config.analyticsRollupEnabled
         && context.experiment?.status === "COMPLETED"
         && this.journal.loadAnalyticsRollup
         && this.journal.deleteCanonicalEventsThrough
@@ -307,6 +341,8 @@ export class RetentionManager {
             occurredBefore: new Date(rollup.sourceFenceOccurredAt!),
             limit,
             sourceCursor: rollup.sourceCursor,
+            sourceCommitSeq: rollup.sourceCommitSeq,
+            sourceRecordedAt: rollup.sourceRecordedAt ? new Date(rollup.sourceRecordedAt) : undefined,
           }));
         }
       }
@@ -328,6 +364,10 @@ export class RetentionManager {
           durableCompaction = await this.journal.compactDurableTransitionsThrough(cursor, {
             ttlMs: this.config.compactionReplayKeyTtlMs,
             maxReplayKeys: this.config.compactionReplayKeyLimit,
+            maxRows: this.config.maxRowsPerCycle - totalDeleted,
+            maxBatches: this.config.maxBatchesPerCycle - batchCount,
+            batchSize: this.config.batchSize,
+            budgetMs: Math.max(0, budgetEnd - Date.now()),
           });
         }
       }
