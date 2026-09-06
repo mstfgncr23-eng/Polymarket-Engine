@@ -147,11 +147,19 @@ describe("persistence admission keeps live inputs in memory", () => {
     const idleTrigger = monitoringTrigger("idle-admission-trigger", now);
     try {
       await engine.registerTriggerForResearch(idleTrigger);
-      await engine.submitGrokSignal(fairSubmission(idleTrigger, "idle-admission-submission"), "fair_probability_analyst");
+      const idleSubmission = fairSubmission(idleTrigger, "idle-admission-submission");
+      const beforeRetry = (await journal.readAll()).length;
+      expect(await engine.submitGrokSignal(idleSubmission, "fair_probability_analyst")).toMatchObject({ status: "accepted" });
+      expect(await engine.submitGrokSignal(idleSubmission, "fair_probability_analyst")).toEqual({ status: "duplicate" });
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        expect(await engine.submitGrokSignal(idleSubmission, "fair_probability_analyst")).toEqual({ status: "duplicate" });
+      }
       await drainRuntime(engine);
       expect(await journal.queryEvents({ types: [
         "TRIGGER_EVENT", "GROK_ACTIVATION_DECISION", "GROK_ACTIVATION_RESULT", "GROK_SIGNAL_ACCEPTED",
       ] })).toEqual([]);
+      expect(await journal.idempotencyCreatedAt("grok_signal_submission", "fair_probability_analyst:idle-admission-submission")).toBeNull();
+      expect((await journal.readAll()).length).toBe(beforeRetry);
 
       expect((await engine.beginExperiment()).ok).toBe(true);
       const runningTrigger = monitoringTrigger("running-admission-trigger", now + 1_000);
@@ -164,6 +172,22 @@ describe("persistence admission keeps live inputs in memory", () => {
       expect(events.some((event) => event.type === "TRIGGER_EVENT" && event.payload.experimentId === engine.experimentManifest()?.id)).toBe(true);
       expect(events.some((event) => event.type === "GROK_ACTIVATION_DECISION")).toBe(true);
       expect(events.some((event) => event.type === "GROK_SIGNAL_ACCEPTED")).toBe(true);
+    } finally {
+      await engine.stop();
+    }
+  });
+
+  it("requires the durable accepted fact for running-experiment duplicates", async () => {
+    const { engine, journal } = await startQualifiedEngine();
+    const trigger = monitoringTrigger("running-duplicate-trigger");
+    const runningSubmission = fairSubmission(trigger, "running-duplicate-submission");
+    try {
+      expect((await engine.beginExperiment()).ok).toBe(true);
+      await engine.registerTriggerForResearch(trigger);
+      expect(await engine.submitGrokSignal(runningSubmission, "fair_probability_analyst")).toMatchObject({ status: "accepted" });
+      expect(await engine.submitGrokSignal(runningSubmission, "fair_probability_analyst")).toEqual({ status: "duplicate" });
+      expect(await journal.idempotencyCreatedAt("grok_signal_submission", "fair_probability_analyst:running-duplicate-submission")).toBeTruthy();
+      expect(await journal.queryEvents({ types: ["GROK_SIGNAL_ACCEPTED"] })).toHaveLength(1);
     } finally {
       await engine.stop();
     }

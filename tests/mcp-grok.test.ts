@@ -99,7 +99,7 @@ describe("Grok signal inbox", () => {
 
     const first = submission(trigger, "market_microstructure_scanner", microstructureOutput());
     expect(await engine.submitGrokSignal(first, "market_microstructure_scanner")).toMatchObject({ status: "accepted" });
-    await expect(engine.submitGrokSignal(first, "market_microstructure_scanner")).rejects.toThrow("GROK_SUBMISSION_CANONICAL_FACT_MISSING");
+    expect(await engine.submitGrokSignal(first, "market_microstructure_scanner")).toEqual({ status: "duplicate" });
     expect(engine.ledger.positions.size).toBe(0);
     expect(await engine.submitGrokSignal(submission(trigger, "fair_probability_analyst", fairOutput()), "market_microstructure_scanner")).toMatchObject({ status: "identity_mismatch" });
   });

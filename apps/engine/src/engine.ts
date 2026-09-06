@@ -153,6 +153,10 @@ function isJournalAdmissionRejectedError(error: unknown): boolean {
     || (Boolean(error) && typeof error === "object" && (error as { name?: string }).name === "JournalAdmissionRejected");
 }
 
+const IDLE_GROK_IDEMPOTENCY_MAX = 4_096;
+const IDLE_GROK_IDEMPOTENCY_TTL_MS = 5 * 60_000;
+type IdleGrokSubmission = { observedAt: number; pending: boolean };
+
 export class EngineService {
   readonly metrics = new EngineMetrics();
   readonly sse: SseHub;
@@ -246,6 +250,12 @@ export class EngineService {
   private sourceSealFlight: Promise<{ sealed: boolean; reason: string | null }> | null = null;
   private researchIngressInFlight = 0;
   private grokClaimHold: Promise<void> | null = null;
+  /**
+   * Idle monitoring deliberately has no durable canonical Grok fact. Keep a
+   * bounded process-local claim set for exact live retries and concurrent
+   * duplicate suppression; active experiment submissions use the journal.
+   */
+  private readonly idleGrokSubmissions = new Map<string, IdleGrokSubmission>();
   private readonly reportSourceIntegrity = new Map<string, ReportSourceIntegrityFault>();
   private readonly persistedIntegrityFaults = new WeakSet<ReportSourceIntegrityFault>();
   private referenceTelemetryHoldForTest: Promise<void> | null = null;
@@ -538,6 +548,7 @@ export class EngineService {
       }),
       checkpoint: true,
       afterApply: async () => {
+        this.idleGrokSubmissions.clear();
         this.reportGenerated = false;
         this.abortSourceSealPersist();
         this.sourceSealed = false;
@@ -1657,79 +1668,106 @@ export class EngineService {
       if (this.researchIngressStale(ingress.generation)) return rejectSealed();
       if (this.grokClaimHold) await this.grokClaimHold;
       if (this.researchIngressStale(ingress.generation)) return rejectSealed();
-      const claimed = await this.journal.claimIdempotency("grok_signal_submission", `${clientId}:${submission.submissionId}`);
-      this.assertResearchIntegrity();
-      if (!claimed) {
-        // A claim proves admission only, including across a crash before append.
-        // Check every canonical fact required by this submission with bounded trace
-        // pages (also works for old IDs). The proposal is linked to the accepted
-        // signal by the same trace and aggregate identity.
-        const requiresStrategyProposal = submission.agentId === "strategy_supervisor"
-          && submission.output.proposedChange !== null;
-        let acceptedEvent: JournalEvent | undefined;
-        const strategyProposalAggregateIds = new Set<string>();
-        let after: Parameters<EventJournal["readTracePage"]>[1]["after"];
-        do {
-          const page = await this.journal.readTracePage(submission.traceId, { after, limit: 128 });
-          for (const event of page.events) {
-            if (event.type === "STRATEGY_CHANGE_PROPOSED" && event.traceId === submission.traceId) {
-              strategyProposalAggregateIds.add(event.aggregateId);
-            }
-            if (!acceptedEvent && event.type === "GROK_SIGNAL_ACCEPTED"
-              && event.traceId === submission.traceId
-              && event.payload.clientId === clientId && event.payload.submissionId === submission.submissionId) {
-              acceptedEvent = event;
-            }
-          }
-          after = page.nextCursor ?? undefined;
-          const proposalPersisted = acceptedEvent !== undefined && strategyProposalAggregateIds.has(acceptedEvent.aggregateId);
-          if (acceptedEvent !== undefined && (!requiresStrategyProposal || proposalPersisted)) break;
-        } while (after);
-        this.assertResearchIntegrity();
-        const proposalPersisted = acceptedEvent !== undefined && strategyProposalAggregateIds.has(acceptedEvent.aggregateId);
-        if (acceptedEvent === undefined || (requiresStrategyProposal && !proposalPersisted)) {
-          // This can also be a concurrent claim whose first caller is still
-          // persisting one of its canonical facts. Reject the unproven duplicate
-          // without poisoning that caller. An actual total persistence failure
-          // installs the sticky fail-closed state in safeAppend; restart still
-          // cannot accept this claim.
-          throw new Error("GROK_SUBMISSION_CANONICAL_FACT_MISSING");
-        }
+      const idempotencyKey = `${clientId}:${submission.submissionId}`;
+      const idleAdmission = !this.isExperimentWindowOpen();
+      let idleReservation = false;
+      const duplicate = (): { status: "duplicate" } => {
         this.state.recordGrokRejection("duplicate");
         this.metrics.grokSignals.inc({ agent: submission.agentId, status: "duplicate" });
         return { status: "duplicate" };
-      }
-      // Recheck the experiment-scoped fence immediately before irreversible accept.
-      if (this.researchIngressStale(ingress.generation) || !this.isTriggerActionable(trigger.id)) {
-        this.state.recordGrokRejection("rejected");
-        this.metrics.grokSignals.inc({ agent: submission.agentId, status: this.researchIngressStale(ingress.generation) ? "source_sealed" : "stale" });
-        return { status: this.researchIngressStale(ingress.generation) ? "source_sealed" : "stale" };
+      };
+      if (idleAdmission) {
+        // Idle monitoring intentionally does not create durable idempotency
+        // claims because its canonical accepted fact is not persisted. A
+        // bounded live reservation still makes exact retries deterministic and
+        // suppresses concurrent duplicates within this process.
+        idleReservation = this.reserveIdleGrokSubmission(idempotencyKey, now.getTime());
+        if (!idleReservation) return duplicate();
+        this.assertResearchIntegrity();
+      } else {
+        const claimed = await this.journal.claimIdempotency("grok_signal_submission", idempotencyKey);
+        this.assertResearchIntegrity();
+        if (!claimed) {
+          // A claim proves admission only, including across a crash before append.
+          // Check every canonical fact required by this submission with bounded trace
+          // pages (also works for old IDs). The proposal is linked to the accepted
+          // signal by the same trace and aggregate identity.
+          const requiresStrategyProposal = submission.agentId === "strategy_supervisor"
+            && submission.output.proposedChange !== null;
+          let acceptedEvent: JournalEvent | undefined;
+          const strategyProposalAggregateIds = new Set<string>();
+          let after: Parameters<EventJournal["readTracePage"]>[1]["after"];
+          do {
+            const page = await this.journal.readTracePage(submission.traceId, { after, limit: 128 });
+            for (const event of page.events) {
+              if (event.type === "STRATEGY_CHANGE_PROPOSED" && event.traceId === submission.traceId) {
+                strategyProposalAggregateIds.add(event.aggregateId);
+              }
+              if (!acceptedEvent && event.type === "GROK_SIGNAL_ACCEPTED"
+                && event.traceId === submission.traceId
+                && event.payload.clientId === clientId && event.payload.submissionId === submission.submissionId) {
+                acceptedEvent = event;
+              }
+            }
+            after = page.nextCursor ?? undefined;
+            const proposalPersisted = acceptedEvent !== undefined && strategyProposalAggregateIds.has(acceptedEvent.aggregateId);
+            if (acceptedEvent !== undefined && (!requiresStrategyProposal || proposalPersisted)) break;
+          } while (after);
+          this.assertResearchIntegrity();
+          const proposalPersisted = acceptedEvent !== undefined && strategyProposalAggregateIds.has(acceptedEvent.aggregateId);
+          if (acceptedEvent === undefined || (requiresStrategyProposal && !proposalPersisted)) {
+            // This can also be a concurrent claim whose first caller is still
+            // persisting one of its canonical facts. Reject the unproven duplicate
+            // without poisoning that caller. An actual total persistence failure
+            // installs the sticky fail-closed state in safeAppend; restart still
+            // cannot accept this claim.
+            throw new Error("GROK_SUBMISSION_CANONICAL_FACT_MISSING");
+          }
+          return duplicate();
+        }
       }
 
-      const signal: GrokSignalEnvelope = grokSignalEnvelopeSchema.parse({
-        signalId: createId("grok_signal"), submissionId: submission.submissionId, traceId: submission.traceId,
-        triggerId: submission.triggerId, correlationId: submission.correlationId, marketId: submission.marketId,
-        asset: submission.asset ?? trigger.asset ?? null,
-        agentId: submission.agentId, role: submission.role, provider: "grok_bot_mcp", clientId,
-        receivedAt: now.toISOString(), timestamp: submission.timestamp, output: submission.output, resultingDecision: null,
-      });
-      if (this.researchIngressStale(ingress.generation)) return rejectSealed();
-      await this.persistReportInput(createJournalEvent({ traceId: signal.traceId, type: "GROK_SIGNAL_ACCEPTED", aggregateType: "grok_signal", aggregateId: signal.signalId, payload: signal }));
-      if (submission.agentId === "strategy_supervisor" && submission.output.proposedChange) {
-        await this.persistReportInput(createJournalEvent({ traceId: signal.traceId, type: "STRATEGY_CHANGE_PROPOSED", aggregateType: "strategy_change", aggregateId: signal.signalId, payload: submission.output.proposedChange }));
+      try {
+        // Recheck the experiment-scoped fence immediately before irreversible accept.
+        if (this.researchIngressStale(ingress.generation) || !this.isTriggerActionable(trigger.id)) {
+          if (idleReservation) this.releaseIdleGrokSubmission(idempotencyKey);
+          this.state.recordGrokRejection("rejected");
+          this.metrics.grokSignals.inc({ agent: submission.agentId, status: this.researchIngressStale(ingress.generation) ? "source_sealed" : "stale" });
+          return { status: this.researchIngressStale(ingress.generation) ? "source_sealed" : "stale" };
+        }
+
+        const signal: GrokSignalEnvelope = grokSignalEnvelopeSchema.parse({
+          signalId: createId("grok_signal"), submissionId: submission.submissionId, traceId: submission.traceId,
+          triggerId: submission.triggerId, correlationId: submission.correlationId, marketId: submission.marketId,
+          asset: submission.asset ?? trigger.asset ?? null,
+          agentId: submission.agentId, role: submission.role, provider: "grok_bot_mcp", clientId,
+          receivedAt: now.toISOString(), timestamp: submission.timestamp, output: submission.output, resultingDecision: null,
+        });
+        if (this.researchIngressStale(ingress.generation)) {
+          if (idleReservation) this.releaseIdleGrokSubmission(idempotencyKey);
+          return rejectSealed();
+        }
+        await this.persistReportInput(createJournalEvent({ traceId: signal.traceId, type: "GROK_SIGNAL_ACCEPTED", aggregateType: "grok_signal", aggregateId: signal.signalId, payload: signal }));
+        if (submission.agentId === "strategy_supervisor" && submission.output.proposedChange) {
+          await this.persistReportInput(createJournalEvent({ traceId: signal.traceId, type: "STRATEGY_CHANGE_PROPOSED", aggregateType: "strategy_change", aggregateId: signal.signalId, payload: submission.output.proposedChange }));
+        }
+        this.assertResearchIntegrity();
+        const byRole = this.signalsByTrigger.get(trigger.id) ?? new Map<ExternalAgentRoleId, GrokSignalEnvelope>();
+        byRole.set(signal.agentId, signal);
+        this.signalsByTrigger.set(trigger.id, byRole);
+        this.signalReceivedTimes.push(now.getTime());
+        this.state.addGrokSignal(signal);
+        this.activation.noteSignal(trigger.id, now);
+        this.state.setActivationLatency(this.activation.snapshot());
+        this.metrics.grokSignals.inc({ agent: signal.agentId, status: "accepted" });
+        this.record(`${signal.agentId.toUpperCase()}_COMPLETE`, signal.traceId, trigger.marketId, { signalId: signal.signalId, clientId, confidence: submission.output.confidence, expiresAt: submission.output.expiresAt }, trigger.asset ?? null);
+        await this.evaluateExternalConsensus(trigger);
+        if (idleReservation) this.completeIdleGrokSubmission(idempotencyKey, now.getTime());
+        return { status: "accepted", signalId: signal.signalId };
+      } catch (error) {
+        if (idleReservation) this.releaseIdleGrokSubmission(idempotencyKey);
+        throw error;
       }
-      this.assertResearchIntegrity();
-      const byRole = this.signalsByTrigger.get(trigger.id) ?? new Map<ExternalAgentRoleId, GrokSignalEnvelope>();
-      byRole.set(signal.agentId, signal);
-      this.signalsByTrigger.set(trigger.id, byRole);
-      this.signalReceivedTimes.push(now.getTime());
-      this.state.addGrokSignal(signal);
-      this.activation.noteSignal(trigger.id, now);
-      this.state.setActivationLatency(this.activation.snapshot());
-      this.metrics.grokSignals.inc({ agent: signal.agentId, status: "accepted" });
-      this.record(`${signal.agentId.toUpperCase()}_COMPLETE`, signal.traceId, trigger.marketId, { signalId: signal.signalId, clientId, confidence: submission.output.confidence, expiresAt: submission.output.expiresAt }, trigger.asset ?? null);
-      await this.evaluateExternalConsensus(trigger);
-      return { status: "accepted", signalId: signal.signalId };
     } finally {
       this.endResearchIngress();
     }
@@ -2163,6 +2201,37 @@ export class EngineService {
   private isExperimentWindowOpen(): boolean {
     const status = this.experiment?.status;
     return status === "RUNNING" || status === "ENTRY_CLOSED";
+  }
+
+  private pruneIdleGrokSubmissions(nowMs: number): void {
+    for (const [key, entry] of this.idleGrokSubmissions) {
+      if (nowMs - entry.observedAt > IDLE_GROK_IDEMPOTENCY_TTL_MS) this.idleGrokSubmissions.delete(key);
+    }
+    while (this.idleGrokSubmissions.size > IDLE_GROK_IDEMPOTENCY_MAX) {
+      const oldest = this.idleGrokSubmissions.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.idleGrokSubmissions.delete(oldest);
+    }
+  }
+
+  private reserveIdleGrokSubmission(key: string, nowMs: number): boolean {
+    this.pruneIdleGrokSubmissions(nowMs);
+    if (this.idleGrokSubmissions.has(key)) return false;
+    this.idleGrokSubmissions.set(key, { observedAt: nowMs, pending: true });
+    this.pruneIdleGrokSubmissions(nowMs);
+    return this.idleGrokSubmissions.has(key);
+  }
+
+  private completeIdleGrokSubmission(key: string, nowMs: number): void {
+    const entry = this.idleGrokSubmissions.get(key);
+    if (entry?.pending) {
+      entry.pending = false;
+      entry.observedAt = nowMs;
+    }
+  }
+
+  private releaseIdleGrokSubmission(key: string): void {
+    if (this.idleGrokSubmissions.get(key)?.pending) this.idleGrokSubmissions.delete(key);
   }
 
   private isCanonicalWindowAdmission(type: string): boolean {
