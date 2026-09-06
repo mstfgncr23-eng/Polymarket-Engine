@@ -378,7 +378,9 @@ describe("PR18 hot operational storage lifecycle", () => {
       const checkpoints = await journal.listCheckpoints();
       await journal.saveCheckpoint({
         experimentId: idle.id,
-        sequence: (checkpoints.at(-1)?.sequence ?? 0) + 1,
+        // listCheckpoints is newest-first; advance from the newest sequence so
+        // this fence is the authoritative recovery checkpoint in a shared CI DB.
+        sequence: (checkpoints[0]?.sequence ?? 0) + 1,
         payload: {
           schemaVersion: 2,
           durableCursor: commit.sequence,
