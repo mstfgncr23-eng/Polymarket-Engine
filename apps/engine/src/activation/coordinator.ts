@@ -101,7 +101,13 @@ export class GrokActivationCoordinator {
     }
     const fanout = Math.max(1, this.limits.fanout ?? 3);
     const results: GrokActivationResult[] = [];
-    const roles = [...request.targetRoles];
+    // Scouts warm the process-local research cache before the single Alpha
+    // synthesis call. Auxiliary risk/supervisor roles remain available for
+    // audit, but are kept out of the Alpha critical section.
+    const scouts = request.targetRoles.filter((role) => ["market_microstructure_scanner", "crypto_market_scanner", "news_x_intelligence_scanner"].includes(role as string));
+    const alpha = request.targetRoles.filter((role) => role === "fair_probability_analyst");
+    const auxiliary = request.targetRoles.filter((role) => !scouts.some((scout) => scout === role) && !alpha.some((item) => item === role));
+    const roles = [...scouts, ...alpha, ...auxiliary];
     for (let i = 0; i < roles.length; i += fanout) {
       const slice = roles.slice(i, i + fanout);
       const batch = await Promise.all(slice.map(async (role) => {
@@ -203,6 +209,16 @@ export class GrokActivationCoordinator {
   footprint(): { sent: number; lastByMarketAsset: number; latency: number; recent: number } {
     this.prune();
     return { sent: this.sent.size, lastByMarketAsset: this.lastByMarketAsset.size, latency: this.latency.size, recent: this.recentCount() };
+  }
+
+  runtimeMetricsSnapshot(): unknown[] {
+    const bridge = this.bridge as GrokActivationBridge & { metricsSnapshot?: () => unknown[] };
+    return bridge.metricsSnapshot?.() ?? [];
+  }
+
+  runtimeBudgetSnapshot(): { limit: number; used: number; remaining: number } | null {
+    const bridge = this.bridge as GrokActivationBridge & { budgetSnapshot?: () => { limit: number; used: number; remaining: number } };
+    return bridge.budgetSnapshot?.() ?? null;
   }
 
   private evictLatencyIfNeeded(): void {

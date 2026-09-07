@@ -11,6 +11,9 @@ export interface StrategyCandidate {
   quantity: string;
   limitPrice: string;
   intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG";
+  /** Raw expected value in USD/share for a $1 binary payout. */
+  rawEdgeUsdPerShare?: number;
+  /** @deprecated Compatibility alias for rawEdgeUsdPerShare. */
   rawExpectedEdge: number;
   reasonCodes: string[];
 }
@@ -20,6 +23,7 @@ export interface StrategyContext {
   snapshots: Record<Outcome, MarketSnapshot | null>;
   position: Position | null;
   maxOrderSizeUsd: number;
+  /** Minimum locked pair value in USD/share for a $1 binary payout. */
   minimumLockedPairEdge: number;
 }
 
@@ -49,7 +53,7 @@ export class TemporalPairHedgeStrategy implements Strategy {
       return {
         strategyId: this.id, strategyVersion: this.version, marketId: snapshot.marketId,
         tokenId: snapshot.tokenId, outcome: hedgeOutcome, side: "BUY", quantity, limitPrice: ask.price,
-        intent: "HEDGE_SECOND_LEG", rawExpectedEdge: lockedEdge,
+        intent: "HEDGE_SECOND_LEG", rawEdgeUsdPerShare: lockedEdge, rawExpectedEdge: lockedEdge,
         reasonCodes: ["UNPAIRED_INVENTORY", "LOCKABLE_PAIR_EDGE"],
       };
     }
@@ -63,7 +67,7 @@ export class TemporalPairHedgeStrategy implements Strategy {
     return {
       strategyId: this.id, strategyVersion: this.version, marketId: snapshot.marketId,
       tokenId: snapshot.tokenId, outcome, side: "BUY", quantity, limitPrice: ask.price,
-      intent: "OPEN_FIRST_LEG", rawExpectedEdge: context.consensus.estimatedEdge,
+      intent: "OPEN_FIRST_LEG", rawEdgeUsdPerShare: context.consensus.estimatedEdge, rawExpectedEdge: context.consensus.estimatedEdge,
       reasonCodes: ["CONSENSUS_DIRECTION", "TEMPORAL_FIRST_LEG"],
     };
   }

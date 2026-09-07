@@ -11,6 +11,7 @@ export const riskLimitsSchema = z.object({
   maxDailyPaperLossUsd: z.number().positive().default(50),
   maxDrawdownUsd: z.number().positive().default(100),
   minLiquidityUsd: z.number().nonnegative().default(100),
+  /** Minimum net expected value in USD/share for a $1 binary payout. */
   minExpectedEdge: z.number().min(0).max(1).default(0.015),
   maxSpread: z.number().min(0).max(1).default(0.08),
   minSignalConfidence: z.number().min(0).max(1).default(0.6),
@@ -78,10 +79,28 @@ export const engineEnvSchema = z.object({
   GROK_MCP_BEARER_TOKENS: z.string().default(""),
   GROK_MCP_ALLOWED_ORIGINS: z.string().default("https://grok.com,https://x.ai"),
   GROK_MCP_RATE_LIMIT_PER_MINUTE: z.coerce.number().int().positive().default(60),
-  GROK_ACTIVATION_PROVIDER: z.enum(["noop", "slack"]).default("noop"),
+  /** Safe by default: xAI inference is explicit opt-in and never enabled by a key alone. */
+  GROK_ACTIVATION_PROVIDER: z.enum(["noop", "slack", "xai"]).default("noop"),
   SLACK_BOT_TOKEN: z.string().optional(),
   SLACK_CHANNEL_ID: z.string().optional(),
   SLACK_API_URL: z.string().url().default("https://slack.com/api/chat.postMessage"),
+  XAI_API_KEY: z.string().optional(),
+  XAI_API_BASE_URL: z.string().url().default("https://api.x.ai/v1"),
+  /** Required explicitly when xAI is selected; safe noop mode needs no model. */
+  XAI_MODEL: z.string().min(1).optional(),
+  XAI_REQUEST_TIMEOUT_MS: z.coerce.number().int().positive().max(120_000).default(20_000),
+  XAI_MAX_OUTPUT_TOKENS: z.coerce.number().int().positive().max(16_384).default(1_024),
+  /** Separate explicit gate for sending paper portfolio context to xAI. */
+  XAI_ALLOW_PORTFOLIO_CONTEXT: z.preprocess(
+    (value) => value === undefined ? undefined : value === true || value === "true" || value === "1",
+    z.boolean().optional(),
+  ).default(false),
+  XAI_SCOUT_CACHE_MAX_ENTRIES: z.coerce.number().int().positive().max(2_048).default(128),
+  /** Shared actual xAI role-inference attempts per rolling minute, retries included. */
+  XAI_MAX_ROLE_CALLS_PER_MINUTE: z.coerce.number().int().positive().max(240).default(24),
+  XAI_SCOUT_MICRO_TTL_MS: z.coerce.number().int().positive().max(120_000).default(5_000),
+  XAI_SCOUT_CRYPTO_TTL_MS: z.coerce.number().int().positive().max(300_000).default(15_000),
+  XAI_SCOUT_NEWS_TTL_MS: z.coerce.number().int().positive().max(3_600_000).default(60_000),
   DISCOVERY_INTERVAL_MS: z.coerce.number().int().positive().default(300_000),
   MAX_QUALIFIED_MARKETS: z.coerce.number().int().positive().default(40),
   ESTIMATED_INFRA_COST_PER_HOUR_USD: z.coerce.number().nonnegative().default(0.08),

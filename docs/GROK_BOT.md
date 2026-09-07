@@ -105,6 +105,7 @@ The engine defines `GrokActivationBridge`. Core trigger/consensus/risk code does
 |---|---|---|---|
 | `NoopGrokActivationBridge` | `GROK_ACTIVATION_PROVIDER=noop` (default) | Records a skipped activation. Monitoring continues. | Not a fake Grok signal, consensus, or paper order. |
 | `SlackGrokActivationBridge` | `GROK_ACTIVATION_PROVIDER=slack` plus engine-only `SLACK_BOT_TOKEN` and `SLACK_CHANNEL_ID` | Posts a **minimal wake-signal** per target role: `eventType, triggerId, traceId, marketId, asset, severity, triggerKind, createdAt, expiresAt, targetRoles`. Canonical research stays on MCP. | Adapter HTTP `ok` is **not** an observed Grok wake. Official docs do not prove that a programmatic Slack bot post (vs a human message) fires a Cursor-account routine. |
+| `XaiGrokActivationBridge` | `GROK_ACTIVATION_PROVIDER=xai` plus engine-only `XAI_API_KEY` | Runs the selected registered role with bounded xAI structured output, validates the role schema locally, and submits through the existing `submitGrokSignal` path. | Explicit opt-in only; default remains `noop`. `XAI_ALLOW_PORTFOLIO_CONTEXT` defaults false and gates paper portfolio fields to the risk role. News/X research is disabled (`researchToolsAvailable=false`) until a safe provider tool contract is added. |
 
 Bot-to-Bot fan-out is **not** used: MCP cannot send those messages, and a dispatcher Bot would add hops without validated product behavior. Role-specific Slack posts are used instead of waking all six Bots.
 
@@ -134,4 +135,45 @@ Latency timestamps persisted: `triggerCreatedAt`, `activationRequestedAt`, `acti
 
 Thousands of ticks are filtered deterministically. Only qualifying triggers request activation.
 
+The opt-in xAI runtime keeps scout research in a bounded process-local cache.
+Market/book precursors refresh `market_microstructure_scanner`; reference
+precursors refresh `crypto_market_scanner`. News refresh requires an actual
+bounded news context, so ordinary market and reference traffic never spends a
+call for a synthetic "no news" result. Each role is scheduled due before its
+own usable TTL expires, independently of the economic trigger cooldown.
+`XAI_MAX_ROLE_CALLS_PER_MINUTE` is a shared rolling budget of actual model
+attempts; retries consume additional units and exhausted budgets fail closed.
+
+With the default 5s micro TTL and 15s crypto TTL, the bounded headroom policy
+(`TTL/3`, capped at 2s) makes the earliest refresh intervals about 3.333s and
+13s. One continuously active market therefore needs at most about 18.00
+micro attempts/minute plus 4.62 crypto attempts/minute, or 22.62 scout
+attempts/minute before Alpha calls or retries. The default 24-attempt budget
+leaves little multi-market/Alpha headroom; exhausted calls remain fail closed.
+This relationship is a paper-calibration parameter after merge, not a reason
+to bypass the provider-call cap.
+
 Do not mix grok.com custom MCP or Grok Build hooks (outbound) into this as if they wake Grok Bot.
+
+## Deterministic execution economics
+
+For a binary market with a $1 payout, the engine's canonical edge unit is USD
+per share (the same numeric scale as probability points):
+
+| Field | Unit |
+|---|---|
+| `rawEdgeUsdPerShare` | fair probability for the traded outcome minus the current executable price |
+| `costUsdPerShare` | fee and slippage totals divided by executable quantity |
+| `netEvUsdPerShare` | raw edge minus cost per share; `MIN_EXPECTED_EDGE` uses this net unit |
+| `grossEvUsdTotal` / `netEvUsdTotal` | the corresponding per-share value multiplied by quantity |
+| `executableNotionalUsd` | executable quantity multiplied by executable price |
+| `expectedROI` | net expected value total divided by executable notional |
+
+The deterministic engine computes fees, slippage, net expected value, and ROI.
+Alpha supplies a fair probability; when it submits the opposite binary outcome,
+the engine explicitly applies the complement and records that fact in
+calibration.
+
+Calibration also records `executionStyle`. Taker orders expose
+`takerExecutableVwap`; maker orders expose `makerLimitPrice` and the separate
+`takerReferenceVwap`. A maker limit is not labeled as immediately executable.

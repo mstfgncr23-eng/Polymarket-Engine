@@ -15,6 +15,8 @@ export const grokActivationRequestSchema = z.object({
   createdAt: timestampSchema,
   expiresAt: timestampSchema,
   targetRoles: z.array(externalAgentRoleIdSchema).min(1).max(6),
+  /** Internal bounded scout warming; it never becomes an economic trigger. */
+  researchRefresh: z.boolean().default(false),
 }).strict();
 export type GrokActivationRequest = z.infer<typeof grokActivationRequestSchema>;
 
@@ -64,6 +66,7 @@ export function activationRequestFromTrigger(trigger: TriggerEvent): GrokActivat
     createdAt: trigger.createdAt,
     expiresAt: trigger.expiresAt,
     targetRoles: roles.length > 0 ? roles : ["strategy_supervisor"],
+    researchRefresh: false,
   });
 }
 

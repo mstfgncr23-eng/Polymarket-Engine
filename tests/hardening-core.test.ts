@@ -182,6 +182,9 @@ describe("I fair probability is diagnostic only", () => {
       consensus: { consensusDirection: "UP" }, snapshot: book, quantity: "5",
     });
     expect(result?.rawEdge).toBeCloseTo(0.01, 8);
+    expect(result?.rawEdgeUsdPerShare).toBeCloseTo(0.01, 8);
+    expect(result?.fairProbabilityForTradedOutcome).toBeCloseTo(0.50, 8);
+    expect(result?.usedComplement).toBe(false);
     expect(result?.estimatedEdgeIgnored).toBe(0.90);
     expect(result?.bookMarketProbability).toBe(0.49);
   });
@@ -194,6 +197,8 @@ describe("I fair probability is diagnostic only", () => {
     });
     expect(result?.usedComplement).toBe(true);
     expect(result?.fairProbabilityForConsensus).toBeCloseTo(0.70, 8);
+    expect(result?.fairProbabilityForTradedOutcome).toBeCloseTo(0.70, 8);
+    expect(result?.rawEdgeUsdPerShare).toBeCloseTo(0.30, 8);
     expect(result?.rawEdge).toBeCloseTo(0.30, 8);
   });
 
@@ -226,7 +231,17 @@ describe("I fair probability is diagnostic only", () => {
       },
     });
     expect(decision.rawEdge).toBe(0.02);
+    expect(decision.rawEdgeUsdPerShare).toBe(0.02);
+    expect(decision.quantity).toBe("10");
+    expect(decision.executableNotionalUsd).toBe("5");
+    expect(decision.feeUsdPerShare).not.toBeNull();
+    expect(decision.costUsdPerShare).not.toBeNull();
+    expect(decision.grossEvUsdTotal).toBe("0.2");
+    expect(decision.netEvUsdTotal).not.toBeNull();
+    expect(decision.expectedROI).toBeCloseTo(Number(decision.netEvUsdTotal) / Number(decision.executableNotionalUsd), 8);
+    expect(Number(decision.netEvUsdTotal)).toBeCloseTo(decision.netEvUsdPerShare * 10, 8);
     expect(decision.netExpectedEdge).toBeLessThan(0.015);
+    expect(decision.netEvUsdPerShare).toBe(decision.netExpectedEdge);
     expect(decision.risk.vetoes).toContain("MINIMUM_EXPECTED_EDGE");
   });
 });

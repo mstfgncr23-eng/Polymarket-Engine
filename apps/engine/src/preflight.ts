@@ -76,9 +76,14 @@ export function evaluateExperimentPreflight(input: {
   const requireGrok = grokPaper || input.env.EXPERIMENT_REQUIRES_GROK;
   if (requireGrok) {
     if (input.env.GROK_ACTIVATION_PROVIDER === "noop") blockers.push("GROK_ACTIVATION_NOOP");
-    if (missingRoles.length > 0) blockers.push("GROK_MCP_ROLES_INCOMPLETE");
+    // The in-process xAI runtime uses the EngineService binding directly;
+    // MCP bearer roles are required only for the Slack/MCP activation path.
+    if (input.env.GROK_ACTIVATION_PROVIDER !== "xai" && missingRoles.length > 0) blockers.push("GROK_MCP_ROLES_INCOMPLETE");
     if (input.env.GROK_ACTIVATION_PROVIDER === "slack" && (!input.env.SLACK_BOT_TOKEN || !input.env.SLACK_CHANNEL_ID)) {
       blockers.push("SLACK_ACTIVATION_UNCONFIGURED");
+    }
+    if (input.env.GROK_ACTIVATION_PROVIDER === "xai" && (!input.env.XAI_API_KEY || !input.env.XAI_MODEL)) {
+      blockers.push("XAI_ACTIVATION_UNCONFIGURED");
     }
   } else if (input.env.GROK_ACTIVATION_PROVIDER === "noop") {
     warnings.push("GROK_WAKE_NOT_VALIDATED");
