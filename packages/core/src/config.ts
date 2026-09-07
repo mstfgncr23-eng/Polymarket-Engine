@@ -96,6 +96,8 @@ export const engineEnvSchema = z.object({
     z.boolean().optional(),
   ).default(false),
   XAI_SCOUT_CACHE_MAX_ENTRIES: z.coerce.number().int().positive().max(2_048).default(128),
+  /** Shared actual xAI role-inference attempts per rolling minute, retries included. */
+  XAI_MAX_ROLE_CALLS_PER_MINUTE: z.coerce.number().int().positive().max(240).default(24),
   XAI_SCOUT_MICRO_TTL_MS: z.coerce.number().int().positive().max(120_000).default(5_000),
   XAI_SCOUT_CRYPTO_TTL_MS: z.coerce.number().int().positive().max(300_000).default(15_000),
   XAI_SCOUT_NEWS_TTL_MS: z.coerce.number().int().positive().max(3_600_000).default(60_000),

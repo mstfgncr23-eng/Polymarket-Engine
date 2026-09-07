@@ -135,6 +135,15 @@ Latency timestamps persisted: `triggerCreatedAt`, `activationRequestedAt`, `acti
 
 Thousands of ticks are filtered deterministically. Only qualifying triggers request activation.
 
+The opt-in xAI runtime keeps scout research in a bounded process-local cache.
+Market/book precursors refresh `market_microstructure_scanner`; reference
+precursors refresh `crypto_market_scanner`. News refresh requires an actual
+bounded news context, so ordinary market and reference traffic never spends a
+call for a synthetic "no news" result. Each role is scheduled due before its
+own usable TTL expires, independently of the economic trigger cooldown.
+`XAI_MAX_ROLE_CALLS_PER_MINUTE` is a shared rolling budget of actual model
+attempts; retries consume additional units and exhausted budgets fail closed.
+
 Do not mix grok.com custom MCP or Grok Build hooks (outbound) into this as if they wake Grok Bot.
 
 ## Deterministic execution economics
@@ -155,3 +164,7 @@ The deterministic engine computes fees, slippage, net expected value, and ROI.
 Alpha supplies a fair probability; when it submits the opposite binary outcome,
 the engine explicitly applies the complement and records that fact in
 calibration.
+
+Calibration also records `executionStyle`. Taker orders expose
+`takerExecutableVwap`; maker orders expose `makerLimitPrice` and the separate
+`takerReferenceVwap`. A maker limit is not labeled as immediately executable.

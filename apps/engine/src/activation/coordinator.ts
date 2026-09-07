@@ -216,6 +216,11 @@ export class GrokActivationCoordinator {
     return bridge.metricsSnapshot?.() ?? [];
   }
 
+  runtimeBudgetSnapshot(): { limit: number; used: number; remaining: number } | null {
+    const bridge = this.bridge as GrokActivationBridge & { budgetSnapshot?: () => { limit: number; used: number; remaining: number } };
+    return bridge.budgetSnapshot?.() ?? null;
+  }
+
   private evictLatencyIfNeeded(): void {
     const limit = this.limits.memoryLimit ?? 500;
     while (this.latency.size > limit && this.latencyHead < this.latencyOrder.length) {

@@ -18,6 +18,7 @@ export function createGrokActivationBridge(env: EngineEnv, fetchImpl: typeof fet
     return new XaiGrokActivationBridge({
       apiKey: env.XAI_API_KEY, baseUrl: env.XAI_API_BASE_URL, model: env.XAI_MODEL,
       timeoutMs: env.XAI_REQUEST_TIMEOUT_MS, maxOutputTokens: env.XAI_MAX_OUTPUT_TOKENS,
+      maxRoleCallsPerMinute: env.XAI_MAX_ROLE_CALLS_PER_MINUTE,
       fetchImpl, contextProvider: bindings?.contextProvider, submitSignal: bindings?.submitSignal, onRoleResult: bindings?.onRoleResult, now: bindings?.now,
     });
   }

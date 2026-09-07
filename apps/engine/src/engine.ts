@@ -168,6 +168,7 @@ const IDLE_GROK_IDEMPOTENCY_MAX = 4_096;
 const IDLE_GROK_IDEMPOTENCY_TTL_MS = 5 * 60_000;
 const SCOUT_REFRESH_STATE_TTL_MS = 60_000;
 const SCOUT_REFRESH_CONTEXT_MAX = 128;
+const SCOUT_REFRESH_RETRY_GAP_MS = 1_000;
 type IdleGrokSubmission = { observedAt: number; pending: boolean };
 type RetainedBookkeepingCounts = {
   activeTriggers: number;
@@ -214,8 +215,6 @@ export class EngineService {
   private readonly scoutRefreshContexts = new Map<string, TriggerEvent>();
   private readonly scoutRefreshLastAt = new Map<string, number>();
   private readonly scoutRefreshInFlight = new Set<string>();
-  private readonly scoutRefreshRecentAt: number[] = [];
-  private readonly scoutRefreshRoleRecentAt = new Map<ExternalAgentRoleId, number[]>();
   private readonly scoutRefreshSubmissionKeys = new Map<string, number>();
   private readonly marketsById = new Map<string, DiscoveredMarket>();
   private readonly entryQualified = new Set<string>();
@@ -512,6 +511,8 @@ export class EngineService {
   restingOrderCount() { return this.restingOrders.size; }
   reservedCash() { return this.ledger.snapshot().reservedCash; }
   async tickMaintenance(): Promise<void> { await this.runMaintenance(); }
+  /** Test-only ingress hook that exercises the real reference precursor path. */
+  async referenceTickForTest(tick: ReferenceTick): Promise<void> { await this.onReferenceTick(tick); }
   async applyObservedFill(fill: Parameters<PaperLedger["applyFill"]>[0]): Promise<void> { await this.applyFill(fill); }
   async restMakerForTest(
     order: PaperOrder,
@@ -1638,7 +1639,7 @@ export class EngineService {
     if (synchronized) {
       // Deterministic market state is a precursor for bounded scout warming;
       // this admission is intentionally separate from economic triggers.
-      this.requestScoutRefresh(snapshot);
+      this.requestScoutRefresh(snapshot, "market");
       const triggers = this.triggerEngine.ingestMarket(snapshot);
       for (const trigger of triggers) this.admitTrigger(trigger, this.provenanceForGenerated(trigger, "MARKET"));
     }
@@ -1690,7 +1691,7 @@ export class EngineService {
     for (const marketId of this.assetIndex.marketIds(tick.asset)) {
       const pair = this.snapshots.get(marketId);
       const candidate = pair?.UP ?? pair?.DOWN;
-      if (pair?.UP && pair?.DOWN && candidate) this.requestScoutRefresh(candidate);
+      if (pair?.UP && pair?.DOWN && candidate) this.requestScoutRefresh(candidate, "reference");
     }
     for (const trigger of admission.triggers) this.admitTrigger(trigger, this.provenanceForGenerated(trigger, "REFERENCE", tick.asset));
     this.metrics.triggerDedupeEntries.set(this.triggerEngine.dedupeEntryCount());
@@ -1864,11 +1865,15 @@ export class EngineService {
     // established bounded scout dispatch because it is not the internal xAI
     // trading critical path.
     if (xaiRuntime && requiresAlpha && scoutWarm.length > 0) {
+      const runtimeBudget = this.activation.runtimeBudgetSnapshot();
+      const coldReason = runtimeBudget && runtimeBudget.remaining <= 0
+        ? "SCOUT_CACHE_COLD_BUDGET_EXHAUSTED"
+        : "SCOUT_CACHE_COLD";
       await this.persistReportInput(createJournalEvent({
         traceId: trigger.traceId, type: "GROK_ACTIVATION_DECISION", aggregateType: "activation", aggregateId: trigger.id,
-        payload: { triggerId: trigger.id, marketId: trigger.marketId, asset: trigger.asset ?? null, reason: "SCOUT_CACHE_COLD", activate: false, missingScoutRoles: scoutWarm },
+        payload: { triggerId: trigger.id, marketId: trigger.marketId, asset: trigger.asset ?? null, reason: coldReason, activate: false, missingScoutRoles: scoutWarm, budgetRemaining: runtimeBudget?.remaining ?? null },
       }));
-      this.state.addActivation({ triggerId: trigger.id, reason: "SCOUT_CACHE_COLD", at: this.nowFn().toISOString(), provider: this.env.GROK_ACTIVATION_PROVIDER, grokWakeObserved: false });
+      this.state.addActivation({ triggerId: trigger.id, reason: coldReason, at: this.nowFn().toISOString(), provider: this.env.GROK_ACTIVATION_PROVIDER, grokWakeObserved: false });
       return;
     }
     const dispatchRequest: GrokActivationRequest = {
@@ -2405,6 +2410,7 @@ export class EngineService {
       fairProbability?: number; marketProbability?: number; estimatedEdge?: number;
     } | undefined : undefined;
     const scoutEntries = this.hotResearchCache.freshFor(trigger.marketId ?? "", asset, SCOUT_ROLES);
+    const executionStyle = decision.order?.orderType ?? this.env.PAPER_EXECUTION_STYLE;
     const calibration = alphaAuthoritative && executableFair ? {
       /** Compatibility display fields; executable fields below are authoritative. */
       fairProbability: alphaOutput?.fairProbability ?? null,
@@ -2413,7 +2419,16 @@ export class EngineService {
       fairProbabilityForTradedOutcome: executableFair.fairProbabilityForTradedOutcome,
       tradedOutcome: executableFair.consensusOutcome,
       usedComplement: executableFair.usedComplement,
-      currentExecutablePrice: String(executableFair.executablePrice),
+      executionStyle,
+      ...(executionStyle === "MAKER"
+        ? {
+          makerLimitPrice: decision.order?.requestedPrice ?? snapshot.bids[0]?.price ?? candidate.limitPrice,
+          takerReferenceVwap: String(executableFair.executablePrice),
+        }
+        : {
+          takerExecutableVwap: String(executableFair.executablePrice),
+          currentExecutablePrice: String(executableFair.executablePrice),
+        }),
       rawEdgeUsdPerShare: executableFair.rawEdgeUsdPerShare,
       feeUsdTotal: decision.feeUsdTotal,
       slippageUsdTotal: decision.slippageUsdTotal,
@@ -2785,25 +2800,44 @@ export class EngineService {
    * Admit a bounded, non-economic scout refresh from trusted live state.
    * Refresh contexts never enter activeTriggers, trigger admission, or the
    * durable journal. They exist only until the asynchronous role fanout has
-   * returned, with TTL/cooldown/rate limits preventing a queue per tick.
+   * returned, with role TTL/headroom, a small retry gap, and the shared
+   * actual-attempt budget preventing a queue per tick.
    */
-  private requestScoutRefresh(snapshot: MarketSnapshot): void {
-    if (this.env.GROK_ACTIVATION_PROVIDER !== "xai" || !this.isExperimentWindowOpen()) return;
+  private requestScoutRefresh(snapshot: MarketSnapshot, source: "market" | "reference" | "news"): void {
+    // Background research is an entry-path concern. ENTRY_CLOSED may still
+    // process hedge/settlement work, but it must not keep paid scouts warm.
+    if (this.env.GROK_ACTIVATION_PROVIDER !== "xai"
+      || this.experiment?.status !== "RUNNING"
+      || !experimentAllowsFirstLeg(this.experiment)
+      || (this.experiment.entryClosesAt !== null && this.nowFn().getTime() >= new Date(this.experiment.entryClosesAt).getTime())) return;
+    // No bounded news context is produced by ordinary market/reference
+    // ingress. Never spend a call to manufacture a "no news" answer.
+    if (source === "news") {
+      this.metrics.scoutRefreshSkipped.inc({ reason: "NO_NEWS_CONTEXT" });
+      return;
+    }
     const pair = this.snapshots.get(snapshot.marketId);
     if (!pair?.UP || !pair.DOWN) return;
     const now = this.nowFn();
     const nowMs = now.getTime();
     this.pruneScoutRefreshState(nowMs);
     const scope = `${snapshot.marketId}:${snapshot.asset ?? this.assetByMarket.get(snapshot.marketId) ?? "none"}`;
-    const minimumGap = Math.max(1, this.triggerConfig.debounceMs, this.triggerConfig.cooldownMs);
-    const lastAt = this.scoutRefreshLastAt.get(scope);
-    if ((lastAt !== undefined && nowMs - lastAt < minimumGap) || this.scoutRefreshInFlight.has(scope)) return;
-    const recentLimit = Math.max(1, this.triggerConfig.maxActivationsPerMinute);
-    if (this.scoutRefreshRecentAt.length >= recentLimit) return;
-    const fresh = this.hotResearchCache.freshFor(snapshot.marketId, snapshot.asset ?? null, SCOUT_ROLES);
-    if (fresh.length === SCOUT_ROLES.length) return;
-    const selectedRoles = SCOUT_ROLES.filter((role) => (this.scoutRefreshRoleRecentAt.get(role)?.length ?? 0) < recentLimit);
-    if (selectedRoles.length === 0) return;
+    const ownedRole: ExternalAgentRoleId = source === "market"
+      ? "market_microstructure_scanner"
+      : "crypto_market_scanner";
+    const dueRoles = this.hotResearchCache.refreshDueFor(snapshot.marketId, snapshot.asset ?? null, [ownedRole]);
+    if (dueRoles.length === 0 || this.scoutRefreshInFlight.has(scope)) return;
+    const roleKey = `${scope}:${ownedRole}`;
+    const lastAt = this.scoutRefreshLastAt.get(roleKey);
+    // This is a research retry gap, deliberately independent of the
+    // economic trigger cooldown. The usable TTL/headroom decision above is
+    // role-specific; this gap only prevents a failed call from hot-looping.
+    if (lastAt !== undefined && nowMs - lastAt < SCOUT_REFRESH_RETRY_GAP_MS) return;
+    const budget = this.activation.runtimeBudgetSnapshot();
+    if (budget && budget.remaining <= 0) {
+      this.metrics.scoutRefreshSkipped.inc({ reason: "BUDGET_EXHAUSTED" });
+      return;
+    }
 
     const triggerId = `research_refresh_${snapshot.marketId}_${nowMs}`;
     const expiresAt = new Date(nowMs + Math.min(this.triggerConfig.triggerTtlMs, 60_000)).toISOString();
@@ -2833,18 +2867,12 @@ export class EngineService {
       triggerKind: trigger.kind,
       createdAt: trigger.createdAt,
       expiresAt: trigger.expiresAt,
-      targetRoles: [...selectedRoles],
+      targetRoles: [ownedRole],
       researchRefresh: true,
     });
     this.scoutRefreshContexts.set(triggerId, trigger);
-    this.scoutRefreshLastAt.set(scope, nowMs);
+    this.scoutRefreshLastAt.set(roleKey, nowMs);
     this.scoutRefreshInFlight.add(scope);
-    this.scoutRefreshRecentAt.push(nowMs);
-    for (const role of selectedRoles) {
-      const times = this.scoutRefreshRoleRecentAt.get(role) ?? [];
-      times.push(nowMs);
-      this.scoutRefreshRoleRecentAt.set(role, times);
-    }
     this.pruneScoutRefreshState(nowMs);
     void this.activation.dispatch(request)
       .then((results) => {
@@ -2869,13 +2897,6 @@ export class EngineService {
     for (const [scope, at] of this.scoutRefreshLastAt) {
       if (nowMs - at >= SCOUT_REFRESH_STATE_TTL_MS) this.scoutRefreshLastAt.delete(scope);
     }
-    for (const [role, times] of this.scoutRefreshRoleRecentAt) {
-      while (times.length > 0 && nowMs - (times[0] ?? nowMs) >= 60_000) times.shift();
-      if (times.length === 0) this.scoutRefreshRoleRecentAt.delete(role);
-      else if (times.length > SCOUT_REFRESH_CONTEXT_MAX) times.splice(0, times.length - SCOUT_REFRESH_CONTEXT_MAX);
-    }
-    while (this.scoutRefreshRecentAt.length > 0 && nowMs - (this.scoutRefreshRecentAt[0] ?? nowMs) >= 60_000) this.scoutRefreshRecentAt.shift();
-    while (this.scoutRefreshRecentAt.length > SCOUT_REFRESH_CONTEXT_MAX) this.scoutRefreshRecentAt.shift();
     for (const [key, at] of this.scoutRefreshSubmissionKeys) {
       if (nowMs - at >= SCOUT_REFRESH_STATE_TTL_MS) this.scoutRefreshSubmissionKeys.delete(key);
     }

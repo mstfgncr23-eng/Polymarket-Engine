@@ -16,6 +16,8 @@ export interface XaiGrokActivationConfig extends Omit<XaiInferenceConfig, "fetch
   submitSignal?: (submission: GrokSignalSubmission, clientId: ExternalAgentRoleId, mode?: GrokSubmissionMode) => Promise<{ status: string; signalId?: string }>;
   onRoleResult?: (request: GrokActivationRequest, outcome: RoleRunOutcome) => void | Promise<void>;
   maxAttempts?: number;
+  /** Shared rolling-window model-attempt budget. Retries consume attempts. */
+  maxRoleCallsPerMinute?: number;
   delayImpl?: (ms: number) => Promise<void>;
   now?: () => Date;
 }
@@ -29,11 +31,14 @@ export class XaiGrokActivationBridge implements GrokActivationBridge {
   private readonly delayImpl: (ms: number) => Promise<void>;
   private readonly now: () => Date;
   private readonly runtimeMetrics: RoleRuntimeMetric[];
+  private readonly maxRoleCallsPerMinute: number;
+  private readonly roleCallAttempts: number[] = [];
 
   constructor(private readonly config: XaiGrokActivationConfig) {
     this.now = config.now ?? (() => new Date());
     this.client = new XaiInferenceClient({ ...config, now: () => this.now().getTime() });
     this.maxAttempts = Math.max(1, Math.min(config.maxAttempts ?? 2, 3));
+    this.maxRoleCallsPerMinute = Math.max(1, Math.min(config.maxRoleCallsPerMinute ?? 24, 240));
     this.delayImpl = config.delayImpl ?? delay;
     this.runtimeMetrics = emptyRoleRuntimeMetrics(config.model);
     const submitSignal = config.submitSignal ?? (async () => ({ status: "runtime_not_bound" }));
@@ -50,6 +55,12 @@ export class XaiGrokActivationBridge implements GrokActivationBridge {
 
   metricsSnapshot(): RoleRuntimeMetric[] { return this.runtimeMetrics.map((item) => ({ ...item })); }
 
+  budgetSnapshot(): { limit: number; used: number; remaining: number } {
+    this.pruneRoleCallAttempts(this.now().getTime());
+    const used = this.roleCallAttempts.length;
+    return { limit: this.maxRoleCallsPerMinute, used, remaining: Math.max(0, this.maxRoleCallsPerMinute - used) };
+  }
+
   private async runRole(request: GrokActivationRequest, role: ExternalAgentRoleId): Promise<GrokActivationResult> {
     const requestedAt = this.now().toISOString();
     const metric = this.runtimeMetrics.find((item) => item.role === role)!;
@@ -57,6 +68,10 @@ export class XaiGrokActivationBridge implements GrokActivationBridge {
     for (let attempt = 0; attempt < this.maxAttempts; attempt += 1) {
       if (this.expired(request.expiresAt)) {
         lastError = new GrokRoleRuntimeError("TRIGGER_EXPIRED");
+        break;
+      }
+      if (!this.tryConsumeRoleCall()) {
+        lastError = new GrokRoleRuntimeError("XAI_ROLE_CALL_BUDGET_EXHAUSTED");
         break;
       }
       metric.requests += 1;
@@ -85,7 +100,7 @@ export class XaiGrokActivationBridge implements GrokActivationBridge {
     metric.failures += 1;
     const detail = errorDetail(lastError);
     return {
-      provider: this.provider, ok: false, skipped: false, targetRole: role,
+      provider: this.provider, ok: false, skipped: detail.code === "XAI_ROLE_CALL_BUDGET_EXHAUSTED", targetRole: role,
       requestedAt, sentAt: null, errorCode: detail.code, httpStatus: detail.httpStatus,
       grokWakeObserved: false, idempotencyKey: activationIdempotencyKey(request.triggerId, role),
     };
@@ -97,6 +112,18 @@ export class XaiGrokActivationBridge implements GrokActivationBridge {
   }
 
   private expired(expiresAt: string): boolean { return new Date(expiresAt).getTime() <= this.now().getTime(); }
+
+  private tryConsumeRoleCall(): boolean {
+    const nowMs = this.now().getTime();
+    this.pruneRoleCallAttempts(nowMs);
+    if (this.roleCallAttempts.length >= this.maxRoleCallsPerMinute) return false;
+    this.roleCallAttempts.push(nowMs);
+    return true;
+  }
+
+  private pruneRoleCallAttempts(nowMs: number): void {
+    while (this.roleCallAttempts.length > 0 && nowMs - (this.roleCallAttempts[0] ?? nowMs) >= 60_000) this.roleCallAttempts.shift();
+  }
 }
 
 function errorDetail(error: unknown): { code: string; httpStatus: number | null } {

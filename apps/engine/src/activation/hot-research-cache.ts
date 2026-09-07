@@ -90,6 +90,22 @@ export class HotResearchCache {
     });
   }
 
+  /** A role becomes refresh-due before its usable TTL expires. */
+  refreshDueFor(marketId: string, asset: string | null, roles: readonly ExternalAgentRoleId[]): ExternalAgentRoleId[] {
+    this.prune();
+    const nowMs = this.now().getTime();
+    return roles.filter((role) => {
+      const entry = this.entries.get(HotResearchCache.key(marketId, asset, role));
+      if (!entry) return true;
+      const generatedMs = new Date(entry.generatedAt).getTime();
+      const expiresMs = new Date(entry.expiresAt).getTime();
+      if (!Number.isFinite(generatedMs) || !Number.isFinite(expiresMs)) return true;
+      const ttlMs = Math.max(1, expiresMs - generatedMs);
+      const headroomMs = Math.min(2_000, Math.max(250, Math.floor(ttlMs / 3)));
+      return nowMs >= expiresMs - headroomMs;
+    });
+  }
+
   snapshot(): HotResearchEntry[] {
     this.prune();
     return [...this.entries.values()].map((entry) => structuredClone(entry));
