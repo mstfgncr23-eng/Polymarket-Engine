@@ -136,3 +136,22 @@ Latency timestamps persisted: `triggerCreatedAt`, `activationRequestedAt`, `acti
 Thousands of ticks are filtered deterministically. Only qualifying triggers request activation.
 
 Do not mix grok.com custom MCP or Grok Build hooks (outbound) into this as if they wake Grok Bot.
+
+## Deterministic execution economics
+
+For a binary market with a $1 payout, the engine's canonical edge unit is USD
+per share (the same numeric scale as probability points):
+
+| Field | Unit |
+|---|---|
+| `rawEdgeUsdPerShare` | fair probability for the traded outcome minus the current executable price |
+| `costUsdPerShare` | fee and slippage totals divided by executable quantity |
+| `netEvUsdPerShare` | raw edge minus cost per share; `MIN_EXPECTED_EDGE` uses this net unit |
+| `grossEvUsdTotal` / `netEvUsdTotal` | the corresponding per-share value multiplied by quantity |
+| `executableNotionalUsd` | executable quantity multiplied by executable price |
+| `expectedROI` | net expected value total divided by executable notional |
+
+The deterministic engine computes fees, slippage, net expected value, and ROI.
+Alpha supplies a fair probability; when it submits the opposite binary outcome,
+the engine explicitly applies the complement and records that fact in
+calibration.

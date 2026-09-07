@@ -34,6 +34,7 @@ export interface RiskInput {
   referenceProviderBlocked?: boolean;
   marketEntryQualified?: boolean;
   availableLiquidityUsd: string;
+  /** Net expected value in USD/share for a $1 binary payout. */
   expectedEdge: number;
   spread: number;
   signalConfidence: number;

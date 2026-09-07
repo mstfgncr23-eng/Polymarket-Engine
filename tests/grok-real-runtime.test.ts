@@ -57,6 +57,67 @@ function responseFor(role: string): Response {
   return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify(outputs(role)) } }], usage: { prompt_tokens: 15, completion_tokens: 20 } }), { status: 200, headers: { "content-type": "application/json" } });
 }
 
+function runtimeTriggerAt(atMs: number, id: string, overrides: Partial<TriggerEvent> = {}): TriggerEvent {
+  const createdAt = new Date(atMs).toISOString();
+  return {
+    id, traceId: `${id}_trace`, marketId: "market_runtime", asset: "BTC", source: "polymarket",
+    kind: "BOOK_IMBALANCE", severity: 3, score: 1, dedupeKey: `${id}_dedupe`, evidence: { book: "observed" },
+    sourceEventIds: ["runtime_market_event"], evidenceIds: ["runtime_market_event"], createdAt,
+    expiresAt: new Date(atMs + 60_000).toISOString(), ...overrides,
+  };
+}
+
+async function waitForRuntime(condition: () => boolean | Promise<boolean>, timeoutMs = 3_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!(await condition())) {
+    if (Date.now() >= deadline) throw new Error("RUNTIME_TEST_TIMEOUT");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+async function createRuntimeProduct(overrides: Record<string, string | undefined> = {}) {
+  let clockMs = now.getTime();
+  const market = new ScriptedMarketAdapter();
+  market.queue(discoveryReport([qualified("market_runtime", "BTC", "up-runtime", "down-runtime", new Date(clockMs + 4 * 60 * 60_000).toISOString())]));
+  const journal = new MemoryEventJournal();
+  const env = qualifiedPaperEnv({
+    GROK_ACTIVATION_PROVIDER: "xai", XAI_API_KEY: "xai-runtime-test-secret", XAI_MODEL: "grok-test",
+    ESTIMATED_INFRA_COST_PER_HOUR_USD: "0", PAPER_EXECUTION_LATENCY_MS: "0", EXPERIMENT_DURATION_HOURS: "1",
+    ...overrides,
+  });
+  const calls: Array<{ role: string; at: number; context: Record<string, any>; systemPrompt: string }> = [];
+  const fetchImpl: typeof fetch = vi.fn(async (_input, init) => {
+    const body = JSON.parse(String(init?.body)) as { response_format: { json_schema: { name: string } }; messages: Array<{ content: string }> };
+    const role = body.response_format.json_schema.name.replace(/^grok_/, "");
+    const contextEnvelope = JSON.parse(body.messages[1]!.content) as { context: Record<string, any> };
+    calls.push({ role, at: Date.now(), context: contextEnvelope.context, systemPrompt: body.messages[0]!.content });
+    const output = outputs(role);
+    output.expiresAt = contextEnvelope.context.trigger.expiresAt;
+    output.evidenceIds = contextEnvelope.context.trigger.evidenceIds ?? contextEnvelope.context.trigger.sourceEventIds ?? [];
+    return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify(output) } }], usage: { prompt_tokens: 30, completion_tokens: 20 } }), { status: 200, headers: { "content-type": "application/json" } });
+  });
+  const engine = new EngineService(env, journal, { error: () => undefined }, {
+    market: market as never, referenceRegistry: new ScriptedReferenceRegistry() as never,
+    activationFetch: fetchImpl, now: () => new Date(clockMs),
+  });
+  await engine.start();
+  await market.waitForHandlers();
+  expect((await engine.beginExperiment()).ok).toBe(true);
+  engine.state.noteReferenceTick("BTC", new Date(clockMs).toISOString(), { symbol: "BTCUSDT", venue: "binance", price: "65000" });
+  return {
+    engine, journal, market, calls,
+    clock: { get: () => clockMs, set: (value: number) => { clockMs = value; }, advance: (ms: number) => { clockMs += ms; } },
+  };
+}
+
+function runtimeSnapshot(outcome: "UP" | "DOWN", tokenId: string, sequence: number, atMs: number, ask = "0.40") {
+  return {
+    eventId: `runtime_${tokenId}_${sequence}`, traceId: `runtime_trace_${tokenId}_${sequence}`, marketId: "market_runtime", tokenId, outcome, asset: "BTC",
+    bids: [{ price: "0.39", quantity: "300" }], asks: [{ price: ask, quantity: "300" }], lastTradePrice: ask,
+    tickSize: "0.01", minOrderSize: "1", feeSchedule, sourceTimestamp: new Date(atMs).toISOString(), receivedAt: new Date(atMs).toISOString(), sequence, hash: `runtime_${sequence}`,
+  };
+}
+
 describe("real Grok role runtime", () => {
   it("keeps xAI disabled by default even when a key is present", () => {
     const env = engineEnvSchema.parse({ NODE_ENV: "test", JOURNAL_MODE: "memory", TRADING_MODE: "paper", XAI_API_KEY: "xai-secret" });
@@ -94,6 +155,11 @@ describe("real Grok role runtime", () => {
       expect(format.json_schema.schema).toMatchObject({ type: "object" });
       expect(JSON.stringify(call.body)).not.toContain("xai-test-secret");
     }
+    const alphaPrompt = calls.find((call) => call.role === "fair_probability_analyst")?.body.messages[0]?.content ?? "";
+    expect(alphaPrompt).toContain("not independent votes");
+    expect(alphaPrompt).toContain("correlated evidence");
+    expect(alphaPrompt).toContain("current synchronized raw book");
+    expect(alphaPrompt).toContain("execution-cost math");
     expect(bridge.metricsSnapshot().every((item) => item.successes === 1 && item.requests === 1)).toBe(true);
   });
 
@@ -243,6 +309,9 @@ describe("hot research cache and role isolation", () => {
     const alpha = boundedContextForPrompt(base, "fair_probability_analyst");
     expect(alpha.portfolio.cash).toBe("[omitted]");
     expect(alpha.scoutResearch).toHaveLength(1);
+    alpha.provenance = { sourceEventIds: ["s1", "s1"], correlatedFeatureIds: ["f1", "f1"], scoutKeys: ["k1", "k1"] };
+    const deduplicatedAlpha = boundedContextForPrompt(alpha, "fair_probability_analyst");
+    expect(deduplicatedAlpha.provenance).toMatchObject({ sourceEventIds: ["s1"], correlatedFeatureIds: ["f1"], scoutKeys: ["k1"] });
     const risk = boundedContextForPrompt(base, "risk_hedge_analyst");
     expect(risk.portfolio.cash).toBe("1000");
   });
@@ -323,6 +392,98 @@ describe("EngineService xAI product path", () => {
       expect(JSON.stringify(submissions)).not.toContain("xai-runtime-test-secret");
     } finally {
       await engine.stop().catch(() => undefined);
+    }
+  });
+
+  it("warms scouts before a hot trigger and executes the critical path with Alpha only", async () => {
+    const setup = await createRuntimeProduct();
+    try {
+      await setup.market.emitSnapshot(runtimeSnapshot("UP", "up-runtime", 1, setup.clock.get(), "0.40") as never);
+      await setup.market.emitSnapshot(runtimeSnapshot("DOWN", "down-runtime", 1, setup.clock.get(), "0.70") as never);
+      await waitForRuntime(() => setup.engine.hotResearchCacheForTest().filter((entry) => entry.marketId === "market_runtime").length === 3);
+      const warmRoles = setup.calls.map((call) => call.role);
+      expect(warmRoles).toEqual(expect.arrayContaining(["market_microstructure_scanner", "crypto_market_scanner", "news_x_intelligence_scanner"]));
+      const tradeTriggerAt = Date.now();
+      await setup.engine.registerTriggerForResearch(runtimeTriggerAt(setup.clock.get(), "hot_runtime", { severity: 2 }));
+      await waitForRuntime(async () => (await setup.journal.queryEvents({ types: ["PAPER_FILL"] })).length === 1);
+      const afterTrigger = setup.calls.filter((call) => call.at >= tradeTriggerAt);
+      expect(afterTrigger.map((call) => call.role)).toEqual(["fair_probability_analyst"]);
+      expect((await setup.journal.queryEvents({ types: ["PAPER_ORDER_CREATED"] })).length).toBe(1);
+      expect((await setup.journal.queryEvents({ types: ["PAPER_FILL"] })).length).toBe(1);
+      expect((await setup.journal.queryEvents({ types: ["GROK_SIGNAL_ACCEPTED"] })).length).toBe(1);
+      const alphaRisk = (await setup.journal.queryEvents({ types: ["RISK_EVALUATION"] }))
+        .map((event) => event.payload as { alpha?: Record<string, unknown> })
+        .find((payload) => payload.alpha)?.alpha;
+      expect(alphaRisk).toMatchObject({
+        alphaSubmittedFairProbability: 0.61,
+        fairProbabilityForTradedOutcome: 0.61,
+        tradedOutcome: "UP",
+        usedComplement: false,
+        currentExecutablePrice: "0.4",
+        quantity: expect.any(String),
+        executableNotionalUsd: expect.any(String),
+        costUsdPerShare: expect.any(String),
+        netEvUsdPerShare: expect.any(Number),
+        grossEvUsdTotal: expect.any(String),
+        netEvUsdTotal: expect.any(String),
+        expectedROI: expect.any(Number),
+        decisionTimestamp: expect.any(String),
+        scoutAgesMs: expect.any(Array),
+        provenance: expect.any(Array),
+      });
+      expect(Number(alphaRisk?.rawEdgeUsdPerShare)).toBeCloseTo(0.21, 8);
+      expect((afterTrigger.find((call) => call.role === "fair_probability_analyst")?.systemPrompt ?? "")).toContain("not independent votes");
+      expect((afterTrigger.find((call) => call.role === "fair_probability_analyst")?.systemPrompt ?? "")).toContain("correlated evidence");
+    } finally {
+      await setup.engine.stop().catch(() => undefined);
+    }
+  });
+
+  it("fails closed on a cold cache without invoking a stale Alpha trade", async () => {
+    const setup = await createRuntimeProduct();
+    try {
+      await setup.engine.registerTriggerForResearch(runtimeTriggerAt(setup.clock.get(), "cold_runtime", { severity: 2 }));
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(setup.calls).toHaveLength(0);
+      expect(await setup.journal.queryEvents({ types: ["PAPER_ORDER_CREATED", "PAPER_FILL"] })).toHaveLength(0);
+    } finally {
+      await setup.engine.stop().catch(() => undefined);
+    }
+  });
+
+  it("fails closed when the pre-trigger scout cache has expired", async () => {
+    const setup = await createRuntimeProduct({ XAI_SCOUT_MICRO_TTL_MS: "1000", XAI_SCOUT_CRYPTO_TTL_MS: "1000", XAI_SCOUT_NEWS_TTL_MS: "1000" });
+    try {
+      await setup.market.emitSnapshot(runtimeSnapshot("UP", "up-runtime", 1, setup.clock.get(), "0.40") as never);
+      await setup.market.emitSnapshot(runtimeSnapshot("DOWN", "down-runtime", 1, setup.clock.get(), "0.70") as never);
+      await waitForRuntime(() => setup.engine.hotResearchCacheForTest().length === 3);
+      const beforeTrigger = setup.calls.length;
+      setup.clock.advance(2_000);
+      await setup.engine.registerTriggerForResearch(runtimeTriggerAt(setup.clock.get(), "expired_runtime", { severity: 2 }));
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(setup.engine.hotResearchCacheForTest()).toHaveLength(0);
+      expect(setup.calls.slice(beforeTrigger).filter((call) => call.role === "fair_probability_analyst")).toHaveLength(0);
+      expect(await setup.journal.queryEvents({ types: ["PAPER_ORDER_CREATED", "PAPER_FILL"] })).toHaveLength(0);
+    } finally {
+      await setup.engine.stop().catch(() => undefined);
+    }
+  });
+
+  it("never forwards an unsynchronized book and creates no trade", async () => {
+    const setup = await createRuntimeProduct();
+    try {
+      await setup.market.emitSnapshot(runtimeSnapshot("UP", "up-runtime", 1, setup.clock.get(), "0.40") as never);
+      await setup.market.emitSnapshot(runtimeSnapshot("DOWN", "down-runtime", 1, setup.clock.get(), "0.70") as never);
+      await waitForRuntime(() => setup.engine.hotResearchCacheForTest().length === 3);
+      const before = setup.calls.length;
+      setup.market.markTokenSync("up-runtime", "GAPPED");
+      await setup.engine.registerTriggerForResearch(runtimeTriggerAt(setup.clock.get(), "unsync_runtime", { severity: 2 }));
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(await setup.journal.queryEvents({ types: ["PAPER_ORDER_CREATED", "PAPER_FILL"] })).toHaveLength(0);
+      const after = setup.calls.slice(before);
+      expect(after.every((call) => call.context.market?.synchronized !== true || call.context.market.snapshots.length === 0)).toBe(true);
+    } finally {
+      await setup.engine.stop().catch(() => undefined);
     }
   });
 });

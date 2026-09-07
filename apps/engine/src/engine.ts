@@ -21,6 +21,7 @@ import {
   evolveMakerOrder,
   grokSignalSubmissionSchema,
   grokSignalEnvelopeSchema,
+  grokActivationRequestSchema,
   triggerEventSchema,
   calculatePairMetrics,
   computePaperExposures,
@@ -165,6 +166,8 @@ function isJournalAdmissionRejectedError(error: unknown): boolean {
 
 const IDLE_GROK_IDEMPOTENCY_MAX = 4_096;
 const IDLE_GROK_IDEMPOTENCY_TTL_MS = 5 * 60_000;
+const SCOUT_REFRESH_STATE_TTL_MS = 60_000;
+const SCOUT_REFRESH_CONTEXT_MAX = 128;
 type IdleGrokSubmission = { observedAt: number; pending: boolean };
 type RetainedBookkeepingCounts = {
   activeTriggers: number;
@@ -207,6 +210,13 @@ export class EngineService {
   private readonly signalReceivedTimes: number[] = [];
   private readonly lastEvaluatedSignalCount = new Map<string, number>();
   private readonly alphaSignalIds = new Map<string, string>();
+  /** Bounded non-economic contexts used only while warming scout research. */
+  private readonly scoutRefreshContexts = new Map<string, TriggerEvent>();
+  private readonly scoutRefreshLastAt = new Map<string, number>();
+  private readonly scoutRefreshInFlight = new Set<string>();
+  private readonly scoutRefreshRecentAt: number[] = [];
+  private readonly scoutRefreshRoleRecentAt = new Map<ExternalAgentRoleId, number[]>();
+  private readonly scoutRefreshSubmissionKeys = new Map<string, number>();
   private readonly marketsById = new Map<string, DiscoveredMarket>();
   private readonly entryQualified = new Set<string>();
   private readonly managedMarketIds = new Set<string>();
@@ -1626,6 +1636,9 @@ export class EngineService {
     }
 
     if (synchronized) {
+      // Deterministic market state is a precursor for bounded scout warming;
+      // this admission is intentionally separate from economic triggers.
+      this.requestScoutRefresh(snapshot);
       const triggers = this.triggerEngine.ingestMarket(snapshot);
       for (const trigger of triggers) this.admitTrigger(trigger, this.provenanceForGenerated(trigger, "MARKET"));
     }
@@ -1671,6 +1684,14 @@ export class EngineService {
       this.referenceResyncRequested.delete(tick.asset);
     }
     this.metrics.referenceWindowEntries.set(this.triggerEngine.referenceWindowTotalEntries());
+    // A fresh reference observation is another deterministic precursor. Warm
+    // only markets that already have a trusted UP/DOWN pair; requestScoutRefresh
+    // applies the per-scope cooldown and in-flight bounds.
+    for (const marketId of this.assetIndex.marketIds(tick.asset)) {
+      const pair = this.snapshots.get(marketId);
+      const candidate = pair?.UP ?? pair?.DOWN;
+      if (pair?.UP && pair?.DOWN && candidate) this.requestScoutRefresh(candidate);
+    }
     for (const trigger of admission.triggers) this.admitTrigger(trigger, this.provenanceForGenerated(trigger, "REFERENCE", tick.asset));
     this.metrics.triggerDedupeEntries.set(this.triggerEngine.dedupeEntryCount());
     this.metrics.referenceTickProcessingDuration.observe((performance.now() - started) / 1000);
@@ -1835,21 +1856,32 @@ export class EngineService {
       ? this.hotResearchCache.freshFor(trigger.marketId, trigger.asset ?? null, scoutRoles).map((entry) => entry.role)
       : scoutRoles;
     const scoutWarm = scoutRoles.filter((role) => !freshScoutRoles.includes(role));
-    const coldScoutWarmup = scoutWarm.length > 0 && requestedRoles.includes("fair_probability_analyst");
-    const dispatchRequest: GrokActivationRequest = coldScoutWarmup
-      ? { ...decision.request, targetRoles: [...scoutWarm, ...auxiliaryRoles] }
-      : { ...decision.request, targetRoles: requestedRoles.filter((role) => role === "fair_probability_analyst" || auxiliaryRoles.includes(role)) };
+    const requiresAlpha = requestedRoles.includes("fair_probability_analyst");
+    const xaiRuntime = this.env.GROK_ACTIVATION_PROVIDER === "xai";
+    // Scouts are warmed by the bounded precursor path. A real trade trigger
+    // never waits for sequential scout inference and never trades on a cold
+    // cache in the xAI runtime. External Grok/Slack wake behavior retains its
+    // established bounded scout dispatch because it is not the internal xAI
+    // trading critical path.
+    if (xaiRuntime && requiresAlpha && scoutWarm.length > 0) {
+      await this.persistReportInput(createJournalEvent({
+        traceId: trigger.traceId, type: "GROK_ACTIVATION_DECISION", aggregateType: "activation", aggregateId: trigger.id,
+        payload: { triggerId: trigger.id, marketId: trigger.marketId, asset: trigger.asset ?? null, reason: "SCOUT_CACHE_COLD", activate: false, missingScoutRoles: scoutWarm },
+      }));
+      this.state.addActivation({ triggerId: trigger.id, reason: "SCOUT_CACHE_COLD", at: this.nowFn().toISOString(), provider: this.env.GROK_ACTIVATION_PROVIDER, grokWakeObserved: false });
+      return;
+    }
+    const dispatchRequest: GrokActivationRequest = {
+      ...decision.request,
+      targetRoles: xaiRuntime && requiresAlpha
+        ? ["fair_probability_analyst", ...auxiliaryRoles]
+        : requiresAlpha && scoutWarm.length > 0
+          ? [...scoutWarm, ...auxiliaryRoles]
+          : requestedRoles,
+    };
     if (dispatchRequest.targetRoles.length === 0) return;
     this.activation.markRequested(trigger, dispatchRequest);
     this.state.setActivationLatency(this.activation.snapshot());
-    if (coldScoutWarmup) {
-      // Scout warming is bounded and asynchronous. A later trigger consumes
-      // the hot entries and invokes one Alpha call on the critical path.
-      void this.activation.dispatch(dispatchRequest)
-        .then((results) => this.recordActivationResults(trigger, results, decision.reason))
-        .catch((error) => this.logger.error({ err: error, triggerId: trigger.id }, "bounded scout warmup failed"));
-      return;
-    }
     const results = await this.activation.dispatch(dispatchRequest);
     await this.recordActivationResults(trigger, results, decision.reason);
     this.state.setActivationLatency(this.activation.snapshot());
@@ -1872,7 +1904,8 @@ export class EngineService {
 
   /** Bounded, role-scoped context for the opt-in internal xAI runtime. */
   private grokRoleContext(request: GrokActivationRequest, role: ExternalAgentRoleId, allowPortfolioContext: boolean): GrokRoleContext {
-    const trigger = this.activeTriggers.get(request.triggerId);
+    const trigger = this.activeTriggers.get(request.triggerId)
+      ?? (request.researchRefresh ? this.scoutRefreshContexts.get(request.triggerId) : undefined);
     if (!trigger) throw new Error("RUNTIME_TRIGGER_UNAVAILABLE");
     const synchronized = request.marketId ? this.isMarketSynchronized(request.marketId) : true;
     // The adapter's token-sync index is the trusted-book authority. A raw
@@ -1985,6 +2018,7 @@ export class EngineService {
   /** The only ingress for external Grok research; it cannot create orders directly. */
   async submitGrokSignal(raw: GrokSignalSubmission, clientId: string, mode: GrokSubmissionMode = "mcp"): Promise<GrokSubmissionResult> {
     this.assertResearchIntegrity();
+    const researchRefresh = mode === "refresh";
     let submission: GrokSignalSubmission;
     try { submission = grokSignalSubmissionSchema.parse(raw); }
     catch {
@@ -2006,7 +2040,8 @@ export class EngineService {
     try {
       if (this.researchIngressStale(ingress.generation)) return rejectSealed();
       const now = this.nowFn();
-      const trigger = this.activeTriggers.get(submission.triggerId);
+      const trigger = this.activeTriggers.get(submission.triggerId)
+        ?? (researchRefresh ? this.scoutRefreshContexts.get(submission.triggerId) : undefined);
       if (!trigger) { this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "unknown_trigger" }); return { status: "unknown_trigger" }; }
       if (trigger.traceId !== submission.traceId) { this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "trace_mismatch" }); return { status: "trace_mismatch" }; }
       if (trigger.marketId && trigger.marketId !== submission.marketId) {
@@ -2023,7 +2058,7 @@ export class EngineService {
       if (new Date(trigger.expiresAt).getTime() <= now.getTime() || new Date(submission.output.expiresAt).getTime() <= now.getTime()) {
         this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "stale" }); return { status: "stale" };
       }
-      if (!this.isTriggerActionable(trigger.id)) {
+      if (!researchRefresh && !this.isTriggerActionable(trigger.id)) {
         this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "stale" }); return { status: "stale" };
       }
       if (this.researchIngressStale(ingress.generation)) return rejectSealed();
@@ -2037,7 +2072,16 @@ export class EngineService {
         this.metrics.grokSignals.inc({ agent: submission.agentId, status: "duplicate" });
         return { status: "duplicate" };
       };
-      if (idleAdmission) {
+      if (researchRefresh) {
+        if (idleAdmission || !isScoutRole(submission.agentId)) {
+          this.state.recordGrokRejection("rejected");
+          this.metrics.grokSignals.inc({ agent: submission.agentId, status: "stale" });
+          return { status: "stale" };
+        }
+        this.pruneScoutRefreshState(now.getTime());
+        if (this.scoutRefreshSubmissionKeys.has(idempotencyKey)) return duplicate();
+        this.scoutRefreshSubmissionKeys.set(idempotencyKey, now.getTime());
+      } else if (idleAdmission) {
         // Idle monitoring intentionally does not create durable idempotency
         // claims because its canonical accepted fact is not persisted. A
         // bounded live reservation still makes exact retries deterministic and
@@ -2087,7 +2131,7 @@ export class EngineService {
           ingress.generation = this.sourceSealGeneration;
         }
         // Recheck the experiment-scoped fence immediately before irreversible accept.
-        if (this.researchIngressStale(ingress.generation) || !this.isTriggerActionable(trigger.id)) {
+        if (this.researchIngressStale(ingress.generation) || (!researchRefresh && !this.isTriggerActionable(trigger.id))) {
           if (idleReservation) this.releaseIdleGrokSubmission(idempotencyKey);
           this.state.recordGrokRejection("rejected");
           this.metrics.grokSignals.inc({ agent: submission.agentId, status: this.researchIngressStale(ingress.generation) ? "source_sealed" : "stale" });
@@ -2104,6 +2148,12 @@ export class EngineService {
         if (this.researchIngressStale(ingress.generation)) {
           if (idleReservation) this.releaseIdleGrokSubmission(idempotencyKey);
           return rejectSealed();
+        }
+        if (researchRefresh) {
+          // Scout refresh is a bounded in-memory research admission. It must
+          // not create canonical report rows or an economic trigger.
+          this.metrics.grokSignals.inc({ agent: signal.agentId, status: "accepted" });
+          return { status: "accepted", signalId: signal.signalId };
         }
         await this.persistReportInput(createJournalEvent({ traceId: signal.traceId, type: "GROK_SIGNAL_ACCEPTED", aggregateType: "grok_signal", aggregateId: signal.signalId, payload: signal }));
         if (submission.agentId === "strategy_supervisor" && submission.output.proposedChange) {
@@ -2292,14 +2342,16 @@ export class EngineService {
     const snapshot = this.state.marketSnapshots.get(candidate.tokenId);
     if (!snapshot) return;
     const fair = outputs.find((item) => item.agentId === "fair_probability_analyst")?.output as { direction?: Direction; fairProbability?: number; marketProbability?: number; estimatedEdge?: number } | undefined;
+    let executableFair: ReturnType<typeof executableFairEdge> = null;
     if (candidate.intent === "OPEN_FIRST_LEG" && fair && typeof fair.fairProbability === "number" && (fair.direction === "UP" || fair.direction === "DOWN")) {
-      const executable = executableFairEdge({
+      executableFair = executableFairEdge({
         fair: { direction: fair.direction, fairProbability: fair.fairProbability, marketProbability: fair.marketProbability, estimatedEdge: fair.estimatedEdge },
         consensus, snapshot, quantity: candidate.quantity, limitPrice: candidate.limitPrice,
       });
-      if (!executable) return;
-      candidate.rawExpectedEdge = executable.rawEdge;
-      consensus.estimatedEdge = executable.rawEdge;
+      if (!executableFair) return;
+      candidate.rawEdgeUsdPerShare = executableFair.rawEdgeUsdPerShare;
+      candidate.rawExpectedEdge = executableFair.rawEdgeUsdPerShare;
+      consensus.estimatedEdge = executableFair.rawEdgeUsdPerShare;
     }
     const duplicateKey = `${candidate.marketId}:${candidate.outcome}:${candidate.intent}`;
     const now = this.nowFn();
@@ -2352,29 +2404,37 @@ export class EngineService {
     const alphaOutput = alphaAuthoritative ? outputs.find((item) => item.signalId === this.alphaSignalIds.get(trigger.id))?.output as {
       fairProbability?: number; marketProbability?: number; estimatedEdge?: number;
     } | undefined : undefined;
-    const executablePrice = decision.bookVwap
-      ?? (this.env.PAPER_EXECUTION_STYLE === "MAKER" ? snapshot.bids[0]?.price : snapshot.asks[0]?.price)
-      ?? null;
-    const probabilityEdge = alphaOutput && typeof alphaOutput.fairProbability === "number" && executablePrice
-      ? alphaOutput.fairProbability - Number(executablePrice) : null;
-    const expectedGrossUsdPerShare = probabilityEdge;
-    const expectedExecutionCosts = decision.feeUsd && decision.slippageUsd ? Number(decision.feeUsd) + Number(decision.slippageUsd) : null;
-    const expectedNetUsdPerShare = decision.netExpectedEdge;
-    const expectedROI = expectedExecutionCosts !== null && expectedExecutionCosts > 0 ? expectedNetUsdPerShare / expectedExecutionCosts : expectedNetUsdPerShare;
+    const scoutEntries = this.hotResearchCache.freshFor(trigger.marketId ?? "", asset, SCOUT_ROLES);
+    const calibration = alphaAuthoritative && executableFair ? {
+      alphaSubmittedFairProbability: alphaOutput?.fairProbability ?? null,
+      fairProbabilityForTradedOutcome: executableFair.fairProbabilityForTradedOutcome,
+      tradedOutcome: executableFair.consensusOutcome,
+      usedComplement: executableFair.usedComplement,
+      currentExecutablePrice: String(executableFair.executablePrice),
+      rawEdgeUsdPerShare: executableFair.rawEdgeUsdPerShare,
+      feeUsdTotal: decision.feeUsdTotal,
+      slippageUsdTotal: decision.slippageUsdTotal,
+      costUsdPerShare: decision.costUsdPerShare,
+      netEvUsdPerShare: decision.netEvUsdPerShare,
+      grossEvUsdTotal: decision.grossEvUsdTotal,
+      netEvUsdTotal: decision.netEvUsdTotal,
+      executableNotionalUsd: decision.executableNotionalUsd,
+      expectedROI: decision.expectedROI,
+      quantity: decision.quantity,
+      decisionTimestamp: this.nowFn().toISOString(),
+      scoutAgesMs: scoutEntries.map((entry) => ({ role: entry.role, ageMs: Math.max(0, this.nowFn().getTime() - new Date(entry.generatedAt).getTime()) })),
+      provenance: scoutEntries.map((entry) => ({ role: entry.role, evidenceIds: entry.evidenceIds, sourceEventIds: entry.sourceEventIds, featureIds: entry.featureIds, derivedFrom: entry.derivedFrom })),
+    } : undefined;
     await this.persistReportInput(createJournalEvent({ traceId: trigger.traceId, type: "RISK_EVALUATION", aggregateType: "risk", aggregateId: decision.risk.id, payload: {
       ...decision.risk, marketId: trigger.marketId, asset,
-      ...(alphaAuthoritative ? { alpha: { fairProbability: alphaOutput?.fairProbability ?? null, marketProbability: alphaOutput?.marketProbability ?? null,
-        probabilityEdge, currentExecutablePrice: executablePrice, expectedGrossUsdPerShare, expectedExecutionCosts,
-        expectedNetUsdPerShare, expectedROI, decisionTimestamp: this.nowFn().toISOString(),
-        scoutAgesMs: this.hotResearchCache.freshFor(trigger.marketId ?? "", asset, SCOUT_ROLES).map((entry) => ({ role: entry.role, ageMs: Math.max(0, this.nowFn().getTime() - new Date(entry.generatedAt).getTime()) })),
-        provenance: this.hotResearchCache.freshFor(trigger.marketId ?? "", asset, SCOUT_ROLES).map((entry) => ({ role: entry.role, evidenceIds: entry.evidenceIds, sourceEventIds: entry.sourceEventIds, featureIds: entry.featureIds })) } } : {}),
+      ...(calibration ? { alpha: calibration } : {}),
     } }));
     if (!decision.accepted || !decision.order) {
       for (const reason of decision.risk.vetoes) this.metrics.riskVetoes.inc({ reason });
-      this.record("RISK_VETO", trigger.traceId, trigger.marketId, { reasons: decision.risk.vetoes, netExpectedEdge: decision.netExpectedEdge }, asset);
+      this.record("RISK_VETO", trigger.traceId, trigger.marketId, { reasons: decision.risk.vetoes, netEvUsdPerShare: decision.netEvUsdPerShare }, asset);
       return;
     }
-    this.record("RISK_ACCEPT", trigger.traceId, trigger.marketId, { orderId: decision.order.id, netExpectedEdge: decision.netExpectedEdge }, asset);
+    this.record("RISK_ACCEPT", trigger.traceId, trigger.marketId, { orderId: decision.order.id, netEvUsdPerShare: decision.netEvUsdPerShare }, asset);
     await this.submitPaperOrder(decision.order, snapshot, duplicateKey, candidate.intent);
   }
 
@@ -2716,6 +2776,111 @@ export class EngineService {
     if (this.experimentStartPending || this.experiment?.startValidationPending === true) return false;
     const status = this.experiment?.status;
     return status === "RUNNING" || status === "ENTRY_CLOSED";
+  }
+
+  /**
+   * Admit a bounded, non-economic scout refresh from trusted live state.
+   * Refresh contexts never enter activeTriggers, trigger admission, or the
+   * durable journal. They exist only until the asynchronous role fanout has
+   * returned, with TTL/cooldown/rate limits preventing a queue per tick.
+   */
+  private requestScoutRefresh(snapshot: MarketSnapshot): void {
+    if (this.env.GROK_ACTIVATION_PROVIDER !== "xai" || !this.isExperimentWindowOpen()) return;
+    const pair = this.snapshots.get(snapshot.marketId);
+    if (!pair?.UP || !pair.DOWN) return;
+    const now = this.nowFn();
+    const nowMs = now.getTime();
+    this.pruneScoutRefreshState(nowMs);
+    const scope = `${snapshot.marketId}:${snapshot.asset ?? this.assetByMarket.get(snapshot.marketId) ?? "none"}`;
+    const minimumGap = Math.max(1, this.triggerConfig.debounceMs, this.triggerConfig.cooldownMs);
+    const lastAt = this.scoutRefreshLastAt.get(scope);
+    if ((lastAt !== undefined && nowMs - lastAt < minimumGap) || this.scoutRefreshInFlight.has(scope)) return;
+    const recentLimit = Math.max(1, this.triggerConfig.maxActivationsPerMinute);
+    if (this.scoutRefreshRecentAt.length >= recentLimit) return;
+    const fresh = this.hotResearchCache.freshFor(snapshot.marketId, snapshot.asset ?? null, SCOUT_ROLES);
+    if (fresh.length === SCOUT_ROLES.length) return;
+    const selectedRoles = SCOUT_ROLES.filter((role) => (this.scoutRefreshRoleRecentAt.get(role)?.length ?? 0) < recentLimit);
+    if (selectedRoles.length === 0) return;
+
+    const triggerId = `research_refresh_${snapshot.marketId}_${nowMs}`;
+    const expiresAt = new Date(nowMs + Math.min(this.triggerConfig.triggerTtlMs, 60_000)).toISOString();
+    const trigger = triggerEventSchema.parse({
+      id: triggerId,
+      traceId: snapshot.traceId,
+      marketId: snapshot.marketId,
+      asset: snapshot.asset ?? this.assetByMarket.get(snapshot.marketId) ?? null,
+      source: "polymarket",
+      kind: "BOOK_IMBALANCE",
+      severity: 1,
+      score: 0,
+      dedupeKey: `research_refresh:${scope}`,
+      evidence: { source: "deterministic_market_state", refresh: true, sequence: snapshot.sequence },
+      sourceEventIds: [snapshot.eventId],
+      evidenceIds: [snapshot.eventId],
+      createdAt: now.toISOString(),
+      expiresAt,
+    });
+    const request = grokActivationRequestSchema.parse({
+      eventType: "GROK_RESEARCH_REQUEST",
+      triggerId,
+      traceId: snapshot.traceId,
+      marketId: snapshot.marketId,
+      asset: trigger.asset ?? null,
+      severity: 1,
+      triggerKind: trigger.kind,
+      createdAt: trigger.createdAt,
+      expiresAt: trigger.expiresAt,
+      targetRoles: [...selectedRoles],
+      researchRefresh: true,
+    });
+    this.scoutRefreshContexts.set(triggerId, trigger);
+    this.scoutRefreshLastAt.set(scope, nowMs);
+    this.scoutRefreshInFlight.add(scope);
+    this.scoutRefreshRecentAt.push(nowMs);
+    for (const role of selectedRoles) {
+      const times = this.scoutRefreshRoleRecentAt.get(role) ?? [];
+      times.push(nowMs);
+      this.scoutRefreshRoleRecentAt.set(role, times);
+    }
+    this.pruneScoutRefreshState(nowMs);
+    void this.activation.dispatch(request)
+      .then((results) => {
+        for (const result of results) this.metrics.activations.inc({ provider: result.provider, status: result.ok ? "ok" : "failed" });
+      })
+      .catch((error) => this.logger.error({ err: error, marketId: snapshot.marketId }, "bounded scout refresh failed"))
+      .finally(() => {
+        this.scoutRefreshInFlight.delete(scope);
+        this.scoutRefreshContexts.delete(triggerId);
+      });
+  }
+
+  private pruneScoutRefreshState(nowMs: number): void {
+    for (const [triggerId, trigger] of this.scoutRefreshContexts) {
+      if (Date.parse(trigger.expiresAt) <= nowMs) this.scoutRefreshContexts.delete(triggerId);
+    }
+    while (this.scoutRefreshContexts.size > SCOUT_REFRESH_CONTEXT_MAX) {
+      const oldest = this.scoutRefreshContexts.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.scoutRefreshContexts.delete(oldest);
+    }
+    for (const [scope, at] of this.scoutRefreshLastAt) {
+      if (nowMs - at >= SCOUT_REFRESH_STATE_TTL_MS) this.scoutRefreshLastAt.delete(scope);
+    }
+    for (const [role, times] of this.scoutRefreshRoleRecentAt) {
+      while (times.length > 0 && nowMs - (times[0] ?? nowMs) >= 60_000) times.shift();
+      if (times.length === 0) this.scoutRefreshRoleRecentAt.delete(role);
+      else if (times.length > SCOUT_REFRESH_CONTEXT_MAX) times.splice(0, times.length - SCOUT_REFRESH_CONTEXT_MAX);
+    }
+    while (this.scoutRefreshRecentAt.length > 0 && nowMs - (this.scoutRefreshRecentAt[0] ?? nowMs) >= 60_000) this.scoutRefreshRecentAt.shift();
+    while (this.scoutRefreshRecentAt.length > SCOUT_REFRESH_CONTEXT_MAX) this.scoutRefreshRecentAt.shift();
+    for (const [key, at] of this.scoutRefreshSubmissionKeys) {
+      if (nowMs - at >= SCOUT_REFRESH_STATE_TTL_MS) this.scoutRefreshSubmissionKeys.delete(key);
+    }
+    while (this.scoutRefreshSubmissionKeys.size > SCOUT_REFRESH_CONTEXT_MAX * 2) {
+      const oldest = this.scoutRefreshSubmissionKeys.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.scoutRefreshSubmissionKeys.delete(oldest);
+    }
   }
 
   private noteExperimentFeedInvalidation(): void {

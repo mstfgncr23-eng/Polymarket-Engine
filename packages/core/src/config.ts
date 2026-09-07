@@ -11,6 +11,7 @@ export const riskLimitsSchema = z.object({
   maxDailyPaperLossUsd: z.number().positive().default(50),
   maxDrawdownUsd: z.number().positive().default(100),
   minLiquidityUsd: z.number().nonnegative().default(100),
+  /** Minimum net expected value in USD/share for a $1 binary payout. */
   minExpectedEdge: z.number().min(0).max(1).default(0.015),
   maxSpread: z.number().min(0).max(1).default(0.08),
   minSignalConfidence: z.number().min(0).max(1).default(0.6),

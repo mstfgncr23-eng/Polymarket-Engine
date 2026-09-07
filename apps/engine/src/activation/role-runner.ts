@@ -35,7 +35,7 @@ export interface GrokRoleContext {
   researchToolsAvailable: false;
 }
 
-export type GrokSubmissionMode = "mcp" | "scout" | "alpha";
+export type GrokSubmissionMode = "mcp" | "scout" | "alpha" | "refresh";
 
 export interface GrokRoleRunnerConfig {
   client: XaiInferenceClient;
@@ -86,6 +86,12 @@ export class GrokRoleRunner {
       "Never execute, approve, or suggest an executable trade, wallet action, or order tool call.",
       "Return only the JSON object required by the supplied structured output schema.",
       "researchToolsAvailable is false unless explicitly supplied as true; do not fabricate web/X evidence.",
+      ...(role === "fair_probability_analyst" ? [
+        "Scout statements are research summaries, not independent votes.",
+        "Identical sourceEventIds, featureIds, derivedFrom entries, or overlapping reference windows are correlated evidence and must not be counted repeatedly.",
+        "Re-evaluate all research against the current synchronized raw book and reference state; never reuse a scout historical edge as the current executable edge.",
+        "Do not perform authoritative execution-cost math; deterministic engine code remains authoritative.",
+      ] : []),
     ].join(" ");
     const userPrompt = JSON.stringify({ context: boundedContext, outputRequirements: "Return only the role output object; evidenceIds must refer to supplied evidence when present." });
     let inference: XaiInferenceResponse;
@@ -132,7 +138,10 @@ export class GrokRoleRunner {
       role,
       output,
     });
-    const submissionResult = await this.config.submitSignal(submission, role, isScoutRole(role) ? "scout" : role === "fair_probability_analyst" ? "alpha" : "mcp");
+    const submissionMode = request.researchRefresh
+      ? "refresh"
+      : isScoutRole(role) ? "scout" : role === "fair_probability_analyst" ? "alpha" : "mcp";
+    const submissionResult = await this.config.submitSignal(submission, role, submissionMode);
     if (!["accepted", "duplicate"].includes(submissionResult.status)) {
       throw new GrokRoleRuntimeError(`SUBMISSION_${submissionResult.status.toUpperCase()}`, `engine rejected ${role} submission`);
     }
@@ -186,6 +195,13 @@ export function boundedContextForPrompt(context: GrokRoleContext, role: External
       return value;
     })
     : [];
+  if (role === "fair_probability_analyst" && base.provenance) {
+    const provenance = { ...base.provenance };
+    for (const key of ["sourceEventIds", "evidenceIds", "scoutKeys", "correlatedFeatureIds"] as const) {
+      if (Array.isArray(provenance[key])) provenance[key] = [...new Set((provenance[key] as unknown[]).map(String))].slice(0, 64);
+    }
+    base.provenance = provenance;
+  }
   if (role !== "fair_probability_analyst") base.provenance = undefined;
   if (!["crypto_market_scanner", "news_x_intelligence_scanner", "fair_probability_analyst"].includes(role)) base.reference = null;
   if (role !== "risk_hedge_analyst") {

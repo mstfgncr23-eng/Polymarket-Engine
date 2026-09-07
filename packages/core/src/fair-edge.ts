@@ -11,7 +11,12 @@ export interface FairProbabilityEvidence {
 export interface ExecutableFairEdge {
   consensusOutcome: Outcome;
   fairProbabilityForConsensus: number;
+  /** Fair probability for the traded binary outcome after complementing. */
+  fairProbabilityForTradedOutcome: number;
   executablePrice: number;
+  /** Expected USD/share (equivalent to probability points for a $1 payout). */
+  rawEdgeUsdPerShare: number;
+  /** @deprecated Compatibility alias for rawEdgeUsdPerShare. */
   rawEdge: number;
   usedComplement: boolean;
   estimatedEdgeIgnored: number | null;
@@ -49,11 +54,14 @@ export function executableFairEdge(input: {
   if (!walk.sufficientDepth) return null;
   const executablePrice = Number(walk.vwap);
   if (!Number.isFinite(executablePrice)) return null;
+  const rawEdgeUsdPerShare = fairForConsensus - executablePrice;
   return {
     consensusOutcome: consensus,
     fairProbabilityForConsensus: fairForConsensus,
+    fairProbabilityForTradedOutcome: fairForConsensus,
     executablePrice,
-    rawEdge: fairForConsensus - executablePrice,
+    rawEdgeUsdPerShare,
+    rawEdge: rawEdgeUsdPerShare,
     usedComplement,
     estimatedEdgeIgnored: typeof input.fair.estimatedEdge === "number" ? input.fair.estimatedEdge : null,
     bookMarketProbability: executablePrice,
