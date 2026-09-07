@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, gte, inArray, lte, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, lt, lte, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/postgres-js";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
 import postgres from "postgres";
@@ -974,7 +974,7 @@ export class PostgresEventJournal implements EventJournal {
       DELETE FROM mcp_idempotency_keys
       WHERE (scope, key) IN (
         SELECT scope, key FROM mcp_idempotency_keys
-        WHERE created_at < ${olderThan}
+        WHERE created_at < ${olderThan.toISOString()}
         ORDER BY created_at ASC, scope ASC, key ASC
         LIMIT ${cap}
       )
@@ -1054,7 +1054,7 @@ export class PostgresEventJournal implements EventJournal {
       WHERE (occurred_at, id) IN (
         SELECT occurred_at, id FROM journal_events
         WHERE type = ANY(${input.types as string[]})
-          AND occurred_at < ${input.occurredBefore}
+          AND occurred_at < ${input.occurredBefore.toISOString()}
         ORDER BY occurred_at ASC, id ASC
         LIMIT ${cap}
       )
@@ -1396,7 +1396,7 @@ export class PostgresEventJournal implements EventJournal {
       count: sql<number>`count(*)::int`,
       oldest: sql<Date | null>`min(${journalEvents.occurredAt})`,
     }).from(journalEvents)
-      .where(and(inArray(journalEvents.type, [...types]), sql`${journalEvents.occurredAt} < ${occurredBefore}`));
+      .where(and(inArray(journalEvents.type, [...types]), lt(journalEvents.occurredAt, occurredBefore)));
     const row = rows[0];
     return {
       count: Number(row?.count ?? 0),
