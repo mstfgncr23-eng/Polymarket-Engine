@@ -45,6 +45,26 @@ function localPgUrl(): string {
   return databaseUrl;
 }
 
+async function withIsolatedPgDatabase<T>(baseUrl: string, run: (database: string) => Promise<T>): Promise<T> {
+  const dbName = `step4_pr20_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const adminUrl = new URL(baseUrl);
+  adminUrl.pathname = "/postgres";
+  const adminJournal = new PostgresEventJournal(adminUrl.toString(), migrations);
+  const adminClient = Reflect.get(adminJournal, "client") as { unsafe(sql: string): Promise<unknown> };
+  try {
+    // The source URL is the disposable localhost PG17 service. A private
+    // database keeps this lifecycle recovery test independent from the other
+    // PG17 tests that share that service during the full CI run.
+    await adminClient.unsafe(`CREATE DATABASE "${dbName}"`);
+    const isolatedUrl = new URL(baseUrl);
+    isolatedUrl.pathname = `/${dbName}`;
+    return await run(isolatedUrl.toString());
+  } finally {
+    await adminClient.unsafe(`DROP DATABASE IF EXISTS "${dbName}" WITH (FORCE)`).catch(() => undefined);
+    await adminJournal.close();
+  }
+}
+
 async function drainRuntime(engine: EngineService): Promise<void> {
   const started = Date.now();
   while (engine.runtimeSupervisorSnapshot().unresolved !== 0) {
@@ -172,16 +192,17 @@ function payloadObject(row: { payload: Record<string, unknown> }, key: string): 
 
 describe("PR20 true product end-to-end gate on PostgreSQL 17", () => {
   it.skipIf(!databaseUrl)("persists fill, crash recovery, settlement, and canonical report exactly once", { timeout: 120_000 }, async () => {
-    const url = localPgUrl();
-    const clock = { nowMs: START_MS };
-    const resolutions = new Map<string, Record<string, unknown>>();
-    const marketId = `pg17-btc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    const journal = new PostgresEventJournal(url, migrations);
-    const setup = await setupPgScenario(journal, clock, resolutions, marketId);
-    let experimentId = "";
-    let trigger!: TriggerEvent;
-    let fillId = "";
-    try {
+    const baseUrl = localPgUrl();
+    await withIsolatedPgDatabase(baseUrl, async (url) => {
+      const clock = { nowMs: START_MS };
+      const resolutions = new Map<string, Record<string, unknown>>();
+      const marketId = `pg17-btc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const journal = new PostgresEventJournal(url, migrations);
+      const setup = await setupPgScenario(journal, clock, resolutions, marketId);
+      let experimentId = "";
+      let trigger!: TriggerEvent;
+      let fillId = "";
+      try {
       trigger = await beginAndGenerateTrigger(setup);
       experimentId = setup.engine.experimentManifest()!.id;
       const startRows = await journal.queryDurableTransitions({ types: ["EXPERIMENT_STARTED"], limit: 20_000 });
@@ -263,9 +284,10 @@ describe("PR20 true product end-to-end gate on PostgreSQL 17", () => {
       } finally {
         await finalJournal.close();
       }
-    } finally {
-      if (!recovered.engine.state.draining) await recovered.engine.stop();
-      await restartedJournal.close().catch(() => undefined);
-    }
+      } finally {
+        if (!recovered.engine.state.draining) await recovered.engine.stop();
+        await restartedJournal.close().catch(() => undefined);
+      }
+    });
   });
 });
