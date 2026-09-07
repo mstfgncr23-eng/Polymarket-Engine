@@ -80,6 +80,9 @@ export function evaluateExperimentPreflight(input: {
     if (input.env.GROK_ACTIVATION_PROVIDER === "slack" && (!input.env.SLACK_BOT_TOKEN || !input.env.SLACK_CHANNEL_ID)) {
       blockers.push("SLACK_ACTIVATION_UNCONFIGURED");
     }
+    if (input.env.GROK_ACTIVATION_PROVIDER === "xai" && !input.env.XAI_API_KEY) {
+      blockers.push("XAI_ACTIVATION_UNCONFIGURED");
+    }
   } else if (input.env.GROK_ACTIVATION_PROVIDER === "noop") {
     warnings.push("GROK_WAKE_NOT_VALIDATED");
   }

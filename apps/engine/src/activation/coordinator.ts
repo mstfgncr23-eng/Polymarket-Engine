@@ -205,6 +205,11 @@ export class GrokActivationCoordinator {
     return { sent: this.sent.size, lastByMarketAsset: this.lastByMarketAsset.size, latency: this.latency.size, recent: this.recentCount() };
   }
 
+  runtimeMetricsSnapshot(): unknown[] {
+    const bridge = this.bridge as GrokActivationBridge & { metricsSnapshot?: () => unknown[] };
+    return bridge.metricsSnapshot?.() ?? [];
+  }
+
   private evictLatencyIfNeeded(): void {
     const limit = this.limits.memoryLimit ?? 500;
     while (this.latency.size > limit && this.latencyHead < this.latencyOrder.length) {

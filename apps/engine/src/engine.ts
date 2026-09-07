@@ -44,6 +44,7 @@ import {
   type ExternalAgentRoleId,
   type Direction,
   type GrokActivationBridge,
+  type GrokActivationRequest,
   type GrokSignalEnvelope,
   type GrokSignalSubmission,
   type EngineEnv,
@@ -112,6 +113,7 @@ import {
 } from "./report-source-integrity.js";
 import { GrokActivationCoordinator, persistableActivation } from "./activation/coordinator.js";
 import { createGrokActivationBridge } from "./activation/index.js";
+import type { GrokRoleContext } from "./activation/role-runner.js";
 import { BoundedJournalWriter } from "./journal-writer.js";
 import { evaluateExperimentPreflight, isGenuineEntryQualifiedMarket } from "./preflight.js";
 import { CrashInjectedError, CrashInjector, type CrashInjectionPoint } from "./crash-injection.js";
@@ -297,6 +299,7 @@ export class EngineService {
       market?: PolymarketMarketDataAdapter;
       btc?: BtcWebSocketAdapter;
       activation?: GrokActivationBridge;
+      activationFetch?: typeof fetch;
       referenceRegistry?: ReferenceFeedRegistry;
       now?: () => Date;
       resolutionFetcher?: (idOrSlug: string) => Promise<Record<string, unknown> | null>;
@@ -357,7 +360,11 @@ export class EngineService {
       },
     });
     this.activation = new GrokActivationCoordinator(
-      adapters?.activation ?? createGrokActivationBridge(env),
+      adapters?.activation ?? createGrokActivationBridge(env, adapters?.activationFetch ?? fetch, {
+        contextProvider: (request, role) => this.grokRoleContext(request, role, env.XAI_ALLOW_PORTFOLIO_CONTEXT),
+        submitSignal: (submission, clientId) => this.submitGrokSignal(submission, clientId),
+        now: this.nowFn,
+      }),
       {
         cooldownMs: this.triggerConfig.cooldownMs, maxPerMinute: this.triggerConfig.maxActivationsPerMinute,
         suppressAtOrBelow: this.triggerConfig.activationSeveritySuppression,
@@ -475,6 +482,7 @@ export class EngineService {
   snapshotBroadcastCount() { return this.sse.snapshotBroadcastCount(); }
   experimentManifest() { return this.experiment; }
   activationFootprint() { return this.activation.footprint(); }
+  grokRuntimeMetricsForTest() { return this.activation.runtimeMetricsSnapshot(); }
   restingOrderCount() { return this.restingOrders.size; }
   reservedCash() { return this.ledger.snapshot().reservedCash; }
   async tickMaintenance(): Promise<void> { await this.runMaintenance(); }
@@ -1819,6 +1827,67 @@ export class EngineService {
       });
     }
     this.state.setActivationLatency(this.activation.snapshot());
+  }
+
+  /** Bounded, role-scoped context for the opt-in internal xAI runtime. */
+  private grokRoleContext(request: GrokActivationRequest, role: ExternalAgentRoleId, allowPortfolioContext: boolean): GrokRoleContext {
+    const trigger = this.activeTriggers.get(request.triggerId);
+    if (!trigger) throw new Error("RUNTIME_TRIGGER_UNAVAILABLE");
+    const snapshots = request.marketId
+      ? [...this.state.marketSnapshots.values()]
+        .filter((item) => item.marketId === request.marketId)
+        .slice(-2)
+        .map((item) => boundedMarketSnapshot(item))
+      : [];
+    const ledger = this.ledger.snapshot();
+    const selectedPosition = request.marketId ? this.ledger.positions.get(request.marketId) : undefined;
+    const scopedPositions = role === "risk_hedge_analyst" && allowPortfolioContext && selectedPosition
+      ? [boundedPosition(selectedPosition)]
+      : [];
+    const exposure = request.marketId && role === "risk_hedge_analyst" && allowPortfolioContext
+      ? computePaperExposures(this.ledger.positions.values(), request.marketId, this.assetByMarket, this.nowFn().getTime())
+      : undefined;
+    const hedgeState = selectedPosition && role === "risk_hedge_analyst" && allowPortfolioContext
+      ? {
+        marketId: selectedPosition.marketId,
+        pairedQuantity: selectedPosition.pairedQuantity,
+        unpairedQuantity: selectedPosition.unpairedQuantity,
+        unpairedOutcome: selectedPosition.unpairedOutcome,
+        combinedPairCost: selectedPosition.combinedPairCost,
+        obligation: Number(selectedPosition.unpairedQuantity) > 0 ? "HEDGE_REQUIRED" : "PAIRED",
+      }
+      : null;
+    const recentStrategyRisk = this.state.feed
+      .filter((item) => item.type.startsWith("RISK_") || item.type.startsWith("CONSENSUS_") || item.type.startsWith("PAPER_"))
+      .slice(0, 20)
+      .map((item) => boundedStrategyRiskSummary(item));
+    const experiment = this.experiment ? {
+      id: this.experiment.id,
+      status: this.experiment.status,
+      startedAt: this.experiment.startedAt,
+      completedAt: this.experiment.completedAt,
+      startValidationPending: this.experiment.startValidationPending,
+    } : null;
+    return {
+      trigger: boundedTrigger(trigger),
+      market: request.marketId ? {
+        marketId: request.marketId,
+        asset: request.asset ?? trigger.asset ?? null,
+        snapshots,
+      } : null,
+      reference: request.asset ? boundedReference(this.state.getReferenceContext(request.asset, this.nowFn().getTime(), this.riskLimits.staleFeedTimeoutMs)) : null,
+      portfolio: {
+        cash: allowPortfolioContext && role === "risk_hedge_analyst" ? ledger.cash : "[omitted]",
+        equity: allowPortfolioContext && role === "risk_hedge_analyst" ? ledger.equity : "[omitted]",
+        reservedCash: allowPortfolioContext && role === "risk_hedge_analyst" ? ledger.reservedCash : "[omitted]",
+        positions: scopedPositions,
+        ...(exposure ? { exposure } : {}),
+        hedgeState,
+      },
+      experiment,
+      recentStrategyRisk,
+      researchToolsAvailable: false,
+    };
   }
 
   /** The only ingress for external Grok research; it cannot create orders directly. */
@@ -3933,6 +4002,93 @@ function splitList(value: string): string[] { return value.split(",").map((item)
 function uniqueStrings(values: readonly string[]): string[] { return [...new Set(values.filter(Boolean))]; }
 function dateOrNull(value: string | null | undefined): Date | null { return value ? new Date(value) : null; }
 function delay(ms: number): Promise<void> { return new Promise((resolve) => setTimeout(resolve, ms)); }
+
+function boundedTrigger(trigger: TriggerEvent): Record<string, unknown> {
+  return {
+    id: trigger.id,
+    traceId: trigger.traceId,
+    marketId: trigger.marketId,
+    asset: trigger.asset ?? null,
+    kind: trigger.kind,
+    severity: trigger.severity,
+    score: trigger.score,
+    evidenceIds: (trigger.evidenceIds ?? []).slice(0, 32),
+    sourceEventIds: trigger.sourceEventIds.slice(0, 32),
+    createdAt: trigger.createdAt,
+    expiresAt: trigger.expiresAt,
+  };
+}
+
+function boundedMarketSnapshot(snapshot: MarketSnapshot): Record<string, unknown> {
+  return {
+    eventId: snapshot.eventId,
+    traceId: snapshot.traceId,
+    marketId: snapshot.marketId,
+    tokenId: snapshot.tokenId,
+    outcome: snapshot.outcome,
+    asset: snapshot.asset ?? null,
+    bids: snapshot.bids.slice(0, 20).map((level) => ({ price: level.price, quantity: level.quantity })),
+    asks: snapshot.asks.slice(0, 20).map((level) => ({ price: level.price, quantity: level.quantity })),
+    lastTradePrice: snapshot.lastTradePrice,
+    tickSize: snapshot.tickSize,
+    minOrderSize: snapshot.minOrderSize,
+    sourceTimestamp: snapshot.sourceTimestamp,
+    receivedAt: snapshot.receivedAt,
+    sequence: snapshot.sequence,
+    hash: snapshot.hash,
+  };
+}
+
+function boundedPosition(position: Position): Record<string, unknown> {
+  return {
+    marketId: position.marketId,
+    upQuantity: position.upQuantity,
+    downQuantity: position.downQuantity,
+    averageUpCost: position.averageUpCost,
+    averageDownCost: position.averageDownCost,
+    pairedQuantity: position.pairedQuantity,
+    unpairedOutcome: position.unpairedOutcome,
+    unpairedQuantity: position.unpairedQuantity,
+    combinedPairCost: position.combinedPairCost,
+    openedAt: position.openedAt,
+    updatedAt: position.updatedAt,
+  };
+}
+
+function boundedReference(reference: {
+  asset: string; symbol: string | null; venue: string | null; latestPrice: string | null;
+  lastMessageAt: string | null; freshness: string; freshnessMs: number | null;
+  recentMoveBps: number | null; recentVolatilityBps: number | null;
+}): Record<string, unknown> {
+  return {
+    asset: reference.asset,
+    symbol: reference.symbol,
+    venue: reference.venue,
+    latestPrice: reference.latestPrice,
+    lastMessageAt: reference.lastMessageAt,
+    freshness: reference.freshness,
+    freshnessMs: reference.freshnessMs,
+    recentMoveBps: reference.recentMoveBps,
+    recentVolatilityBps: reference.recentVolatilityBps,
+  };
+}
+
+function boundedStrategyRiskSummary(item: {
+  type: string; at: string; traceId: string; marketId: string | null; asset?: string | null; detail: Record<string, unknown>;
+}): Record<string, unknown> {
+  const allowed = [
+    "direction", "confidence", "estimatedEdge", "consensusDirection", "consensusConfidence", "agentAgreement",
+    "vetoes", "orderSizeUsd", "marketExposureUsd", "assetExposureUsd", "totalExposureUsd", "unhedgedExposureUsd",
+    "reason", "status", "intent", "outcome", "pairedQuantity", "unpairedQuantity",
+  ];
+  const detail: Record<string, unknown> = {};
+  for (const key of allowed) {
+    const value = item.detail[key];
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean" || value === null) detail[key] = value;
+    else if (Array.isArray(value)) detail[key] = value.slice(0, 8).filter((entry) => typeof entry === "string" || typeof entry === "number" || typeof entry === "boolean");
+  }
+  return { type: item.type, at: item.at, traceId: item.traceId, marketId: item.marketId, asset: item.asset ?? null, detail };
+}
 
 export function isRiskHedgeSettlementTrigger(kind: string): boolean {
   return isRiskHedgeSettlementKind(kind);

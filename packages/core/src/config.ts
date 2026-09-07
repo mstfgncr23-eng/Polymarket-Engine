@@ -78,10 +78,21 @@ export const engineEnvSchema = z.object({
   GROK_MCP_BEARER_TOKENS: z.string().default(""),
   GROK_MCP_ALLOWED_ORIGINS: z.string().default("https://grok.com,https://x.ai"),
   GROK_MCP_RATE_LIMIT_PER_MINUTE: z.coerce.number().int().positive().default(60),
-  GROK_ACTIVATION_PROVIDER: z.enum(["noop", "slack"]).default("noop"),
+  /** Safe by default: xAI inference is explicit opt-in and never enabled by a key alone. */
+  GROK_ACTIVATION_PROVIDER: z.enum(["noop", "slack", "xai"]).default("noop"),
   SLACK_BOT_TOKEN: z.string().optional(),
   SLACK_CHANNEL_ID: z.string().optional(),
   SLACK_API_URL: z.string().url().default("https://slack.com/api/chat.postMessage"),
+  XAI_API_KEY: z.string().optional(),
+  XAI_API_BASE_URL: z.string().url().default("https://api.x.ai/v1"),
+  XAI_MODEL: z.string().min(1).default("grok-4-1-fast-reasoning"),
+  XAI_REQUEST_TIMEOUT_MS: z.coerce.number().int().positive().max(120_000).default(20_000),
+  XAI_MAX_OUTPUT_TOKENS: z.coerce.number().int().positive().max(16_384).default(1_024),
+  /** Separate explicit gate for sending paper portfolio context to xAI. */
+  XAI_ALLOW_PORTFOLIO_CONTEXT: z.preprocess(
+    (value) => value === undefined ? undefined : value === true || value === "true" || value === "1",
+    z.boolean().optional(),
+  ).default(false),
   DISCOVERY_INTERVAL_MS: z.coerce.number().int().positive().default(300_000),
   MAX_QUALIFIED_MARKETS: z.coerce.number().int().positive().default(40),
   ESTIMATED_INFRA_COST_PER_HOUR_USD: z.coerce.number().nonnegative().default(0.08),

@@ -105,6 +105,7 @@ The engine defines `GrokActivationBridge`. Core trigger/consensus/risk code does
 |---|---|---|---|
 | `NoopGrokActivationBridge` | `GROK_ACTIVATION_PROVIDER=noop` (default) | Records a skipped activation. Monitoring continues. | Not a fake Grok signal, consensus, or paper order. |
 | `SlackGrokActivationBridge` | `GROK_ACTIVATION_PROVIDER=slack` plus engine-only `SLACK_BOT_TOKEN` and `SLACK_CHANNEL_ID` | Posts a **minimal wake-signal** per target role: `eventType, triggerId, traceId, marketId, asset, severity, triggerKind, createdAt, expiresAt, targetRoles`. Canonical research stays on MCP. | Adapter HTTP `ok` is **not** an observed Grok wake. Official docs do not prove that a programmatic Slack bot post (vs a human message) fires a Cursor-account routine. |
+| `XaiGrokActivationBridge` | `GROK_ACTIVATION_PROVIDER=xai` plus engine-only `XAI_API_KEY` | Runs the selected registered role with bounded xAI structured output, validates the role schema locally, and submits through the existing `submitGrokSignal` path. | Explicit opt-in only; default remains `noop`. `XAI_ALLOW_PORTFOLIO_CONTEXT` defaults false and gates paper portfolio fields to the risk role. News/X research is disabled (`researchToolsAvailable=false`) until a safe provider tool contract is added. |
 
 Bot-to-Bot fan-out is **not** used: MCP cannot send those messages, and a dispatcher Bot would add hops without validated product behavior. Role-specific Slack posts are used instead of waking all six Bots.
 

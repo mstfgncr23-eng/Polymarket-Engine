@@ -218,8 +218,11 @@ Dashboard: `http://localhost:3000`; engine liveness/readiness/metrics: `http://l
 | `GROK_MCP_BEARER_TOKENS` | Engine-only `roleId:token` list. `clientId` must be a Grok role ID and is bound to writes (`clientId === agentId === role`). Dashboard never receives it. Token fingerprints, not raw tokens, are audited. |
 | `GROK_MCP_ALLOWED_ORIGINS` | Allowed `Origin` values; missing Origin is allowed for server-side Grok clients. Default `https://grok.com,https://x.ai` |
 | `GROK_MCP_RATE_LIMIT_PER_MINUTE` | Per-client MCP request cap, default `60` |
-| `GROK_ACTIVATION_PROVIDER` | `noop` (default) or `slack`. Slack is wake-signal transport only. |
+| `GROK_ACTIVATION_PROVIDER` | `noop` (default), `slack`, or explicit `xai`. Slack is wake-signal transport only; xAI calls the bounded structured role runtime. A key alone never enables xAI. |
 | `SLACK_BOT_TOKEN`, `SLACK_CHANNEL_ID` | Engine-only Slack secrets when provider=`slack`. Never put these on the dashboard, in MCP, journal, logs, or traces. |
+| `XAI_API_KEY`, `XAI_API_BASE_URL`, `XAI_MODEL` | Engine-only xAI configuration when provider=`xai`; the key is never persisted or logged. |
+| `XAI_REQUEST_TIMEOUT_MS`, `XAI_MAX_OUTPUT_TOKENS` | Per-call timeout and output bounds for the opt-in xAI runtime. |
+| `XAI_ALLOW_PORTFOLIO_CONTEXT` | `false` by default. Set `true` only when paper cash/equity/reserved cash and the selected market's bounded position/exposure are explicitly approved for the risk role; no wallet or signer data is ever included. |
 | `SLACK_API_URL` | Slack `chat.postMessage` URL, default `https://slack.com/api/chat.postMessage` |
 | `ESTIMATED_INFRA_COST_PER_HOUR_USD` | Accrued into economic PnL |
 | `DASHBOARD_ORIGIN` | Allowed browser origin for engine API |
