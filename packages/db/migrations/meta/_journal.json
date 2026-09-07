@@ -43,6 +43,34 @@
       "when": 1788612000000,
       "tag": "0005_step4_reports_retention",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1788715628729,
+      "tag": "0006_hot_storage_lifecycle",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1788715629000,
+      "tag": "0007_storage_correctness",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1788715629300,
+      "tag": "0008_journal_commit_fence",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1788715629600,
+      "tag": "0009_replay_scope",
+      "breakpoints": true
     }
   ]
 }

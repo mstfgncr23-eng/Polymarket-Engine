@@ -28,6 +28,8 @@ export interface JournalQuery {
   offset?: number;
   /** asc = earliest first (required for multi-page scans). desc = newest-first window. */
   order?: "asc" | "desc";
+  /** Exclusive commit sequence lower fence for rollup tail scans. */
+  commitSeqAfter?: number;
 }
 
 export interface JournalKeysetCursor {
@@ -45,6 +47,8 @@ export interface JournalKeysetQuery {
   through?: JournalKeysetCursor;
   /** Exclude rows recorded after scan start (late-write fence). Not sufficient alone for commit stability. */
   recordedAtTo?: Date;
+  /** Exclusive lower commit-sequence fence used when folding a verified rollup tail. */
+  commitSeqAfter?: number;
   /** Inclusive commit-sequence fence assigned only when a row becomes visible. */
   commitSeqTo?: number;
   limit: number;

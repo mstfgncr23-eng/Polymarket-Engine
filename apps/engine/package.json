@@ -12,7 +12,8 @@
     "smoke:live": "tsx src/cli.ts live-feed-smoke",
     "smoke:discovery": "tsx src/cli.ts live-discovery-diag",
     "experiment:start": "tsx src/cli.ts experiment:start",
-    "report": "tsx src/cli.ts report"
+    "report": "tsx src/cli.ts report",
+    "archive:export": "tsx src/cli.ts archive:export"
   },
   "dependencies": {
     "@fastify/cors": "11.3.0",

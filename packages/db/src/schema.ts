@@ -90,8 +90,18 @@ export const journalEvents = pgTable("journal_events", {
   id: text("id").primaryKey(), traceId: text("trace_id").notNull(), correlationId: text("correlation_id").notNull(),
   type: text("type").notNull(), aggregateType: text("aggregate_type").notNull(), aggregateId: text("aggregate_id").notNull(),
   payload: jsonb("payload").notNull(), occurredAt: timestamp("occurred_at", { withTimezone: true }).notNull(),
-  recordedAt: timestamp("recorded_at", { withTimezone: true }).notNull().defaultNow(), sourceEventId: text("source_event_id"),
+  recordedAt: timestamp("recorded_at", { withTimezone: true }).notNull().defaultNow(),
+  /** Database-persistent admission/commit fence. Never inferred from recorded_at. */
+  commitSeq: bigint("commit_seq", { mode: "number" }).notNull().default(0),
+  sourceEventId: text("source_event_id"),
 }, (table) => [index("journal_trace_idx").on(table.traceId), index("journal_aggregate_idx").on(table.aggregateType, table.aggregateId, table.occurredAt), index("journal_type_time_idx").on(table.type, table.occurredAt)]);
+
+/** Singleton commit fence for journal_events. Updated in the same transaction as each event. */
+export const journalCommitMetadata = pgTable("journal_commit_metadata", {
+  id: integer("id").primaryKey(),
+  highWater: bigint("high_water", { mode: "number" }).notNull().default(0),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
 
 export const engineCheckpoints = pgTable("engine_checkpoints", {
   id: text("id").primaryKey(), experimentId: text("experiment_id"), sequence: integer("sequence").notNull(),
@@ -140,4 +150,51 @@ export const durableTransitions = pgTable("durable_transitions", {
 }, (table) => [
   uniqueIndex("durable_transitions_operation_key_uidx").on(table.operationKey),
   index("durable_transitions_sequence_idx").on(table.sequence),
+]);
+
+/** Singleton monotonic high-water and bounded compaction-key index. */
+export const durableSequenceMetadata = pgTable("durable_sequence_metadata", {
+  id: integer("id").primaryKey(),
+  highWater: bigint("high_water", { mode: "number" }).notNull().default(0),
+  compactedOperationKeys: jsonb("compacted_operation_keys").notNull().default({}),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+/** Indexed replay identities; payloads are intentionally excluded. */
+export const durableReplayKeys = pgTable("durable_replay_keys", {
+  operationKey: text("operation_key").primaryKey(),
+  type: text("type").notNull(),
+  aggregateType: text("aggregate_type").notNull(),
+  aggregateId: text("aggregate_id").notNull(),
+  /** Compact lifecycle scope (market/order/experiment); never full payload. */
+  scopeId: text("scope_id"),
+  payloadHash: text("payload_hash").notNull(),
+  sequence: bigint("sequence", { mode: "number" }).notNull(),
+  occurredAt: timestamp("occurred_at", { withTimezone: true }).notNull(),
+  recordedAt: timestamp("recorded_at", { withTimezone: true }).notNull(),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  lifecycleState: text("lifecycle_state").notNull().default("closed"),
+}, (table) => [index("durable_replay_keys_sequence_idx").on(table.sequence), index("durable_replay_keys_expiry_idx").on(table.expiresAt), index("durable_replay_keys_scope_idx").on(table.scopeId, table.lifecycleState)]);
+
+/** Versioned, verified analytics accumulator; raw source may be deleted only after this row is durable. */
+export const experimentReportRollups = pgTable("experiment_report_rollups", {
+  experimentId: text("experiment_id").notNull(),
+  rollupKind: text("rollup_kind").notNull(),
+  schemaVersion: integer("schema_version").notNull(),
+  sourceCursor: bigint("source_cursor", { mode: "number" }).notNull(),
+  sourceFenceId: text("source_fence_id"),
+  sourceFenceOccurredAt: timestamp("source_fence_occurred_at", { withTimezone: true }),
+  sourceEventCount: integer("source_event_count").notNull().default(0),
+  sourceCommitSeq: bigint("source_commit_seq", { mode: "number" }).notNull().default(0),
+  sourceRecordedAt: timestamp("source_recorded_at", { withTimezone: true }),
+  stableRead: boolean("stable_read").notNull().default(false),
+  previousContentHash: text("previous_content_hash"),
+  coverageHash: text("coverage_hash"),
+  accumulator: jsonb("accumulator").notNull(),
+  contentHash: text("content_hash").notNull(),
+  verified: boolean("verified").notNull().default(false),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  primaryKey({ name: "experiment_report_rollups_pkey", columns: [table.experimentId, table.rollupKind] }),
+  index("experiment_report_rollups_cursor_idx").on(table.sourceCursor),
 ]);

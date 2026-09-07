@@ -7,6 +7,7 @@ import {
 } from "@pm/core";
 import {
   createJournalEvent,
+  canonicalJson,
   hashExperimentReport,
   isCanonicalFinalReport,
   isTransientJournalError,
@@ -21,15 +22,68 @@ import {
 import {
   ExperimentSummaryAccumulator,
   includeCurrentExperimentEvent,
+  type ExperimentSummaryAccumulatorSnapshot,
   type ExperimentSummaryExtras,
 } from "./report.js";
 import { loadSourceSeal } from "./source-seal.js";
 import { loadUnresolvedReportSourceIntegrity } from "./report-source-integrity.js";
+import { createHash } from "node:crypto";
 
 export interface StreamedExperimentSummary {
   summary: ExperimentSummary;
   scan: ScanStats;
   accumulatorHighWaterBytes: number;
+  accumulatorSnapshot?: ExperimentSummaryAccumulatorSnapshot;
+  /** Content hash of the rollup actually restored before scanning the tail. */
+  baseRollupContentHash: string | null;
+}
+
+export const ANALYTICS_ROLLUP_SCHEMA_VERSION = 1;
+
+export function hashAnalyticsRollup(accumulator: Record<string, unknown>): string {
+  return createHash("sha256").update(canonicalJson(accumulator)).digest("hex");
+}
+
+function hashAnalyticsCoverage(input: { experimentId: string; schemaVersion: number; sourceEventCount: number; sourceCommitSeq: number; sourceFenceId: string | null; sourceFenceOccurredAt: string | null; sourceRecordedAt: string | null; stableRead: boolean; accumulatorHash: string }): string {
+  return createHash("sha256").update(canonicalJson(input)).digest("hex");
+}
+
+export async function persistVerifiedAnalyticsRollup(
+  journal: EventJournal,
+  input: { experimentId: string; sourceCursor: number; sourceFenceId?: string | null; sourceFenceOccurredAt?: string | null; sourceEventCount?: number; sourceCommitSeq?: number | null; sourceRecordedAt?: string | null; stableRead?: boolean; sourceCoverageComplete?: boolean; previousContentHash?: string | null; baseContentHash?: string | null; accumulator: Record<string, unknown>; rollupKind?: string },
+): Promise<import("@pm/db").AnalyticsRollup | null> {
+  if (!journal.persistAnalyticsRollup) return null;
+  if (input.stableRead === false) return null;
+  if (input.sourceCoverageComplete === false) return null;
+  const coveredCount = input.sourceEventCount ?? 0;
+  if (coveredCount > 0 && (!input.sourceFenceId || !input.sourceFenceOccurredAt)) return null;
+  if (input.sourceFenceId && journal.readJournalEventById) {
+    const fenceEvent = await journal.readJournalEventById(input.sourceFenceId);
+    if (!fenceEvent || !CANONICAL_REPORT_INPUT_EVENT_TYPES.includes(fenceEvent.type as (typeof CANONICAL_REPORT_INPUT_EVENT_TYPES)[number])) return null;
+    const fenceExperimentId = typeof fenceEvent.payload.experimentId === "string" ? fenceEvent.payload.experimentId : fenceEvent.aggregateId;
+    if (fenceExperimentId !== input.experimentId) return null;
+    if (input.sourceFenceOccurredAt && fenceEvent.occurredAt !== input.sourceFenceOccurredAt) return null;
+  }
+  const existing = journal.loadAnalyticsRollup ? await journal.loadAnalyticsRollup(input.experimentId, input.rollupKind ?? "canonical") : null;
+  const contentHash = hashAnalyticsRollup(input.accumulator);
+  const rollup = {
+    experimentId: input.experimentId, rollupKind: input.rollupKind ?? "canonical", schemaVersion: ANALYTICS_ROLLUP_SCHEMA_VERSION,
+    sourceCursor: input.sourceCursor, sourceFenceId: input.sourceFenceId ?? null, sourceFenceOccurredAt: input.sourceFenceOccurredAt ?? null,
+    sourceEventCount: coveredCount, sourceCommitSeq: input.sourceCommitSeq ?? 0, sourceRecordedAt: input.sourceRecordedAt ?? null,
+    stableRead: input.stableRead ?? true,
+    previousContentHash: input.baseContentHash !== undefined ? input.baseContentHash : (input.previousContentHash !== undefined ? input.previousContentHash : existing?.contentHash ?? null),
+    accumulator: input.accumulator, contentHash, verified: true, createdAt: new Date().toISOString(),
+  };
+  (rollup as { coverageHash?: string }).coverageHash = hashAnalyticsCoverage({ experimentId: rollup.experimentId, schemaVersion: rollup.schemaVersion, sourceEventCount: rollup.sourceEventCount, sourceCommitSeq: rollup.sourceCommitSeq, sourceFenceId: rollup.sourceFenceId, sourceFenceOccurredAt: rollup.sourceFenceOccurredAt, sourceRecordedAt: rollup.sourceRecordedAt, stableRead: rollup.stableRead, accumulatorHash: contentHash });
+  return journal.persistAnalyticsRollup(rollup);
+}
+
+export async function loadVerifiedAnalyticsRollup(journal: EventJournal, experimentId: string, rollupKind = "canonical"): Promise<import("@pm/db").AnalyticsRollup | null> {
+  if (!journal.loadAnalyticsRollup) return null;
+  const row = await journal.loadAnalyticsRollup(experimentId, rollupKind);
+  if (!row || !row.verified || row.schemaVersion !== ANALYTICS_ROLLUP_SCHEMA_VERSION || row.stableRead === false || hashAnalyticsRollup(row.accumulator) !== row.contentHash) return null;
+  if (row.coverageHash && row.coverageHash !== hashAnalyticsCoverage({ experimentId: row.experimentId, schemaVersion: row.schemaVersion, sourceEventCount: row.sourceEventCount ?? 0, sourceCommitSeq: row.sourceCommitSeq ?? 0, sourceFenceId: row.sourceFenceId, sourceFenceOccurredAt: row.sourceFenceOccurredAt, sourceRecordedAt: row.sourceRecordedAt ?? null, stableRead: row.stableRead ?? false, accumulatorHash: row.contentHash })) return null;
+  return row;
 }
 
 export async function streamExperimentSummary(
@@ -38,18 +92,33 @@ export async function streamExperimentSummary(
   extras: ExperimentSummaryExtras,
   options: { signal?: AbortSignal; pageSize?: number; ceiling?: number } = {},
 ): Promise<StreamedExperimentSummary> {
+  const rollup = await loadVerifiedAnalyticsRollup(journal, experiment.id);
   const acc = new ExperimentSummaryAccumulator(experiment.id, extras);
+  const rollupSnapshot = rollup?.accumulator as unknown as ExperimentSummaryAccumulatorSnapshot | undefined;
+  if (rollupSnapshot) {
+    try { acc.restore({ ...rollupSnapshot, extras }); } catch { /* stale/incompatible rollups are ignored */ }
+  }
+  let tailScanned = 0;
   const scan = await scanJournalEvents(journal, {
     types: CANONICAL_REPORT_INPUT_EVENT_TYPES,
     from: experiment.startedAt ? new Date(experiment.startedAt) : undefined,
     to: experiment.completedAt ? new Date(experiment.completedAt) : undefined,
+    // Commit sequence is the authoritative prefix boundary. Do not use the
+    // prior rollup's occurredAt cursor: a newly committed event may carry an
+    // older occurredAt and still belongs to the uncovered tail.
+    ...(rollup ? { commitSeqAfter: rollup.sourceCommitSeq ?? 0 } : {}),
   }, {
     pageSize: options.pageSize,
     ceiling: options.ceiling,
     signal: options.signal,
-    onPage: (page) => {
+    onPage: async (page) => {
       for (const event of page) {
-        if (includeCurrentExperimentEvent(event, experiment)) acc.fold(event);
+        if (!includeCurrentExperimentEvent(event, experiment)) continue;
+        // The query already excludes the verified rollup prefix by commit_seq.
+        // Folding the returned page is therefore O(pages), with no per-event
+        // commit-sequence lookup or DB fanout.
+        acc.fold(event);
+        tailScanned += 1;
       }
     },
   });
@@ -58,7 +127,18 @@ export async function streamExperimentSummary(
   summary.truncated = scan.truncated || scan.interrupted || summary.truncated;
   summary.truncatedReason = summary.truncated ? (extras.truncatedReason ?? scan.truncatedReason ?? "SCAN_CEILING") : null;
   if (scan.interrupted) summary.complete = false;
-  return { summary, scan, accumulatorHighWaterBytes: acc.highWaterMarkBytes };
+  const baseThrough = rollup && rollup.sourceFenceId && rollup.sourceFenceOccurredAt
+    ? { id: rollup.sourceFenceId, occurredAt: rollup.sourceFenceOccurredAt }
+    : null;
+  const effectiveThrough = baseThrough && scan.fence.through
+    ? (Date.parse(scan.fence.through.occurredAt) > Date.parse(baseThrough.occurredAt)
+      || (scan.fence.through.occurredAt === baseThrough.occurredAt && scan.fence.through.id > baseThrough.id) ? scan.fence.through : baseThrough)
+    : baseThrough ?? scan.fence.through;
+  const effectiveFence = rollup && effectiveThrough
+    ? { ...scan.fence, through: effectiveThrough }
+    : scan.fence;
+  const effectiveScan = { ...scan, fence: effectiveFence, scanned: (rollup?.sourceEventCount ?? 0) + tailScanned };
+  return { summary, scan: effectiveScan, accumulatorHighWaterBytes: acc.highWaterMarkBytes, accumulatorSnapshot: acc.serialize(), baseRollupContentHash: rollup?.contentHash ?? null };
 }
 
 export function toDurableReportInput(input: {

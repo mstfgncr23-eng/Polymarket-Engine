@@ -17,6 +17,7 @@ import { generateOperatorReport } from "./operator-report.js";
 import { retentionConfigFromEnv } from "./retention-manager.js";
 import { PolymarketMarketDataAdapter, ReferenceFeedRegistry, createRestProbe } from "@pm/market-data";
 import { startRuntime } from "./runtime.js";
+import { exportExperimentArchive } from "./archive.js";
 
 const command = process.argv[2] ?? "help";
 
@@ -67,6 +68,18 @@ if (command === "experiment:start") {
         experiment, confirm: "I_UNDERSTAND_DESTRUCTIVE_CLEANUP", config: retention, lifecycle,
       }), null, 2));
     }
+  } finally {
+    await journal.close();
+  }
+} else if (command === "archive:export" || command === "archive") {
+  if (!process.env.DATABASE_URL) throw new Error("DATABASE_URL_REQUIRED_FOR_ARCHIVE_EXPORT");
+  const experimentId = process.env.EXPERIMENT_ID;
+  if (!experimentId) throw new Error("EXPERIMENT_ID_REQUIRED_FOR_ARCHIVE_EXPORT");
+  const journal = new PostgresEventJournal(process.env.DATABASE_URL, process.env.DB_MIGRATIONS_DIR ?? resolve(process.cwd(), "packages/db/migrations"), { access: "readonly" });
+  await journal.connectWithoutMigrate("readonly");
+  try {
+    const directory = process.env.ARCHIVE_DIRECTORY ?? resolve(process.cwd(), "reports", "archive", experimentId);
+    console.log(JSON.stringify(await exportExperimentArchive(journal, { experimentId, directory }), null, 2));
   } finally {
     await journal.close();
   }
@@ -199,5 +212,5 @@ if (command === "experiment:start") {
   console.log(JSON.stringify(result, null, 2));
   if (!result.ok) process.exitCode = 1;
 } else {
-  console.log("Usage: tsx src/cli.ts <smoke|live-feed-smoke|live-discovery-diag|experiment:start|report|journal-cleanup>");
+  console.log("Usage: tsx src/cli.ts <smoke|live-feed-smoke|live-discovery-diag|experiment:start|report|journal-cleanup|archive:export>");
 }

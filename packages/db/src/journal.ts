@@ -3,6 +3,7 @@ import { drizzle } from "drizzle-orm/postgres-js";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
 import postgres from "postgres";
 import {
+  CANONICAL_REPORT_INPUT_EVENT_TYPES,
   compareJournalEventOrder, createId, EVENT_PAGE_SIZE, EVENT_SCAN_CEILING, isProtectedJournalType,
   journalEventSchema, sortJournalEventsChronologically,
   type JournalEvent, type JournalKeysetCursor, type JournalKeysetQuery, type JournalQuery,
@@ -11,10 +12,14 @@ import {
   CheckpointFenceError,
   DURABLE_MUTATION_LOCK_ID,
   DurableCursorBehindError,
+  hashCheckpointPayload,
+  isSemanticallyValidCheckpointPayload,
   durableTransitionInputSchema,
   hashDurablePayload,
   IdempotencyConflictError,
   type DurableCommitResult,
+  type CompactedOperationKey,
+  type DurableCompactionResult,
   type DurableTransition,
   type DurableTransitionInput,
 } from "./durable.js";
@@ -26,7 +31,7 @@ import {
   type DurableExperimentReportInput,
   type PersistReportResult,
 } from "./reports.js";
-import { durableTransitions, engineCheckpoints, experimentReports, journalEvents, mcpIdempotencyKeys } from "./schema.js";
+import { durableReplayKeys, durableSequenceMetadata, durableTransitions, engineCheckpoints, experimentReportRollups, experimentReports, journalCommitMetadata, journalEvents, mcpIdempotencyKeys } from "./schema.js";
 import {
   journalMayMaintain,
   journalMayMigrate,
@@ -47,6 +52,28 @@ export interface EngineCheckpoint {
   experimentId: string | null;
   sequence: number;
   payload: Record<string, unknown>;
+  createdAt: string;
+  /** Present for PR18 verified snapshots; absent on legacy checkpoints. */
+  contentHash?: string;
+  verified?: boolean;
+}
+
+export interface AnalyticsRollup {
+  experimentId: string;
+  rollupKind: string;
+  schemaVersion: number;
+  sourceCursor: number;
+  sourceFenceId: string | null;
+  sourceFenceOccurredAt: string | null;
+  sourceEventCount?: number;
+  sourceCommitSeq?: number;
+  sourceRecordedAt?: string | null;
+  stableRead?: boolean;
+  previousContentHash?: string | null;
+  coverageHash?: string;
+  accumulator: Record<string, unknown>;
+  contentHash: string;
+  verified: boolean;
   createdAt: string;
 }
 
@@ -155,9 +182,16 @@ export interface EventJournal {
   latestDurableSequence(): Promise<number>;
   saveCheckpoint(checkpoint: Omit<EngineCheckpoint, "id" | "createdAt">): Promise<EngineCheckpoint>;
   loadLatestCheckpoint(): Promise<EngineCheckpoint | null>;
+  /** Snapshot/compaction APIs are optional so legacy journal adapters remain valid. */
+  compactDurableTransitionsThrough?(cursor: number, options?: { maxReplayKeys?: number; ttlMs?: number; maxRows?: number; maxBatches?: number; batchSize?: number; budgetMs?: number }): Promise<DurableCompactionResult>;
+  listVerifiedCheckpoints?(): Promise<EngineCheckpoint[]>;
+  persistAnalyticsRollup?(rollup: AnalyticsRollup): Promise<AnalyticsRollup>;
+  loadAnalyticsRollup?(experimentId: string, rollupKind?: string): Promise<AnalyticsRollup | null>;
+  deleteCanonicalEventsThrough?(input: { experimentId: string; occurredBefore?: Date; limit: number; sourceCursor: number; sourceCommitSeq?: number; sourceRecordedAt?: Date }): Promise<{ deleted: number }>;
   countEligible(types: readonly string[], occurredBefore: Date): Promise<{ count: number; oldestOccurredAt: string | null }>;
   withReadSnapshot<T>(work: (journal: EventJournalKeyset) => Promise<T>): Promise<{ value: T; stable: boolean }>;
   latestCommitSeq(): Promise<number>;
+  eventCommitSeq?(id: string): Promise<number | null>;
   connectWithoutMigrate?(mode: JournalAccessMode): Promise<void>;
   close(): Promise<void>;
 }
@@ -182,8 +216,11 @@ export class MemoryEventJournal implements EventJournal {
   private readonly checkpoints: EngineCheckpoint[] = [];
   private readonly idempotencyKeys = new Map<string, string>();
   private readonly reports = new Map<string, DurableExperimentReport>();
+  private readonly rollups = new Map<string, AnalyticsRollup>();
   private readonly durableRows: DurableTransition[] = [];
   private readonly durableByKey = new Map<string, DurableTransition>();
+  private readonly compactedByKey = new Map<string, CompactedOperationKey>();
+  private durableHighWater = 0;
   private readonly maxEvents: number;
   private readonly maxMutations: number;
   private durableChain = Promise.resolve();
@@ -212,6 +249,20 @@ export class MemoryEventJournal implements EventJournal {
       eventIds: this.eventIds.size,
       commitSeqById: this.commitSeqById.size,
       mutations: this.mutations.length,
+    };
+  }
+
+  /** Read-only hot-table approximation for deterministic plateau evidence. */
+  storageFootprintForTest(): Record<string, { rows: number; bytes: number }> {
+    const size = (value: unknown): number => Buffer.byteLength(JSON.stringify(value) ?? "null");
+    return {
+      journal_events: { rows: this.events.length, bytes: this.events.reduce((n, row) => n + size(row), 0) },
+      durable_transitions: { rows: this.durableRows.length, bytes: this.durableRows.reduce((n, row) => n + size(row), 0) },
+      durable_replay_keys: { rows: this.compactedByKey.size, bytes: [...this.compactedByKey.values()].reduce((n, row) => n + size(row), 0) },
+      engine_checkpoints: { rows: this.checkpoints.length, bytes: this.checkpoints.reduce((n, row) => n + size(row), 0) },
+      mcp_idempotency: { rows: this.idempotencyKeys.size, bytes: [...this.idempotencyKeys].reduce((n, row) => n + size(row), 0) },
+      experiment_report_rollups: { rows: this.rollups.size, bytes: [...this.rollups.values()].reduce((n, row) => n + size(row), 0) },
+      experiment_reports: { rows: this.reports.size, bytes: [...this.reports.values()].reduce((n, row) => n + size(row), 0) },
     };
   }
 
@@ -420,6 +471,7 @@ export class MemoryEventJournal implements EventJournal {
   async latestCommitSeq(): Promise<number> {
     return this.nextCommitSeq;
   }
+  async eventCommitSeq(id: string): Promise<number | null> { return this.commitSeqById.get(id) ?? null; }
   async withReadSnapshot<T>(work: (journal: EventJournalKeyset) => Promise<T>): Promise<{ value: T; stable: boolean }> {
     const frozen = this.events.map((event) => structuredClone(event));
     const seq = new Map(this.commitSeqById);
@@ -474,7 +526,13 @@ export class MemoryEventJournal implements EventJournal {
   }
   async readDurableByOperationKey(operationKey: string): Promise<DurableTransition | null> {
     const existing = this.durableByKey.get(operationKey);
-    return existing ? structuredClone(existing) : null;
+    if (existing) return structuredClone(existing);
+    const compacted = this.compactedByKey.get(operationKey);
+    if (!compacted || (compacted.lifecycleState !== "open" && Date.parse(compacted.expiresAt) <= Date.now())) {
+      if (compacted) this.compactedByKey.delete(operationKey);
+      return null;
+    }
+    return { operationKey: compacted.operationKey, type: compacted.type, aggregateType: compacted.aggregateType, aggregateId: compacted.aggregateId, payloadHash: compacted.payloadHash, sequence: compacted.sequence, occurredAt: compacted.occurredAt, recordedAt: compacted.recordedAt, payload: {} };
   }
   async queryDurableTransitions(query: { types?: readonly string[]; afterSequence?: number; limit: number }): Promise<DurableTransition[]> {
     const after = query.afterSequence ?? 0;
@@ -488,17 +546,20 @@ export class MemoryEventJournal implements EventJournal {
     return event ? structuredClone(event) : null;
   }
   async latestDurableSequence(): Promise<number> {
-    return this.durableRows.length === 0 ? 0 : this.durableRows[this.durableRows.length - 1]!.sequence;
+    return this.durableHighWater;
   }
   async saveCheckpoint(checkpoint: Omit<EngineCheckpoint, "id" | "createdAt">): Promise<EngineCheckpoint> {
     assertJournalCapability(this.access, "runtime-write", "saveCheckpoint");
     return this.withDurableLock(() => {
       const cursor = typeof checkpoint.payload.durableCursor === "number" ? checkpoint.payload.durableCursor : null;
       if (cursor != null) {
-        const latest = this.durableRows.length === 0 ? 0 : this.durableRows[this.durableRows.length - 1]!.sequence;
+        const latest = this.durableHighWater;
         if (cursor !== latest) throw new CheckpointFenceError(cursor, latest);
       }
-      const stored = { ...structuredClone(checkpoint), id: createId("checkpoint"), createdAt: new Date().toISOString() };
+      const payload = structuredClone(checkpoint.payload);
+      const contentHash = hashCheckpointPayload(payload);
+      payload.checkpointContentHash = contentHash;
+      const stored = { ...structuredClone(checkpoint), payload, contentHash, verified: true, id: createId("checkpoint"), createdAt: new Date().toISOString() };
       this.checkpoints.push(stored);
       return structuredClone(stored);
     });
@@ -506,6 +567,106 @@ export class MemoryEventJournal implements EventJournal {
   async loadLatestCheckpoint(): Promise<EngineCheckpoint | null> {
     const latest = this.checkpoints.toSorted((a, b) => b.sequence - a.sequence)[0];
     return latest ? structuredClone(latest) : null;
+  }
+  async listVerifiedCheckpoints(): Promise<EngineCheckpoint[]> {
+    const rows = this.checkpoints.filter((row) => row.verified && row.contentHash && hashCheckpointPayload(row.payload) === row.contentHash && isSemanticallyValidCheckpointPayload(row.payload)
+      && (typeof row.payload.durableCursor !== "number" || row.payload.durableCursor <= this.durableHighWater));
+    return structuredClone(rows.sort((a, b) => b.sequence - a.sequence));
+  }
+  async compactDurableTransitionsThrough(cursor: number, options: { maxReplayKeys?: number; ttlMs?: number; maxRows?: number; maxBatches?: number; batchSize?: number; budgetMs?: number } = {}): Promise<DurableCompactionResult> {
+    assertJournalCapability(this.access, "maintenance", "compactDurableTransitionsThrough");
+    const target = Math.max(0, Math.floor(cursor));
+    if (target <= 0) return { deleted: 0, cursor: target, highWater: this.durableHighWater, compactedOperationKeys: 0 };
+    if (target > this.durableHighWater) throw new CheckpointFenceError(target, this.durableHighWater);
+    const ttl = Math.max(60_000, options.ttlMs ?? 7 * 24 * 60 * 60_000);
+    const maxKeys = Math.max(0, Math.floor(options.maxReplayKeys ?? 4_096));
+    if ((options.maxBatches ?? 1) <= 0 || (options.budgetMs ?? 1) <= 0) return { deleted: 0, cursor: target, highWater: this.durableHighWater, compactedOperationKeys: this.compactedByKey.size };
+    const rowCap = Math.max(0, Math.min(options.maxRows ?? Number.MAX_SAFE_INTEGER, options.batchSize ?? Number.MAX_SAFE_INTEGER));
+    if (rowCap <= 0) return { deleted: 0, cursor: target, highWater: this.durableHighWater, compactedOperationKeys: this.compactedByKey.size };
+    const victims = this.durableRows.filter((row) => row.sequence <= target).slice(0, rowCap);
+    const now = Date.now();
+    for (const row of victims) {
+      if (maxKeys > 0) this.compactedByKey.set(row.operationKey, { operationKey: row.operationKey, type: row.type, aggregateType: row.aggregateType, aggregateId: row.aggregateId, scopeId: replayScopeId(row), payloadHash: row.payloadHash, sequence: row.sequence, occurredAt: row.occurredAt, recordedAt: row.recordedAt, expiresAt: new Date(now + ttl).toISOString(), lifecycleState: replayLifecycleState(row) });
+      this.durableByKey.delete(row.operationKey);
+    }
+    const closedOrders = new Set(victims.filter((row) => row.type === "PAPER_MAKER_RELEASED" || row.type === "PAPER_ORDER_CANCELLED").map((row) => row.aggregateId));
+    for (const orderId of closedOrders) {
+      const reserve = this.compactedByKey.get(`maker:${orderId}:reserve`);
+      if (reserve) reserve.lifecycleState = "closed";
+    }
+    const closedExperiments = new Set(victims.filter((row) => row.type === "EXPERIMENT_COMPLETED" || row.type === "EXPERIMENT_START_ABORTED").map((row) => row.aggregateId));
+    for (const experimentId of closedExperiments) {
+      for (const row of this.compactedByKey.values()) if (row.type === "EXPERIMENT_STARTED" && row.aggregateId === experimentId) row.lifecycleState = "closed";
+    }
+    const repairedExperiments = new Set(victims.filter((row) => row.type === "REPORT_SOURCE_INTEGRITY_REPAIRED")
+      .map((row) => typeof row.payload.experimentId === "string" ? row.payload.experimentId : row.aggregateId));
+    for (const experimentId of repairedExperiments) {
+      for (const row of this.compactedByKey.values()) {
+        if (row.type === "REPORT_SOURCE_INTEGRITY_FAULT" && row.aggregateId === experimentId) row.lifecycleState = "closed";
+      }
+    }
+    const settledScopes = new Set(victims.filter((row) => row.type === "POSITION_SETTLED")
+      .map((row) => replayScopeId(row)).filter((scope): scope is string => Boolean(scope)));
+    for (const row of this.compactedByKey.values()) {
+      if (row.type === "PAPER_FILL" && row.lifecycleState === "open" && row.scopeId && settledScopes.has(row.scopeId)) row.lifecycleState = "closed";
+    }
+    while (this.compactedByKey.size > maxKeys) {
+      const oldest = [...this.compactedByKey.values()].filter((row) => row.lifecycleState !== "open").sort((a, b) => a.sequence - b.sequence)[0];
+      if (!oldest) break;
+      this.compactedByKey.delete(oldest.operationKey);
+    }
+    for (const [key, row] of [...this.compactedByKey.entries()]) {
+      if (row.lifecycleState !== "open" && Date.parse(row.expiresAt) <= now) this.compactedByKey.delete(key);
+    }
+    if (victims.length > 0) {
+      this.durableRows.splice(0, victims.length);
+      this.recordMutation(`compactDurableTransitionsThrough:${victims.length}`);
+    }
+    return { deleted: victims.length, cursor: target, highWater: this.durableHighWater, compactedOperationKeys: this.compactedByKey.size };
+  }
+  async persistAnalyticsRollup(rollup: AnalyticsRollup): Promise<AnalyticsRollup> {
+    assertJournalCapability(this.access, "report-write", "persistAnalyticsRollup");
+    const stored = structuredClone(rollup);
+    // Memory journal keeps one versioned row per experiment/kind.
+    const map = this.rollups;
+    const key = `${stored.experimentId}:${stored.rollupKind}`;
+    const existing = map.get(key);
+    if (existing) {
+      const oldCoverage = existing.sourceEventCount ?? 0;
+      const newCoverage = stored.sourceEventCount ?? 0;
+      const oldSeq = existing.sourceCommitSeq ?? 0;
+      const newSeq = stored.sourceCommitSeq ?? 0;
+      if (newCoverage < oldCoverage || newSeq < oldSeq) return structuredClone(existing);
+      if (newCoverage === oldCoverage && newSeq === oldSeq) {
+        if (existing.contentHash !== stored.contentHash) throw new Error("ANALYTICS_ROLLUP_CONFLICT");
+        return structuredClone(existing);
+      }
+      if ((stored.previousContentHash ?? null) !== existing.contentHash) throw new Error("ANALYTICS_ROLLUP_PREFIX_MISMATCH");
+    }
+    map.set(key, stored);
+    return structuredClone(stored);
+  }
+  async loadAnalyticsRollup(experimentId: string, rollupKind = "canonical"): Promise<AnalyticsRollup | null> {
+    const row = this.rollups.get(`${experimentId}:${rollupKind}`);
+    return row ? structuredClone(row) : null;
+  }
+  async deleteCanonicalEventsThrough(input: { experimentId: string; occurredBefore?: Date; limit: number; sourceCursor: number; sourceCommitSeq?: number; sourceRecordedAt?: Date }): Promise<{ deleted: number }> {
+    assertJournalCapability(this.access, "maintenance", "deleteCanonicalEventsThrough");
+    const cap = Math.max(0, Math.floor(input.limit));
+    const before = input.occurredBefore?.getTime() ?? Number.POSITIVE_INFINITY;
+    const victims = this.events.filter((event) => CANONICAL_REPORT_INPUT_EVENT_TYPES.includes(event.type as (typeof CANONICAL_REPORT_INPUT_EVENT_TYPES)[number]))
+      .filter((event) => (event.payload as { experimentId?: unknown }).experimentId === input.experimentId && Date.parse(event.occurredAt) < before)
+      .filter((event) => input.sourceCommitSeq == null || (this.commitSeqById.get(event.id) ?? Number.POSITIVE_INFINITY) <= input.sourceCommitSeq)
+      .filter((event) => input.sourceRecordedAt == null || Date.parse(event.recordedAt) <= input.sourceRecordedAt.getTime())
+      .slice(0, cap);
+    const ids = new Set(victims.map((event) => event.id));
+    for (let i = this.events.length - 1; i >= 0; i -= 1) if (ids.has(this.events[i]!.id)) {
+      this.eventIds.delete(this.events[i]!.id);
+      this.commitSeqById.delete(this.events[i]!.id);
+      this.events.splice(i, 1);
+    }
+    this.recordMutation(`deleteCanonicalEventsThrough:${victims.length}`);
+    return { deleted: victims.length };
   }
   async close(): Promise<void> {}
 
@@ -534,24 +695,26 @@ export class MemoryEventJournal implements EventJournal {
     const parsed = durableTransitionInputSchema.parse(input);
     const payloadHash = hashDurablePayload(parsed.payload);
     const existing = this.durableByKey.get(parsed.operationKey);
-    if (existing) {
+    const compacted = existing ? undefined : this.compactedByKey.get(parsed.operationKey);
+    const replay = existing ?? (compacted ? { ...compacted, payload: {} } as DurableTransition : undefined);
+    if (replay) {
       if (
-        existing.type !== parsed.type
-        || existing.aggregateType !== parsed.aggregateType
-        || existing.aggregateId !== parsed.aggregateId
-        || existing.payloadHash !== payloadHash
+        replay.type !== parsed.type
+        || replay.aggregateType !== parsed.aggregateType
+        || replay.aggregateId !== parsed.aggregateId
+        || replay.payloadHash !== payloadHash
       ) {
-        throw new IdempotencyConflictError(parsed.operationKey, existing.type, parsed.type);
+        throw new IdempotencyConflictError(parsed.operationKey, replay.type, parsed.type);
       }
       return {
-        sequence: existing.sequence,
+        sequence: replay.sequence,
         operationKey: parsed.operationKey,
         inserted: false,
         existing: true,
-        transition: structuredClone(existing),
+        transition: structuredClone(replay),
       };
     }
-    const latest = this.durableRows.length === 0 ? 0 : this.durableRows[this.durableRows.length - 1]!.sequence;
+    const latest = this.durableHighWater;
     if (latest !== expectedPreviousSequence) {
       throw new DurableCursorBehindError(expectedPreviousSequence, latest);
     }
@@ -574,6 +737,7 @@ export class MemoryEventJournal implements EventJournal {
     };
     this.durableRows.push(row);
     this.durableByKey.set(parsed.operationKey, row);
+    this.durableHighWater = row.sequence;
     return {
       sequence: row.sequence,
       operationKey: parsed.operationKey,
@@ -600,6 +764,9 @@ function filterKeysetRows(
   if (query.recordedAtTo) rows = rows.filter((event) => new Date(event.recordedAt).getTime() <= query.recordedAtTo!.getTime());
   if (query.commitSeqTo != null) {
     rows = rows.filter((event) => (commitSeqById.get(event.id) ?? Number.POSITIVE_INFINITY) <= query.commitSeqTo!);
+  }
+  if (query.commitSeqAfter != null) {
+    rows = rows.filter((event) => (commitSeqById.get(event.id) ?? Number.NEGATIVE_INFINITY) > query.commitSeqAfter!);
   }
   if (query.after) rows = rows.filter((event) => compareJournalEventOrder(event, query.after!) > 0);
   if (query.through) rows = rows.filter((event) => compareJournalEventOrder(event, query.through!) <= 0);
@@ -701,11 +868,10 @@ export class PostgresEventJournal implements EventJournal {
   async appendMany(events: readonly JournalEvent[]): Promise<void> {
     assertJournalCapability(this.access, "runtime-write", "appendMany");
     if (events.length === 0) return;
-    const values = events.map((raw) => {
-      const value = journalEventSchema.parse(raw);
-      return { ...value, occurredAt: new Date(value.occurredAt), recordedAt: new Date(value.recordedAt) };
-    });
-    await this.db.insert(journalEvents).values(values).onConflictDoNothing({ target: journalEvents.id });
+    const values = events.map((raw) => journalEventSchema.parse(raw));
+    await this.db.insert(journalEvents).values(values.map((value) => ({
+      ...value, occurredAt: new Date(value.occurredAt), recordedAt: new Date(value.recordedAt),
+    }))).onConflictDoNothing({ target: journalEvents.id });
   }
   async readTrace(traceId: string): Promise<JournalEvent[]> {
     const rows = await this.db.select().from(journalEvents)
@@ -762,6 +928,16 @@ export class PostgresEventJournal implements EventJournal {
       count: sql<number>`count(*)::int`,
     }).from(journalEvents).where(filters.length > 0 ? and(...filters) : undefined).groupBy(journalEvents.type);
     return Object.fromEntries(rows.map((row) => [row.type, Number(row.count)]));
+  }
+  /** Read-only physical footprint for storage soak diagnostics. */
+  async storageFootprintForTest(): Promise<Record<string, { rows: number; bytes: number }>> {
+    const names = ["journal_events", "durable_transitions", "durable_replay_keys", "engine_checkpoints", "mcp_idempotency_keys", "experiment_report_rollups", "experiment_reports"] as const;
+    const result: Record<string, { rows: number; bytes: number }> = {};
+    for (const name of names) {
+      const rows = await this.client.unsafe(`SELECT count(*)::bigint AS rows, pg_total_relation_size('public.${name}')::bigint AS bytes`);
+      result[name === "mcp_idempotency_keys" ? "mcp_idempotency" : name] = { rows: Number(rows[0]?.rows ?? 0), bytes: Number(rows[0]?.bytes ?? 0) };
+    }
+    return result;
   }
   async queryEventsKeyset(query: JournalKeysetQuery): Promise<JournalEvent[]> {
     const filters = journalKeysetFilters(query);
@@ -913,10 +1089,22 @@ export class PostgresEventJournal implements EventJournal {
   }
   async listCheckpoints(): Promise<EngineCheckpoint[]> {
     const rows = await this.db.select().from(engineCheckpoints).orderBy(desc(engineCheckpoints.sequence)).limit(64);
-    return rows.map((row) => ({
-      id: row.id, experimentId: row.experimentId, sequence: row.sequence,
-      payload: row.payload as Record<string, unknown>, createdAt: row.createdAt.toISOString(),
-    }));
+    return rows.map((row) => {
+      const payload = row.payload as Record<string, unknown>;
+      const contentHash = typeof payload.checkpointContentHash === "string" ? payload.checkpointContentHash : undefined;
+      return {
+        id: row.id, experimentId: row.experimentId, sequence: row.sequence, payload,
+        createdAt: row.createdAt.toISOString(),
+        ...(contentHash ? { contentHash } : {}),
+        verified: Boolean(contentHash && hashCheckpointPayload(payload) === contentHash),
+      };
+    });
+  }
+  async listVerifiedCheckpoints(): Promise<EngineCheckpoint[]> {
+    const rows = await this.listCheckpoints();
+    const highWater = await this.latestDurableSequence();
+    return rows.filter((row) => row.verified && row.contentHash && isSemanticallyValidCheckpointPayload(row.payload)
+      && (typeof row.payload.durableCursor !== "number" || row.payload.durableCursor <= highWater)).sort((a, b) => b.sequence - a.sequence);
   }
   async commitDurableTransition(input: DurableTransitionInput, expectedPreviousSequence: number): Promise<DurableCommitResult> {
     assertJournalCapability(this.access, "runtime-write", "commitDurableTransition");
@@ -928,6 +1116,15 @@ export class PostgresEventJournal implements EventJournal {
       const existingRows = await tx.select().from(durableTransitions)
         .where(eq(durableTransitions.operationKey, parsed.operationKey)).limit(1);
       const existing = existingRows[0];
+      const compactedRows = existing ? [] : await tx.select().from(durableReplayKeys)
+        .where(eq(durableReplayKeys.operationKey, parsed.operationKey)).limit(1);
+      const compactedExisting = compactedRows[0];
+      if (!existing && compactedExisting && (compactedExisting.lifecycleState === "open" || compactedExisting.expiresAt.getTime() > Date.now())) {
+        if (compactedExisting.type !== parsed.type || compactedExisting.aggregateType !== parsed.aggregateType || compactedExisting.aggregateId !== parsed.aggregateId || compactedExisting.payloadHash !== payloadHash) {
+          throw new IdempotencyConflictError(parsed.operationKey, compactedExisting.type, parsed.type);
+        }
+        return { sequence: Number(compactedExisting.sequence), operationKey: parsed.operationKey, inserted: false, existing: true, transition: { sequence: Number(compactedExisting.sequence), operationKey: compactedExisting.operationKey, type: compactedExisting.type, aggregateType: compactedExisting.aggregateType, aggregateId: compactedExisting.aggregateId, payloadHash: compactedExisting.payloadHash, payload: {}, occurredAt: compactedExisting.occurredAt.toISOString(), recordedAt: compactedExisting.recordedAt.toISOString() } };
+      }
       if (existing) {
         if (
           existing.type !== parsed.type
@@ -945,10 +1142,9 @@ export class PostgresEventJournal implements EventJournal {
           transition: toDurableTransition(existing),
         };
       }
-      const latestRows = await tx.select({
-        max: sql<number>`coalesce(max(${durableTransitions.sequence}), 0)`,
-      }).from(durableTransitions);
-      const latest = Number(latestRows[0]?.max ?? 0);
+      await tx.insert(durableSequenceMetadata).values({ id: 1, highWater: 0 }).onConflictDoNothing();
+      const latestRows = await tx.select({ highWater: durableSequenceMetadata.highWater }).from(durableSequenceMetadata).where(eq(durableSequenceMetadata.id, 1)).limit(1);
+      const latest = Number(latestRows[0]?.highWater ?? 0);
       if (latest !== expectedPreviousSequence) {
         throw new DurableCursorBehindError(expectedPreviousSequence, latest);
       }
@@ -965,6 +1161,7 @@ export class PostgresEventJournal implements EventJournal {
       const row = inserted[0];
       if (!row) throw new Error("DURABLE_TRANSITION_INSERT_FAILED");
       const transition = toDurableTransition(row);
+      await tx.update(durableSequenceMetadata).set({ highWater: latest + 1, updatedAt: new Date() }).where(eq(durableSequenceMetadata.id, 1));
       return {
         sequence: transition.sequence,
         operationKey: parsed.operationKey,
@@ -986,7 +1183,11 @@ export class PostgresEventJournal implements EventJournal {
     const rows = await this.db.select().from(durableTransitions)
       .where(eq(durableTransitions.operationKey, operationKey)).limit(1);
     const row = rows[0];
-    return row ? toDurableTransition(row) : null;
+    if (row) return toDurableTransition(row);
+    const replayRows = await this.db.select().from(durableReplayKeys).where(eq(durableReplayKeys.operationKey, operationKey)).limit(1);
+    const compacted = replayRows[0];
+    if (!compacted || (compacted.lifecycleState !== "open" && compacted.expiresAt.getTime() <= Date.now())) return null;
+    return { sequence: Number(compacted.sequence), operationKey: compacted.operationKey, type: compacted.type, aggregateType: compacted.aggregateType, aggregateId: compacted.aggregateId, payloadHash: compacted.payloadHash, payload: {}, occurredAt: compacted.occurredAt.toISOString(), recordedAt: compacted.recordedAt.toISOString() };
   }
   async queryDurableTransitions(query: { types?: readonly string[]; afterSequence?: number; limit: number }): Promise<DurableTransition[]> {
     const after = query.afterSequence ?? 0;
@@ -1005,33 +1206,172 @@ export class PostgresEventJournal implements EventJournal {
     return row ? toJournalEvent(row) : null;
   }
   async latestDurableSequence(): Promise<number> {
-    const rows = await this.db.select({
-      max: sql<number>`coalesce(max(${durableTransitions.sequence}), 0)`,
-    }).from(durableTransitions);
-    return Number(rows[0]?.max ?? 0);
+    const rows = await this.db.select({ highWater: durableSequenceMetadata.highWater }).from(durableSequenceMetadata).where(eq(durableSequenceMetadata.id, 1)).limit(1);
+    if (rows[0]) return Number(rows[0].highWater);
+    const fallback = await this.db.select({ max: sql<number>`coalesce(max(${durableTransitions.sequence}), 0)` }).from(durableTransitions);
+    return Number(fallback[0]?.max ?? 0);
+  }
+  async compactDurableTransitionsThrough(cursor: number, options: { maxReplayKeys?: number; ttlMs?: number; maxRows?: number; maxBatches?: number; batchSize?: number; budgetMs?: number } = {}): Promise<DurableCompactionResult> {
+    assertJournalCapability(this.access, "maintenance", "compactDurableTransitionsThrough");
+    const target = Math.max(0, Math.floor(cursor));
+    const ttl = Math.max(60_000, options.ttlMs ?? 7 * 24 * 60 * 60_000);
+    const maxKeys = Math.max(0, Math.floor(options.maxReplayKeys ?? 4_096));
+    if ((options.maxBatches ?? 1) <= 0 || (options.budgetMs ?? 1) <= 0) return { deleted: 0, cursor: target, highWater: await this.latestDurableSequence(), compactedOperationKeys: 0 };
+    const deadline = Date.now() + Math.max(0, options.budgetMs ?? 1);
+    return this.db.transaction(async (tx) => {
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(${DURABLE_MUTATION_LOCK_ID})`);
+      const remaining = Math.max(1, deadline - Date.now());
+      await tx.execute(sql`SELECT set_config('statement_timeout', ${String(remaining)}, true)`);
+      await tx.insert(durableSequenceMetadata).values({ id: 1, highWater: 0 }).onConflictDoNothing();
+      const current = await tx.select({ highWater: durableSequenceMetadata.highWater }).from(durableSequenceMetadata).where(eq(durableSequenceMetadata.id, 1)).limit(1);
+      const highWater = Number(current[0]?.highWater ?? 0);
+      if (target > highWater) throw new CheckpointFenceError(target, highWater);
+      const rowCap = Math.max(0, Math.min(options.maxRows ?? Number.MAX_SAFE_INTEGER, options.batchSize ?? Number.MAX_SAFE_INTEGER));
+      if (rowCap <= 0) return { deleted: 0, cursor: target, highWater, compactedOperationKeys: 0 };
+      const rows = await tx.select().from(durableTransitions).where(lte(durableTransitions.sequence, target)).orderBy(asc(durableTransitions.sequence)).limit(Math.min(rowCap, 10_000));
+      const expiresAt = new Date(Date.now() + ttl).toISOString();
+      if (Date.now() >= deadline) throw new Error("RETENTION_CYCLE_BUDGET_EXCEEDED");
+      if (rows.length > 0) {
+        // One bounded multi-row statement replaces the old N+1 insert loop.
+        await tx.insert(durableReplayKeys).values(rows.map((row) => {
+          const transition = toDurableTransition(row);
+          return {
+            operationKey: row.operationKey, type: row.type, aggregateType: row.aggregateType,
+            aggregateId: row.aggregateId, scopeId: replayScopeId(transition), payloadHash: row.payloadHash,
+            sequence: row.sequence, occurredAt: row.occurredAt, recordedAt: row.recordedAt,
+            expiresAt: new Date(expiresAt), lifecycleState: replayLifecycleState(transition),
+          };
+        })).onConflictDoUpdate({ target: durableReplayKeys.operationKey, set: { expiresAt: new Date(expiresAt) } });
+      }
+      const closedReserveKeys = rows.filter((item) => item.type === "PAPER_MAKER_RELEASED" || item.type === "PAPER_ORDER_CANCELLED").map((row) => `maker:${row.aggregateId}:reserve`);
+      if (closedReserveKeys.length > 0) {
+        await tx.update(durableReplayKeys).set({ lifecycleState: "closed" }).where(inArray(durableReplayKeys.operationKey, closedReserveKeys));
+      }
+      const closedExperimentIds = rows.filter((item) => item.type === "EXPERIMENT_COMPLETED" || item.type === "EXPERIMENT_START_ABORTED").map((row) => row.aggregateId);
+      if (closedExperimentIds.length > 0) {
+        await tx.update(durableReplayKeys).set({ lifecycleState: "closed" }).where(and(eq(durableReplayKeys.type, "EXPERIMENT_STARTED"), inArray(durableReplayKeys.aggregateId, closedExperimentIds)));
+      }
+      const repairedExperimentIds = rows.filter((item) => item.type === "REPORT_SOURCE_INTEGRITY_REPAIRED").map((row) => {
+        const payload = row.payload as Record<string, unknown>;
+        return typeof payload.experimentId === "string" ? payload.experimentId : row.aggregateId;
+      });
+      if (repairedExperimentIds.length > 0) {
+        await tx.update(durableReplayKeys).set({ lifecycleState: "closed" }).where(and(eq(durableReplayKeys.type, "REPORT_SOURCE_INTEGRITY_FAULT"), inArray(durableReplayKeys.aggregateId, repairedExperimentIds)));
+      }
+      const settledScopes = rows.filter((item) => item.type === "POSITION_SETTLED").map((row) => replayScopeId(toDurableTransition(row))).filter((scope): scope is string => Boolean(scope));
+      if (settledScopes.length > 0) {
+        await tx.update(durableReplayKeys).set({ lifecycleState: "closed" }).where(and(eq(durableReplayKeys.type, "PAPER_FILL"), eq(durableReplayKeys.lifecycleState, "open"), inArray(durableReplayKeys.scopeId, settledScopes)));
+      }
+      if (maxKeys > 0) {
+        await tx.execute(sql`DELETE FROM durable_replay_keys WHERE operation_key IN (SELECT operation_key FROM durable_replay_keys WHERE lifecycle_state <> 'open' ORDER BY (expires_at <= now()) DESC, sequence ASC LIMIT GREATEST(0, (SELECT count(*) FROM durable_replay_keys WHERE lifecycle_state <> 'open') - ${maxKeys}))`);
+      } else {
+        await tx.delete(durableReplayKeys).where(sql`expires_at <= now()`);
+      }
+      if (rows.length > 0) {
+        await tx.delete(durableTransitions).where(inArray(durableTransitions.operationKey, rows.map((row) => row.operationKey)));
+      }
+      const countRows = await tx.select({ count: sql<number>`count(*)::int` }).from(durableReplayKeys);
+      return { deleted: rows.length, cursor: target, highWater, compactedOperationKeys: Number(countRows[0]?.count ?? 0) };
+    });
+  }
+  async persistAnalyticsRollup(rollup: AnalyticsRollup): Promise<AnalyticsRollup> {
+    assertJournalCapability(this.access, "report-write", "persistAnalyticsRollup");
+    const row = await this.db.transaction(async (tx) => {
+      const existingRows = await tx.select().from(experimentReportRollups).where(and(eq(experimentReportRollups.experimentId, rollup.experimentId), eq(experimentReportRollups.rollupKind, rollup.rollupKind))).limit(1);
+      const existing = existingRows[0];
+      const newCount = rollup.sourceEventCount ?? 0;
+      const newSeq = rollup.sourceCommitSeq ?? 0;
+      if (existing) {
+        const oldCount = Number(existing.sourceEventCount ?? 0); const oldSeq = Number(existing.sourceCommitSeq ?? 0);
+        if (newCount < oldCount || newSeq < oldSeq) return existing;
+        if (newCount === oldCount && newSeq === oldSeq) {
+          if (existing.contentHash !== rollup.contentHash) throw new Error("ANALYTICS_ROLLUP_CONFLICT");
+          return existing;
+        }
+        if ((rollup.previousContentHash ?? null) !== existing.contentHash) throw new Error("ANALYTICS_ROLLUP_PREFIX_MISMATCH");
+        const updated = await tx.update(experimentReportRollups).set({
+          schemaVersion: rollup.schemaVersion, sourceCursor: rollup.sourceCursor, sourceFenceId: rollup.sourceFenceId,
+          sourceFenceOccurredAt: rollup.sourceFenceOccurredAt ? new Date(rollup.sourceFenceOccurredAt) : null,
+          sourceEventCount: newCount, sourceCommitSeq: newSeq, sourceRecordedAt: rollup.sourceRecordedAt ? new Date(rollup.sourceRecordedAt) : null,
+          stableRead: rollup.stableRead ?? false, previousContentHash: rollup.previousContentHash ?? null,
+          coverageHash: rollup.coverageHash ?? null,
+          accumulator: rollup.accumulator, contentHash: rollup.contentHash, verified: rollup.verified, createdAt: new Date(rollup.createdAt),
+        }).where(and(eq(experimentReportRollups.experimentId, rollup.experimentId), eq(experimentReportRollups.rollupKind, rollup.rollupKind), eq(experimentReportRollups.contentHash, existing.contentHash))).returning();
+        return updated[0] ?? existing;
+      }
+      const inserted = await tx.insert(experimentReportRollups).values({
+        experimentId: rollup.experimentId, rollupKind: rollup.rollupKind, schemaVersion: rollup.schemaVersion,
+        sourceCursor: rollup.sourceCursor, sourceFenceId: rollup.sourceFenceId,
+        sourceFenceOccurredAt: rollup.sourceFenceOccurredAt ? new Date(rollup.sourceFenceOccurredAt) : null,
+        sourceEventCount: newCount, sourceCommitSeq: newSeq, sourceRecordedAt: rollup.sourceRecordedAt ? new Date(rollup.sourceRecordedAt) : null,
+        stableRead: rollup.stableRead ?? false, previousContentHash: rollup.previousContentHash ?? null, coverageHash: rollup.coverageHash ?? null,
+        accumulator: rollup.accumulator, contentHash: rollup.contentHash, verified: rollup.verified, createdAt: new Date(rollup.createdAt),
+      }).onConflictDoNothing({ target: [experimentReportRollups.experimentId, experimentReportRollups.rollupKind] }).returning();
+      return inserted[0] ?? (await tx.select().from(experimentReportRollups).where(and(eq(experimentReportRollups.experimentId, rollup.experimentId), eq(experimentReportRollups.rollupKind, rollup.rollupKind))).limit(1))[0];
+    });
+    if (!row) throw new Error("ANALYTICS_ROLLUP_WRITE_FAILED");
+    const rowCount = Number(row.sourceEventCount ?? 0);
+    const rowSeq = Number(row.sourceCommitSeq ?? 0);
+    const requestedCount = rollup.sourceEventCount ?? 0;
+    const requestedSeq = rollup.sourceCommitSeq ?? 0;
+    const rowIsStrictlyNewer = rowCount > requestedCount || (rowCount === requestedCount && rowSeq > requestedSeq);
+    if (row.contentHash !== rollup.contentHash && !rowIsStrictlyNewer) throw new Error("ANALYTICS_ROLLUP_CONFLICT");
+    return {
+      experimentId: row.experimentId, rollupKind: row.rollupKind, schemaVersion: row.schemaVersion, sourceCursor: Number(row.sourceCursor),
+      sourceFenceId: row.sourceFenceId, sourceFenceOccurredAt: row.sourceFenceOccurredAt?.toISOString() ?? null, sourceEventCount: Number(row.sourceEventCount ?? 0), sourceCommitSeq: Number(row.sourceCommitSeq ?? 0), sourceRecordedAt: row.sourceRecordedAt?.toISOString() ?? null, stableRead: row.stableRead, previousContentHash: row.previousContentHash, ...(row.coverageHash ? { coverageHash: row.coverageHash } : {}),
+      accumulator: row.accumulator as Record<string, unknown>, contentHash: row.contentHash, verified: row.verified, createdAt: row.createdAt.toISOString(),
+    };
+  }
+  async loadAnalyticsRollup(experimentId: string, rollupKind = "canonical"): Promise<AnalyticsRollup | null> {
+    const rows = await this.db.select().from(experimentReportRollups).where(and(eq(experimentReportRollups.experimentId, experimentId), eq(experimentReportRollups.rollupKind, rollupKind))).limit(1);
+    const row = rows[0];
+    return row ? { experimentId: row.experimentId, rollupKind: row.rollupKind, schemaVersion: row.schemaVersion, sourceCursor: Number(row.sourceCursor), sourceFenceId: row.sourceFenceId, sourceFenceOccurredAt: row.sourceFenceOccurredAt?.toISOString() ?? null, sourceEventCount: Number(row.sourceEventCount ?? 0), sourceCommitSeq: Number(row.sourceCommitSeq ?? 0), sourceRecordedAt: row.sourceRecordedAt?.toISOString() ?? null, stableRead: row.stableRead, previousContentHash: row.previousContentHash, ...(row.coverageHash ? { coverageHash: row.coverageHash } : {}), accumulator: row.accumulator as Record<string, unknown>, contentHash: row.contentHash, verified: row.verified, createdAt: row.createdAt.toISOString() } : null;
+  }
+  async deleteCanonicalEventsThrough(input: { experimentId: string; occurredBefore?: Date; limit: number; sourceCursor: number; sourceCommitSeq?: number; sourceRecordedAt?: Date }): Promise<{ deleted: number }> {
+    assertJournalCapability(this.access, "maintenance", "deleteCanonicalEventsThrough");
+    const cap = Math.max(0, Math.min(500, Math.floor(input.limit)));
+    if (cap <= 0) return { deleted: 0 };
+    // A cleanup-authoritative rollup must prove both the durable commit fence
+    // and the recorded-at fence. recorded_at alone is not commit authority.
+    if (input.sourceCommitSeq == null) return { deleted: 0 };
+    const before = input.occurredBefore ?? new Date();
+    const types = [...CANONICAL_REPORT_INPUT_EVENT_TYPES] as string[];
+    const result = await this.client`
+      DELETE FROM journal_events
+      WHERE id IN (
+        SELECT id FROM journal_events
+        WHERE type = ANY(${types}) AND (payload->>'experimentId') = ${input.experimentId}
+          AND occurred_at < ${before.toISOString()}
+          AND commit_seq <= ${input.sourceCommitSeq}
+          AND (${input.sourceRecordedAt == null} OR recorded_at <= ${(input.sourceRecordedAt ?? new Date()).toISOString()})
+        ORDER BY occurred_at ASC, id ASC LIMIT ${cap}
+      )`;
+    return { deleted: result.count ?? 0 };
   }
   async saveCheckpoint(checkpoint: Omit<EngineCheckpoint, "id" | "createdAt">): Promise<EngineCheckpoint> {
     assertJournalCapability(this.access, "runtime-write", "saveCheckpoint");
     const id = createId("checkpoint");
-    const cursor = typeof checkpoint.payload.durableCursor === "number" ? checkpoint.payload.durableCursor : null;
+    const payload = structuredClone(checkpoint.payload);
+    const contentHash = hashCheckpointPayload(payload);
+    payload.checkpointContentHash = contentHash;
+    const cursor = typeof payload.durableCursor === "number" ? payload.durableCursor : null;
     const toCheckpoint = (row: typeof engineCheckpoints.$inferSelect): EngineCheckpoint => ({
       id: row.id, experimentId: row.experimentId, sequence: row.sequence,
-      payload: row.payload as Record<string, unknown>, createdAt: row.createdAt.toISOString(),
+      payload: row.payload as Record<string, unknown>, createdAt: row.createdAt.toISOString(), contentHash, verified: true,
     });
     if (cursor == null) {
-      const rows = await this.db.insert(engineCheckpoints).values({ id, ...checkpoint }).returning();
+      const rows = await this.db.insert(engineCheckpoints).values({ id, ...checkpoint, payload }).returning();
       const row = rows[0];
       if (!row) throw new Error("CHECKPOINT_WRITE_FAILED");
       return toCheckpoint(row);
     }
     return this.db.transaction(async (tx) => {
       await tx.execute(sql`SELECT pg_advisory_xact_lock(${DURABLE_MUTATION_LOCK_ID})`);
-      const latestRows = await tx.select({
-        max: sql<number>`coalesce(max(${durableTransitions.sequence}), 0)`,
-      }).from(durableTransitions);
-      const latest = Number(latestRows[0]?.max ?? 0);
+      await tx.insert(durableSequenceMetadata).values({ id: 1, highWater: 0 }).onConflictDoNothing();
+      const latestRows = await tx.select({ highWater: durableSequenceMetadata.highWater }).from(durableSequenceMetadata).where(eq(durableSequenceMetadata.id, 1)).limit(1);
+      const latest = Number(latestRows[0]?.highWater ?? 0);
       if (cursor !== latest) throw new CheckpointFenceError(cursor, latest);
-      const rows = await tx.insert(engineCheckpoints).values({ id, ...checkpoint }).returning();
+      const rows = await tx.insert(engineCheckpoints).values({ id, ...checkpoint, payload }).returning();
       const row = rows[0];
       if (!row) throw new Error("CHECKPOINT_WRITE_FAILED");
       return toCheckpoint(row);
@@ -1040,7 +1380,15 @@ export class PostgresEventJournal implements EventJournal {
   async loadLatestCheckpoint(): Promise<EngineCheckpoint | null> {
     const rows = await this.db.select().from(engineCheckpoints).orderBy(desc(engineCheckpoints.sequence)).limit(1);
     const row = rows[0];
-    return row ? { id: row.id, experimentId: row.experimentId, sequence: row.sequence, payload: row.payload as Record<string, unknown>, createdAt: row.createdAt.toISOString() } : null;
+    if (!row) return null;
+    const payload = row.payload as Record<string, unknown>;
+    const contentHash = typeof payload.checkpointContentHash === "string" ? payload.checkpointContentHash : undefined;
+    return {
+      id: row.id, experimentId: row.experimentId, sequence: row.sequence, payload,
+      createdAt: row.createdAt.toISOString(),
+      ...(contentHash ? { contentHash } : {}),
+      verified: Boolean(contentHash && hashCheckpointPayload(payload) === contentHash),
+    };
   }
   async countEligible(types: readonly string[], occurredBefore: Date): Promise<{ count: number; oldestOccurredAt: string | null }> {
     if (types.length === 0) return { count: 0, oldestOccurredAt: null };
@@ -1056,7 +1404,15 @@ export class PostgresEventJournal implements EventJournal {
     };
   }
   async latestCommitSeq(): Promise<number> {
-    return 0;
+    const rows = await this.db.select({ highWater: journalCommitMetadata.highWater })
+      .from(journalCommitMetadata).where(eq(journalCommitMetadata.id, 1)).limit(1);
+    return Number(rows[0]?.highWater ?? 0);
+  }
+  async eventCommitSeq(id: string): Promise<number | null> {
+    const rows = await this.db.select({ commitSeq: journalEvents.commitSeq }).from(journalEvents)
+      .where(eq(journalEvents.id, id)).limit(1);
+    const value = rows[0]?.commitSeq;
+    return value == null ? null : Number(value);
   }
   async withReadSnapshot<T>(work: (journal: EventJournalKeyset) => Promise<T>): Promise<{ value: T; stable: boolean }> {
     // The caller owns the accumulator. Retrying a partially executed callback
@@ -1087,7 +1443,10 @@ export class PostgresEventJournal implements EventJournal {
           const row = rows[0];
           return row ? { occurredAt: new Date(row.occurred_at).toISOString(), id: row.id } : null;
         },
-        latestCommitSeq: async () => 0,
+        latestCommitSeq: async () => {
+          const rows = await sql`SELECT high_water FROM journal_commit_metadata WHERE id = 1`;
+          return Number(rows[0]?.high_water ?? 0);
+        },
       };
       value = await work(snap);
     });
@@ -1131,6 +1490,8 @@ export function buildJournalKeysetSql(query: JournalKeysetQuery & { orderDesc?: 
   if (query.from) push(`occurred_at >= ?`, query.from);
   if (query.to) push(`occurred_at <= ?`, query.to);
   if (query.recordedAtTo) push(`recorded_at <= ?`, query.recordedAtTo);
+  if (query.commitSeqTo != null) push(`commit_seq <= ?`, query.commitSeqTo);
+  if (query.commitSeqAfter != null) push(`commit_seq > ?`, query.commitSeqAfter);
   if (query.after) {
     values.push(sqlBindValue(query.after.occurredAt), query.after.id);
     clauses.push(`(occurred_at, id) > ($${values.length - 1}::timestamptz, $${values.length})`);
@@ -1143,7 +1504,7 @@ export function buildJournalKeysetSql(query: JournalKeysetQuery & { orderDesc?: 
   const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
   const order = query.orderDesc ? "occurred_at DESC, id DESC" : "occurred_at ASC, id ASC";
   return {
-    text: `SELECT id, trace_id, correlation_id, type, aggregate_type, aggregate_id, payload, occurred_at, recorded_at, source_event_id FROM journal_events ${where} ORDER BY ${order} LIMIT $${values.length}`,
+    text: `SELECT id, trace_id, correlation_id, type, aggregate_type, aggregate_id, payload, occurred_at, recorded_at, commit_seq, source_event_id FROM journal_events ${where} ORDER BY ${order} LIMIT $${values.length}`,
     values,
   };
 }
@@ -1157,6 +1518,8 @@ function journalKeysetFilters(query: Omit<JournalKeysetQuery, "limit">): ReturnT
   if (query.from) filters.push(gte(journalEvents.occurredAt, query.from));
   if (query.to) filters.push(lte(journalEvents.occurredAt, query.to));
   if (query.recordedAtTo) filters.push(lte(journalEvents.recordedAt, query.recordedAtTo));
+  if (query.commitSeqTo != null) filters.push(lte(journalEvents.commitSeq, query.commitSeqTo));
+  if (query.commitSeqAfter != null) filters.push(gt(journalEvents.commitSeq, query.commitSeqAfter));
   if (query.after) {
     filters.push(sql`(${journalEvents.occurredAt}, ${journalEvents.id}) > (${query.after.occurredAt}::timestamptz, ${query.after.id})`);
   }
@@ -1211,6 +1574,31 @@ function toDurableTransition(row: typeof durableTransitions.$inferSelect): Durab
     occurredAt: row.occurredAt.toISOString(),
     recordedAt: row.recordedAt.toISOString(),
   };
+}
+
+function replayLifecycleState(row: Pick<DurableTransition, "type" | "payload">): "open" | "closed" | "historical" {
+  // A full engine fill is pinned while its market/position obligation remains
+  // live. A later POSITION_SETTLED scope update closes it, after which normal
+  // bounded pressure/TTL eviction is safe. Minimal fixtures without a fill
+  // payload retain the historical closed behavior.
+  if (row.type === "PAPER_FILL" && row.payload && typeof row.payload === "object" && "fill" in row.payload) return "open";
+  if (row.type === "PAPER_MAKER_RESERVED" || row.type === "EXPERIMENT_STARTED") return "open";
+  if (row.type === "REPORT_SOURCE_INTEGRITY_FAULT") return "open";
+  return "closed";
+}
+
+function replayScopeId(row: Pick<DurableTransition, "type" | "payload" | "aggregateId">): string | null {
+  const payload = row.payload as Record<string, unknown>;
+  if (row.type === "PAPER_FILL" && payload.fill && typeof payload.fill === "object") {
+    const marketId = (payload.fill as Record<string, unknown>).marketId;
+    return typeof marketId === "string" ? marketId : null;
+  }
+  if (row.type === "POSITION_SETTLED" && typeof payload.marketId === "string") return payload.marketId;
+  if (row.type === "PAPER_MAKER_RESERVED" || row.type === "PAPER_MAKER_RELEASED" || row.type === "PAPER_ORDER_CANCELLED") {
+    return typeof payload.orderId === "string" ? payload.orderId : row.aggregateId;
+  }
+  if (row.type.startsWith("EXPERIMENT_")) return typeof payload.experimentId === "string" ? payload.experimentId : row.aggregateId;
+  return null;
 }
 
 export { EVENT_PAGE_SIZE, EVENT_SCAN_CEILING };

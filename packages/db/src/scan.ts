@@ -53,6 +53,7 @@ export async function captureSourceFence(
   if (query.experimentId) peek.experimentId = query.experimentId;
   if (query.from) peek.from = query.from;
   if (query.to) peek.to = query.to;
+  if (query.commitSeqAfter != null) peek.commitSeqAfter = query.commitSeqAfter;
   const through = await journal.peekLatestKeyset(peek);
   const commitSeqTo = journal.latestCommitSeq ? await journal.latestCommitSeq() : null;
   return {
@@ -105,6 +106,7 @@ async function scanOnJournal(
       if (query.experimentId) pageQuery.experimentId = query.experimentId;
       if (query.from) pageQuery.from = query.from;
       if (query.to) pageQuery.to = query.to;
+      if (query.commitSeqAfter != null) pageQuery.commitSeqAfter = query.commitSeqAfter;
       if (after) pageQuery.after = after;
       if (fence.through) pageQuery.through = fence.through;
       if (fence.commitSeqTo != null) pageQuery.commitSeqTo = fence.commitSeqTo;
