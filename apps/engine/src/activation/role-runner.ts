@@ -105,6 +105,16 @@ export class GrokRoleRunner {
     const parsedOutput = definition.schema.safeParse(inference.output);
     if (!parsedOutput.success) throw new GrokRoleRuntimeError("XAI_SCHEMA_INVALID", "xAI output failed role schema validation", parsedOutput.error);
     const output = parsedOutput.data as Record<string, unknown>;
+    const suppliedEvidence = new Set<string>([
+      ...(Array.isArray(boundedContext.trigger.evidenceIds) ? boundedContext.trigger.evidenceIds.map(String) : []),
+      ...(Array.isArray(boundedContext.trigger.sourceEventIds) ? boundedContext.trigger.sourceEventIds.map(String) : []),
+      ...(boundedContext.market?.snapshots ?? []).flatMap((snapshot) => [snapshot.eventId, snapshot.traceId].filter(Boolean).map(String)),
+      ...(boundedContext.scoutResearch ?? []).flatMap((item) => ["evidenceIds", "sourceEventIds", "featureIds"].flatMap((key) => Array.isArray(item[key]) ? (item[key] as unknown[]).map(String) : [])),
+    ]);
+    const outputEvidence = Array.isArray(output.evidenceIds) ? output.evidenceIds.map(String) : [];
+    if (outputEvidence.some((evidenceId) => !suppliedEvidence.has(evidenceId))) {
+      throw new GrokRoleRuntimeError("XAI_EVIDENCE_UNSUPPORTED", "xAI output referenced evidence outside the bounded context");
+    }
     if (signal?.aborted || this.now().getTime() >= deadlineAt) throw new GrokRoleRuntimeError("TRIGGER_EXPIRED");
     const outputExpiry = typeof output.expiresAt === "string" ? new Date(output.expiresAt).getTime() : Number.NaN;
     if (!Number.isFinite(outputExpiry) || outputExpiry <= this.now().getTime() || outputExpiry > deadlineAt) {

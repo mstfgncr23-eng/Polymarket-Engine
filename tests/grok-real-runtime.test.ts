@@ -119,6 +119,15 @@ describe("real Grok role runtime", () => {
     });
     const rejected = await badSchema.activate({ ...request, targetRoles: ["fair_probability_analyst"] });
     expect(rejected[0]).toMatchObject({ ok: false, errorCode: "XAI_SCHEMA_INVALID" });
+
+    const unsupportedEvidence = new XaiGrokActivationBridge({
+      apiKey: "xai-secret", baseUrl: "https://xai.test/v1", model: "grok-test", fetchImpl: async () => {
+        const output = outputs("fair_probability_analyst"); output.evidenceIds = ["invented-evidence"];
+        return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify(output) } }] }), { status: 200 });
+      },
+      contextProvider: (item) => context(item), submitSignal: async () => ({ status: "accepted" }), now: () => new Date(now),
+    });
+    expect((await unsupportedEvidence.activate({ ...request, targetRoles: ["fair_probability_analyst"] }))[0]).toMatchObject({ ok: false, errorCode: "XAI_EVIDENCE_UNSUPPORTED" });
   });
 
   it("retries 429 with a bounded delay and never retries a trigger expiry", async () => {
@@ -261,6 +270,7 @@ describe("EngineService xAI product path", () => {
     const env = qualifiedPaperEnv({
       GROK_ACTIVATION_PROVIDER: "xai",
       XAI_API_KEY: "xai-runtime-test-secret",
+      GROK_MCP_BEARER_TOKENS: "",
       XAI_ALLOW_PORTFOLIO_CONTEXT: "true",
       XAI_MODEL: "grok-test",
       ESTIMATED_INFRA_COST_PER_HOUR_USD: "0",
