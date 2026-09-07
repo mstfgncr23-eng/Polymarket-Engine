@@ -2406,6 +2406,9 @@ export class EngineService {
     } | undefined : undefined;
     const scoutEntries = this.hotResearchCache.freshFor(trigger.marketId ?? "", asset, SCOUT_ROLES);
     const calibration = alphaAuthoritative && executableFair ? {
+      /** Compatibility display fields; executable fields below are authoritative. */
+      fairProbability: alphaOutput?.fairProbability ?? null,
+      marketProbability: alphaOutput?.marketProbability ?? null,
       alphaSubmittedFairProbability: alphaOutput?.fairProbability ?? null,
       fairProbabilityForTradedOutcome: executableFair.fairProbabilityForTradedOutcome,
       tradedOutcome: executableFair.consensusOutcome,
