@@ -1860,11 +1860,14 @@ describe("Step-4 follow-up: cleanup authority from durable_transitions", () => {
     try {
       engine.setCrashInjectionForTest("AFTER_APPLY_BEFORE_DERIVED_AUDIT");
       await expect(engine.beginExperiment()).rejects.toThrow(/CRASH_INJECTED/);
-      const experimentId = (await journal.readDurableTransitionsAfter(0, 8))
-        .find((row) => row.type === "EXPERIMENT_STARTED")?.aggregateId;
+      const started = (await journal.readDurableTransitionsAfter(0, 8))
+        .find((row) => row.type === "EXPERIMENT_STARTED");
+      const experimentId = started?.aggregateId;
       expect(experimentId).toBeTruthy();
       expect((await journal.queryEvents({ types: ["EXPERIMENT_STARTED"] })).length).toBe(0);
-      await journal.append(ev("TRIGGER_EVENT", "2026-09-07T13:00:00.000Z", { experimentId }, "live-after-apply"));
+      const startedAt = Date.parse(String((started?.payload.experiment as { startedAt?: unknown } | undefined)?.startedAt ?? started?.occurredAt));
+      expect(Number.isFinite(startedAt)).toBe(true);
+      await journal.append(ev("TRIGGER_EVENT", new Date(startedAt + 60 * 60 * 1_000).toISOString(), { experimentId }, "live-after-apply"));
       await journal.append(ev("MARKET_SNAPSHOT", "2026-01-01T00:00:00.000Z", {}, "old-tel-after-apply"));
       const lifecycle = await resolveCleanupLifecycle(journal, {});
       expect(lifecycle.state).toBe("ACTIVE_RUNNING");
