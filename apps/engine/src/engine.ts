@@ -3258,6 +3258,11 @@ export class EngineService {
         experiment: next,
         derivedAudit: [this.experimentDerivedAudit(type, next)],
       }),
+      // Keep the durable completion event inside the manifest's authoritative
+      // report window.  The manifest timestamp is captured before the durable
+      // append; taking a second clock reading here can otherwise place the
+      // event just beyond completedAt on a slow PG17 runner.
+      occurredAt: next.status === "COMPLETED" && next.completedAt ? new Date(next.completedAt) : undefined,
       checkpoint: true,
     });
     if (next.status === "COMPLETED") this.freezeExperimentResearchIngress();
