@@ -2,21 +2,23 @@ import type { EngineEnv, GrokActivationBridge, GrokActivationRequest, ExternalAg
 import { NoopGrokActivationBridge } from "./noop.js";
 import { SlackGrokActivationBridge } from "./slack.js";
 import { XaiGrokActivationBridge } from "./xai.js";
-import type { GrokRoleContext } from "./role-runner.js";
+import type { GrokRoleContext, GrokSubmissionMode, RoleRunOutcome } from "./role-runner.js";
 
 export interface GrokRuntimeBindings {
   contextProvider?: (request: GrokActivationRequest, role: ExternalAgentRoleId) => Promise<GrokRoleContext> | GrokRoleContext;
-  submitSignal?: (submission: GrokSignalSubmission, clientId: ExternalAgentRoleId) => Promise<{ status: string; signalId?: string }>;
+  submitSignal?: (submission: GrokSignalSubmission, clientId: ExternalAgentRoleId, mode?: GrokSubmissionMode) => Promise<{ status: string; signalId?: string }>;
+  onRoleResult?: (request: GrokActivationRequest, outcome: RoleRunOutcome) => void | Promise<void>;
   now?: () => Date;
 }
 
 export function createGrokActivationBridge(env: EngineEnv, fetchImpl: typeof fetch = fetch, bindings?: GrokRuntimeBindings): GrokActivationBridge {
   if (env.GROK_ACTIVATION_PROVIDER === "xai") {
     if (!env.XAI_API_KEY) throw new Error("XAI_API_KEY_REQUIRED");
+    if (!env.XAI_MODEL) throw new Error("XAI_MODEL_REQUIRED");
     return new XaiGrokActivationBridge({
       apiKey: env.XAI_API_KEY, baseUrl: env.XAI_API_BASE_URL, model: env.XAI_MODEL,
       timeoutMs: env.XAI_REQUEST_TIMEOUT_MS, maxOutputTokens: env.XAI_MAX_OUTPUT_TOKENS,
-      fetchImpl, contextProvider: bindings?.contextProvider, submitSignal: bindings?.submitSignal, now: bindings?.now,
+      fetchImpl, contextProvider: bindings?.contextProvider, submitSignal: bindings?.submitSignal, onRoleResult: bindings?.onRoleResult, now: bindings?.now,
     });
   }
   if (env.GROK_ACTIVATION_PROVIDER !== "slack") return new NoopGrokActivationBridge();

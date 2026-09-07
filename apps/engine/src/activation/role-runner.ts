@@ -7,13 +7,16 @@ import {
   type GrokActivationRequest,
 } from "@pm/core";
 import { XaiInferenceClient, XaiInferenceError, type XaiInferenceResponse, type XaiUsage } from "./xai-client.js";
+import { isScoutRole } from "./hot-research-cache.js";
 
 export interface GrokRoleContext {
   trigger: Record<string, unknown>;
   market: {
     marketId: string;
     asset: string | null;
+    synchronized: boolean;
     snapshots: readonly Record<string, unknown>[];
+    features?: Record<string, unknown>;
   } | null;
   reference: Record<string, unknown> | null;
   portfolio: {
@@ -26,12 +29,17 @@ export interface GrokRoleContext {
   };
   experiment: Record<string, unknown> | null;
   recentStrategyRisk: readonly Record<string, unknown>[];
+  /** Fresh, bounded scout research supplied only to Alpha. */
+  scoutResearch?: readonly Record<string, unknown>[];
+  provenance?: Record<string, unknown>;
   researchToolsAvailable: false;
 }
 
+export type GrokSubmissionMode = "mcp" | "scout" | "alpha";
+
 export interface GrokRoleRunnerConfig {
   client: XaiInferenceClient;
-  submitSignal: (submission: GrokSignalSubmission, clientId: ExternalAgentRoleId) => Promise<{ status: string; signalId?: string }>;
+  submitSignal: (submission: GrokSignalSubmission, clientId: ExternalAgentRoleId, mode?: GrokSubmissionMode) => Promise<{ status: string; signalId?: string }>;
   contextProvider: (request: GrokActivationRequest, role: ExternalAgentRoleId) => Promise<GrokRoleContext> | GrokRoleContext;
   now?: () => Date;
 }
@@ -41,6 +49,7 @@ export interface RoleRunOutcome {
   submission: GrokSignalSubmission;
   submissionResult: { status: string; signalId?: string };
   inference: XaiInferenceResponse;
+  context: GrokRoleContext;
 }
 
 export class GrokRoleRuntimeError extends Error {
@@ -113,11 +122,11 @@ export class GrokRoleRunner {
       role,
       output,
     });
-    const submissionResult = await this.config.submitSignal(submission, role);
+    const submissionResult = await this.config.submitSignal(submission, role, isScoutRole(role) ? "scout" : role === "fair_probability_analyst" ? "alpha" : "mcp");
     if (!["accepted", "duplicate"].includes(submissionResult.status)) {
       throw new GrokRoleRuntimeError(`SUBMISSION_${submissionResult.status.toUpperCase()}`, `engine rejected ${role} submission`);
     }
-    return { role, submission, submissionResult, inference };
+    return { role, submission, submissionResult, inference, context: boundedContext };
   }
 }
 
@@ -148,22 +157,36 @@ export function boundedContextForPrompt(context: GrokRoleContext, role: External
     createdAt: base.trigger.createdAt, expiresAt: base.trigger.expiresAt,
   };
   if (base.market) {
-    base.market.snapshots = base.market.snapshots.slice(0, 2).map((snapshot) => {
+    base.market.synchronized = base.market.synchronized === true;
+    base.market.snapshots = base.market.synchronized ? base.market.snapshots.slice(0, 2).map((snapshot) => {
       const value = { ...snapshot };
       for (const key of ["bids", "asks"]) if (Array.isArray(value[key])) value[key] = (value[key] as unknown[]).slice(0, 20);
       return value;
-    });
+    }) : [];
   }
   base.portfolio.positions = base.portfolio.positions.slice(0, 100);
   base.recentStrategyRisk = base.recentStrategyRisk.slice(0, 20);
+  base.scoutResearch = role === "fair_probability_analyst"
+    ? (base.scoutResearch ?? []).slice(0, 3).map((item) => {
+      const value = { ...item };
+      if (Array.isArray(value.evidenceIds)) value.evidenceIds = (value.evidenceIds as unknown[]).slice(0, 32);
+      if (Array.isArray(value.sourceEventIds)) value.sourceEventIds = (value.sourceEventIds as unknown[]).slice(0, 32);
+      if (Array.isArray(value.featureIds)) value.featureIds = (value.featureIds as unknown[]).slice(0, 32);
+      if (Array.isArray(value.derivedFrom)) value.derivedFrom = (value.derivedFrom as unknown[]).slice(0, 32);
+      return value;
+    })
+    : [];
+  if (role !== "fair_probability_analyst") base.provenance = undefined;
   if (!["crypto_market_scanner", "news_x_intelligence_scanner", "fair_probability_analyst"].includes(role)) base.reference = null;
   if (role !== "risk_hedge_analyst") {
     base.portfolio = { cash: "[omitted]", equity: "[omitted]", reservedCash: "[omitted]", positions: [], hedgeState: null };
   }
-  if (role === "market_microstructure_scanner" || role === "fair_probability_analyst") {
-    base.portfolio = { cash: base.portfolio.cash, equity: base.portfolio.equity, reservedCash: base.portfolio.reservedCash, positions: [] };
+  if (role === "market_microstructure_scanner" || role === "crypto_market_scanner" || role === "news_x_intelligence_scanner" || role === "fair_probability_analyst") {
+    base.portfolio = { cash: "[omitted]", equity: "[omitted]", reservedCash: "[omitted]", positions: [], hedgeState: null };
     base.recentStrategyRisk = [];
   }
+  if (role !== "strategy_supervisor") base.recentStrategyRisk = [];
+  if (role !== "fair_probability_analyst") base.scoutResearch = [];
   return base;
 }
 

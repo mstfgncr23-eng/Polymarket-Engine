@@ -7,13 +7,14 @@ import {
   type GrokActivationResult,
   type GrokSignalSubmission,
 } from "@pm/core";
-import { GrokRoleRunner, GrokRoleRuntimeError, emptyRoleRuntimeMetrics, usageNumbers, type GrokRoleContext, type RoleRuntimeMetric } from "./role-runner.js";
+import { GrokRoleRunner, GrokRoleRuntimeError, emptyRoleRuntimeMetrics, usageNumbers, type GrokRoleContext, type GrokSubmissionMode, type RoleRunOutcome, type RoleRuntimeMetric } from "./role-runner.js";
 import { XaiInferenceClient, XaiInferenceError, type XaiInferenceConfig } from "./xai-client.js";
 
 export interface XaiGrokActivationConfig extends Omit<XaiInferenceConfig, "fetchImpl" | "now"> {
   fetchImpl?: typeof fetch;
   contextProvider?: (request: GrokActivationRequest, role: ExternalAgentRoleId) => Promise<GrokRoleContext> | GrokRoleContext;
-  submitSignal?: (submission: GrokSignalSubmission, clientId: ExternalAgentRoleId) => Promise<{ status: string; signalId?: string }>;
+  submitSignal?: (submission: GrokSignalSubmission, clientId: ExternalAgentRoleId, mode?: GrokSubmissionMode) => Promise<{ status: string; signalId?: string }>;
+  onRoleResult?: (request: GrokActivationRequest, outcome: RoleRunOutcome) => void | Promise<void>;
   maxAttempts?: number;
   delayImpl?: (ms: number) => Promise<void>;
   now?: () => Date;
@@ -61,6 +62,7 @@ export class XaiGrokActivationBridge implements GrokActivationBridge {
       metric.requests += 1;
       try {
         const outcome = await this.runner.run(request, role);
+        await this.config.onRoleResult?.(request, outcome);
         metric.successes += 1;
         metric.totalLatencyMs += outcome.inference.latencyMs;
         const usage = usageNumbers(outcome.inference.usage);

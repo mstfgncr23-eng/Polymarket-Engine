@@ -85,7 +85,8 @@ export const engineEnvSchema = z.object({
   SLACK_API_URL: z.string().url().default("https://slack.com/api/chat.postMessage"),
   XAI_API_KEY: z.string().optional(),
   XAI_API_BASE_URL: z.string().url().default("https://api.x.ai/v1"),
-  XAI_MODEL: z.string().min(1).default("grok-4-1-fast-reasoning"),
+  /** Required explicitly when xAI is selected; safe noop mode needs no model. */
+  XAI_MODEL: z.string().min(1).optional(),
   XAI_REQUEST_TIMEOUT_MS: z.coerce.number().int().positive().max(120_000).default(20_000),
   XAI_MAX_OUTPUT_TOKENS: z.coerce.number().int().positive().max(16_384).default(1_024),
   /** Separate explicit gate for sending paper portfolio context to xAI. */
@@ -93,6 +94,10 @@ export const engineEnvSchema = z.object({
     (value) => value === undefined ? undefined : value === true || value === "true" || value === "1",
     z.boolean().optional(),
   ).default(false),
+  XAI_SCOUT_CACHE_MAX_ENTRIES: z.coerce.number().int().positive().max(2_048).default(128),
+  XAI_SCOUT_MICRO_TTL_MS: z.coerce.number().int().positive().max(120_000).default(5_000),
+  XAI_SCOUT_CRYPTO_TTL_MS: z.coerce.number().int().positive().max(300_000).default(15_000),
+  XAI_SCOUT_NEWS_TTL_MS: z.coerce.number().int().positive().max(3_600_000).default(60_000),
   DISCOVERY_INTERVAL_MS: z.coerce.number().int().positive().default(300_000),
   MAX_QUALIFIED_MARKETS: z.coerce.number().int().positive().default(40),
   ESTIMATED_INFRA_COST_PER_HOUR_USD: z.coerce.number().nonnegative().default(0.08),

@@ -61,6 +61,7 @@ import {
   classifyTriggerProvenance,
   isMarketDataDerivedTrigger,
   type TriggerProvenance,
+  rolesForTriggerKind,
 } from "@pm/core";
 import {
   CHECKPOINT_SCHEMA_VERSION,
@@ -113,7 +114,8 @@ import {
 } from "./report-source-integrity.js";
 import { GrokActivationCoordinator, persistableActivation } from "./activation/coordinator.js";
 import { createGrokActivationBridge } from "./activation/index.js";
-import type { GrokRoleContext } from "./activation/role-runner.js";
+import type { GrokRoleContext, GrokSubmissionMode, RoleRunOutcome } from "./activation/role-runner.js";
+import { HotResearchCache, isScoutRole, SCOUT_ROLES } from "./activation/hot-research-cache.js";
 import { BoundedJournalWriter } from "./journal-writer.js";
 import { evaluateExperimentPreflight, isGenuineEntryQualifiedMarket } from "./preflight.js";
 import { CrashInjectedError, CrashInjector, type CrashInjectionPoint } from "./crash-injection.js";
@@ -204,6 +206,7 @@ export class EngineService {
   private readonly signalsByTrigger = new Map<string, Map<ExternalAgentRoleId, GrokSignalEnvelope>>();
   private readonly signalReceivedTimes: number[] = [];
   private readonly lastEvaluatedSignalCount = new Map<string, number>();
+  private readonly alphaSignalIds = new Map<string, string>();
   private readonly marketsById = new Map<string, DiscoveredMarket>();
   private readonly entryQualified = new Set<string>();
   private readonly managedMarketIds = new Set<string>();
@@ -283,6 +286,7 @@ export class EngineService {
    * duplicate suppression; active experiment submissions use the journal.
    */
   private readonly idleGrokSubmissions = new Map<string, IdleGrokSubmission>();
+  private readonly hotResearchCache: HotResearchCache;
   private readonly retainedCleanupCycles: RetainedCleanupCycle[] = [];
   private startPostCommitValidationHoldForTest: Promise<void> | null = null;
   private readonly reportSourceIntegrity = new Map<string, ReportSourceIntegrityFault>();
@@ -328,6 +332,15 @@ export class EngineService {
       createRestProbe(env.REFERENCE_REST_BASE_URL),
     );
     this.resolutionFetcher = adapters?.resolutionFetcher ?? ((id) => this.marketAdapter.fetchPublicMarket(id));
+    this.hotResearchCache = new HotResearchCache({
+      now: this.nowFn,
+      maxEntries: env.XAI_SCOUT_CACHE_MAX_ENTRIES,
+      roleTtlMs: {
+        market_microstructure_scanner: env.XAI_SCOUT_MICRO_TTL_MS,
+        crypto_market_scanner: env.XAI_SCOUT_CRYPTO_TTL_MS,
+        news_x_intelligence_scanner: env.XAI_SCOUT_NEWS_TTL_MS,
+      },
+    });
     if (adapters?.recoveryPageSize) this.recoveryPageSize = adapters.recoveryPageSize;
     this.writer = new BoundedJournalWriter(journal, (up) => {
       if (up) this.state.database = "UP";
@@ -362,7 +375,8 @@ export class EngineService {
     this.activation = new GrokActivationCoordinator(
       adapters?.activation ?? createGrokActivationBridge(env, adapters?.activationFetch ?? fetch, {
         contextProvider: (request, role) => this.grokRoleContext(request, role, env.XAI_ALLOW_PORTFOLIO_CONTEXT),
-        submitSignal: (submission, clientId) => this.submitGrokSignal(submission, clientId),
+        submitSignal: (submission, clientId, mode) => this.submitGrokSignal(submission, clientId, mode),
+        onRoleResult: (request, outcome) => this.onGrokRoleResult(request, outcome),
         now: this.nowFn,
       }),
       {
@@ -482,6 +496,8 @@ export class EngineService {
   snapshotBroadcastCount() { return this.sse.snapshotBroadcastCount(); }
   experimentManifest() { return this.experiment; }
   activationFootprint() { return this.activation.footprint(); }
+  hotResearchCacheForTest() { return this.hotResearchCache.snapshot(); }
+  hotResearchFootprintForTest() { return this.hotResearchCache.footprint(); }
   grokRuntimeMetricsForTest() { return this.activation.runtimeMetricsSnapshot(); }
   restingOrderCount() { return this.restingOrders.size; }
   reservedCash() { return this.ledger.snapshot().reservedCash; }
@@ -1812,14 +1828,39 @@ export class EngineService {
       this.state.addActivation({ triggerId: trigger.id, reason: "PROVENANCE_STALE", at: this.nowFn().toISOString(), provider: this.env.GROK_ACTIVATION_PROVIDER, grokWakeObserved: false });
       return;
     }
-    this.activation.markRequested(trigger, decision.request);
+    const requestedRoles = decision.request.targetRoles;
+    const scoutRoles = requestedRoles.filter(isScoutRole);
+    const auxiliaryRoles = requestedRoles.filter((role) => !isScoutRole(role) && role !== "fair_probability_analyst");
+    const freshScoutRoles = trigger.marketId
+      ? this.hotResearchCache.freshFor(trigger.marketId, trigger.asset ?? null, scoutRoles).map((entry) => entry.role)
+      : scoutRoles;
+    const scoutWarm = scoutRoles.filter((role) => !freshScoutRoles.includes(role));
+    const coldScoutWarmup = scoutWarm.length > 0 && requestedRoles.includes("fair_probability_analyst");
+    const dispatchRequest: GrokActivationRequest = coldScoutWarmup
+      ? { ...decision.request, targetRoles: [...scoutWarm, ...auxiliaryRoles] }
+      : { ...decision.request, targetRoles: requestedRoles.filter((role) => role === "fair_probability_analyst" || auxiliaryRoles.includes(role)) };
+    if (dispatchRequest.targetRoles.length === 0) return;
+    this.activation.markRequested(trigger, dispatchRequest);
     this.state.setActivationLatency(this.activation.snapshot());
-    const results = await this.activation.dispatch(decision.request);
+    if (coldScoutWarmup) {
+      // Scout warming is bounded and asynchronous. A later trigger consumes
+      // the hot entries and invokes one Alpha call on the critical path.
+      void this.activation.dispatch(dispatchRequest)
+        .then((results) => this.recordActivationResults(trigger, results, decision.reason))
+        .catch((error) => this.logger.error({ err: error, triggerId: trigger.id }, "bounded scout warmup failed"));
+      return;
+    }
+    const results = await this.activation.dispatch(dispatchRequest);
+    await this.recordActivationResults(trigger, results, decision.reason);
+    this.state.setActivationLatency(this.activation.snapshot());
+  }
+
+  private async recordActivationResults(trigger: TriggerEvent, results: Awaited<ReturnType<GrokActivationCoordinator["dispatch"]>>, reason: string): Promise<void> {
     for (const result of results) {
       this.metrics.activations.inc({ provider: result.provider, status: result.ok ? "ok" : "failed" });
       await this.persistReportInput(createJournalEvent({
         traceId: trigger.traceId, type: "GROK_ACTIVATION_RESULT", aggregateType: "activation", aggregateId: trigger.id,
-        payload: persistableActivation(result, trigger.id, decision.reason),
+        payload: persistableActivation(result, trigger.id, reason),
       }));
       this.state.addActivation({
         triggerId: trigger.id, role: result.targetRole, provider: result.provider, ok: result.ok, skipped: result.skipped,
@@ -1833,11 +1874,17 @@ export class EngineService {
   private grokRoleContext(request: GrokActivationRequest, role: ExternalAgentRoleId, allowPortfolioContext: boolean): GrokRoleContext {
     const trigger = this.activeTriggers.get(request.triggerId);
     if (!trigger) throw new Error("RUNTIME_TRIGGER_UNAVAILABLE");
-    const snapshots = request.marketId
+    const synchronized = request.marketId ? this.isMarketSynchronized(request.marketId) : true;
+    // The adapter's token-sync index is the trusted-book authority. A raw
+    // snapshot map is never sufficient after a gap or reconnect.
+    const snapshots = request.marketId && synchronized
       ? [...this.state.marketSnapshots.values()]
         .filter((item) => item.marketId === request.marketId)
         .slice(-2)
         .map((item) => boundedMarketSnapshot(item))
+      : [];
+    const scoutResearch = request.marketId && role === "fair_probability_analyst"
+      ? this.hotResearchCache.freshFor(request.marketId, request.asset ?? trigger.asset ?? null, SCOUT_ROLES)
       : [];
     const ledger = this.ledger.snapshot();
     const selectedPosition = request.marketId ? this.ledger.positions.get(request.marketId) : undefined;
@@ -1857,10 +1904,10 @@ export class EngineService {
         obligation: Number(selectedPosition.unpairedQuantity) > 0 ? "HEDGE_REQUIRED" : "PAIRED",
       }
       : null;
-    const recentStrategyRisk = this.state.feed
+    const recentStrategyRisk = role === "strategy_supervisor" ? this.state.feed
       .filter((item) => item.type.startsWith("RISK_") || item.type.startsWith("CONSENSUS_") || item.type.startsWith("PAPER_"))
       .slice(0, 20)
-      .map((item) => boundedStrategyRiskSummary(item));
+      .map((item) => boundedStrategyRiskSummary(item)) : [];
     const experiment = this.experiment ? {
       id: this.experiment.id,
       status: this.experiment.status,
@@ -1873,9 +1920,12 @@ export class EngineService {
       market: request.marketId ? {
         marketId: request.marketId,
         asset: request.asset ?? trigger.asset ?? null,
+        synchronized,
         snapshots,
+        features: synchronized ? deterministicMarketFeatures(snapshots) : {},
       } : null,
-      reference: request.asset ? boundedReference(this.state.getReferenceContext(request.asset, this.nowFn().getTime(), this.riskLimits.staleFeedTimeoutMs)) : null,
+      reference: request.asset && ["crypto_market_scanner", "news_x_intelligence_scanner", "fair_probability_analyst", "risk_hedge_analyst"].includes(role)
+        ? boundedReference(this.state.getReferenceContext(request.asset, this.nowFn().getTime(), this.riskLimits.staleFeedTimeoutMs)) : null,
       portfolio: {
         cash: allowPortfolioContext && role === "risk_hedge_analyst" ? ledger.cash : "[omitted]",
         equity: allowPortfolioContext && role === "risk_hedge_analyst" ? ledger.equity : "[omitted]",
@@ -1886,12 +1936,54 @@ export class EngineService {
       },
       experiment,
       recentStrategyRisk,
+      scoutResearch,
+      provenance: role === "fair_probability_analyst" ? {
+        triggerId: trigger.id,
+        sourceEventIds: trigger.sourceEventIds.slice(0, 32),
+        evidenceIds: (trigger.evidenceIds ?? []).slice(0, 32),
+        scoutKeys: scoutResearch.map((entry) => entry.key),
+        correlatedFeatureIds: [...new Set(scoutResearch.flatMap((entry) => Array.isArray(entry.featureIds) ? entry.featureIds : []))].slice(0, 32),
+      } : undefined,
       researchToolsAvailable: false,
     };
   }
 
+  private async onGrokRoleResult(request: GrokActivationRequest, outcome: RoleRunOutcome): Promise<void> {
+    if (!isScoutRole(outcome.role) || !request.marketId) return;
+    if (!this.isMarketSynchronized(request.marketId)) return;
+    if (!outcome.submissionResult || !["accepted", "duplicate"].includes(outcome.submissionResult.status)) return;
+    const context = outcome.context;
+    const trigger = context.trigger;
+    const market = context.market;
+    const output = outcome.submission.output as Record<string, unknown>;
+    const evidenceIds = Array.isArray(output.evidenceIds) ? output.evidenceIds.map(String) : [];
+    const sourceEventIds = Array.isArray(trigger.sourceEventIds) ? trigger.sourceEventIds.map(String) : [];
+    const featureIds = [
+      `feature:${String(trigger.kind)}:${request.marketId}`,
+      ...evidenceIds.map((id) => `evidence:${id}`),
+      ...sourceEventIds.map((id) => `source:${id}`),
+    ];
+    const reference = this.state.getReferenceContext(request.asset ?? String(trigger.asset ?? ""), this.nowFn().getTime(), this.riskLimits.staleFeedTimeoutMs);
+    this.hotResearchCache.put({
+      role: outcome.role,
+      marketId: request.marketId,
+      asset: request.asset ?? (typeof trigger.asset === "string" ? trigger.asset : null),
+      triggerId: request.triggerId,
+      traceId: request.traceId,
+      generatedAt: outcome.submission.timestamp,
+      expiresAt: String(output.expiresAt),
+      evidenceIds,
+      sourceEventIds,
+      featureIds,
+      derivedFrom: [...sourceEventIds, ...evidenceIds],
+      marketSequence: market ? Math.max(0, ...market.snapshots.map((item) => Number(item.sequence ?? 0))) : null,
+      referenceTimestamp: reference.lastMessageAt ?? null,
+      output,
+    });
+  }
+
   /** The only ingress for external Grok research; it cannot create orders directly. */
-  async submitGrokSignal(raw: GrokSignalSubmission, clientId: string): Promise<GrokSubmissionResult> {
+  async submitGrokSignal(raw: GrokSignalSubmission, clientId: string, mode: GrokSubmissionMode = "mcp"): Promise<GrokSubmissionResult> {
     this.assertResearchIntegrity();
     let submission: GrokSignalSubmission;
     try { submission = grokSignalSubmissionSchema.parse(raw); }
@@ -2027,7 +2119,14 @@ export class EngineService {
         this.state.setActivationLatency(this.activation.snapshot());
         this.metrics.grokSignals.inc({ agent: signal.agentId, status: "accepted" });
         this.record(`${signal.agentId.toUpperCase()}_COMPLETE`, signal.traceId, trigger.marketId, { signalId: signal.signalId, clientId, confidence: submission.output.confidence, expiresAt: submission.output.expiresAt }, trigger.asset ?? null);
-        await this.evaluateExternalConsensus(trigger);
+        if (mode === "alpha") {
+          this.alphaSignalIds.set(trigger.id, signal.signalId);
+          await this.evaluateAlphaDecision(trigger);
+        } else if (mode !== "scout") {
+          // MCP callers retain the established peer-consensus path. Runtime
+          // scouts are audit/research inputs and never create a trade.
+          await this.evaluateExternalConsensus(trigger);
+        }
         if (idleReservation) this.completeIdleGrokSubmission(idempotencyKey, now.getTime());
         return { status: "accepted", signalId: signal.signalId };
       } catch (error) {
@@ -2120,7 +2219,52 @@ export class EngineService {
     if (trigger.marketId) await this.evaluateTrade(trigger, consensus, outputs);
   }
 
-  private async evaluateTrade(trigger: TriggerEvent, consensus: NonNullable<EngineStateStore["latestConsensus"]>, outputs: GrokSignalEnvelope[]): Promise<void> {
+  /** Alpha is the sole runtime trading authority; scouts only provide fresh research. */
+  private async evaluateAlphaDecision(trigger: TriggerEvent): Promise<void> {
+    if (this.researchIngressBlocked() || !this.isTriggerActionable(trigger.id) || !trigger.marketId) return;
+    if (!this.isMarketSynchronized(trigger.marketId)) return;
+    const outputs = [...(this.signalsByTrigger.get(trigger.id)?.values() ?? [])];
+    const fairEnvelope = outputs.find((item) => item.signalId === this.alphaSignalIds.get(trigger.id));
+    const fair = fairEnvelope?.output as {
+      direction?: Direction; confidence?: number; fairProbability?: number; marketProbability?: number; estimatedEdge?: number;
+      evidenceIds?: unknown[]; expiresAt?: string;
+    } | undefined;
+    if (!fairEnvelope || !fair || !(fair.direction === "UP" || fair.direction === "DOWN" || fair.direction === "FLAT")
+      || typeof fair.confidence !== "number" || typeof fair.fairProbability !== "number" || typeof fair.marketProbability !== "number"
+      || typeof fair.estimatedEdge !== "number") return;
+    const requiredScoutRoles = rolesForTriggerKind(trigger.kind, trigger.severity).filter(isScoutRole);
+    const freshScout = this.hotResearchCache.freshFor(trigger.marketId, trigger.asset ?? null, requiredScoutRoles);
+    if (freshScout.length !== requiredScoutRoles.length) return;
+    const evidenceIds = [...new Set([
+      ...(Array.isArray(fair.evidenceIds) ? fair.evidenceIds.map(String) : []),
+      ...freshScout.flatMap((entry) => entry.evidenceIds),
+      ...trigger.sourceEventIds,
+    ])].slice(0, 64);
+    const correlatedFeatureIds = [...new Set(freshScout.flatMap((entry) => entry.featureIds))].slice(0, 64);
+    const alpha = {
+      id: createId("alpha_decision"), traceId: trigger.traceId, triggerId: trigger.id,
+      consensusDirection: fair.direction, consensusConfidence: fair.confidence,
+      agentAgreement: 1, signalFreshness: 1, conflicts: ["ALPHA_SYNTHESIS", "SCOUT_RESEARCH_CORRELATED"],
+      estimatedEdge: fair.estimatedEdge, evidenceIds, calculatedAt: this.nowFn().toISOString(),
+    } as NonNullable<EngineStateStore["latestConsensus"]>;
+    this.state.latestConsensus = alpha;
+    this.record("CONSENSUS_COMPLETE", trigger.traceId, trigger.marketId, {
+      authority: "ALPHA", direction: alpha.consensusDirection, confidence: alpha.consensusConfidence,
+      fairProbability: fair.fairProbability, marketProbability: fair.marketProbability,
+      scoutRoles: freshScout.map((entry) => entry.role), correlatedFeatureIds,
+      triggerId: trigger.id,
+    }, trigger.asset ?? null);
+    await this.persistReportInput(createJournalEvent({
+      traceId: trigger.traceId, type: "CONSENSUS_DECISION", aggregateType: "consensus", aggregateId: alpha.id,
+      payload: { ...alpha, authority: "ALPHA", fairProbability: fair.fairProbability, marketProbability: fair.marketProbability,
+        scoutAgesMs: freshScout.map((entry) => ({ role: entry.role, ageMs: Math.max(0, this.nowFn().getTime() - new Date(entry.generatedAt).getTime()) })),
+        correlatedFeatureIds },
+    }));
+    for (const disagreement of this.triggerEngine.ingestConsensus(alpha, trigger.marketId, trigger.asset ?? null)) this.admitTrigger(disagreement);
+    await this.evaluateTrade(trigger, alpha, outputs, true);
+  }
+
+  private async evaluateTrade(trigger: TriggerEvent, consensus: NonNullable<EngineStateStore["latestConsensus"]>, outputs: GrokSignalEnvelope[], alphaAuthoritative = false): Promise<void> {
     if (this.researchIngressBlocked()) return;
     if (!this.isTriggerActionable(trigger.id)) return;
     const pair = this.snapshots.get(trigger.marketId ?? "");
@@ -2159,7 +2303,7 @@ export class EngineService {
     }
     const duplicateKey = `${candidate.marketId}:${candidate.outcome}:${candidate.intent}`;
     const now = this.nowFn();
-    const externalRisk = outputs.find((item) => item.agentId === "risk_hedge_analyst")?.output as { recommendVeto?: boolean } | undefined;
+    const externalRisk = alphaAuthoritative ? undefined : outputs.find((item) => item.agentId === "risk_hedge_analyst")?.output as { recommendVeto?: boolean } | undefined;
     const earliestSignalExpiry = outputs.reduce((earliest, item) => {
       const expiresAt = (item.output as { expiresAt?: string }).expiresAt;
       return expiresAt && new Date(expiresAt).getTime() < earliest.getTime() ? new Date(expiresAt) : earliest;
@@ -2205,7 +2349,26 @@ export class EngineService {
       },
     });
     this.state.latestRisk = decision.risk;
-    await this.persistReportInput(createJournalEvent({ traceId: trigger.traceId, type: "RISK_EVALUATION", aggregateType: "risk", aggregateId: decision.risk.id, payload: { ...decision.risk, marketId: trigger.marketId, asset } }));
+    const alphaOutput = alphaAuthoritative ? outputs.find((item) => item.signalId === this.alphaSignalIds.get(trigger.id))?.output as {
+      fairProbability?: number; marketProbability?: number; estimatedEdge?: number;
+    } | undefined : undefined;
+    const executablePrice = decision.bookVwap
+      ?? (this.env.PAPER_EXECUTION_STYLE === "MAKER" ? snapshot.bids[0]?.price : snapshot.asks[0]?.price)
+      ?? null;
+    const probabilityEdge = alphaOutput && typeof alphaOutput.fairProbability === "number" && executablePrice
+      ? alphaOutput.fairProbability - Number(executablePrice) : null;
+    const expectedGrossUsdPerShare = probabilityEdge;
+    const expectedExecutionCosts = decision.feeUsd && decision.slippageUsd ? Number(decision.feeUsd) + Number(decision.slippageUsd) : null;
+    const expectedNetUsdPerShare = decision.netExpectedEdge;
+    const expectedROI = expectedExecutionCosts !== null && expectedExecutionCosts > 0 ? expectedNetUsdPerShare / expectedExecutionCosts : expectedNetUsdPerShare;
+    await this.persistReportInput(createJournalEvent({ traceId: trigger.traceId, type: "RISK_EVALUATION", aggregateType: "risk", aggregateId: decision.risk.id, payload: {
+      ...decision.risk, marketId: trigger.marketId, asset,
+      ...(alphaAuthoritative ? { alpha: { fairProbability: alphaOutput?.fairProbability ?? null, marketProbability: alphaOutput?.marketProbability ?? null,
+        probabilityEdge, currentExecutablePrice: executablePrice, expectedGrossUsdPerShare, expectedExecutionCosts,
+        expectedNetUsdPerShare, expectedROI, decisionTimestamp: this.nowFn().toISOString(),
+        scoutAgesMs: this.hotResearchCache.freshFor(trigger.marketId ?? "", asset, SCOUT_ROLES).map((entry) => ({ role: entry.role, ageMs: Math.max(0, this.nowFn().getTime() - new Date(entry.generatedAt).getTime()) })),
+        provenance: this.hotResearchCache.freshFor(trigger.marketId ?? "", asset, SCOUT_ROLES).map((entry) => ({ role: entry.role, evidenceIds: entry.evidenceIds, sourceEventIds: entry.sourceEventIds, featureIds: entry.featureIds })) } } : {}),
+    } }));
     if (!decision.accepted || !decision.order) {
       for (const reason of decision.risk.vetoes) this.metrics.riskVetoes.inc({ reason });
       this.record("RISK_VETO", trigger.traceId, trigger.marketId, { reasons: decision.risk.vetoes, netExpectedEdge: decision.netExpectedEdge }, asset);
@@ -3840,6 +4003,7 @@ export class EngineService {
     this.provenanceInvalid.delete(triggerId);
     this.signalsByTrigger.delete(triggerId);
     this.lastEvaluatedSignalCount.delete(triggerId);
+    this.alphaSignalIds.delete(triggerId);
   }
 
   private isProvenanceCurrentlyValid(triggerId: string, provenance: TriggerProvenance): boolean {
@@ -4036,6 +4200,28 @@ function boundedMarketSnapshot(snapshot: MarketSnapshot): Record<string, unknown
     receivedAt: snapshot.receivedAt,
     sequence: snapshot.sequence,
     hash: snapshot.hash,
+  };
+}
+
+function deterministicMarketFeatures(snapshots: readonly Record<string, unknown>[]): Record<string, unknown> {
+  const levels = snapshots.flatMap((snapshot) => {
+    const bids = Array.isArray(snapshot.bids) ? snapshot.bids as Array<{ price?: unknown; quantity?: unknown }> : [];
+    const asks = Array.isArray(snapshot.asks) ? snapshot.asks as Array<{ price?: unknown; quantity?: unknown }> : [];
+    const bid = bids[0] ? Number(bids[0].price) : Number.NaN;
+    const ask = asks[0] ? Number(asks[0].price) : Number.NaN;
+    const bidDepth = bids.reduce((sum, level) => sum + (Number(level.quantity) || 0), 0);
+    const askDepth = asks.reduce((sum, level) => sum + (Number(level.quantity) || 0), 0);
+    return [{ bid, ask, bidDepth, askDepth }];
+  });
+  const valid = levels.filter((item) => Number.isFinite(item.bid) && Number.isFinite(item.ask));
+  const bestBid = valid.length > 0 ? Math.max(...valid.map((item) => item.bid)) : null;
+  const bestAsk = valid.length > 0 ? Math.min(...valid.map((item) => item.ask)) : null;
+  const bidDepth = levels.reduce((sum, item) => sum + item.bidDepth, 0);
+  const askDepth = levels.reduce((sum, item) => sum + item.askDepth, 0);
+  return {
+    bestBid, bestAsk, spread: bestBid !== null && bestAsk !== null ? bestAsk - bestBid : null,
+    mid: bestBid !== null && bestAsk !== null ? (bestAsk + bestBid) / 2 : null,
+    bidDepth, askDepth, imbalance: bidDepth + askDepth > 0 ? (bidDepth - askDepth) / (bidDepth + askDepth) : null,
   };
 }
 

@@ -17,7 +17,10 @@ import { GrokActivationCoordinator } from "../apps/engine/src/activation/coordin
 import { XaiGrokActivationBridge } from "../apps/engine/src/activation/xai.js";
 import { XaiInferenceClient, XaiInferenceError } from "../apps/engine/src/activation/xai-client.js";
 import type { GrokRoleContext } from "../apps/engine/src/activation/role-runner.js";
+import { boundedContextForPrompt } from "../apps/engine/src/activation/role-runner.js";
+import { HotResearchCache } from "../apps/engine/src/activation/hot-research-cache.js";
 import { createGrokActivationBridge } from "../apps/engine/src/activation/index.js";
+import { feeSchedule } from "./fixtures.js";
 
 const now = new Date("2026-01-01T00:00:00.000Z");
 const expiry = new Date(now.getTime() + 60_000).toISOString();
@@ -33,7 +36,7 @@ function trigger(): TriggerEvent {
 function context(request: GrokActivationRequest): GrokRoleContext {
   return {
     trigger: { id: request.triggerId, traceId: request.traceId, marketId: request.marketId, asset: request.asset, kind: request.triggerKind, severity: request.severity, evidenceIds: ["market_event"], sourceEventIds: ["market_event"], createdAt: request.createdAt, expiresAt: request.expiresAt },
-    market: { marketId: "market_runtime", asset: "BTC", snapshots: [{ marketId: "market_runtime", outcome: "UP", bids: [{ price: "0.48", quantity: "10" }], asks: [{ price: "0.49", quantity: "10" }] }] },
+    market: { marketId: "market_runtime", asset: "BTC", synchronized: true, snapshots: [{ marketId: "market_runtime", outcome: "UP", bids: [{ price: "0.48", quantity: "10" }], asks: [{ price: "0.49", quantity: "10" }] }] },
     reference: { asset: "BTC", latestPrice: "65000", freshness: "fresh" },
     portfolio: { cash: "1000", equity: "1000", reservedCash: "0", positions: [] },
     experiment: { id: "experiment_runtime", status: "RUNNING" }, recentStrategyRisk: [], researchToolsAvailable: false,
@@ -201,6 +204,55 @@ describe("xAI client contract", () => {
   }, 2_000);
 });
 
+describe("hot research cache and role isolation", () => {
+  it("expires role-specific research and remains bounded", () => {
+    let clock = now.getTime();
+    const cache = new HotResearchCache({ now: () => new Date(clock), maxEntries: 2, roleTtlMs: { market_microstructure_scanner: 1_000 } });
+    const base = {
+      marketId: "m", asset: "BTC", triggerId: "t", traceId: "tr", generatedAt: new Date(clock).toISOString(),
+      expiresAt: new Date(clock + 60_000).toISOString(), evidenceIds: ["e1", "e1"], sourceEventIds: ["s1"],
+      featureIds: ["f1", "f1"], derivedFrom: ["s1"], marketSequence: 4, referenceTimestamp: null,
+      output: { direction: "UP" },
+    };
+    cache.put({ ...base, role: "market_microstructure_scanner" });
+    cache.put({ ...base, role: "crypto_market_scanner" });
+    cache.put({ ...base, role: "news_x_intelligence_scanner" });
+    expect(cache.footprint().entries).toBe(2);
+    expect(cache.freshFor("m", "BTC", ["news_x_intelligence_scanner"])).toHaveLength(1);
+    clock += 2_000;
+    expect(cache.get("m", "BTC", "market_microstructure_scanner")).toBeNull();
+  });
+
+  it("keeps portfolio and prior outcomes isolated while exposing provenance only to Alpha", () => {
+    const base = context(grokActivationRequestSchema.parse(activationRequestFromTrigger(trigger())));
+    base.recentStrategyRisk = [{ type: "RISK_ACCEPT" }];
+    base.scoutResearch = [{ role: "crypto_market_scanner", featureIds: ["f1"], sourceEventIds: ["s1"], evidenceIds: ["e1"] }];
+    const micro = boundedContextForPrompt(base, "market_microstructure_scanner");
+    expect(micro.portfolio.cash).toBe("[omitted]");
+    expect(micro.recentStrategyRisk).toEqual([]);
+    expect(micro.scoutResearch).toEqual([]);
+    const alpha = boundedContextForPrompt(base, "fair_probability_analyst");
+    expect(alpha.portfolio.cash).toBe("[omitted]");
+    expect(alpha.scoutResearch).toHaveLength(1);
+    const risk = boundedContextForPrompt(base, "risk_hedge_analyst");
+    expect(risk.portfolio.cash).toBe("1000");
+  });
+
+  it("never forwards an unsynchronized book and exposes overlapping evidence", () => {
+    const base = context(grokActivationRequestSchema.parse(activationRequestFromTrigger(trigger())));
+    base.market = { ...base.market!, synchronized: false };
+    base.scoutResearch = [
+      { role: "crypto_market_scanner", evidenceIds: ["same-event"], sourceEventIds: ["same-event"], featureIds: ["btc-window"] },
+      { role: "market_microstructure_scanner", evidenceIds: ["same-event"], sourceEventIds: ["same-event"], featureIds: ["btc-window"] },
+    ];
+    const alpha = boundedContextForPrompt(base, "fair_probability_analyst");
+    expect(alpha.market?.synchronized).toBe(false);
+    expect(alpha.market?.snapshots).toEqual([]);
+    expect(alpha.provenance?.correlatedFeatureIds).toEqual(undefined);
+    expect(alpha.scoutResearch?.map((item) => item.sourceEventIds)).toEqual([["same-event"], ["same-event"]]);
+  });
+});
+
 describe("EngineService xAI product path", () => {
   it("originates three signals in the real runtime and reaches existing consensus/paper ingress", async () => {
     const market = new ScriptedMarketAdapter();
@@ -220,6 +272,7 @@ describe("EngineService xAI product path", () => {
       const role = body.response_format.json_schema.name.replace(/^grok_/, "");
       const envelope = JSON.parse(body.messages[1]!.content) as { context: { trigger: { expiresAt: string; evidenceIds?: string[]; sourceEventIds?: string[] } } };
       const output = outputs(role);
+      if (role === "fair_probability_analyst") output.estimatedEdge = 0.35;
       output.expiresAt = envelope.context.trigger.expiresAt;
       output.evidenceIds = envelope.context.trigger.evidenceIds ?? envelope.context.trigger.sourceEventIds ?? [];
       return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify(output) } }], usage: { prompt_tokens: 30, completion_tokens: 20 } }), { status: 200, headers: { "content-type": "application/json" } });
@@ -234,17 +287,26 @@ describe("EngineService xAI product path", () => {
       await engine.start();
       await market.waitForHandlers();
       expect((await engine.beginExperiment()).ok).toBe(true);
+      engine.state.noteReferenceTick("BTC", now.toISOString(), { symbol: "BTCUSDT", venue: "binance", price: "65000" });
       const marketSnapshot = (outcome: "UP" | "DOWN", tokenId: string) => ({
         eventId: createId("market"), traceId: createId("trace"), marketId: "market_runtime", tokenId, outcome, asset: "BTC",
         bids: [{ price: "0.39", quantity: "2000" }], asks: [{ price: "0.40", quantity: "300" }], lastTradePrice: "0.40",
-        tickSize: "0.01", minOrderSize: "1", feeSchedule: null, sourceTimestamp: now.toISOString(), receivedAt: now.toISOString(), sequence: 1, hash: "runtime",
+        tickSize: "0.01", minOrderSize: "1", feeSchedule, sourceTimestamp: now.toISOString(), receivedAt: now.toISOString(), sequence: 1, hash: "runtime",
       });
       await market.emitSnapshot(marketSnapshot("UP", "up-runtime") as never);
       await market.emitSnapshot(marketSnapshot("DOWN", "down-runtime") as never);
-      const deadline = Date.now() + 3_000;
-      while (engine.state.grokActivity.acceptedSignals < 3 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+       const deadline = Date.now() + 3_000;
+       while ((engine.state.grokActivity.acceptedSignals < 3 || (await journal.queryEvents({ types: ["PAPER_ORDER_CREATED"] })).length === 0) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
       expect(engine.state.grokActivity.acceptedSignals).toBeGreaterThanOrEqual(3);
-      expect(engine.state.latestConsensus).not.toBeNull();
+       expect(engine.state.latestConsensus).toMatchObject({ consensusDirection: "UP" });
+       expect(engine.hotResearchCacheForTest().map((entry) => entry.role)).toEqual(expect.arrayContaining(["market_microstructure_scanner", "crypto_market_scanner"]));
+       expect((await journal.queryEvents({ types: ["PAPER_ORDER_CREATED"] })).length).toBeGreaterThanOrEqual(1);
+       const fillDeadline = Date.now() + 3_000;
+       while ((await journal.queryEvents({ types: ["PAPER_FILL"] })).length === 0 && Date.now() < fillDeadline) await new Promise((resolve) => setTimeout(resolve, 5));
+       expect((await journal.queryEvents({ types: ["PAPER_FILL"] })).length).toBeGreaterThanOrEqual(1);
+       expect(engine.ledger.positions.get("market_runtime")).toBeDefined();
+       const alphaDecision = await journal.queryEvents({ types: ["CONSENSUS_DECISION"] });
+       expect(alphaDecision.some((event) => (event.payload as { authority?: string }).authority === "ALPHA")).toBe(true);
       expect((fetchImpl as ReturnType<typeof vi.fn>).mock.calls.length).toBeGreaterThanOrEqual(3);
       const submissions = (await journal.readAll()).filter((event) => event.type === "GROK_SIGNAL_ACCEPTED");
       expect(submissions.length).toBeGreaterThanOrEqual(3);
