@@ -7,7 +7,7 @@ import {
   type ReferenceTick,
   type TriggerEvent,
 } from "@pm/core";
-import { hashExperimentReport, MemoryEventJournal } from "@pm/db";
+import { hashExperimentReport, MemoryEventJournal, type EventJournal } from "@pm/db";
 import { EngineService } from "../apps/engine/src/engine.js";
 import { NoopGrokActivationBridge } from "../apps/engine/src/activation/index.js";
 import { CrashInjectedError } from "../apps/engine/src/crash-injection.js";
@@ -128,7 +128,7 @@ async function submitThree(engine: EngineService, trigger: TriggerEvent, clock: 
 }
 
 async function setupScenario(options: {
-  journal?: MemoryEventJournal;
+  journal?: EventJournal;
   clock?: ScenarioClock;
   resolutions?: Map<string, Record<string, unknown>>;
   env?: Record<string, string | undefined>;
@@ -172,7 +172,7 @@ async function beginAndGenerateTrigger(setup: Awaited<ReturnType<typeof setupSce
   return trigger!;
 }
 
-function eventTypes(journal: MemoryEventJournal): Promise<string[]> {
+function eventTypes(journal: EventJournal): Promise<string[]> {
   return journal.readAll().then((events) => events.map((event) => event.type));
 }
 
@@ -329,6 +329,9 @@ describe("PR20 true product end-to-end gate", () => {
       await recovered.engine.tickMaintenance();
       expect((await journal.queryEvents({ types: ["PAPER_FILL"] })).length).toBe(1);
       expect((await journal.queryEvents({ types: ["POSITION_SETTLED"] })).length).toBe(1);
+      const durableEconomic = await journal.queryDurableTransitions({ types: ["PAPER_FILL", "POSITION_SETTLED"], limit: 20 });
+      expect(durableEconomic.filter((row) => row.type === "PAPER_FILL")).toHaveLength(1);
+      expect(durableEconomic.filter((row) => row.type === "POSITION_SETTLED")).toHaveLength(1);
       expect(recovered.engine.ledger.positions.has("btc-mkt")).toBe(false);
       expect(recovered.engine.experimentManifest()?.status).toBe("COMPLETED");
     } finally {
