@@ -1879,7 +1879,10 @@ export class EngineService {
     const dispatchRequest: GrokActivationRequest = {
       ...decision.request,
       targetRoles: xaiRuntime && requiresAlpha
-        ? ["fair_probability_analyst", ...auxiliaryRoles]
+        // Alpha is the only synchronous economic inference in the internal
+        // xAI path. Supervisor/risk work stays on its own advisory lanes and
+        // must never delay or influence this trade decision.
+        ? ["fair_probability_analyst"]
         : requiresAlpha && scoutWarm.length > 0
           ? [...scoutWarm, ...auxiliaryRoles]
           : requestedRoles,

@@ -7,6 +7,7 @@ import {
   engineEnvSchema,
   grokActivationRequestSchema,
   grokSignalSubmissionSchema,
+  rolesForTriggerKind,
   type GrokActivationRequest,
   type TriggerEvent,
   type ReferenceTick,
@@ -512,6 +513,39 @@ describe("EngineService xAI product path", () => {
       expect(Number(alphaRisk?.rawEdgeUsdPerShare)).toBeCloseTo(0.21, 8);
       expect((afterTrigger.find((call) => call.role === "fair_probability_analyst")?.systemPrompt ?? "")).toContain("not independent votes");
       expect((afterTrigger.find((call) => call.role === "fair_probability_analyst")?.systemPrompt ?? "")).toContain("correlated evidence");
+    } finally {
+      await setup.engine.stop().catch(() => undefined);
+    }
+  });
+
+  it("filters a severity-3 economic trigger to Alpha only in the internal xAI path", async () => {
+    const setup = await createRuntimeProduct();
+    try {
+      const preFilterRoles = rolesForTriggerKind("BOOK_IMBALANCE", 3);
+      expect(preFilterRoles).toEqual(expect.arrayContaining([
+        "market_microstructure_scanner", "crypto_market_scanner", "fair_probability_analyst", "strategy_supervisor",
+      ]));
+
+      await setup.market.emitSnapshot(runtimeSnapshot("UP", "up-runtime", 1, setup.clock.get(), "0.40") as never);
+      await setup.market.emitSnapshot(runtimeSnapshot("DOWN", "down-runtime", 1, setup.clock.get(), "0.70") as never);
+      await waitForRuntime(() => setup.engine.hotResearchCacheForTest().some((entry) => entry.role === "market_microstructure_scanner"));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await setup.engine.referenceTickForTest(runtimeReferenceTick(setup.clock.get(), "severity3_reference"));
+      await waitForRuntime(() => setup.engine.hotResearchCacheForTest().some((entry) => entry.role === "crypto_market_scanner"));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      const tradeAt = Date.now();
+      const callIndex = setup.calls.length;
+      await setup.engine.registerTriggerForResearch(runtimeTriggerAt(setup.clock.get(), "severity3_hot_trade", { severity: 3 }));
+      await waitForRuntime(async () => (await setup.journal.queryEvents({ types: ["PAPER_FILL"] })).length === 1);
+
+      const afterTrigger = setup.calls.slice(callIndex).filter((call) => call.at >= tradeAt);
+      expect(afterTrigger.map((call) => call.role)).toEqual(["fair_probability_analyst"]);
+      expect(afterTrigger.some((call) => call.role === "strategy_supervisor")).toBe(false);
+      expect(afterTrigger.some((call) => call.role === "risk_hedge_analyst")).toBe(false);
+      expect(afterTrigger.every((call) => !["market_microstructure_scanner", "crypto_market_scanner", "news_x_intelligence_scanner"].includes(call.role))).toBe(true);
+      expect(await setup.journal.queryEvents({ types: ["PAPER_ORDER_CREATED"] })).toHaveLength(1);
+      expect(await setup.journal.queryEvents({ types: ["PAPER_FILL"] })).toHaveLength(1);
     } finally {
       await setup.engine.stop().catch(() => undefined);
     }

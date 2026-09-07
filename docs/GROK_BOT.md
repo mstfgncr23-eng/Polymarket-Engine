@@ -144,6 +144,15 @@ own usable TTL expires, independently of the economic trigger cooldown.
 `XAI_MAX_ROLE_CALLS_PER_MINUTE` is a shared rolling budget of actual model
 attempts; retries consume additional units and exhausted budgets fail closed.
 
+With the default 5s micro TTL and 15s crypto TTL, the bounded headroom policy
+(`TTL/3`, capped at 2s) makes the earliest refresh intervals about 3.333s and
+13s. One continuously active market therefore needs at most about 18.00
+micro attempts/minute plus 4.62 crypto attempts/minute, or 22.62 scout
+attempts/minute before Alpha calls or retries. The default 24-attempt budget
+leaves little multi-market/Alpha headroom; exhausted calls remain fail closed.
+This relationship is a paper-calibration parameter after merge, not a reason
+to bypass the provider-call cap.
+
 Do not mix grok.com custom MCP or Grok Build hooks (outbound) into this as if they wake Grok Bot.
 
 ## Deterministic execution economics
