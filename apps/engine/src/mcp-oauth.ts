@@ -30,7 +30,7 @@ export interface McpOAuthConfig {
 }
 
 export interface OAuthSafeEvent {
-  event: "protected_resource_401" | "resource_metadata_requested" | "authorization_metadata_requested" | "dynamic_client_registered" | "dynamic_client_registration_rejected" | "authorization_started" | "authorization_approved" | "token_issued" | "mcp_authenticated";
+  event: "protected_resource_401" | "resource_metadata_requested" | "authorization_metadata_requested" | "dynamic_client_registered" | "dynamic_client_registration_rejected" | "authorization_scope_downscoped" | "authorization_started" | "authorization_approved" | "token_issued" | "mcp_authenticated";
   role?: ExternalAgentRoleId;
   endpoint?: string;
   status?: string;
@@ -41,6 +41,9 @@ export interface OAuthSafeEvent {
   tokenEndpointAuthMethod?: string | null;
   redirectUris?: Array<{ scheme: string; hostname: string }>;
   requestedScopes?: string[];
+  requestedScopeNames?: string[];
+  grantedScopeNames?: string[];
+  resource?: string;
   timestamp: string;
 }
 
@@ -232,7 +235,13 @@ export class McpOAuthService {
     const roleName = externalAgentRoleDefinitions.find((item) => item.id === role)?.name ?? role;
     const clientName = validation.client.clientName?.trim() || "Unnamed public MCP client";
     const redirectHost = new URL(validation.redirectUri).hostname;
-    const body = `<!doctype html><html><head><meta charset="utf-8"><title>Authorize Polymarket MCP connector</title></head><body><h1>Authorize Polymarket MCP connector</h1><p>Role: <strong>${escapeHtml(roleName)}</strong></p><p>Client: <strong>${escapeHtml(clientName)}</strong></p><p>Redirect host: <code>${escapeHtml(redirectHost)}</code></p><p>Resource: <code>${escapeHtml(validation.resource)}</code></p><p>No wallet or user trading credentials are involved.</p><form method="post" action="/oauth/authorize">${hidden}<label>Connection secret <input type="password" name="bootstrap_secret" autocomplete="off" required></label><button type="submit">Authorize</button></form></body></html>`;
+    const requestedScopeNames = validation.requestedScopes.join(" ");
+    const requestedScopeCount = validation.requestedScopes.length;
+    const grantedScopeNames = validation.effectiveScopes.join(" ");
+    if (validation.requestedScopes.length !== validation.effectiveScopes.length) {
+      this.observeEvent({ event: "authorization_scope_downscoped", role, resource: validation.resource, requestedScopeNames: [...validation.requestedScopes], grantedScopeNames: [...validation.effectiveScopes], clientFingerprint: fingerprint(validation.client.clientId), timestamp: new Date(this.now()).toISOString() });
+    }
+    const body = `<!doctype html><html><head><meta charset="utf-8"><title>Authorize Polymarket MCP connector</title></head><body><h1>Authorize Polymarket MCP connector</h1><p>Role: <strong>${escapeHtml(roleName)}</strong></p><p>Client: <strong>${escapeHtml(clientName)}</strong></p><p>Redirect host: <code>${escapeHtml(redirectHost)}</code></p><p>Requested scopes: <code>${escapeHtml(requestedScopeNames)}</code> (${requestedScopeCount} known MCP scope${requestedScopeCount === 1 ? "" : "s"})</p><p>Granted authority: <strong>${escapeHtml(roleName)} only</strong></p><p>Granted scope: <code>${escapeHtml(grantedScopeNames)}</code></p><p>Resource: <code>${escapeHtml(validation.resource)}</code></p><p>No wallet or user trading credentials are involved.</p><form method="post" action="/oauth/authorize">${hidden}<label>Connection secret <input type="password" name="bootstrap_secret" autocomplete="off" required></label><button type="submit">Authorize</button></form></body></html>`;
     return { status: 200, body, headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } };
   }
 
@@ -251,7 +260,7 @@ export class McpOAuthService {
       redirectUri: validation.redirectUri,
       role,
       resource: validation.resource,
-      scopes: validation.scopes,
+      scopes: validation.effectiveScopes,
       codeChallenge: input.code_challenge!,
       expiresAt: this.now() + this.config.authorizationCodeTtlSeconds * 1000,
     });
@@ -319,16 +328,20 @@ export class McpOAuthService {
     return { clients: this.clients.size, codes: this.codes.size, tokens: this.tokens.size, rateKeys: this.registrationRate.size + this.authorizationRate.size + this.tokenRate.size };
   }
 
-  private validateAuthorizationInput(input: Record<string, string | undefined>, context: OAuthRequestContext, role: ExternalAgentRoleId): { ok: true; client: OAuthClient; redirectUri: string; resource: string; scopes: string[] } | { ok: false; status: 400 | 401; reason: string } {
+  private validateAuthorizationInput(input: Record<string, string | undefined>, context: OAuthRequestContext, role: ExternalAgentRoleId): { ok: true; client: OAuthClient; redirectUri: string; resource: string; requestedScopes: string[]; effectiveScopes: string[] } | { ok: false; status: 400 | 401; reason: string } {
     if (!input.client_id || !input.redirect_uri || input.response_type !== "code" || !input.code_challenge || input.code_challenge_method !== "S256" || !input.resource) return { ok: false, status: 400, reason: "invalid_request" };
     const client = this.clients.get(input.client_id);
     if (!client || !client.redirectUris.includes(input.redirect_uri)) return { ok: false, status: 400, reason: "invalid_client" };
     const resource = this.resourceForRole(role, context.origin);
     if (input.resource !== resource) return { ok: false, status: 400, reason: "invalid_target" };
-    const scopes = (input.scope ?? this.scopeForRole(role)).split(/\s+/).filter(Boolean);
-    if (!scopes.includes(this.scopeForRole(role)) || scopes.some((scope) => scope !== this.scopeForRole(role))) return { ok: false, status: 400, reason: "invalid_scope" };
-    if (client.scope && client.scope.split(/\s+/).some((scope) => !scopes.includes(scope))) return { ok: false, status: 400, reason: "invalid_scope" };
-    return { ok: true, client, redirectUri: input.redirect_uri, resource, scopes };
+    const requestedScopes = [...new Set((input.scope ?? this.scopeForRole(role)).split(/\s+/).filter(Boolean))];
+    const roleScope = this.scopeForRole(role);
+    if (requestedScopes.some((scope) => !MCP_OAUTH_SCOPES.includes(scope)) || !requestedScopes.includes(roleScope)) return { ok: false, status: 400, reason: "invalid_scope" };
+    if (client.scope) {
+      const registeredScopes = client.scope.split(/\s+/).filter(Boolean);
+      if (requestedScopes.some((scope) => !registeredScopes.includes(scope)) || !registeredScopes.includes(roleScope)) return { ok: false, status: 400, reason: "invalid_scope" };
+    }
+    return { ok: true, client, redirectUri: input.redirect_uri, resource, requestedScopes, effectiveScopes: [roleScope] };
   }
 
   private consumeRate(store: Map<string, RateState>, key: string, limit: number): boolean {

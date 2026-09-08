@@ -154,6 +154,62 @@ describe("PR23 OAuth 2.1 compatibility for role-scoped MCP", () => {
     } finally { await ctx.server.close(); }
   });
 
+  it("downscopes broad known Grok authorization requests to the resource role", async () => {
+    const ctx = await createOAuthServer();
+    try {
+      const redirectUri = "http://127.0.0.1:9876/callback";
+      const allScopes = [...MCP_OAUTH_SCOPES];
+      const registration = await jsonFetch(`${ctx.base}/oauth/register`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ client_name: "Grok Custom Connector", redirect_uris: [redirectUri], scope: allScopes.join(" ") }),
+      });
+      expect(registration.response.status).toBe(201);
+      const clientId = (registration.body as { client_id: string }).client_id;
+      const pkce = verifier();
+      const resource = `${ctx.base}/mcp/${ROLE}`;
+      const params = { client_id: clientId, redirect_uri: redirectUri, response_type: "code", scope: allScopes.join(" "), state: "broad", code_challenge: pkce.challenge, code_challenge_method: "S256", resource };
+
+      const page = await jsonFetch(`${ctx.base}/oauth/authorize?${new URLSearchParams(params)}`);
+      expect(page.response.status).toBe(200);
+      expect(page.text).toContain(`Requested scopes: <code>${allScopes.join(" ")}</code> (6 known MCP scopes)`);
+      expect(page.text).toContain("Granted authority: <strong>Market Microstructure Scanner only</strong>");
+      expect(page.text).toContain(`Granted scope: <code>${ROLE_SCOPE}</code>`);
+      expect(page.text).toContain(`Resource: <code>${resource}</code>`);
+
+      const unknownScope = await jsonFetch(`${ctx.base}/oauth/authorize?${new URLSearchParams({ ...params, scope: `${ROLE_SCOPE} mcp:unknown_scope` })}`);
+      expect(unknownScope.response.status).toBe(400);
+      expect(unknownScope.body).toMatchObject({ error: "invalid_scope" });
+      const missingRoleScope = allScopes.filter((scope) => scope !== ROLE_SCOPE).join(" ");
+      const missingRole = await jsonFetch(`${ctx.base}/oauth/authorize?${new URLSearchParams({ ...params, scope: missingRoleScope })}`);
+      expect(missingRole.response.status).toBe(400);
+      expect(missingRole.body).toMatchObject({ error: "invalid_scope" });
+
+      const approval = await fetch(`${ctx.base}/oauth/authorize`, {
+        method: "POST", redirect: "manual", headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: form({ ...params, bootstrap_secret: "bootstrap-micro" }),
+      });
+      expect(approval.status).toBe(302);
+      const code = new URL(approval.headers.get("location") ?? "").searchParams.get("code");
+      expect(code).toBeTruthy();
+      const exchanged = await jsonFetch(`${ctx.base}/oauth/token`, {
+        method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: form({ grant_type: "authorization_code", client_id: clientId, code: code!, redirect_uri: redirectUri, code_verifier: pkce.value, resource }),
+      });
+      expect(exchanged.response.status).toBe(200);
+      const token = exchanged.body as { access_token: string; scope: string };
+      expect(token.scope).toBe(ROLE_SCOPE);
+
+      const micro = await fetch(resource, { method: "POST", headers: { authorization: `Bearer ${token.access_token}`, "content-type": "application/json", accept: "application/json, text/event-stream" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }) });
+      expect(micro.status).toBe(200);
+      const alphaWrite = await fetch(`${ctx.base}/mcp/${ALPHA}`, { method: "POST", headers: { authorization: `Bearer ${token.access_token}`, "content-type": "application/json", accept: "application/json, text/event-stream" }, body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "submit_analysis", arguments: {} } }) });
+      expect(alphaWrite.status).toBe(401);
+
+      const downscoped = [...ctx.events].reverse().find((event) => event.event === "authorization_scope_downscoped");
+      expect(downscoped).toMatchObject({ event: "authorization_scope_downscoped", role: ROLE, requestedScopeNames: allScopes, grantedScopeNames: [ROLE_SCOPE], resource });
+      expect(JSON.stringify(downscoped)).not.toContain("bootstrap-micro");
+    } finally { await ctx.server.close(); }
+  });
+
   it("completes DCR, operator approval, PKCE token exchange, and Streamable HTTP tools/list", async () => {
     const ctx = await createOAuthServer();
     try {
