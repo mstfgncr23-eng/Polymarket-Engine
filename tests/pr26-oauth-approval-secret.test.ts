@@ -14,21 +14,10 @@ describe("PR26 single Grok OAuth approval secret", () => {
     for (const role of MCP_OAUTH_ROLES) expect(entries).toContain(`${role}:${SECRET}`);
   });
 
-  it("migrates the existing Micro bootstrap secret without requiring another credential", () => {
-    const bootstrap = resolveOAuthApprovalBootstrap({
+  it("does not fall back to the old role-mapped bootstrap secret", () => {
+    expect(() => resolveOAuthApprovalBootstrap({
       GROK_MCP_OAUTH_BOOTSTRAP_TOKENS: `market_microstructure_scanner:${SECRET}`,
-    }, true);
-    for (const role of MCP_OAUTH_ROLES) expect(bootstrap).toContain(`${role}:${SECRET}`);
-  });
-
-  it("prefers the new single secret over stale legacy bootstrap mappings", () => {
-    const fresh = "b".repeat(64);
-    const bootstrap = resolveOAuthApprovalBootstrap({
-      GROK_MCP_OAUTH_APPROVAL_SECRET: fresh,
-      GROK_MCP_OAUTH_BOOTSTRAP_TOKENS: `market_microstructure_scanner:${SECRET}`,
-    }, true);
-    expect(bootstrap).toContain(`${ROLE}:${fresh}`);
-    expect(bootstrap).not.toContain(SECRET);
+    }, true)).toThrow("GROK_MCP_OAUTH_APPROVAL_SECRET_REQUIRED");
   });
 
   it("fails closed when OAuth is enabled without a usable operator secret", () => {
