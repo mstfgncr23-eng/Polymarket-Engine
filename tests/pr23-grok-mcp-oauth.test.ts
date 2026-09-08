@@ -138,6 +138,22 @@ describe("PR23 OAuth 2.1 compatibility for role-scoped MCP", () => {
     } finally { await ctx.server.close(); }
   });
 
+  it("accepts refresh-token metadata but normalizes the effective grant capability", async () => {
+    const ctx = await createOAuthServer();
+    try {
+      for (const grantTypes of [["authorization_code"], ["authorization_code", "refresh_token"]]) {
+        const registration = await jsonFetch(`${ctx.base}/oauth/register`, {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ redirect_uris: ["http://127.0.0.1:9876/callback"], grant_types: grantTypes }),
+        });
+        expect(registration.response.status).toBe(201);
+        expect((registration.body as { grant_types: string[] }).grant_types).toEqual(["authorization_code"]);
+      }
+      const metadata = await jsonFetch(`${ctx.base}/.well-known/oauth-authorization-server`);
+      expect(metadata.body).toMatchObject({ grant_types_supported: ["authorization_code"] });
+    } finally { await ctx.server.close(); }
+  });
+
   it("completes DCR, operator approval, PKCE token exchange, and Streamable HTTP tools/list", async () => {
     const ctx = await createOAuthServer();
     try {
@@ -253,6 +269,31 @@ describe("PR23 OAuth 2.1 compatibility for role-scoped MCP", () => {
       expect(badRedirect.response.status).toBe(400);
       const badClientAuth = await jsonFetch(`${ctx.base}/oauth/register`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ redirect_uris: ["https://client.example/cb"], token_endpoint_auth_method: "client_secret_post" }) });
       expect(badClientAuth.response.status).toBe(400);
+      const unsupportedGrantTypes = ["client_credentials", "password", "urn:ietf:params:oauth:grant-type:jwt-bearer"];
+      for (const grantType of unsupportedGrantTypes) {
+        const rejected = await jsonFetch(`${ctx.base}/oauth/register`, {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            client_name: "diagnostic-client",
+            redirect_uris: ["https://grok.example/callback?secret=bootstrap-secret"],
+            token_endpoint_auth_method: "none",
+            grant_types: [grantType],
+            scope: `${ROLE_SCOPE} mcp:unknown_scope`,
+          }),
+        });
+        expect(rejected.response.status).toBe(400);
+      }
+      const rejection = [...ctx.events].reverse().find((event) => event.event === "dynamic_client_registration_rejected");
+      expect(rejection).toMatchObject({
+        event: "dynamic_client_registration_rejected",
+        reason: "unsupported_grant_type",
+        tokenEndpointAuthMethod: "none",
+        requestedGrantTypes: [unsupportedGrantTypes.at(-1)],
+        redirectUris: [{ scheme: "https", hostname: "grok.example" }],
+        requestedScopes: [ROLE_SCOPE, "mcp:unknown_scope"],
+      });
+      expect(rejection?.metadataFields).toEqual(expect.arrayContaining(["client_name", "redirect_uris", "token_endpoint_auth_method", "grant_types", "scope"]));
+      expect(JSON.stringify(rejection)).not.toContain("bootstrap-secret");
       expect(MCP_OAUTH_SCOPES).toHaveLength(6);
     } finally { await ctx.server.close(); }
   });
