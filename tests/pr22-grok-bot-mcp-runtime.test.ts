@@ -181,22 +181,26 @@ describe("PR22 external Grok Bot MCP runtime alignment", () => {
     const event = trigger();
     await setupResult.engine.registerTriggerForResearch(event);
 
-    const rolesBeforeScout = setupResult.activations.flatMap((item) => item.targetRoles);
-    expect(rolesBeforeScout).toEqual(expect.arrayContaining([
-      "market_microstructure_scanner", "crypto_market_scanner",
-    ]));
-    expect(rolesBeforeScout).not.toContain("fair_probability_analyst");
-    expect(rolesBeforeScout).not.toContain("risk_hedge_analyst");
-    expect(rolesBeforeScout).not.toContain("strategy_supervisor");
+    const wakeCount = (role: ExternalAgentRoleId) => setupResult.activations.filter((item) => item.targetRoles.includes(role)).length;
+    expect(wakeCount("market_microstructure_scanner")).toBe(1);
+    expect(wakeCount("crypto_market_scanner")).toBe(1);
+    expect(wakeCount("fair_probability_analyst")).toBe(0);
+    expect(wakeCount("risk_hedge_analyst")).toBe(0);
+    expect(wakeCount("strategy_supervisor")).toBe(0);
 
     const micro = await setupResult.engine.submitGrokSignal(submission(event, "market_microstructure_scanner", scoutOutput("micro")), "market_microstructure_scanner", "scout");
     expect(micro.status).toBe("accepted");
     await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(setupResult.activations.flatMap((item) => item.targetRoles)).not.toContain("fair_probability_analyst");
+    expect(wakeCount("market_microstructure_scanner")).toBe(1);
+    expect(wakeCount("crypto_market_scanner")).toBe(1);
+    expect(wakeCount("fair_probability_analyst")).toBe(0);
 
     const crypto = await setupResult.engine.submitGrokSignal(submission(event, "crypto_market_scanner", scoutOutput("crypto")), "crypto_market_scanner", "scout");
     expect(crypto.status).toBe("accepted");
     await waitFor(() => setupResult.activations.filter((item) => item.targetRoles.length === 1 && item.targetRoles[0] === "fair_probability_analyst").length === 1);
+    expect(wakeCount("market_microstructure_scanner")).toBe(1);
+    expect(wakeCount("crypto_market_scanner")).toBe(1);
+    expect(wakeCount("fair_probability_analyst")).toBe(1);
     expect(setupResult.activations.filter((item) => item.targetRoles.includes("fair_probability_analyst"))).toEqual([
       { triggerId: event.id, targetRoles: ["fair_probability_analyst"] },
     ]);
@@ -215,6 +219,8 @@ describe("PR22 external Grok Bot MCP runtime alignment", () => {
     expect(micro.status).toBe("accepted");
     expect(crypto.status).toBe("accepted");
     await waitFor(() => setupResult.activations.some((item) => item.targetRoles.length === 1 && item.targetRoles[0] === "fair_probability_analyst"));
+    expect(setupResult.activations.filter((item) => item.targetRoles.includes("market_microstructure_scanner"))).toHaveLength(1);
+    expect(setupResult.activations.filter((item) => item.targetRoles.includes("crypto_market_scanner"))).toHaveLength(1);
     const alphaWakes = setupResult.activations.filter((item) => item.targetRoles.includes("fair_probability_analyst"));
     expect(alphaWakes).toHaveLength(1);
     expect(alphaWakes[0]).toEqual({ triggerId: event.id, targetRoles: ["fair_probability_analyst"] });

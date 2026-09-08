@@ -58,6 +58,37 @@ export class GrokActivationCoordinator {
     return { activate: true, reason: "SEND", request };
   }
 
+  /** A successful wake remains reserved while its scout result is outstanding. */
+  isRoleRequested(triggerId: string, role: ExternalAgentRoleId): boolean {
+    this.prune();
+    return this.sent.has(activationIdempotencyKey(triggerId, role));
+  }
+
+  /** Release only the trigger-scoped wake reservations that are no longer valid. */
+  forgetTrigger(triggerId: string): void {
+    const prefix = `${triggerId}:`;
+    for (const key of [...this.sent.keys()]) {
+      if (key.startsWith(prefix)) this.sent.delete(key);
+    }
+    this.latency.delete(triggerId);
+  }
+
+  /** Drop all trigger-scoped wake state when the engine/experiment lifecycle ends. */
+  clearAll(): void {
+    this.sent.clear();
+    this.sentOrder.length = 0;
+    this.sentHead = 0;
+    this.lastByMarketAsset.clear();
+    this.lastOrder.length = 0;
+    this.lastHead = 0;
+    this.recent.length = 0;
+    this.recentHead = 0;
+    this.retryAfterUntil.clear();
+    this.latency.clear();
+    this.latencyOrder.length = 0;
+    this.latencyHead = 0;
+  }
+
   markRequested(trigger: TriggerEvent, request: GrokActivationRequest): void {
     const now = this.now();
     const nowMs = now.getTime();
@@ -92,12 +123,14 @@ export class GrokActivationCoordinator {
   async dispatch(request: GrokActivationRequest): Promise<GrokActivationResult[]> {
     const now = this.now().getTime();
     if (new Date(request.expiresAt).getTime() <= now) {
-      return request.targetRoles.map((targetRole) => ({
+      const expired = request.targetRoles.map((targetRole) => ({
         provider: this.bridge.provider, ok: false, skipped: true, targetRole,
         requestedAt: new Date(now).toISOString(), sentAt: null, errorCode: "TRIGGER_EXPIRED",
         httpStatus: null, grokWakeObserved: false as const,
         idempotencyKey: activationIdempotencyKey(request.triggerId, targetRole),
       }));
+      this.releaseFailed(expired);
+      return expired;
     }
     const fanout = Math.max(1, this.limits.fanout ?? 3);
     const results: GrokActivationResult[] = [];
@@ -150,6 +183,7 @@ export class GrokActivationCoordinator {
           } satisfies GrokActivationResult;
         }
       }));
+      this.releaseFailed(batch);
       results.push(...batch);
     }
     const sentAt = results.find((item) => item.sentAt)?.sentAt ?? null;
@@ -239,6 +273,12 @@ export class GrokActivationCoordinator {
     this.expireLastByMarket(now);
     for (const [role, until] of this.retryAfterUntil) if (until <= now) this.retryAfterUntil.delete(role);
     this.evictLatencyIfNeeded();
+  }
+
+  private releaseFailed(results: readonly GrokActivationResult[]): void {
+    for (const result of results) {
+      if (!result.ok) this.sent.delete(result.idempotencyKey);
+    }
   }
 
   private trimRecent(now: number): void {

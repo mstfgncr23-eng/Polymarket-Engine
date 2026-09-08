@@ -487,6 +487,7 @@ export class EngineService {
     }
     this.sse.close();
     await this.journal.close();
+    this.clearResearchActivationState();
     this.record("ENGINE_STOPPED", this.experiment?.id ?? "engine", null, {
       unresolvedOwnedWork: (this.lastShutdown.unresolved ?? 0) + (this.lastJournalShutdown.unresolved ?? 0),
       shutdownTimedOut: this.lastShutdown.timedOut || this.lastJournalShutdown.timedOut,
@@ -1926,6 +1927,10 @@ export class EngineService {
       ? this.hotResearchCache.freshFor(trigger.marketId, trigger.asset ?? null, scoutRoles).map((entry) => entry.role)
       : scoutRoles;
     const scoutWarm = scoutRoles.filter((role) => !freshScoutRoles.includes(role));
+    // A cold scout may already have a valid wake reservation. Keep that
+    // reservation while its MCP result is outstanding so a sibling result
+    // cannot spend another Bot call for the same trigger/role.
+    const scoutDispatchable = scoutWarm.filter((role) => !this.activation.isRoleRequested(trigger.id, role));
     const requiresAlpha = requestedRoles.includes("fair_probability_analyst");
     const xaiRuntime = this.env.GROK_ACTIVATION_PROVIDER === "xai";
     // Scouts are warmed by the bounded precursor path. A real trade trigger
@@ -1953,7 +1958,7 @@ export class EngineService {
         // the missing scout roles are dispatched; risk/supervisor lanes stay
         // out of this bounded research warm-up.
         ? scoutWarm.length > 0
-          ? scoutWarm
+          ? scoutDispatchable
           : ["fair_probability_analyst"]
         : requestedRoles,
     };
@@ -3651,7 +3656,10 @@ export class EngineService {
       occurredAt: next.status === "COMPLETED" && next.completedAt ? new Date(next.completedAt) : undefined,
       checkpoint: true,
     });
-    if (next.status === "COMPLETED") this.freezeExperimentResearchIngress();
+    if (next.status === "COMPLETED") {
+      this.freezeExperimentResearchIngress();
+      this.clearResearchActivationState();
+    }
   }
 
   private sourceSealBlocksAdmission(): boolean {
@@ -4386,15 +4394,28 @@ export class EngineService {
 
   private markProvenanceInvalid(triggerId: string): void {
     this.provenanceInvalid.add(triggerId);
+    // An invalidated trigger can no longer receive research wakeups. Release
+    // its bounded reservations while retaining the trigger record so stale
+    // submissions still receive the explicit provenance-stale response.
+    this.activation.forgetTrigger(triggerId);
+    this.activationFlights.delete(triggerId);
   }
 
   private forgetTrigger(triggerId: string): void {
+    this.activation.forgetTrigger(triggerId);
+    this.activationFlights.delete(triggerId);
     this.activeTriggers.delete(triggerId);
     this.triggerProvenance.delete(triggerId);
     this.provenanceInvalid.delete(triggerId);
     this.signalsByTrigger.delete(triggerId);
     this.lastEvaluatedSignalCount.delete(triggerId);
     this.alphaSignalIds.delete(triggerId);
+  }
+
+  private clearResearchActivationState(): void {
+    for (const triggerId of [...this.activeTriggers.keys()]) this.forgetTrigger(triggerId);
+    this.hotResearchCache.clear();
+    this.activation.clearAll();
   }
 
   private isProvenanceCurrentlyValid(triggerId: string, provenance: TriggerProvenance): boolean {
