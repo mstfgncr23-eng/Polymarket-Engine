@@ -58,6 +58,14 @@ async function setup() {
   return result;
 }
 
+async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
+  const started = Date.now();
+  while (!predicate()) {
+    if (Date.now() - started >= timeoutMs) throw new Error("test wait timed out");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
 describe("PR22 external Grok Bot MCP runtime alignment", () => {
   it("routes authenticated MCP scout writes to cache mode and keeps Alpha context/portfolio role-scoped", async () => {
     const setupResult = await setup();
@@ -165,5 +173,41 @@ describe("PR22 external Grok Bot MCP runtime alignment", () => {
       "market_microstructure_scanner", "scout",
     );
     expect(expired.status).toBe("stale");
+  });
+
+  it("rehydrates an active scout duplicate from the canonical accepted payload", async () => {
+    const { engine } = await setup();
+    expect((await engine.beginExperiment()).ok).toBe(true);
+    const event = trigger();
+    await engine.registerTriggerForResearch(event);
+    const first = submission(event, "market_microstructure_scanner", scoutOutput("micro"));
+    expect((await engine.submitGrokSignal(first, "market_microstructure_scanner", "scout")).status).toBe("accepted");
+
+    const altered = { ...first, output: { ...first.output, direction: "DOWN" as const } };
+    expect((await engine.submitGrokSignal(altered, "market_microstructure_scanner", "scout")).status).toBe("duplicate");
+    const cached = engine.hotResearchCacheForTest().find((entry) => entry.triggerId === event.id && entry.role === "market_microstructure_scanner");
+    expect(cached?.output.direction).toBe("UP");
+  });
+
+  it("treats feed loss after final admission as runtime invalidation, not a stale acceptance", async () => {
+    const { engine, journal, market } = await setup();
+    expect((await engine.beginExperiment()).ok).toBe(true);
+    const event = trigger();
+    await engine.registerTriggerForResearch(event);
+    const first = submission(event, "market_microstructure_scanner", scoutOutput("micro"));
+    let release!: () => void;
+    journal.setAppendInFlightHoldForTest(new Promise<void>((resolve) => { release = resolve; }), ["GROK_SIGNAL_ACCEPTED"]);
+    try {
+      const pending = engine.submitGrokSignal(first, "market_microstructure_scanner", "scout");
+      await waitFor(() => journal.inFlightAppends > 0);
+      market.markTokenSync("btc-up", "GAPPED");
+      release();
+      expect((await pending).status).toBe("accepted");
+      expect(await journal.queryEvents({ types: ["GROK_SIGNAL_ACCEPTED"] })).toHaveLength(1);
+      expect(engine.hotResearchCacheForTest()).toHaveLength(0);
+    } finally {
+      release();
+      journal.setAppendInFlightHoldForTest(null);
+    }
   });
 });

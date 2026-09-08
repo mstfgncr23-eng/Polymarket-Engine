@@ -2216,9 +2216,9 @@ export class EngineService {
         const claimed = await this.journal.claimIdempotency("grok_signal_submission", idempotencyKey);
         this.assertResearchIntegrity();
         if (!claimed) {
-          await this.proveGrokSubmissionCanonicalFacts(submission, clientId);
+          const canonical = await this.proveGrokSubmissionCanonicalFacts(submission, clientId);
           if (mode === "scout") {
-            const rehydrated = this.admitScoutResearch(submission, trigger);
+            const rehydrated = this.admitScoutResearch(canonical, trigger);
             if (rehydrated.ok) void this.requestActivation(trigger).catch(() => undefined);
           }
           return duplicate();
@@ -2237,9 +2237,9 @@ export class EngineService {
           const promoted = await this.journal.claimIdempotency("grok_signal_submission", idempotencyKey);
           this.assertResearchIntegrity();
           if (!promoted) {
-            await this.proveGrokSubmissionCanonicalFacts(submission, clientId);
+            const canonical = await this.proveGrokSubmissionCanonicalFacts(submission, clientId);
             if (mode === "scout") {
-              const rehydrated = this.admitScoutResearch(submission, trigger);
+              const rehydrated = this.admitScoutResearch(canonical, trigger);
               if (rehydrated.ok) void this.requestActivation(trigger).catch(() => undefined);
             }
             return duplicate();
@@ -2274,6 +2274,27 @@ export class EngineService {
           if (idleReservation) this.releaseIdleGrokSubmission(idempotencyKey);
           return rejectSealed();
         }
+        // This is the final admission linearization point for role-bound
+        // research.  Once the canonical event is appended, a later feed loss
+        // is ordinary runtime invalidation; it must not turn an accepted
+        // journal fact into a stale response.
+        if (mode === "scout") {
+          const finalScoutAdmission = this.scoutAdmissionStatus(submission, trigger);
+          if (finalScoutAdmission !== "accepted") {
+            if (idleReservation) this.releaseIdleGrokSubmission(idempotencyKey);
+            this.state.recordGrokRejection("rejected");
+            this.metrics.grokSignals.inc({ agent: submission.agentId, status: finalScoutAdmission });
+            return { status: finalScoutAdmission };
+          }
+        } else if (mode === "alpha") {
+          const finalAlphaAdmission = this.alphaAdmissionStatus(submission, trigger);
+          if (finalAlphaAdmission !== "accepted") {
+            if (idleReservation) this.releaseIdleGrokSubmission(idempotencyKey);
+            this.state.recordGrokRejection("rejected");
+            this.metrics.grokSignals.inc({ agent: submission.agentId, status: finalAlphaAdmission });
+            return { status: finalAlphaAdmission };
+          }
+        }
         if (researchRefresh) {
           // Scout refresh is a bounded in-memory research admission. It must
           // not create canonical report rows or an economic trigger.
@@ -2296,15 +2317,10 @@ export class EngineService {
         this.record(`${signal.agentId.toUpperCase()}_COMPLETE`, signal.traceId, trigger.marketId, { signalId: signal.signalId, clientId, confidence: submission.output.confidence, expiresAt: submission.output.expiresAt }, trigger.asset ?? null);
         if (mode === "scout") {
           const scoutAdmission = this.admitScoutResearch(submission, trigger);
-          if (!scoutAdmission.ok) {
-            this.state.recordGrokRejection("rejected");
-            this.metrics.grokSignals.inc({ agent: signal.agentId, status: scoutAdmission.status });
-            return { status: scoutAdmission.status };
-          }
           // In the opt-in internal xAI runtime, a final required scout causes
           // the coordinator to wake Alpha once. Coordinator idempotency keeps
           // concurrent scout completions bounded.
-          if (this.env.GROK_ACTIVATION_PROVIDER === "xai") void this.requestActivation(trigger).catch(() => undefined);
+          if (scoutAdmission.ok && this.env.GROK_ACTIVATION_PROVIDER === "xai") void this.requestActivation(trigger).catch(() => undefined);
         } else if (mode === "alpha") {
           this.alphaSignalIds.set(trigger.id, signal.signalId);
           await this.evaluateAlphaDecision(trigger);
@@ -2336,14 +2352,14 @@ export class EngineService {
     }
   }
 
-  private async proveGrokSubmissionCanonicalFacts(submission: GrokSignalSubmission, clientId: string): Promise<void> {
+  private async proveGrokSubmissionCanonicalFacts(submission: GrokSignalSubmission, clientId: string): Promise<GrokSignalSubmission> {
     // A claim proves admission only, including across a crash before append.
     // Check every canonical fact required by this submission with bounded trace
     // pages (also works for old IDs). The proposal is linked to the accepted
     // signal by the same trace and aggregate identity.
-    const requiresStrategyProposal = submission.agentId === "strategy_supervisor"
-      && submission.output.proposedChange !== null;
     let acceptedEvent: JournalEvent | undefined;
+    let canonicalSubmission: GrokSignalSubmission | undefined;
+    let requiresStrategyProposal = false;
     const strategyProposalAggregateIds = new Set<string>();
     let after: Parameters<EventJournal["readTracePage"]>[1]["after"];
     do {
@@ -2355,7 +2371,13 @@ export class EngineService {
         if (!acceptedEvent && event.type === "GROK_SIGNAL_ACCEPTED"
           && event.traceId === submission.traceId
           && event.payload.clientId === clientId && event.payload.submissionId === submission.submissionId) {
-          acceptedEvent = event;
+          const candidate = this.canonicalGrokSubmission(event.payload);
+          if (candidate) {
+            acceptedEvent = event;
+            canonicalSubmission = candidate;
+            requiresStrategyProposal = candidate.agentId === "strategy_supervisor"
+              && candidate.output.proposedChange !== null;
+          }
         }
       }
       after = page.nextCursor ?? undefined;
@@ -2364,7 +2386,7 @@ export class EngineService {
     } while (after);
     this.assertResearchIntegrity();
     const proposalPersisted = acceptedEvent !== undefined && strategyProposalAggregateIds.has(acceptedEvent.aggregateId);
-    if (acceptedEvent === undefined || (requiresStrategyProposal && !proposalPersisted)) {
+    if (acceptedEvent === undefined || canonicalSubmission === undefined || (requiresStrategyProposal && !proposalPersisted)) {
       // This can also be a concurrent claim whose first caller is still
       // persisting one of its canonical facts. Reject the unproven duplicate
       // without poisoning that caller. An actual total persistence failure
@@ -2372,6 +2394,24 @@ export class EngineService {
       // cannot accept this claim.
       throw new Error("GROK_SUBMISSION_CANONICAL_FACT_MISSING");
     }
+    return canonicalSubmission;
+  }
+
+  /** Reconstruct the immutable submission body from its accepted canonical fact. */
+  private canonicalGrokSubmission(payload: Record<string, unknown>): GrokSignalSubmission | undefined {
+    const parsed = grokSignalSubmissionSchema.safeParse({
+      submissionId: payload.submissionId,
+      triggerId: payload.triggerId,
+      traceId: payload.traceId,
+      correlationId: payload.correlationId,
+      marketId: payload.marketId,
+      asset: payload.asset,
+      timestamp: payload.timestamp,
+      agentId: payload.agentId,
+      role: payload.role,
+      output: payload.output,
+    });
+    return parsed.success ? parsed.data : undefined;
   }
 
   private assertResearchIntegrity(): void {
