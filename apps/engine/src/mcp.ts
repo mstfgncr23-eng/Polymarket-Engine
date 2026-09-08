@@ -18,6 +18,7 @@ import { streamExperimentSummary, summaryFromDurableReport } from "./final-repor
 import { buildExperimentSummary, filterCurrentExperimentEvents } from "./report.js";
 import { KeyedResultFlight } from "./runtime-supervisor.js";
 import type { EngineStateStore } from "./state.js";
+import type { GrokSubmissionMode } from "./activation/role-runner.js";
 
 export interface McpConfig {
   bearerTokens: string;
@@ -29,12 +30,13 @@ export interface McpDependencies {
   state: EngineStateStore;
   journal: EventJournal;
   metrics: EngineMetrics;
-  submitSignal(signal: GrokSignalSubmission, clientId: string): Promise<Record<string, unknown>>;
+  submitSignal(signal: GrokSignalSubmission, clientId: string, mode?: GrokSubmissionMode): Promise<Record<string, unknown>>;
   persistReportInput(event: import("@pm/core").JournalEvent): Promise<void>;
   noteMcpRequest?(tool: string | null, triggerId?: string): void;
   heavyRead?<T>(work: () => Promise<T>): Promise<T>;
   isTokenSynchronized?(tokenId: string): boolean;
   isTriggerActionable?(triggerId: string): boolean;
+  getAlphaResearchContext?(triggerId: string): Record<string, unknown> | null;
 }
 
 export function mcpVisibleOrderbook(
@@ -77,6 +79,7 @@ export const ALLOWED_MCP_READ_TOOLS = [
   "get_recent_decisions",
   "get_system_health",
   "get_reference_context",
+  "get_alpha_research_context",
 ] as const;
 
 export const ALLOWED_MCP_WRITE_TOOLS = [
@@ -320,12 +323,15 @@ export function createGrokMcpServer(clientId: string, dependencies: McpDependenc
   server.registerTool("get_positions", {
     description: "Read paper positions. This tool cannot modify positions or place orders.",
     inputSchema: {}, annotations: readOnly,
-  }, async () => toolResult(dependencies.state.snapshot().positions));
+  }, async () => clientId === "risk_hedge_analyst"
+    ? toolResult(dependencies.state.snapshot().positions)
+    : errorResult("ROLE_TOOL_FORBIDDEN", "portfolio context is restricted to risk_hedge_analyst"));
 
   server.registerTool("get_portfolio", {
     description: "Read paper ledger, cash, PnL, and positions. This tool cannot modify the portfolio.",
     inputSchema: {}, annotations: readOnly,
   }, async () => {
+    if (clientId !== "risk_hedge_analyst") return errorResult("ROLE_TOOL_FORBIDDEN", "portfolio context is restricted to risk_hedge_analyst");
     const snapshot = dependencies.state.snapshot();
     return toolResult({ balance: snapshot.balance, positions: snapshot.positions, experiment: snapshot.engine });
   });
@@ -391,6 +397,15 @@ export function createGrokMcpServer(clientId: string, dependencies: McpDependenc
     inputSchema: { asset: z.string().min(1).max(32) }, annotations: readOnly,
   }, async ({ asset }) => toolResult(dependencies.state.getReferenceContext(asset)));
 
+  server.registerTool("get_alpha_research_context", {
+    description: "Read bounded, trigger-scoped synchronized scout research for Alpha synthesis. Alpha-only; no portfolio, wallet, secrets, stale evidence, or unrelated markets.",
+    inputSchema: { triggerId: z.string().min(1).max(160) }, annotations: readOnly,
+  }, async ({ triggerId }) => {
+    if (clientId !== "fair_probability_analyst") return errorResult("ROLE_TOOL_FORBIDDEN", "Alpha research context is restricted to fair_probability_analyst");
+    const context = dependencies.getAlphaResearchContext?.(triggerId);
+    return context ? toolResult(context) : errorResult("TRIGGER_CONTEXT_UNAVAILABLE", "trigger is unknown, stale, or not actionable");
+  });
+
   server.registerTool("get_recent_decisions", {
     description: "Read the recent persisted decision feed (triggers, consensus, risk, paper fills).",
     inputSchema: { limit: z.number().int().min(1).max(100).default(25) }, annotations: readOnly,
@@ -411,7 +426,14 @@ export function createGrokMcpServer(clientId: string, dependencies: McpDependenc
   const writeHandler = (tool: (typeof ALLOWED_MCP_WRITE_TOOLS)[number]) => async (raw: Record<string, unknown>) => {
     try {
       const submission = parseGrokWritePayload(tool, raw, clientId);
-      const result = await dependencies.submitSignal(submission, clientId);
+      const mode: GrokSubmissionMode = tool === "submit_analysis"
+        ? "alpha"
+        : tool === "submit_signal" && [
+          "market_microstructure_scanner", "crypto_market_scanner", "news_x_intelligence_scanner",
+        ].includes(submission.agentId)
+          ? "scout"
+          : tool === "submit_signal" ? "advisory" : "advisory";
+      const result = await dependencies.submitSignal(submission, clientId, mode);
       return toolResult(result);
     } catch (error) {
       dependencies.state.recordGrokRejection("rejected");

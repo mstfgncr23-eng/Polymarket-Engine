@@ -6,6 +6,7 @@ import { DECISION_EVENT_TYPES, HISTORY_DECISIONS_LIMIT, TRACE_PAGE_MAX, type Gro
 import type { EventJournal } from "@pm/db";
 import type { EngineMetrics } from "./metrics.js";
 import type { DashboardSnapshot, EngineStateStore } from "./state.js";
+import type { GrokSubmissionMode } from "./activation/role-runner.js";
 import { createMcpHttpHandler, type McpConfig } from "./mcp.js";
 
 import { FiniteSemaphore, RUNTIME_BOUNDS } from "./runtime-supervisor.js";
@@ -162,11 +163,12 @@ export async function createApiServer(input: {
   sse: SseHub;
   dashboardOrigin: string;
   mcp: McpConfig;
-  submitGrokSignal(signal: GrokSignalSubmission, clientId: string): Promise<Record<string, unknown>>;
+  submitGrokSignal(signal: GrokSignalSubmission, clientId: string, mode?: GrokSubmissionMode): Promise<Record<string, unknown>>;
   persistReportInput?(event: import("@pm/core").JournalEvent): Promise<void>;
   noteMcpRequest?(tool: string | null, triggerId?: string): void;
   isTokenSynchronized?(tokenId: string): boolean;
   isTriggerActionable?(triggerId: string): boolean;
+  getAlphaResearchContext?(triggerId: string): Record<string, unknown> | null;
   startExperiment?: () => Promise<Record<string, unknown>>;
   engineReadToken?: string;
   operatorToken?: string;
@@ -213,6 +215,7 @@ export async function createApiServer(input: {
     noteMcpRequest: input.noteMcpRequest,
     isTokenSynchronized: input.isTokenSynchronized,
     isTriggerActionable: input.isTriggerActionable,
+    getAlphaResearchContext: input.getAlphaResearchContext,
     heavyRead: (work) => heavyRead.run(work),
   });
   app.route({ method: ["GET", "POST", "DELETE"], url: "/mcp", handler: mcpHandler });

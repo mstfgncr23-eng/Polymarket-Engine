@@ -35,7 +35,7 @@ export interface GrokRoleContext {
   researchToolsAvailable: false;
 }
 
-export type GrokSubmissionMode = "mcp" | "scout" | "alpha" | "refresh";
+export type GrokSubmissionMode = "mcp" | "scout" | "alpha" | "advisory" | "refresh";
 
 export interface GrokRoleRunnerConfig {
   client: XaiInferenceClient;

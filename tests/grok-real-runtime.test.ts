@@ -630,6 +630,13 @@ describe("EngineService xAI product path", () => {
       expect(setup.calls.map((call) => call.role)).toEqual([
         "market_microstructure_scanner", "crypto_market_scanner", "market_microstructure_scanner",
       ]);
+      // The call counter is incremented when inference starts. Wait for the
+      // refresh admission to finish writing the fresh cache entry before
+      // opening the economic trigger window; otherwise a slow CI runner can
+      // classify the in-flight refresh as a post-trigger role call.
+      await waitForRuntime(() => setup.engine.hotResearchCacheForTest().some((entry) =>
+        entry.role === "market_microstructure_scanner"
+        && entry.generatedAt === new Date(setup.clock.get()).toISOString()));
       await new Promise((resolve) => setTimeout(resolve, 0));
 
       const tradeAt = Date.now();
