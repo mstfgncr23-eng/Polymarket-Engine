@@ -14,27 +14,13 @@ export interface Runtime {
 /**
  * OAuth operator approval uses one secret. Role authority is still derived from
  * the exact protected-resource URL and downscoped access token, never from the
- * approval secret itself.
- *
- * `GROK_MCP_OAUTH_BOOTSTRAP_TOKENS` is accepted only as a migration source so
- * an already-deployed Micro connector can move to the single-secret model
- * without generating another credential. New deployments should set only
- * `GROK_MCP_OAUTH_APPROVAL_SECRET`.
+ * approval secret itself. The old comma-separated role mapping is deliberately
+ * not consumed here; this keeps production approval wiring unambiguous.
  */
 export function resolveOAuthApprovalBootstrap(envInput: NodeJS.ProcessEnv, oauthEnabled: boolean): string {
   if (!oauthEnabled) return "";
 
-  let secret = (envInput.GROK_MCP_OAUTH_APPROVAL_SECRET ?? "").trim();
-  if (!secret) {
-    const legacy = (envInput.GROK_MCP_OAUTH_BOOTSTRAP_TOKENS ?? "").trim().replace(/^['"]|['"]$/g, "");
-    const prefix = "market_microstructure_scanner:";
-    const micro = legacy
-      .split(",")
-      .map((entry) => entry.trim())
-      .find((entry) => entry.startsWith(prefix));
-    secret = micro?.slice(prefix.length).trim() ?? "";
-  }
-
+  const secret = (envInput.GROK_MCP_OAUTH_APPROVAL_SECRET ?? "").trim();
   if (!secret) throw new Error("GROK_MCP_OAUTH_APPROVAL_SECRET_REQUIRED");
   if (secret.length < 32) throw new Error("GROK_MCP_OAUTH_APPROVAL_SECRET_TOO_SHORT");
   if (secret.includes(",")) throw new Error("GROK_MCP_OAUTH_APPROVAL_SECRET_INVALID");
