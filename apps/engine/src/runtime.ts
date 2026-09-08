@@ -38,7 +38,10 @@ export async function startRuntime(envInput: NodeJS.ProcessEnv = process.env): P
     getAlphaResearchContext: (triggerId) => engine.getAlphaResearchContextForMcp(triggerId),
     oauthObserve: (event) => logger.info({
       oauthEvent: event.event, role: event.role ?? null, endpoint: event.endpoint ?? null,
-      status: event.status ?? null, clientFingerprint: event.clientFingerprint ?? null,
+      status: event.status ?? null, reason: event.reason ?? null, clientFingerprint: event.clientFingerprint ?? null,
+      metadataFields: event.metadataFields ?? null, requestedGrantTypes: event.requestedGrantTypes ?? null,
+      tokenEndpointAuthMethod: event.tokenEndpointAuthMethod ?? null, redirectUris: event.redirectUris ?? null,
+      requestedScopes: event.requestedScopes ?? null,
     }, "mcp oauth event"),
     startExperiment: () => engine.beginExperiment(),
     engineReadToken: env.ENGINE_READ_TOKEN,

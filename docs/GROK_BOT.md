@@ -94,7 +94,10 @@ authorization-code + PKCE S256, exact redirect URI matching, RFC 8707
 tokens, and role-specific operator approval. Bootstrap secrets use the
 separate `GROK_MCP_OAUTH_BOOTSTRAP_TOKENS` setting and are never logged or
 journaled. Only `mcp:<role>` is accepted for that role resource; the existing
-MCP tool ACL and authenticated-role identity checks still apply.
+MCP tool ACL and authenticated-role identity checks still apply. Registration
+accepts clients that advertise `refresh_token` alongside `authorization_code`
+for connector compatibility, but the effective registration remains
+`authorization_code` only because refresh-token issuance is not implemented.
 
 The OAuth state store is intentionally bounded and process-local in this
 compatibility release. Public DCR registrations have a hard cap of 256 and a

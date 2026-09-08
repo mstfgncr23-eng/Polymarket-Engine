@@ -30,11 +30,17 @@ export interface McpOAuthConfig {
 }
 
 export interface OAuthSafeEvent {
-  event: "protected_resource_401" | "resource_metadata_requested" | "authorization_metadata_requested" | "dynamic_client_registered" | "authorization_started" | "authorization_approved" | "token_issued" | "mcp_authenticated";
+  event: "protected_resource_401" | "resource_metadata_requested" | "authorization_metadata_requested" | "dynamic_client_registered" | "dynamic_client_registration_rejected" | "authorization_started" | "authorization_approved" | "token_issued" | "mcp_authenticated";
   role?: ExternalAgentRoleId;
   endpoint?: string;
   status?: string;
+  reason?: string;
   clientFingerprint?: string | null;
+  metadataFields?: string[];
+  requestedGrantTypes?: string[];
+  tokenEndpointAuthMethod?: string | null;
+  redirectUris?: Array<{ scheme: string; hostname: string }>;
+  requestedScopes?: string[];
   timestamp: string;
 }
 
@@ -160,24 +166,31 @@ export class McpOAuthService {
 
   register(input: unknown, context: OAuthRequestContext): { status: number; body: Record<string, unknown> } {
     this.prune();
-    if (!this.config.enabled) return { status: 404, body: { error: "NOT_FOUND" } };
+    if (!this.config.enabled) return this.rejectRegistration(input, context, 404, "NOT_FOUND", "oauth_disabled");
     if (!this.consumeRate(this.registrationRate, context.remoteAddress ?? "unknown", MAX_REGISTRATIONS_PER_WINDOW)) {
-      return { status: 429, body: { error: "temporarily_unavailable" } };
+      return this.rejectRegistration(input, context, 429, "temporarily_unavailable", "rate_limited");
     }
-    if (!input || typeof input !== "object" || Array.isArray(input)) return { status: 400, body: { error: "invalid_client_metadata" } };
+    if (!input || typeof input !== "object" || Array.isArray(input)) return this.rejectRegistration(input, context, 400, "invalid_client_metadata", "invalid_client_metadata");
     const raw = input as Record<string, unknown>;
     const redirects = raw.redirect_uris;
     if (!Array.isArray(redirects) || redirects.length === 0 || redirects.length > 8 || !redirects.every((item) => typeof item === "string" && validRedirectUri(item))) {
-      return { status: 400, body: { error: "invalid_redirect_uri" } };
+      return this.rejectRegistration(input, context, 400, "invalid_redirect_uri", "invalid_redirect_uri");
     }
     const authMethod = raw.token_endpoint_auth_method;
-    if (authMethod !== undefined && authMethod !== "none") return { status: 400, body: { error: "invalid_client_metadata" } };
+    if (authMethod !== undefined && authMethod !== "none") return this.rejectRegistration(input, context, 400, "invalid_client_metadata", "unsupported_token_endpoint_auth_method");
     const grants = raw.grant_types;
-    if (grants !== undefined && (!Array.isArray(grants) || grants.some((item) => item !== "authorization_code"))) return { status: 400, body: { error: "invalid_client_metadata" } };
+    if (grants !== undefined) {
+      if (!Array.isArray(grants) || grants.length === 0 || grants.some((item) => typeof item !== "string")) {
+        return this.rejectRegistration(input, context, 400, "invalid_client_metadata", "invalid_grant_types");
+      }
+      if (!grants.includes("authorization_code") || grants.some((item) => item !== "authorization_code" && item !== "refresh_token")) {
+        return this.rejectRegistration(input, context, 400, "invalid_client_metadata", "unsupported_grant_type");
+      }
+    }
     const responseTypes = raw.response_types;
-    if (responseTypes !== undefined && (!Array.isArray(responseTypes) || responseTypes.some((item) => item !== "code"))) return { status: 400, body: { error: "invalid_client_metadata" } };
+    if (responseTypes !== undefined && (!Array.isArray(responseTypes) || responseTypes.some((item) => item !== "code"))) return this.rejectRegistration(input, context, 400, "invalid_client_metadata", "unsupported_response_type");
     const requestedScope = typeof raw.scope === "string" ? raw.scope.trim() : "";
-    if (requestedScope && !scopeListValid(requestedScope)) return { status: 400, body: { error: "invalid_scope" } };
+    if (requestedScope && !scopeListValid(requestedScope)) return this.rejectRegistration(input, context, 400, "invalid_scope", "invalid_scope");
     const now = this.now();
     const clientId = randomToken(18);
     const client: OAuthClient = {
@@ -189,7 +202,7 @@ export class McpOAuthService {
       lastUsedAt: now,
       expiresAt: now + CLIENT_REGISTRATION_TTL_MS,
     };
-    if (!this.ensureClientCapacity(now)) return { status: 503, body: { error: "temporarily_unavailable" } };
+    if (!this.ensureClientCapacity(now)) return this.rejectRegistration(input, context, 503, "temporarily_unavailable", "client_capacity_exhausted");
     this.clients.set(clientId, client);
     this.observeEvent({ event: "dynamic_client_registered", endpoint: context.endpoint, status: "ok", clientFingerprint: fingerprint(clientId), timestamp: new Date(now).toISOString() });
     return {
@@ -382,6 +395,19 @@ export class McpOAuthService {
   }
 
   private observeEvent(event: OAuthSafeEvent): void { this.observe?.(event); }
+
+  private rejectRegistration(input: unknown, context: OAuthRequestContext, status: 400 | 404 | 429 | 503, error: string, reason: string): { status: number; body: Record<string, unknown> } {
+    const diagnostic = registrationDiagnostic(input);
+    this.observeEvent({
+      event: "dynamic_client_registration_rejected",
+      endpoint: context.endpoint,
+      status: "rejected",
+      reason,
+      ...diagnostic,
+      timestamp: new Date(this.now()).toISOString(),
+    });
+    return { status, body: { error } };
+  }
 }
 
 function sha256(value: string): Buffer { return createHash("sha256").update(value).digest(); }
@@ -391,6 +417,38 @@ function randomToken(bytes: number): string { return randomBytes(bytes).toString
 function fingerprint(value: string): string { return digestKey(value).slice(0, 12); }
 function safeEqual(a: Buffer, b: Buffer): boolean { return a.length === b.length && timingSafeEqual(a, b); }
 function scopeListValid(value: string): boolean { return value.split(/\s+/).filter(Boolean).every((item) => MCP_OAUTH_SCOPES.includes(item)); }
+function registrationDiagnostic(input: unknown): Pick<OAuthSafeEvent, "metadataFields" | "requestedGrantTypes" | "tokenEndpointAuthMethod" | "redirectUris" | "requestedScopes"> {
+  const empty: Pick<OAuthSafeEvent, "metadataFields" | "requestedGrantTypes" | "tokenEndpointAuthMethod" | "redirectUris" | "requestedScopes"> = {
+    metadataFields: [], requestedGrantTypes: [], tokenEndpointAuthMethod: null, redirectUris: [], requestedScopes: [],
+  };
+  if (!input || typeof input !== "object" || Array.isArray(input)) return empty;
+  const raw = input as Record<string, unknown>;
+  const metadataFields = Object.keys(raw).slice(0, 24).map((field) => field.slice(0, 64));
+  const grantValue = raw.grant_types;
+  const requestedGrantTypes = Array.isArray(grantValue)
+    ? grantValue.slice(0, 8).map((item) => typeof item === "string" ? item.slice(0, 80) : `<${typeof item}>`)
+    : grantValue === undefined
+      ? []
+      : [typeof grantValue === "string" ? grantValue.slice(0, 80) : `<${typeof grantValue}>`];
+  const tokenEndpointAuthMethod = raw.token_endpoint_auth_method === undefined
+    ? null
+    : typeof raw.token_endpoint_auth_method === "string"
+      ? raw.token_endpoint_auth_method.slice(0, 80)
+      : `<${typeof raw.token_endpoint_auth_method}>`;
+  const redirectUris = Array.isArray(raw.redirect_uris)
+    ? raw.redirect_uris.slice(0, 8).flatMap((item) => {
+      if (typeof item !== "string") return [];
+      try {
+        const url = new URL(item);
+        return [{ scheme: url.protocol.replace(/:$/, "").slice(0, 16), hostname: url.hostname.slice(0, 255) }];
+      } catch { return []; }
+    })
+    : [];
+  const requestedScopes = typeof raw.scope === "string"
+    ? raw.scope.trim().split(/\s+/).filter(Boolean).slice(0, 16).map((scope) => scope.slice(0, 80))
+    : [];
+  return { metadataFields, requestedGrantTypes, tokenEndpointAuthMethod, redirectUris, requestedScopes };
+}
 function validRedirectUri(value: string): boolean {
   try {
     const url = new URL(value);
