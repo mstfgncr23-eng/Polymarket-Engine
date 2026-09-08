@@ -179,7 +179,7 @@ type RetainedBookkeepingCounts = {
 };
 type RetainedCleanupCycle = { atMs: number; before: RetainedBookkeepingCounts; after: RetainedBookkeepingCounts };
 type GrokSubmissionResult = {
-  status: "accepted" | "duplicate" | "stale" | "unknown_trigger" | "trace_mismatch" | "market_mismatch" | "asset_mismatch" | "replay_rejected" | "malformed" | "identity_mismatch" | "source_sealed";
+  status: "accepted" | "duplicate" | "stale" | "unsupported_evidence" | "unknown_trigger" | "trace_mismatch" | "market_mismatch" | "asset_mismatch" | "replay_rejected" | "malformed" | "identity_mismatch" | "source_sealed";
   signalId?: string;
 };
 
@@ -507,6 +507,51 @@ export class EngineService {
   activationFootprint() { return this.activation.footprint(); }
   hotResearchCacheForTest() { return this.hotResearchCache.snapshot(); }
   hotResearchFootprintForTest() { return this.hotResearchCache.footprint(); }
+  /** Bounded Alpha-only MCP context. Fresh cache entries are derived from the
+   * current actionable trigger and trusted synchronized engine state. */
+  getAlphaResearchContextForMcp(triggerId: string): Record<string, unknown> | null {
+    const trigger = this.activeTriggers.get(triggerId);
+    if (!trigger || !this.isTriggerActionable(triggerId)) return null;
+    const marketId = trigger.marketId ?? null;
+    const synchronized = marketId ? this.isMarketSynchronized(marketId) : false;
+    const requiredScoutRoles = rolesForTriggerKind(trigger.kind, trigger.severity).filter(isScoutRole);
+    const research = marketId && synchronized
+      ? this.hotResearchCache.freshFor(marketId, trigger.asset ?? null, requiredScoutRoles)
+      : [];
+    const snapshots = marketId && synchronized
+      ? [...this.state.marketSnapshots.values()]
+        .filter((item) => item.marketId === marketId)
+        .slice(-2)
+        .map((item) => boundedMarketSnapshot(item))
+      : [];
+    const reference = trigger.asset
+      ? boundedReference(this.state.getReferenceContext(trigger.asset, this.nowFn().getTime(), this.riskLimits.staleFeedTimeoutMs))
+      : null;
+    const missingScoutRoles = requiredScoutRoles.filter((role) => !research.some((entry) => entry.role === role));
+    return {
+      trigger: boundedTrigger(trigger),
+      market: { marketId, asset: trigger.asset ?? null, synchronized, snapshots, features: deterministicMarketFeatures(snapshots) },
+      reference,
+      research: research.slice(0, 3),
+      requiredScoutRoles,
+      missingScoutRoles,
+      synchronized,
+      actionable: true,
+      readyForAlpha: synchronized && missingScoutRoles.length === 0,
+      experiment: this.experiment ? {
+        id: this.experiment.id, status: this.experiment.status, startedAt: this.experiment.startedAt,
+        completedAt: this.experiment.completedAt,
+      } : null,
+      provenance: {
+        triggerId: trigger.id,
+        traceId: trigger.traceId,
+        marketId: trigger.marketId ?? null,
+        sourceEventIds: trigger.sourceEventIds.slice(0, 32),
+        evidenceIds: (trigger.evidenceIds ?? []).slice(0, 32),
+        scoutKeys: research.map((entry) => entry.key),
+      },
+    };
+  }
   grokRuntimeMetricsForTest() { return this.activation.runtimeMetricsSnapshot(); }
   restingOrderCount() { return this.restingOrders.size; }
   reservedCash() { return this.ledger.snapshot().reservedCash; }
@@ -1991,36 +2036,81 @@ export class EngineService {
 
   private async onGrokRoleResult(request: GrokActivationRequest, outcome: RoleRunOutcome): Promise<void> {
     if (!isScoutRole(outcome.role) || !request.marketId) return;
-    if (!this.isMarketSynchronized(request.marketId)) return;
     if (!outcome.submissionResult || !["accepted", "duplicate"].includes(outcome.submissionResult.status)) return;
-    const context = outcome.context;
-    const trigger = context.trigger;
-    const market = context.market;
-    const output = outcome.submission.output as Record<string, unknown>;
+    const trigger = this.activeTriggers.get(request.triggerId) ?? this.scoutRefreshContexts.get(request.triggerId);
+    if (!trigger) return;
+    const admission = this.admitScoutResearch(outcome.submission, trigger, request.researchRefresh === true);
+    if (!admission.ok) return;
+  }
+
+  private scoutAdmissionStatus(submission: GrokSignalSubmission, trigger: TriggerEvent, allowNonActionable = false): "accepted" | "stale" | "unsupported_evidence" {
+    if (!trigger.marketId || !rolesForTriggerKind(trigger.kind, trigger.severity).filter(isScoutRole).includes(submission.agentId)) return "stale";
+    if (!this.entryQualified.has(trigger.marketId)) return "stale";
+    if (!this.isMarketSynchronized(trigger.marketId)) return "stale";
+    if (!allowNonActionable && !this.isTriggerActionable(trigger.id)) return "stale";
+    const expiry = new Date(submission.output.expiresAt).getTime();
+    if (!Number.isFinite(expiry) || expiry <= this.nowFn().getTime() || expiry > new Date(trigger.expiresAt).getTime()) return "stale";
+    const suppliedEvidence = new Set<string>([
+      ...(trigger.evidenceIds ?? []).map(String),
+      ...trigger.sourceEventIds.map(String),
+      ...[...this.state.marketSnapshots.values()]
+        .filter((item) => item.marketId === trigger.marketId && this.isTokenSynchronized(item.tokenId))
+        .flatMap((item) => [item.eventId, item.traceId].map(String)),
+    ]);
+    const evidenceIds = Array.isArray(submission.output.evidenceIds) ? submission.output.evidenceIds.map(String) : [];
+    return evidenceIds.some((id) => !suppliedEvidence.has(id)) ? "unsupported_evidence" : "accepted";
+  }
+
+  private alphaAdmissionStatus(submission: GrokSignalSubmission, trigger: TriggerEvent): "accepted" | "stale" | "unsupported_evidence" {
+    if (!trigger.marketId || !this.entryQualified.has(trigger.marketId) || !this.isMarketSynchronized(trigger.marketId) || !this.isTriggerActionable(trigger.id)) return "stale";
+    const suppliedEvidence = new Set<string>([
+      ...(trigger.evidenceIds ?? []).map(String),
+      ...trigger.sourceEventIds.map(String),
+      ...[...this.state.marketSnapshots.values()]
+        .filter((item) => item.marketId === trigger.marketId && this.isTokenSynchronized(item.tokenId))
+        .flatMap((item) => [item.eventId, item.traceId].map(String)),
+    ]);
+    const requiredScoutRoles = rolesForTriggerKind(trigger.kind, trigger.severity).filter(isScoutRole);
+    const freshScout = this.hotResearchCache.freshFor(trigger.marketId, trigger.asset ?? null, requiredScoutRoles);
+    if (freshScout.length !== requiredScoutRoles.length) return "stale";
+    for (const entry of freshScout) {
+      for (const id of [...entry.evidenceIds, ...entry.sourceEventIds, ...entry.featureIds, ...entry.derivedFrom]) suppliedEvidence.add(id);
+    }
+    const evidenceIds = Array.isArray(submission.output.evidenceIds) ? submission.output.evidenceIds.map(String) : [];
+    return evidenceIds.some((id) => !suppliedEvidence.has(id)) ? "unsupported_evidence" : "accepted";
+  }
+
+  private admitScoutResearch(submission: GrokSignalSubmission, trigger: TriggerEvent, allowNonActionable = false): { ok: true } | { ok: false; status: "stale" | "unsupported_evidence" } {
+    const status = this.scoutAdmissionStatus(submission, trigger, allowNonActionable);
+    if (status !== "accepted") return { ok: false, status };
+    const output = submission.output as Record<string, unknown>;
     const evidenceIds = Array.isArray(output.evidenceIds) ? output.evidenceIds.map(String) : [];
-    const sourceEventIds = Array.isArray(trigger.sourceEventIds) ? trigger.sourceEventIds.map(String) : [];
-    const featureIds = [
-      `feature:${String(trigger.kind)}:${request.marketId}`,
-      ...evidenceIds.map((id) => `evidence:${id}`),
-      ...sourceEventIds.map((id) => `source:${id}`),
-    ];
-    const reference = this.state.getReferenceContext(request.asset ?? String(trigger.asset ?? ""), this.nowFn().getTime(), this.riskLimits.staleFeedTimeoutMs);
+    const sourceEventIds = trigger.sourceEventIds.map(String);
+    const snapshots = [...this.state.marketSnapshots.values()].filter((item) => item.marketId === trigger.marketId && this.isTokenSynchronized(item.tokenId));
+    const reference = trigger.asset
+      ? this.state.getReferenceContext(trigger.asset, this.nowFn().getTime(), this.riskLimits.staleFeedTimeoutMs)
+      : null;
     this.hotResearchCache.put({
-      role: outcome.role,
-      marketId: request.marketId,
-      asset: request.asset ?? (typeof trigger.asset === "string" ? trigger.asset : null),
-      triggerId: request.triggerId,
-      traceId: request.traceId,
-      generatedAt: outcome.submission.timestamp,
+      role: submission.agentId,
+      marketId: trigger.marketId!,
+      asset: trigger.asset ?? submission.asset ?? null,
+      triggerId: trigger.id,
+      traceId: trigger.traceId,
+      generatedAt: this.nowFn().toISOString(),
       expiresAt: String(output.expiresAt),
       evidenceIds,
       sourceEventIds,
-      featureIds,
+      featureIds: [
+        `feature:${String(trigger.kind)}:${trigger.marketId}`,
+        ...evidenceIds.map((id) => `evidence:${id}`),
+        ...sourceEventIds.map((id) => `source:${id}`),
+      ],
       derivedFrom: [...sourceEventIds, ...evidenceIds],
-      marketSequence: market ? Math.max(0, ...market.snapshots.map((item) => Number(item.sequence ?? 0))) : null,
-      referenceTimestamp: reference.lastMessageAt ?? null,
+      marketSequence: snapshots.length > 0 ? Math.max(...snapshots.map((item) => Number(item.sequence ?? 0))) : null,
+      referenceTimestamp: reference?.lastMessageAt ?? null,
       output,
     });
+    return { ok: true };
   }
 
   /** The only ingress for external Grok research; it cannot create orders directly. */
@@ -2069,6 +2159,25 @@ export class EngineService {
       if (!researchRefresh && !this.isTriggerActionable(trigger.id)) {
         this.state.recordGrokRejection("rejected"); this.metrics.grokSignals.inc({ agent: submission.agentId, status: "stale" }); return { status: "stale" };
       }
+      // Scout MCP ingress is admitted only from the trusted synchronized
+      // trigger/cache domain. Reject before claiming or journaling anything
+      // when the role, evidence, feed, or freshness contract is not met.
+      if (mode === "scout") {
+        const scoutAdmission = this.scoutAdmissionStatus(submission, trigger);
+        if (scoutAdmission !== "accepted") {
+          this.state.recordGrokRejection("rejected");
+          this.metrics.grokSignals.inc({ agent: submission.agentId, status: scoutAdmission });
+          return { status: scoutAdmission };
+        }
+      }
+      if (mode === "alpha") {
+        const alphaAdmission = this.alphaAdmissionStatus(submission, trigger);
+        if (alphaAdmission !== "accepted") {
+          this.state.recordGrokRejection("rejected");
+          this.metrics.grokSignals.inc({ agent: submission.agentId, status: alphaAdmission });
+          return { status: alphaAdmission };
+        }
+      }
       if (this.researchIngressStale(ingress.generation)) return rejectSealed();
       if (this.grokClaimHold) await this.grokClaimHold;
       if (this.researchIngressStale(ingress.generation)) return rejectSealed();
@@ -2108,6 +2217,10 @@ export class EngineService {
         this.assertResearchIntegrity();
         if (!claimed) {
           await this.proveGrokSubmissionCanonicalFacts(submission, clientId);
+          if (mode === "scout") {
+            const rehydrated = this.admitScoutResearch(submission, trigger);
+            if (rehydrated.ok) void this.requestActivation(trigger).catch(() => undefined);
+          }
           return duplicate();
         }
       }
@@ -2125,6 +2238,10 @@ export class EngineService {
           this.assertResearchIntegrity();
           if (!promoted) {
             await this.proveGrokSubmissionCanonicalFacts(submission, clientId);
+            if (mode === "scout") {
+              const rehydrated = this.admitScoutResearch(submission, trigger);
+              if (rehydrated.ok) void this.requestActivation(trigger).catch(() => undefined);
+            }
             return duplicate();
           }
           promotedToActive = true;
@@ -2177,12 +2294,24 @@ export class EngineService {
         this.state.setActivationLatency(this.activation.snapshot());
         this.metrics.grokSignals.inc({ agent: signal.agentId, status: "accepted" });
         this.record(`${signal.agentId.toUpperCase()}_COMPLETE`, signal.traceId, trigger.marketId, { signalId: signal.signalId, clientId, confidence: submission.output.confidence, expiresAt: submission.output.expiresAt }, trigger.asset ?? null);
-        if (mode === "alpha") {
+        if (mode === "scout") {
+          const scoutAdmission = this.admitScoutResearch(submission, trigger);
+          if (!scoutAdmission.ok) {
+            this.state.recordGrokRejection("rejected");
+            this.metrics.grokSignals.inc({ agent: signal.agentId, status: scoutAdmission.status });
+            return { status: scoutAdmission.status };
+          }
+          // In the opt-in internal xAI runtime, a final required scout causes
+          // the coordinator to wake Alpha once. Coordinator idempotency keeps
+          // concurrent scout completions bounded.
+          if (this.env.GROK_ACTIVATION_PROVIDER === "xai") void this.requestActivation(trigger).catch(() => undefined);
+        } else if (mode === "alpha") {
           this.alphaSignalIds.set(trigger.id, signal.signalId);
           await this.evaluateAlphaDecision(trigger);
-        } else if (mode !== "scout") {
+        } else if (mode === "mcp" && !["risk_hedge_analyst", "strategy_supervisor"].includes(submission.agentId)) {
           // MCP callers retain the established peer-consensus path. Runtime
-          // scouts are audit/research inputs and never create a trade.
+          // role-bound paths use scout/alpha/advisory modes; this compatibility
+          // branch is retained only for direct legacy callers.
           await this.evaluateExternalConsensus(trigger);
         }
         if (idleReservation) this.completeIdleGrokSubmission(idempotencyKey, now.getTime());

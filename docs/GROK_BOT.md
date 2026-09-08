@@ -58,7 +58,8 @@ Official Grok Bot attachment of connectors/MCP:
 3. On Cursor Teams, Grok Bot follows existing Cursor plugin and MCP policy (allowlist/denylist, whether members can add their own servers). MCP authentication is shared across Cursor + Grok Bot. ([Teams and enterprises](https://docs.x.ai/grok-bot/teams-and-enterprises))
 4. Each of the six role Bots must authenticate with **its own** bearer token whose `clientId` is that role ID. Send `Authorization: Bearer <token>` (token half only). Do not share one token.
 5. The engine lists only these tools (there is **no** `place_order` / wallet tool):
-   - Read: `get_markets`, `get_market_snapshot`, `get_orderbook`, `get_recent_triggers`, `get_positions`, `get_portfolio`, `get_strategy_metrics`, `get_recent_decisions`, `get_system_health`, `get_reference_context`
+   - Read: `get_markets`, `get_market_snapshot`, `get_orderbook`, `get_recent_triggers`, `get_positions`, `get_portfolio`, `get_strategy_metrics`, `get_recent_decisions`, `get_system_health`, `get_reference_context`, `get_alpha_research_context`
+     (`get_positions` and `get_portfolio` return data only to `risk_hedge_analyst`; `get_alpha_research_context` returns data only to `fair_probability_analyst`).
    - Write: `submit_signal`, `submit_analysis`, `recommend_hedge`, `recommend_veto`
 6. Create six Grok Bots with the stable role IDs below. Each Bot must send `agentId` and `role` equal to its authenticated `clientId`, plus `timestamp`, `marketId`, `confidence`, `evidence`/`evidenceIds`, `expiresAt`, `reasonCodes`, and `traceId`/`correlationId`.
 7. Restrict writes per role using the allow-list above (engine-enforced even if the UI cannot). Scanners + supervisor: `submit_signal`. Fair probability: `submit_analysis`. Risk & hedge: `recommend_hedge` + `recommend_veto`.
@@ -83,7 +84,29 @@ Paste the matching instructions from `packages/core/src/agents.ts`. Every bot mu
 
 ## Runtime behavior
 
-Triggers are always persisted. The engine never waits for Grok. Fresh, schema-valid signals from the **authenticated** role are assembled into consensus when minimum role/evidence requirements are met. Stale, duplicate, malformed, unauthorized, impersonated, forbidden-tool, and trade-tool calls are rejected and audited. If Grok Bots are down, monitoring continues and the dashboard shows idle/stale — it does not fake activity. Paper only: `TRADING_MODE=paper`; the live adapter always throws `LIVE_TRADING_DISABLED`.
+Triggers are always persisted. The engine never waits for Grok. Role-bound MCP
+scouts (`market_microstructure_scanner`, `crypto_market_scanner`, and
+`news_x_intelligence_scanner`) are admitted into a bounded, process-local
+`HotResearchCache` only when the trigger family, synchronized current book,
+freshness, and trusted evidence/provenance checks pass. Scout submissions never
+call peer consensus and never create an order. Required scouts are selected by
+`rolesForTriggerKind`; ordinary book changes do not wake the news role.
+
+The Alpha role reads only the bounded trigger-scoped
+`get_alpha_research_context` view and submits through `evaluateAlphaDecision`.
+Alpha requires all fresh trigger-specific scout entries, a synchronized current
+book, matching trace/market/asset, supported evidence, and deterministic risk
+checks before paper execution. Risk remains advisory, and the supervisor is a
+background diagnostic path whose changes remain `PROPOSED`. In the opt-in xAI
+runtime, the coordinator wakes Alpha once after the final required scout; MCP
+itself remains client-initiated and cannot wake a Grok Bot. Legacy consensus
+helpers are retained only for direct compatibility callers and are not used by
+the role-bound MCP path.
+
+Stale, duplicate, malformed, unauthorized, impersonated, forbidden-tool, and
+trade-tool calls are rejected and audited. If Grok Bots are down, monitoring
+continues and the dashboard shows idle/stale — it does not fake activity. Paper
+only: `TRADING_MODE=paper`; the live adapter always throws `LIVE_TRADING_DISABLED`.
 
 ## Issue #2 — Event-driven activation (re-verified 2026-09-01)
 
