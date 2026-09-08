@@ -267,16 +267,6 @@ export async function createApiServer(input: {
     input.oauthObserve?.({ event: "authorization_metadata_requested", endpoint: request.url.split("?", 1)[0], status: "ok", timestamp: new Date().toISOString() });
     return reply.header("Cache-Control", "no-store").send(oauth.authorizationServerMetadata(requestOrigin(request)));
   });
-  app.get("/.well-known/openid-configuration", async (request, reply) => {
-    if (!oauth) return reply.code(404).send({ error: "NOT_FOUND" });
-    input.oauthObserve?.({ event: "authorization_metadata_requested", endpoint: request.url.split("?", 1)[0], status: "ok", timestamp: new Date().toISOString() });
-    return reply.header("Cache-Control", "no-store").send(oauth.authorizationServerMetadata(requestOrigin(request)));
-  });
-  app.get("/oauth/.well-known/openid-configuration", async (request, reply) => {
-    if (!oauth) return reply.code(404).send({ error: "NOT_FOUND" });
-    input.oauthObserve?.({ event: "authorization_metadata_requested", endpoint: request.url.split("?", 1)[0], status: "ok", timestamp: new Date().toISOString() });
-    return reply.header("Cache-Control", "no-store").send(oauth.authorizationServerMetadata(requestOrigin(request)));
-  });
   app.post("/oauth/register", async (request, reply) => {
     if (!oauth) return reply.code(404).send({ error: "NOT_FOUND" });
     return oauthJson(reply, oauth.register(request.body, oauthContext(request)));

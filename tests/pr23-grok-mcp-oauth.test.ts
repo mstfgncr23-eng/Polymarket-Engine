@@ -71,6 +71,51 @@ describe("PR23 OAuth 2.1 compatibility for role-scoped MCP", () => {
     expect(service.footprint().codes).toBe(0);
   });
 
+  it("reclaims inactive DCR clients at the hard cap and keeps the footprint bounded", () => {
+    let clock = 1_700_000_000_000;
+    const service = new McpOAuthService({ enabled: true, issuer: "https://mcp.example", bootstrapTokens: "", accessTokenTtlSeconds: 3_600, authorizationCodeTtlSeconds: 300 }, () => clock);
+    const context = (index: number) => ({ origin: "https://mcp.example", remoteAddress: `registration-${index}` });
+    for (let index = 0; index < 256; index += 1) {
+      expect(service.register({ redirect_uris: ["http://127.0.0.1:9876/callback"], client_name: `client-${index}` }, context(index)).status).toBe(201);
+    }
+    expect(service.footprint().clients).toBe(256);
+    expect(service.register({ redirect_uris: ["http://127.0.0.1:9876/callback"], client_name: "after-cap" }, context(256)).status).toBe(201);
+    expect(service.footprint().clients).toBe(256);
+
+    clock += 24 * 60 * 60 * 1_000 + 1;
+    expect(service.footprint().clients).toBe(0);
+    for (let index = 0; index < 600; index += 1) {
+      expect(service.register({ redirect_uris: ["http://127.0.0.1:9876/callback"] }, context(1_000 + index)).status).toBe(201);
+    }
+    const footprint = service.footprint();
+    expect(footprint.clients).toBeLessThanOrEqual(256);
+    expect(footprint.codes).toBeLessThanOrEqual(512);
+    expect(footprint.tokens).toBeLessThanOrEqual(1_024);
+    expect(footprint.rateKeys).toBeLessThanOrEqual(512);
+  });
+
+  it("does not evict clients that own an unexpired code or access token", () => {
+    let clock = 1_700_000_000_000;
+    const service = new McpOAuthService({ enabled: true, issuer: "https://mcp.example", bootstrapTokens: `${ROLE}:bootstrap`, accessTokenTtlSeconds: 3_600, authorizationCodeTtlSeconds: 300 }, () => clock);
+    const redirectUri = "http://127.0.0.1:9876/callback";
+    const registered: string[] = [];
+    for (let index = 0; index < 256; index += 1) {
+      const result = service.register({ redirect_uris: [redirectUri] }, { origin: "https://mcp.example", remoteAddress: `active-${index}` });
+      registered.push(String((result.body as { client_id: string }).client_id));
+    }
+    const pkce = verifier();
+    const params = { client_id: registered[0]!, redirect_uri: redirectUri, response_type: "code", scope: ROLE_SCOPE, code_challenge: pkce.challenge, code_challenge_method: "S256", resource: `https://mcp.example/mcp/${ROLE}` };
+    const approval = service.approve({ ...params, bootstrap_secret: "bootstrap" }, { origin: "https://mcp.example", endpoint: "/oauth/authorize", remoteAddress: "active-0" }, ROLE);
+    const code = new URL(approval.headers?.location ?? "").searchParams.get("code");
+    expect(code).toBeTruthy();
+    expect(service.register({ redirect_uris: [redirectUri] }, { origin: "https://mcp.example", remoteAddress: "active-new-code" }).status).toBe(201);
+    const tokenResult = service.token({ grant_type: "authorization_code", client_id: registered[0]!, code: code!, redirect_uri: redirectUri, code_verifier: pkce.value, resource: params.resource }, { origin: "https://mcp.example", endpoint: "/oauth/token", remoteAddress: "active-0" });
+    expect(tokenResult.status).toBe(200);
+    const accessToken = String(tokenResult.body.access_token);
+    expect(service.register({ redirect_uris: [redirectUri] }, { origin: "https://mcp.example", remoteAddress: "active-new-token" }).status).toBe(201);
+    expect(service.authenticate(`Bearer ${accessToken}`, ROLE, { origin: "https://mcp.example", endpoint: `/mcp/${ROLE}` }).ok).toBe(true);
+  });
+
   it("publishes protected-resource and authorization-server discovery without authentication", async () => {
     const ctx = await createOAuthServer();
     try {
@@ -87,6 +132,8 @@ describe("PR23 OAuth 2.1 compatibility for role-scoped MCP", () => {
       const metadata = await jsonFetch(`${ctx.base}/.well-known/oauth-authorization-server`);
       expect(metadata.response.status).toBe(200);
       expect(metadata.body).toMatchObject({ issuer: ctx.base, authorization_endpoint: `${ctx.base}/oauth/authorize`, token_endpoint: `${ctx.base}/oauth/token`, registration_endpoint: `${ctx.base}/oauth/register`, code_challenge_methods_supported: ["S256"], token_endpoint_auth_methods_supported: ["none"] });
+      expect((await fetch(`${ctx.base}/.well-known/openid-configuration`)).status).toBe(404);
+      expect((await fetch(`${ctx.base}/oauth/.well-known/openid-configuration`)).status).toBe(404);
       expect(ctx.events.map((event) => event.event)).toEqual(expect.arrayContaining(["protected_resource_401", "resource_metadata_requested", "authorization_metadata_requested"]));
     } finally { await ctx.server.close(); }
   });
@@ -122,6 +169,27 @@ describe("PR23 OAuth 2.1 compatibility for role-scoped MCP", () => {
       expect(mcp.response.status).toBe(200);
       expect(mcp.text).toContain("get_markets");
       expect(ctx.events.map((event) => event.event)).toEqual(expect.arrayContaining(["dynamic_client_registered", "authorization_started", "authorization_approved", "token_issued", "mcp_authenticated"]));
+    } finally { await ctx.server.close(); }
+  });
+
+  it("shows only escaped registration identity on the operator approval page", async () => {
+    const ctx = await createOAuthServer();
+    try {
+      const redirectUri = "https://grok.com/oauth/callback";
+      const clientName = `<img src=x onerror="alert(1)">`;
+      const registration = await jsonFetch(`${ctx.base}/oauth/register`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ client_name: clientName, redirect_uris: [redirectUri] }) });
+      expect(registration.response.status).toBe(201);
+      const clientId = (registration.body as { client_id: string }).client_id;
+      const pkce = verifier();
+      const resource = `${ctx.base}/mcp/${ROLE}`;
+      const params = { client_id: clientId, redirect_uri: redirectUri, response_type: "code", scope: ROLE_SCOPE, state: "safe", code_challenge: pkce.challenge, code_challenge_method: "S256", resource };
+      const page = await jsonFetch(`${ctx.base}/oauth/authorize?${new URLSearchParams(params)}`);
+      expect(page.response.status).toBe(200);
+      expect(page.text).toContain("Client: <strong>&lt;img src=x onerror=&quot;alert(1)&quot;&gt;</strong>");
+      expect(page.text).not.toContain(clientName);
+      expect(page.text).toContain("Redirect host: <code>grok.com</code>");
+      expect(page.text).toContain(`Resource: <code>${resource}</code>`);
+      expect(page.text).not.toContain("bootstrap-micro");
     } finally { await ctx.server.close(); }
   });
 

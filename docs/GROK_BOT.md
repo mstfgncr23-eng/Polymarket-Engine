@@ -97,10 +97,13 @@ journaled. Only `mcp:<role>` is accepted for that role resource; the existing
 MCP tool ACL and authenticated-role identity checks still apply.
 
 The OAuth state store is intentionally bounded and process-local in this
-compatibility release. Codes and access tokens expire and are discarded on a
-Fly restart, so a connector must authorize again after a restart; a token can
-never change into another role. This avoids introducing a new persistence
-schema in the authentication-only PR.
+compatibility release. Public DCR registrations have a hard cap of 256 and a
+24-hour lifetime; expired or inactive clients are reclaimed, while clients
+that own an unexpired authorization code or access token remain pinned. Codes
+and access tokens expire and are discarded on a Fly restart, so a connector
+must authorize again after a restart; a token can never change into another
+role. This avoids introducing a new persistence schema in the
+authentication-only PR.
 
 Manual post-deploy test (read-only first):
 

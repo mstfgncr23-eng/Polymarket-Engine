@@ -16,6 +16,7 @@ const MAX_CODES = 512;
 const MAX_TOKENS = 1_024;
 const MAX_RATE_KEYS = 512;
 const REGISTRATION_WINDOW_MS = 60_000;
+const CLIENT_REGISTRATION_TTL_MS = 24 * 60 * 60 * 1_000;
 const MAX_REGISTRATIONS_PER_WINDOW = 30;
 const MAX_AUTHORIZATIONS_PER_WINDOW = 60;
 const MAX_TOKEN_REQUESTS_PER_WINDOW = 120;
@@ -67,6 +68,7 @@ interface OAuthClient {
   scope: string | null;
   issuedAt: number;
   lastUsedAt: number;
+  expiresAt: number;
 }
 
 interface AuthorizationCode {
@@ -162,7 +164,6 @@ export class McpOAuthService {
     if (!this.consumeRate(this.registrationRate, context.remoteAddress ?? "unknown", MAX_REGISTRATIONS_PER_WINDOW)) {
       return { status: 429, body: { error: "temporarily_unavailable" } };
     }
-    if (this.clients.size >= MAX_CLIENTS) return { status: 503, body: { error: "temporarily_unavailable" } };
     if (!input || typeof input !== "object" || Array.isArray(input)) return { status: 400, body: { error: "invalid_client_metadata" } };
     const raw = input as Record<string, unknown>;
     const redirects = raw.redirect_uris;
@@ -186,7 +187,9 @@ export class McpOAuthService {
       scope: requestedScope || null,
       issuedAt: now,
       lastUsedAt: now,
+      expiresAt: now + CLIENT_REGISTRATION_TTL_MS,
     };
+    if (!this.ensureClientCapacity(now)) return { status: 503, body: { error: "temporarily_unavailable" } };
     this.clients.set(clientId, client);
     this.observeEvent({ event: "dynamic_client_registered", endpoint: context.endpoint, status: "ok", clientFingerprint: fingerprint(clientId), timestamp: new Date(now).toISOString() });
     return {
@@ -209,11 +212,14 @@ export class McpOAuthService {
     if (!this.consumeRate(this.authorizationRate, context.remoteAddress ?? "unknown", MAX_AUTHORIZATIONS_PER_WINDOW)) return { status: 429, body: JSON.stringify({ error: "temporarily_unavailable" }), headers: { "content-type": "application/json" } };
     const validation = this.validateAuthorizationInput(input, context, role);
     if (!validation.ok) return { status: validation.status, body: JSON.stringify({ error: validation.reason }), headers: { "content-type": "application/json" } };
+    validation.client.lastUsedAt = this.now();
     this.observeEvent({ event: "authorization_started", role, endpoint: context.endpoint, status: "pending", clientFingerprint: fingerprint(validation.client.clientId), timestamp: new Date(this.now()).toISOString() });
     const hidden = ["client_id", "redirect_uri", "response_type", "scope", "state", "code_challenge", "code_challenge_method", "resource"]
       .map((key) => `<input type="hidden" name="${key}" value="${escapeHtml(input[key] ?? "")}">`).join("");
     const roleName = externalAgentRoleDefinitions.find((item) => item.id === role)?.name ?? role;
-    const body = `<!doctype html><html><head><meta charset="utf-8"><title>Authorize Polymarket MCP connector</title></head><body><h1>Authorize Polymarket MCP connector</h1><p>Role: <strong>${escapeHtml(roleName)}</strong></p><p>No wallet or user trading credentials are involved.</p><form method="post" action="/oauth/authorize">${hidden}<label>Connection secret <input type="password" name="bootstrap_secret" autocomplete="off" required></label><button type="submit">Authorize</button></form></body></html>`;
+    const clientName = validation.client.clientName?.trim() || "Unnamed public MCP client";
+    const redirectHost = new URL(validation.redirectUri).hostname;
+    const body = `<!doctype html><html><head><meta charset="utf-8"><title>Authorize Polymarket MCP connector</title></head><body><h1>Authorize Polymarket MCP connector</h1><p>Role: <strong>${escapeHtml(roleName)}</strong></p><p>Client: <strong>${escapeHtml(clientName)}</strong></p><p>Redirect host: <code>${escapeHtml(redirectHost)}</code></p><p>Resource: <code>${escapeHtml(validation.resource)}</code></p><p>No wallet or user trading credentials are involved.</p><form method="post" action="/oauth/authorize">${hidden}<label>Connection secret <input type="password" name="bootstrap_secret" autocomplete="off" required></label><button type="submit">Authorize</button></form></body></html>`;
     return { status: 200, body, headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } };
   }
 
@@ -222,6 +228,7 @@ export class McpOAuthService {
     if (!this.consumeRate(this.authorizationRate, context.remoteAddress ?? "unknown", MAX_AUTHORIZATIONS_PER_WINDOW)) return { status: 429, body: { error: "temporarily_unavailable" } };
     const validation = this.validateAuthorizationInput(input, context, role);
     if (!validation.ok) return { status: validation.status, body: { error: validation.reason } };
+    validation.client.lastUsedAt = this.now();
     const supplied = typeof input.bootstrap_secret === "string" ? sha256(input.bootstrap_secret) : null;
     const expected = this.bootstrap.get(role);
     if (!supplied || !expected || !safeEqual(supplied, expected)) return { status: 401, body: { error: "access_denied" } };
@@ -335,9 +342,31 @@ export class McpOAuthService {
     for (const store of [this.registrationRate, this.authorizationRate, this.tokenRate]) {
       for (const [key, item] of store) if (now - item.lastUsedAt >= REGISTRATION_WINDOW_MS) store.delete(key);
     }
-    if (this.clients.size > MAX_CLIENTS) this.evictOldest(this.clients, MAX_CLIENTS, (item) => item.lastUsedAt);
+    this.reclaimExpiredClients(now);
     if (this.codes.size > MAX_CODES) this.evictOldest(this.codes, MAX_CODES, (item) => item.expiresAt);
     if (this.tokens.size > MAX_TOKENS) this.evictOldest(this.tokens, MAX_TOKENS, (item) => item.expiresAt);
+  }
+
+  private reclaimExpiredClients(now: number): void {
+    for (const [clientId, client] of this.clients) {
+      if (client.expiresAt <= now && !this.clientHasActiveGrant(clientId, now)) this.clients.delete(clientId);
+    }
+  }
+
+  private ensureClientCapacity(now: number): boolean {
+    this.reclaimExpiredClients(now);
+    if (this.clients.size < MAX_CLIENTS) return true;
+    const candidate = [...this.clients.entries()]
+      .filter(([clientId]) => !this.clientHasActiveGrant(clientId, now))
+      .sort(([, left], [, right]) => left.lastUsedAt - right.lastUsedAt || left.issuedAt - right.issuedAt)[0]?.[0];
+    if (candidate) this.clients.delete(candidate);
+    return this.clients.size < MAX_CLIENTS;
+  }
+
+  private clientHasActiveGrant(clientId: string, now: number): boolean {
+    for (const code of this.codes.values()) if (code.clientId === clientId && code.expiresAt > now) return true;
+    for (const token of this.tokens.values()) if (token.clientId === clientId && token.expiresAt > now) return true;
+    return false;
   }
 
   private evictOldest<T>(store: Map<string, T>, limit: number, at: (item: T) => number): void {
@@ -366,7 +395,7 @@ function validRedirectUri(value: string): boolean {
   try {
     const url = new URL(value);
     const loopback = ["localhost", "127.0.0.1", "[::1]", "::1"].includes(url.hostname);
-    return (url.protocol === "https:" || (url.protocol === "http:" && loopback)) && !url.hash && !/[\\s\u0000-\u001f]/.test(value);
+    return (url.protocol === "https:" || (url.protocol === "http:" && loopback)) && !url.hash && !/[\s\u0000-\u001f]/.test(value);
   } catch { return false; }
 }
 function validCodeVerifier(value: string): boolean { return /^[A-Za-z0-9._~-]{43,128}$/.test(value); }
