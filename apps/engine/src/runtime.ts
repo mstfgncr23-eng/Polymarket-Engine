@@ -2,6 +2,7 @@ import { resolve } from "node:path";
 import pino from "pino";
 import { MemoryEventJournal, PostgresEventJournal, type EventJournal } from "@pm/db";
 import { EngineService, parseEnv } from "./engine.js";
+import { MCP_OAUTH_ROLES } from "./mcp-oauth.js";
 import { createApiServer } from "./server.js";
 
 export interface Runtime {
@@ -10,8 +11,40 @@ export interface Runtime {
   stop(): Promise<void>;
 }
 
+/**
+ * OAuth operator approval uses one secret. Role authority is still derived from
+ * the exact protected-resource URL and downscoped access token, never from the
+ * approval secret itself.
+ *
+ * `GROK_MCP_OAUTH_BOOTSTRAP_TOKENS` is accepted only as a migration source so
+ * an already-deployed Micro connector can move to the single-secret model
+ * without generating another credential. New deployments should set only
+ * `GROK_MCP_OAUTH_APPROVAL_SECRET`.
+ */
+export function resolveOAuthApprovalBootstrap(envInput: NodeJS.ProcessEnv, oauthEnabled: boolean): string {
+  if (!oauthEnabled) return "";
+
+  let secret = (envInput.GROK_MCP_OAUTH_APPROVAL_SECRET ?? "").trim();
+  if (!secret) {
+    const legacy = (envInput.GROK_MCP_OAUTH_BOOTSTRAP_TOKENS ?? "").trim().replace(/^['"]|['"]$/g, "");
+    const prefix = "market_microstructure_scanner:";
+    const micro = legacy
+      .split(",")
+      .map((entry) => entry.trim())
+      .find((entry) => entry.startsWith(prefix));
+    secret = micro?.slice(prefix.length).trim() ?? "";
+  }
+
+  if (!secret) throw new Error("GROK_MCP_OAUTH_APPROVAL_SECRET_REQUIRED");
+  if (secret.length < 32) throw new Error("GROK_MCP_OAUTH_APPROVAL_SECRET_TOO_SHORT");
+  if (secret.includes(",")) throw new Error("GROK_MCP_OAUTH_APPROVAL_SECRET_INVALID");
+
+  return MCP_OAUTH_ROLES.map((role) => `${role}:${secret}`).join(",");
+}
+
 export async function startRuntime(envInput: NodeJS.ProcessEnv = process.env): Promise<Runtime> {
   const env = parseEnv(envInput);
+  const oauthBootstrapTokens = resolveOAuthApprovalBootstrap(envInput, env.GROK_MCP_OAUTH_ENABLED);
   const logger = pino({ level: env.LOG_LEVEL, base: { service: "polymarket-engine", tradingMode: "paper" } });
   const journal = createJournal(env, logger);
   const engine = new EngineService(env, journal, logger);
@@ -25,7 +58,7 @@ export async function startRuntime(envInput: NodeJS.ProcessEnv = process.env): P
       oauth: {
         enabled: env.GROK_MCP_OAUTH_ENABLED,
         issuer: env.GROK_MCP_OAUTH_ISSUER,
-        bootstrapTokens: env.GROK_MCP_OAUTH_BOOTSTRAP_TOKENS,
+        bootstrapTokens: oauthBootstrapTokens,
         accessTokenTtlSeconds: env.GROK_MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS,
         authorizationCodeTtlSeconds: env.GROK_MCP_OAUTH_AUTH_CODE_TTL_SECONDS,
       },
