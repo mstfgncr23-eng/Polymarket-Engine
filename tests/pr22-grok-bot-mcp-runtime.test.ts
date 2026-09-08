@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { createId, grokSignalSubmissionSchema, triggerEventSchema, type TriggerEvent } from "@pm/core";
-import { startQualifiedEngine, book } from "./paper-engine-testkit.js";
+import { createId, grokSignalSubmissionSchema, triggerEventSchema, type ExternalAgentRoleId, type GrokActivationRequest, type TriggerEvent } from "@pm/core";
+import { MemoryEventJournal } from "@pm/db";
+import { EngineService } from "../apps/engine/src/engine.js";
+import { SlackGrokActivationBridge } from "../apps/engine/src/activation/slack.js";
+import { discoveryReport, qualified, qualifiedPaperEnv, ScriptedMarketAdapter, ScriptedReferenceRegistry, startQualifiedEngine, book } from "./paper-engine-testkit.js";
 import { EngineMetrics } from "../apps/engine/src/metrics.js";
 import { SseHub, createApiServer } from "../apps/engine/src/server.js";
 
@@ -64,6 +67,41 @@ async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<voi
     if (Date.now() - started >= timeoutMs) throw new Error("test wait timed out");
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
+}
+
+type CapturedActivation = { triggerId: string; targetRoles: ExternalAgentRoleId[] };
+
+async function setupSlackActivation() {
+  const market = new ScriptedMarketAdapter();
+  const marketDefinition = qualified("btc-mkt", "BTC", "btc-up", "btc-down");
+  market.queue(discoveryReport([marketDefinition]));
+  const journal = new MemoryEventJournal();
+  const env = qualifiedPaperEnv({ GROK_ACTIVATION_PROVIDER: "slack", SLACK_BOT_TOKEN: "xoxb-test-token", SLACK_CHANNEL_ID: "C-TEST" });
+  const activations: CapturedActivation[] = [];
+  const fetchImpl: typeof fetch = async (_input, init) => {
+    const body = typeof init?.body === "string" ? JSON.parse(init.body) as { blocks?: Array<{ text?: { text?: string } }> } : {};
+    const blockText = body.blocks?.[0]?.text?.text;
+    const encoded = typeof blockText === "string" ? blockText.match(/```([\s\S]*)```/)?.[1] : undefined;
+    if (encoded) {
+      const payload = JSON.parse(encoded) as Pick<GrokActivationRequest, "triggerId" | "targetRoles">;
+      activations.push({ triggerId: payload.triggerId, targetRoles: [...payload.targetRoles] });
+    }
+    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } });
+  };
+  const referenceRegistry = new ScriptedReferenceRegistry();
+  const engine = new EngineService(env, journal, { error: () => undefined }, {
+    market: market as never,
+    referenceRegistry: referenceRegistry as never,
+    activation: new SlackGrokActivationBridge({
+      token: env.SLACK_BOT_TOKEN!, channelId: env.SLACK_CHANNEL_ID!, apiUrl: "https://slack.test/api/chat.postMessage",
+      fetchImpl, delayImpl: async () => undefined,
+    }),
+  });
+  await engine.start();
+  const at = now();
+  await market.emitSnapshot(book({ marketId: marketDefinition.id, tokenId: "btc-up", outcome: "UP", receivedAt: at, sourceTimestamp: at, traceId: createId("book") }));
+  await market.emitSnapshot(book({ marketId: marketDefinition.id, tokenId: "btc-down", outcome: "DOWN", receivedAt: at, sourceTimestamp: at, traceId: createId("book") }));
+  return { engine, activations, market, journal, marketId: marketDefinition.id };
 }
 
 describe("PR22 external Grok Bot MCP runtime alignment", () => {
@@ -135,6 +173,51 @@ describe("PR22 external Grok Bot MCP runtime alignment", () => {
     const news = await engine.submitGrokSignal(newsSubmission(newsEvent), "news_x_intelligence_scanner", "scout");
     expect(news.status).toBe("accepted");
     expect(engine.hotResearchCacheForTest().some((entry) => entry.role === "news_x_intelligence_scanner" && entry.triggerId === newsEvent.id)).toBe(true);
+  });
+
+  it("wakes only Alpha through the external Slack bridge after the final required scout is accepted", async () => {
+    const setupResult = await setupSlackActivation();
+    expect((await setupResult.engine.beginExperiment()).ok).toBe(true);
+    const event = trigger();
+    await setupResult.engine.registerTriggerForResearch(event);
+
+    const rolesBeforeScout = setupResult.activations.flatMap((item) => item.targetRoles);
+    expect(rolesBeforeScout).toEqual(expect.arrayContaining([
+      "market_microstructure_scanner", "crypto_market_scanner",
+    ]));
+    expect(rolesBeforeScout).not.toContain("fair_probability_analyst");
+    expect(rolesBeforeScout).not.toContain("risk_hedge_analyst");
+    expect(rolesBeforeScout).not.toContain("strategy_supervisor");
+
+    const micro = await setupResult.engine.submitGrokSignal(submission(event, "market_microstructure_scanner", scoutOutput("micro")), "market_microstructure_scanner", "scout");
+    expect(micro.status).toBe("accepted");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(setupResult.activations.flatMap((item) => item.targetRoles)).not.toContain("fair_probability_analyst");
+
+    const crypto = await setupResult.engine.submitGrokSignal(submission(event, "crypto_market_scanner", scoutOutput("crypto")), "crypto_market_scanner", "scout");
+    expect(crypto.status).toBe("accepted");
+    await waitFor(() => setupResult.activations.filter((item) => item.targetRoles.length === 1 && item.targetRoles[0] === "fair_probability_analyst").length === 1);
+    expect(setupResult.activations.filter((item) => item.targetRoles.includes("fair_probability_analyst"))).toEqual([
+      { triggerId: event.id, targetRoles: ["fair_probability_analyst"] },
+    ]);
+  });
+
+  it("coalesces simultaneous final scout completions into one external Alpha wake", async () => {
+    const setupResult = await setupSlackActivation();
+    expect((await setupResult.engine.beginExperiment()).ok).toBe(true);
+    const event = trigger();
+    await setupResult.engine.registerTriggerForResearch(event);
+
+    const [micro, crypto] = await Promise.all([
+      setupResult.engine.submitGrokSignal(submission(event, "market_microstructure_scanner", scoutOutput("micro")), "market_microstructure_scanner", "scout"),
+      setupResult.engine.submitGrokSignal(submission(event, "crypto_market_scanner", scoutOutput("crypto")), "crypto_market_scanner", "scout"),
+    ]);
+    expect(micro.status).toBe("accepted");
+    expect(crypto.status).toBe("accepted");
+    await waitFor(() => setupResult.activations.some((item) => item.targetRoles.length === 1 && item.targetRoles[0] === "fair_probability_analyst"));
+    const alphaWakes = setupResult.activations.filter((item) => item.targetRoles.includes("fair_probability_analyst"));
+    expect(alphaWakes).toHaveLength(1);
+    expect(alphaWakes[0]).toEqual({ triggerId: event.id, targetRoles: ["fair_probability_analyst"] });
   });
 
   it("rejects a wrong-role, unsynchronized, expired, or unsupported-evidence scout without usable cache", async () => {

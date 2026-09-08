@@ -216,6 +216,12 @@ export class EngineService {
   private readonly scoutRefreshLastAt = new Map<string, number>();
   private readonly scoutRefreshInFlight = new Set<string>();
   private readonly scoutRefreshSubmissionKeys = new Map<string, number>();
+  /**
+   * Coalesce overlapping activation reevaluations for one trigger while
+   * retaining a single dirty bit for scout completions that arrive during a
+   * dispatch. This keeps the Alpha wake idempotent at the Engine boundary.
+   */
+  private readonly activationFlights = new Map<string, { promise: Promise<void>; rerun: boolean }>();
   private readonly marketsById = new Map<string, DiscoveredMarket>();
   private readonly entryQualified = new Set<string>();
   private readonly managedMarketIds = new Set<string>();
@@ -1848,7 +1854,26 @@ export class EngineService {
     }
   }
 
-  private async requestActivation(trigger: TriggerEvent): Promise<void> {
+  private requestActivation(trigger: TriggerEvent): Promise<void> {
+    const existing = this.activationFlights.get(trigger.id);
+    if (existing) {
+      existing.rerun = true;
+      return existing.promise;
+    }
+    const flight: { promise: Promise<void>; rerun: boolean } = { promise: Promise.resolve(), rerun: false };
+    flight.promise = (async () => {
+      do {
+        flight.rerun = false;
+        await this.requestActivationOnce(trigger);
+      } while (flight.rerun);
+    })().finally(() => {
+      if (this.activationFlights.get(trigger.id) === flight) this.activationFlights.delete(trigger.id);
+    });
+    this.activationFlights.set(trigger.id, flight);
+    return flight.promise;
+  }
+
+  private async requestActivationOnce(trigger: TriggerEvent): Promise<void> {
     if (this.experimentStartPending && !isRiskHedgeSettlementTrigger(trigger.kind)) {
       this.state.addActivation({ triggerId: trigger.id, reason: "EXPERIMENT_START_PENDING", at: this.nowFn().toISOString(), provider: this.env.GROK_ACTIVATION_PROVIDER, grokWakeObserved: false });
       return;
@@ -1897,7 +1922,6 @@ export class EngineService {
     }
     const requestedRoles = decision.request.targetRoles;
     const scoutRoles = requestedRoles.filter(isScoutRole);
-    const auxiliaryRoles = requestedRoles.filter((role) => !isScoutRole(role) && role !== "fair_probability_analyst");
     const freshScoutRoles = trigger.marketId
       ? this.hotResearchCache.freshFor(trigger.marketId, trigger.asset ?? null, scoutRoles).map((entry) => entry.role)
       : scoutRoles;
@@ -1923,14 +1947,15 @@ export class EngineService {
     }
     const dispatchRequest: GrokActivationRequest = {
       ...decision.request,
-      targetRoles: xaiRuntime && requiresAlpha
-        // Alpha is the only synchronous economic inference in the internal
-        // xAI path. Supervisor/risk work stays on its own advisory lanes and
-        // must never delay or influence this trade decision.
-        ? ["fair_probability_analyst"]
-        : requiresAlpha && scoutWarm.length > 0
-          ? [...scoutWarm, ...auxiliaryRoles]
-          : requestedRoles,
+      targetRoles: requiresAlpha
+        // Once all required scouts are fresh, every provider receives the
+        // same single Engine-driven Alpha wake. While scouts are cold, only
+        // the missing scout roles are dispatched; risk/supervisor lanes stay
+        // out of this bounded research warm-up.
+        ? scoutWarm.length > 0
+          ? scoutWarm
+          : ["fair_probability_analyst"]
+        : requestedRoles,
     };
     if (dispatchRequest.targetRoles.length === 0) return;
     this.activation.markRequested(trigger, dispatchRequest);
@@ -2317,10 +2342,10 @@ export class EngineService {
         this.record(`${signal.agentId.toUpperCase()}_COMPLETE`, signal.traceId, trigger.marketId, { signalId: signal.signalId, clientId, confidence: submission.output.confidence, expiresAt: submission.output.expiresAt }, trigger.asset ?? null);
         if (mode === "scout") {
           const scoutAdmission = this.admitScoutResearch(submission, trigger);
-          // In the opt-in internal xAI runtime, a final required scout causes
-          // the coordinator to wake Alpha once. Coordinator idempotency keeps
-          // concurrent scout completions bounded.
-          if (scoutAdmission.ok && this.env.GROK_ACTIVATION_PROVIDER === "xai") void this.requestActivation(trigger).catch(() => undefined);
+          // Every explicitly configured provider uses the same Engine-driven
+          // freshness reevaluation. The activation coordinator and the
+          // per-trigger flight keep concurrent scout completions bounded.
+          if (scoutAdmission.ok) void this.requestActivation(trigger).catch(() => undefined);
         } else if (mode === "alpha") {
           this.alphaSignalIds.set(trigger.id, signal.signalId);
           await this.evaluateAlphaDecision(trigger);
