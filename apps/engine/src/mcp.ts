@@ -10,6 +10,7 @@ import {
   parseGrokWritePayload,
   clientMayCallWriteTool,
   GrokSignalValidationError,
+  type ExternalAgentRoleId,
   type GrokSignalSubmission,
 } from "@pm/core";
 import { createJournalEvent, isCanonicalFinalReport, type EventJournal } from "@pm/db";
@@ -19,11 +20,13 @@ import { buildExperimentSummary, filterCurrentExperimentEvents } from "./report.
 import { KeyedResultFlight } from "./runtime-supervisor.js";
 import type { EngineStateStore } from "./state.js";
 import type { GrokSubmissionMode } from "./activation/role-runner.js";
+import { McpOAuthService, type McpOAuthConfig, type OAuthAuthResult, type OAuthFailure } from "./mcp-oauth.js";
 
 export interface McpConfig {
   bearerTokens: string;
   allowedOrigins: string;
   rateLimitPerMinute: number;
+  oauth?: McpOAuthConfig;
 }
 
 export interface McpDependencies {
@@ -37,6 +40,7 @@ export interface McpDependencies {
   isTokenSynchronized?(tokenId: string): boolean;
   isTriggerActionable?(triggerId: string): boolean;
   getAlphaResearchContext?(triggerId: string): Record<string, unknown> | null;
+  oauthObserve?(event: import("./mcp-oauth.js").OAuthSafeEvent): void;
 }
 
 export function mcpVisibleOrderbook(
@@ -66,7 +70,7 @@ export function mcpVisibleMarketSnapshots(
   return isTokenSynchronized ? items.filter((snapshot) => isTokenSynchronized(snapshot.tokenId)) : items;
 }
 
-type AuthResult = { ok: true; clientId: string; tokenFingerprint: string } | { ok: false; status: 401 | 503; reason: string; tokenFingerprint: string | null };
+type AuthResult = { ok: true; clientId: string; tokenFingerprint: string } | { ok: false; status: 401 | 403 | 503; reason: string; tokenFingerprint: string | null; challenge?: string };
 
 export const ALLOWED_MCP_READ_TOOLS = [
   "get_markets",
@@ -180,7 +184,13 @@ export class McpSecurityGate {
   }
 }
 
-export function createMcpHttpHandler(config: McpConfig, dependencies: McpDependencies) {
+export interface McpHttpHandlerOptions {
+  oauth?: McpOAuthService;
+  requiredRole?: ExternalAgentRoleId;
+  resourceOrigin?: (request: FastifyRequest) => string;
+}
+
+export function createMcpHttpHandler(config: McpConfig, dependencies: McpDependencies, options: McpHttpHandlerOptions = {}) {
   const security = new McpSecurityGate(config);
 
   return async (request: FastifyRequest, reply: FastifyReply): Promise<unknown> => {
@@ -188,7 +198,13 @@ export function createMcpHttpHandler(config: McpConfig, dependencies: McpDepende
     const method = extractRpcMethod(request.body) ?? request.method;
     const toolName = extractToolName(request.body);
     const requestId = extractRpcId(request.body);
-    const auth = security.authenticate(request.headers.authorization);
+    const auth = options.oauth && options.requiredRole
+      ? options.oauth.authenticate(request.headers.authorization, options.requiredRole, {
+        origin: options.resourceOrigin?.(request) ?? "http://localhost",
+        endpoint: request.url,
+        remoteAddress: request.ip,
+      })
+      : security.authenticate(request.headers.authorization);
     if (!auth.ok) {
       dependencies.state.recordGrokRejection("unauthorized");
       dependencies.metrics.mcpInteractions.inc({ status: auth.status === 503 ? "unconfigured" : "unauthorized", method });
@@ -196,7 +212,7 @@ export function createMcpHttpHandler(config: McpConfig, dependencies: McpDepende
         clientId: "unauthorized", tokenFingerprint: auth.tokenFingerprint, method, tool: toolName, requestId,
         status: auth.reason, rateLimitResult: "not_evaluated", durationMs: performance.now() - started,
       });
-      reply.header("WWW-Authenticate", "Bearer");
+      reply.header("WWW-Authenticate", auth.challenge ?? "Bearer");
       return reply.code(auth.status).send({ error: auth.reason });
     }
     if (!security.originAllowed(request.headers.origin)) {

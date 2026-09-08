@@ -805,11 +805,15 @@ export class EngineService {
   }
 
   preflight(mode: "MONITOR_ONLY" | "48H_GROK_PAPER_EXPERIMENT" = "MONITOR_ONLY") {
+    const staticMcpRoles = this.env.GROK_MCP_BEARER_TOKENS.split(",").map((entry) => entry.trim().split(":")[0] ?? "").filter(Boolean);
+    const oauthBootstrapRoles = this.env.GROK_MCP_OAUTH_ENABLED
+      ? this.env.GROK_MCP_OAUTH_BOOTSTRAP_TOKENS.split(",").map((entry) => entry.trim().split(":")[0] ?? "").filter(Boolean)
+      : [];
     return evaluateExperimentPreflight({
       env: this.env, databaseUp: this.state.database === "UP", discoveryStatus: this.state.discoveryStatus,
       qualifiedOrManaged: this.marketsById.size, bootstrapFailed: this.bootstrapFailed,
       tokenConfiguredPath: this.tokenIds.length > 0,
-      mcpRoleTokens: this.env.GROK_MCP_BEARER_TOKENS.split(",").map((entry) => entry.trim().split(":")[0] ?? "").filter(Boolean),
+      mcpRoleTokens: [...new Set([...staticMcpRoles, ...oauthBootstrapRoles])],
       mode,
       overloadFailClosed: this.overload.state === "FAIL_CLOSED",
       entryMarkets: [...this.entryQualified].map((marketId) => {

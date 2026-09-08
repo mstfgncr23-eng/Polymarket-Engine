@@ -1,6 +1,6 @@
 import cors from "@fastify/cors";
 import sensible from "@fastify/sensible";
-import Fastify, { type FastifyInstance, type FastifyRequest } from "fastify";
+import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import { timingSafeEqual } from "node:crypto";
 import { DECISION_EVENT_TYPES, HISTORY_DECISIONS_LIMIT, TRACE_PAGE_MAX, type GrokSignalSubmission } from "@pm/core";
 import type { EventJournal } from "@pm/db";
@@ -8,6 +8,7 @@ import type { EngineMetrics } from "./metrics.js";
 import type { DashboardSnapshot, EngineStateStore } from "./state.js";
 import type { GrokSubmissionMode } from "./activation/role-runner.js";
 import { createMcpHttpHandler, type McpConfig } from "./mcp.js";
+import { MCP_OAUTH_ROLES, McpOAuthService, type OAuthRequestContext } from "./mcp-oauth.js";
 
 import { FiniteSemaphore, RUNTIME_BOUNDS } from "./runtime-supervisor.js";
 
@@ -174,10 +175,12 @@ export async function createApiServer(input: {
   operatorToken?: string;
   metricsToken?: string;
   nodeEnv?: string;
+  oauthObserve?(event: import("./mcp-oauth.js").OAuthSafeEvent): void;
   logger: boolean | Record<string, unknown>;
 }): Promise<FastifyInstance> {
   const app = Fastify({ logger: input.logger });
   await app.register(sensible);
+  app.addContentTypeParser("application/x-www-form-urlencoded", { parseAs: "string" }, (_request, body, done) => done(null, body));
   await app.register(cors, { origin: input.dashboardOrigin, methods: ["GET", "POST"] });
   const heavyRead = new FiniteSemaphore(RUNTIME_BOUNDS.heavyRead.concurrency, RUNTIME_BOUNDS.heavyRead.waiting, "HEAVY_READ_BUSY");
 
@@ -219,6 +222,87 @@ export async function createApiServer(input: {
     heavyRead: (work) => heavyRead.run(work),
   });
   app.route({ method: ["GET", "POST", "DELETE"], url: "/mcp", handler: mcpHandler });
+
+  const oauth = input.mcp.oauth?.enabled
+    ? new McpOAuthService(input.mcp.oauth, () => Date.now(), input.oauthObserve)
+    : null;
+  const requestOrigin = (request: FastifyRequest): string => {
+    const forwarded = request.headers["x-forwarded-proto"];
+    const protocol = (typeof forwarded === "string" ? forwarded.split(",")[0] : undefined) ?? "http";
+    const host = request.headers.host ?? "localhost";
+    return `${protocol}://${host}`;
+  };
+  const oauthContext = (request: FastifyRequest): OAuthRequestContext => ({ origin: requestOrigin(request), endpoint: request.url.split("?", 1)[0], remoteAddress: request.ip });
+  const jsonBody = (request: FastifyRequest): Record<string, string | undefined> => {
+    const body = request.body;
+    if (!body || typeof body !== "object" || Array.isArray(body)) return {};
+    return Object.fromEntries(Object.entries(body as Record<string, unknown>).map(([key, value]) => [key, typeof value === "string" ? value : undefined]));
+  };
+  const formBody = (request: FastifyRequest): Record<string, string | undefined> => {
+    const body = request.body;
+    if (typeof body === "string") return Object.fromEntries(new URLSearchParams(body).entries());
+    return jsonBody(request);
+  };
+  const oauthJson = (reply: { code: (status: number) => { header: (name: string, value: string) => { send: (body: unknown) => unknown }; send: (body: unknown) => unknown } }, result: { status: number; body: unknown }) => {
+    const target = reply.code(result.status);
+    target.header("Cache-Control", "no-store");
+    return target.send(result.body);
+  };
+
+  const protectedMetadata = async (request: FastifyRequest, reply: FastifyReply) => {
+    const role = oauth?.roleFromPath((request.params as { role?: string }).role ?? "");
+    if (!oauth || !role) return reply.code(404).send({ error: "NOT_FOUND" });
+    input.oauthObserve?.({ event: "resource_metadata_requested", role, endpoint: request.url.split("?", 1)[0], status: "ok", timestamp: new Date().toISOString() });
+    return reply.header("Cache-Control", "no-store").send(oauth.protectedResourceMetadata(role, requestOrigin(request)));
+  };
+  app.get<{ Params: { role: string } }>("/.well-known/oauth-protected-resource/mcp/:role", protectedMetadata);
+  app.get<{ Params: { role: string } }>("/mcp/:role/.well-known/oauth-protected-resource", protectedMetadata);
+  app.get("/.well-known/oauth-authorization-server", async (request, reply) => {
+    if (!oauth) return reply.code(404).send({ error: "NOT_FOUND" });
+    input.oauthObserve?.({ event: "authorization_metadata_requested", endpoint: request.url.split("?", 1)[0], status: "ok", timestamp: new Date().toISOString() });
+    return reply.header("Cache-Control", "no-store").send(oauth.authorizationServerMetadata(requestOrigin(request)));
+  });
+  app.get("/oauth/.well-known/oauth-authorization-server", async (request, reply) => {
+    if (!oauth) return reply.code(404).send({ error: "NOT_FOUND" });
+    input.oauthObserve?.({ event: "authorization_metadata_requested", endpoint: request.url.split("?", 1)[0], status: "ok", timestamp: new Date().toISOString() });
+    return reply.header("Cache-Control", "no-store").send(oauth.authorizationServerMetadata(requestOrigin(request)));
+  });
+  app.post("/oauth/register", async (request, reply) => {
+    if (!oauth) return reply.code(404).send({ error: "NOT_FOUND" });
+    return oauthJson(reply, oauth.register(request.body, oauthContext(request)));
+  });
+  app.get<{ Querystring: Record<string, string | undefined> }>("/oauth/authorize", async (request, reply) => {
+    if (!oauth) return reply.code(404).send({ error: "NOT_FOUND" });
+    const query = request.query as Record<string, string | undefined>;
+    const role = typeof query.resource === "string" ? oauth.roleFromPath(query.resource.split("/mcp/")[1] ?? "") : null;
+    if (!role || query.resource !== oauth.resourceForRole(role, requestOrigin(request))) return reply.code(400).send({ error: "invalid_target" });
+    const result = oauth.authorizationPage(query, oauthContext(request), role);
+    return reply.code(result.status).headers(result.headers ?? {}).send(result.body);
+  });
+  app.post<{ Body: Record<string, string> }>("/oauth/authorize", async (request, reply) => {
+    if (!oauth) return reply.code(404).send({ error: "NOT_FOUND" });
+    const body = formBody(request);
+    const role = typeof body.resource === "string" ? oauth.roleFromPath(body.resource.split("/mcp/")[1] ?? "") : null;
+    if (!role || body.resource !== oauth.resourceForRole(role, requestOrigin(request))) return reply.code(400).send({ error: "invalid_target" });
+    const result = oauth.approve(body, oauthContext(request), role);
+    const target = reply.code(result.status).headers(result.headers ?? {});
+    return result.headers?.location ? target.send() : target.send(result.body);
+  });
+  app.post("/oauth/token", async (request, reply) => {
+    if (!oauth) return reply.code(404).send({ error: "not_found" });
+    return oauthJson(reply, oauth.token(formBody(request), oauthContext(request)));
+  });
+  if (oauth) {
+    for (const role of MCP_OAUTH_ROLES) {
+      const roleHandler = createMcpHttpHandler(input.mcp, {
+        state: input.state, journal: input.journal, metrics: input.metrics, submitSignal: input.submitGrokSignal,
+        persistReportInput, noteMcpRequest: input.noteMcpRequest, isTokenSynchronized: input.isTokenSynchronized,
+        isTriggerActionable: input.isTriggerActionable, getAlphaResearchContext: input.getAlphaResearchContext,
+        heavyRead: (work) => heavyRead.run(work), oauthObserve: input.oauthObserve,
+      }, { oauth, requiredRole: role, resourceOrigin: requestOrigin });
+      app.route({ method: ["GET", "POST", "DELETE"], url: `/mcp/${role}`, handler: roleHandler });
+    }
+  }
 
   const requireRead = async (request: FastifyRequest, reply: { code: (n: number) => { send: (body: unknown) => unknown } }) => {
     const auth = protect(request, input.engineReadToken, true);

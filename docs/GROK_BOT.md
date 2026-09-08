@@ -67,7 +67,71 @@ Official Grok Bot attachment of connectors/MCP:
 
 Do **not** configure this engine at [grok.com/connectors](https://grok.com/connectors) as if that were Grok Bot. That is grok.com chat custom MCP, a different product. It does not start a Grok Bot.
 
-If a Grok Bot / Cursor MCP form only offers OAuth 2.1 and refuses static bearer tokens, stop and add OAuth protected-resource discovery later. This repository ships operator-managed bearer tokens first.
+## Four separate connection paths
+
+### A. Legacy/debug static bearer MCP
+
+`/mcp` remains the compatibility endpoint for direct clients that can send a
+static `Authorization: Bearer <token>` header. `GROK_MCP_BEARER_TOKENS` keeps
+the existing role-to-token binding and tool ACL. OAuth does not reinterpret or
+replace these credentials.
+
+### B. OAuth 2.1 Grok Custom Connector MCP
+
+OAuth is an explicit opt-in (`GROK_MCP_OAUTH_ENABLED=false` by default). When
+enabled, each role has its own protected resource, for example:
+
+`/mcp/market_microstructure_scanner`
+
+The protected-resource metadata is available at
+`/.well-known/oauth-protected-resource/mcp/<role>` and
+`/mcp/<role>/.well-known/oauth-protected-resource`. Authorization-server
+metadata is available at `/.well-known/oauth-authorization-server`.
+
+The local OAuth server supports public-client Dynamic Client Registration,
+authorization-code + PKCE S256, exact redirect URI matching, RFC 8707
+`resource` binding, one-time short-lived codes, opaque short-lived bearer
+tokens, and role-specific operator approval. Bootstrap secrets use the
+separate `GROK_MCP_OAUTH_BOOTSTRAP_TOKENS` setting and are never logged or
+journaled. Only `mcp:<role>` is accepted for that role resource; the existing
+MCP tool ACL and authenticated-role identity checks still apply.
+
+The OAuth state store is intentionally bounded and process-local in this
+compatibility release. Public DCR registrations have a hard cap of 256 and a
+24-hour lifetime; expired or inactive clients are reclaimed, while clients
+that own an unexpired authorization code or access token remain pinned. Codes
+and access tokens expire and are discarded on a Fly restart, so a connector
+must authorize again after a restart; a token can never change into another
+role. This avoids introducing a new persistence schema in the
+authentication-only PR.
+
+Manual post-deploy test (read-only first):
+
+1. Set only the OAuth opt-in, issuer, and role-specific bootstrap secret in
+   the engine environment; keep `TRADING_MODE=paper` and the activation
+   provider unchanged.
+2. Add a Custom Connector using
+   `https://<engine-app>.fly.dev/mcp/market_microstructure_scanner`.
+3. Complete OAuth in the browser with the matching Micro bootstrap secret.
+4. Verify `tools/list`, then call only `get_markets` or another read-only tool.
+5. Do not submit a signal until the role, resource, and read-only path have
+   been checked. Never place a wallet, exchange, signer, or order connector on
+   the Bot.
+
+The CI integration test uses a local Fastify server and a disposable public
+client; it does not contact Grok, xAI, Slack, or a production OAuth provider.
+
+### C. Slack event wake transport
+
+`GROK_ACTIVATION_PROVIDER=slack` posts the existing bounded wake signal to the
+operator's Slack bridge. Slack is an event wake transport, not an OAuth
+authorization server and not MCP authentication.
+
+### D. xAI direct API runtime
+
+`GROK_ACTIVATION_PROVIDER=xai` is the separate explicit opt-in direct xAI
+runtime. `XAI_API_KEY` alone never enables it. Its bounded context, portfolio
+approval, role schemas, and call budget remain unchanged by OAuth.
 
 ## Role IDs and instructions
 

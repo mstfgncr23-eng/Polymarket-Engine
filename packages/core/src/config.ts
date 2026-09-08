@@ -79,6 +79,18 @@ export const engineEnvSchema = z.object({
   GROK_MCP_BEARER_TOKENS: z.string().default(""),
   GROK_MCP_ALLOWED_ORIGINS: z.string().default("https://grok.com,https://x.ai"),
   GROK_MCP_RATE_LIMIT_PER_MINUTE: z.coerce.number().int().positive().default(60),
+  /** OAuth 2.1 protected-resource compatibility is explicit opt-in and disabled by default. */
+  GROK_MCP_OAUTH_ENABLED: z.preprocess(
+    (value) => value === undefined ? undefined : value === true || value === "true" || value === "1",
+    z.boolean().optional(),
+  ).default(false),
+  GROK_MCP_OAUTH_ISSUER: z.string().refine((value) => {
+    if (value === "") return true;
+    try { const url = new URL(value); return (url.protocol === "https:" || url.protocol === "http:") && !url.hash; } catch { return false; }
+  }, "OAuth issuer must be an absolute HTTP(S) URL or empty").default(""),
+  GROK_MCP_OAUTH_BOOTSTRAP_TOKENS: z.string().default(""),
+  GROK_MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS: z.coerce.number().int().positive().max(86_400).default(3_600),
+  GROK_MCP_OAUTH_AUTH_CODE_TTL_SECONDS: z.coerce.number().int().positive().max(600).default(300),
   /** Safe by default: xAI inference is explicit opt-in and never enabled by a key alone. */
   GROK_ACTIVATION_PROVIDER: z.enum(["noop", "slack", "xai"]).default("noop"),
   SLACK_BOT_TOKEN: z.string().optional(),
