@@ -3,11 +3,51 @@ import { CLOB_MARKET_WS_URL, MARKET_CONNECT_BOUNDS, MARKET_INGRESS_BOUNDS } from
 import type { MarketStreamTransport } from "./market-stream-transport.js";
 
 export interface BoundedMarketStream {
-  close(): Promise<void>;
+  close(intent?: BoundedMarketCloseIntent): Promise<void>;
+  closeDiagnostic?(): ClobMarketCloseDiagnostic | null;
   pendingWaiterCount(): number;
   pingTimerActive(): boolean;
   streamGeneration(): number;
   [Symbol.asyncIterator](): AsyncIterator<unknown>;
+}
+
+export type BoundedMarketCloseIntent = "operator_shutdown" | "generation_change";
+
+export type ClobMarketCloseKind =
+  | BoundedMarketCloseIntent
+  | "clean_remote_close"
+  | "abnormal_remote_close"
+  | "socket_error"
+  | "stale_heartbeat"
+  | "connect_failure";
+
+export interface ClobMarketCloseDiagnostic {
+  kind: ClobMarketCloseKind;
+  code: number | null;
+  reason: string;
+  wasClean: boolean;
+}
+
+export class ClobMarketCloseError extends Error {
+  constructor(
+    readonly baseMessage: string,
+    readonly diagnostic: ClobMarketCloseDiagnostic,
+  ) {
+    super(`${baseMessage}: ${formatClobMarketClose(diagnostic)}`);
+    this.name = "ClobMarketCloseError";
+  }
+}
+
+export function formatClobMarketClose(diagnostic: ClobMarketCloseDiagnostic): string {
+  return `CLOB_MARKET_CLOSE:kind=${diagnostic.kind}:code=${diagnostic.code ?? "none"}:wasClean=${diagnostic.wasClean}:reason=${diagnostic.reason || ""}`;
+}
+
+export function classifyClobRemoteClose(input: Pick<ClobMarketCloseDiagnostic, "code" | "wasClean">):
+  | "clean_remote_close"
+  | "abnormal_remote_close" {
+  return input.wasClean && (input.code === 1000 || input.code === 1001)
+    ? "clean_remote_close"
+    : "abnormal_remote_close";
 }
 
 export interface BoundedMarketTransportOptions {
@@ -164,6 +204,7 @@ export class BoundedClobMarketTransport implements MarketStreamTransport {
     const waiters: StreamWaiter[] = [];
     const listeners: Array<{ type: string; fn: EventListenerOrEventListenerObject }> = [];
     let pendingError: Error | null = null;
+    let closeDiagnostic: ClobMarketCloseDiagnostic | null = null;
     let ended = false;
     let finalized = false;
     let opened = false;
@@ -217,10 +258,11 @@ export class BoundedClobMarketTransport implements MarketStreamTransport {
       }
     };
 
-    const finalize = (error: Error | null) => {
+    const finalize = (error: Error | null, diagnostic?: ClobMarketCloseDiagnostic) => {
       if (finalized) return;
       finalized = true;
       ended = true;
+      closeDiagnostic = diagnostic ?? (error instanceof ClobMarketCloseError ? error.diagnostic : closeDiagnostic);
       if (error && !pendingError) pendingError = error;
       detachAll();
       signal?.removeEventListener("abort", onAbort);
@@ -228,13 +270,35 @@ export class BoundedClobMarketTransport implements MarketStreamTransport {
       settleWaiters();
     };
 
+    const diagnosticError = (baseMessage: string, diagnostic: ClobMarketCloseDiagnostic): ClobMarketCloseError => {
+      return new ClobMarketCloseError(baseMessage, diagnostic);
+    };
+
+    const abortError = (): ClobMarketCloseError => {
+      const intent: BoundedMarketCloseIntent = signal?.reason === "MARKET_STREAM_RESUBSCRIBE"
+        ? "generation_change"
+        : "operator_shutdown";
+      return diagnosticError(CLOB_MARKET_CONNECT_ABORTED, {
+        kind: intent, code: null, reason: String(signal?.reason ?? ""), wasClean: true,
+      });
+    };
+
+    const closeMetadata = (event: Event): Pick<ClobMarketCloseDiagnostic, "code" | "reason" | "wasClean"> => {
+      const close = event as Partial<CloseEvent>;
+      return {
+        code: typeof close.code === "number" && Number.isFinite(close.code) ? close.code : null,
+        reason: typeof close.reason === "string" ? close.reason : "",
+        wasClean: close.wasClean === true,
+      };
+    };
+
     let finishConnect: ((error?: Error) => void) | null = null;
     const onAbort = () => {
       if (finishConnect) {
-        finishConnect(new Error(CLOB_MARKET_CONNECT_ABORTED));
+        finishConnect(abortError());
         return;
       }
-      finalize(new Error(CLOB_MARKET_CONNECT_ABORTED));
+      finalize(abortError());
     };
 
     const enqueueFrame = (raw: string) => {
@@ -293,26 +357,43 @@ export class BoundedClobMarketTransport implements MarketStreamTransport {
           return;
         }
         if (Date.now() - lastPong > this.staleMs) {
-          finalize(new Error(CLOB_MARKET_WS_STALE));
+          finalize(diagnosticError(CLOB_MARKET_WS_STALE, {
+            kind: "stale_heartbeat", code: null, reason: CLOB_MARKET_WS_STALE, wasClean: false,
+          }));
           return;
         }
-        try { socket.send("PING"); } catch { finalize(new Error(CLOB_MARKET_WS_ERROR)); }
+        try { socket.send("PING"); } catch {
+          finalize(diagnosticError(CLOB_MARKET_WS_ERROR, {
+            kind: "socket_error", code: null, reason: CLOB_MARKET_WS_ERROR, wasClean: false,
+          }));
+        }
       }, this.pingIntervalMs);
     };
 
-    const onRuntimeError = () => finalize(new Error(CLOB_MARKET_WS_ERROR));
-    const onRemoteClose = () => finalize(null);
+    const onRuntimeError = () => finalize(diagnosticError(CLOB_MARKET_WS_ERROR, {
+      kind: "socket_error", code: null, reason: CLOB_MARKET_WS_ERROR, wasClean: false,
+    }));
+    const onRemoteClose = (event: Event) => {
+      const metadata = closeMetadata(event);
+      finalize(null, { ...metadata, kind: classifyClobRemoteClose(metadata) });
+    };
 
     await new Promise<void>((resolve, reject) => {
       let settled = false;
       const connectTimer = setTimeout(() => {
-        finish(new Error(CLOB_MARKET_CONNECT_TIMEOUT));
+        finish(diagnosticError(CLOB_MARKET_CONNECT_TIMEOUT, {
+          kind: "connect_failure", code: null, reason: CLOB_MARKET_CONNECT_TIMEOUT, wasClean: false,
+        }));
       }, this.connectTimeoutMs);
       connectTimer.unref?.();
 
-      const onConnectError = () => finish(new Error(CLOB_MARKET_WS_ERROR));
-      const onCloseDuringConnect = () => {
-        if (!opened) finish(new Error(CLOB_MARKET_CLOSED_BEFORE_OPEN));
+      const onConnectError = () => finish(diagnosticError(CLOB_MARKET_WS_ERROR, {
+        kind: "connect_failure", code: null, reason: CLOB_MARKET_WS_ERROR, wasClean: false,
+      }));
+      const onCloseDuringConnect = (event: Event) => {
+        if (!opened) finish(diagnosticError(CLOB_MARKET_CLOSED_BEFORE_OPEN, {
+          kind: "connect_failure", ...closeMetadata(event),
+        }));
       };
       const onOpened = () => {
         opened = true;
@@ -324,7 +405,10 @@ export class BoundedClobMarketTransport implements MarketStreamTransport {
           }));
           startPing();
         } catch (error) {
-          finish(error instanceof Error ? error : new Error(CLOB_MARKET_WS_OPEN_FAILED));
+          const baseMessage = error instanceof Error ? error.message : CLOB_MARKET_WS_OPEN_FAILED;
+          finish(diagnosticError(baseMessage, {
+            kind: "connect_failure", code: null, reason: baseMessage, wasClean: false,
+          }));
           return;
         }
         finish();
@@ -342,15 +426,20 @@ export class BoundedClobMarketTransport implements MarketStreamTransport {
           attach("close", onRemoteClose);
           attach("error", onRuntimeError);
           if (signal?.aborted) {
-            finalize(new Error(CLOB_MARKET_CONNECT_ABORTED));
+            finalize(abortError());
             resolve();
             return;
           }
           resolve();
           return;
         }
-        finalize(error);
-        reject(error);
+        const normalized = error instanceof ClobMarketCloseError
+          ? error
+          : diagnosticError(error.message, {
+            kind: "connect_failure", code: null, reason: error.message, wasClean: false,
+          });
+        finalize(normalized);
+        reject(normalized);
       };
       finishConnect = finish;
 
@@ -359,14 +448,17 @@ export class BoundedClobMarketTransport implements MarketStreamTransport {
       socket.addEventListener("error", onConnectError, { once: true });
       socket.addEventListener("close", onCloseDuringConnect);
       if (signal?.aborted) {
-        finish(new Error(CLOB_MARKET_CONNECT_ABORTED));
+        finish(abortError());
         return;
       }
       signal?.addEventListener("abort", onAbort);
     });
 
     return {
-      close: async () => { finalize(null); },
+      close: async (intent = "operator_shutdown") => {
+        finalize(null, { kind: intent, code: null, reason: "", wasClean: true });
+      },
+      closeDiagnostic: () => closeDiagnostic,
       pendingWaiterCount: () => waiters.length,
       pingTimerActive: () => pingTimer != null,
       streamGeneration: () => generation,

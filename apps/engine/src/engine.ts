@@ -83,6 +83,7 @@ import {
 } from "@pm/db";
 import {
   BtcWebSocketAdapter,
+  ClobMarketCloseError,
   PolymarketMarketDataAdapter,
   ReferenceFeedRegistry,
   createRestProbe,
@@ -2973,8 +2974,12 @@ export class EngineService {
   }
 
   private async onFeedError(feed: string, error: Error): Promise<void> {
-    this.logger.error({ err: { name: error.name, message: error.message }, feed }, "market feed error");
-    await this.safeAppend(createJournalEvent({ traceId: createId("trace"), type: "SYSTEM_HEALTH_EVENT", aggregateType: "feed", aggregateId: feed, payload: { status: "ERROR", message: error.message } }));
+    const close = error instanceof ClobMarketCloseError ? { close: error.diagnostic } : {};
+    this.logger.error({ err: { name: error.name, message: error.message }, feed, ...close }, "market feed error");
+    await this.safeAppend(createJournalEvent({
+      traceId: createId("trace"), type: "SYSTEM_HEALTH_EVENT", aggregateType: "feed", aggregateId: feed,
+      payload: { status: "ERROR", message: error.message, ...close },
+    }));
   }
 
   private updateReady(): void {
