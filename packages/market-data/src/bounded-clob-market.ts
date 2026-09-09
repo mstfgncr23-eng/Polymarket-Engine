@@ -24,7 +24,7 @@ export interface BoundedMarketTransportOptions {
 
 export const CLOB_MARKET_CONNECT_TIMEOUT = "CLOB_MARKET_WS_CONNECT_TIMEOUT";
 export const CLOB_MARKET_CONNECT_ABORTED = "CLOB_MARKET_WS_CONNECT_ABORTED";
-export const CLOB_MARKET_CLOSED_BEFORE_OPEN = "CLOB_MARKET_WS_CLOSED_BEFORE_OPEN";
+export const CLOB_MARKET_CLOSED_BEFORE_OPEN = "CLOB_MARKET_CLOSED_BEFORE_OPEN";
 export const CLOB_MARKET_WS_ERROR = "CLOB_MARKET_WS_ERROR";
 export const CLOB_MARKET_WS_STALE = "CLOB_MARKET_WS_STALE";
 export const CLOB_MARKET_WS_OPEN_FAILED = "CLOB_MARKET_WS_OPEN_FAILED";
@@ -33,6 +33,83 @@ export const MARKET_INGRESS_MALFORMED = "MARKET_INGRESS_MALFORMED";
 interface StreamWaiter {
   resolve: (result: IteratorResult<unknown>) => void;
   reject: (error: Error) => void;
+}
+
+function record(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function canonicalMarketEvent(type: string, payload: Record<string, unknown>) {
+  return { topic: "market", type, payload };
+}
+
+/**
+ * The owned transport speaks directly to the public CLOB websocket, whose
+ * wire payload uses event_type / asset_id / snake_case. The rest of the
+ * market-data package intentionally consumes the PublicClient-style
+ * type/payload/camelCase event shape. Normalize only at this boundary.
+ */
+export function normalizeRawClobMarketEvent(event: unknown): unknown {
+  const value = record(event);
+  if (!value) return event;
+  if (typeof value.type === "string" && record(value.payload)) return event;
+
+  const eventType = typeof value.event_type === "string" ? value.event_type : null;
+  if (!eventType) return event;
+
+  if (eventType === "book") {
+    return canonicalMarketEvent("book", {
+      market: value.market,
+      tokenId: value.asset_id,
+      bids: value.bids,
+      asks: value.asks,
+      hash: value.hash,
+      timestamp: value.timestamp,
+      minOrderSize: value.min_order_size,
+      tickSize: value.tick_size,
+      negRisk: value.neg_risk,
+      lastTradePrice: value.last_trade_price,
+    });
+  }
+
+  if (eventType === "price_change") {
+    const priceChanges = Array.isArray(value.price_changes)
+      ? value.price_changes.map((item) => {
+        const change = record(item) ?? {};
+        return {
+          tokenId: change.asset_id,
+          price: change.price,
+          size: change.size,
+          side: change.side,
+          hash: change.hash,
+          bestBid: change.best_bid,
+          bestAsk: change.best_ask,
+        };
+      })
+      : value.price_changes;
+    return canonicalMarketEvent("price_change", {
+      market: value.market,
+      priceChanges,
+      timestamp: value.timestamp,
+    });
+  }
+
+  if (eventType === "last_trade_price") {
+    return canonicalMarketEvent("last_trade_price", {
+      market: value.market,
+      tokenId: value.asset_id,
+      price: value.price,
+      size: value.size,
+      feeRateBps: value.fee_rate_bps,
+      side: value.side,
+      timestamp: value.timestamp,
+      transactionHash: value.transaction_hash,
+    });
+  }
+
+  return event;
 }
 
 /**
@@ -185,7 +262,7 @@ export class BoundedClobMarketTransport implements MarketStreamTransport {
         if (finalized || generation !== this.generation) return;
         const share = i === n - 1 ? remaining : Math.floor(raw.length / n);
         remaining -= share;
-        const result = queue.tryEnqueueWeighted(events[i], share);
+        const result = queue.tryEnqueueWeighted(normalizeRawClobMarketEvent(events[i]), share);
         if (!result.ok) {
           finalize(new IngressOverflowError(result.reason));
           return;
