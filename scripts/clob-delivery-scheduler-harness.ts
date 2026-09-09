@@ -42,10 +42,20 @@ const ADAPTER_POLICIES = [
   { maxEvents: 8, maxSliceMs: 0.5 },
   { maxEvents: 16, maxSliceMs: 1 },
   { maxEvents: 32, maxSliceMs: 1 },
+  { maxEvents: 64, maxSliceMs: 0.5 },
   { maxEvents: 64, maxSliceMs: 1 },
 ] as const;
+const FINALIST_POLICIES = [
+  { maxEvents: 64, maxSliceMs: 0.25 },
+  { maxEvents: 64, maxSliceMs: 0.5 },
+  { maxEvents: 64, maxSliceMs: 1 },
+] as const;
+const FINALIST_TARGET_RATE = 6_000;
+const FINALIST_DURATION_MS = 5_000;
+const FINALIST_REPEATS = 3;
 
 type HarnessMode = "direct" | "adapter";
+type EventPhase = "initial" | "prefill" | "workload";
 type WorkloadKind =
   | "initial_book_burst"
   | "steady_book"
@@ -90,6 +100,18 @@ interface HarnessRunResult {
   workload: WorkloadKind;
   targetEventRate: number;
   workloadDurationMs: number;
+  initialEventsAttempted: number;
+  initialEventsAdmitted: number;
+  initialEventsDelivered: number;
+  prefillEventsAttempted: number;
+  prefillEventsAdmitted: number;
+  prefillEventsDelivered: number;
+  workloadEventsExpected: number;
+  workloadEventsAttempted: number;
+  workloadEventsAdmitted: number;
+  workloadEventsDelivered: number;
+  actualProducerRatePerSec: number;
+  workloadDeliveredPerSec: number;
   sourceFramesSent: number;
   sourceEventsAttempted: number;
   sourceEventsAdmitted: number;
@@ -98,6 +120,7 @@ interface HarnessRunResult {
   deliveredPerSec: number;
   snapshotsProduced: number;
   queueFinalDepth: number;
+  queueDepthAtProducerStop: number;
   queueHighWaterEvents: number;
   queueHighWaterBytes: number;
   countLimitGaps: number;
@@ -121,6 +144,60 @@ interface HarnessRunResult {
   adapterErrors: number;
   adapterObservedConnections: number;
   notes: string[];
+}
+
+interface FinalistRunRecord {
+  repeat: number;
+  pass: boolean;
+  result: HarnessRunResult;
+}
+
+interface MetricRange {
+  min: number;
+  max: number;
+  range: number;
+}
+
+interface FinalistPolicySummary {
+  maxEvents: number;
+  maxSliceMs: number;
+  repeats: number;
+  passingRuns: number;
+  allRunsPass: boolean;
+  runs: Array<{
+    repeat: number;
+    pass: boolean;
+    workloadEventsExpected: number;
+    workloadEventsAttempted: number;
+    workloadEventsAdmitted: number;
+    workloadEventsDelivered: number;
+    actualProducerRatePerSec: number;
+    queueDepthAtProducerStop: number;
+    queueHighWaterEvents: number;
+    queueHighWaterBytes: number;
+    drainCompletionMs: number | null;
+    p99DeliveryLatencyMs: number | null;
+    eventLoopUtilization: number;
+    eventLoopDelayP99Ms: number;
+    eventLoopDelayMaxMs: number;
+    fairnessProbeMaxDriftMs: number;
+    processCpuMs: number;
+    wallMs: number;
+  }>;
+  variance: {
+    actualProducerRatePerSec: MetricRange | null;
+    queueDepthAtProducerStop: MetricRange | null;
+    queueHighWaterEvents: MetricRange | null;
+    queueHighWaterBytes: MetricRange | null;
+    drainCompletionMs: MetricRange | null;
+    p99DeliveryLatencyMs: MetricRange | null;
+    eventLoopUtilization: MetricRange | null;
+    eventLoopDelayP99Ms: MetricRange | null;
+    eventLoopDelayMaxMs: MetricRange | null;
+    fairnessProbeMaxDriftMs: MetricRange | null;
+    processCpuMs: MetricRange | null;
+    wallMs: MetricRange | null;
+  };
 }
 
 class HarnessWebSocket extends EventTarget {
@@ -336,8 +413,13 @@ function directSteadyWorkloads(durationMs: number): Workload[] {
   return STEADY_RATES.map((rate) => createWorkload("steady_book", durationMs, rate));
 }
 
+function expectedWorkloadEvents(workload: Workload): number {
+  if (workload.kind === "initial_book_burst") return 0;
+  return Math.floor(Math.max(0, workload.durationMs) * workload.targetRate / 1_000);
+}
+
 function expectedSequenceCapacity(workload: Workload): number {
-  return TOKEN_COUNT + workload.prefillEvents + Math.ceil((workload.targetRate * Math.max(1, workload.durationMs)) / 1_000) + 2_048;
+  return TOKEN_COUNT + workload.prefillEvents + expectedWorkloadEvents(workload) + 2_048;
 }
 
 async function runOnce(options: HarnessOptions): Promise<HarnessRunResult> {
@@ -361,11 +443,25 @@ async function runOnce(options: HarnessOptions): Promise<HarnessRunResult> {
   let adapterErrors = 0;
   let adapterObservedConnections = 0;
   let nextSequence = 1;
+  const sequencePhase = new Map<number, EventPhase>();
+  let initialEventsAttempted = 0;
+  let initialEventsAdmitted = 0;
+  let initialEventsDelivered = 0;
+  let prefillEventsAttempted = 0;
+  let prefillEventsAdmitted = 0;
+  let prefillEventsDelivered = 0;
+  let workloadEventsAttempted = 0;
+  let workloadEventsAdmitted = 0;
+  let workloadEventsDelivered = 0;
   const onTransportEvent = (event: unknown) => {
     const tag = streamEventTag(event);
     if (!tag) return;
     sequenceTracker.add(tag.sequence);
     latency.add(Math.max(0, performance.now() - tag.sentAtMs));
+    const phase = sequencePhase.get(tag.sequence);
+    if (phase === "initial") initialEventsDelivered += 1;
+    if (phase === "prefill") prefillEventsDelivered += 1;
+    if (phase === "workload") workloadEventsDelivered += 1;
   };
   const transport = options.mode === "adapter" ? observedTransport(baseTransport, onTransportEvent) : baseTransport;
   const socketPending = options.mode === "adapter"
@@ -432,27 +528,39 @@ async function runOnce(options: HarnessOptions): Promise<HarnessRunResult> {
   }, fairnessIntervalMs);
   fairnessTimer.unref?.();
 
-  const send = (raw: string, eventCount: number) => {
-    if (socket.readyState !== 1) return;
+  const send = (raw: string, eventCount: number, sequence: number, phase: EventPhase): boolean => {
+    if (socket.readyState !== 1) return false;
+    const acceptedBefore = baseTransport.queue.accepted;
     sourceFramesSent += 1;
     sourceEventsAttempted += eventCount;
+    if (phase === "initial") initialEventsAttempted += eventCount;
+    if (phase === "prefill") prefillEventsAttempted += eventCount;
+    if (phase === "workload") workloadEventsAttempted += eventCount;
+    sequencePhase.set(sequence, phase);
     socket.message(raw);
+    const admitted = baseTransport.queue.accepted - acceptedBefore;
+    if (phase === "initial") initialEventsAdmitted += admitted;
+    if (phase === "prefill") prefillEventsAdmitted += admitted;
+    if (phase === "workload") workloadEventsAdmitted += admitted;
+    return true;
   };
-  const sendBook = (tokenIndex: number) => {
+  const sendBook = (tokenIndex: number, phase: EventPhase): boolean => {
+    if (socket.readyState !== 1) return false;
     const sentAtMs = performance.now();
     const sequence = nextSequence++;
-    send(bookFrame(sequence, TOKENS[tokenIndex % TOKEN_COUNT]!, sentAtMs), 1);
+    return send(bookFrame(sequence, TOKENS[tokenIndex % TOKEN_COUNT]!, sentAtMs), 1, sequence, phase);
   };
-  const sendPriceChange = (entries: number) => {
+  const sendPriceChange = (entries: number): boolean => {
+    if (socket.readyState !== 1) return false;
     const sentAtMs = performance.now();
     const sequence = nextSequence++;
     const startToken = sequence % TOKEN_COUNT;
     const tokenIds = Array.from({ length: entries }, (_, offset) => TOKENS[(startToken + offset) % TOKEN_COUNT]!);
-    send(priceChangeFrame(sequence, tokenIds, sentAtMs), 1);
+    return send(priceChangeFrame(sequence, tokenIds, sentAtMs), 1, sequence, "workload");
   };
 
   const sendInitialBooks = () => {
-    for (let index = 0; index < TOKEN_COUNT; index += 1) sendBook(index);
+    for (let index = 0; index < TOKEN_COUNT; index += 1) sendBook(index, "initial");
   };
 
   const startDirectConsumer = () => {
@@ -481,12 +589,12 @@ async function runOnce(options: HarnessOptions): Promise<HarnessRunResult> {
   const preloadBeforeConsumer = options.workload.kind === "partial_queue_burst" && options.mode === "direct";
   if (preloadBeforeConsumer) {
     sendInitialBooks();
-    for (let index = 0; index < options.workload.prefillEvents; index += 1) sendBook(index);
+    for (let index = 0; index < options.workload.prefillEvents; index += 1) sendBook(index, "prefill");
     startDirectConsumer();
   } else {
     sendInitialBooks();
     if (options.workload.kind === "partial_queue_burst") {
-      for (let index = 0; index < options.workload.prefillEvents; index += 1) sendBook(index);
+      for (let index = 0; index < options.workload.prefillEvents; index += 1) sendBook(index, "prefill");
     }
   }
 
@@ -499,24 +607,27 @@ async function runOnce(options: HarnessOptions): Promise<HarnessRunResult> {
       const timer = setInterval(() => {
         const elapsed = performance.now() - workloadStarted;
         const desired = Math.floor(Math.min(elapsed, workloadDuration) * options.workload.targetRate / 1_000);
-        const prefillApplied = options.workload.kind === "partial_queue_burst" ? options.workload.prefillEvents : 0;
-        const workloadEventsSent = nextSequence - 1 - TOKEN_COUNT - prefillApplied;
+        const workloadEventsSent = workloadEventsAttempted;
         const toSend = Math.min(512, Math.max(0, desired - workloadEventsSent));
         for (let i = 0; i < toSend; i += 1) {
-          if (options.workload.kind === "steady_price_change_single") sendPriceChange(1);
-          else if (options.workload.kind === "steady_price_change_multi") sendPriceChange(options.workload.multiEntries);
-          else sendBook(nextSequence);
+          const sent = options.workload.kind === "steady_price_change_single"
+            ? sendPriceChange(1)
+            : options.workload.kind === "steady_price_change_multi"
+              ? sendPriceChange(options.workload.multiEntries)
+              : sendBook(nextSequence, "workload");
+          if (!sent && socket.readyState !== 1) break;
         }
         if (elapsed >= workloadDuration) {
           clearInterval(timer);
           resolve();
         }
       }, 1);
-      timer.unref?.();
     });
   }
 
-  const admittedAtProducerStop = baseTransport.queue.accepted - initialQueueAccepted;
+  const producerStopSnapshot = baseTransport.queue.snapshot();
+  const admittedAtProducerStop = producerStopSnapshot.accepted - initialQueueAccepted;
+  const queueDepthAtProducerStop = producerStopSnapshot.depth;
   const drainStartedAt = performance.now();
   let drainCompletionMs: number | null = null;
   const drainDeadline = drainStartedAt + Math.max(1_000, Math.min(10_000, options.durationMs * 8 + 1_000));
@@ -536,6 +647,10 @@ async function runOnce(options: HarnessOptions): Promise<HarnessRunResult> {
   const snapshot = baseTransport.queue.snapshot();
   const sourceEventsAdmitted = snapshot.accepted - initialQueueAccepted;
   const eventsDelivered = baseTransport.queue.processed - initialQueueProcessed;
+  const workloadEventsExpected = expectedWorkloadEvents(options.workload);
+  const workloadDurationSec = options.workload.durationMs > 0 ? options.workload.durationMs / 1_000 : 0;
+  const actualProducerRatePerSec = workloadDurationSec > 0 ? workloadEventsAttempted / workloadDurationSec : 0;
+  const workloadDeliveredPerSec = workloadDurationSec > 0 ? workloadEventsDelivered / workloadDurationSec : 0;
   const undeliveredAtObservationEnd = Math.max(0, sourceEventsAdmitted - sequenceTracker.unique);
   const terminalizedWithQueuedEvents = (streamTerminalError !== null || countLimitGaps > 0 || byteLimitGaps > 0)
     && snapshot.depth > 0;
@@ -555,14 +670,27 @@ async function runOnce(options: HarnessOptions): Promise<HarnessRunResult> {
     workload: options.workload.kind,
     targetEventRate: options.workload.targetRate,
     workloadDurationMs: options.workload.durationMs,
+    initialEventsAttempted,
+    initialEventsAdmitted,
+    initialEventsDelivered,
+    prefillEventsAttempted,
+    prefillEventsAdmitted,
+    prefillEventsDelivered,
+    workloadEventsExpected,
+    workloadEventsAttempted,
+    workloadEventsAdmitted,
+    workloadEventsDelivered,
+    actualProducerRatePerSec,
+    workloadDeliveredPerSec,
     sourceFramesSent,
     sourceEventsAttempted,
     sourceEventsAdmitted,
     sourceEventsRejected: Math.max(0, sourceEventsAttempted - sourceEventsAdmitted),
     eventsDelivered,
-    deliveredPerSec: eventsDelivered / Math.max(0.001, options.workload.durationMs / 1_000),
+    deliveredPerSec: workloadDeliveredPerSec,
     snapshotsProduced,
     queueFinalDepth: snapshot.depth,
+    queueDepthAtProducerStop,
     queueHighWaterEvents: snapshot.highWaterEvents,
     queueHighWaterBytes: snapshot.highWaterBytes,
     countLimitGaps,
@@ -594,18 +722,141 @@ async function runOnce(options: HarnessOptions): Promise<HarnessRunResult> {
   return result;
 }
 
+function fullIntendedWorkloadProduced(result: HarnessRunResult): boolean {
+  return result.workloadEventsExpected > 0
+    && result.workloadEventsAttempted === result.workloadEventsExpected
+    && result.workloadEventsAdmitted === result.workloadEventsExpected
+    && result.workloadEventsDelivered === result.workloadEventsExpected;
+}
+
 function resultPassesSixK(result: HarnessRunResult): boolean {
   return result.mode === "direct"
     && result.workload === "steady_book"
     && result.targetEventRate === 6_000
+    && fullIntendedWorkloadProduced(result)
     && result.countLimitGaps === 0
     && result.byteLimitGaps === 0
     && result.sourceEventsAdmitted === result.eventsDelivered
     && result.lostEvents === 0
+    && result.undeliveredAtObservationEnd === 0
     && result.duplicateEvents === 0
     && result.fifoViolations === 0
+    && result.queueDepthAtProducerStop <= 4_096
+    && result.queueHighWaterEvents <= 4_096
+    && result.queueHighWaterBytes <= 4 * 1024 * 1024
     && result.fairnessProbeCallbacksWhileBacklogged > 0
+    && result.queueFinalDepth === 0
+    && result.streamTerminalError === null
     && !result.drainTimedOut;
+}
+
+function resultPassesAdapterFinalist(result: HarnessRunResult): boolean {
+  return result.mode === "adapter"
+    && result.workload === "steady_book"
+    && result.targetEventRate === FINALIST_TARGET_RATE
+    && fullIntendedWorkloadProduced(result)
+    && result.countLimitGaps === 0
+    && result.byteLimitGaps === 0
+    && result.sourceEventsAdmitted === result.eventsDelivered
+    && result.lostEvents === 0
+    && result.undeliveredAtObservationEnd === 0
+    && result.duplicateEvents === 0
+    && result.fifoViolations === 0
+    && result.queueDepthAtProducerStop <= 4_096
+    && result.queueHighWaterEvents <= 4_096
+    && result.queueHighWaterBytes <= 4 * 1024 * 1024
+    && result.queueFinalDepth === 0
+    && result.adapterErrors === 0
+    && result.adapterObservedConnections === 1
+    && !result.drainTimedOut;
+}
+
+function metricRange(values: Array<number | null>): MetricRange | null {
+  const finite = values.filter((value): value is number => value !== null && Number.isFinite(value));
+  if (finite.length === 0) return null;
+  const min = Math.min(...finite);
+  const max = Math.max(...finite);
+  return { min, max, range: max - min };
+}
+
+function finalistPolicySummaries(records: FinalistRunRecord[]): FinalistPolicySummary[] {
+  return FINALIST_POLICIES.map((policy) => {
+    const policyRecords = records.filter((record) => record.result.maxEvents === policy.maxEvents
+      && record.result.maxSliceMs === policy.maxSliceMs);
+    const runs = policyRecords.map((record) => ({
+      repeat: record.repeat,
+      pass: record.pass,
+      workloadEventsExpected: record.result.workloadEventsExpected,
+      workloadEventsAttempted: record.result.workloadEventsAttempted,
+      workloadEventsAdmitted: record.result.workloadEventsAdmitted,
+      workloadEventsDelivered: record.result.workloadEventsDelivered,
+      actualProducerRatePerSec: record.result.actualProducerRatePerSec,
+      queueDepthAtProducerStop: record.result.queueDepthAtProducerStop,
+      queueHighWaterEvents: record.result.queueHighWaterEvents,
+      queueHighWaterBytes: record.result.queueHighWaterBytes,
+      drainCompletionMs: record.result.drainCompletionMs,
+      p99DeliveryLatencyMs: record.result.latency.p99Ms,
+      eventLoopUtilization: record.result.eventLoopUtilization,
+      eventLoopDelayP99Ms: record.result.eventLoopDelayP99Ms,
+      eventLoopDelayMaxMs: record.result.eventLoopDelayMaxMs,
+      fairnessProbeMaxDriftMs: record.result.fairnessProbeMaxDriftMs,
+      processCpuMs: record.result.processCpuMs,
+      wallMs: record.result.wallMs,
+    }));
+    return {
+      ...policy,
+      repeats: policyRecords.length,
+      passingRuns: policyRecords.filter((record) => record.pass).length,
+      allRunsPass: policyRecords.length === FINALIST_REPEATS && policyRecords.every((record) => record.pass),
+      runs,
+      variance: {
+        actualProducerRatePerSec: metricRange(policyRecords.map((record) => record.result.actualProducerRatePerSec)),
+        queueDepthAtProducerStop: metricRange(policyRecords.map((record) => record.result.queueDepthAtProducerStop)),
+        queueHighWaterEvents: metricRange(policyRecords.map((record) => record.result.queueHighWaterEvents)),
+        queueHighWaterBytes: metricRange(policyRecords.map((record) => record.result.queueHighWaterBytes)),
+        drainCompletionMs: metricRange(policyRecords.map((record) => record.result.drainCompletionMs)),
+        p99DeliveryLatencyMs: metricRange(policyRecords.map((record) => record.result.latency.p99Ms)),
+        eventLoopUtilization: metricRange(policyRecords.map((record) => record.result.eventLoopUtilization)),
+        eventLoopDelayP99Ms: metricRange(policyRecords.map((record) => record.result.eventLoopDelayP99Ms)),
+        eventLoopDelayMaxMs: metricRange(policyRecords.map((record) => record.result.eventLoopDelayMaxMs)),
+        fairnessProbeMaxDriftMs: metricRange(policyRecords.map((record) => record.result.fairnessProbeMaxDriftMs)),
+        processCpuMs: metricRange(policyRecords.map((record) => record.result.processCpuMs)),
+        wallMs: metricRange(policyRecords.map((record) => record.result.wallMs)),
+      },
+    };
+  });
+}
+
+function recommendOvhSoakCandidate(summaries: FinalistPolicySummary[]) {
+  const eligible = summaries.filter((summary) => summary.allRunsPass);
+  if (eligible.length === 0) {
+    return {
+      policy: null,
+      basis: "No finalist completed all repeated corrected-data checks; no OVH soak candidate selected.",
+    };
+  }
+  const maxOrInfinity = (range: MetricRange | null) => range?.max ?? Number.POSITIVE_INFINITY;
+  const ranked = [...eligible].sort((left, right) => {
+    const leftHeadroom = Math.max(
+      maxOrInfinity(left.variance.queueHighWaterEvents) / 4_096,
+      maxOrInfinity(left.variance.queueHighWaterBytes) / (4 * 1024 * 1024),
+    );
+    const rightHeadroom = Math.max(
+      maxOrInfinity(right.variance.queueHighWaterEvents) / 4_096,
+      maxOrInfinity(right.variance.queueHighWaterBytes) / (4 * 1024 * 1024),
+    );
+    return leftHeadroom - rightHeadroom
+      || maxOrInfinity(left.variance.drainCompletionMs) - maxOrInfinity(right.variance.drainCompletionMs)
+      || maxOrInfinity(left.variance.p99DeliveryLatencyMs) - maxOrInfinity(right.variance.p99DeliveryLatencyMs)
+      || maxOrInfinity(left.variance.fairnessProbeMaxDriftMs) - maxOrInfinity(right.variance.fairnessProbeMaxDriftMs);
+  });
+  const selected = ranked[0]!;
+  return {
+    policy: { maxEvents: selected.maxEvents, maxSliceMs: selected.maxSliceMs },
+    basis: "All three repeated direct finalist runs passed corrected workload-production, integrity, fairness, bounds, and drain checks; ranked by lowest worst-case normalized queue occupancy, then drain duration, p99 delivery latency, and fairness drift.",
+    caveat: "OVH soak candidate only; this does not select a production scheduler default or establish indefinite sustainable throughput.",
+    eligiblePolicies: eligible.map((summary) => ({ maxEvents: summary.maxEvents, maxSliceMs: summary.maxSliceMs })),
+  };
 }
 
 async function main(): Promise<void> {
@@ -636,6 +887,37 @@ async function main(): Promise<void> {
     console.log(`${index + 1}/${selectedPlans.length} ${plan.mode} ${plan.maxEvents}/${plan.maxSliceMs} ${plan.workload.kind}@${plan.workload.targetRate}: delivered=${result.eventsDelivered} admitted=${result.sourceEventsAdmitted} gaps=${result.countLimitGaps}/${result.byteLimitGaps} hwm=${result.queueHighWaterEvents}`);
   }
 
+  const finalistRecords: FinalistRunRecord[] = [];
+  if (mode === "direct" || mode === "both") {
+    for (const policy of FINALIST_POLICIES) {
+      for (let repeat = 1; repeat <= FINALIST_REPEATS; repeat += 1) {
+        const plan: HarnessOptions = {
+          ...policy,
+          workload: createWorkload("steady_book", FINALIST_DURATION_MS, FINALIST_TARGET_RATE),
+          mode: "direct",
+          durationMs: FINALIST_DURATION_MS,
+        };
+        const result = await runOnce(plan);
+        const pass = resultPassesSixK(result);
+        finalistRecords.push({ repeat, pass, result });
+        console.log(`finalist ${policy.maxEvents}/${policy.maxSliceMs} run ${repeat}/${FINALIST_REPEATS}: pass=${pass} attempted=${result.workloadEventsAttempted}/${result.workloadEventsExpected} admitted=${result.workloadEventsAdmitted} delivered=${result.workloadEventsDelivered} depth@stop=${result.queueDepthAtProducerStop} hwm=${result.queueHighWaterEvents} drain=${result.drainCompletionMs ?? "timeout"}`);
+      }
+    }
+  }
+
+  let adapterFinalistResult: HarnessRunResult | null = null;
+  if (mode === "adapter" || mode === "both") {
+    const adapterFinalistPlan: HarnessOptions = {
+      maxEvents: 64,
+      maxSliceMs: 0.5,
+      workload: createWorkload("steady_book", FINALIST_DURATION_MS, FINALIST_TARGET_RATE),
+      mode: "adapter",
+      durationMs: FINALIST_DURATION_MS,
+    };
+    adapterFinalistResult = await runOnce(adapterFinalistPlan);
+    console.log(`adapter finalist 64/0.5: attempted=${adapterFinalistResult.workloadEventsAttempted}/${adapterFinalistResult.workloadEventsExpected} admitted=${adapterFinalistResult.workloadEventsAdmitted} delivered=${adapterFinalistResult.workloadEventsDelivered} snapshots=${adapterFinalistResult.snapshotsProduced} depth@stop=${adapterFinalistResult.queueDepthAtProducerStop} hwm=${adapterFinalistResult.queueHighWaterEvents} drain=${adapterFinalistResult.drainCompletionMs ?? "timeout"}`);
+  }
+
   const candidateSummary = POLICY_SWEEP.map((policy) => {
     const result = results.find((candidate) => candidate.mode === "direct"
       && candidate.workload === "steady_book"
@@ -645,6 +927,7 @@ async function main(): Promise<void> {
     return {
       ...policy,
       sixKPass: result ? resultPassesSixK(result) : false,
+      fullIntendedWorkloadProduced: result ? fullIntendedWorkloadProduced(result) : false,
       zeroCountLimit: result ? result.countLimitGaps === 0 : false,
       zeroByteLimit: result ? result.byteLimitGaps === 0 : false,
       everyAdmittedDeliveredExactlyOnce: result
@@ -655,6 +938,13 @@ async function main(): Promise<void> {
       fifoPreserved: result ? result.fifoViolations === 0 : false,
       fairnessProbeProgress: result ? result.fairnessProbeCallbacksWhileBacklogged > 0 : false,
       drainCompleted: result ? !result.drainTimedOut : false,
+      initialEventsAttempted: result?.initialEventsAttempted ?? null,
+      workloadEventsExpected: result?.workloadEventsExpected ?? null,
+      workloadEventsAttempted: result?.workloadEventsAttempted ?? null,
+      workloadEventsAdmitted: result?.workloadEventsAdmitted ?? null,
+      workloadEventsDelivered: result?.workloadEventsDelivered ?? null,
+      actualProducerRatePerSec: result?.actualProducerRatePerSec ?? null,
+      queueDepthAtProducerStop: result?.queueDepthAtProducerStop ?? null,
       queueHighWaterEvents: result?.queueHighWaterEvents ?? null,
       queueHighWaterBytes: result?.queueHighWaterBytes ?? null,
       eventLoopUtilization: result?.eventLoopUtilization ?? null,
@@ -665,6 +955,8 @@ async function main(): Promise<void> {
       drainCompletionMs: result?.drainCompletionMs ?? null,
     };
   });
+  const finalistSummaries = finalistPolicySummaries(finalistRecords);
+  const ovhSoakRecommendation = recommendOvhSoakCandidate(finalistSummaries);
   const report = {
     generatedAt: new Date().toISOString(),
     defaultsPreserved: {
@@ -680,14 +972,42 @@ async function main(): Promise<void> {
       directSteadyRuns: POLICY_SWEEP.length * STEADY_RATES.length,
       representativeWorkloads: representativeWorkloads(durationMs).map((workload) => workload.kind),
       durationMs,
+      finalistPolicies: FINALIST_POLICIES,
+      finalistTargetRate: FINALIST_TARGET_RATE,
+      finalistDurationMs: FINALIST_DURATION_MS,
+      finalistRepeats: FINALIST_REPEATS,
+      adapterFinalist: { maxEvents: 64, maxSliceMs: 0.5, targetRate: FINALIST_TARGET_RATE, durationMs: FINALIST_DURATION_MS },
     },
     candidateSummary,
     results,
+    finalistValidation: {
+      label: "5-second 6k source-event burst tolerance",
+      notIndefiniteSustainableThroughput: true,
+      sourceEventRateUnit: "source events/sec",
+      productionObservationUnit: "normalized snapshots/sec",
+      policies: FINALIST_POLICIES,
+      targetRate: FINALIST_TARGET_RATE,
+      durationMs: FINALIST_DURATION_MS,
+      repeats: FINALIST_REPEATS,
+      runs: finalistRecords,
+      policySummaries: finalistSummaries,
+    },
+    adapterFinalistValidation: adapterFinalistResult
+      ? {
+        label: "exact 64 / 0.5 ms adapter finalist validation",
+        notFullEnginePipeline: true,
+        pass: resultPassesAdapterFinalist(adapterFinalistResult),
+        result: adapterFinalistResult,
+      }
+      : null,
     interpretation: {
-      sixKPassDefinition: "zero count/byte gaps, every admitted source event delivered exactly once, FIFO, fairness progress, and drain completion",
+      sixKPassDefinition: "full intended steady workload produced, admitted, and delivered; zero count/byte gaps; every admitted source event delivered exactly once; FIFO; fairness progress; and drain completion",
+      producerRateDefinition: "actualProducerRatePerSec is workloadEventsAttempted divided by steady workload duration; initial book and partial-queue setup events are excluded",
       fairnessLimitation: "The local periodic timer detects event-loop starvation only; OVH production soak remains the network fairness proof.",
       sustainedHarnessLimitation: "scripts/sustained-capacity-harness.ts is not used as scheduler-capacity evidence because it uses ScriptedBoundedMarketTransport.",
-      recommendation: null,
+      sourceUnitLimitation: "The approximately 6k Stage-0 production observation was normalized snapshots/sec; this harness calibrates source events/sec, which are not identical units.",
+      finalistDefinition: "5-second 6k source-event burst tolerance; a bounded backlog that drains after producer stop passes the burst check, but this is not indefinite sustainable throughput.",
+      recommendation: ovhSoakRecommendation,
     },
   };
   await mkdir(dirname(output), { recursive: true });
