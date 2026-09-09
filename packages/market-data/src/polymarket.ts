@@ -14,7 +14,7 @@ import {
   type QualificationReasonCode,
   type QualificationResult,
 } from "@pm/core";
-import { BoundedClobMarketTransport } from "./bounded-clob-market.js";
+import { BoundedClobMarketTransport, ClobMarketCloseError } from "./bounded-clob-market.js";
 import { BoundedIngressQueue, IngressOverflowError, type IngressQueueObserver } from "./bounded-ingress.js";
 import {
   CLOB_MARKET_WS_URL,
@@ -418,7 +418,7 @@ export class PolymarketMarketDataAdapter {
           this.activeStreams += 1;
           this.closeCurrentStream = () => {
             resubscribed = true;
-            void stream.close();
+            void stream.close("generation_change");
           };
           if (signal.aborted || connectAbort.signal.aborted) this.closeCurrentStream();
           try {
@@ -463,6 +463,10 @@ export class PolymarketMarketDataAdapter {
           }
           if (signal.aborted) break;
           if (resubscribed || this.tokenIds.length === 0 || generation !== this.streamGeneration) continue;
+          const closeDiagnostic = stream.closeDiagnostic?.();
+          if (closeDiagnostic && closeDiagnostic.kind !== "operator_shutdown" && closeDiagnostic.kind !== "generation_change") {
+            throw new ClobMarketCloseError("POLYMARKET_STREAM_ENDED", closeDiagnostic);
+          }
           throw new Error("POLYMARKET_STREAM_ENDED");
         } catch (error) {
           this.closeCurrentStream = null;
