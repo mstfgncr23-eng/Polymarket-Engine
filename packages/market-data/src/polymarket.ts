@@ -411,7 +411,7 @@ export class PolymarketMarketDataAdapter {
           };
           let stream: Awaited<ReturnType<MarketStreamTransport["subscribe"]>>;
           try {
-            stream = await this.transport.subscribe(current, true, connectAbort.signal);
+            stream = await this.transport.subscribe(current, false, connectAbort.signal);
           } finally {
             signal.removeEventListener("abort", onParentAbort);
           }

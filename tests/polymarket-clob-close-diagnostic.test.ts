@@ -3,6 +3,7 @@ import {
   BoundedClobMarketTransport,
   ClobMarketCloseError,
   PolymarketMarketDataAdapter,
+  ScriptedBoundedMarketTransport,
   classifyClobRemoteClose,
   CLOB_MARKET_CONNECT_TIMEOUT,
 } from "@pm/market-data";
@@ -22,13 +23,14 @@ function closeEvent(code: number, reason: string, wasClean: boolean): Event {
 class DiagnosticWebSocket extends EventTarget {
   static instances: DiagnosticWebSocket[] = [];
   readyState = 0;
+  readonly sent: string[] = [];
 
   constructor(readonly url: string) {
     super();
     DiagnosticWebSocket.instances.push(this);
   }
 
-  send(_data: string): void {}
+  send(data: string): void { this.sent.push(data); }
 
   close(): void {
     if (this.readyState === 3) return;
@@ -52,6 +54,15 @@ class DiagnosticWebSocket extends EventTarget {
   }
 }
 
+class RecordingScriptedTransport extends ScriptedBoundedMarketTransport {
+  readonly customFeatureEnabled: boolean[] = [];
+
+  override async subscribe(tokenIds: readonly string[], customFeatureEnabled = true, signal?: AbortSignal) {
+    this.customFeatureEnabled.push(customFeatureEnabled);
+    return super.subscribe(tokenIds, customFeatureEnabled, signal);
+  }
+}
+
 async function openStream(options: ConstructorParameters<typeof BoundedClobMarketTransport>[0] = {}) {
   DiagnosticWebSocket.instances = [];
   const transport = new BoundedClobMarketTransport({
@@ -68,6 +79,53 @@ async function openStream(options: ConstructorParameters<typeof BoundedClobMarke
 }
 
 describe("Polymarket CLOB remote close diagnostics", () => {
+  it("passes customFeatureEnabled=false on the live adapter subscription path", async () => {
+    const transport = new RecordingScriptedTransport();
+    const adapter = new PolymarketMarketDataAdapter(undefined, { transport });
+    adapter.registerManualToken("tok-up", "tok-up", "UP", "BTC");
+    const abort = new AbortController();
+    const running = adapter.run(["tok-up"], {
+      onSnapshot: () => undefined,
+      onConnection: () => undefined,
+      onError: () => undefined,
+    }, abort.signal);
+
+    await waitFor(() => transport.customFeatureEnabled.length === 1);
+    expect(transport.customFeatureEnabled).toEqual([false]);
+    abort.abort("test");
+    await running;
+  });
+
+  it("writes custom_feature_enabled=false in the owned WebSocket subscribe frame", async () => {
+    DiagnosticWebSocket.instances = [];
+    const transport = new BoundedClobMarketTransport({
+      webSocket: DiagnosticWebSocket as unknown as typeof WebSocket,
+      connectTimeoutMs: 1_000,
+    });
+    const adapter = new PolymarketMarketDataAdapter(undefined, { transport, ingress: transport.queue });
+    adapter.registerManualToken("tok-up", "tok-up", "UP", "BTC");
+    const connections: Array<{ state: string }> = [];
+    const abort = new AbortController();
+    const running = adapter.run(["tok-up"], {
+      onSnapshot: () => undefined,
+      onConnection: (event) => { connections.push(event); },
+      onError: () => undefined,
+    }, abort.signal);
+
+    await waitFor(() => DiagnosticWebSocket.instances.length === 1);
+    const socket = DiagnosticWebSocket.instances[0]!;
+    socket.open();
+    await waitFor(() => connections.some((event) => event.state === "CONNECTED"));
+
+    expect(JSON.parse(socket.sent[0]!)).toEqual({
+      assets_ids: ["tok-up"],
+      custom_feature_enabled: false,
+      type: "market",
+    });
+    abort.abort("test");
+    await running;
+  });
+
   it("preserves code, reason, and wasClean on a remote close", async () => {
     const { stream, socket } = await openStream();
     const next = stream[Symbol.asyncIterator]().next();
