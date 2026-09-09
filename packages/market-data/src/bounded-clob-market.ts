@@ -1,4 +1,5 @@
 import { BoundedIngressQueue, IngressOverflowError } from "./bounded-ingress.js";
+import { DeliverySlicePolicy, type MonotonicClock } from "./delivery-slice.js";
 import { CLOB_MARKET_WS_URL, MARKET_CONNECT_BOUNDS, MARKET_INGRESS_BOUNDS } from "./ingress-bounds.js";
 import type { MarketStreamTransport } from "./market-stream-transport.js";
 
@@ -60,6 +61,12 @@ export interface BoundedMarketTransportOptions {
   staleMs?: number;
   connectTimeoutMs?: number;
   webSocket?: typeof WebSocket;
+  /** Calibration override; the production default remains PR30A's one event. */
+  maxDeliveryEventsPerSlice?: number;
+  /** Calibration override for the independent monotonic time bound. */
+  maxDeliverySliceMs?: number;
+  /** Internal deterministic-clock hook for scheduler tests and calibration. */
+  monotonicNow?: MonotonicClock;
 }
 
 export const CLOB_MARKET_CONNECT_TIMEOUT = "CLOB_MARKET_WS_CONNECT_TIMEOUT";
@@ -69,6 +76,9 @@ export const CLOB_MARKET_WS_ERROR = "CLOB_MARKET_WS_ERROR";
 export const CLOB_MARKET_WS_STALE = "CLOB_MARKET_WS_STALE";
 export const CLOB_MARKET_WS_OPEN_FAILED = "CLOB_MARKET_WS_OPEN_FAILED";
 export const MARKET_INGRESS_MALFORMED = "MARKET_INGRESS_MALFORMED";
+
+const DEFAULT_DELIVERY_EVENTS_PER_SLICE = 1;
+const DEFAULT_DELIVERY_SLICE_MS = 1;
 
 interface StreamWaiter {
   resolve: (result: IteratorResult<unknown>) => void;
@@ -175,6 +185,9 @@ export class BoundedClobMarketTransport implements MarketStreamTransport {
   private readonly connectTimeoutMs: number;
   private readonly maxRawFrameBytes: number;
   private readonly WebSocketImpl: typeof WebSocket;
+  private readonly maxDeliveryEventsPerSlice: number;
+  private readonly maxDeliverySliceMs: number;
+  private readonly monotonicNow: MonotonicClock;
   private generation = 0;
 
   constructor(options: BoundedMarketTransportOptions = {}) {
@@ -188,6 +201,9 @@ export class BoundedClobMarketTransport implements MarketStreamTransport {
     this.connectTimeoutMs = options.connectTimeoutMs ?? MARKET_CONNECT_BOUNDS.connectTimeoutMs;
     this.maxRawFrameBytes = options.maxRawFrameBytes ?? MARKET_INGRESS_BOUNDS.maxRawFrameBytes;
     this.WebSocketImpl = options.webSocket ?? WebSocket;
+    this.maxDeliveryEventsPerSlice = options.maxDeliveryEventsPerSlice ?? DEFAULT_DELIVERY_EVENTS_PER_SLICE;
+    this.maxDeliverySliceMs = options.maxDeliverySliceMs ?? DEFAULT_DELIVERY_SLICE_MS;
+    this.monotonicNow = options.monotonicNow ?? (() => performance.now());
   }
 
   currentGeneration(): number { return this.generation; }
@@ -212,6 +228,11 @@ export class BoundedClobMarketTransport implements MarketStreamTransport {
     let pingTimer: ReturnType<typeof setInterval> | undefined;
     let deliveryHandle: ReturnType<typeof setImmediate> | undefined;
     let deliveryScheduled = false;
+    const deliverySlice = new DeliverySlicePolicy({
+      maxEvents: this.maxDeliveryEventsPerSlice,
+      maxSliceMs: this.maxDeliverySliceMs,
+      now: this.monotonicNow,
+    });
 
     const attach = (type: string, fn: EventListenerOrEventListenerObject, options?: AddEventListenerOptions) => {
       socket.addEventListener(type, fn, options);
@@ -237,22 +258,36 @@ export class BoundedClobMarketTransport implements MarketStreamTransport {
 
     const isCurrentGeneration = () => generation === this.generation;
 
-    const pump = () => {
-      if (pendingError || ended || !isCurrentGeneration()) {
-        while (waiters.length > 0) {
-          const waiter = waiters.shift()!;
-          if (pendingError) waiter.reject(pendingError);
-          else waiter.resolve({ value: undefined, done: true });
+    const deliverAvailable = () => {
+      while (waiters.length > 0 && queue.depth > 0 && deliverySlice.canDeliver()) {
+        if (pendingError || ended || !isCurrentGeneration()) {
+          settleWaiters();
+          return;
         }
-        return;
+        const item = queue.dequeue();
+        if (item === undefined) return;
+        if (pendingError || ended || !isCurrentGeneration()) {
+          settleWaiters();
+          return;
+        }
+        deliverySlice.recordDelivery();
+        waiters.shift()!.resolve({ value: item, done: false });
       }
 
-      const waiter = waiters[0];
-      if (!waiter) return;
-      const item = queue.dequeue();
-      if (item === undefined) return;
-      waiters.shift()!.resolve({ value: item, done: false });
+      if (pendingError || ended || !isCurrentGeneration()) {
+        settleWaiters();
+        return;
+      }
       if (waiters.length > 0 && queue.depth > 0) schedulePump();
+    };
+
+    const pump = () => {
+      if (pendingError || ended || !isCurrentGeneration()) {
+        settleWaiters();
+        return;
+      }
+      deliverySlice.begin();
+      deliverAvailable();
     };
 
     const cancelScheduledPump = () => {
@@ -282,6 +317,7 @@ export class BoundedClobMarketTransport implements MarketStreamTransport {
       if (error && !pendingError) pendingError = error;
       detachAll();
       cancelScheduledPump();
+      deliverySlice.reset();
       signal?.removeEventListener("abort", onAbort);
       try { socket.close(); } catch { /* already closed */ }
       settleWaiters();
@@ -488,7 +524,11 @@ export class BoundedClobMarketTransport implements MarketStreamTransport {
           }
           return await new Promise<IteratorResult<unknown>>((resolve, reject) => {
             waiters.push({ resolve, reject });
-            schedulePump();
+            if (deliverySlice.active && deliverySlice.hasDelivered && deliverySlice.canDeliver()) {
+              deliverAvailable();
+            } else {
+              schedulePump();
+            }
           });
         },
       }),
