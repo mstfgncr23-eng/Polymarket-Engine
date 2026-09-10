@@ -1,3 +1,4 @@
+import { performance } from "node:perf_hooks";
 import { createPublicClient } from "@polymarket/client";
 import {
   bookLevelSchema,
@@ -16,6 +17,7 @@ import {
 } from "@pm/core";
 import { BoundedClobMarketTransport, ClobMarketCloseError } from "./bounded-clob-market.js";
 import { BoundedIngressQueue, IngressOverflowError, type IngressQueueObserver } from "./bounded-ingress.js";
+import type { MarketDataObservability, MarketGenerationEndReason } from "./market-observability.js";
 import {
   CLOB_MARKET_WS_URL,
   MARKET_CONNECT_BOUNDS,
@@ -125,6 +127,11 @@ export interface MarketNormalizeObserver {
   onPriceChangeEvent(entriesInPayload: number, processed: number): void;
 }
 
+function observeSafely(observer: MarketDataObservability | null, callback: () => void): void {
+  if (!observer) return;
+  try { callback(); } catch { /* observability must not change adapter semantics */ }
+}
+
 export interface DiscoveryReport {
   discovered: DiscoveredMarket[];
   qualified: DiscoveredMarket[];
@@ -168,6 +175,7 @@ export class PolymarketMarketDataAdapter {
   private readonly anomalySampler = new BoundedAnomalySampler();
   private lastAnomaly: PolymarketFeedAnomaly | null = null;
   private normalizeObserver: MarketNormalizeObserver | null = null;
+  private observability: MarketDataObservability | null = null;
   private readonly sync = new TokenSyncIndex();
   readonly ingress: BoundedIngressQueue;
   private readonly transport: MarketStreamTransport;
@@ -179,28 +187,46 @@ export class PolymarketMarketDataAdapter {
   private tokenIdSet = new Set<string>();
   private pendingEpochReason: IngressGapReason | null = null;
   private readonly stableAfterMs: number;
+  /** Bounded by the desired token set and released at the end of each attempt. */
+  private readonly generationTrustedTokens = new Set<string>();
+  private generationObservationActive = false;
+  private generationStartedMonotonic = 0;
+  private generationStartedAtMs = 0;
+  private generationQueueHighWaterEventsAtStart = 0;
+  private generationQueueHighWaterBytesAtStart = 0;
   lastReconnectDelayMs = 0;
   readonly reconnectDelays: number[] = [];
 
   constructor(
     client?: PublicClient,
-    options: { transport?: MarketStreamTransport; marketWsUrl?: string; ingress?: BoundedIngressQueue; stableAfterMs?: number } = {},
+    options: { transport?: MarketStreamTransport; marketWsUrl?: string; ingress?: BoundedIngressQueue; stableAfterMs?: number; observability?: MarketDataObservability } = {},
   ) {
     this.client = client ?? createPublicClient();
     if (options.transport && !isBoundedMarketStreamTransport(options.transport)) {
       throw new Error("MARKET_TRANSPORT_MUST_BE_BOUNDED");
     }
     this.ingress = options.ingress ?? options.transport?.queue ?? new BoundedIngressQueue();
+    this.observability = options.observability ?? null;
     this.transport = options.transport ?? new BoundedClobMarketTransport({
       url: options.marketWsUrl ?? CLOB_MARKET_WS_URL,
       queue: this.ingress,
+      ...(this.observability ? { observability: this.observability } : {}),
     });
     this.stableAfterMs = options.stableAfterMs ?? MARKET_CONNECT_BOUNDS.stableAfterMs;
+    this.setObservability(this.observability);
   }
 
   lastReconnectDelayForTest(): number { return this.lastReconnectDelayMs; }
 
   setNormalizeObserver(observer: MarketNormalizeObserver | null): void { this.normalizeObserver = observer; }
+
+  setObservability(observer: MarketDataObservability | null): void {
+    this.observability = observer;
+    const transport = this.transport as MarketStreamTransport & {
+      setObservability?: (next: MarketDataObservability | null) => void;
+    };
+    transport.setObservability?.(observer);
+  }
 
   isTokenSynchronized(tokenId: string): boolean { return this.sync.isSynchronized(tokenId); }
   tokenSyncState(tokenId: string): TokenSyncState { return this.sync.stateOf(tokenId); }
@@ -232,7 +258,7 @@ export class PolymarketMarketDataAdapter {
 
   /** Same normalize path as the live feed. Intended for replay/equivalence tests. */
   normalizeSourceEvent(event: unknown, handlers: Pick<PolymarketFeedHandlers, "onAnomaly"> = {}): MarketSnapshot[] {
-    return this.normalizeEvent(event, handlers);
+    return this.normalizeObservedEvent(event, handlers);
   }
 
   async discoverCryptoMarkets(
@@ -366,6 +392,47 @@ export class PolymarketMarketDataAdapter {
     return { changed, previous, next };
   }
 
+  private beginGenerationObservation(generation: number, tokenCount: number): void {
+    const queue = this.ingress.snapshot();
+    this.generationTrustedTokens.clear();
+    this.generationObservationActive = this.observability !== null;
+    this.generationStartedMonotonic = performance.now();
+    this.generationStartedAtMs = Date.now();
+    this.generationQueueHighWaterEventsAtStart = queue.highWaterEvents;
+    this.generationQueueHighWaterBytesAtStart = queue.highWaterBytes;
+    observeSafely(this.observability, () => this.observability!.onGenerationStart({
+      generation,
+      tokenCount,
+      startedAtMs: this.generationStartedAtMs,
+      queueHighWaterEvents: queue.highWaterEvents,
+      queueHighWaterBytes: queue.highWaterBytes,
+    }));
+  }
+
+  private finishGenerationObservation(
+    generation: number,
+    endReason: MarketGenerationEndReason,
+    diagnostic: { code: number | null; reason: string } | null,
+  ): void {
+    if (!this.generationObservationActive) {
+      this.generationTrustedTokens.clear();
+      return;
+    }
+    const queue = this.ingress.snapshot();
+    observeSafely(this.observability, () => this.observability!.onGenerationEnd({
+      generation,
+      endedAtMs: Date.now(),
+      durationMs: Math.max(0, performance.now() - this.generationStartedMonotonic),
+      queueHighWaterEvents: Math.max(0, queue.highWaterEvents - this.generationQueueHighWaterEventsAtStart),
+      queueHighWaterBytes: Math.max(0, queue.highWaterBytes - this.generationQueueHighWaterBytesAtStart),
+      closeCode: diagnostic?.code ?? null,
+      closeReason: diagnostic?.reason ?? "",
+      endReason,
+    }));
+    this.generationObservationActive = false;
+    this.generationTrustedTokens.clear();
+  }
+
   async run(tokenIds: readonly string[], handlers: PolymarketFeedHandlers, signal: AbortSignal): Promise<void> {
     this.setTokenIds(this.tokenIds.length > 0 ? this.tokenIds : tokenIds);
     const backoff = new ExponentialBackoff({ initialDelayMs: 500, maxDelayMs: 30_000, multiplier: 2, jitterRatio: 0.2 });
@@ -386,9 +453,19 @@ export class PolymarketMarketDataAdapter {
         await handlers.onConnection({ feed: "polymarket", state: "CONNECTING", at: new Date().toISOString(), reconnectCount });
         let resubscribed = false;
         const generation = ++this.streamGeneration;
+        let generationEnded = false;
+        let generationEndReason: MarketGenerationEndReason = "other";
+        let generationDiagnostic: { code: number | null; reason: string } | null = null;
+        const current = [...this.tokenIds];
+        if (current.length === 0) continue;
+        this.beginGenerationObservation(generation, current.length);
+        const finishGeneration = (reason: MarketGenerationEndReason, diagnostic = generationDiagnostic) => {
+          if (generationEnded) return;
+          generationEnded = true;
+          generationEndReason = reason;
+          this.finishGenerationObservation(generation, generationEndReason, diagnostic);
+        };
         try {
-          const current = [...this.tokenIds];
-          if (current.length === 0) continue;
           const generationRestart = generation > 1 && reconnectCount === 0;
           const previousStreamTrusted = this.streamHadTrustedBooks;
           this.streamHadTrustedBooks = false;
@@ -424,21 +501,45 @@ export class PolymarketMarketDataAdapter {
           try {
             await handlers.onConnection({ feed: "polymarket", state: "CONNECTED", at: new Date().toISOString(), reconnectCount });
             for await (const event of stream) {
-              if (signal.aborted) { await stream.close(); break; }
-              if (resubscribed || generation !== this.streamGeneration) break;
+              if (signal.aborted) {
+                finishGeneration("abort_shutdown");
+                await stream.close();
+                break;
+              }
+              if (resubscribed || generation !== this.streamGeneration) {
+                finishGeneration("operator_generation_change");
+                break;
+              }
               try {
-                for (const snapshot of this.normalizeEvent(event, handlers)) {
+                for (const snapshot of this.normalizeObservedEvent(event, handlers)) {
                   if (resubscribed || generation !== this.streamGeneration) break;
-                  await handlers.onSnapshot(snapshot);
+                  const callbackStarted = performance.now();
+                  let synchronousEnded = false;
+                  let synchronousDurationSeconds = 0;
+                  try {
+                    const pending = handlers.onSnapshot(snapshot);
+                    synchronousDurationSeconds = (performance.now() - callbackStarted) / 1000;
+                    synchronousEnded = true;
+                    await pending;
+                  } finally {
+                    const totalDurationSeconds = (performance.now() - callbackStarted) / 1000;
+                    observeSafely(this.observability, () => this.observability!.onSnapshotCallback({
+                      synchronousDurationSeconds: synchronousEnded ? synchronousDurationSeconds : totalDurationSeconds,
+                      totalDurationSeconds,
+                      awaitedDurationSeconds: Math.max(0, totalDurationSeconds - (synchronousEnded ? synchronousDurationSeconds : totalDurationSeconds)),
+                    }));
+                  }
                 }
               } catch (error) {
                 const normalized = error instanceof Error ? error : new Error(String(error));
                 if (normalized instanceof IngressOverflowError) {
+                  finishGeneration("overflow");
                   this.noteUnexpectedStreamLoss(normalized.reason, handlers);
                   await stream.close();
                   break;
                 }
                 if (normalized instanceof MarketIngressMalformedError) {
+                  finishGeneration("malformed");
                   if (this.streamHadTrustedBooks) this.noteUnexpectedStreamLoss("malformed", handlers);
                   await stream.close();
                   break;
@@ -461,22 +562,52 @@ export class PolymarketMarketDataAdapter {
             this.closeCurrentStream = null;
             this.activeStreams = Math.max(0, this.activeStreams - 1);
           }
-          if (signal.aborted) break;
-          if (resubscribed || this.tokenIds.length === 0 || generation !== this.streamGeneration) continue;
+          if (signal.aborted) {
+            finishGeneration("abort_shutdown");
+            break;
+          }
+          if (resubscribed || this.tokenIds.length === 0 || generation !== this.streamGeneration) {
+            finishGeneration("operator_generation_change");
+            continue;
+          }
           const closeDiagnostic = stream.closeDiagnostic?.();
+          generationDiagnostic = closeDiagnostic ? { code: closeDiagnostic.code, reason: closeDiagnostic.reason } : null;
           if (closeDiagnostic && closeDiagnostic.kind !== "operator_shutdown" && closeDiagnostic.kind !== "generation_change") {
+            finishGeneration(closeDiagnostic.kind === "stale_heartbeat" ? "stale" : "provider_close", generationDiagnostic);
             throw new ClobMarketCloseError("POLYMARKET_STREAM_ENDED", closeDiagnostic);
           }
+          finishGeneration("provider_close", generationDiagnostic);
           throw new Error("POLYMARKET_STREAM_ENDED");
         } catch (error) {
           this.closeCurrentStream = null;
-          if (signal.aborted) break;
-          if (resubscribed || generation !== this.streamGeneration) continue;
-          const normalized = error instanceof Error ? error : new Error(String(error));
-          if (isTimestampDisorderError(normalized)) {
-            this.noteAnomaly(handlers, timestampDisorderAnomaly(normalized));
+          if (signal.aborted) {
+            finishGeneration("abort_shutdown");
+            break;
+          }
+          if (resubscribed || generation !== this.streamGeneration) {
+            finishGeneration("operator_generation_change");
             continue;
           }
+          const normalized = error instanceof Error ? error : new Error(String(error));
+          if (normalized instanceof ClobMarketCloseError) {
+            generationDiagnostic = { code: normalized.diagnostic.code, reason: normalized.diagnostic.reason };
+          }
+          if (isTimestampDisorderError(normalized)) {
+            this.noteAnomaly(handlers, timestampDisorderAnomaly(normalized));
+            finishGeneration("stale", generationDiagnostic);
+            continue;
+          }
+          const endReason: MarketGenerationEndReason = normalized instanceof IngressOverflowError
+            ? "overflow"
+            : normalized instanceof MarketIngressMalformedError
+              ? "malformed"
+              : normalized instanceof ClobMarketCloseError && normalized.diagnostic.kind === "stale_heartbeat"
+                ? "stale"
+                : normalized instanceof ClobMarketCloseError
+                  && (normalized.diagnostic.kind === "clean_remote_close" || normalized.diagnostic.kind === "abnormal_remote_close")
+                  ? "provider_close"
+                  : "other";
+          finishGeneration(endReason, generationDiagnostic);
           this.noteUnexpectedStreamLoss(unexpectedLossReason(normalized), handlers);
           reconnectCount += 1;
           if (!(normalized instanceof IngressOverflowError)) await handlers.onError(normalized);
@@ -485,6 +616,8 @@ export class PolymarketMarketDataAdapter {
           this.lastReconnectDelayMs = delay;
           this.reconnectDelays.push(delay);
           await abortableDelay(delay, signal).catch(() => undefined);
+        } finally {
+          finishGeneration(generationEndReason, generationDiagnostic);
         }
       }
       this.closeCurrentStream = null;
@@ -572,6 +705,23 @@ export class PolymarketMarketDataAdapter {
     return [];
   }
 
+  private normalizeObservedEvent(
+    event: unknown,
+    handlers: Pick<PolymarketFeedHandlers, "onAnomaly" | "onResync" | "onGap">,
+  ): MarketSnapshot[] {
+    const started = performance.now();
+    let snapshots: MarketSnapshot[] = [];
+    try {
+      snapshots = this.normalizeEvent(event, handlers);
+      return snapshots;
+    } finally {
+      observeSafely(this.observability, () => this.observability!.onNormalizeEvent({
+        durationSeconds: (performance.now() - started) / 1000,
+        snapshotsProduced: snapshots.length,
+      }));
+    }
+  }
+
   /**
    * Parse → validate every trusted field → stage → atomically publish.
    * A malformed canonical book never becomes SYNCED / adapter / MCP state.
@@ -635,6 +785,10 @@ export class PolymarketMarketDataAdapter {
     const synced = this.sync.markSyncedFromBook(tokenId);
     if (this.firstTrustedBookAtMs === 0) this.firstTrustedBookAtMs = Date.now();
     this.streamHadTrustedBooks = true;
+    if (this.generationObservationActive && !this.generationTrustedTokens.has(tokenId)) {
+      this.generationTrustedTokens.add(tokenId);
+      observeSafely(this.observability, () => this.observability!.onTrustedFullBook());
+    }
     if (synced.wasResync) {
       handlers.onResync?.({ reason: "full_book", tokenId, epoch: synced.epoch });
     }

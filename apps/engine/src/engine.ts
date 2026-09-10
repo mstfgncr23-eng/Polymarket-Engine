@@ -338,6 +338,10 @@ export class EngineService {
     this.marketAdapter = adapters?.market ?? new PolymarketMarketDataAdapter();
     if (this.marketAdapter instanceof PolymarketMarketDataAdapter) {
       this.marketAdapter.setNormalizeObserver(this.metrics.normalizeObserver());
+      this.marketAdapter.setObservability(this.metrics.marketObservability((summary) => {
+        const info = (this.logger as unknown as { info?: (bindings: object, message: string) => void }).info;
+        info?.call(this.logger, summary, "polymarket market stream generation summary");
+      }));
       this.marketAdapter.setIngressObserver({
         onChange: (snapshot) => this.metrics.noteIngressSnapshot(snapshot),
       });
@@ -1641,70 +1645,76 @@ export class EngineService {
     if (!this.state.recoveryComplete) return;
     if (!this.tokenIdSet.has(snapshot.tokenId)) return;
     const started = performance.now();
-    this.metrics.marketMessages.inc();
-    this.state.connections.polymarket.lastMessageAt = snapshot.receivedAt;
-    const synchronized = this.adapterTokenSynchronized(snapshot.tokenId);
-    if (!synchronized) {
+    try {
+      this.metrics.marketMessages.inc();
+      this.state.connections.polymarket.lastMessageAt = snapshot.receivedAt;
+      const synchronized = this.adapterTokenSynchronized(snapshot.tokenId);
+      if (!synchronized) {
+        this.updateReady();
+        this.state.eventLatencyMs = performance.now() - started;
+        this.metrics.eventLatency.observe((performance.now() - started) / 1000);
+        return;
+      }
+      const epoch = this.adapterTokenEpoch(snapshot.tokenId);
+      const previousEpoch = this.snapshotEpoch.get(snapshot.tokenId);
+      const newTrustedEpoch = previousEpoch !== epoch;
+      if (newTrustedEpoch) {
+        const siblingId = this.siblingTokenId(snapshot.marketId, snapshot.outcome);
+        const siblingEpoch = siblingId ? this.snapshotEpoch.get(siblingId) : undefined;
+        if (siblingEpoch !== epoch) this.clearMarketPairProjections(snapshot.marketId);
+        this.snapshotEpoch.set(snapshot.tokenId, epoch);
+      }
+      this.state.marketSnapshots.set(snapshot.tokenId, snapshot);
+      const pair = this.snapshots.get(snapshot.marketId) ?? {};
+      const previous = pair[snapshot.outcome];
+      pair[snapshot.outcome] = snapshot;
+      this.snapshots.set(snapshot.marketId, pair);
+      if (snapshot.asset) {
+        this.assetByMarket.set(snapshot.marketId, snapshot.asset);
+        this.assetIndex.add(snapshot.asset, snapshot.marketId);
+        this.metrics.assetMarketIndexEntries.set(this.assetIndex.entryCount());
+      }
       this.updateReady();
-      this.state.eventLatencyMs = performance.now() - started;
-      this.metrics.eventLatency.observe((performance.now() - started) / 1000);
-      return;
-    }
-    const epoch = this.adapterTokenEpoch(snapshot.tokenId);
-    const previousEpoch = this.snapshotEpoch.get(snapshot.tokenId);
-    const newTrustedEpoch = previousEpoch !== epoch;
-    if (newTrustedEpoch) {
-      const siblingId = this.siblingTokenId(snapshot.marketId, snapshot.outcome);
-      const siblingEpoch = siblingId ? this.snapshotEpoch.get(siblingId) : undefined;
-      if (siblingEpoch !== epoch) this.clearMarketPairProjections(snapshot.marketId);
-      this.snapshotEpoch.set(snapshot.tokenId, epoch);
-    }
-    this.state.marketSnapshots.set(snapshot.tokenId, snapshot);
-    const pair = this.snapshots.get(snapshot.marketId) ?? {};
-    const previous = pair[snapshot.outcome];
-    pair[snapshot.outcome] = snapshot;
-    this.snapshots.set(snapshot.marketId, pair);
-    if (snapshot.asset) {
-      this.assetByMarket.set(snapshot.marketId, snapshot.asset);
-      this.assetIndex.add(snapshot.asset, snapshot.marketId);
-      this.metrics.assetMarketIndexEntries.set(this.assetIndex.entryCount());
-    }
-    this.updateReady();
-    // Market snapshots are live processing inputs. The current snapshot/state
-    // maps above remain the source for trigger, maker, risk, and dashboard work;
-    // raw observations are intentionally not permanent journal records.
-    this.record("MARKET_EVENT", snapshot.traceId, snapshot.marketId, { tokenId: snapshot.tokenId, outcome: snapshot.outcome, sequence: snapshot.sequence }, snapshot.asset ?? null);
+      // Market snapshots are live processing inputs. The current snapshot/state
+      // maps above remain the source for trigger, maker, risk, and dashboard work;
+      // raw observations are intentionally not permanent journal records.
+      this.record("MARKET_EVENT", snapshot.traceId, snapshot.marketId, { tokenId: snapshot.tokenId, outcome: snapshot.outcome, sequence: snapshot.sequence }, snapshot.asset ?? null);
 
-    if (synchronized && previous) {
-      for (const orderId of this.restingIndex.orderIdsFor(snapshot.tokenId)) {
-        const resting = this.restingOrders.get(orderId);
-        if (!resting || resting.order.tokenId !== snapshot.tokenId) continue;
-        const evolved = evolveMakerOrder(resting, previous, snapshot);
-        if (evolved.fill) {
-          await this.applyFill(evolved.fill, { restingAfter: evolved.resting });
-        } else {
-          this.restingOrders.set(orderId, evolved.resting);
-          if (Number(evolved.resting.remaining) === 0) {
-            this.restingOrders.delete(orderId);
-            this.restingIndex.remove(orderId);
+      if (synchronized && previous) {
+        for (const orderId of this.restingIndex.orderIdsFor(snapshot.tokenId)) {
+          const resting = this.restingOrders.get(orderId);
+          if (!resting || resting.order.tokenId !== snapshot.tokenId) continue;
+          this.metrics.marketRestingOrderEvaluations.inc();
+          const evolved = evolveMakerOrder(resting, previous, snapshot);
+          if (evolved.fill) {
+            this.metrics.marketMakerFillsDetected.inc();
+            await this.applyFill(evolved.fill, { restingAfter: evolved.resting });
+          } else {
+            this.restingOrders.set(orderId, evolved.resting);
+            if (Number(evolved.resting.remaining) === 0) {
+              this.restingOrders.delete(orderId);
+              this.restingIndex.remove(orderId);
+            }
           }
         }
+        this.metrics.restingOrderTokenIndexEntries.set(this.restingIndex.entryCount());
       }
-      this.metrics.restingOrderTokenIndexEntries.set(this.restingIndex.entryCount());
-    }
 
-    if (synchronized) {
-      // Deterministic market state is a precursor for bounded scout warming;
-      // this admission is intentionally separate from economic triggers.
-      this.requestScoutRefresh(snapshot, "market");
-      const triggers = this.triggerEngine.ingestMarket(snapshot);
-      for (const trigger of triggers) this.admitTrigger(trigger, this.provenanceForGenerated(trigger, "MARKET"));
+      if (synchronized) {
+        // Deterministic market state is a precursor for bounded scout warming;
+        // this admission is intentionally separate from economic triggers.
+        this.requestScoutRefresh(snapshot, "market");
+        const triggers = this.triggerEngine.ingestMarket(snapshot);
+        for (const trigger of triggers) this.admitTrigger(trigger, this.provenanceForGenerated(trigger, "MARKET"));
+      }
+      const window = this.marketsById.get(snapshot.marketId);
+      if (window?.endDate) this.triggerEngine.noteMarketWindow(snapshot.marketId, snapshot.asset ?? window.asset, window.endDate);
+      this.metrics.triggerDedupeEntries.set(this.triggerEngine.dedupeEntryCount());
+      this.state.eventLatencyMs = performance.now() - started;
+      this.metrics.eventLatency.observe((performance.now() - started) / 1000);
+    } finally {
+      this.metrics.marketSnapshotProcessingDuration.observe((performance.now() - started) / 1000);
     }
-    const window = this.marketsById.get(snapshot.marketId);
-    if (window?.endDate) this.triggerEngine.noteMarketWindow(snapshot.marketId, snapshot.asset ?? window.asset, window.endDate);
-    this.metrics.triggerDedupeEntries.set(this.triggerEngine.dedupeEntryCount());
-    this.state.eventLatencyMs = performance.now() - started;
-    this.metrics.eventLatency.observe((performance.now() - started) / 1000);
   }
 
   private async onReferenceTick(tick: ReferenceTick): Promise<void> {
@@ -2783,6 +2793,9 @@ export class EngineService {
   }
 
   private async applyFill(fill: Parameters<PaperLedger["applyFill"]>[0], extras: { restingAfter?: RestingPaperOrder | null } = {}): Promise<void> {
+    this.metrics.marketApplyFillCalls.inc();
+    const started = performance.now();
+    try {
     // A settlement is the terminal authority for this market. The live bit
     // is normally restored from the verified checkpoint; the durable lookup
     // covers a rediscovery/retry after bounded replay-key pressure evicted the
@@ -2843,6 +2856,9 @@ export class EngineService {
         }
       },
     });
+    } finally {
+      this.metrics.marketApplyFillDuration.observe((performance.now() - started) / 1000);
+    }
   }
 
   private buildFillDerivedAudit(

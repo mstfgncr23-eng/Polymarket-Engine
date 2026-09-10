@@ -1,7 +1,15 @@
 import { performance } from "node:perf_hooks";
 import { Counter, Gauge, Histogram, Registry, collectDefaultMetrics } from "prom-client";
 import { triggerKindSchema, type TriggerEmitObserver } from "@pm/core";
-import { INGRESS_GAP_REASONS } from "@pm/market-data";
+import {
+  INGRESS_GAP_REASONS,
+  MARKET_GENERATION_END_REASONS,
+  MARKET_RAW_FRAME_KINDS,
+  MARKET_SOURCE_EVENT_TYPES,
+  type MarketDataObservability,
+  type MarketGenerationEndReason,
+  type MarketSourceEventType,
+} from "@pm/market-data";
 import { DURABLE_METRIC_TYPES, type DurableMetricType } from "@pm/db";
 import { RECOVERY_FAILURE_REASONS, type RecoveryFailureReason } from "./recovery.js";
 import { REJECTION_REASONS, WORK_LANES, type RejectionReason, type WorkLane } from "./runtime-supervisor.js";
@@ -21,6 +29,53 @@ const DURATION_BUCKETS = [0.001, 0.005, 0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 1, 5];
 const BYTE_BUCKETS = [1_000, 10_000, 50_000, 100_000, 250_000, 500_000, 1_000_000, 2_000_000];
 const LEVEL_BUCKETS = [1, 5, 10, 25, 50, 100, 250, 500, 1_000];
 const COUNT_BUCKETS = [1, 2, 5, 10, 25, 50, 100, 250, 800];
+const EXPANSION_BUCKETS = [0, 1, 2, 5, 10, 25, 50, 100, 250, 800];
+
+export interface MarketGenerationSummary {
+  generation: number;
+  tokenCount: number;
+  startedAt: string;
+  endedAt: string;
+  durationMs: number;
+  rawFrames: number;
+  rawBytes: number;
+  marketFrames: number;
+  marketBytes: number;
+  controlFrames: number;
+  controlBytes: number;
+  sourceEvents: number;
+  eventCounts: Record<MarketSourceEventType, number>;
+  bookEvents: number;
+  priceChangePayloads: number;
+  priceChangeEntries: number;
+  normalizedSnapshots: number;
+  firstTrustedBooks: number;
+  uniqueTrustedTokens: number;
+  queueHwmEvents: number;
+  queueHwmBytes: number;
+  closeCode: number | null;
+  closeReason: string;
+  endReason: MarketGenerationEndReason;
+}
+
+interface ActiveMarketGeneration {
+  generation: number;
+  tokenCount: number;
+  startedAtMs: number;
+  rawFrames: number;
+  rawBytes: number;
+  marketFrames: number;
+  marketBytes: number;
+  controlFrames: number;
+  controlBytes: number;
+  sourceEvents: number;
+  eventCounts: Record<MarketSourceEventType, number>;
+  bookEvents: number;
+  priceChangePayloads: number;
+  priceChangeEntries: number;
+  normalizedSnapshots: number;
+  firstTrustedBooks: number;
+}
 
 /** Bounded journal class only — never event/trace/market/token identifiers. */
 export function classifyJournalMetricClass(type: string): JournalMetricClass {
@@ -101,6 +156,121 @@ export class EngineMetrics {
   readonly marketNormalizationDuration = new Histogram({
     name: "market_normalization_duration_seconds",
     help: "Time to convert one book state into a MarketSnapshot, including ordered-book construction or incremental level update",
+    buckets: DURATION_BUCKETS,
+    registers: [this.registry],
+  });
+  readonly marketRawFrames = new Counter({
+    name: "polymarket_clob_raw_frames_total",
+    help: "Raw Polymarket CLOB WebSocket frames observed at the message callback, including control frames",
+    labelNames: ["frame_type"],
+    registers: [this.registry],
+  });
+  readonly marketRawFrameBytes = new Counter({
+    name: "polymarket_clob_raw_frame_bytes_total",
+    help: "UTF-8 byte length of raw Polymarket CLOB WebSocket frames observed at the message callback",
+    labelNames: ["frame_type"],
+    registers: [this.registry],
+  });
+  readonly marketSourceEvents = new Counter({
+    name: "polymarket_clob_source_events_total",
+    help: "Expanded Polymarket CLOB source events after JSON parsing and array expansion",
+    labelNames: ["type"],
+    registers: [this.registry],
+  });
+  readonly marketSourceEventsPerFrame = new Histogram({
+    name: "polymarket_clob_source_events_per_frame",
+    help: "Expanded Polymarket CLOB source events represented by one market-data WebSocket frame",
+    buckets: EXPANSION_BUCKETS,
+    registers: [this.registry],
+  });
+  readonly marketPriceChangePayloads = new Counter({
+    name: "polymarket_clob_price_change_payloads_total",
+    help: "Polymarket CLOB price_change source-event payloads observed after array expansion",
+    registers: [this.registry],
+  });
+  readonly marketPriceChangeEntries = new Counter({
+    name: "polymarket_clob_price_change_entries_total",
+    help: "All entries present in observed Polymarket CLOB price_change payloads before adapter filtering",
+    registers: [this.registry],
+  });
+  readonly marketParseDuration = new Histogram({
+    name: "polymarket_clob_parse_duration_seconds",
+    help: "Synchronous JSON.parse duration for one Polymarket CLOB market-data frame",
+    buckets: DURATION_BUCKETS,
+    registers: [this.registry],
+  });
+  readonly marketPreAdmissionDuration = new Histogram({
+    name: "polymarket_clob_pre_admission_duration_seconds",
+    help: "Synchronous parse/expansion/raw-normalization processing time before weighted queue admission",
+    buckets: DURATION_BUCKETS,
+    registers: [this.registry],
+  });
+  readonly marketCallbackToAdmissionDuration = new Histogram({
+    name: "polymarket_clob_callback_to_admission_duration_seconds",
+    help: "Synchronous duration from the WebSocket message callback entry to completion of all queue admissions for a frame",
+    buckets: DURATION_BUCKETS,
+    registers: [this.registry],
+  });
+  readonly marketNormalizeEventDuration = new Histogram({
+    name: "polymarket_market_normalize_event_duration_seconds",
+    help: "PolymarketMarketDataAdapter normalizeEvent duration for one consumed source event",
+    buckets: DURATION_BUCKETS,
+    registers: [this.registry],
+  });
+  readonly marketNormalizedSnapshotsPerSourceEvent = new Histogram({
+    name: "polymarket_market_normalized_snapshots_per_source_event",
+    help: "Normalized snapshots produced by one consumed Polymarket source event",
+    buckets: EXPANSION_BUCKETS,
+    registers: [this.registry],
+  });
+  readonly marketSnapshotHandlerSyncDuration = new Histogram({
+    name: "polymarket_market_snapshot_handler_sync_duration_seconds",
+    help: "Synchronous invocation time before the market snapshot handler first suspends or returns",
+    buckets: DURATION_BUCKETS,
+    registers: [this.registry],
+  });
+  readonly marketSnapshotHandlerTotalDuration = new Histogram({
+    name: "polymarket_market_snapshot_handler_total_duration_seconds",
+    help: "Total awaited completion time for one market snapshot handler invocation",
+    buckets: DURATION_BUCKETS,
+    registers: [this.registry],
+  });
+  readonly marketSnapshotHandlerAwaitedDuration = new Histogram({
+    name: "polymarket_market_snapshot_handler_awaited_duration_seconds",
+    help: "Estimated awaited portion of one market snapshot handler invocation",
+    buckets: DURATION_BUCKETS,
+    registers: [this.registry],
+  });
+  readonly marketGenerationEnded = new Counter({
+    name: "polymarket_market_generation_ended_total",
+    help: "Completed Polymarket market stream generation summaries by finite end reason",
+    labelNames: ["reason"],
+    registers: [this.registry],
+  });
+  readonly marketSnapshotProcessingDuration = new Histogram({
+    name: "polymarket_market_snapshot_processing_duration_seconds",
+    help: "Total Engine.onMarketSnapshot duration including synchronous work and awaited maker-fill work",
+    buckets: DURATION_BUCKETS,
+    registers: [this.registry],
+  });
+  readonly marketRestingOrderEvaluations = new Counter({
+    name: "polymarket_market_resting_order_evaluations_total",
+    help: "Resting maker orders evaluated from synchronized market snapshots",
+    registers: [this.registry],
+  });
+  readonly marketMakerFillsDetected = new Counter({
+    name: "polymarket_market_maker_fills_detected_total",
+    help: "Maker fills detected while evaluating market snapshot transitions",
+    registers: [this.registry],
+  });
+  readonly marketApplyFillCalls = new Counter({
+    name: "polymarket_market_apply_fill_calls_total",
+    help: "Engine applyFill invocations, including calls not originating from market snapshots",
+    registers: [this.registry],
+  });
+  readonly marketApplyFillDuration = new Histogram({
+    name: "polymarket_market_apply_fill_duration_seconds",
+    help: "Total Engine applyFill duration including durable/economic work",
     buckets: DURATION_BUCKETS,
     registers: [this.registry],
   });
@@ -606,6 +776,7 @@ export class EngineMetrics {
   private processTriggerInFlightCount = 0;
   private processTriggerPeakCount = 0;
   private journalDirectInFlightCount = 0;
+  private activeMarketGeneration: ActiveMarketGeneration | null = null;
 
   constructor() {
     collectDefaultMetrics({ register: this.registry, prefix: "polymarket_" });
@@ -657,6 +828,12 @@ export class EngineMetrics {
       this.marketIngressResync.inc({ reason }, 0);
     }
     this.marketIngressResync.inc({ reason: "full_book" }, 0);
+    for (const kind of MARKET_RAW_FRAME_KINDS) {
+      this.marketRawFrames.inc({ frame_type: kind }, 0);
+      this.marketRawFrameBytes.inc({ frame_type: kind }, 0);
+    }
+    for (const type of MARKET_SOURCE_EVENT_TYPES) this.marketSourceEvents.inc({ type }, 0);
+    for (const reason of MARKET_GENERATION_END_REASONS) this.marketGenerationEnded.inc({ reason }, 0);
     this.referenceWindowOverflow.inc({ reason: "reference_window_limit" }, 0);
     this.triggerDedupeEntries.set(0);
     this.marketIngressQueueDepth.set(0);
@@ -734,6 +911,143 @@ export class EngineMetrics {
       onPriceChangeEvent: (entriesInPayload, processed) => {
         this.priceChangeEntriesPerEvent.observe(entriesInPayload);
         if (processed > 0) this.priceChangeEntries.inc(processed);
+      },
+    };
+  }
+
+  marketObservability(summarySink?: (summary: MarketGenerationSummary) => void): MarketDataObservability {
+    return {
+      onGenerationStart: (input) => {
+        const eventCounts = Object.fromEntries(MARKET_SOURCE_EVENT_TYPES.map((type) => [type, 0])) as Record<MarketSourceEventType, number>;
+        this.activeMarketGeneration = {
+          generation: input.generation,
+          tokenCount: input.tokenCount,
+          startedAtMs: input.startedAtMs,
+          rawFrames: 0,
+          rawBytes: 0,
+          marketFrames: 0,
+          marketBytes: 0,
+          controlFrames: 0,
+          controlBytes: 0,
+          sourceEvents: 0,
+          eventCounts,
+          bookEvents: 0,
+          priceChangePayloads: 0,
+          priceChangeEntries: 0,
+          normalizedSnapshots: 0,
+          firstTrustedBooks: 0,
+        };
+      },
+      onRawFrame: (input) => {
+        const bytes = Number.isFinite(input.bytes) && input.bytes >= 0 ? input.bytes : 0;
+        this.marketRawFrames.inc({ frame_type: input.kind });
+        this.marketRawFrameBytes.inc({ frame_type: input.kind }, bytes);
+        const active = this.activeMarketGeneration;
+        if (!active) return;
+        active.rawFrames += 1;
+        active.rawBytes += bytes;
+        if (input.kind === "market") {
+          active.marketFrames += 1;
+          active.marketBytes += bytes;
+        } else {
+          active.controlFrames += 1;
+          active.controlBytes += bytes;
+        }
+      },
+      onSourceFrame: (eventCount) => {
+        const bounded = Number.isFinite(eventCount) && eventCount >= 0 ? Math.floor(eventCount) : 0;
+        this.marketSourceEventsPerFrame.observe(bounded);
+      },
+      onSourceEvent: (input) => {
+        this.marketSourceEvents.inc({ type: input.type });
+        const active = this.activeMarketGeneration;
+        if (active) {
+          active.sourceEvents += 1;
+          active.eventCounts[input.type] += 1;
+          if (input.type === "book") active.bookEvents += 1;
+        }
+        if (input.type !== "price_change") return;
+        this.marketPriceChangePayloads.inc();
+        const entries = Number.isFinite(input.priceChangeEntries) && (input.priceChangeEntries ?? 0) >= 0
+          ? Math.floor(input.priceChangeEntries ?? 0)
+          : 0;
+        this.marketPriceChangeEntries.inc(entries);
+        if (active) {
+          active.priceChangePayloads += 1;
+          active.priceChangeEntries += entries;
+        }
+      },
+      onReceiveTiming: (input) => {
+        if (Number.isFinite(input.parseDurationSeconds) && input.parseDurationSeconds >= 0) {
+          this.marketParseDuration.observe(input.parseDurationSeconds);
+        }
+        if (input.preAdmissionDurationSeconds !== undefined
+          && Number.isFinite(input.preAdmissionDurationSeconds)
+          && input.preAdmissionDurationSeconds >= 0) {
+          this.marketPreAdmissionDuration.observe(input.preAdmissionDurationSeconds);
+        }
+        if (input.callbackToAdmissionDurationSeconds !== undefined
+          && Number.isFinite(input.callbackToAdmissionDurationSeconds)
+          && input.callbackToAdmissionDurationSeconds >= 0) {
+          this.marketCallbackToAdmissionDuration.observe(input.callbackToAdmissionDurationSeconds);
+        }
+      },
+      onNormalizeEvent: (input) => {
+        const durationSeconds = Number.isFinite(input.durationSeconds) && input.durationSeconds >= 0 ? input.durationSeconds : 0;
+        const snapshotsProduced = Number.isFinite(input.snapshotsProduced) && input.snapshotsProduced >= 0
+          ? Math.floor(input.snapshotsProduced)
+          : 0;
+        this.marketNormalizeEventDuration.observe(durationSeconds);
+        this.marketNormalizedSnapshotsPerSourceEvent.observe(snapshotsProduced);
+        if (this.activeMarketGeneration) this.activeMarketGeneration.normalizedSnapshots += snapshotsProduced;
+      },
+      onSnapshotCallback: (input) => {
+        if (Number.isFinite(input.synchronousDurationSeconds) && input.synchronousDurationSeconds >= 0) {
+          this.marketSnapshotHandlerSyncDuration.observe(input.synchronousDurationSeconds);
+        }
+        if (Number.isFinite(input.totalDurationSeconds) && input.totalDurationSeconds >= 0) {
+          this.marketSnapshotHandlerTotalDuration.observe(input.totalDurationSeconds);
+        }
+        if (Number.isFinite(input.awaitedDurationSeconds) && input.awaitedDurationSeconds >= 0) {
+          this.marketSnapshotHandlerAwaitedDuration.observe(input.awaitedDurationSeconds);
+        }
+      },
+      onTrustedFullBook: () => {
+        if (this.activeMarketGeneration) this.activeMarketGeneration.firstTrustedBooks += 1;
+      },
+      onGenerationEnd: (input) => {
+        const boundedReason = MARKET_GENERATION_END_REASONS.includes(input.endReason) ? input.endReason : "other";
+        this.marketGenerationEnded.inc({ reason: boundedReason });
+        const active = this.activeMarketGeneration;
+        if (!active || active.generation !== input.generation) return;
+        const summary: MarketGenerationSummary = {
+          generation: active.generation,
+          tokenCount: active.tokenCount,
+          startedAt: new Date(active.startedAtMs).toISOString(),
+          endedAt: new Date(input.endedAtMs).toISOString(),
+          durationMs: Math.max(0, input.durationMs),
+          rawFrames: active.rawFrames,
+          rawBytes: active.rawBytes,
+          marketFrames: active.marketFrames,
+          marketBytes: active.marketBytes,
+          controlFrames: active.controlFrames,
+          controlBytes: active.controlBytes,
+          sourceEvents: active.sourceEvents,
+          eventCounts: { ...active.eventCounts },
+          bookEvents: active.bookEvents,
+          priceChangePayloads: active.priceChangePayloads,
+          priceChangeEntries: active.priceChangeEntries,
+          normalizedSnapshots: active.normalizedSnapshots,
+          firstTrustedBooks: active.firstTrustedBooks,
+          uniqueTrustedTokens: active.firstTrustedBooks,
+          queueHwmEvents: Math.max(0, input.queueHighWaterEvents),
+          queueHwmBytes: Math.max(0, input.queueHighWaterBytes),
+          closeCode: input.closeCode,
+          closeReason: String(input.closeReason ?? "").slice(0, 512),
+          endReason: boundedReason,
+        };
+        this.activeMarketGeneration = null;
+        try { summarySink?.(summary); } catch { /* logging must not change feed semantics */ }
       },
     };
   }

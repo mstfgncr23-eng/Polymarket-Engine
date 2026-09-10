@@ -1,5 +1,8 @@
+import { Buffer } from "node:buffer";
+import { performance } from "node:perf_hooks";
 import { BoundedIngressQueue, IngressOverflowError } from "./bounded-ingress.js";
 import { CLOB_MARKET_WS_URL, MARKET_CONNECT_BOUNDS, MARKET_INGRESS_BOUNDS } from "./ingress-bounds.js";
+import type { MarketDataObservability, MarketSourceEventType } from "./market-observability.js";
 import type { MarketStreamTransport } from "./market-stream-transport.js";
 
 export interface BoundedMarketStream {
@@ -60,6 +63,7 @@ export interface BoundedMarketTransportOptions {
   staleMs?: number;
   connectTimeoutMs?: number;
   webSocket?: typeof WebSocket;
+  observability?: MarketDataObservability;
 }
 
 export const CLOB_MARKET_CONNECT_TIMEOUT = "CLOB_MARKET_WS_CONNECT_TIMEOUT";
@@ -152,6 +156,29 @@ export function normalizeRawClobMarketEvent(event: unknown): unknown {
   return event;
 }
 
+function observeSafely(observer: MarketDataObservability | null, callback: () => void): void {
+  if (!observer) return;
+  try { callback(); } catch { /* observability must not change feed semantics */ }
+}
+
+function sourceEventObservation(event: unknown): { type: MarketSourceEventType; priceChangeEntries?: number } {
+  const value = record(event);
+  const rawType = typeof value?.type === "string"
+    ? value.type
+    : typeof value?.event_type === "string" ? value.event_type : "";
+  const type: MarketSourceEventType = rawType === "book"
+    || rawType === "price_change"
+    || rawType === "last_trade_price"
+    ? rawType
+    : "other";
+  if (type !== "price_change") return { type };
+  const payload = record(value?.payload);
+  return {
+    type,
+    priceChangeEntries: Array.isArray(payload?.priceChanges) ? payload.priceChanges.length : 0,
+  };
+}
+
 /**
  * Owned CLOB market WebSocket. Nearest controlled layer in front of the
  * unbounded @polymarket/client it-pushable registry.
@@ -175,6 +202,7 @@ export class BoundedClobMarketTransport implements MarketStreamTransport {
   private readonly connectTimeoutMs: number;
   private readonly maxRawFrameBytes: number;
   private readonly WebSocketImpl: typeof WebSocket;
+  private observability: MarketDataObservability | null;
   private generation = 0;
 
   constructor(options: BoundedMarketTransportOptions = {}) {
@@ -188,9 +216,12 @@ export class BoundedClobMarketTransport implements MarketStreamTransport {
     this.connectTimeoutMs = options.connectTimeoutMs ?? MARKET_CONNECT_BOUNDS.connectTimeoutMs;
     this.maxRawFrameBytes = options.maxRawFrameBytes ?? MARKET_INGRESS_BOUNDS.maxRawFrameBytes;
     this.WebSocketImpl = options.webSocket ?? WebSocket;
+    this.observability = options.observability ?? null;
   }
 
   currentGeneration(): number { return this.generation; }
+
+  setObservability(observer: MarketDataObservability | null): void { this.observability = observer; }
 
   async subscribe(
     tokenIds: readonly string[],
@@ -198,6 +229,7 @@ export class BoundedClobMarketTransport implements MarketStreamTransport {
     signal?: AbortSignal,
   ): Promise<BoundedMarketStream> {
     const generation = ++this.generation;
+    const observability = this.observability;
     const queue = this.queue;
     queue.clear();
     const socket = new this.WebSocketImpl(this.url);
@@ -301,7 +333,7 @@ export class BoundedClobMarketTransport implements MarketStreamTransport {
       finalize(abortError());
     };
 
-    const enqueueFrame = (raw: string) => {
+    const enqueueFrame = (raw: string, callbackStarted: number) => {
       if (finalized || generation !== this.generation) return;
       if (raw.length > this.maxRawFrameBytes) {
         queue.noteOverflow("byte_limit");
@@ -309,41 +341,70 @@ export class BoundedClobMarketTransport implements MarketStreamTransport {
         return;
       }
       let parsed: unknown;
+      const parseStarted = performance.now();
       try { parsed = JSON.parse(raw) as unknown; } catch {
+        observeSafely(observability, () => observability?.onReceiveTiming({
+          parseDurationSeconds: (performance.now() - parseStarted) / 1000,
+        }));
         finalize(new Error(MARKET_INGRESS_MALFORMED));
         return;
       }
+      const parseDurationSeconds = (performance.now() - parseStarted) / 1000;
+      const expansionStarted = performance.now();
       const events = Array.isArray(parsed) ? parsed : [parsed];
+      const expansionDurationSeconds = (performance.now() - expansionStarted) / 1000;
+      observeSafely(observability, () => observability?.onSourceFrame(events.length));
+      const admitStarted = performance.now();
       const admit = queue.canAdmit(events.length, raw.length);
+      const admissionCheckDurationSeconds = (performance.now() - admitStarted) / 1000;
       if (!admit.ok) {
+        observeSafely(observability, () => observability?.onReceiveTiming({
+          parseDurationSeconds,
+          preAdmissionDurationSeconds: parseDurationSeconds + expansionDurationSeconds + admissionCheckDurationSeconds,
+        }));
         queue.noteOverflow(admit.reason);
         finalize(new IngressOverflowError(admit.reason));
         return;
       }
       const n = events.length;
       let remaining = raw.length;
+      let normalizationDurationSeconds = 0;
       for (let i = 0; i < n; i += 1) {
         if (finalized || generation !== this.generation) return;
         const share = i === n - 1 ? remaining : Math.floor(raw.length / n);
         remaining -= share;
-        const result = queue.tryEnqueueWeighted(normalizeRawClobMarketEvent(events[i]), share);
+        const normalizationStarted = performance.now();
+        const normalized = normalizeRawClobMarketEvent(events[i]);
+        normalizationDurationSeconds += (performance.now() - normalizationStarted) / 1000;
+        const source = sourceEventObservation(normalized);
+        observeSafely(observability, () => observability?.onSourceEvent(source));
+        const result = queue.tryEnqueueWeighted(normalized, share);
         if (!result.ok) {
           finalize(new IngressOverflowError(result.reason));
           return;
         }
       }
+      observeSafely(observability, () => observability?.onReceiveTiming({
+        parseDurationSeconds,
+        preAdmissionDurationSeconds: parseDurationSeconds + expansionDurationSeconds + admissionCheckDurationSeconds + normalizationDurationSeconds,
+        callbackToAdmissionDurationSeconds: (performance.now() - callbackStarted) / 1000,
+      }));
       pump();
     };
 
     const onMessage = (message: Event) => {
+      const callbackStarted = performance.now();
       if (finalized || generation !== this.generation) return;
       const data = (message as MessageEvent).data;
       const raw = typeof data === "string" ? data : String(data ?? "");
+      const bytes = Buffer.byteLength(raw, "utf8");
+      const kind = raw === "PONG" ? "control" : "market";
+      observeSafely(observability, () => observability?.onRawFrame({ kind, bytes }));
       if (raw === "PONG") {
         lastPong = Date.now();
         return;
       }
-      enqueueFrame(raw);
+      enqueueFrame(raw, callbackStarted);
     };
 
     const startPing = () => {
