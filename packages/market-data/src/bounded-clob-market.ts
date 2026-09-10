@@ -210,8 +210,6 @@ export class BoundedClobMarketTransport implements MarketStreamTransport {
     let opened = false;
     let lastPong = Date.now();
     let pingTimer: ReturnType<typeof setInterval> | undefined;
-    let deliveryHandle: ReturnType<typeof setImmediate> | undefined;
-    let deliveryScheduled = false;
 
     const attach = (type: string, fn: EventListenerOrEventListenerObject, options?: AddEventListenerOptions) => {
       socket.addEventListener(type, fn, options);
@@ -238,40 +236,26 @@ export class BoundedClobMarketTransport implements MarketStreamTransport {
     const isCurrentGeneration = () => generation === this.generation;
 
     const pump = () => {
-      if (pendingError || ended || !isCurrentGeneration()) {
-        while (waiters.length > 0) {
-          const waiter = waiters.shift()!;
-          if (pendingError) waiter.reject(pendingError);
-          else waiter.resolve({ value: undefined, done: true });
+      while (waiters.length > 0) {
+        if (pendingError) {
+          waiters.shift()!.reject(pendingError);
+          continue;
         }
-        return;
+        if (ended || !isCurrentGeneration()) {
+          waiters.shift()!.resolve({ value: undefined, done: true });
+          continue;
+        }
+        const item = queue.dequeue();
+        if (item !== undefined) {
+          waiters.shift()!.resolve({ value: item, done: false });
+          continue;
+        }
+        if (ended || !isCurrentGeneration()) {
+          waiters.shift()!.resolve({ value: undefined, done: true });
+          continue;
+        }
+        break;
       }
-
-      const waiter = waiters[0];
-      if (!waiter) return;
-      const item = queue.dequeue();
-      if (item === undefined) return;
-      waiters.shift()!.resolve({ value: item, done: false });
-      if (waiters.length > 0 && queue.depth > 0) schedulePump();
-    };
-
-    const cancelScheduledPump = () => {
-      if (deliveryHandle !== undefined) {
-        clearImmediate(deliveryHandle);
-        deliveryHandle = undefined;
-      }
-      deliveryScheduled = false;
-    };
-
-    const schedulePump = () => {
-      if (deliveryScheduled || finalized) return;
-      deliveryScheduled = true;
-      deliveryHandle = setImmediate(() => {
-        deliveryHandle = undefined;
-        deliveryScheduled = false;
-        pump();
-      });
-      deliveryHandle.unref?.();
     };
 
     const finalize = (error: Error | null, diagnostic?: ClobMarketCloseDiagnostic) => {
@@ -281,7 +265,6 @@ export class BoundedClobMarketTransport implements MarketStreamTransport {
       closeDiagnostic = diagnostic ?? (error instanceof ClobMarketCloseError ? error.diagnostic : closeDiagnostic);
       if (error && !pendingError) pendingError = error;
       detachAll();
-      cancelScheduledPump();
       signal?.removeEventListener("abort", onAbort);
       try { socket.close(); } catch { /* already closed */ }
       settleWaiters();
@@ -349,7 +332,7 @@ export class BoundedClobMarketTransport implements MarketStreamTransport {
           return;
         }
       }
-      schedulePump();
+      pump();
     };
 
     const onMessage = (message: Event) => {
@@ -486,9 +469,15 @@ export class BoundedClobMarketTransport implements MarketStreamTransport {
             if (pendingError) throw pendingError;
             return { value: undefined, done: true };
           }
+          const existing = queue.dequeue();
+          if (existing !== undefined) return { value: existing, done: false };
+          if (ended || !isCurrentGeneration()) {
+            if (pendingError) throw pendingError;
+            return { value: undefined, done: true };
+          }
           return await new Promise<IteratorResult<unknown>>((resolve, reject) => {
             waiters.push({ resolve, reject });
-            schedulePump();
+            pump();
           });
         },
       }),
