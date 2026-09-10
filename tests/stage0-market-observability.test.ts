@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  BoundedIngressQueue,
   BoundedClobMarketTransport,
   PolymarketMarketDataAdapter,
   ScriptedBoundedMarketTransport,
@@ -90,6 +91,65 @@ function rawPriceChange(timestamp: number) {
       { asset_id: "tok-up", price: "0.41", size: "4", side: "BUY", hash: "delta-buy" },
       { asset_id: "tok-up", price: "0.59", size: "3", side: "SELL", hash: "delta-sell" },
     ],
+  };
+}
+
+async function runQueueHwmCase(targetDepth: number): Promise<{
+  summary: MarketGenerationSummary;
+  lifetimeHighWaterEvents: number;
+  lifetimeHighWaterBytes: number;
+  generationPeakBytes: number;
+}> {
+  const queue = new BoundedIngressQueue();
+  for (let i = 0; i < 100; i += 1) queue.tryEnqueueWeighted(`previous-${i}`, 1);
+  expect(queue.snapshot().highWaterEvents).toBe(100);
+  const transport = new ScriptedBoundedMarketTransport(queue);
+  const metrics = new EngineMetrics();
+  const summaries: MarketGenerationSummary[] = [];
+  const adapter = new PolymarketMarketDataAdapter(undefined, { transport, ingress: queue });
+  adapter.setObservability(metrics.marketObservability((summary) => summaries.push(summary)));
+  adapter.registerManualToken("tok-up", "mkt", "UP", "BTC");
+  const controller = new AbortController();
+  let snapshotEntered = false;
+  let releaseSnapshot!: () => void;
+  const snapshotHold = new Promise<void>((resolve) => { releaseSnapshot = resolve; });
+  const running = adapter.run(["tok-up"], {
+    onSnapshot: async () => {
+      if (snapshotEntered) return;
+      snapshotEntered = true;
+      await snapshotHold;
+    },
+    onConnection: () => undefined,
+    onError: () => undefined,
+  }, controller.signal);
+  await waitFor(() => adapter.activeStreamCount() === 1);
+  const stream = transport.current();
+  expect(stream.push({
+    type: "book",
+    payload: {
+      tokenId: "tok-up", market: "mkt", timestamp: 1_000,
+      bids: [{ price: "0.40", size: "1" }], asks: [{ price: "0.60", size: "1" }],
+    },
+  }).ok).toBe(true);
+  await waitFor(() => snapshotEntered);
+  for (let i = 0; i < targetDepth; i += 1) {
+    expect(stream.push({
+      type: "last_trade_price",
+      payload: { tokenId: "tok-up", price: "0.50" },
+    }).ok).toBe(true);
+  }
+  const peak = queue.snapshot();
+  expect(peak.depth).toBe(targetDepth);
+  stream.endRemote();
+  releaseSnapshot();
+  await waitFor(() => summaries.length === 1);
+  controller.abort();
+  await running;
+  return {
+    summary: summaries[0]!,
+    lifetimeHighWaterEvents: queue.snapshot().highWaterEvents,
+    lifetimeHighWaterBytes: queue.snapshot().highWaterBytes,
+    generationPeakBytes: peak.bytes,
   };
 }
 
@@ -198,6 +258,18 @@ describe("Stage 0 market observability", () => {
     expect(summaries).toHaveLength(2);
     expect(summaries[0]).toMatchObject({ generation: 1, sourceEvents: 1, firstTrustedBooks: 1, endReason: "provider_close", closeCode: 1013 });
     expect(summaries[1]).toMatchObject({ generation: 2, sourceEvents: 0, firstTrustedBooks: 0, endReason: "operator_generation_change", closeCode: null });
+  });
+
+  it("tracks exact generation-local queue HWM instead of subtracting lifetime maxima", async () => {
+    const belowPreviousLifetimeHwm = await runQueueHwmCase(90);
+    expect(belowPreviousLifetimeHwm.summary.queueHwmEvents).toBe(90);
+    expect(belowPreviousLifetimeHwm.summary.queueHwmBytes).toBe(belowPreviousLifetimeHwm.generationPeakBytes);
+    expect(belowPreviousLifetimeHwm.lifetimeHighWaterEvents).toBe(100);
+
+    const abovePreviousLifetimeHwm = await runQueueHwmCase(150);
+    expect(abovePreviousLifetimeHwm.summary.queueHwmEvents).toBe(150);
+    expect(abovePreviousLifetimeHwm.summary.queueHwmBytes).toBe(abovePreviousLifetimeHwm.generationPeakBytes);
+    expect(abovePreviousLifetimeHwm.lifetimeHighWaterEvents).toBe(150);
   });
 
   it("records adapter normalization and Engine snapshot timing without changing snapshot delivery", async () => {

@@ -35,6 +35,8 @@ export interface IngressQueueObserver {
   onChange(snapshot: IngressQueueSnapshot): void;
 }
 
+type IngressQueueAdmissionObserver = (depth: number, bytes: number) => void;
+
 export class BoundedIngressQueue {
   private readonly items: QueuedIngress[] = [];
   private head = 0;
@@ -47,6 +49,7 @@ export class BoundedIngressQueue {
   lastGapReason: IngressGapReason | null = null;
   observerPublishCount = 0;
   private observer: IngressQueueObserver | null = null;
+  private admissionObserver: IngressQueueAdmissionObserver | null = null;
   private mutationsSincePublish = 0;
   private lastPublishAt = 0;
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
@@ -60,6 +63,13 @@ export class BoundedIngressQueue {
   get queuedBytes(): number { return this.bytes; }
 
   setObserver(observer: IngressQueueObserver | null): void { this.observer = observer; }
+
+  /**
+   * Synchronous post-admission hook for bounded local measurements. This is
+   * separate from the coalesced observer so callers can observe every queue
+   * admission without changing metric publication cadence.
+   */
+  setAdmissionObserver(observer: IngressQueueAdmissionObserver | null): void { this.admissionObserver = observer; }
 
   tryEnqueue(event: unknown, precomputedBytes?: number): { ok: true } | { ok: false; reason: Extract<IngressGapReason, "count_limit" | "byte_limit"> } {
     return this.tryEnqueueWeighted(event, precomputedBytes ?? approximateEventBytes(event));
@@ -83,6 +93,7 @@ export class BoundedIngressQueue {
     this.accepted += 1;
     if (this.depth > this.highWaterEvents) this.highWaterEvents = this.depth;
     if (this.bytes > this.highWaterBytes) this.highWaterBytes = this.bytes;
+    try { this.admissionObserver?.(this.depth, this.bytes); } catch { /* observability must not change queue semantics */ }
     this.publish(false);
     return { ok: true };
   }

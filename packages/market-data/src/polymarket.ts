@@ -192,8 +192,8 @@ export class PolymarketMarketDataAdapter {
   private generationObservationActive = false;
   private generationStartedMonotonic = 0;
   private generationStartedAtMs = 0;
-  private generationQueueHighWaterEventsAtStart = 0;
-  private generationQueueHighWaterBytesAtStart = 0;
+  private generationQueueHighWaterEvents = 0;
+  private generationQueueHighWaterBytes = 0;
   lastReconnectDelayMs = 0;
   readonly reconnectDelays: number[] = [];
 
@@ -222,6 +222,11 @@ export class PolymarketMarketDataAdapter {
 
   setObservability(observer: MarketDataObservability | null): void {
     this.observability = observer;
+    this.ingress.setAdmissionObserver(observer ? (depth, bytes) => {
+      if (!this.generationObservationActive) return;
+      this.generationQueueHighWaterEvents = Math.max(this.generationQueueHighWaterEvents, depth);
+      this.generationQueueHighWaterBytes = Math.max(this.generationQueueHighWaterBytes, bytes);
+    } : null);
     const transport = this.transport as MarketStreamTransport & {
       setObservability?: (next: MarketDataObservability | null) => void;
     };
@@ -398,8 +403,8 @@ export class PolymarketMarketDataAdapter {
     this.generationObservationActive = this.observability !== null;
     this.generationStartedMonotonic = performance.now();
     this.generationStartedAtMs = Date.now();
-    this.generationQueueHighWaterEventsAtStart = queue.highWaterEvents;
-    this.generationQueueHighWaterBytesAtStart = queue.highWaterBytes;
+    this.generationQueueHighWaterEvents = 0;
+    this.generationQueueHighWaterBytes = 0;
     observeSafely(this.observability, () => this.observability!.onGenerationStart({
       generation,
       tokenCount,
@@ -418,13 +423,12 @@ export class PolymarketMarketDataAdapter {
       this.generationTrustedTokens.clear();
       return;
     }
-    const queue = this.ingress.snapshot();
     observeSafely(this.observability, () => this.observability!.onGenerationEnd({
       generation,
       endedAtMs: Date.now(),
       durationMs: Math.max(0, performance.now() - this.generationStartedMonotonic),
-      queueHighWaterEvents: Math.max(0, queue.highWaterEvents - this.generationQueueHighWaterEventsAtStart),
-      queueHighWaterBytes: Math.max(0, queue.highWaterBytes - this.generationQueueHighWaterBytesAtStart),
+      queueHighWaterEvents: this.generationQueueHighWaterEvents,
+      queueHighWaterBytes: this.generationQueueHighWaterBytes,
       closeCode: diagnostic?.code ?? null,
       closeReason: diagnostic?.reason ?? "",
       endReason,
