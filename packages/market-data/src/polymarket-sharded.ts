@@ -42,12 +42,15 @@ type ConnectionState = FeedConnectionEvent["state"];
  * - no raw market event is dropped/coalesced/sampled.
  *
  * Explicit client/transport/ingress injection keeps legacy single-shard
- * behavior for existing tests and custom callers. The production zero-arg
- * constructor is the only path that enables the two owned shards by default.
+ * behavior for existing tests and custom callers. Before run() starts, direct
+ * normalizeSourceEvent/test usage also remains backed by the inherited
+ * single-adapter state. The production zero-arg live run is the path that
+ * activates the two owned shards.
  */
 export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDataAdapter {
   private readonly sharded: boolean;
   private readonly shards: readonly SinglePolymarketMarketDataAdapter[];
+  private shardedRunStarted = false;
   private readonly ownerByToken = new Map<string, number>();
   private readonly ownerByGroup = new Map<string, number>();
   private currentTokenIds: string[] = [];
@@ -97,10 +100,10 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
   marketShardCount(): number { return this.sharded ? MARKET_SHARD_COUNT : 1; }
 
   override setNormalizeObserver(observer: MarketNormalizeObserver | null): void {
-    if (!this.sharded) {
-      super.setNormalizeObserver(observer);
-      return;
-    }
+    // Keep the inherited direct-normalization API observable for replay/unit
+    // callers that intentionally use normalizeSourceEvent() without run().
+    super.setNormalizeObserver(observer);
+    if (!this.sharded) return;
     for (const shard of this.shards) shard.setNormalizeObserver(observer);
   }
 
@@ -149,8 +152,8 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
     if (!this.sharded) return report;
 
     // Child adapters need normalization metadata, but discovery/REST remains
-    // centralized in the facade. Patch the rich fee schedule back onto every
-    // emitted snapshot before the Engine sees it.
+    // centralized in the facade. The rich catalog fields (including fees) are
+    // restored onto each emitted snapshot at the facade boundary.
     for (const market of report.qualified) {
       for (const token of market.tokens) {
         for (const shard of this.shards) {
@@ -192,6 +195,7 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
   ): Promise<void> {
     if (!this.sharded) return super.run(tokenIds, handlers, signal);
 
+    this.shardedRunStarted = true;
     this.setTokenIds(this.currentTokenIds.length > 0 ? this.currentTokenIds : tokenIds);
     this.connectionStates = ["STOPPED", "STOPPED"];
     this.connectionReconnects = [0, 0];
@@ -207,27 +211,27 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
   }
 
   override isTokenSynchronized(tokenId: string): boolean {
-    if (!this.sharded) return super.isTokenSynchronized(tokenId);
+    if (!this.sharded || !this.shardedRunStarted) return super.isTokenSynchronized(tokenId);
     return this.shardForToken(tokenId)?.isTokenSynchronized(tokenId) ?? false;
   }
 
   override tokenSyncState(tokenId: string): TokenSyncState {
-    if (!this.sharded) return super.tokenSyncState(tokenId);
+    if (!this.sharded || !this.shardedRunStarted) return super.tokenSyncState(tokenId);
     return this.shardForToken(tokenId)?.tokenSyncState(tokenId) ?? "AWAITING_BOOK";
   }
 
   override tokenEpoch(tokenId: string): number {
-    if (!this.sharded) return super.tokenEpoch(tokenId);
+    if (!this.sharded || !this.shardedRunStarted) return super.tokenEpoch(tokenId);
     return this.shardForToken(tokenId)?.tokenEpoch(tokenId) ?? 0;
   }
 
   override unsynchronizedTokenCount(): number {
-    if (!this.sharded) return super.unsynchronizedTokenCount();
+    if (!this.sharded || !this.shardedRunStarted) return super.unsynchronizedTokenCount();
     return this.shards.reduce((sum, shard) => sum + shard.unsynchronizedTokenCount(), 0);
   }
 
   override tokenSyncEntryCount(): number {
-    if (!this.sharded) return super.tokenSyncEntryCount();
+    if (!this.sharded || !this.shardedRunStarted) return super.tokenSyncEntryCount();
     return this.shards.reduce((sum, shard) => sum + shard.tokenSyncEntryCount(), 0);
   }
 
@@ -237,17 +241,17 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
   }
 
   override lastAcceptedTimestamp(tokenId: string): number | undefined {
-    if (!this.sharded) return super.lastAcceptedTimestamp(tokenId);
+    if (!this.sharded || !this.shardedRunStarted) return super.lastAcceptedTimestamp(tokenId);
     return this.shardForToken(tokenId)?.lastAcceptedTimestamp(tokenId);
   }
 
   override bookState(tokenId: string): ReturnType<SinglePolymarketMarketDataAdapter["bookState"]> {
-    if (!this.sharded) return super.bookState(tokenId);
+    if (!this.sharded || !this.shardedRunStarted) return super.bookState(tokenId);
     return this.shardForToken(tokenId)?.bookState(tokenId);
   }
 
   override timestampStats(): PolymarketTimestampStats {
-    if (!this.sharded) return super.timestampStats();
+    if (!this.sharded || !this.shardedRunStarted) return super.timestampStats();
     const stats = this.shards.map((shard) => shard.timestampStats());
     const anomalies = stats
       .map((item) => item.lastAnomaly)
@@ -262,7 +266,7 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
   }
 
   override markTokenGappedForTest(tokenId: string, reason: IngressGapReason = "explicit_resubscribe"): void {
-    if (!this.sharded) {
+    if (!this.sharded || !this.shardedRunStarted) {
       super.markTokenGappedForTest(tokenId, reason);
       return;
     }
@@ -275,7 +279,7 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
     handlers?: Pick<PolymarketFeedHandlers, "onGap">,
     options: { emitGap?: boolean } = {},
   ): void {
-    if (!this.sharded) {
+    if (!this.sharded || !this.shardedRunStarted) {
       super.beginStreamEpoch(tokenIds, reason, handlers, options);
       return;
     }
@@ -290,7 +294,7 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
   }
 
   override gapAll(reason: IngressGapReason, handlers?: Pick<PolymarketFeedHandlers, "onGap">): void {
-    if (!this.sharded) {
+    if (!this.sharded || !this.shardedRunStarted) {
       super.gapAll(reason, handlers);
       return;
     }
