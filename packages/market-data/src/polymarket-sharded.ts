@@ -85,12 +85,12 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
 
     this.shards = Array.from({ length: MARKET_SHARD_COUNT }, (_, index) => {
       const transport = transports?.[index];
-      return new SinglePolymarketMarketDataAdapter(client, {
-        transport,
-        marketWsUrl: singleOptions.marketWsUrl,
-        ingress: transport?.queue,
-        stableAfterMs: singleOptions.stableAfterMs,
-      });
+      const childOptions: SingleOptions = {};
+      if (transport) childOptions.transport = transport;
+      if (singleOptions.marketWsUrl !== undefined) childOptions.marketWsUrl = singleOptions.marketWsUrl;
+      if (transport?.queue) childOptions.ingress = transport.queue;
+      if (singleOptions.stableAfterMs !== undefined) childOptions.stableAfterMs = singleOptions.stableAfterMs;
+      return new SinglePolymarketMarketDataAdapter(client, childOptions);
     });
   }
 
@@ -298,14 +298,15 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
   }
 
   private handlersForShard(shardIndex: number, handlers: PolymarketFeedHandlers): PolymarketFeedHandlers {
-    return {
+    const result: PolymarketFeedHandlers = {
       onSnapshot: (snapshot) => this.dispatchSnapshot(snapshot, handlers),
       onConnection: (event) => this.reportShardConnection(shardIndex, event, handlers),
       onError: (error) => handlers.onError(error),
-      onAnomaly: handlers.onAnomaly,
-      onGap: (event: MarketIngressGapEvent) => handlers.onGap?.(event),
-      onResync: handlers.onResync,
     };
+    if (handlers.onAnomaly) result.onAnomaly = handlers.onAnomaly;
+    if (handlers.onGap) result.onGap = (event: MarketIngressGapEvent) => handlers.onGap!(event);
+    if (handlers.onResync) result.onResync = handlers.onResync;
+    return result;
   }
 
   private dispatchSnapshot(snapshot: MarketSnapshot, handlers: PolymarketFeedHandlers): Promise<void> {
@@ -405,17 +406,17 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
       if (!liveKeys.has(key)) this.ownerByGroup.delete(key);
     }
 
-    const load = [0, 0];
+    const load: [number, number] = [0, 0];
     for (const group of groups) {
       const owner = this.ownerByGroup.get(group.key);
-      if (owner !== undefined) load[owner] += group.tokenIds.length;
+      if (owner !== undefined) load[owner] = (load[owner] ?? 0) + group.tokenIds.length;
     }
 
     for (const group of groups) {
       if (this.ownerByGroup.has(group.key)) continue;
       const owner = load[0] <= load[1] ? 0 : 1;
       this.ownerByGroup.set(group.key, owner);
-      load[owner] += group.tokenIds.length;
+      load[owner] = (load[owner] ?? 0) + group.tokenIds.length;
     }
 
     const partitions: string[][] = [[], []];
