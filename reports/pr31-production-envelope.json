@@ -1,0 +1,1496 @@
+{
+  "report": "PR31 production-envelope falsification",
+  "generatedAt": "2026-09-10T15:41:08.796Z",
+  "candidate": {
+    "maxDeliveryEventsPerSlice": 128,
+    "maxDeliverySliceMs": 0.5
+  },
+  "queueBounds": {
+    "maxEvents": 4096,
+    "maxBytes": 4194304
+  },
+  "tokenModel": {
+    "markets": 40,
+    "tokens": 80,
+    "outcomesPerMarket": 2,
+    "ordering": "deterministic UP then DOWN"
+  },
+  "sourceMix": {
+    "price_change": 0.981,
+    "book": 0.013,
+    "last_trade_price": 0.006,
+    "priceChangeEntriesPerPayload": 2
+  },
+  "producer": {
+    "maxCatchUpEventsPerTurn": 64,
+    "graceMs": 2000,
+    "schedulingLagToleranceMs": 100,
+    "pacing": "real-time due-time pacing with bounded catch-up; no giant synchronous catch-up batch"
+  },
+  "stage0ObservedEnvelope": {
+    "durationSec": 901,
+    "rawFrames": 1542116,
+    "rawFramesPerSec": 1711.56,
+    "expandedSourceEvents": 1544091,
+    "sourceEventsPerSec": 1713.75,
+    "averageNormalizedSnapshotsPerSec": 3384.91,
+    "observedPeakSourceEventsPerSec": 3641.33,
+    "observedPeakNormalizedSnapshotsPerSec": 7190.33,
+    "queueHighWaterEvents": 104,
+    "ingressOverflow": 0,
+    "provider1013Closes": 21
+  },
+  "scope": {
+    "fullReal": [
+      "BoundedClobMarketTransport",
+      "BoundedIngressQueue",
+      "delivery scheduler",
+      "PolymarketMarketDataAdapter",
+      "EngineService.onMarketSnapshot",
+      "TriggerEngine.ingestMarket"
+    ],
+    "partialReal": [
+      "in-process deterministic WebSocket boundary",
+      "memory journal",
+      "configured token metadata",
+      "measurement wrappers around real snapshot handler"
+    ],
+    "stubbed": [
+      "external reference/economic side effects not required by neutral IDLE paper-mode workload",
+      "NoopGrokActivationBridge"
+    ],
+    "notExercised": [
+      "remote Polymarket server",
+      "server-side send-buffer threshold",
+      "reconnect initial_dump",
+      "dynamic subscription",
+      "active triggers",
+      "Grok/network",
+      "resting orders",
+      "fills",
+      "risk",
+      "execution",
+      "live trading"
+    ]
+  },
+  "scenarios": {
+    "A": {
+      "name": "A",
+      "description": "Stage0 average source-event load",
+      "observed": true,
+      "syntheticSafetyMargin": false,
+      "segments": [
+        {
+          "label": "average",
+          "durationMs": 30000,
+          "ratePerSec": 1714
+        }
+      ],
+      "repeats": 3,
+      "passingRuns": 3,
+      "allRunsPass": true,
+      "repeatsDetail": [
+        {
+          "scenario": "A",
+          "repeat": 1,
+          "pass": true,
+          "maxEvents": 128,
+          "maxSliceMs": 0.5,
+          "initialBooksExpected": 80,
+          "initialBooksAttempted": 80,
+          "initialBooksAdmitted": 80,
+          "initialBooksDelivered": 80,
+          "initialBooksProcessed": 80,
+          "workloadEventsScheduled": 51420,
+          "workloadEventsExpected": 51420,
+          "workloadEventsAttempted": 51420,
+          "workloadEventsAdmitted": 51420,
+          "workloadEventsDelivered": 51420,
+          "workloadEventsProcessed": 51420,
+          "producerDueEventsAtStop": 51420,
+          "actualProducerRatePerSec": 1713.987196515642,
+          "workloadDeliveredRatePerSec": 1712.8668871681316,
+          "producerSchedulingLag": {
+            "count": 51420,
+            "p50Ms": 2.7731313885651616,
+            "p95Ms": 11.169123220537585,
+            "p99Ms": 12.969030805135844,
+            "maxMs": 15.02933395565924
+          },
+          "workloadSourceCountsAttempted": {
+            "book": 663,
+            "price_change": 50451,
+            "last_trade_price": 306,
+            "total": 51420
+          },
+          "workloadSourceCountsAdmitted": {
+            "book": 663,
+            "price_change": 50451,
+            "last_trade_price": 306,
+            "total": 51420
+          },
+          "workloadSourceCountsDelivered": {
+            "book": 663,
+            "price_change": 50451,
+            "last_trade_price": 306,
+            "total": 51420
+          },
+          "workloadPriceChangeEntriesAttempted": 100902,
+          "workloadPriceChangeEntriesDelivered": 100902,
+          "workloadNormalizedSnapshotsExpected": 101565,
+          "workloadNormalizedSnapshots": 101565,
+          "initialNormalizedSnapshots": 80,
+          "allInitialBooksProcessed": true,
+          "loss": 0,
+          "duplicateEvents": 0,
+          "fifoViolations": 0,
+          "perTokenOrderingViolations": 0,
+          "gapsByReason": {
+            "count_limit": 0,
+            "byte_limit": 0,
+            "reconnect": 0,
+            "generation_change": 0,
+            "reference_window_limit": 0,
+            "malformed": 0,
+            "explicit_resubscribe": 0
+          },
+          "resyncs": 0,
+          "unsynchronizedTokens": 0,
+          "queueFinalDepth": 0,
+          "queueFinalBytes": 0,
+          "queueDepthAtProducerStop": 0,
+          "queueHighWaterEvents": 80,
+          "queueHighWaterBytes": 16391,
+          "countLimitGaps": 0,
+          "byteLimitGaps": 0,
+          "transportDeliveryLatency": {
+            "count": 51500,
+            "p50Ms": 0.7737999999990279,
+            "p95Ms": 2.1273000000001048,
+            "p99Ms": 2.901400000000649,
+            "maxMs": 609.1257
+          },
+          "snapshotCompletionLatency": {
+            "count": 101565,
+            "p50Ms": 0.8381999999983236,
+            "p95Ms": 2.184400000000096,
+            "p99Ms": 2.9016000000010536,
+            "maxMs": 5.199399999999514
+          },
+          "eventLoopUtilization": 0.3334499354275869,
+          "eventLoopDelayP50Ms": 15.597567,
+          "eventLoopDelayP95Ms": 16.588799,
+          "eventLoopDelayP99Ms": 22.102015,
+          "eventLoopDelayMaxMs": 22.888447,
+          "fairnessProbeCallbacks": 1955,
+          "fairnessProbeCallbacksWhileBacklogged": 1724,
+          "fairnessProbeMaxDriftMs": 12.875499999998283,
+          "processCpuMs": 9781,
+          "wallMs": 30001.921000000002,
+          "engineOnMarketSnapshot": {
+            "count": 101645,
+            "totalMs": 1902.0870000004018,
+            "meanMs": 0.018713040484041533
+          },
+          "triggerEngineIngestMarket": {
+            "count": 101645,
+            "totalMs": 1123.3612000000255,
+            "meanMs": 0.011051809729942698
+          },
+          "adapterNormalization": {
+            "count": 101645,
+            "totalMs": 743.0284000001421,
+            "meanMs": 0.007310033941661096
+          },
+          "drainCompletionMs": 1.1941999999980908,
+          "drainTimedOut": false,
+          "terminalError": null,
+          "adapterErrors": 0,
+          "reconnects": 0,
+          "connectionGeneration": 1,
+          "notes": [
+            "Source-event schedule used real-time pacing with a maximum synchronous catch-up batch of 64 events per turn.",
+            "Fairness maximum drift is per 10 ms timer interval (actual interval minus 10 ms), not cumulative timer phase drift.",
+            "Producer scheduling lag tolerance was 100 ms; this is a harness pass criterion, not a production SLO.",
+            "processed is the bounded queue processed counter after iterator delivery; normalized snapshots are measured separately by the real adapter observer.",
+            "Engine instrumentation wraps and calls the real onMarketSnapshot implementation; wrapper overhead is not production code.",
+            "Scenario rate is drawn from the Stage0 observed envelope."
+          ]
+        },
+        {
+          "scenario": "A",
+          "repeat": 2,
+          "pass": true,
+          "maxEvents": 128,
+          "maxSliceMs": 0.5,
+          "initialBooksExpected": 80,
+          "initialBooksAttempted": 80,
+          "initialBooksAdmitted": 80,
+          "initialBooksDelivered": 80,
+          "initialBooksProcessed": 80,
+          "workloadEventsScheduled": 51420,
+          "workloadEventsExpected": 51420,
+          "workloadEventsAttempted": 51420,
+          "workloadEventsAdmitted": 51420,
+          "workloadEventsDelivered": 51420,
+          "workloadEventsProcessed": 51420,
+          "producerDueEventsAtStop": 51420,
+          "actualProducerRatePerSec": 1713.787387536702,
+          "workloadDeliveredRatePerSec": 1711.8769872230125,
+          "producerSchedulingLag": {
+            "count": 51420,
+            "p50Ms": 2.7879764294048073,
+            "p95Ms": 11.14728634772473,
+            "p99Ms": 13.015513068843575,
+            "maxMs": 15.851429171525524
+          },
+          "workloadSourceCountsAttempted": {
+            "book": 663,
+            "price_change": 50451,
+            "last_trade_price": 306,
+            "total": 51420
+          },
+          "workloadSourceCountsAdmitted": {
+            "book": 663,
+            "price_change": 50451,
+            "last_trade_price": 306,
+            "total": 51420
+          },
+          "workloadSourceCountsDelivered": {
+            "book": 663,
+            "price_change": 50451,
+            "last_trade_price": 306,
+            "total": 51420
+          },
+          "workloadPriceChangeEntriesAttempted": 100902,
+          "workloadPriceChangeEntriesDelivered": 100902,
+          "workloadNormalizedSnapshotsExpected": 101565,
+          "workloadNormalizedSnapshots": 101565,
+          "initialNormalizedSnapshots": 80,
+          "allInitialBooksProcessed": true,
+          "loss": 0,
+          "duplicateEvents": 0,
+          "fifoViolations": 0,
+          "perTokenOrderingViolations": 0,
+          "gapsByReason": {
+            "count_limit": 0,
+            "byte_limit": 0,
+            "reconnect": 0,
+            "generation_change": 0,
+            "reference_window_limit": 0,
+            "malformed": 0,
+            "explicit_resubscribe": 0
+          },
+          "resyncs": 0,
+          "unsynchronizedTokens": 0,
+          "queueFinalDepth": 0,
+          "queueFinalBytes": 0,
+          "queueDepthAtProducerStop": 12,
+          "queueHighWaterEvents": 80,
+          "queueHighWaterBytes": 16471,
+          "countLimitGaps": 0,
+          "byteLimitGaps": 0,
+          "transportDeliveryLatency": {
+            "count": 51500,
+            "p50Ms": 0.7708999999958905,
+            "p95Ms": 2.1396999999997206,
+            "p99Ms": 2.889600000002247,
+            "maxMs": 203.67369999999937
+          },
+          "snapshotCompletionLatency": {
+            "count": 101565,
+            "p50Ms": 0.833200000000943,
+            "p95Ms": 2.2003999999942607,
+            "p99Ms": 2.885099999999511,
+            "maxMs": 15.906399999999849
+          },
+          "eventLoopUtilization": 0.3313505918038377,
+          "eventLoopDelayP50Ms": 15.613951,
+          "eventLoopDelayP95Ms": 16.621567,
+          "eventLoopDelayP99Ms": 21.790719,
+          "eventLoopDelayMaxMs": 24.035327,
+          "fairnessProbeCallbacks": 1956,
+          "fairnessProbeCallbacksWhileBacklogged": 1732,
+          "fairnessProbeMaxDriftMs": 14.001299999996263,
+          "processCpuMs": 10984,
+          "wallMs": 30019.332799999996,
+          "engineOnMarketSnapshot": {
+            "count": 101645,
+            "totalMs": 1882.1137000002054,
+            "meanMs": 0.018516539918345273
+          },
+          "triggerEngineIngestMarket": {
+            "count": 101645,
+            "totalMs": 1116.6951000002796,
+            "meanMs": 0.01098622755669516
+          },
+          "adapterNormalization": {
+            "count": 101645,
+            "totalMs": 725.9250000000861,
+            "meanMs": 0.007141767917753811
+          },
+          "drainCompletionMs": 15.507799999999406,
+          "drainTimedOut": false,
+          "terminalError": null,
+          "adapterErrors": 0,
+          "reconnects": 0,
+          "connectionGeneration": 1,
+          "notes": [
+            "Source-event schedule used real-time pacing with a maximum synchronous catch-up batch of 64 events per turn.",
+            "Fairness maximum drift is per 10 ms timer interval (actual interval minus 10 ms), not cumulative timer phase drift.",
+            "Producer scheduling lag tolerance was 100 ms; this is a harness pass criterion, not a production SLO.",
+            "processed is the bounded queue processed counter after iterator delivery; normalized snapshots are measured separately by the real adapter observer.",
+            "Engine instrumentation wraps and calls the real onMarketSnapshot implementation; wrapper overhead is not production code.",
+            "Scenario rate is drawn from the Stage0 observed envelope."
+          ]
+        },
+        {
+          "scenario": "A",
+          "repeat": 3,
+          "pass": true,
+          "maxEvents": 128,
+          "maxSliceMs": 0.5,
+          "initialBooksExpected": 80,
+          "initialBooksAttempted": 80,
+          "initialBooksAdmitted": 80,
+          "initialBooksDelivered": 80,
+          "initialBooksProcessed": 80,
+          "workloadEventsScheduled": 51420,
+          "workloadEventsExpected": 51420,
+          "workloadEventsAttempted": 51420,
+          "workloadEventsAdmitted": 51420,
+          "workloadEventsDelivered": 51420,
+          "workloadEventsProcessed": 51420,
+          "producerDueEventsAtStop": 51420,
+          "actualProducerRatePerSec": 1713.3064535476035,
+          "workloadDeliveredRatePerSec": 1712.3512397774302,
+          "producerSchedulingLag": {
+            "count": 51420,
+            "p50Ms": 2.850087164537399,
+            "p95Ms": 11.205633372228476,
+            "p99Ms": 13.006686464417726,
+            "maxMs": 15.108919603284448
+          },
+          "workloadSourceCountsAttempted": {
+            "book": 663,
+            "price_change": 50451,
+            "last_trade_price": 306,
+            "total": 51420
+          },
+          "workloadSourceCountsAdmitted": {
+            "book": 663,
+            "price_change": 50451,
+            "last_trade_price": 306,
+            "total": 51420
+          },
+          "workloadSourceCountsDelivered": {
+            "book": 663,
+            "price_change": 50451,
+            "last_trade_price": 306,
+            "total": 51420
+          },
+          "workloadPriceChangeEntriesAttempted": 100902,
+          "workloadPriceChangeEntriesDelivered": 100902,
+          "workloadNormalizedSnapshotsExpected": 101565,
+          "workloadNormalizedSnapshots": 101565,
+          "initialNormalizedSnapshots": 80,
+          "allInitialBooksProcessed": true,
+          "loss": 0,
+          "duplicateEvents": 0,
+          "fifoViolations": 0,
+          "perTokenOrderingViolations": 0,
+          "gapsByReason": {
+            "count_limit": 0,
+            "byte_limit": 0,
+            "reconnect": 0,
+            "generation_change": 0,
+            "reference_window_limit": 0,
+            "malformed": 0,
+            "explicit_resubscribe": 0
+          },
+          "resyncs": 0,
+          "unsynchronizedTokens": 0,
+          "queueFinalDepth": 0,
+          "queueFinalBytes": 0,
+          "queueDepthAtProducerStop": 0,
+          "queueHighWaterEvents": 80,
+          "queueHighWaterBytes": 16471,
+          "countLimitGaps": 0,
+          "byteLimitGaps": 0,
+          "transportDeliveryLatency": {
+            "count": 51500,
+            "p50Ms": 0.7635000000009313,
+            "p95Ms": 2.1670999999914784,
+            "p99Ms": 2.907600000005914,
+            "maxMs": 309.2743999999948
+          },
+          "snapshotCompletionLatency": {
+            "count": 101565,
+            "p50Ms": 0.8310000000055879,
+            "p95Ms": 2.2256999999954132,
+            "p99Ms": 2.912000000011176,
+            "maxMs": 4.901299999997718
+          },
+          "eventLoopUtilization": 0.32708047169204796,
+          "eventLoopDelayP50Ms": 15.597567,
+          "eventLoopDelayP95Ms": 16.523263,
+          "eventLoopDelayP99Ms": 21.790719,
+          "eventLoopDelayMaxMs": 23.019519,
+          "fairnessProbeCallbacks": 1952,
+          "fairnessProbeCallbacksWhileBacklogged": 1740,
+          "fairnessProbeMaxDriftMs": 12.991399999998976,
+          "processCpuMs": 8578,
+          "wallMs": 30012.581600000005,
+          "engineOnMarketSnapshot": {
+            "count": 101645,
+            "totalMs": 1891.7378000007138,
+            "meanMs": 0.018611223375480483
+          },
+          "triggerEngineIngestMarket": {
+            "count": 101645,
+            "totalMs": 1125.7940999992536,
+            "meanMs": 0.011075744994827622
+          },
+          "adapterNormalization": {
+            "count": 101645,
+            "totalMs": 724.7459999976538,
+            "meanMs": 0.007130168724459185
+          },
+          "drainCompletionMs": 0.2865999999921769,
+          "drainTimedOut": false,
+          "terminalError": null,
+          "adapterErrors": 0,
+          "reconnects": 0,
+          "connectionGeneration": 1,
+          "notes": [
+            "Source-event schedule used real-time pacing with a maximum synchronous catch-up batch of 64 events per turn.",
+            "Fairness maximum drift is per 10 ms timer interval (actual interval minus 10 ms), not cumulative timer phase drift.",
+            "Producer scheduling lag tolerance was 100 ms; this is a harness pass criterion, not a production SLO.",
+            "processed is the bounded queue processed counter after iterator delivery; normalized snapshots are measured separately by the real adapter observer.",
+            "Engine instrumentation wraps and calls the real onMarketSnapshot implementation; wrapper overhead is not production code.",
+            "Scenario rate is drawn from the Stage0 observed envelope."
+          ]
+        }
+      ],
+      "variance": {
+        "workloadEventsAttempted": {
+          "min": 51420,
+          "max": 51420,
+          "range": 0
+        },
+        "workloadEventsDelivered": {
+          "min": 51420,
+          "max": 51420,
+          "range": 0
+        },
+        "producerSchedulingLagMaxMs": {
+          "min": 15.02933395565924,
+          "max": 15.851429171525524,
+          "range": 0.822095215866284
+        },
+        "queueDepthAtProducerStop": {
+          "min": 0,
+          "max": 12,
+          "range": 12
+        },
+        "queueHighWaterEvents": {
+          "min": 80,
+          "max": 80,
+          "range": 0
+        },
+        "queueHighWaterBytes": {
+          "min": 16391,
+          "max": 16471,
+          "range": 80
+        },
+        "transportDeliveryP99Ms": {
+          "min": 2.889600000002247,
+          "max": 2.907600000005914,
+          "range": 0.018000000003667083
+        },
+        "snapshotCompletionP99Ms": {
+          "min": 2.885099999999511,
+          "max": 2.912000000011176,
+          "range": 0.026900000011664815
+        },
+        "eventLoopUtilization": {
+          "min": 0.32708047169204796,
+          "max": 0.3334499354275869,
+          "range": 0.006369463735538927
+        },
+        "eventLoopDelayP99Ms": {
+          "min": 21.790719,
+          "max": 22.102015,
+          "range": 0.31129600000000224
+        },
+        "fairnessMaxDriftMs": {
+          "min": 12.875499999998283,
+          "max": 14.001299999996263,
+          "range": 1.1257999999979802
+        },
+        "processCpuMs": {
+          "min": 8578,
+          "max": 10984,
+          "range": 2406
+        },
+        "wallMs": {
+          "min": 30001.921000000002,
+          "max": 30019.332799999996,
+          "range": 17.4117999999944
+        }
+      }
+    },
+    "B": {
+      "name": "B",
+      "description": "Stage0 observed approximately six-second peak",
+      "observed": true,
+      "syntheticSafetyMargin": false,
+      "segments": [
+        {
+          "label": "average-before-peak",
+          "durationMs": 10000,
+          "ratePerSec": 1714
+        },
+        {
+          "label": "observed-peak",
+          "durationMs": 6000,
+          "ratePerSec": 3650
+        },
+        {
+          "label": "average-after-peak",
+          "durationMs": 10000,
+          "ratePerSec": 1714
+        }
+      ],
+      "repeats": 3,
+      "passingRuns": 3,
+      "allRunsPass": true,
+      "repeatsDetail": [
+        {
+          "scenario": "B",
+          "repeat": 1,
+          "pass": true,
+          "maxEvents": 128,
+          "maxSliceMs": 0.5,
+          "initialBooksExpected": 80,
+          "initialBooksAttempted": 80,
+          "initialBooksAdmitted": 80,
+          "initialBooksDelivered": 80,
+          "initialBooksProcessed": 80,
+          "workloadEventsScheduled": 56180,
+          "workloadEventsExpected": 56180,
+          "workloadEventsAttempted": 56180,
+          "workloadEventsAdmitted": 56180,
+          "workloadEventsDelivered": 56180,
+          "workloadEventsProcessed": 56180,
+          "producerDueEventsAtStop": 56180,
+          "actualProducerRatePerSec": 2160.762299708624,
+          "workloadDeliveredRatePerSec": 2159.517931327277,
+          "producerSchedulingLag": {
+            "count": 56180,
+            "p50Ms": 0.10286137690127362,
+            "p95Ms": 10.449402683778317,
+            "p99Ms": 12.727847141184611,
+            "maxMs": 15.663275962651824
+          },
+          "workloadSourceCountsAttempted": {
+            "book": 728,
+            "price_change": 55116,
+            "last_trade_price": 336,
+            "total": 56180
+          },
+          "workloadSourceCountsAdmitted": {
+            "book": 728,
+            "price_change": 55116,
+            "last_trade_price": 336,
+            "total": 56180
+          },
+          "workloadSourceCountsDelivered": {
+            "book": 728,
+            "price_change": 55116,
+            "last_trade_price": 336,
+            "total": 56180
+          },
+          "workloadPriceChangeEntriesAttempted": 110232,
+          "workloadPriceChangeEntriesDelivered": 110232,
+          "workloadNormalizedSnapshotsExpected": 110960,
+          "workloadNormalizedSnapshots": 110960,
+          "initialNormalizedSnapshots": 80,
+          "allInitialBooksProcessed": true,
+          "loss": 0,
+          "duplicateEvents": 0,
+          "fifoViolations": 0,
+          "perTokenOrderingViolations": 0,
+          "gapsByReason": {
+            "count_limit": 0,
+            "byte_limit": 0,
+            "reconnect": 0,
+            "generation_change": 0,
+            "reference_window_limit": 0,
+            "malformed": 0,
+            "explicit_resubscribe": 0
+          },
+          "resyncs": 0,
+          "unsynchronizedTokens": 0,
+          "queueFinalDepth": 0,
+          "queueFinalBytes": 0,
+          "queueDepthAtProducerStop": 0,
+          "queueHighWaterEvents": 80,
+          "queueHighWaterBytes": 16471,
+          "countLimitGaps": 0,
+          "byteLimitGaps": 0,
+          "transportDeliveryLatency": {
+            "count": 56260,
+            "p50Ms": 0.0771999999997206,
+            "p95Ms": 1.925199999997858,
+            "p99Ms": 2.613100000002305,
+            "maxMs": 202.98480000000563
+          },
+          "snapshotCompletionLatency": {
+            "count": 110960,
+            "p50Ms": 0.14429999999993015,
+            "p95Ms": 1.985899999999674,
+            "p99Ms": 2.6231000000116182,
+            "maxMs": 6.464299999992363
+          },
+          "eventLoopUtilization": 0.4753199240332429,
+          "eventLoopDelayP50Ms": 15.204351,
+          "eventLoopDelayP95Ms": 16.334847,
+          "eventLoopDelayP99Ms": 21.626879,
+          "eventLoopDelayMaxMs": 22.937599,
+          "fairnessProbeCallbacks": 1898,
+          "fairnessProbeCallbacksWhileBacklogged": 1213,
+          "fairnessProbeMaxDriftMs": 12.897299999996903,
+          "processCpuMs": 11938,
+          "wallMs": 26001.291100000002,
+          "engineOnMarketSnapshot": {
+            "count": 111040,
+            "totalMs": 1489.8529999983339,
+            "meanMs": 0.013417264048976349
+          },
+          "triggerEngineIngestMarket": {
+            "count": 111040,
+            "totalMs": 887.3993000009633,
+            "meanMs": 0.007991708393380433
+          },
+          "adapterNormalization": {
+            "count": 111040,
+            "totalMs": 581.5169999991175,
+            "meanMs": 0.00523700468298917
+          },
+          "drainCompletionMs": 1.0856000000057975,
+          "drainTimedOut": false,
+          "terminalError": null,
+          "adapterErrors": 0,
+          "reconnects": 0,
+          "connectionGeneration": 1,
+          "notes": [
+            "Source-event schedule used real-time pacing with a maximum synchronous catch-up batch of 64 events per turn.",
+            "Fairness maximum drift is per 10 ms timer interval (actual interval minus 10 ms), not cumulative timer phase drift.",
+            "Producer scheduling lag tolerance was 100 ms; this is a harness pass criterion, not a production SLO.",
+            "processed is the bounded queue processed counter after iterator delivery; normalized snapshots are measured separately by the real adapter observer.",
+            "Engine instrumentation wraps and calls the real onMarketSnapshot implementation; wrapper overhead is not production code.",
+            "Scenario rate is drawn from the Stage0 observed envelope."
+          ]
+        },
+        {
+          "scenario": "B",
+          "repeat": 2,
+          "pass": true,
+          "maxEvents": 128,
+          "maxSliceMs": 0.5,
+          "initialBooksExpected": 80,
+          "initialBooksAttempted": 80,
+          "initialBooksAdmitted": 80,
+          "initialBooksDelivered": 80,
+          "initialBooksProcessed": 80,
+          "workloadEventsScheduled": 56180,
+          "workloadEventsExpected": 56180,
+          "workloadEventsAttempted": 56180,
+          "workloadEventsAdmitted": 56180,
+          "workloadEventsDelivered": 56180,
+          "workloadEventsProcessed": 56180,
+          "producerDueEventsAtStop": 56180,
+          "actualProducerRatePerSec": 2160.39441895596,
+          "workloadDeliveredRatePerSec": 2153.658719424482,
+          "producerSchedulingLag": {
+            "count": 56180,
+            "p50Ms": 0.06526347724138759,
+            "p95Ms": 10.429769544920418,
+            "p99Ms": 12.725719603273319,
+            "maxMs": 15.03000490082195
+          },
+          "workloadSourceCountsAttempted": {
+            "book": 728,
+            "price_change": 55116,
+            "last_trade_price": 336,
+            "total": 56180
+          },
+          "workloadSourceCountsAdmitted": {
+            "book": 728,
+            "price_change": 55116,
+            "last_trade_price": 336,
+            "total": 56180
+          },
+          "workloadSourceCountsDelivered": {
+            "book": 728,
+            "price_change": 55116,
+            "last_trade_price": 336,
+            "total": 56180
+          },
+          "workloadPriceChangeEntriesAttempted": 110232,
+          "workloadPriceChangeEntriesDelivered": 110232,
+          "workloadNormalizedSnapshotsExpected": 110960,
+          "workloadNormalizedSnapshots": 110960,
+          "initialNormalizedSnapshots": 80,
+          "allInitialBooksProcessed": true,
+          "loss": 0,
+          "duplicateEvents": 0,
+          "fifoViolations": 0,
+          "perTokenOrderingViolations": 0,
+          "gapsByReason": {
+            "count_limit": 0,
+            "byte_limit": 0,
+            "reconnect": 0,
+            "generation_change": 0,
+            "reference_window_limit": 0,
+            "malformed": 0,
+            "explicit_resubscribe": 0
+          },
+          "resyncs": 0,
+          "unsynchronizedTokens": 0,
+          "queueFinalDepth": 0,
+          "queueFinalBytes": 0,
+          "queueDepthAtProducerStop": 9,
+          "queueHighWaterEvents": 80,
+          "queueHighWaterBytes": 16551,
+          "countLimitGaps": 0,
+          "byteLimitGaps": 0,
+          "transportDeliveryLatency": {
+            "count": 56260,
+            "p50Ms": 0.05409999999392312,
+            "p95Ms": 1.8722000000125263,
+            "p99Ms": 2.493499999996857,
+            "maxMs": 60.83840000000782
+          },
+          "snapshotCompletionLatency": {
+            "count": 110960,
+            "p50Ms": 0.1272000000171829,
+            "p95Ms": 1.9407000000064727,
+            "p99Ms": 2.57390000000305,
+            "maxMs": 60.90160000001197
+          },
+          "eventLoopUtilization": 0.4788868176439306,
+          "eventLoopDelayP50Ms": 15.204351,
+          "eventLoopDelayP95Ms": 16.343039,
+          "eventLoopDelayP99Ms": 21.987327,
+          "eventLoopDelayMaxMs": 24.002559,
+          "fairnessProbeCallbacks": 1910,
+          "fairnessProbeCallbacksWhileBacklogged": 1182,
+          "fairnessProbeMaxDriftMs": 14.00989999997546,
+          "processCpuMs": 14469,
+          "wallMs": 26065.24859999999,
+          "engineOnMarketSnapshot": {
+            "count": 111040,
+            "totalMs": 1489.208700002494,
+            "meanMs": 0.013411461635469146
+          },
+          "triggerEngineIngestMarket": {
+            "count": 111040,
+            "totalMs": 879.2846000003345,
+            "meanMs": 0.007918629322769584
+          },
+          "adapterNormalization": {
+            "count": 111040,
+            "totalMs": 559.3983000007387,
+            "meanMs": 0.005037808897701177
+          },
+          "drainCompletionMs": 60.577799999999115,
+          "drainTimedOut": false,
+          "terminalError": null,
+          "adapterErrors": 0,
+          "reconnects": 0,
+          "connectionGeneration": 1,
+          "notes": [
+            "Source-event schedule used real-time pacing with a maximum synchronous catch-up batch of 64 events per turn.",
+            "Fairness maximum drift is per 10 ms timer interval (actual interval minus 10 ms), not cumulative timer phase drift.",
+            "Producer scheduling lag tolerance was 100 ms; this is a harness pass criterion, not a production SLO.",
+            "processed is the bounded queue processed counter after iterator delivery; normalized snapshots are measured separately by the real adapter observer.",
+            "Engine instrumentation wraps and calls the real onMarketSnapshot implementation; wrapper overhead is not production code.",
+            "Scenario rate is drawn from the Stage0 observed envelope."
+          ]
+        },
+        {
+          "scenario": "B",
+          "repeat": 3,
+          "pass": true,
+          "maxEvents": 128,
+          "maxSliceMs": 0.5,
+          "initialBooksExpected": 80,
+          "initialBooksAttempted": 80,
+          "initialBooksAdmitted": 80,
+          "initialBooksDelivered": 80,
+          "initialBooksProcessed": 80,
+          "workloadEventsScheduled": 56180,
+          "workloadEventsExpected": 56180,
+          "workloadEventsAttempted": 56180,
+          "workloadEventsAdmitted": 56180,
+          "workloadEventsDelivered": 56180,
+          "workloadEventsProcessed": 56180,
+          "producerDueEventsAtStop": 56180,
+          "actualProducerRatePerSec": 2160.1342676094737,
+          "workloadDeliveredRatePerSec": 2158.382201179716,
+          "producerSchedulingLag": {
+            "count": 56180,
+            "p50Ms": 0.06697808220633306,
+            "p95Ms": 10.256607584626181,
+            "p99Ms": 12.644619486585725,
+            "maxMs": 15.321224504092243
+          },
+          "workloadSourceCountsAttempted": {
+            "book": 728,
+            "price_change": 55116,
+            "last_trade_price": 336,
+            "total": 56180
+          },
+          "workloadSourceCountsAdmitted": {
+            "book": 728,
+            "price_change": 55116,
+            "last_trade_price": 336,
+            "total": 56180
+          },
+          "workloadSourceCountsDelivered": {
+            "book": 728,
+            "price_change": 55116,
+            "last_trade_price": 336,
+            "total": 56180
+          },
+          "workloadPriceChangeEntriesAttempted": 110232,
+          "workloadPriceChangeEntriesDelivered": 110232,
+          "workloadNormalizedSnapshotsExpected": 110960,
+          "workloadNormalizedSnapshots": 110960,
+          "initialNormalizedSnapshots": 80,
+          "allInitialBooksProcessed": true,
+          "loss": 0,
+          "duplicateEvents": 0,
+          "fifoViolations": 0,
+          "perTokenOrderingViolations": 0,
+          "gapsByReason": {
+            "count_limit": 0,
+            "byte_limit": 0,
+            "reconnect": 0,
+            "generation_change": 0,
+            "reference_window_limit": 0,
+            "malformed": 0,
+            "explicit_resubscribe": 0
+          },
+          "resyncs": 0,
+          "unsynchronizedTokens": 0,
+          "queueFinalDepth": 0,
+          "queueFinalBytes": 0,
+          "queueDepthAtProducerStop": 0,
+          "queueHighWaterEvents": 80,
+          "queueHighWaterBytes": 16551,
+          "countLimitGaps": 0,
+          "byteLimitGaps": 0,
+          "transportDeliveryLatency": {
+            "count": 56260,
+            "p50Ms": 0.0625,
+            "p95Ms": 1.933500000013737,
+            "p99Ms": 2.6178000000072643,
+            "maxMs": 215.62150000000838
+          },
+          "snapshotCompletionLatency": {
+            "count": 110960,
+            "p50Ms": 0.13409999999566935,
+            "p95Ms": 1.9894999999960419,
+            "p99Ms": 2.6319000000075903,
+            "maxMs": 6.683699999994133
+          },
+          "eventLoopUtilization": 0.4820948056490006,
+          "eventLoopDelayP50Ms": 15.245311,
+          "eventLoopDelayP95Ms": 16.392191,
+          "eventLoopDelayP99Ms": 21.692415,
+          "eventLoopDelayMaxMs": 23.560191,
+          "fairnessProbeCallbacks": 1891,
+          "fairnessProbeCallbacksWhileBacklogged": 1176,
+          "fairnessProbeMaxDriftMs": 13.551100000011502,
+          "processCpuMs": 12703,
+          "wallMs": 26008.100799999986,
+          "engineOnMarketSnapshot": {
+            "count": 111040,
+            "totalMs": 1516.3796000067787,
+            "meanMs": 0.013656156340118684
+          },
+          "triggerEngineIngestMarket": {
+            "count": 111040,
+            "totalMs": 899.4537000003307,
+            "meanMs": 0.008100267471184535
+          },
+          "adapterNormalization": {
+            "count": 111040,
+            "totalMs": 592.0633000003231,
+            "meanMs": 0.005331982168590806
+          },
+          "drainCompletionMs": 0.28279999998630956,
+          "drainTimedOut": false,
+          "terminalError": null,
+          "adapterErrors": 0,
+          "reconnects": 0,
+          "connectionGeneration": 1,
+          "notes": [
+            "Source-event schedule used real-time pacing with a maximum synchronous catch-up batch of 64 events per turn.",
+            "Fairness maximum drift is per 10 ms timer interval (actual interval minus 10 ms), not cumulative timer phase drift.",
+            "Producer scheduling lag tolerance was 100 ms; this is a harness pass criterion, not a production SLO.",
+            "processed is the bounded queue processed counter after iterator delivery; normalized snapshots are measured separately by the real adapter observer.",
+            "Engine instrumentation wraps and calls the real onMarketSnapshot implementation; wrapper overhead is not production code.",
+            "Scenario rate is drawn from the Stage0 observed envelope."
+          ]
+        }
+      ],
+      "variance": {
+        "workloadEventsAttempted": {
+          "min": 56180,
+          "max": 56180,
+          "range": 0
+        },
+        "workloadEventsDelivered": {
+          "min": 56180,
+          "max": 56180,
+          "range": 0
+        },
+        "producerSchedulingLagMaxMs": {
+          "min": 15.03000490082195,
+          "max": 15.663275962651824,
+          "range": 0.6332710618298734
+        },
+        "queueDepthAtProducerStop": {
+          "min": 0,
+          "max": 9,
+          "range": 9
+        },
+        "queueHighWaterEvents": {
+          "min": 80,
+          "max": 80,
+          "range": 0
+        },
+        "queueHighWaterBytes": {
+          "min": 16471,
+          "max": 16551,
+          "range": 80
+        },
+        "transportDeliveryP99Ms": {
+          "min": 2.493499999996857,
+          "max": 2.6178000000072643,
+          "range": 0.12430000001040753
+        },
+        "snapshotCompletionP99Ms": {
+          "min": 2.57390000000305,
+          "max": 2.6319000000075903,
+          "range": 0.0580000000045402
+        },
+        "eventLoopUtilization": {
+          "min": 0.4753199240332429,
+          "max": 0.4820948056490006,
+          "range": 0.0067748816157576774
+        },
+        "eventLoopDelayP99Ms": {
+          "min": 21.626879,
+          "max": 21.987327,
+          "range": 0.36044800000000166
+        },
+        "fairnessMaxDriftMs": {
+          "min": 12.897299999996903,
+          "max": 14.00989999997546,
+          "range": 1.1125999999785563
+        },
+        "processCpuMs": {
+          "min": 11938,
+          "max": 14469,
+          "range": 2531
+        },
+        "wallMs": {
+          "min": 26001.291100000002,
+          "max": 26065.24859999999,
+          "range": 63.95749999998952
+        }
+      }
+    },
+    "C": {
+      "name": "C",
+      "description": "Synthetic safety margin above the observed 3,641/s peak",
+      "observed": false,
+      "syntheticSafetyMargin": true,
+      "segments": [
+        {
+          "label": "synthetic-safety",
+          "durationMs": 10000,
+          "ratePerSec": 4500
+        }
+      ],
+      "repeats": 3,
+      "passingRuns": 3,
+      "allRunsPass": true,
+      "repeatsDetail": [
+        {
+          "scenario": "C",
+          "repeat": 1,
+          "pass": true,
+          "maxEvents": 128,
+          "maxSliceMs": 0.5,
+          "initialBooksExpected": 80,
+          "initialBooksAttempted": 80,
+          "initialBooksAdmitted": 80,
+          "initialBooksDelivered": 80,
+          "initialBooksProcessed": 80,
+          "workloadEventsScheduled": 45000,
+          "workloadEventsExpected": 45000,
+          "workloadEventsAttempted": 45000,
+          "workloadEventsAdmitted": 45000,
+          "workloadEventsDelivered": 45000,
+          "workloadEventsProcessed": 45000,
+          "producerDueEventsAtStop": 45000,
+          "actualProducerRatePerSec": 4499.996850002212,
+          "workloadDeliveredRatePerSec": 4496.276408692149,
+          "producerSchedulingLag": {
+            "count": 45000,
+            "p50Ms": 0.001155555568402633,
+            "p95Ms": 0.00888888887129724,
+            "p99Ms": 0.12091111112385988,
+            "maxMs": 1.2200555555464234
+          },
+          "workloadSourceCountsAttempted": {
+            "book": 585,
+            "price_change": 44145,
+            "last_trade_price": 270,
+            "total": 45000
+          },
+          "workloadSourceCountsAdmitted": {
+            "book": 585,
+            "price_change": 44145,
+            "last_trade_price": 270,
+            "total": 45000
+          },
+          "workloadSourceCountsDelivered": {
+            "book": 585,
+            "price_change": 44145,
+            "last_trade_price": 270,
+            "total": 45000
+          },
+          "workloadPriceChangeEntriesAttempted": 88290,
+          "workloadPriceChangeEntriesDelivered": 88290,
+          "workloadNormalizedSnapshotsExpected": 88875,
+          "workloadNormalizedSnapshots": 88875,
+          "initialNormalizedSnapshots": 80,
+          "allInitialBooksProcessed": true,
+          "loss": 0,
+          "duplicateEvents": 0,
+          "fifoViolations": 0,
+          "perTokenOrderingViolations": 0,
+          "gapsByReason": {
+            "count_limit": 0,
+            "byte_limit": 0,
+            "reconnect": 0,
+            "generation_change": 0,
+            "reference_window_limit": 0,
+            "malformed": 0,
+            "explicit_resubscribe": 0
+          },
+          "resyncs": 0,
+          "unsynchronizedTokens": 0,
+          "queueFinalDepth": 0,
+          "queueFinalBytes": 0,
+          "queueDepthAtProducerStop": 0,
+          "queueHighWaterEvents": 80,
+          "queueHighWaterBytes": 16551,
+          "countLimitGaps": 0,
+          "byteLimitGaps": 0,
+          "transportDeliveryLatency": {
+            "count": 45080,
+            "p50Ms": 0.006699999998090789,
+            "p95Ms": 0.027399999991757795,
+            "p99Ms": 0.07019999998738058,
+            "maxMs": 64.40200000000186
+          },
+          "snapshotCompletionLatency": {
+            "count": 88875,
+            "p50Ms": 0.0268999999971129,
+            "p95Ms": 0.07430000000749715,
+            "p99Ms": 0.12739999999757856,
+            "maxMs": 1.4346000000077765
+          },
+          "eventLoopUtilization": 1,
+          "eventLoopDelayP50Ms": 10.002431,
+          "eventLoopDelayP95Ms": 10.043391,
+          "eventLoopDelayP99Ms": 10.223615,
+          "eventLoopDelayMaxMs": 10.960895,
+          "fairnessProbeCallbacks": 1000,
+          "fairnessProbeCallbacksWhileBacklogged": 67,
+          "fairnessProbeMaxDriftMs": 0.9552000000257976,
+          "processCpuMs": 9984,
+          "wallMs": 10000.11659999998,
+          "engineOnMarketSnapshot": {
+            "count": 88955,
+            "totalMs": 543.581900002134,
+            "meanMs": 0.006110751503593211
+          },
+          "triggerEngineIngestMarket": {
+            "count": 88955,
+            "totalMs": 327.7059999964038,
+            "meanMs": 0.0036839525602428624
+          },
+          "adapterNormalization": {
+            "count": 88955,
+            "totalMs": 211.15030000038507,
+            "meanMs": 0.0023736754538855047
+          },
+          "drainCompletionMs": 0.06680000000051223,
+          "drainTimedOut": false,
+          "terminalError": null,
+          "adapterErrors": 0,
+          "reconnects": 0,
+          "connectionGeneration": 1,
+          "notes": [
+            "Source-event schedule used real-time pacing with a maximum synchronous catch-up batch of 64 events per turn.",
+            "Fairness maximum drift is per 10 ms timer interval (actual interval minus 10 ms), not cumulative timer phase drift.",
+            "Producer scheduling lag tolerance was 100 ms; this is a harness pass criterion, not a production SLO.",
+            "processed is the bounded queue processed counter after iterator delivery; normalized snapshots are measured separately by the real adapter observer.",
+            "Engine instrumentation wraps and calls the real onMarketSnapshot implementation; wrapper overhead is not production code.",
+            "Scenario C is synthetic safety margin above the observed Stage0 peak, not an observed production rate."
+          ]
+        },
+        {
+          "scenario": "C",
+          "repeat": 2,
+          "pass": true,
+          "maxEvents": 128,
+          "maxSliceMs": 0.5,
+          "initialBooksExpected": 80,
+          "initialBooksAttempted": 80,
+          "initialBooksAdmitted": 80,
+          "initialBooksDelivered": 80,
+          "initialBooksProcessed": 80,
+          "workloadEventsScheduled": 45000,
+          "workloadEventsExpected": 45000,
+          "workloadEventsAttempted": 45000,
+          "workloadEventsAdmitted": 45000,
+          "workloadEventsDelivered": 45000,
+          "workloadEventsProcessed": 45000,
+          "producerDueEventsAtStop": 45000,
+          "actualProducerRatePerSec": 4499.995725004068,
+          "workloadDeliveredRatePerSec": 4496.398429821707,
+          "producerSchedulingLag": {
+            "count": 45000,
+            "p50Ms": 0.001144444424426183,
+            "p95Ms": 0.0039555555558763444,
+            "p99Ms": 0.14558888887404464,
+            "maxMs": 2.221966666635126
+          },
+          "workloadSourceCountsAttempted": {
+            "book": 585,
+            "price_change": 44145,
+            "last_trade_price": 270,
+            "total": 45000
+          },
+          "workloadSourceCountsAdmitted": {
+            "book": 585,
+            "price_change": 44145,
+            "last_trade_price": 270,
+            "total": 45000
+          },
+          "workloadSourceCountsDelivered": {
+            "book": 585,
+            "price_change": 44145,
+            "last_trade_price": 270,
+            "total": 45000
+          },
+          "workloadPriceChangeEntriesAttempted": 88290,
+          "workloadPriceChangeEntriesDelivered": 88290,
+          "workloadNormalizedSnapshotsExpected": 88875,
+          "workloadNormalizedSnapshots": 88875,
+          "initialNormalizedSnapshots": 80,
+          "allInitialBooksProcessed": true,
+          "loss": 0,
+          "duplicateEvents": 0,
+          "fifoViolations": 0,
+          "perTokenOrderingViolations": 0,
+          "gapsByReason": {
+            "count_limit": 0,
+            "byte_limit": 0,
+            "reconnect": 0,
+            "generation_change": 0,
+            "reference_window_limit": 0,
+            "malformed": 0,
+            "explicit_resubscribe": 0
+          },
+          "resyncs": 0,
+          "unsynchronizedTokens": 0,
+          "queueFinalDepth": 0,
+          "queueFinalBytes": 0,
+          "queueDepthAtProducerStop": 0,
+          "queueHighWaterEvents": 80,
+          "queueHighWaterBytes": 16551,
+          "countLimitGaps": 0,
+          "byteLimitGaps": 0,
+          "transportDeliveryLatency": {
+            "count": 45080,
+            "p50Ms": 0.006699999998090789,
+            "p95Ms": 0.027600000001257285,
+            "p99Ms": 0.07919999997830018,
+            "maxMs": 155.99229999998352
+          },
+          "snapshotCompletionLatency": {
+            "count": 88875,
+            "p50Ms": 0.02669999998761341,
+            "p95Ms": 0.07509999998728745,
+            "p99Ms": 0.13980000000447035,
+            "maxMs": 1.8923999999824446
+          },
+          "eventLoopUtilization": 1,
+          "eventLoopDelayP50Ms": 10.002431,
+          "eventLoopDelayP95Ms": 10.018815,
+          "eventLoopDelayP99Ms": 10.092543,
+          "eventLoopDelayMaxMs": 10.461183,
+          "fairnessProbeCallbacks": 1000,
+          "fairnessProbeCallbacksWhileBacklogged": 18,
+          "fairnessProbeMaxDriftMs": 0.46209999997518025,
+          "processCpuMs": 9859,
+          "wallMs": 10000.139399999985,
+          "engineOnMarketSnapshot": {
+            "count": 88955,
+            "totalMs": 553.1623999984316,
+            "meanMs": 0.006218452026287805
+          },
+          "triggerEngineIngestMarket": {
+            "count": 88955,
+            "totalMs": 333.8780999974679,
+            "meanMs": 0.003753337080517879
+          },
+          "adapterNormalization": {
+            "count": 88955,
+            "totalMs": 210.08170000736536,
+            "meanMs": 0.002361662638495479
+          },
+          "drainCompletionMs": 0.0687000000034459,
+          "drainTimedOut": false,
+          "terminalError": null,
+          "adapterErrors": 0,
+          "reconnects": 0,
+          "connectionGeneration": 1,
+          "notes": [
+            "Source-event schedule used real-time pacing with a maximum synchronous catch-up batch of 64 events per turn.",
+            "Fairness maximum drift is per 10 ms timer interval (actual interval minus 10 ms), not cumulative timer phase drift.",
+            "Producer scheduling lag tolerance was 100 ms; this is a harness pass criterion, not a production SLO.",
+            "processed is the bounded queue processed counter after iterator delivery; normalized snapshots are measured separately by the real adapter observer.",
+            "Engine instrumentation wraps and calls the real onMarketSnapshot implementation; wrapper overhead is not production code.",
+            "Scenario C is synthetic safety margin above the observed Stage0 peak, not an observed production rate."
+          ]
+        },
+        {
+          "scenario": "C",
+          "repeat": 3,
+          "pass": true,
+          "maxEvents": 128,
+          "maxSliceMs": 0.5,
+          "initialBooksExpected": 80,
+          "initialBooksAttempted": 80,
+          "initialBooksAdmitted": 80,
+          "initialBooksDelivered": 80,
+          "initialBooksProcessed": 80,
+          "workloadEventsScheduled": 45000,
+          "workloadEventsExpected": 45000,
+          "workloadEventsAttempted": 45000,
+          "workloadEventsAdmitted": 45000,
+          "workloadEventsDelivered": 45000,
+          "workloadEventsProcessed": 45000,
+          "producerDueEventsAtStop": 45000,
+          "actualProducerRatePerSec": 4499.995545004409,
+          "workloadDeliveredRatePerSec": 4496.406247306843,
+          "producerSchedulingLag": {
+            "count": 45000,
+            "p50Ms": 0.001144444424426183,
+            "p95Ms": 0.002966666652355343,
+            "p99Ms": 0.1503111111233011,
+            "maxMs": 7.1416555555479135
+          },
+          "workloadSourceCountsAttempted": {
+            "book": 585,
+            "price_change": 44145,
+            "last_trade_price": 270,
+            "total": 45000
+          },
+          "workloadSourceCountsAdmitted": {
+            "book": 585,
+            "price_change": 44145,
+            "last_trade_price": 270,
+            "total": 45000
+          },
+          "workloadSourceCountsDelivered": {
+            "book": 585,
+            "price_change": 44145,
+            "last_trade_price": 270,
+            "total": 45000
+          },
+          "workloadPriceChangeEntriesAttempted": 88290,
+          "workloadPriceChangeEntriesDelivered": 88290,
+          "workloadNormalizedSnapshotsExpected": 88875,
+          "workloadNormalizedSnapshots": 88875,
+          "initialNormalizedSnapshots": 80,
+          "allInitialBooksProcessed": true,
+          "loss": 0,
+          "duplicateEvents": 0,
+          "fifoViolations": 0,
+          "perTokenOrderingViolations": 0,
+          "gapsByReason": {
+            "count_limit": 0,
+            "byte_limit": 0,
+            "reconnect": 0,
+            "generation_change": 0,
+            "reference_window_limit": 0,
+            "malformed": 0,
+            "explicit_resubscribe": 0
+          },
+          "resyncs": 0,
+          "unsynchronizedTokens": 0,
+          "queueFinalDepth": 0,
+          "queueFinalBytes": 0,
+          "queueDepthAtProducerStop": 0,
+          "queueHighWaterEvents": 80,
+          "queueHighWaterBytes": 16551,
+          "countLimitGaps": 0,
+          "byteLimitGaps": 0,
+          "transportDeliveryLatency": {
+            "count": 45080,
+            "p50Ms": 0.006699999998090789,
+            "p95Ms": 0.02670000001671724,
+            "p99Ms": 0.07950000002165325,
+            "maxMs": 81.59419999999227
+          },
+          "snapshotCompletionLatency": {
+            "count": 88875,
+            "p50Ms": 0.0268999999971129,
+            "p95Ms": 0.073900000017602,
+            "p99Ms": 0.13529999999445863,
+            "maxMs": 7.316099999996368
+          },
+          "eventLoopUtilization": 1,
+          "eventLoopDelayP50Ms": 10.002431,
+          "eventLoopDelayP95Ms": 10.010623,
+          "eventLoopDelayP99Ms": 10.076159,
+          "eventLoopDelayMaxMs": 10.403839,
+          "fairnessProbeCallbacks": 1000,
+          "fairnessProbeCallbacksWhileBacklogged": 11,
+          "fairnessProbeMaxDriftMs": 0.40030000000842847,
+          "processCpuMs": 9844,
+          "wallMs": 10000.14969999998,
+          "engineOnMarketSnapshot": {
+            "count": 88955,
+            "totalMs": 546.6796999966339,
+            "meanMs": 0.006145575852921521
+          },
+          "triggerEngineIngestMarket": {
+            "count": 88955,
+            "totalMs": 329.99129999843643,
+            "meanMs": 0.0037096430779431895
+          },
+          "adapterNormalization": {
+            "count": 88955,
+            "totalMs": 209.03259999384656,
+            "meanMs": 0.0023498690348361146
+          },
+          "drainCompletionMs": 0.09299999999348074,
+          "drainTimedOut": false,
+          "terminalError": null,
+          "adapterErrors": 0,
+          "reconnects": 0,
+          "connectionGeneration": 1,
+          "notes": [
+            "Source-event schedule used real-time pacing with a maximum synchronous catch-up batch of 64 events per turn.",
+            "Fairness maximum drift is per 10 ms timer interval (actual interval minus 10 ms), not cumulative timer phase drift.",
+            "Producer scheduling lag tolerance was 100 ms; this is a harness pass criterion, not a production SLO.",
+            "processed is the bounded queue processed counter after iterator delivery; normalized snapshots are measured separately by the real adapter observer.",
+            "Engine instrumentation wraps and calls the real onMarketSnapshot implementation; wrapper overhead is not production code.",
+            "Scenario C is synthetic safety margin above the observed Stage0 peak, not an observed production rate."
+          ]
+        }
+      ],
+      "variance": {
+        "workloadEventsAttempted": {
+          "min": 45000,
+          "max": 45000,
+          "range": 0
+        },
+        "workloadEventsDelivered": {
+          "min": 45000,
+          "max": 45000,
+          "range": 0
+        },
+        "producerSchedulingLagMaxMs": {
+          "min": 1.2200555555464234,
+          "max": 7.1416555555479135,
+          "range": 5.92160000000149
+        },
+        "queueDepthAtProducerStop": {
+          "min": 0,
+          "max": 0,
+          "range": 0
+        },
+        "queueHighWaterEvents": {
+          "min": 80,
+          "max": 80,
+          "range": 0
+        },
+        "queueHighWaterBytes": {
+          "min": 16551,
+          "max": 16551,
+          "range": 0
+        },
+        "transportDeliveryP99Ms": {
+          "min": 0.07019999998738058,
+          "max": 0.07950000002165325,
+          "range": 0.00930000003427267
+        },
+        "snapshotCompletionP99Ms": {
+          "min": 0.12739999999757856,
+          "max": 0.13980000000447035,
+          "range": 0.012400000006891787
+        },
+        "eventLoopUtilization": {
+          "min": 1,
+          "max": 1,
+          "range": 0
+        },
+        "eventLoopDelayP99Ms": {
+          "min": 10.076159,
+          "max": 10.223615,
+          "range": 0.14745600000000003
+        },
+        "fairnessMaxDriftMs": {
+          "min": 0.40030000000842847,
+          "max": 0.9552000000257976,
+          "range": 0.5549000000173692
+        },
+        "processCpuMs": {
+          "min": 9844,
+          "max": 9984,
+          "range": 140
+        },
+        "wallMs": {
+          "min": 10000.11659999998,
+          "max": 10000.14969999998,
+          "range": 0.033100000000558794
+        }
+      }
+    }
+  },
+  "bottleneckAttribution": "No local bottleneck was exposed by the required production-shaped scenarios; this does not establish production safety.",
+  "decision": "PASS_TO_OVH_COMPARISON",
+  "claimsNotMade": [
+    "1013 fixed",
+    "architecture fixed",
+    "production scheduler selected",
+    "safe for merge",
+    "safe for deploy",
+    "safe for live trading"
+  ]
+}
