@@ -7,62 +7,85 @@ import {
   type DiscoveryReport,
   type FeedConnectionEvent,
   type MarketIngressGapEvent,
+  type MarketIngressResyncEvent,
   type PolymarketFeedHandlers,
   type PolymarketFeedAnomaly,
   type PolymarketTimestampStats,
   type MarketNormalizeObserver,
 } from "./polymarket.js";
 
-const MARKET_SHARD_COUNT = 2;
+export const DEFAULT_POLYMARKET_MARKET_SHARD_COUNT = 4;
 type SingleOptions = NonNullable<ConstructorParameters<typeof SinglePolymarketMarketDataAdapter>[1]>;
 type SingleClient = ConstructorParameters<typeof SinglePolymarketMarketDataAdapter>[0];
 
+type ConnectionState = FeedConnectionEvent["state"];
+type TokenGroup = { key: string; tokenIds: string[] };
+
 export interface ShardedPolymarketAdapterOptions extends SingleOptions {
-  /** Test seam only. Production always constructs two independent owned transports. */
+  /**
+   * Test seam only. Production constructs DEFAULT_POLYMARKET_MARKET_SHARD_COUNT
+   * independent owned transports. Supplying transports makes their positive
+   * length the shard count for deterministic tests.
+   */
   transports?: readonly MarketStreamTransport[];
 }
 
-type TokenGroup = { key: string; tokenIds: string[] };
-type ConnectionState = FeedConnectionEvent["state"];
+export interface PolymarketMarketShardSnapshot {
+  shard: number;
+  state: ConnectionState;
+  reconnectCount: number;
+  tokenCount: number;
+  unsynchronizedTokens: number;
+  ingress: IngressQueueSnapshot;
+}
+
+export interface PolymarketMarketShardObserver {
+  onChange?(snapshots: readonly PolymarketMarketShardSnapshot[]): void;
+  onError?(input: { shard: number; error: Error }): void;
+  onGap?(input: { shard: number; event: MarketIngressGapEvent }): void;
+  onResync?(input: { shard: number; event: MarketIngressResyncEvent; remainingUnsynchronizedTokens: number }): void;
+}
 
 /**
- * Production facade for two independent Polymarket market WebSocket shards.
+ * Production facade for independent Polymarket market WebSocket shards.
  *
  * Why composition rather than teaching the existing adapter about multiple
  * sockets? The single-socket adapter already has correct, tested reconnect,
  * bounded-ingress and book-trust semantics. Keeping one complete adapter per
  * shard makes queue, generation, reconnect and resync state physically
- * independent. A loss on shard A therefore cannot clear or gap shard B.
+ * independent. A loss on one shard therefore cannot clear or gap another.
  *
  * The facade preserves the Engine-facing contract:
  * - both outcomes of a discovered market stay on the same shard;
  * - snapshots remain serialized at the Engine boundary;
  * - one global facade sequence is assigned in dispatch order;
  * - connection and ingress telemetry are aggregated;
- * - no raw market event is dropped/coalesced/sampled.
+ * - no raw market event is dropped, coalesced, or sampled.
  *
  * Explicit client/transport/ingress injection keeps legacy single-shard
  * behavior for existing tests and custom callers. Before run() starts, direct
  * normalizeSourceEvent/test usage also remains backed by the inherited
- * single-adapter state. The production zero-arg live run is the path that
- * activates the two owned shards.
+ * single-adapter state. The production zero-argument live run activates the
+ * four-shard production default measured by the production-shaped soak.
  */
 export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDataAdapter {
   private readonly sharded: boolean;
+  private readonly shardCount: number;
   private readonly shards: readonly SinglePolymarketMarketDataAdapter[];
   private shardedRunStarted = false;
   private readonly ownerByToken = new Map<string, number>();
   private readonly ownerByGroup = new Map<string, number>();
   private currentTokenIds: string[] = [];
-  private shardTokenIds: string[][] = [[], []];
+  private shardTokenIds: string[][];
   private globalSequence = 0;
 
   private aggregateIngressObserver: IngressQueueObserver | null = null;
+  private shardObserver: PolymarketMarketShardObserver | null = null;
   private aggregateIngressHighWaterEvents = 0;
   private aggregateIngressHighWaterBytes = 0;
 
-  private connectionStates: ConnectionState[] = ["STOPPED", "STOPPED"];
-  private connectionReconnects = [0, 0];
+  private connectionStates: ConnectionState[];
+  private connectionReconnects: number[];
   private lastConnectionSignature = "";
   private connectionTail: Promise<void> = Promise.resolve();
   private snapshotTail: Promise<void> = Promise.resolve();
@@ -71,22 +94,27 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
     const { transports, ...singleOptions } = options;
     super(client, singleOptions);
 
-    if (transports && transports.length !== MARKET_SHARD_COUNT) {
-      throw new Error(`MARKET_SHARD_TRANSPORT_COUNT:${transports.length}`);
+    if (transports && transports.length === 0) {
+      throw new Error("MARKET_SHARD_TRANSPORT_COUNT:0");
     }
     if (transports?.some((transport) => !isBoundedMarketStreamTransport(transport))) {
       throw new Error("MARKET_TRANSPORT_MUST_BE_BOUNDED");
     }
 
+    this.shardCount = transports?.length ?? DEFAULT_POLYMARKET_MARKET_SHARD_COUNT;
+    this.shardTokenIds = this.emptyShardTokenIds();
+    this.connectionStates = this.stoppedConnectionStates();
+    this.connectionReconnects = this.zeroReconnectCounts();
+
     // Preserve every explicit legacy injection path. Engine production uses
-    // the zero-argument constructor and therefore gets exactly two shards.
+    // the zero-argument constructor and therefore gets the production default.
     this.sharded = Boolean(transports) || (!client && !singleOptions.transport && !singleOptions.ingress);
     if (!this.sharded) {
       this.shards = [];
       return;
     }
 
-    this.shards = Array.from({ length: MARKET_SHARD_COUNT }, (_, index) => {
+    this.shards = Array.from({ length: this.shardCount }, (_, index) => {
       const transport = transports?.[index];
       const childOptions: SingleOptions = {};
       if (transport) childOptions.transport = transport;
@@ -97,7 +125,24 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
     });
   }
 
-  marketShardCount(): number { return this.sharded ? MARKET_SHARD_COUNT : 1; }
+  marketShardCount(): number { return this.sharded ? this.shardCount : 1; }
+
+  shardSnapshots(): readonly PolymarketMarketShardSnapshot[] {
+    if (!this.sharded) return [];
+    return this.shards.map((shard, index) => ({
+      shard: index + 1,
+      state: this.connectionStates[index] ?? "STOPPED",
+      reconnectCount: this.connectionReconnects[index] ?? 0,
+      tokenCount: this.shardTokenIds[index]?.length ?? 0,
+      unsynchronizedTokens: shard.unsynchronizedTokenCount(),
+      ingress: shard.ingressSnapshot(),
+    }));
+  }
+
+  setShardObserver(observer: PolymarketMarketShardObserver | null): void {
+    this.shardObserver = observer;
+    this.publishShardSnapshots();
+  }
 
   override setNormalizeObserver(observer: MarketNormalizeObserver | null): void {
     // Keep the inherited direct-normalization API observable for replay/unit
@@ -114,9 +159,15 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
     }
     this.aggregateIngressObserver = observer;
     for (const shard of this.shards) {
-      shard.setIngressObserver(observer ? { onChange: () => this.publishAggregateIngress() } : null);
+      shard.setIngressObserver(observer || this.shardObserver ? {
+        onChange: () => {
+          if (this.aggregateIngressObserver) this.publishAggregateIngress();
+          this.publishShardSnapshots();
+        },
+      } : null);
     }
     if (observer) this.publishAggregateIngress();
+    this.publishShardSnapshots();
   }
 
   override ingressSnapshot(): IngressQueueSnapshot {
@@ -152,8 +203,8 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
     if (!this.sharded) return report;
 
     // Child adapters need normalization metadata, but discovery/REST remains
-    // centralized in the facade. The rich catalog fields (including fees) are
-    // restored onto each emitted snapshot at the facade boundary.
+    // centralized in the facade. Rich catalog fields are restored onto each
+    // emitted snapshot at the facade boundary.
     for (const market of report.qualified) {
       for (const token of market.tokens) {
         for (const shard of this.shards) {
@@ -185,6 +236,7 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
       for (const tokenId of this.shardTokenIds[shardIndex]!) this.ownerByToken.set(tokenId, shardIndex);
       this.shards[shardIndex]!.setTokenIds(this.shardTokenIds[shardIndex]!);
     }
+    this.publishShardSnapshots();
     return result;
   }
 
@@ -197,11 +249,12 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
 
     this.shardedRunStarted = true;
     this.setTokenIds(this.currentTokenIds.length > 0 ? this.currentTokenIds : tokenIds);
-    this.connectionStates = ["STOPPED", "STOPPED"];
-    this.connectionReconnects = [0, 0];
+    this.connectionStates = this.stoppedConnectionStates();
+    this.connectionReconnects = this.zeroReconnectCounts();
     this.lastConnectionSignature = "";
     this.connectionTail = Promise.resolve();
     this.snapshotTail = Promise.resolve();
+    this.publishShardSnapshots();
 
     await Promise.all(this.shards.map((shard, shardIndex) => shard.run(
       this.shardTokenIds[shardIndex] ?? [],
@@ -271,6 +324,7 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
       return;
     }
     this.shardForToken(tokenId)?.markTokenGappedForTest(tokenId, reason);
+    this.publishShardSnapshots();
   }
 
   override beginStreamEpoch(
@@ -283,7 +337,7 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
       super.beginStreamEpoch(tokenIds, reason, handlers, options);
       return;
     }
-    const byShard: string[][] = [[], []];
+    const byShard = this.emptyShardTokenIds();
     for (const tokenId of tokenIds) {
       const owner = this.ownerByToken.get(tokenId);
       if (owner !== undefined) byShard[owner]!.push(tokenId);
@@ -291,6 +345,7 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
     for (let index = 0; index < this.shards.length; index += 1) {
       if (byShard[index]!.length > 0) this.shards[index]!.beginStreamEpoch(byShard[index]!, reason, handlers, options);
     }
+    this.publishShardSnapshots();
   }
 
   override gapAll(reason: IngressGapReason, handlers?: Pick<PolymarketFeedHandlers, "onGap">): void {
@@ -299,17 +354,34 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
       return;
     }
     for (const shard of this.shards) shard.gapAll(reason, handlers);
+    this.publishShardSnapshots();
   }
 
   private handlersForShard(shardIndex: number, handlers: PolymarketFeedHandlers): PolymarketFeedHandlers {
     const result: PolymarketFeedHandlers = {
       onSnapshot: (snapshot) => this.dispatchSnapshot(snapshot, handlers),
       onConnection: (event) => this.reportShardConnection(shardIndex, event, handlers),
-      onError: (error) => handlers.onError(error),
+      onError: (error) => {
+        this.notifyShardObserver((observer) => observer.onError?.({ shard: shardIndex + 1, error }));
+        return handlers.onError(error);
+      },
     };
     if (handlers.onAnomaly) result.onAnomaly = handlers.onAnomaly;
-    if (handlers.onGap) result.onGap = (event: MarketIngressGapEvent) => handlers.onGap!(event);
-    if (handlers.onResync) result.onResync = handlers.onResync;
+    if (handlers.onGap) result.onGap = (event: MarketIngressGapEvent) => {
+      this.notifyShardObserver((observer) => observer.onGap?.({ shard: shardIndex + 1, event }));
+      this.publishShardSnapshots();
+      handlers.onGap!(event);
+    };
+    if (handlers.onResync) result.onResync = (event: MarketIngressResyncEvent) => {
+      const remainingUnsynchronizedTokens = this.shards[shardIndex]!.unsynchronizedTokenCount();
+      this.notifyShardObserver((observer) => observer.onResync?.({
+        shard: shardIndex + 1,
+        event,
+        remainingUnsynchronizedTokens,
+      }));
+      this.publishShardSnapshots();
+      handlers.onResync!(event);
+    };
     return result;
   }
 
@@ -339,6 +411,7 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
     const work = this.connectionTail.then(async () => {
       this.connectionStates[shardIndex] = event.state;
       this.connectionReconnects[shardIndex] = event.reconnectCount;
+      this.publishShardSnapshots();
       const aggregate = this.aggregateConnectionState();
       const reconnectCount = this.connectionReconnects.reduce((sum, value) => sum + value, 0);
       const message = event.message ? `shard=${shardIndex + 1}:${event.message}` : undefined;
@@ -370,9 +443,33 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
     this.aggregateIngressObserver?.onChange(this.ingressSnapshot());
   }
 
+  private publishShardSnapshots(): void {
+    if (!this.shardObserver?.onChange) return;
+    const snapshots = this.shardSnapshots();
+    this.notifyShardObserver((observer) => observer.onChange?.(snapshots));
+  }
+
+  private notifyShardObserver(work: (observer: PolymarketMarketShardObserver) => void): void {
+    const observer = this.shardObserver;
+    if (!observer) return;
+    try { work(observer); } catch { /* observability must never change feed semantics */ }
+  }
+
   private shardForToken(tokenId: string): SinglePolymarketMarketDataAdapter | undefined {
     const owner = this.ownerByToken.get(tokenId);
     return owner === undefined ? undefined : this.shards[owner];
+  }
+
+  private emptyShardTokenIds(): string[][] {
+    return Array.from({ length: this.shardCount }, () => []);
+  }
+
+  private stoppedConnectionStates(): ConnectionState[] {
+    return Array.from({ length: this.shardCount }, () => "STOPPED" as ConnectionState);
+  }
+
+  private zeroReconnectCounts(): number[] {
+    return Array.from({ length: this.shardCount }, () => 0);
   }
 
   private partitionPairAware(tokenIds: readonly string[]): string[][] {
@@ -410,7 +507,7 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
       if (!liveKeys.has(key)) this.ownerByGroup.delete(key);
     }
 
-    const load: [number, number] = [0, 0];
+    const load = Array.from({ length: this.shardCount }, () => 0);
     for (const group of groups) {
       const owner = this.ownerByGroup.get(group.key);
       if (owner !== undefined) load[owner] = (load[owner] ?? 0) + group.tokenIds.length;
@@ -418,12 +515,15 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
 
     for (const group of groups) {
       if (this.ownerByGroup.has(group.key)) continue;
-      const owner = load[0] <= load[1] ? 0 : 1;
+      let owner = 0;
+      for (let index = 1; index < this.shardCount; index += 1) {
+        if ((load[index] ?? 0) < (load[owner] ?? 0)) owner = index;
+      }
       this.ownerByGroup.set(group.key, owner);
       load[owner] = (load[owner] ?? 0) + group.tokenIds.length;
     }
 
-    const partitions: string[][] = [[], []];
+    const partitions = this.emptyShardTokenIds();
     for (const group of groups) {
       const owner = this.ownerByGroup.get(group.key)!;
       partitions[owner]!.push(...group.tokenIds);
