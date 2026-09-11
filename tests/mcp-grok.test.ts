@@ -268,7 +268,10 @@ describe("authenticated MCP HTTP", () => {
         jsonrpc: "2.0", id: 1, method: "tools/call",
         params: { name: "submit_signal", arguments: impersonating },
       });
-      expect(JSON.stringify(result.json)).toContain("IDENTITY_CLIENT_MISMATCH");
+      const body = JSON.stringify(result.json);
+      expect(body).toContain("Input validation error");
+      expect(body).toContain("market_microstructure_scanner");
+      expect(body).toContain("agentId");
       expect(ctx.engine.state.grokActivity.acceptedSignals).toBe(0);
       expect(ctx.engine.state.latestAgents.size).toBe(0);
     } finally { await ctx.server.close(); }
