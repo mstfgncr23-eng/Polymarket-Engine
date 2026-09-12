@@ -2,10 +2,11 @@ import {
   PaperLedger,
   TemporalPairHedgeStrategy,
   TriggerEngine,
-  buildConsensus,
   createId,
   decidePaperOrder,
-  defaultConsensusConfig,
+  defaultNativeDecisionConfig,
+  evaluateNativeDecision,
+  NATIVE_DETERMINISTIC_AUTHORITY,
   parseEngineEnv,
   executePaperTaker,
   experimentManifestSchema,
@@ -62,6 +63,9 @@ import {
   classifyTriggerProvenance,
   isMarketDataDerivedTrigger,
   type TriggerProvenance,
+  type NativeDecision,
+  type NativeReferenceFeatures,
+  type NativeDecisionConfig,
   rolesForTriggerKind,
 } from "@pm/core";
 import {
@@ -114,7 +118,7 @@ import {
   shouldLatchReportSourceIntegrity,
   type ReportSourceIntegrityFault,
 } from "./report-source-integrity.js";
-import { GrokActivationCoordinator, persistableActivation } from "./activation/coordinator.js";
+import { GrokActivationCoordinator } from "./activation/coordinator.js";
 import { createGrokActivationBridge } from "./activation/index.js";
 import type { GrokRoleContext, GrokSubmissionMode, RoleRunOutcome } from "./activation/role-runner.js";
 import { HotResearchCache, isScoutRole, SCOUT_ROLES } from "./activation/hot-research-cache.js";
@@ -176,7 +180,6 @@ type RetainedBookkeepingCounts = {
   triggerProvenance: number;
   provenanceInvalid: number;
   signalsByTrigger: number;
-  lastEvaluatedSignalCount: number;
 };
 type RetainedCleanupCycle = { atMs: number; before: RetainedBookkeepingCounts; after: RetainedBookkeepingCounts };
 type GrokSubmissionResult = {
@@ -194,6 +197,7 @@ export class EngineService {
   private readonly triggerEngine;
   private readonly riskLimits;
   private readonly triggerConfig;
+  private readonly nativeDecisionConfig: NativeDecisionConfig;
   private readonly strategy = new TemporalPairHedgeStrategy();
   private readonly marketAdapter: PolymarketMarketDataAdapter;
   private readonly legacyBtcAdapter: BtcWebSocketAdapter | null;
@@ -210,19 +214,11 @@ export class EngineService {
   private readonly provenanceInvalid = new Set<string>();
   private readonly signalsByTrigger = new Map<string, Map<ExternalAgentRoleId, GrokSignalEnvelope>>();
   private readonly signalReceivedTimes: number[] = [];
-  private readonly lastEvaluatedSignalCount = new Map<string, number>();
-  private readonly alphaSignalIds = new Map<string, string>();
   /** Bounded non-economic contexts used only while warming scout research. */
   private readonly scoutRefreshContexts = new Map<string, TriggerEvent>();
   private readonly scoutRefreshLastAt = new Map<string, number>();
   private readonly scoutRefreshInFlight = new Set<string>();
   private readonly scoutRefreshSubmissionKeys = new Map<string, number>();
-  /**
-   * Coalesce overlapping activation reevaluations for one trigger while
-   * retaining a single dirty bit for scout completions that arrive during a
-   * dispatch. This keeps the Alpha wake idempotent at the Engine boundary.
-   */
-  private readonly activationFlights = new Map<string, { promise: Promise<void>; rerun: boolean }>();
   private readonly marketsById = new Map<string, DiscoveredMarket>();
   private readonly entryQualified = new Set<string>();
   private readonly managedMarketIds = new Set<string>();
@@ -334,6 +330,10 @@ export class EngineService {
     this.state = new EngineStateStore(this.ledger.snapshot(), this.ledger.positions);
     this.triggerConfig = triggerConfigSchema.parse({ scheduledReviewIntervalMs: env.SCHEDULED_REVIEW_INTERVAL_MS });
     this.triggerEngine = new TriggerEngine(this.triggerConfig, this.nowFn, this.metrics.triggerObserver());
+    this.nativeDecisionConfig = {
+      ...defaultNativeDecisionConfig,
+      referenceRapidMoveBps: this.triggerConfig.referenceRapidMoveBps,
+    };
     this.riskLimits = riskLimitsSchema.parse({ maxExternalSignalsPerMinute: env.GROK_MCP_RATE_LIMIT_PER_MINUTE });
     this.marketAdapter = adapters?.market ?? new PolymarketMarketDataAdapter();
     if (this.marketAdapter instanceof PolymarketMarketDataAdapter) {
@@ -637,10 +637,10 @@ export class EngineService {
         return { ok: false, blockers: ["EXPERIMENT_ALREADY_COMPLETED"], experiment: this.experiment };
       }
       if (!this.state.newPaperEntryAllowed() || this.overload.state === "FAIL_CLOSED") {
-        const preflight = this.preflight("48H_GROK_PAPER_EXPERIMENT");
+        const preflight = this.preflight("48H_NATIVE_PAPER_EXPERIMENT");
         return { ...preflight, ok: false, blockers: [...new Set([...preflight.blockers, "OVERLOAD_FAIL_CLOSED"])] };
       }
-      const preflight = this.preflight("48H_GROK_PAPER_EXPERIMENT");
+      const preflight = this.preflight("48H_NATIVE_PAPER_EXPERIMENT");
       const feedBlockers = this.experimentFeedBlockers();
       const gatedPreflight = feedBlockers.length > 0
         ? { ...preflight, ok: false, blockers: [...new Set([...preflight.blockers, ...feedBlockers])] }
@@ -653,7 +653,11 @@ export class EngineService {
       const now = this.nowFn();
       const next = startExperiment({
         id: undefined, durationHours: this.env.EXPERIMENT_DURATION_HOURS, strategyVersion: this.strategy.version,
-        riskConfiguration: this.riskLimits, modelConfiguration: { provider: "external_grok_bot_mcp", logicalRoles: 6, localModelExecution: false },
+        riskConfiguration: this.riskLimits,
+        modelConfiguration: {
+          provider: "native_deterministic", version: "native-deterministic-v1",
+          localExecution: true, externalInference: false, authority: NATIVE_DETERMINISTIC_AUTHORITY,
+        },
         startingBalance: this.ledger.snapshot().startingBalance, systemVersion: "0.1.0",
         gitSha: process.env.GIT_SHA ?? process.env.FLY_IMAGE_REF ?? "unknown", now,
         closePolicy: this.env.EXPERIMENT_CLOSE_POLICY,
@@ -754,7 +758,7 @@ export class EngineService {
             experiment: this.experiment,
           };
         }
-        const current = this.preflight("48H_GROK_PAPER_EXPERIMENT");
+        const current = this.preflight("48H_NATIVE_PAPER_EXPERIMENT");
         const blockers = [...new Set([...current.blockers, ...this.experimentFeedBlockers()])];
         return { ...current, ok: false, blockers };
       } finally {
@@ -805,7 +809,7 @@ export class EngineService {
     });
   }
 
-  preflight(mode: "MONITOR_ONLY" | "48H_GROK_PAPER_EXPERIMENT" = "MONITOR_ONLY") {
+  preflight(mode: "MONITOR_ONLY" | "48H_GROK_PAPER_EXPERIMENT" | "48H_NATIVE_PAPER_EXPERIMENT" = "MONITOR_ONLY") {
     const staticMcpRoles = this.env.GROK_MCP_BEARER_TOKENS.split(",").map((entry) => entry.trim().split(":")[0] ?? "").filter(Boolean);
     const oauthBootstrapRoles = this.env.GROK_MCP_OAUTH_ENABLED
       ? this.env.GROK_MCP_OAUTH_BOOTSTRAP_TOKENS.split(",").map((entry) => entry.trim().split(":")[0] ?? "").filter(Boolean)
@@ -824,13 +828,16 @@ export class EngineService {
         const up = market?.tokens.find((token) => token.outcome === "UP")?.tokenId ?? null;
         const down = market?.tokens.find((token) => token.outcome === "DOWN")?.tokenId ?? null;
         const monitored = Boolean(up && down && this.tokenIds.includes(up) && this.tokenIds.includes(down));
+        const referenceFresh = this.marketAdapter instanceof PolymarketMarketDataAdapter
+          ? !this.referenceRequired.get(marketId) || this.state.getReferenceContext(asset ?? "", this.nowFn().getTime(), this.riskLimits.staleFeedTimeoutMs).freshness === "fresh"
+          : undefined;
         return {
           marketId, asset, referenceRequired: this.referenceRequired.get(marketId) === true, blockedStatus: blocked,
           yesTokenId: up, noTokenId: down, endDate: market?.endDate ?? null,
           feeScheduleKnown: market?.feeSchedule != null,
           binarySafe: market?.qualification.binary.safe === true
             && market.qualification.binary.yesOutcome !== market.qualification.binary.noOutcome,
-          monitored,
+          monitored, referenceFresh,
         };
       }).filter((entry) => isGenuineEntryQualifiedMarket(entry) || this.entryQualified.has(entry.marketId)),
       reference: [...this.referenceRequired.keys()].map((marketId) => {
@@ -1432,7 +1439,11 @@ export class EngineService {
       } else {
         this.experiment = createIdleExperiment({
           durationHours: this.env.EXPERIMENT_DURATION_HOURS, strategyVersion: this.strategy.version,
-          riskConfiguration: this.riskLimits, modelConfiguration: { provider: "external_grok_bot_mcp", logicalRoles: 6, localModelExecution: false },
+          riskConfiguration: this.riskLimits,
+          modelConfiguration: {
+            provider: "native_deterministic", version: "native-deterministic-v1",
+            localExecution: true, externalInference: false, authority: NATIVE_DETERMINISTIC_AUTHORITY,
+          },
           startingBalance: this.ledger.snapshot().startingBalance, systemVersion: "0.1.0",
           gitSha: process.env.GIT_SHA ?? process.env.FLY_IMAGE_REF ?? "unknown",
         });
@@ -1478,7 +1489,12 @@ export class EngineService {
     this.state.setLedger(this.ledger.snapshot());
     this.experiment = payload.experiment ? experimentManifestSchema.parse(payload.experiment) : createIdleExperiment({
       durationHours: this.env.EXPERIMENT_DURATION_HOURS, strategyVersion: this.strategy.version,
-      riskConfiguration: this.riskLimits, modelConfiguration: {}, startingBalance: this.ledger.snapshot().startingBalance,
+      riskConfiguration: this.riskLimits,
+      modelConfiguration: {
+        provider: "native_deterministic", version: "native-deterministic-v1",
+        localExecution: true, externalInference: false, authority: NATIVE_DETERMINISTIC_AUTHORITY,
+      },
+      startingBalance: this.ledger.snapshot().startingBalance,
       systemVersion: "0.1.0", gitSha: "unknown",
     });
     const resting = Array.isArray(payload.restingOrders) ? payload.restingOrders.map((item) => restingPaperOrderSchema.parse(item)) : [];
@@ -1853,141 +1869,104 @@ export class EngineService {
       return;
     }
     this.state.addTrigger(trigger);
-    this.record("GROK_RESEARCH_AVAILABLE", trigger.traceId, trigger.marketId, { triggerId: trigger.id, expiresAt: trigger.expiresAt }, trigger.asset ?? null);
-    await this.requestActivation(trigger);
+    const nativeBookkeepingStarted = performance.now();
+    this.activation.ensureLatency(trigger);
+    this.state.setActivationLatency(this.activation.snapshot());
+    await this.persistReportInput(createJournalEvent({
+      traceId: trigger.traceId, type: "GROK_ACTIVATION_DECISION", aggregateType: "activation", aggregateId: trigger.id,
+      payload: {
+        triggerId: trigger.id, marketId: trigger.marketId, asset: trigger.asset ?? null,
+        reason: "NATIVE_DETERMINISTIC_ONLY", activate: false, authority: NATIVE_DETERMINISTIC_AUTHORITY,
+      },
+    }));
+    this.state.addActivation({
+      triggerId: trigger.id, reason: "NATIVE_DETERMINISTIC_ONLY", at: this.nowFn().toISOString(),
+      provider: "native_deterministic", grokWakeObserved: false,
+    });
+    this.metrics.idleActivationBookkeepingDuration.observe((performance.now() - nativeBookkeepingStarted) / 1000);
+    this.record("NATIVE_DECISION_EVALUATION", trigger.traceId, trigger.marketId, {
+      authority: NATIVE_DETERMINISTIC_AUTHORITY, triggerId: trigger.id, expiresAt: trigger.expiresAt,
+    }, trigger.asset ?? null);
+    await this.evaluateNativeDecisionForTrigger(trigger, provenance);
     } finally {
       this.metrics.noteProcessTriggerEnd(started);
     }
   }
 
-  private requestActivation(trigger: TriggerEvent): Promise<void> {
-    const existing = this.activationFlights.get(trigger.id);
-    if (existing) {
-      existing.rerun = true;
-      return existing.promise;
-    }
-    const flight: { promise: Promise<void>; rerun: boolean } = { promise: Promise.resolve(), rerun: false };
-    flight.promise = (async () => {
-      do {
-        flight.rerun = false;
-        await this.requestActivationOnce(trigger);
-      } while (flight.rerun);
-    })().finally(() => {
-      if (this.activationFlights.get(trigger.id) === flight) this.activationFlights.delete(trigger.id);
+  /**
+   * Evaluate one trigger from the current trusted pair. The Engine owns the
+   * synchronization, epoch, provenance, lifecycle, and persistence gates;
+   * the core model only receives the already-admitted inputs.
+   */
+  private async evaluateNativeDecisionForTrigger(trigger: TriggerEvent, provenance: TriggerProvenance): Promise<void> {
+    if (this.researchIngressBlocked() || !trigger.marketId || !this.isTriggerActionable(trigger.id)) return;
+    if (!this.isMarketSynchronized(trigger.marketId)) return;
+    const pair = this.snapshots.get(trigger.marketId);
+    if (!pair?.UP || !pair.DOWN) return;
+    const asset = trigger.asset ?? this.assetByMarket.get(trigger.marketId) ?? pair.UP.asset ?? pair.DOWN.asset ?? null;
+    const referenceContext = asset
+      ? this.state.getReferenceContext(asset, this.nowFn().getTime(), this.riskLimits.staleFeedTimeoutMs)
+      : null;
+    const referenceMovement = asset ? this.triggerEngine.referenceMovement(asset) : null;
+    const reference: NativeReferenceFeatures | null = referenceContext ? {
+      asset: referenceContext.asset,
+      venue: referenceContext.venue,
+      freshness: referenceContext.freshness,
+      freshnessMs: referenceContext.freshnessMs,
+      recentMoveBps: referenceMovement?.moveBps ?? null,
+      recentVolatilityBps: referenceContext.recentVolatilityBps,
+      referenceWindowMs: referenceMovement?.windowMs ?? null,
+      referenceSourceTimestamp: referenceMovement?.sourceTimestamp ?? null,
+    } : null;
+    const native = evaluateNativeDecision({
+      trigger, up: pair.UP, down: pair.DOWN, reference,
+      referenceRequired: this.referenceRequired.get(trigger.marketId) === true,
+      marketSynchronized: this.isMarketSynchronized(trigger.marketId),
+      triggerProvenanceValid: this.isProvenanceCurrentlyValid(trigger.id, provenance),
+      now: this.nowFn(), config: this.nativeDecisionConfig,
     });
-    this.activationFlights.set(trigger.id, flight);
-    return flight.promise;
-  }
+    if (!native) return;
 
-  private async requestActivationOnce(trigger: TriggerEvent): Promise<void> {
-    if (this.experimentStartPending && !isRiskHedgeSettlementTrigger(trigger.kind)) {
-      this.state.addActivation({ triggerId: trigger.id, reason: "EXPERIMENT_START_PENDING", at: this.nowFn().toISOString(), provider: this.env.GROK_ACTIVATION_PROVIDER, grokWakeObserved: false });
-      return;
-    }
-    const status = this.experiment?.status ?? "IDLE";
-    if (status === "IDLE" || status === "COMPLETED" || status === "FAILED" || status === "ABORTED_START") {
-      const bookkeepingStarted = performance.now();
-      this.activation.ensureLatency(trigger);
-      this.state.setActivationLatency(this.activation.snapshot());
-      await this.persistReportInput(createJournalEvent({
-        traceId: trigger.traceId, type: "GROK_ACTIVATION_DECISION", aggregateType: "activation", aggregateId: trigger.id,
-        payload: { triggerId: trigger.id, marketId: trigger.marketId, asset: trigger.asset ?? null, reason: "EXPERIMENT_NOT_ACTIVE", activate: false },
-      }));
-      this.state.addActivation({ triggerId: trigger.id, reason: "EXPERIMENT_NOT_ACTIVE", at: this.nowFn().toISOString(), provider: this.env.GROK_ACTIVATION_PROVIDER, grokWakeObserved: false });
-      this.metrics.idleActivationBookkeepingDuration.observe((performance.now() - bookkeepingStarted) / 1000);
-      return;
-    }
-    if (status === "ENTRY_CLOSED" && !isRiskHedgeSettlementTrigger(trigger.kind)) {
-      await this.persistReportInput(createJournalEvent({
-        traceId: trigger.traceId, type: "GROK_ACTIVATION_DECISION", aggregateType: "activation", aggregateId: trigger.id,
-        payload: { triggerId: trigger.id, marketId: trigger.marketId, asset: trigger.asset ?? null, reason: "ENTRY_CLOSED", activate: false },
-      }));
-      this.state.addActivation({ triggerId: trigger.id, reason: "ENTRY_CLOSED", at: this.nowFn().toISOString(), provider: this.env.GROK_ACTIVATION_PROVIDER, grokWakeObserved: false });
-      return;
-    }
-    if (!this.isTriggerActionable(trigger.id)) {
-      await this.persistReportInput(createJournalEvent({
-        traceId: trigger.traceId, type: "GROK_ACTIVATION_DECISION", aggregateType: "activation", aggregateId: trigger.id,
-        payload: { triggerId: trigger.id, marketId: trigger.marketId, asset: trigger.asset ?? null, reason: "PROVENANCE_STALE", activate: false },
-      }));
-      this.state.addActivation({ triggerId: trigger.id, reason: "PROVENANCE_STALE", at: this.nowFn().toISOString(), provider: this.env.GROK_ACTIVATION_PROVIDER, grokWakeObserved: false });
-      return;
-    }
-    const decision = this.activation.decide(trigger);
+    const consensus = this.nativeCompatibilityDecision(trigger, native);
+    this.state.latestConsensus = consensus;
+    this.record("NATIVE_DECISION_COMPLETE", trigger.traceId, trigger.marketId, {
+      authority: NATIVE_DETERMINISTIC_AUTHORITY,
+      direction: native.direction, confidence: native.confidence,
+      fairProbability: native.fairProbability, marketProbability: native.marketProbability,
+      featureVector: native.featureVector, triggerId: trigger.id,
+    }, asset);
     await this.persistReportInput(createJournalEvent({
-      traceId: trigger.traceId, type: "GROK_ACTIVATION_DECISION", aggregateType: "activation", aggregateId: trigger.id,
-      payload: { triggerId: trigger.id, marketId: trigger.marketId, asset: trigger.asset ?? null, reason: decision.reason, activate: decision.activate },
+      traceId: trigger.traceId, type: "CONSENSUS_DECISION", aggregateType: "consensus", aggregateId: consensus.id,
+      payload: {
+        ...consensus,
+        authority: NATIVE_DETERMINISTIC_AUTHORITY,
+        marketId: trigger.marketId, asset,
+        fairProbability: native.fairProbability, marketProbability: native.marketProbability,
+        expiresAt: native.expiresAt, featureVector: native.featureVector,
+        reference: reference ? {
+          asset: reference.asset, venue: reference.venue, freshness: reference.freshness,
+          freshnessMs: reference.freshnessMs, recentMoveBps: reference.recentMoveBps,
+          referenceWindowMs: reference.referenceWindowMs,
+          referenceSourceTimestamp: reference.referenceSourceTimestamp,
+          recentVolatilityBps: reference.recentVolatilityBps,
+        } : null,
+      },
     }));
-    if (!decision.activate || !decision.request) {
-      this.state.addActivation({ triggerId: trigger.id, reason: decision.reason, at: new Date().toISOString(), provider: this.env.GROK_ACTIVATION_PROVIDER, grokWakeObserved: false });
-      return;
-    }
-    if (!this.isTriggerActionable(trigger.id)) {
-      this.state.addActivation({ triggerId: trigger.id, reason: "PROVENANCE_STALE", at: this.nowFn().toISOString(), provider: this.env.GROK_ACTIVATION_PROVIDER, grokWakeObserved: false });
-      return;
-    }
-    const requestedRoles = decision.request.targetRoles;
-    const scoutRoles = requestedRoles.filter(isScoutRole);
-    const freshScoutRoles = trigger.marketId
-      ? this.hotResearchCache.freshFor(trigger.marketId, trigger.asset ?? null, scoutRoles).map((entry) => entry.role)
-      : scoutRoles;
-    const scoutWarm = scoutRoles.filter((role) => !freshScoutRoles.includes(role));
-    // A cold scout may already have a valid wake reservation. Keep that
-    // reservation while its MCP result is outstanding so a sibling result
-    // cannot spend another Bot call for the same trigger/role.
-    const scoutDispatchable = scoutWarm.filter((role) => !this.activation.isRoleRequested(trigger.id, role));
-    const requiresAlpha = requestedRoles.includes("fair_probability_analyst");
-    const xaiRuntime = this.env.GROK_ACTIVATION_PROVIDER === "xai";
-    // Scouts are warmed by the bounded precursor path. A real trade trigger
-    // never waits for sequential scout inference and never trades on a cold
-    // cache in the xAI runtime. External Grok/Slack wake behavior retains its
-    // established bounded scout dispatch because it is not the internal xAI
-    // trading critical path.
-    if (xaiRuntime && requiresAlpha && scoutWarm.length > 0) {
-      const runtimeBudget = this.activation.runtimeBudgetSnapshot();
-      const coldReason = runtimeBudget && runtimeBudget.remaining <= 0
-        ? "SCOUT_CACHE_COLD_BUDGET_EXHAUSTED"
-        : "SCOUT_CACHE_COLD";
-      await this.persistReportInput(createJournalEvent({
-        traceId: trigger.traceId, type: "GROK_ACTIVATION_DECISION", aggregateType: "activation", aggregateId: trigger.id,
-        payload: { triggerId: trigger.id, marketId: trigger.marketId, asset: trigger.asset ?? null, reason: coldReason, activate: false, missingScoutRoles: scoutWarm, budgetRemaining: runtimeBudget?.remaining ?? null },
-      }));
-      this.state.addActivation({ triggerId: trigger.id, reason: coldReason, at: this.nowFn().toISOString(), provider: this.env.GROK_ACTIVATION_PROVIDER, grokWakeObserved: false });
-      return;
-    }
-    const dispatchRequest: GrokActivationRequest = {
-      ...decision.request,
-      targetRoles: requiresAlpha
-        // Once all required scouts are fresh, every provider receives the
-        // same single Engine-driven Alpha wake. While scouts are cold, only
-        // the missing scout roles are dispatched; risk/supervisor lanes stay
-        // out of this bounded research warm-up.
-        ? scoutWarm.length > 0
-          ? scoutDispatchable
-          : ["fair_probability_analyst"]
-        : requestedRoles,
-    };
-    if (dispatchRequest.targetRoles.length === 0) return;
-    this.activation.markRequested(trigger, dispatchRequest);
-    this.state.setActivationLatency(this.activation.snapshot());
-    const results = await this.activation.dispatch(dispatchRequest);
-    await this.recordActivationResults(trigger, results, decision.reason);
-    this.state.setActivationLatency(this.activation.snapshot());
+    for (const disagreement of this.triggerEngine.ingestConsensus(consensus, trigger.marketId, asset)) this.admitTrigger(disagreement);
+    await this.evaluateTrade(trigger, consensus, native);
   }
 
-  private async recordActivationResults(trigger: TriggerEvent, results: Awaited<ReturnType<GrokActivationCoordinator["dispatch"]>>, reason: string): Promise<void> {
-    for (const result of results) {
-      this.metrics.activations.inc({ provider: result.provider, status: result.ok ? "ok" : "failed" });
-      await this.persistReportInput(createJournalEvent({
-        traceId: trigger.traceId, type: "GROK_ACTIVATION_RESULT", aggregateType: "activation", aggregateId: trigger.id,
-        payload: persistableActivation(result, trigger.id, reason),
-      }));
-      this.state.addActivation({
-        triggerId: trigger.id, role: result.targetRole, provider: result.provider, ok: result.ok, skipped: result.skipped,
-        errorCode: result.errorCode, grokWakeObserved: false, at: result.sentAt ?? result.requestedAt,
-      });
-    }
-    this.state.setActivationLatency(this.activation.snapshot());
+  private nativeCompatibilityDecision(trigger: TriggerEvent, native: NativeDecision): NonNullable<EngineStateStore["latestConsensus"]> {
+    return {
+      id: createId("native_decision"), traceId: trigger.traceId, triggerId: trigger.id,
+      consensusDirection: native.direction, consensusConfidence: native.confidence,
+      agentAgreement: 1, signalFreshness: 1, conflicts: [],
+      estimatedEdge: native.fairProbability - native.marketProbability,
+      evidenceIds: native.evidenceIds, calculatedAt: this.nowFn().toISOString(),
+      authority: NATIVE_DETERMINISTIC_AUTHORITY,
+      fairProbability: native.fairProbability, marketProbability: native.marketProbability,
+      featureVector: { ...native.featureVector },
+    };
   }
 
   /** Bounded, role-scoped context for the opt-in internal xAI runtime. */
@@ -2254,7 +2233,7 @@ export class EngineService {
           const canonical = await this.proveGrokSubmissionCanonicalFacts(submission, clientId);
           if (mode === "scout") {
             const rehydrated = this.admitScoutResearch(canonical, trigger);
-            if (rehydrated.ok) void this.requestActivation(trigger).catch(() => undefined);
+            void rehydrated;
           }
           return duplicate();
         }
@@ -2275,7 +2254,7 @@ export class EngineService {
             const canonical = await this.proveGrokSubmissionCanonicalFacts(submission, clientId);
             if (mode === "scout") {
               const rehydrated = this.admitScoutResearch(canonical, trigger);
-              if (rehydrated.ok) void this.requestActivation(trigger).catch(() => undefined);
+              void rehydrated;
             }
             return duplicate();
           }
@@ -2351,19 +2330,12 @@ export class EngineService {
         this.metrics.grokSignals.inc({ agent: signal.agentId, status: "accepted" });
         this.record(`${signal.agentId.toUpperCase()}_COMPLETE`, signal.traceId, trigger.marketId, { signalId: signal.signalId, clientId, confidence: submission.output.confidence, expiresAt: submission.output.expiresAt }, trigger.asset ?? null);
         if (mode === "scout") {
-          const scoutAdmission = this.admitScoutResearch(submission, trigger);
-          // Every explicitly configured provider uses the same Engine-driven
-          // freshness reevaluation. The activation coordinator and the
-          // per-trigger flight keep concurrent scout completions bounded.
-          if (scoutAdmission.ok) void this.requestActivation(trigger).catch(() => undefined);
-        } else if (mode === "alpha") {
-          this.alphaSignalIds.set(trigger.id, signal.signalId);
-          await this.evaluateAlphaDecision(trigger);
-        } else if (mode === "mcp" && !["risk_hedge_analyst", "strategy_supervisor"].includes(submission.agentId)) {
-          // MCP callers retain the established peer-consensus path. Runtime
-          // role-bound paths use scout/alpha/advisory modes; this compatibility
-          // branch is retained only for direct legacy callers.
-          await this.evaluateExternalConsensus(trigger);
+          // Legacy scout admission remains available for diagnostics, but a
+          // scout completion cannot wake an economic decision path.
+          this.admitScoutResearch(submission, trigger);
+        } else {
+          // Legacy Alpha/MCP submissions are retained as auditable research
+          // facts only. Native decisions are the sole economic authority.
         }
         if (idleReservation) this.completeIdleGrokSubmission(idempotencyKey, now.getTime());
         return { status: "accepted", signalId: signal.signalId };
@@ -2459,74 +2431,7 @@ export class EngineService {
     if (result.admitted) await result.done;
   }
 
-  private async evaluateExternalConsensus(trigger: TriggerEvent): Promise<void> {
-    if (this.researchIngressBlocked()) return;
-    if (!this.isTriggerActionable(trigger.id)) return;
-    const outputs = [...(this.signalsByTrigger.get(trigger.id)?.values() ?? [])];
-    const fair = outputs.find((item) => item.agentId === "fair_probability_analyst")?.output as { estimatedEdge?: number; fairProbability?: number; direction?: Direction; marketProbability?: number } | undefined;
-    const directional = outputs.flatMap((item) => {
-      const output = item.output as { direction?: unknown; confidence?: unknown; expiresAt?: unknown; evidenceIds?: unknown };
-      return (output.direction === "UP" || output.direction === "DOWN" || output.direction === "FLAT") && typeof output.confidence === "number"
-        && typeof output.expiresAt === "string" && Array.isArray(output.evidenceIds) && new Date(output.expiresAt).getTime() > this.nowFn().getTime()
-        ? [{ agentId: item.agentId, direction: output.direction as Direction, confidence: output.confidence, expiresAt: output.expiresAt, evidenceIds: output.evidenceIds.map(String) }]
-        : [];
-    });
-    if (!fair || typeof fair.fairProbability !== "number" || directional.length < 2 || this.lastEvaluatedSignalCount.get(trigger.id) === outputs.length) return;
-    this.lastEvaluatedSignalCount.set(trigger.id, outputs.length);
-    const consensus = buildConsensus({ traceId: trigger.traceId, triggerId: trigger.id, signals: directional, deterministicEdge: 0, now: this.nowFn(), config: defaultConsensusConfig });
-    this.state.latestConsensus = consensus;
-    this.record("CONSENSUS_COMPLETE", trigger.traceId, trigger.marketId, { direction: consensus.consensusDirection, confidence: consensus.consensusConfidence, conflicts: consensus.conflicts, triggerId: trigger.id, estimatedEdgeIgnored: fair.estimatedEdge ?? null }, trigger.asset ?? null);
-    await this.persistReportInput(createJournalEvent({ traceId: trigger.traceId, type: "CONSENSUS_DECISION", aggregateType: "consensus", aggregateId: consensus.id, payload: { ...consensus, marketId: trigger.marketId, asset: trigger.asset ?? null } }));
-    for (const disagreement of this.triggerEngine.ingestConsensus(consensus, trigger.marketId, trigger.asset ?? null)) this.admitTrigger(disagreement);
-    if (trigger.marketId) await this.evaluateTrade(trigger, consensus, outputs);
-  }
-
-  /** Alpha is the sole runtime trading authority; scouts only provide fresh research. */
-  private async evaluateAlphaDecision(trigger: TriggerEvent): Promise<void> {
-    if (this.researchIngressBlocked() || !this.isTriggerActionable(trigger.id) || !trigger.marketId) return;
-    if (!this.isMarketSynchronized(trigger.marketId)) return;
-    const outputs = [...(this.signalsByTrigger.get(trigger.id)?.values() ?? [])];
-    const fairEnvelope = outputs.find((item) => item.signalId === this.alphaSignalIds.get(trigger.id));
-    const fair = fairEnvelope?.output as {
-      direction?: Direction; confidence?: number; fairProbability?: number; marketProbability?: number; estimatedEdge?: number;
-      evidenceIds?: unknown[]; expiresAt?: string;
-    } | undefined;
-    if (!fairEnvelope || !fair || !(fair.direction === "UP" || fair.direction === "DOWN" || fair.direction === "FLAT")
-      || typeof fair.confidence !== "number" || typeof fair.fairProbability !== "number" || typeof fair.marketProbability !== "number"
-      || typeof fair.estimatedEdge !== "number") return;
-    const requiredScoutRoles = rolesForTriggerKind(trigger.kind, trigger.severity).filter(isScoutRole);
-    const freshScout = this.hotResearchCache.freshFor(trigger.marketId, trigger.asset ?? null, requiredScoutRoles);
-    if (freshScout.length !== requiredScoutRoles.length) return;
-    const evidenceIds = [...new Set([
-      ...(Array.isArray(fair.evidenceIds) ? fair.evidenceIds.map(String) : []),
-      ...freshScout.flatMap((entry) => entry.evidenceIds),
-      ...trigger.sourceEventIds,
-    ])].slice(0, 64);
-    const correlatedFeatureIds = [...new Set(freshScout.flatMap((entry) => entry.featureIds))].slice(0, 64);
-    const alpha = {
-      id: createId("alpha_decision"), traceId: trigger.traceId, triggerId: trigger.id,
-      consensusDirection: fair.direction, consensusConfidence: fair.confidence,
-      agentAgreement: 1, signalFreshness: 1, conflicts: ["ALPHA_SYNTHESIS", "SCOUT_RESEARCH_CORRELATED"],
-      estimatedEdge: fair.estimatedEdge, evidenceIds, calculatedAt: this.nowFn().toISOString(),
-    } as NonNullable<EngineStateStore["latestConsensus"]>;
-    this.state.latestConsensus = alpha;
-    this.record("CONSENSUS_COMPLETE", trigger.traceId, trigger.marketId, {
-      authority: "ALPHA", direction: alpha.consensusDirection, confidence: alpha.consensusConfidence,
-      fairProbability: fair.fairProbability, marketProbability: fair.marketProbability,
-      scoutRoles: freshScout.map((entry) => entry.role), correlatedFeatureIds,
-      triggerId: trigger.id,
-    }, trigger.asset ?? null);
-    await this.persistReportInput(createJournalEvent({
-      traceId: trigger.traceId, type: "CONSENSUS_DECISION", aggregateType: "consensus", aggregateId: alpha.id,
-      payload: { ...alpha, authority: "ALPHA", fairProbability: fair.fairProbability, marketProbability: fair.marketProbability,
-        scoutAgesMs: freshScout.map((entry) => ({ role: entry.role, ageMs: Math.max(0, this.nowFn().getTime() - new Date(entry.generatedAt).getTime()) })),
-        correlatedFeatureIds },
-    }));
-    for (const disagreement of this.triggerEngine.ingestConsensus(alpha, trigger.marketId, trigger.asset ?? null)) this.admitTrigger(disagreement);
-    await this.evaluateTrade(trigger, alpha, outputs, true);
-  }
-
-  private async evaluateTrade(trigger: TriggerEvent, consensus: NonNullable<EngineStateStore["latestConsensus"]>, outputs: GrokSignalEnvelope[], alphaAuthoritative = false): Promise<void> {
+  private async evaluateTrade(trigger: TriggerEvent, consensus: NonNullable<EngineStateStore["latestConsensus"]>, native: NativeDecision): Promise<void> {
     if (this.researchIngressBlocked()) return;
     if (!this.isTriggerActionable(trigger.id)) return;
     const pair = this.snapshots.get(trigger.marketId ?? "");
@@ -2553,11 +2458,10 @@ export class EngineService {
     if (candidate.intent === "HEDGE_SECOND_LEG" && !experimentAllowsHedge(this.experiment)) return;
     const snapshot = this.state.marketSnapshots.get(candidate.tokenId);
     if (!snapshot) return;
-    const fair = outputs.find((item) => item.agentId === "fair_probability_analyst")?.output as { direction?: Direction; fairProbability?: number; marketProbability?: number; estimatedEdge?: number } | undefined;
     let executableFair: ReturnType<typeof executableFairEdge> = null;
-    if (candidate.intent === "OPEN_FIRST_LEG" && fair && typeof fair.fairProbability === "number" && (fair.direction === "UP" || fair.direction === "DOWN")) {
+    if (candidate.intent === "OPEN_FIRST_LEG" && (native.direction === "UP" || native.direction === "DOWN")) {
       executableFair = executableFairEdge({
-        fair: { direction: fair.direction, fairProbability: fair.fairProbability, marketProbability: fair.marketProbability, estimatedEdge: fair.estimatedEdge },
+        fair: { direction: native.direction, fairProbability: native.fairProbability, marketProbability: native.marketProbability },
         consensus, snapshot, quantity: candidate.quantity, limitPrice: candidate.limitPrice,
       });
       if (!executableFair) return;
@@ -2567,11 +2471,7 @@ export class EngineService {
     }
     const duplicateKey = `${candidate.marketId}:${candidate.outcome}:${candidate.intent}`;
     const now = this.nowFn();
-    const externalRisk = alphaAuthoritative ? undefined : outputs.find((item) => item.agentId === "risk_hedge_analyst")?.output as { recommendVeto?: boolean } | undefined;
-    const earliestSignalExpiry = outputs.reduce((earliest, item) => {
-      const expiresAt = (item.output as { expiresAt?: string }).expiresAt;
-      return expiresAt && new Date(expiresAt).getTime() < earliest.getTime() ? new Date(expiresAt) : earliest;
-    }, new Date(trigger.expiresAt));
+    const signalExpiry = new Date(native.expiresAt);
     const asset = trigger.asset ?? this.assetByMarket.get(candidate.marketId) ?? snapshot.asset ?? null;
     const exposure = computePaperExposures(this.ledger.positions.values(), candidate.marketId, this.assetByMarket, now.getTime());
     const projected = projectPaperExposures({
@@ -2589,7 +2489,7 @@ export class EngineService {
     const marketFeedAt = collectMarketFeedAt(this.snapshots.get(candidate.marketId), candidate.outcome, candidate.intent, snapshot.receivedAt);
     const decision = decidePaperOrder({
       candidate, consensus, snapshotAfterDecisionLatency: snapshot, limits: this.riskLimits, triggerId: trigger.id,
-      signalExpiresAt: earliestSignalExpiry, orderType: this.env.PAPER_EXECUTION_STYLE,
+      signalExpiresAt: signalExpiry, orderType: this.env.PAPER_EXECUTION_STYLE,
       baseRisk: {
         now, marketFeedAt,
         btcFeedAt: asset === "BTC" ? referenceFeedAt ?? dateOrNull(this.state.lastBtcMessageAt) : now,
@@ -2604,25 +2504,22 @@ export class EngineService {
         projectedAssetExposureUsd: projected.asset, availableCashUsd: this.ledger.availableCash().toFixed(),
         referenceProviderBlocked: Boolean(blocked),
         marketEntryQualified: this.entryQualified.has(candidate.marketId),
-        externalSignalsLastMinute: this.signalReceivedTimes.filter((at) => now.getTime() - at < 60_000).length,
+        externalSignalsLastMinute: 0,
         lastStrategyTradeAt: this.lastTradeAt,
         duplicateTrade: (this.recentTrades.get(duplicateKey) ?? 0) > now.getTime() - this.riskLimits.strategyCooldownMs,
         experimentEntryOpen: candidate.intent === "HEDGE_SECOND_LEG" ? experimentAllowsHedge(this.experiment) : experimentAllowsFirstLeg(this.experiment),
         executionErrorsLastHour: this.executionErrors.filter((at) => now.getTime() - at < 3_600_000).length,
-        externalRiskRecommendedVeto: externalRisk?.recommendVeto === true, shuttingDown: this.state.draining,
+        externalRiskRecommendedVeto: false, shuttingDown: this.state.draining,
       },
     });
     this.state.latestRisk = decision.risk;
-    const alphaOutput = alphaAuthoritative ? outputs.find((item) => item.signalId === this.alphaSignalIds.get(trigger.id))?.output as {
-      fairProbability?: number; marketProbability?: number; estimatedEdge?: number;
-    } | undefined : undefined;
-    const scoutEntries = this.hotResearchCache.freshFor(trigger.marketId ?? "", asset, SCOUT_ROLES);
     const executionStyle = decision.order?.orderType ?? this.env.PAPER_EXECUTION_STYLE;
-    const calibration = alphaAuthoritative && executableFair ? {
+    const calibration = executableFair ? {
+      authority: NATIVE_DETERMINISTIC_AUTHORITY,
       /** Compatibility display fields; executable fields below are authoritative. */
-      fairProbability: alphaOutput?.fairProbability ?? null,
-      marketProbability: alphaOutput?.marketProbability ?? null,
-      alphaSubmittedFairProbability: alphaOutput?.fairProbability ?? null,
+      fairProbability: native.fairProbability,
+      marketProbability: native.marketProbability,
+      featureVector: native.featureVector,
       fairProbabilityForTradedOutcome: executableFair.fairProbabilityForTradedOutcome,
       tradedOutcome: executableFair.consensusOutcome,
       usedComplement: executableFair.usedComplement,
@@ -2647,9 +2544,16 @@ export class EngineService {
       expectedROI: decision.expectedROI,
       quantity: decision.quantity,
       decisionTimestamp: this.nowFn().toISOString(),
-      scoutAgesMs: scoutEntries.map((entry) => ({ role: entry.role, ageMs: Math.max(0, this.nowFn().getTime() - new Date(entry.generatedAt).getTime()) })),
-      provenance: scoutEntries.map((entry) => ({ role: entry.role, evidenceIds: entry.evidenceIds, sourceEventIds: entry.sourceEventIds, featureIds: entry.featureIds, derivedFrom: entry.derivedFrom })),
-    } : undefined;
+      evidenceIds: native.evidenceIds,
+      expiresAt: native.expiresAt,
+    } : {
+      authority: NATIVE_DETERMINISTIC_AUTHORITY,
+      fairProbability: native.fairProbability,
+      marketProbability: native.marketProbability,
+      featureVector: native.featureVector,
+      evidenceIds: native.evidenceIds,
+      expiresAt: native.expiresAt,
+    };
     await this.persistReportInput(createJournalEvent({ traceId: trigger.traceId, type: "RISK_EVALUATION", aggregateType: "risk", aggregateId: decision.risk.id, payload: {
       ...decision.risk, marketId: trigger.marketId, asset,
       ...(calibration ? { alpha: calibration } : {}),
@@ -3018,6 +2922,7 @@ export class EngineService {
     // Background research is an entry-path concern. ENTRY_CLOSED may still
     // process hedge/settlement work, but it must not keep paid scouts warm.
     if (this.env.GROK_ACTIVATION_PROVIDER !== "xai"
+      || this.experiment?.modelConfiguration.authority === NATIVE_DETERMINISTIC_AUTHORITY
       || this.experiment?.status !== "RUNNING"
       || !experimentAllowsFirstLeg(this.experiment)
       || (this.experiment.entryClosesAt !== null && this.nowFn().getTime() >= new Date(this.experiment.entryClosesAt).getTime())) return;
@@ -4138,7 +4043,6 @@ export class EngineService {
       triggerProvenance: this.triggerProvenance.size,
       provenanceInvalid: this.provenanceInvalid.size,
       signalsByTrigger: this.signalsByTrigger.size,
-      lastEvaluatedSignalCount: this.lastEvaluatedSignalCount.size,
     };
   }
 
@@ -4151,7 +4055,6 @@ export class EngineService {
       triggerProvenance: this.triggerProvenance.size,
       provenanceInvalid: this.provenanceInvalid.size,
       signalsByTrigger: this.signalsByTrigger.size,
-      lastEvaluatedSignalCount: this.lastEvaluatedSignalCount.size,
     };
   }
   retainedCleanupCyclesForTest(): RetainedCleanupCycle[] {
@@ -4175,7 +4078,6 @@ export class EngineService {
       this.activeTriggers.set(input.trigger.id, input.trigger);
       this.rememberProvenance(input.trigger.id, this.captureProvenance(input.trigger));
       this.signalsByTrigger.set(input.trigger.id, new Map());
-      this.lastEvaluatedSignalCount.set(input.trigger.id, 1);
     }
   }
 
@@ -4407,18 +4309,14 @@ export class EngineService {
     // its bounded reservations while retaining the trigger record so stale
     // submissions still receive the explicit provenance-stale response.
     this.activation.forgetTrigger(triggerId);
-    this.activationFlights.delete(triggerId);
   }
 
   private forgetTrigger(triggerId: string): void {
     this.activation.forgetTrigger(triggerId);
-    this.activationFlights.delete(triggerId);
     this.activeTriggers.delete(triggerId);
     this.triggerProvenance.delete(triggerId);
     this.provenanceInvalid.delete(triggerId);
     this.signalsByTrigger.delete(triggerId);
-    this.lastEvaluatedSignalCount.delete(triggerId);
-    this.alphaSignalIds.delete(triggerId);
   }
 
   private clearResearchActivationState(): void {

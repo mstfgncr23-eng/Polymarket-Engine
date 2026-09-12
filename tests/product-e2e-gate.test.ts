@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   createId,
   grokSignalSubmissionSchema,
+  triggerEventSchema,
   type Direction,
   type MarketSnapshot,
   type ReferenceTick,
@@ -10,7 +11,6 @@ import {
 import { hashExperimentReport, MemoryEventJournal, type EventJournal } from "@pm/db";
 import { EngineService } from "../apps/engine/src/engine.js";
 import { NoopGrokActivationBridge } from "../apps/engine/src/activation/index.js";
-import { CrashInjectedError } from "../apps/engine/src/crash-injection.js";
 import {
   ScriptedMarketAdapter,
   ScriptedReferenceRegistry,
@@ -102,7 +102,12 @@ function outputFor(role: string, trigger: TriggerEvent, clock: ScenarioClock): R
   return { ...base, classification: "NEUTRAL", summary: "deterministic product gate", sources: [] };
 }
 
-function submission(trigger: TriggerEvent, role: "market_microstructure_scanner" | "crypto_market_scanner" | "fair_probability_analyst", clock: ScenarioClock, suffix: string) {
+function submission(
+  trigger: TriggerEvent,
+  role: "market_microstructure_scanner" | "crypto_market_scanner" | "news_x_intelligence_scanner" | "fair_probability_analyst" | "risk_hedge_analyst" | "strategy_supervisor",
+  clock: ScenarioClock,
+  suffix: string,
+) {
   return grokSignalSubmissionSchema.parse({
     submissionId: createId(`sub-${suffix}`),
     triggerId: trigger.id,
@@ -117,14 +122,23 @@ function submission(trigger: TriggerEvent, role: "market_microstructure_scanner"
   });
 }
 
-async function submitThree(engine: EngineService, trigger: TriggerEvent, clock: ScenarioClock, suffix: string): Promise<void> {
-  // Submit directional roles first; fair last makes this one consensus evaluation
-  // from three independent, role-authenticated production inbox submissions.
-  const roles = ["market_microstructure_scanner", "crypto_market_scanner", "fair_probability_analyst"] as const;
-  for (const role of roles) {
-    const result = await engine.submitGrokSignal(submission(trigger, role, clock, suffix), role);
-    expect(result.status).toBe("accepted");
-  }
+function unsynchronizedTrigger(clock: ScenarioClock): TriggerEvent {
+  return triggerEventSchema.parse({
+    id: createId("trigger"),
+    traceId: createId("trace"),
+    marketId: "btc-mkt",
+    asset: "BTC",
+    source: "system",
+    kind: "BOOK_IMBALANCE",
+    severity: 2,
+    score: 1,
+    dedupeKey: createId("dedupe"),
+    evidence: {},
+    sourceEventIds: [createId("source")],
+    evidenceIds: [createId("evidence")],
+    createdAt: iso(clock),
+    expiresAt: new Date(clock.nowMs + 30_000).toISOString(),
+  });
 }
 
 async function setupScenario(options: {
@@ -180,12 +194,10 @@ describe("PR20 true product end-to-end gate", () => {
   it("Scenario A crosses one shared production chain from discovery through canonical report", async () => {
     const setup = await setupScenario();
     try {
-      const trigger = await beginAndGenerateTrigger(setup);
       const cashBefore = setup.engine.ledger.snapshot().cash;
-      await submitThree(setup.engine, trigger, setup.clock, "first-leg");
-      await drainRuntime(setup.engine);
+      await beginAndGenerateTrigger(setup);
       expect(setup.engine.state.latestConsensus?.consensusDirection).toBe("UP");
-      expect(setup.engine.state.latestRisk?.accepted).toBe(true);
+      expect(setup.engine.state.latestConsensus?.authority).toBe("NATIVE_DETERMINISTIC_V1");
       expect(setup.engine.ledger.positions.get("btc-mkt")?.unpairedQuantity).not.toBe("0");
       expect(setup.engine.ledger.snapshot().cash).not.toBe(cashBefore);
 
@@ -193,15 +205,17 @@ describe("PR20 true product end-to-end gate", () => {
       // clock, refresh both books/reference, and let the real market trigger
       // path create a fresh hedge opportunity after that cooldown.
       setup.clock.nowMs = START_MS + 61_000;
+      const hedgeStartedAt = setup.clock.nowMs;
       await setup.market.emitSnapshot(marketBook(setup.clock, "DOWN", 2));
       await setup.market.emitSnapshot(marketBook(setup.clock, "UP", 2));
+      await setup.engine.ingestReferenceTickForTest(referenceTick(setup.clock, "100"));
+      setup.clock.nowMs = START_MS + 62_000;
       await setup.engine.ingestReferenceTickForTest(referenceTick(setup.clock, "102"));
       await drainRuntime(setup.engine);
       const hedgeTrigger = await waitFor(
-        () => [...setup.engine.state.recentTriggers].reverse().find((item) => item.marketId === "btc-mkt" && item.kind === "BOOK_IMBALANCE" && Date.parse(item.createdAt) >= setup.clock.nowMs),
+        () => [...setup.engine.state.recentTriggers].reverse().find((item) => item.marketId === "btc-mkt" && item.kind === "BOOK_IMBALANCE" && Date.parse(item.createdAt) >= hedgeStartedAt),
         (item): item is TriggerEvent => Boolean(item),
       );
-      await submitThree(setup.engine, hedgeTrigger, setup.clock, "hedge-leg");
       await drainRuntime(setup.engine);
       const paired = setup.engine.ledger.positions.get("btc-mkt");
       expect(paired?.pairedQuantity, JSON.stringify({
@@ -238,14 +252,21 @@ describe("PR20 true product end-to-end gate", () => {
       expect((report!.canonicalSummary as { settlementCount?: number }).settlementCount).toBe(1);
       const types = await eventTypes(setup.journal);
       expect(types).toEqual(expect.arrayContaining([
-        "EXPERIMENT_STARTED", "EXPERIMENT_START_VALIDATED", "TRIGGER_EVENT", "GROK_SIGNAL_ACCEPTED",
-        "CONSENSUS_DECISION", "RISK_EVALUATION", "PAPER_ORDER_CREATED", "PAPER_FILL", "POSITION_SETTLED",
+        "EXPERIMENT_STARTED", "EXPERIMENT_START_VALIDATED", "TRIGGER_EVENT", "CONSENSUS_DECISION",
+        "RISK_EVALUATION", "PAPER_ORDER_CREATED", "PAPER_FILL", "POSITION_SETTLED",
         "EXPERIMENT_COMPLETED", "EXPERIMENT_SOURCE_SEALED", "EXPERIMENT_REPORT_GENERATED",
       ]));
-      // These durable/audit facts are the diagnostic trace proving the calls
-      // crossed beginExperiment, TriggerEngine/admitTrigger/processTrigger,
-      // submitGrokSignal, consensus, strategy/risk/order/fill, settlement,
-      // source seal, and canonical report persistence on one engine instance.
+      expect(types).not.toContain("GROK_SIGNAL_ACCEPTED");
+      const consensusRows = await setup.journal.queryEvents({ types: ["CONSENSUS_DECISION"] });
+      expect(consensusRows[0]?.payload).toMatchObject({
+        authority: "NATIVE_DETERMINISTIC_V1",
+        featureVector: expect.any(Object),
+        reference: { venue: "deterministic-test" },
+      });
+      expect(setup.engine.activationFootprint().sent).toBe(0);
+      expect(setup.engine.experimentManifest()?.modelConfiguration).toMatchObject({
+        provider: "native_deterministic", version: "native-deterministic-v1", localExecution: true, externalInference: false,
+      });
     } finally {
       await setup.engine.stop();
     }
@@ -254,11 +275,13 @@ describe("PR20 true product end-to-end gate", () => {
   it("Scenario B produces valid consensus but risk rejects without economic mutation", async () => {
     const setup = await setupScenario({ env: { EXPERIMENT_DURATION_HOURS: "1" } });
     try {
-      const trigger = await beginAndGenerateTrigger(setup);
+      expect((await setup.engine.beginExperiment()).ok).toBe(true);
+      await setup.market.emitSnapshot(marketBook(setup.clock, "UP", 1));
+      await setup.market.emitSnapshot(marketBook(setup.clock, "DOWN", 1));
+      await setup.engine.ingestReferenceTickForTest(referenceTick(setup.clock, "100"));
       const before = setup.engine.ledger.snapshot();
       setup.clock.nowMs = START_MS + 16_000;
-      await setup.engine.ingestReferenceTickForTest(referenceTick(setup.clock, "100"));
-      await submitThree(setup.engine, trigger, setup.clock, "risk-reject");
+      await setup.engine.ingestReferenceTickForTest(referenceTick(setup.clock, "102"));
       await drainRuntime(setup.engine);
       expect(setup.engine.state.latestConsensus?.consensusDirection).toBe("UP");
       expect(setup.engine.state.latestRisk?.accepted, JSON.stringify({
@@ -279,7 +302,9 @@ describe("PR20 true product end-to-end gate", () => {
   it("Scenario C accepts one valid response but never creates consensus or a trade", async () => {
     const setup = await setupScenario();
     try {
-      const trigger = await beginAndGenerateTrigger(setup);
+      expect((await setup.engine.beginExperiment()).ok).toBe(true);
+      const trigger = unsynchronizedTrigger(setup.clock);
+      await setup.engine.registerTriggerForResearch(trigger);
       const before = setup.engine.ledger.snapshot();
       const result = await setup.engine.submitGrokSignal(submission(trigger, "fair_probability_analyst", setup.clock, "insufficient"), "fair_probability_analyst");
       expect(result.status).toBe("accepted");
@@ -292,20 +317,103 @@ describe("PR20 true product end-to-end gate", () => {
     }
   });
 
+  it("Scenario E accepts legacy Grok research without crossing the native economic boundary", async () => {
+    const setup = await setupScenario();
+    try {
+      await beginAndGenerateTrigger(setup);
+      const nativeBefore = structuredClone(setup.engine.state.latestConsensus);
+      const riskBefore = structuredClone(setup.engine.state.latestRisk);
+      const positionsBefore = structuredClone([...setup.engine.ledger.positions.entries()]);
+      const ledgerBefore = setup.engine.ledger.snapshot();
+      const reservedBefore = setup.engine.reservedCash();
+      const beforeCounts = {
+        consensus: (await setup.journal.queryEvents({ types: ["CONSENSUS_DECISION"] })).length,
+        risk: (await setup.journal.queryEvents({ types: ["RISK_EVALUATION"] })).length,
+        orders: (await setup.journal.queryEvents({ types: ["PAPER_ORDER_CREATED"] })).length,
+        fills: (await setup.journal.queryEvents({ types: ["PAPER_FILL"] })).length,
+      };
+      const nativeTrigger = setup.engine.state.recentTriggers.find((item) => item.id === nativeBefore?.triggerId);
+      expect(nativeBefore).toBeTruthy();
+      expect(nativeTrigger).toBeTruthy();
+
+      const roles = [
+        "market_microstructure_scanner", "crypto_market_scanner", "news_x_intelligence_scanner",
+        "fair_probability_analyst", "risk_hedge_analyst", "strategy_supervisor",
+      ] as const;
+      for (const role of roles) {
+        await expect(
+          setup.engine.submitGrokSignal(submission(nativeTrigger!, role, setup.clock, `non-authority-${role}`), role),
+        ).resolves.toMatchObject({ status: "accepted" });
+      }
+
+      const afterCounts = {
+        consensus: (await setup.journal.queryEvents({ types: ["CONSENSUS_DECISION"] })).length,
+        risk: (await setup.journal.queryEvents({ types: ["RISK_EVALUATION"] })).length,
+        orders: (await setup.journal.queryEvents({ types: ["PAPER_ORDER_CREATED"] })).length,
+        fills: (await setup.journal.queryEvents({ types: ["PAPER_FILL"] })).length,
+      };
+      expect(setup.engine.state.latestConsensus).toEqual(nativeBefore);
+      expect(setup.engine.state.latestRisk).toEqual(riskBefore);
+      expect(afterCounts).toEqual(beforeCounts);
+      expect(setup.engine.ledger.snapshot().cash).toBe(ledgerBefore.cash);
+      expect([...setup.engine.ledger.positions.entries()]).toEqual(positionsBefore);
+      expect(setup.engine.reservedCash()).toBe(reservedBefore);
+      expect((await setup.journal.queryEvents({ types: ["GROK_SIGNAL_ACCEPTED"] })).length).toBe(roles.length);
+    } finally {
+      await setup.engine.stop();
+    }
+  });
+
+  it("uses the TriggerEngine 60-second reference window instead of the last eight state prices", async () => {
+    const setup = await setupScenario();
+    try {
+      expect((await setup.engine.beginExperiment()).ok).toBe(true);
+      await setup.market.emitSnapshot(marketBook(setup.clock, "UP", 1));
+      await setup.market.emitSnapshot(marketBook(setup.clock, "DOWN", 1));
+
+      const prices = ["100", "100.13", "100.13", "100.13", "100.13", "100.13", "100.13", "100.13", "100.13", "100.29"];
+      for (const [index, price] of prices.entries()) {
+        setup.clock.nowMs = START_MS + index * 1_000;
+        await setup.engine.ingestReferenceTickForTest(referenceTick(setup.clock, price));
+      }
+      await drainRuntime(setup.engine);
+
+      const rapidMove = setup.engine.state.recentTriggers.find((item) => item.kind === "BTC_RAPID_MOVE");
+      const rapidMoveBps = Number(rapidMove?.evidence.moveBps);
+      const featureVector = setup.engine.state.latestConsensus?.featureVector as {
+        referenceMoveBps?: number;
+        referenceWindowMs?: number;
+        referenceVenue?: string | null;
+      } | undefined;
+      expect(setup.engine.referenceWindowTotalEntriesForTest()).toBe(10);
+      expect(rapidMove).toBeTruthy();
+      expect(rapidMoveBps).toBeCloseTo(29, 8);
+      expect(featureVector?.referenceMoveBps).toBeCloseTo(29, 8);
+      expect(featureVector?.referenceWindowMs).toBe(9_000);
+      expect(featureVector?.referenceVenue).toBe("deterministic-test");
+    } finally {
+      await setup.engine.stop();
+    }
+  });
+
   it("Scenario D replays a durable fill after crash and settles exactly once", async () => {
     const journal = new MemoryEventJournal();
     const clock = { nowMs: START_MS };
     const resolutions = new Map<string, Record<string, unknown>>();
     const setup = await setupScenario({ journal, clock, resolutions, env: { PAPER_EXECUTION_LATENCY_MS: "200" } });
     try {
-      const trigger = await beginAndGenerateTrigger(setup);
-      const first = setup.engine.submitGrokSignal(submission(trigger, "market_microstructure_scanner", clock, "crash"), "market_microstructure_scanner");
-      const second = setup.engine.submitGrokSignal(submission(trigger, "crypto_market_scanner", clock, "crash"), "crypto_market_scanner");
-      await Promise.all([first, second]);
-      const fairPromise = setup.engine.submitGrokSignal(submission(trigger, "fair_probability_analyst", clock, "crash"), "fair_probability_analyst");
-      await waitFor(() => journal.queryEvents({ types: ["PAPER_ORDER_CREATED"] }), (events) => events.length === 1);
+      expect((await setup.engine.beginExperiment()).ok).toBe(true);
+      await setup.market.emitSnapshot(marketBook(clock, "UP", 1));
+      await setup.market.emitSnapshot(marketBook(clock, "DOWN", 1));
+      await setup.engine.ingestReferenceTickForTest(referenceTick(clock, "100"));
       setup.engine.setCrashInjectionForTest("AFTER_DURABLE_COMMIT_BEFORE_APPLY");
-      await expect(fairPromise).rejects.toBeInstanceOf(CrashInjectedError);
+      clock.nowMs = START_MS + 1_000;
+      await setup.engine.ingestReferenceTickForTest(referenceTick(clock, "102"));
+      await waitFor(() => journal.queryEvents({ types: ["PAPER_ORDER_CREATED"] }), (events) => events.length === 1);
+      await waitFor(() => journal.readDurableTransitionsAfter(0, 256), (rows) => rows.some((row) => row.type === "PAPER_FILL"));
+      await drainRuntime(setup.engine);
+      const trigger = setup.engine.state.recentTriggers.find((item) => item.kind === "BTC_RAPID_MOVE");
+      expect(trigger).toBeTruthy();
       const durableFill = (await journal.readDurableTransitionsAfter(0, 256)).filter((row) => row.type === "PAPER_FILL");
       expect(durableFill).toHaveLength(1);
       expect(setup.engine.ledger.positions.size).toBe(0);

@@ -2,26 +2,23 @@
 
 Production-shaped, event-driven research system for a continuous engine with an explicit 48-hour experiment/validation window using **public live Polymarket crypto prediction markets** plus **generic external crypto reference prices** for the assets those markets need. It creates **paper orders only**. There is no wallet integration, signer, private CLOB client, or live-order path; `TRADING_MODE` accepts only `paper`, and the live adapter always throws `LIVE_TRADING_DISABLED`.
 
-The engine is **not Bitcoin-only**. It discovers whichever qualifying crypto prediction markets Polymarket currently offers, qualifies them with explicit reason codes, monitors them concurrently with isolated state, and only then opens reference feeds for those underlying assets. Research comes from **external Grok Bots** over a bearer-authenticated Streamable HTTP MCP endpoint. This repository does not call OpenAI, does not require `OPENAI_API_KEY`, does not call an xAI inference API, and does not place live Polymarket orders.
+The engine is **not Bitcoin-only**. It discovers whichever qualifying crypto prediction markets Polymarket currently offers, qualifies them with explicit reason codes, monitors them concurrently with isolated state, and only then opens reference feeds for those underlying assets. Optional **external Grok Bots** may provide bounded scouting and diagnostic research over a bearer-authenticated Streamable HTTP MCP endpoint, but economic decisions are owned by the local deterministic `NATIVE_DETERMINISTIC_V1` model. This repository does not call OpenAI, does not require `OPENAI_API_KEY`, does not call an xAI inference API, and does not place live Polymarket orders.
 
-Thousands of ticks are cheaply filtered by the deterministic trigger engine. Only a few triggers request Grok activation for the matching roles. Missing Grok research never invents consensus or paper orders.
+Thousands of ticks are cheaply filtered by the deterministic trigger engine. Only a few triggers reach the native decision path. Missing or conflicting Grok research never changes the economic decision or invents paper orders.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-  GB[Six Grok Bots] -->|Streamable HTTP MCP /mcp\nbearer auth| E[Always-on Fly engine]
+  GB[Optional Grok research clients] -->|Streamable HTTP MCP /mcp\nbearer auth| E[Always-on Fly engine]
   PM[Polymarket public CLOB v2\nREST discovery + market WebSocket] --> E
   REF[Generic reference WS\none feed per underlying asset] --> E
   E --> Q[Qualification + multi-market state]
   Q --> T[Deterministic trigger engine]
-  T --> AB[GrokActivationBridge\nNoop or Slack wake transport]
-  AB -->|minimal wake signal| INT[Cursor-account integration\ne.g. Slack message]
-  GB -->|client-initiated MCP| E
-  T --> IN[Signal inbox / freshness window]
-  GB --> IN
-  IN --> C[Validated consensus\ntrigger-scoped]
-  C --> R[Deterministic risk veto\norder / market / asset / portfolio]
+  T --> N[NATIVE_DETERMINISTIC_V1\nlocal deterministic decision]
+  GB --> D[Grok scouting/diagnostics\nnon-authoritative]
+  D --> E
+  N --> R[Deterministic risk veto\norder / market / asset / portfolio]
   R --> X[Conservative paper execution]
   X --> L[Ledger + positions]
   E --> J[(PostgreSQL journal + durable_transitions\n+ experiment_reports)]
@@ -32,7 +29,7 @@ flowchart LR
 
 The pnpm workspace contains `apps/engine`, `apps/dashboard`, and focused `packages/core`, `packages/db`, and `packages/market-data`. PostgreSQL journal events are the canonical audit trail for durable experiment, trading, and recovery facts. Live `MARKET_SNAPSHOT` and `REFERENCE_TICK` observations are processed in memory and are deliberately not permanent journal records; the report-input admission path stores ordinary canonical research events only while an experiment window is open, with lifecycle boundary events retained separately.
 
-Every important event carries a `traceId`. Journal/dashboard records also carry `marketId` and `asset` when known. `/api/traces/:traceId` reconstructs the source market evidence, participating Grok roles, consensus, risk result, order/fill, and resulting position from the append-only journal. Secrets are never written to that trail.
+Every important event carries a `traceId`. Journal/dashboard records also carry `marketId` and `asset` when known. `/api/traces/:traceId` reconstructs the source market evidence, native decision, optional Grok research, risk result, order/fill, and resulting position from the append-only journal. Secrets are never written to that trail.
 
 ## Discovery and qualification
 
@@ -50,7 +47,7 @@ Paper settlement uses **public** Polymarket resolution only (`state.closed` / `r
 
 HTTP 451/403 from the reference venue is `REGION_BLOCKED` / `PROVIDER_BLOCKED`: fail closed, visible health, no paper execution that requires that reference, and a slow recheck (~30 min) rather than a 30–60s retry storm.
 
-The engine is continuous and can keep monitoring/discovery/feeds alive while `IDLE`; the 48h **experiment/validation window clock does not start on boot**. An operator starts that window with `pnpm experiment:start` or `POST /api/operator/experiment/start` (`ENGINE_OPERATOR_TOKEN` only; the read token cannot start it). Preflight requires paper mode, Postgres, and working discovery; if `EXPERIMENT_REQUIRES_GROK=true` and `GROK_ACTIVATION_PROVIDER=noop`, start is blocked. Slack HTTP success is not a Grok wake.
+The engine is continuous and can keep monitoring/discovery/feeds alive while `IDLE`; the 48h **experiment/validation window clock does not start on boot**. An operator starts that window with `pnpm experiment:start` or `POST /api/operator/experiment/start` (`ENGINE_OPERATOR_TOKEN` only; the read token cannot start it). The native experiment preflight requires paper mode, Postgres, working discovery, a genuine entry-qualified market, and a fresh required reference; it does not require Grok tokens, xAI, Slack, or external inference.
 
 `EXPERIMENT_CLOSE_POLICY=observe_until_settlement` (default) stops new first legs at 48h, continues hedges/settlement, and writes the FINAL report only after experiment positions settle. `mark_to_market` snapshots remaining books, marks unresolved, and does not fabricate wins/losses.
 
@@ -76,7 +73,7 @@ Explicit reason codes (reject unless `QUALIFIED`):
 
 Binary UP/DOWN is used only when outcome labels are clearly Up/Down (or Higher/Lower), or when the market is an explicit directional up/down listing with Yes/No or unlabeled outcomes (Polymarket crypto updown convention: Yes→UP, No→DOWN). Other binaries are skipped.
 
-State is isolated by `marketId` / `tokenId` / underlying asset: books, snapshots, triggers, Grok signals, consensus, risk, positions, maker orders, hedges, traces, journal, metrics, and reports must not mix across markets.
+State is isolated by `marketId` / `tokenId` / underlying asset: books, snapshots, triggers, Grok research, native decisions, compatibility envelopes, risk, positions, maker orders, hedges, traces, journal, metrics, and reports must not mix across markets.
 
 ## Reference feeds
 
@@ -86,25 +83,23 @@ Reference symbol probes distinguish `SUPPORTED`, `UNSUPPORTED_DEFINITIVE`, and `
 
 `/ready` means the engine process is alive, not draining, and PostgreSQL is up. It does **not** require a qualifying market or a Polymarket WebSocket message. Zero currently qualifying markets is a scanner idle state (`discoveryStatus=ZERO_QUALIFIED`), not a crash: discovery continues on `DISCOVERY_INTERVAL_MS`, no market WS is opened until tokens exist, and no paper trade is fabricated. `/health` remains process-liveness. A failed reference feed does **not** keep the whole engine unready.
 
-## Trigger and Grok Bot flow
+## Trigger and decision flow
 
 ```mermaid
 flowchart TD
   M[Every market/reference message] --> F[Decimal-safe features]
   F --> G{Threshold + debounce\n+ cooldown + dedupe}
   G -->|Any level| P[Persist trigger immediately]
-  P --> R[Role routing: only matching Grok roles]
-  R --> A[GrokActivationBridge]
-  A -->|noop default| N[Skip; monitoring continues]
-  A -->|slack| S[Minimal Slack wake payload]
-  P --> W[Grok research window]
-  W -->|fresh signals meet minimum roles| C[Weighted consensus]
-  W -->|Grok unavailable or stale| M2[Continue monitoring\nno paper order]
+  P --> N[NATIVE_DETERMINISTIC_V1]
+  N --> E[Current-book executable fair edge]
+  E --> R[Deterministic risk veto]
+  R --> X[Paper execution only]
+  G[Optional Grok scouting/diagnostics] --> D[No economic mutation]
 ```
 
 Triggers identify `triggerId`, `traceId`, `marketId`, underlying asset, source, kind, severity, created/expiry, and evidence IDs. They are isolated by market/asset. Deterministic trigger math is unchanged except for per-asset reference windows. BTC rapid-move math still emits `BTC_RAPID_MOVE` for BTC; other assets emit `CRYPTO_REFERENCE_RAPID_MOVE`.
 
-Activation is **non-fatal**: monitoring continues, the trigger remains available in live engine state, active experiment triggers are persisted, failures are journaled when applicable, no crash, no fake Grok signal, no invented consensus, no paper order from missing research.
+Native evaluation is **fail closed**: monitoring continues, the trigger remains available in live engine state, active experiment triggers are persisted, and missing/stale/malformed market or reference evidence yields no decision and no paper order. Grok submissions, when enabled, are retained only as bounded research/diagnostic evidence and cannot mutate fair probability, risk, orders, fills, positions, or accounting.
 
 ### Official Grok activation (re-verified 2026-09-01)
 
@@ -130,10 +125,11 @@ flowchart LR
   A1[fair_probability_analyst] --> AN[MCP submit_analysis]
   R1[risk_hedge_analyst] --> H[MCP recommend_hedge / recommend_veto]
   SV[strategy_supervisor] --> IN
-  IN --> C[Consensus]
-  AN --> C
-  H --> V{Deterministic risk}
-  C --> V
+  IN --> D[Diagnostic/scouting retention]
+  AN --> D
+  H --> D
+  N[NATIVE_DETERMINISTIC_V1] --> V{Deterministic risk}
+  V --> X[Paper execution]
 ```
 
 Exactly six logical Grok Bot roles exist. They are **external** MCP clients. They may only read bounded state and submit structured research. They have no wallet, signer, or `place_order` tool. Identity binding is unchanged from PR #1: `authenticated clientId === submission.agentId === submission.role`, plus the role-to-write-tool allow-list (scanners + supervisor: `submit_signal`; fair probability: `submit_analysis`; risk/hedge: `recommend_hedge` / `recommend_veto`).
@@ -152,9 +148,9 @@ Role routing (do not wake all six):
 
 ```mermaid
 flowchart LR
-  S[Validated signals] --> C[Weighted consensus]
+  B0[Trusted UP/DOWN books + reference] --> N[NATIVE_DETERMINISTIC_V1]
   B[Post-latency order book] --> D[Decision engine]
-  C --> D
+  N --> D
   D --> E[Raw edge - fee - slippage]
   I[Inventory/exposure] --> R{Risk veto}
   E --> R
@@ -254,7 +250,7 @@ pnpm report                # stream a bounded summary; persist canonical row in 
 pnpm bench:retention       # report/retention boundedness diagnostic (not a capacity claim)
 ```
 
-Tests cover pair/PnL math, fee curve, slippage/VWAP, exposure/accounting, consensus, stale/expired/budget/risk vetoes, maker/taker execution, insufficient depth, trigger dedupe, Grok unavailable continuity, malformed/duplicate/stale/unauthorized MCP behavior, forbidden trade-tool rejection, journal outage/recovery, reconnect backoff, feed parsing, exact-six topology, the hard live-order gate, multi-market isolation, Grok activation bridge/dedupe/rate limits, and identity-binding regressions.
+Tests cover pair/PnL math, fee curve, slippage/VWAP, exposure/accounting, native decision math, stale/expired/budget/risk vetoes, maker/taker execution, insufficient depth, trigger dedupe, Grok non-authority continuity, malformed/duplicate/stale/unauthorized MCP behavior, forbidden trade-tool rejection, journal outage/recovery, reconnect backoff, feed parsing, exact-six topology, the hard live-order gate, multi-market isolation, Grok activation bridge/dedupe/rate limits, and identity-binding regressions.
 
 ## 48-hour procedure
 

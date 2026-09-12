@@ -2,19 +2,18 @@ import { describe, expect, it } from "vitest";
 import {
   PaperLedger,
   activationRequestFromTrigger,
-  buildConsensus,
   calculateFee,
   calculateSlippageUsd,
   conservativeRealizableMark,
   createId,
   decidePaperOrder,
-  defaultConsensusConfig,
   engineEnvSchema,
   evaluateRisk,
   makerReserveNotional,
   parsePublicBinaryResolution,
   projectPaperExposures,
   riskLimitsSchema,
+  type ConsensusDecision,
   type TriggerEvent,
 } from "@pm/core";
 import { MemoryEventJournal, createJournalEvent, queryEventsPaged } from "@pm/db";
@@ -57,17 +56,19 @@ function futureTrigger(overrides: Partial<TriggerEvent> = {}): TriggerEvent {
   };
 }
 
+function nativeConsensus(estimatedEdge = 0.2): ConsensusDecision {
+  return {
+    id: createId("consensus"), traceId: "t", triggerId: "g", consensusDirection: "UP", consensusConfidence: 0.9,
+    agentAgreement: 1, signalFreshness: 1, conflicts: [], estimatedEdge, evidenceIds: ["e"],
+    calculatedAt: now.toISOString(), authority: "NATIVE_DETERMINISTIC_V1", fairProbability: 0.5, marketProbability: 0.4, featureVector: {},
+  };
+}
+
 function cashDecision(availableCashUsd: string, book = snapshot({
   asks: [{ price: "0.40", quantity: "20" }],
   bids: [{ price: "0.39", quantity: "20" }],
 })) {
-  const consensus = buildConsensus({
-    traceId: "t", triggerId: "g", deterministicEdge: 0.2, now, config: defaultConsensusConfig,
-    signals: [
-      { agentId: "fair_probability_analyst", direction: "UP", confidence: 0.9, expiresAt: new Date(now.getTime() + 60_000).toISOString(), evidenceIds: ["e"] },
-      { agentId: "market_microstructure_scanner", direction: "UP", confidence: 0.9, expiresAt: new Date(now.getTime() + 60_000).toISOString(), evidenceIds: ["e"] },
-    ],
-  });
+  const consensus = nativeConsensus();
   return decidePaperOrder({
     candidate: {
       strategyId: "temporal-pair-hedge", strategyVersion: "v1", marketId: book.marketId, tokenId: book.tokenId,
@@ -230,7 +231,7 @@ describe("4 final report pagination over >8000 events", () => {
 });
 
 describe("5 experiment IDLE vs Grok paper activation policy", () => {
-  it("Grok paper preflight blocks noop even without EXPERIMENT_REQUIRES_GROK", async () => {
+  it("native paper preflight ignores legacy Grok noop configuration", async () => {
     const journal = new MemoryEventJournal();
     const env = engineEnvSchema.parse({
       NODE_ENV: "test", JOURNAL_MODE: "memory", TRADING_MODE: "paper", POLYMARKET_TOKEN_IDS: "up,down",
@@ -241,7 +242,8 @@ describe("5 experiment IDLE vs Grok paper activation policy", () => {
     try {
       const result = await engine.beginExperiment();
       expect(result.ok).toBe(false);
-      expect(result.blockers).toEqual(expect.arrayContaining(["GROK_ACTIVATION_NOOP"]));
+      expect(result.blockers).toContain("NO_ENTRY_QUALIFIED_MARKET");
+      expect(result.blockers).not.toContain("GROK_ACTIVATION_NOOP");
     } finally {
       await engine.stop();
     }

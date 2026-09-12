@@ -146,7 +146,7 @@ describe("PR22 external Grok Bot MCP runtime alignment", () => {
     }
   });
 
-  it("admits required scouts into the bounded cache and wakes Alpha without peer consensus", async () => {
+  it("admits required scouts into the bounded cache without creating an economic decision", async () => {
     const { engine } = await setup();
     const event = trigger();
     await engine.registerTriggerForResearch(event);
@@ -166,7 +166,7 @@ describe("PR22 external Grok Bot MCP runtime alignment", () => {
 
     const alpha = await engine.submitGrokSignal(submission(event, "fair_probability_analyst", fairOutput()), "fair_probability_analyst", "alpha");
     expect(alpha.status).toBe("accepted");
-    expect(engine.state.latestConsensus).toMatchObject({ triggerId: event.id, consensusDirection: "UP" });
+    expect(engine.state.latestConsensus).toBeNull();
 
     const newsEvent = trigger({ id: createId("trigger"), traceId: createId("trace"), kind: "NEWS_INFORMATION", sourceEventIds: ["news-event"], evidenceIds: ["news-event"] });
     await engine.registerTriggerForResearch(newsEvent);
@@ -175,15 +175,15 @@ describe("PR22 external Grok Bot MCP runtime alignment", () => {
     expect(engine.hotResearchCacheForTest().some((entry) => entry.role === "news_x_intelligence_scanner" && entry.triggerId === newsEvent.id)).toBe(true);
   });
 
-  it("wakes only Alpha through the external Slack bridge after the final required scout is accepted", async () => {
+  it("does not wake the external Slack bridge in native experiment mode", async () => {
     const setupResult = await setupSlackActivation();
     expect((await setupResult.engine.beginExperiment()).ok).toBe(true);
     const event = trigger();
     await setupResult.engine.registerTriggerForResearch(event);
 
     const wakeCount = (role: ExternalAgentRoleId) => setupResult.activations.filter((item) => item.targetRoles.includes(role)).length;
-    expect(wakeCount("market_microstructure_scanner")).toBe(1);
-    expect(wakeCount("crypto_market_scanner")).toBe(1);
+    expect(wakeCount("market_microstructure_scanner")).toBe(0);
+    expect(wakeCount("crypto_market_scanner")).toBe(0);
     expect(wakeCount("fair_probability_analyst")).toBe(0);
     expect(wakeCount("risk_hedge_analyst")).toBe(0);
     expect(wakeCount("strategy_supervisor")).toBe(0);
@@ -191,22 +191,18 @@ describe("PR22 external Grok Bot MCP runtime alignment", () => {
     const micro = await setupResult.engine.submitGrokSignal(submission(event, "market_microstructure_scanner", scoutOutput("micro")), "market_microstructure_scanner", "scout");
     expect(micro.status).toBe("accepted");
     await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(wakeCount("market_microstructure_scanner")).toBe(1);
-    expect(wakeCount("crypto_market_scanner")).toBe(1);
+    expect(wakeCount("market_microstructure_scanner")).toBe(0);
+    expect(wakeCount("crypto_market_scanner")).toBe(0);
     expect(wakeCount("fair_probability_analyst")).toBe(0);
 
     const crypto = await setupResult.engine.submitGrokSignal(submission(event, "crypto_market_scanner", scoutOutput("crypto")), "crypto_market_scanner", "scout");
     expect(crypto.status).toBe("accepted");
-    await waitFor(() => setupResult.activations.filter((item) => item.targetRoles.length === 1 && item.targetRoles[0] === "fair_probability_analyst").length === 1);
-    expect(wakeCount("market_microstructure_scanner")).toBe(1);
-    expect(wakeCount("crypto_market_scanner")).toBe(1);
-    expect(wakeCount("fair_probability_analyst")).toBe(1);
-    expect(setupResult.activations.filter((item) => item.targetRoles.includes("fair_probability_analyst"))).toEqual([
-      { triggerId: event.id, targetRoles: ["fair_probability_analyst"] },
-    ]);
+    expect(wakeCount("market_microstructure_scanner")).toBe(0);
+    expect(wakeCount("crypto_market_scanner")).toBe(0);
+    expect(wakeCount("fair_probability_analyst")).toBe(0);
   });
 
-  it("coalesces simultaneous final scout completions into one external Alpha wake", async () => {
+  it("keeps simultaneous scout completions non-economic in native mode", async () => {
     const setupResult = await setupSlackActivation();
     expect((await setupResult.engine.beginExperiment()).ok).toBe(true);
     const event = trigger();
@@ -218,12 +214,10 @@ describe("PR22 external Grok Bot MCP runtime alignment", () => {
     ]);
     expect(micro.status).toBe("accepted");
     expect(crypto.status).toBe("accepted");
-    await waitFor(() => setupResult.activations.some((item) => item.targetRoles.length === 1 && item.targetRoles[0] === "fair_probability_analyst"));
-    expect(setupResult.activations.filter((item) => item.targetRoles.includes("market_microstructure_scanner"))).toHaveLength(1);
-    expect(setupResult.activations.filter((item) => item.targetRoles.includes("crypto_market_scanner"))).toHaveLength(1);
+    expect(setupResult.activations.filter((item) => item.targetRoles.includes("market_microstructure_scanner"))).toHaveLength(0);
+    expect(setupResult.activations.filter((item) => item.targetRoles.includes("crypto_market_scanner"))).toHaveLength(0);
     const alphaWakes = setupResult.activations.filter((item) => item.targetRoles.includes("fair_probability_analyst"));
-    expect(alphaWakes).toHaveLength(1);
-    expect(alphaWakes[0]).toEqual({ triggerId: event.id, targetRoles: ["fair_probability_analyst"] });
+    expect(alphaWakes).toHaveLength(0);
   });
 
   it("rejects a wrong-role, unsynchronized, expired, or unsupported-evidence scout without usable cache", async () => {

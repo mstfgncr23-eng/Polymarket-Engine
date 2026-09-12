@@ -1,6 +1,6 @@
 import type { EngineEnv } from "@pm/core";
 
-export type ExperimentActivationMode = "MONITOR_ONLY" | "48H_GROK_PAPER_EXPERIMENT";
+export type ExperimentActivationMode = "MONITOR_ONLY" | "48H_GROK_PAPER_EXPERIMENT" | "48H_NATIVE_PAPER_EXPERIMENT";
 
 export interface PreflightEntryMarket {
   marketId: string;
@@ -13,6 +13,8 @@ export interface PreflightEntryMarket {
   feeScheduleKnown?: boolean;
   binarySafe?: boolean;
   monitored?: boolean;
+  /** Provided by the real feed path; synthetic adapters may omit it. */
+  referenceFresh?: boolean;
 }
 
 export function isGenuineEntryQualifiedMarket(market: PreflightEntryMarket): boolean {
@@ -23,6 +25,7 @@ export function isGenuineEntryQualifiedMarket(market: PreflightEntryMarket): boo
   if (market.feeScheduleKnown !== true) return false;
   if (market.monitored !== true) return false;
   if (market.referenceRequired && isProviderBlocked(market.blockedStatus)) return false;
+  if (market.referenceRequired && market.referenceFresh === false) return false;
   return true;
 }
 
@@ -57,6 +60,7 @@ export function evaluateExperimentPreflight(input: {
 }): PreflightResult {
   const mode = input.mode ?? "MONITOR_ONLY";
   const grokPaper = mode === "48H_GROK_PAPER_EXPERIMENT";
+  const nativePaper = mode === "48H_NATIVE_PAPER_EXPERIMENT";
   const blockers: string[] = [];
   const warnings: string[] = [];
   if (input.env.TRADING_MODE !== "paper") blockers.push("TRADING_MODE_NOT_PAPER");
@@ -65,7 +69,7 @@ export function evaluateExperimentPreflight(input: {
   if (input.bootstrapFailed) blockers.push("UNRESOLVED_BOOTSTRAP_FAILURE");
   const entries = input.entryMarkets ?? [];
   const genuineEntries = entries.filter(isGenuineEntryQualifiedMarket);
-  if (grokPaper) {
+  if (grokPaper || nativePaper) {
     if (genuineEntries.length === 0) blockers.push("NO_ENTRY_QUALIFIED_MARKET");
   } else {
     const hasMarketPath = genuineEntries.length > 0 || input.qualifiedOrManaged > 0 || input.tokenConfiguredPath === true;
@@ -73,7 +77,9 @@ export function evaluateExperimentPreflight(input: {
   }
   const tokens = input.env.GROK_MCP_BEARER_TOKENS.split(",").map((entry) => entry.trim().split(":")[0]).filter(Boolean);
   const missingRoles = REQUIRED_ROLES.filter((role) => !tokens.includes(role));
-  const requireGrok = grokPaper || input.env.EXPERIMENT_REQUIRES_GROK;
+  // Native authority is deliberately independent of the legacy Grok/MCP
+  // control plane, even when old compatibility flags remain configured.
+  const requireGrok = !nativePaper && (grokPaper || input.env.EXPERIMENT_REQUIRES_GROK);
   if (requireGrok) {
     if (input.env.GROK_ACTIVATION_PROVIDER === "noop") blockers.push("GROK_ACTIVATION_NOOP");
     // The in-process xAI runtime uses the EngineService binding directly;
@@ -85,7 +91,7 @@ export function evaluateExperimentPreflight(input: {
     if (input.env.GROK_ACTIVATION_PROVIDER === "xai" && (!input.env.XAI_API_KEY || !input.env.XAI_MODEL)) {
       blockers.push("XAI_ACTIVATION_UNCONFIGURED");
     }
-  } else if (input.env.GROK_ACTIVATION_PROVIDER === "noop") {
+  } else if (!nativePaper && input.env.GROK_ACTIVATION_PROVIDER === "noop") {
     warnings.push("GROK_WAKE_NOT_VALIDATED");
   }
   const blocked = input.reference.filter((item) => isProviderBlocked(item.status));
@@ -113,13 +119,17 @@ export function evaluateExperimentPreflight(input: {
       tokenConfiguredPath: input.tokenConfiguredPath === true,
       genuineEntryQualified: genuineEntries.length,
       manualTokensMonitorOnly: input.tokenConfiguredPath === true && genuineEntries.length === 0,
-      activationProvider: input.env.GROK_ACTIVATION_PROVIDER,
+      activationProvider: nativePaper ? "native_deterministic" : input.env.GROK_ACTIVATION_PROVIDER,
+      decisionAuthority: nativePaper ? "NATIVE_DETERMINISTIC_V1" : "LEGACY_EXTERNAL",
+      localExecution: nativePaper,
+      externalInference: !nativePaper,
+      grokDisabled: nativePaper,
       grokWakeValidated: false,
       grokResearchRequired: requireGrok,
       experimentMode: mode,
       overloadFailClosed: input.overloadFailClosed === true,
-      mcpRoles: tokens,
-      missingRoles,
+      mcpRoles: nativePaper ? [] : tokens,
+      missingRoles: nativePaper ? [] : missingRoles,
       reference: input.reference,
       entryMarkets: entries,
     },

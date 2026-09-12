@@ -162,16 +162,15 @@ freshness, and trusted evidence/provenance checks pass. Scout submissions never
 call peer consensus and never create an order. Required scouts are selected by
 `rolesForTriggerKind`; ordinary book changes do not wake the news role.
 
-The Alpha role reads only the bounded trigger-scoped
-`get_alpha_research_context` view and submits through `evaluateAlphaDecision`.
-Alpha requires all fresh trigger-specific scout entries, a synchronized current
-book, matching trace/market/asset, supported evidence, and deterministic risk
-checks before paper execution. Risk remains advisory, and the supervisor is a
-background diagnostic path whose changes remain `PROPOSED`. In the opt-in xAI
-runtime, the coordinator wakes Alpha once after the final required scout; MCP
-itself remains client-initiated and cannot wake a Grok Bot. Legacy consensus
-helpers are retained only for direct compatibility callers and are not used by
-the role-bound MCP path.
+The native engine reads the synchronized current books and configured external
+reference momentum directly through `evaluateNativeDecision`. Grok roles may
+read bounded trigger-scoped context and submit scouting, risk, or diagnostic
+research, but those submissions never provide fair probability, never assemble
+economic consensus, and never authorize paper execution. The native model is
+local, deterministic, fail-closed, and the sole economic decision authority.
+MCP remains client-initiated and cannot wake a Grok Bot. The legacy Grok/xAI
+runtime is retained only for compatibility and diagnostics; it cannot mutate
+the native decision, risk, orders, fills, positions, or accounting.
 
 Stale, duplicate, malformed, unauthorized, impersonated, forbidden-tool, and
 trade-tool calls are rejected and audited. If Grok Bots are down, monitoring

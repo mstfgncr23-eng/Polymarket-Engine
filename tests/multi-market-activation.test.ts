@@ -352,8 +352,8 @@ describe("security regression 30-35", () => {
   });
 });
 
-describe("consensus/risk 36-40", () => {
-  it("36 BTC signals never assemble into an ETH trigger consensus", async () => {
+describe("native authority isolation 36-40", () => {
+  it("36 external BTC/ETH signals never assemble an economic consensus", async () => {
     const { engine } = await makeEngine();
     const btc = trigger({ marketId: "btc-mkt", asset: "BTC", traceId: createId("btc") });
     const eth = trigger({ marketId: "eth-mkt", asset: "ETH", traceId: createId("eth") });
@@ -373,8 +373,7 @@ describe("consensus/risk 36-40", () => {
       submissionId: createId("s2"), triggerId: btc.id, traceId: btc.traceId, correlationId: createId("c"), marketId: "btc-mkt", asset: "BTC",
       timestamp: new Date().toISOString(), agentId: "fair_probability_analyst", role: "fair_probability_analyst", output: fairUp,
     }), "fair_probability_analyst");
-    expect(engine.state.latestConsensus?.triggerId).toBe(btc.id);
-    expect(engine.state.latestConsensus?.consensusDirection).toBe("UP");
+    expect(engine.state.latestConsensus).toBeNull();
     await engine.submitGrokSignal(grokSignalSubmissionSchema.parse({
       submissionId: createId("s3"), triggerId: eth.id, traceId: eth.traceId, correlationId: createId("c"), marketId: "eth-mkt", asset: "ETH",
       timestamp: new Date().toISOString(), agentId: "market_microstructure_scanner", role: "market_microstructure_scanner", output: { ...micro, direction: "DOWN" },
@@ -383,8 +382,7 @@ describe("consensus/risk 36-40", () => {
       submissionId: createId("s4"), triggerId: eth.id, traceId: eth.traceId, correlationId: createId("c"), marketId: "eth-mkt", asset: "ETH",
       timestamp: new Date().toISOString(), agentId: "fair_probability_analyst", role: "fair_probability_analyst", output: fairDown,
     }), "fair_probability_analyst");
-    expect(engine.state.latestConsensus?.triggerId).toBe(eth.id);
-    expect(engine.state.latestConsensus?.consensusDirection).toBe("DOWN");
+    expect(engine.state.latestConsensus).toBeNull();
   });
 
   it("37 rejects a Grok signal that mixes another market's id onto a trigger", async () => {
