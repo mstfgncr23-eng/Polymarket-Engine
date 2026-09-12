@@ -1907,13 +1907,16 @@ export class EngineService {
     const referenceContext = asset
       ? this.state.getReferenceContext(asset, this.nowFn().getTime(), this.riskLimits.staleFeedTimeoutMs)
       : null;
+    const referenceMovement = asset ? this.triggerEngine.referenceMovement(asset) : null;
     const reference: NativeReferenceFeatures | null = referenceContext ? {
       asset: referenceContext.asset,
       venue: referenceContext.venue,
       freshness: referenceContext.freshness,
       freshnessMs: referenceContext.freshnessMs,
-      recentMoveBps: referenceContext.recentMoveBps,
+      recentMoveBps: referenceMovement?.moveBps ?? null,
       recentVolatilityBps: referenceContext.recentVolatilityBps,
+      referenceWindowMs: referenceMovement?.windowMs ?? null,
+      referenceSourceTimestamp: referenceMovement?.sourceTimestamp ?? null,
     } : null;
     const native = evaluateNativeDecision({
       trigger, up: pair.UP, down: pair.DOWN, reference,
@@ -1943,6 +1946,8 @@ export class EngineService {
         reference: reference ? {
           asset: reference.asset, venue: reference.venue, freshness: reference.freshness,
           freshnessMs: reference.freshnessMs, recentMoveBps: reference.recentMoveBps,
+          referenceWindowMs: reference.referenceWindowMs,
+          referenceSourceTimestamp: reference.referenceSourceTimestamp,
           recentVolatilityBps: reference.recentVolatilityBps,
         } : null,
       },

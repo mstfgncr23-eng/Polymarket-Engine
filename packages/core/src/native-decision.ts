@@ -10,6 +10,8 @@ export interface NativeReferenceFeatures {
   freshnessMs: number | null;
   recentMoveBps: number | null;
   recentVolatilityBps: number | null;
+  referenceWindowMs: number | null;
+  referenceSourceTimestamp: string | null;
 }
 
 export interface NativeDecisionConfig {
@@ -60,6 +62,9 @@ export interface NativeFeatureVector {
   downImbalance: number;
   bookPressure: number;
   referenceMoveBps: number | null;
+  referenceWindowMs: number | null;
+  referenceVenue: string | null;
+  referenceSourceTimestamp: string | null;
   referenceVolatilityBps: number | null;
   referenceStrength: number;
   directionalScore: number;
@@ -143,7 +148,11 @@ export function evaluateNativeDecision(input: NativeDecisionInput): NativeDecisi
   const pairAskCost = upBook.askPrice + downBook.askPrice;
   const featureVector: NativeFeatureVector = {
     upMid, downMid, marketPriorUp, upImbalance, downImbalance, bookPressure,
-    referenceMoveBps, referenceVolatilityBps, referenceStrength, directionalScore,
+    referenceMoveBps,
+    referenceWindowMs: reference?.referenceWindowMs ?? null,
+    referenceVenue: reference?.venue ?? null,
+    referenceSourceTimestamp: reference?.referenceSourceTimestamp ?? null,
+    referenceVolatilityBps, referenceStrength, directionalScore,
     probabilityAdjustment, fairProbabilityUp,
     pairAskCost: Number.isFinite(pairAskCost) ? pairAskCost : null,
   };
@@ -194,6 +203,8 @@ function usableReference(reference: NativeReferenceFeatures | null): NativeRefer
   if (reference.freshnessMs === null || !Number.isFinite(reference.freshnessMs) || reference.freshnessMs < 0) return null;
   if (reference.recentMoveBps !== null && !Number.isFinite(reference.recentMoveBps)) return null;
   if (reference.recentVolatilityBps !== null && !Number.isFinite(reference.recentVolatilityBps)) return null;
+  if (reference.referenceWindowMs !== null && (!Number.isFinite(reference.referenceWindowMs) || reference.referenceWindowMs < 0)) return null;
+  if (reference.referenceSourceTimestamp !== null && !Number.isFinite(Date.parse(reference.referenceSourceTimestamp))) return null;
   if (reference.recentMoveBps === null) return null;
   return reference;
 }

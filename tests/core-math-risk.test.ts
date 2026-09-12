@@ -42,7 +42,7 @@ describe("native decisions and hard risk", () => {
     });
     const result = evaluateNativeDecision({
       trigger, up: upBook, down: downBook,
-      reference: { asset: "BTC", venue: "binance", freshness: "fresh", freshnessMs: 0, recentMoveBps: 15, recentVolatilityBps: 2 },
+      reference: { asset: "BTC", venue: "binance", freshness: "fresh", freshnessMs: 0, recentMoveBps: 15, recentVolatilityBps: 2, referenceWindowMs: 60_000, referenceSourceTimestamp: now.toISOString() },
       referenceRequired: true, marketSynchronized: true, triggerProvenanceValid: true, now,
     });
     expect(result?.direction).toBe("UP");

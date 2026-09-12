@@ -149,7 +149,6 @@ describe("PR20 true product end-to-end gate on PostgreSQL 17", () => {
       const journal = new PostgresEventJournal(url, migrations);
       const setup = await setupPgScenario(journal, clock, resolutions, marketId);
       let experimentId = "";
-      let triggerTraceId = "";
       let fillId = "";
       try {
       expect((await setup.engine.beginExperiment()).ok).toBe(true);
@@ -167,10 +166,9 @@ describe("PR20 true product end-to-end gate on PostgreSQL 17", () => {
       await waitFor(() => journal.queryDurableTransitions({ types: ["PAPER_FILL"], limit: 20_000 }), (rows) => rows.length === 1);
       await drainRuntime(setup.engine);
       expect(setup.engine.state.latestConsensus?.authority).toBe("NATIVE_DETERMINISTIC_V1");
-      triggerTraceId = setup.engine.state.latestConsensus?.traceId ?? "";
 
       const durableBeforeRestart = await journal.queryDurableTransitions({ types: ["PAPER_FILL"], limit: 20_000 });
-      const ownDurableFill = durableBeforeRestart.filter((row) => payloadObject(row, "fill").traceId === triggerTraceId);
+      const ownDurableFill = durableBeforeRestart.filter((row) => payloadObject(row, "fill").marketId === marketId);
       expect(ownDurableFill).toHaveLength(1);
       fillId = String(payloadObject(ownDurableFill[0]!, "fill").id);
       const fillEventsBeforeRestart = await journal.queryEvents({ types: ["PAPER_FILL"], limit: 20_000 });

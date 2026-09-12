@@ -102,7 +102,12 @@ function outputFor(role: string, trigger: TriggerEvent, clock: ScenarioClock): R
   return { ...base, classification: "NEUTRAL", summary: "deterministic product gate", sources: [] };
 }
 
-function submission(trigger: TriggerEvent, role: "market_microstructure_scanner" | "crypto_market_scanner" | "fair_probability_analyst", clock: ScenarioClock, suffix: string) {
+function submission(
+  trigger: TriggerEvent,
+  role: "market_microstructure_scanner" | "crypto_market_scanner" | "news_x_intelligence_scanner" | "fair_probability_analyst" | "risk_hedge_analyst" | "strategy_supervisor",
+  clock: ScenarioClock,
+  suffix: string,
+) {
   return grokSignalSubmissionSchema.parse({
     submissionId: createId(`sub-${suffix}`),
     triggerId: trigger.id,
@@ -200,12 +205,15 @@ describe("PR20 true product end-to-end gate", () => {
       // clock, refresh both books/reference, and let the real market trigger
       // path create a fresh hedge opportunity after that cooldown.
       setup.clock.nowMs = START_MS + 61_000;
+      const hedgeStartedAt = setup.clock.nowMs;
       await setup.market.emitSnapshot(marketBook(setup.clock, "DOWN", 2));
       await setup.market.emitSnapshot(marketBook(setup.clock, "UP", 2));
+      await setup.engine.ingestReferenceTickForTest(referenceTick(setup.clock, "100"));
+      setup.clock.nowMs = START_MS + 62_000;
       await setup.engine.ingestReferenceTickForTest(referenceTick(setup.clock, "102"));
       await drainRuntime(setup.engine);
       const hedgeTrigger = await waitFor(
-        () => [...setup.engine.state.recentTriggers].reverse().find((item) => item.marketId === "btc-mkt" && item.kind === "BOOK_IMBALANCE" && Date.parse(item.createdAt) >= setup.clock.nowMs),
+        () => [...setup.engine.state.recentTriggers].reverse().find((item) => item.marketId === "btc-mkt" && item.kind === "BOOK_IMBALANCE" && Date.parse(item.createdAt) >= hedgeStartedAt),
         (item): item is TriggerEvent => Boolean(item),
       );
       await drainRuntime(setup.engine);
@@ -304,6 +312,85 @@ describe("PR20 true product end-to-end gate", () => {
       expect(setup.engine.ledger.positions.size).toBe(0);
       expect(setup.engine.ledger.snapshot().cash).toBe(before.cash);
       expect(await setup.journal.queryEvents({ types: ["PAPER_ORDER_CREATED", "PAPER_FILL"] })).toEqual([]);
+    } finally {
+      await setup.engine.stop();
+    }
+  });
+
+  it("Scenario E accepts legacy Grok research without crossing the native economic boundary", async () => {
+    const setup = await setupScenario();
+    try {
+      await beginAndGenerateTrigger(setup);
+      const nativeBefore = structuredClone(setup.engine.state.latestConsensus);
+      const riskBefore = structuredClone(setup.engine.state.latestRisk);
+      const positionsBefore = structuredClone([...setup.engine.ledger.positions.entries()]);
+      const ledgerBefore = setup.engine.ledger.snapshot();
+      const reservedBefore = setup.engine.reservedCash();
+      const beforeCounts = {
+        consensus: (await setup.journal.queryEvents({ types: ["CONSENSUS_DECISION"] })).length,
+        risk: (await setup.journal.queryEvents({ types: ["RISK_EVALUATION"] })).length,
+        orders: (await setup.journal.queryEvents({ types: ["PAPER_ORDER_CREATED"] })).length,
+        fills: (await setup.journal.queryEvents({ types: ["PAPER_FILL"] })).length,
+      };
+      const nativeTrigger = setup.engine.state.recentTriggers.find((item) => item.id === nativeBefore?.triggerId);
+      expect(nativeBefore).toBeTruthy();
+      expect(nativeTrigger).toBeTruthy();
+
+      const roles = [
+        "market_microstructure_scanner", "crypto_market_scanner", "news_x_intelligence_scanner",
+        "fair_probability_analyst", "risk_hedge_analyst", "strategy_supervisor",
+      ] as const;
+      for (const role of roles) {
+        await expect(
+          setup.engine.submitGrokSignal(submission(nativeTrigger!, role, setup.clock, `non-authority-${role}`), role),
+        ).resolves.toMatchObject({ status: "accepted" });
+      }
+
+      const afterCounts = {
+        consensus: (await setup.journal.queryEvents({ types: ["CONSENSUS_DECISION"] })).length,
+        risk: (await setup.journal.queryEvents({ types: ["RISK_EVALUATION"] })).length,
+        orders: (await setup.journal.queryEvents({ types: ["PAPER_ORDER_CREATED"] })).length,
+        fills: (await setup.journal.queryEvents({ types: ["PAPER_FILL"] })).length,
+      };
+      expect(setup.engine.state.latestConsensus).toEqual(nativeBefore);
+      expect(setup.engine.state.latestRisk).toEqual(riskBefore);
+      expect(afterCounts).toEqual(beforeCounts);
+      expect(setup.engine.ledger.snapshot().cash).toBe(ledgerBefore.cash);
+      expect([...setup.engine.ledger.positions.entries()]).toEqual(positionsBefore);
+      expect(setup.engine.reservedCash()).toBe(reservedBefore);
+      expect((await setup.journal.queryEvents({ types: ["GROK_SIGNAL_ACCEPTED"] })).length).toBe(roles.length);
+    } finally {
+      await setup.engine.stop();
+    }
+  });
+
+  it("uses the TriggerEngine 60-second reference window instead of the last eight state prices", async () => {
+    const setup = await setupScenario();
+    try {
+      expect((await setup.engine.beginExperiment()).ok).toBe(true);
+      await setup.market.emitSnapshot(marketBook(setup.clock, "UP", 1));
+      await setup.market.emitSnapshot(marketBook(setup.clock, "DOWN", 1));
+
+      const prices = ["100", "100.13", "100.13", "100.13", "100.13", "100.13", "100.13", "100.13", "100.13", "100.29"];
+      for (const [index, price] of prices.entries()) {
+        setup.clock.nowMs = START_MS + index * 1_000;
+        await setup.engine.ingestReferenceTickForTest(referenceTick(setup.clock, price));
+      }
+      await drainRuntime(setup.engine);
+
+      const rapidMove = setup.engine.state.recentTriggers.find((item) => item.kind === "BTC_RAPID_MOVE");
+      const rapidMoveBps = Number(rapidMove?.evidence.moveBps);
+      const featureVector = setup.engine.state.latestConsensus?.featureVector as {
+        referenceMoveBps?: number;
+        referenceWindowMs?: number;
+        referenceVenue?: string | null;
+      } | undefined;
+      expect(setup.engine.referenceWindowTotalEntriesForTest()).toBe(10);
+      expect(rapidMove).toBeTruthy();
+      expect(rapidMoveBps).toBeCloseTo(29, 8);
+      expect(featureVector?.referenceMoveBps).toBeCloseTo(29, 8);
+      expect(featureVector?.referenceWindowMs).toBe(9_000);
+      expect(featureVector?.referenceVenue).toBe("deterministic-test");
     } finally {
       await setup.engine.stop();
     }

@@ -106,7 +106,7 @@ if (command === "experiment:start") {
   });
   const native = evaluateNativeDecision({
     trigger, up: snapshot, down: downSnapshot,
-    reference: { asset: "BTC", venue: "binance", freshness: "fresh", freshnessMs: 0, recentMoveBps: 30, recentVolatilityBps: 0 },
+    reference: { asset: "BTC", venue: "binance", freshness: "fresh", freshnessMs: 0, recentMoveBps: 30, recentVolatilityBps: 0, referenceWindowMs: 60_000, referenceSourceTimestamp: now.toISOString() },
     referenceRequired: true, marketSynchronized: true, triggerProvenanceValid: true, now,
   });
   if (!native) throw new Error("SMOKE_NATIVE_DECISION_UNAVAILABLE");

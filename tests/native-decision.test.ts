@@ -33,6 +33,7 @@ function reference(recentMoveBps: number, freshness: NativeReferenceFeatures["fr
   return {
     asset: "BTC", venue: "binance", freshness, freshnessMs: 100,
     recentMoveBps, recentVolatilityBps: Math.abs(recentMoveBps) / 2,
+    referenceWindowMs: 60_000, referenceSourceTimestamp: now.toISOString(),
   };
 }
 
