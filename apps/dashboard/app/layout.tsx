@@ -3,8 +3,8 @@ import type { ReactNode } from "react";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Polymarket Paper Research Engine",
-  description: "Live, event-driven paper-trading research control plane",
+  title: "Galaxy System Dashboard",
+  description: "Live, event-driven paper-trading system dashboard",
 };
 
 export default function RootLayout({ children }: Readonly<{ children: ReactNode }>) {
