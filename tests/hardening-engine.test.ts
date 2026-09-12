@@ -173,7 +173,7 @@ describe("C experiment clock is explicit", () => {
     }
   });
 
-  it("preflight blocks a Grok-required start when the activation provider is noop", async () => {
+  it("native preflight ignores legacy Grok-required and noop configuration", async () => {
     const journal = new MemoryEventJournal();
     const env = engineEnvSchema.parse({
       NODE_ENV: "test", JOURNAL_MODE: "memory", TRADING_MODE: "paper", POLYMARKET_TOKEN_IDS: "up,down",
@@ -184,7 +184,8 @@ describe("C experiment clock is explicit", () => {
     try {
       const result = await engine.beginExperiment();
       expect(result.ok).toBe(false);
-      expect(result.blockers).toEqual(expect.arrayContaining(["GROK_ACTIVATION_NOOP"]));
+      expect(result.blockers).toContain("NO_ENTRY_QUALIFIED_MARKET");
+      expect(result.blockers).not.toContain("GROK_ACTIVATION_NOOP");
       expect(engine.experimentManifest()?.status).toBe("IDLE");
     } finally {
       await engine.stop();

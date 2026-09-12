@@ -2,16 +2,12 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
   createId,
-  grokSignalSubmissionSchema,
-  type Direction,
   type MarketSnapshot,
   type ReferenceTick,
-  type TriggerEvent,
 } from "@pm/core";
 import { hashExperimentReport, PostgresEventJournal, type EventJournal } from "@pm/db";
 import { EngineService } from "../apps/engine/src/engine.js";
 import { NoopGrokActivationBridge } from "../apps/engine/src/activation/index.js";
-import { CrashInjectedError } from "../apps/engine/src/crash-injection.js";
 import {
   ScriptedMarketAdapter,
   ScriptedReferenceRegistry,
@@ -116,40 +112,6 @@ function referenceTick(clock: ScenarioClock, price: string): ReferenceTick {
   };
 }
 
-function signalSubmission(trigger: TriggerEvent, role: "market_microstructure_scanner" | "crypto_market_scanner" | "fair_probability_analyst", clock: ScenarioClock, suffix: string) {
-  const base = {
-    confidence: 0.95,
-    evidenceIds: trigger.sourceEventIds,
-    expiresAt: trigger.expiresAt,
-    reasonCodes: ["PRODUCT_E2E_PG17"],
-    direction: "UP" as Direction,
-  };
-  const output = role === "fair_probability_analyst"
-    ? { ...base, fairProbability: 0.70, marketProbability: 0.40, estimatedEdge: 0.30 }
-    : role === "market_microstructure_scanner"
-      ? { ...base, spread: "0.01", imbalance: 0.80, depthChange: 0.10, pairCost: "0.80", unusualConditions: [] }
-      : { ...base, momentumBps: 20, volatilityBps: 8, volumeAnomalyScore: 0, accelerationBps: 2, regime: "TRENDING" };
-  return grokSignalSubmissionSchema.parse({
-    submissionId: createId(`sub-${suffix}`),
-    triggerId: trigger.id,
-    traceId: trigger.traceId,
-    correlationId: createId("correlation"),
-    marketId: trigger.marketId,
-    asset: trigger.asset,
-    timestamp: iso(clock),
-    agentId: role,
-    role,
-    output,
-  });
-}
-
-async function submitThree(engine: EngineService, trigger: TriggerEvent, clock: ScenarioClock, suffix: string): Promise<void> {
-  const roles = ["market_microstructure_scanner", "crypto_market_scanner", "fair_probability_analyst"] as const;
-  for (const role of roles) {
-    expect((await engine.submitGrokSignal(signalSubmission(trigger, role, clock, suffix), role)).status).toBe("accepted");
-  }
-}
-
 async function setupPgScenario(journal: EventJournal, clock: ScenarioClock, resolutions: Map<string, Record<string, unknown>>, marketId: string): Promise<PgScenario> {
   const market = new ScriptedMarketAdapter();
   const endDate = new Date(START_MS + 10_000).toISOString();
@@ -172,19 +134,6 @@ async function setupPgScenario(journal: EventJournal, clock: ScenarioClock, reso
   return { engine, journal, market, clock, resolutions, marketId };
 }
 
-async function beginAndGenerateTrigger(setup: PgScenario): Promise<TriggerEvent> {
-  expect((await setup.engine.beginExperiment()).ok).toBe(true);
-  await setup.market.emitSnapshot(marketBook(setup.clock, setup.marketId, "UP", 1));
-  await setup.market.emitSnapshot(marketBook(setup.clock, setup.marketId, "DOWN", 1));
-  await setup.engine.ingestReferenceTickForTest(referenceTick(setup.clock, "100"));
-  setup.clock.nowMs = START_MS + 1_000;
-  await setup.engine.ingestReferenceTickForTest(referenceTick(setup.clock, "102"));
-  await drainRuntime(setup.engine);
-  const trigger = setup.engine.state.recentTriggers.find((item) => item.marketId === setup.marketId && item.kind === "BOOK_IMBALANCE");
-  expect(trigger).toBeTruthy();
-  return trigger!;
-}
-
 function payloadObject(row: { payload: Record<string, unknown> }, key: string): Record<string, unknown> {
   const value = row.payload[key];
   return value && typeof value === "object" ? value as Record<string, unknown> : {};
@@ -200,24 +149,28 @@ describe("PR20 true product end-to-end gate on PostgreSQL 17", () => {
       const journal = new PostgresEventJournal(url, migrations);
       const setup = await setupPgScenario(journal, clock, resolutions, marketId);
       let experimentId = "";
-      let trigger!: TriggerEvent;
+      let triggerTraceId = "";
       let fillId = "";
       try {
-      trigger = await beginAndGenerateTrigger(setup);
+      expect((await setup.engine.beginExperiment()).ok).toBe(true);
+      await setup.market.emitSnapshot(marketBook(clock, marketId, "UP", 1));
+      await setup.market.emitSnapshot(marketBook(clock, marketId, "DOWN", 1));
+      await setup.engine.ingestReferenceTickForTest(referenceTick(clock, "100"));
       experimentId = setup.engine.experimentManifest()!.id;
       const startRows = await journal.queryDurableTransitions({ types: ["EXPERIMENT_STARTED"], limit: 20_000 });
       expect(startRows.filter((row) => row.aggregateId === experimentId)).toHaveLength(1);
 
-      const first = setup.engine.submitGrokSignal(signalSubmission(trigger, "market_microstructure_scanner", clock, "pg17-crash"), "market_microstructure_scanner");
-      const second = setup.engine.submitGrokSignal(signalSubmission(trigger, "crypto_market_scanner", clock, "pg17-crash"), "crypto_market_scanner");
-      await Promise.all([first, second]);
-      const fairPromise = setup.engine.submitGrokSignal(signalSubmission(trigger, "fair_probability_analyst", clock, "pg17-crash"), "fair_probability_analyst");
-      await waitFor(() => journal.queryEvents({ types: ["PAPER_ORDER_CREATED"], limit: 20_000 }), (events) => events.some((event) => event.payload && typeof event.payload === "object" && event.payload.marketId === marketId));
       setup.engine.setCrashInjectionForTest("AFTER_DURABLE_COMMIT_BEFORE_APPLY");
-      await expect(fairPromise).rejects.toBeInstanceOf(CrashInjectedError);
+      clock.nowMs = START_MS + 1_000;
+      await setup.engine.ingestReferenceTickForTest(referenceTick(clock, "102"));
+      await waitFor(() => journal.queryEvents({ types: ["PAPER_ORDER_CREATED"], limit: 20_000 }), (events) => events.some((event) => event.payload && typeof event.payload === "object" && event.payload.marketId === marketId));
+      await waitFor(() => journal.queryDurableTransitions({ types: ["PAPER_FILL"], limit: 20_000 }), (rows) => rows.length === 1);
+      await drainRuntime(setup.engine);
+      expect(setup.engine.state.latestConsensus?.authority).toBe("NATIVE_DETERMINISTIC_V1");
+      triggerTraceId = setup.engine.state.latestConsensus?.traceId ?? "";
 
       const durableBeforeRestart = await journal.queryDurableTransitions({ types: ["PAPER_FILL"], limit: 20_000 });
-      const ownDurableFill = durableBeforeRestart.filter((row) => payloadObject(row, "fill").traceId === trigger.traceId);
+      const ownDurableFill = durableBeforeRestart.filter((row) => payloadObject(row, "fill").traceId === triggerTraceId);
       expect(ownDurableFill).toHaveLength(1);
       fillId = String(payloadObject(ownDurableFill[0]!, "fill").id);
       const fillEventsBeforeRestart = await journal.queryEvents({ types: ["PAPER_FILL"], limit: 20_000 });
@@ -256,6 +209,9 @@ describe("PR20 true product end-to-end gate on PostgreSQL 17", () => {
         const settlementEvents = (await finalJournal.queryEvents({ types: ["POSITION_SETTLED"], limit: 20_000 })).filter((event) => event.aggregateId === firstPositionId);
         expect(fillEvents).toHaveLength(1);
         expect(settlementEvents).toHaveLength(1);
+        const consensusEvents = await finalJournal.queryEvents({ types: ["CONSENSUS_DECISION"], limit: 20_000 });
+        expect(consensusEvents.some((event) => event.payload && typeof event.payload === "object" && event.payload.authority === "NATIVE_DETERMINISTIC_V1")).toBe(true);
+        expect((await finalJournal.queryEvents({ types: ["GROK_SIGNAL_ACCEPTED"], limit: 20_000 }))).toEqual([]);
 
         const durable = await finalJournal.queryDurableTransitions({ types: ["PAPER_FILL", "POSITION_SETTLED"], limit: 20_000 });
         expect(durable.filter((row) => row.type === "PAPER_FILL" && payloadObject(row, "fill").id === fillId)).toHaveLength(1);

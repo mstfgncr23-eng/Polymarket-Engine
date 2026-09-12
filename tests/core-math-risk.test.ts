@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { PaperLedger, buildConsensus, calculateFee, calculatePairMetrics, calculateSlippageUsd, calculateUnrealizedPnl, defaultConsensusConfig, evaluateRisk, fairProbabilityOutputSchema, riskLimitsSchema, walkBook } from "@pm/core";
+import { PaperLedger, calculateFee, calculatePairMetrics, calculateSlippageUsd, calculateUnrealizedPnl, createId, evaluateNativeDecision, evaluateRisk, fairProbabilityOutputSchema, riskLimitsSchema, triggerEventSchema, walkBook } from "@pm/core";
 import { fill, feeSchedule, now, safeRisk } from "./fixtures.js";
 
 describe("deterministic math and accounting", () => {
@@ -27,15 +27,27 @@ describe("deterministic math and accounting", () => {
   });
 });
 
-describe("consensus and hard risk", () => {
-  it("weights fresh agents and reports disagreement without naive averaging", () => {
-    const expiresAt = new Date(now.getTime() + 60_000).toISOString();
-    const result = buildConsensus({ traceId: "trace", triggerId: "trigger", deterministicEdge: 0.04, now, config: defaultConsensusConfig, signals: [
-      { agentId: "fair_probability_analyst", direction: "UP", confidence: 0.9, expiresAt, evidenceIds: ["e1"] },
-      { agentId: "crypto_market_scanner", direction: "DOWN", confidence: 0.3, expiresAt, evidenceIds: ["e2"] },
-    ] });
-    expect(result.consensusDirection).toBe("UP");
-    expect(result.conflicts).toContain("DIRECTION_DISAGREEMENT");
+describe("native decisions and hard risk", () => {
+  it("uses deterministic book/reference evidence instead of weighted agents", () => {
+    const upBook = {
+      eventId: createId("up"), traceId: "trace", marketId: "native-math", tokenId: "up", outcome: "UP" as const,
+      bids: [{ price: "0.48", quantity: "80" }], asks: [{ price: "0.49", quantity: "20" }], lastTradePrice: "0.49",
+      tickSize: "0.01", minOrderSize: "1", feeSchedule, sourceTimestamp: now.toISOString(), receivedAt: now.toISOString(), sequence: 1, hash: "up",
+    };
+    const downBook = { ...upBook, eventId: createId("down"), tokenId: "down", outcome: "DOWN" as const, bids: [{ price: "0.50", quantity: "20" }], asks: [{ price: "0.51", quantity: "80" }], hash: "down" };
+    const trigger = triggerEventSchema.parse({
+      id: createId("trigger"), traceId: "trace", marketId: "native-math", asset: "BTC", source: "polymarket",
+      kind: "BOOK_IMBALANCE", severity: 2, score: 1, dedupeKey: "native-math", evidence: {}, sourceEventIds: [upBook.eventId],
+      evidenceIds: [upBook.eventId], createdAt: now.toISOString(), expiresAt: new Date(now.getTime() + 60_000).toISOString(),
+    });
+    const result = evaluateNativeDecision({
+      trigger, up: upBook, down: downBook,
+      reference: { asset: "BTC", venue: "binance", freshness: "fresh", freshnessMs: 0, recentMoveBps: 15, recentVolatilityBps: 2 },
+      referenceRequired: true, marketSynchronized: true, triggerProvenanceValid: true, now,
+    });
+    expect(result?.direction).toBe("UP");
+    expect(result?.featureVector.referenceStrength).toBe(0.5);
+    expect(result?.confidence).toBeGreaterThan(0.5);
   });
 
   it.each([

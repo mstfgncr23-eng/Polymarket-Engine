@@ -2,13 +2,14 @@ import { resolve } from "node:path";
 import {
   PaperLedger,
   TemporalPairHedgeStrategy,
-  buildConsensus,
   createId,
-  defaultConsensusConfig,
+  evaluateNativeDecision,
   executePaperTaker,
   feeScheduleSchema,
   marketSnapshotSchema,
   paperOrderSchema,
+  triggerEventSchema,
+  NATIVE_DETERMINISTIC_AUTHORITY,
 } from "@pm/core";
 import { MemoryEventJournal, PostgresEventJournal, type JournalAccessMode } from "@pm/db";
 import { applyJournalCleanup, dryRunJournalCleanup } from "./journal-cleanup.js";
@@ -93,18 +94,35 @@ if (command === "experiment:start") {
     lastTradePrice: "0.48", tickSize: "0.01", minOrderSize: "5", feeSchedule,
     sourceTimestamp: now.toISOString(), receivedAt: now.toISOString(), sequence: 1, hash: "fixture",
   });
-  const consensus = buildConsensus({
-    traceId, triggerId: createId("trigger"), deterministicEdge: 0.04, now,
-    signals: [
-      { agentId: "market_microstructure_scanner", direction: "UP", confidence: 0.8, expiresAt: new Date(now.getTime() + 30_000).toISOString(), evidenceIds: [snapshot.eventId] },
-      { agentId: "fair_probability_analyst", direction: "UP", confidence: 0.82, expiresAt: new Date(now.getTime() + 30_000).toISOString(), evidenceIds: [snapshot.eventId] },
-    ], config: defaultConsensusConfig,
+  const downSnapshot = marketSnapshotSchema.parse({
+    ...snapshot, eventId: createId("market"), tokenId: "down-token", outcome: "DOWN",
+    bids: [{ price: "0.50", quantity: "80" }], asks: [{ price: "0.51", quantity: "30" }],
   });
+  const trigger = triggerEventSchema.parse({
+    id: createId("trigger"), traceId, marketId: snapshot.marketId, asset: "BTC", source: "polymarket",
+    kind: "BOOK_IMBALANCE", severity: 2, score: 1, dedupeKey: createId("dedupe"), evidence: { source: "smoke" },
+    sourceEventIds: [snapshot.eventId, downSnapshot.eventId], evidenceIds: [snapshot.eventId, downSnapshot.eventId],
+    createdAt: now.toISOString(), expiresAt: new Date(now.getTime() + 30_000).toISOString(),
+  });
+  const native = evaluateNativeDecision({
+    trigger, up: snapshot, down: downSnapshot,
+    reference: { asset: "BTC", venue: "binance", freshness: "fresh", freshnessMs: 0, recentMoveBps: 30, recentVolatilityBps: 0 },
+    referenceRequired: true, marketSynchronized: true, triggerProvenanceValid: true, now,
+  });
+  if (!native) throw new Error("SMOKE_NATIVE_DECISION_UNAVAILABLE");
+  const consensus = {
+    id: createId("consensus"), traceId, triggerId: trigger.id,
+    consensusDirection: native.direction, consensusConfidence: native.confidence,
+    agentAgreement: 1, signalFreshness: 1, conflicts: [],
+    estimatedEdge: native.fairProbability - native.marketProbability,
+    evidenceIds: native.evidenceIds, calculatedAt: now.toISOString(), authority: NATIVE_DETERMINISTIC_AUTHORITY,
+    fairProbability: native.fairProbability, marketProbability: native.marketProbability, featureVector: { ...native.featureVector },
+  };
   const strategy = new TemporalPairHedgeStrategy();
-  const candidate = strategy.evaluate({ consensus, snapshots: { UP: snapshot, DOWN: null }, position: null, maxOrderSizeUsd: 10, minimumLockedPairEdge: 0.01 });
+  const candidate = strategy.evaluate({ consensus, snapshots: { UP: snapshot, DOWN: downSnapshot }, position: null, maxOrderSizeUsd: 10, minimumLockedPairEdge: 0.01 });
   if (!candidate) throw new Error("SMOKE_NO_CANDIDATE");
   const order = paperOrderSchema.parse({
-    id: createId("order"), traceId, triggerId: consensus.triggerId, strategyId: strategy.id,
+    id: createId("order"), traceId, triggerId: trigger.id, strategyId: strategy.id,
     marketId: snapshot.marketId, tokenId: snapshot.tokenId, outcome: "UP", side: "BUY", orderType: "TAKER",
     requestedPrice: "0.49", quantity: candidate.quantity, status: "PENDING", createdAt: now.toISOString(),
   });

@@ -7,7 +7,6 @@ import {
   engineEnvSchema,
   grokActivationRequestSchema,
   grokSignalSubmissionSchema,
-  rolesForTriggerKind,
   type GrokActivationRequest,
   type TriggerEvent,
   type ReferenceTick,
@@ -67,14 +66,6 @@ function runtimeTriggerAt(atMs: number, id: string, overrides: Partial<TriggerEv
     sourceEventIds: ["runtime_market_event"], evidenceIds: ["runtime_market_event"], createdAt,
     expiresAt: new Date(atMs + 60_000).toISOString(), ...overrides,
   };
-}
-
-async function waitForRuntime(condition: () => boolean | Promise<boolean>, timeoutMs = 3_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (!(await condition())) {
-    if (Date.now() >= deadline) throw new Error("RUNTIME_TEST_TIMEOUT");
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
 }
 
 async function createRuntimeProduct(overrides: Record<string, string | undefined> = {}) {
@@ -397,7 +388,7 @@ describe("hot research cache and role isolation", () => {
 });
 
 describe("EngineService xAI product path", () => {
-  it("routes source-owned scout signals into the real runtime and reaches existing consensus/paper ingress", async () => {
+  it("keeps the native experiment independent from the xAI runtime", async () => {
     const market = new ScriptedMarketAdapter();
     market.queue(discoveryReport([qualified("market_runtime", "BTC", "up-runtime", "down-runtime", expiry)]));
     const journal = new MemoryEventJournal();
@@ -441,111 +432,46 @@ describe("EngineService xAI product path", () => {
       await market.emitSnapshot(marketSnapshot("DOWN", "down-runtime") as never);
       await new Promise((resolve) => setTimeout(resolve, 0));
       await engine.referenceTickForTest(runtimeReferenceTick(now.getTime()));
-      const deadline = Date.now() + 3_000;
-      while (engine.hotResearchCacheForTest().filter((entry) => entry.marketId === "market_runtime").length < 2 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
       await engine.registerTriggerForResearch(runtimeTriggerAt(now.getTime(), "runtime_product_trigger", { severity: 2 }));
-      while ((engine.state.grokActivity.acceptedSignals < 3 || (await journal.queryEvents({ types: ["PAPER_ORDER_CREATED"] })).length === 0) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
-      expect(engine.state.grokActivity.acceptedSignals).toBeGreaterThanOrEqual(2);
-       expect(engine.state.latestConsensus).toMatchObject({ consensusDirection: "UP" });
-       expect(engine.hotResearchCacheForTest().map((entry) => entry.role)).toEqual(expect.arrayContaining(["market_microstructure_scanner", "crypto_market_scanner"]));
-       expect((await journal.queryEvents({ types: ["PAPER_ORDER_CREATED"] })).length).toBeGreaterThanOrEqual(1);
-       const fillDeadline = Date.now() + 3_000;
-       while ((await journal.queryEvents({ types: ["PAPER_FILL"] })).length === 0 && Date.now() < fillDeadline) await new Promise((resolve) => setTimeout(resolve, 5));
-       expect((await journal.queryEvents({ types: ["PAPER_FILL"] })).length).toBeGreaterThanOrEqual(1);
-       expect(engine.ledger.positions.get("market_runtime")).toBeDefined();
-       const alphaDecision = await journal.queryEvents({ types: ["CONSENSUS_DECISION"] });
-       expect(alphaDecision.some((event) => (event.payload as { authority?: string }).authority === "ALPHA")).toBe(true);
-      expect((fetchImpl as ReturnType<typeof vi.fn>).mock.calls.length).toBeGreaterThanOrEqual(3);
+      expect(engine.experimentManifest()?.modelConfiguration).toMatchObject({ provider: "native_deterministic", version: "native-deterministic-v1", localExecution: true, externalInference: false });
+      expect(engine.state.latestConsensus).toMatchObject({ authority: "NATIVE_DETERMINISTIC_V1" });
+      expect(engine.hotResearchCacheForTest()).toHaveLength(0);
+      expect((await journal.queryEvents({ types: ["PAPER_ORDER_CREATED", "PAPER_FILL"] }))).toHaveLength(0);
+      expect((fetchImpl as ReturnType<typeof vi.fn>).mock.calls.length).toBe(0);
       const submissions = (await journal.readAll()).filter((event) => event.type === "GROK_SIGNAL_ACCEPTED");
-      expect(submissions.length).toBe(2);
-      expect((fetchImpl as ReturnType<typeof vi.fn>).mock.calls.map((call) => {
-        const body = JSON.parse(String(call[1]?.body)) as { response_format: { json_schema: { name: string } } };
-        return body.response_format.json_schema.name.replace(/^grok_/, "");
-      })).not.toContain("news_x_intelligence_scanner");
+      expect(submissions).toHaveLength(0);
       expect(JSON.stringify(submissions)).not.toContain("xai-runtime-test-secret");
     } finally {
       await engine.stop().catch(() => undefined);
     }
   });
 
-  it("warms scouts before a hot trigger and executes the critical path with Alpha only", async () => {
+  it("does not warm Grok scouts before a native trigger", async () => {
     const setup = await createRuntimeProduct();
     try {
       await setup.market.emitSnapshot(runtimeSnapshot("UP", "up-runtime", 1, setup.clock.get(), "0.40") as never);
       await setup.market.emitSnapshot(runtimeSnapshot("DOWN", "down-runtime", 1, setup.clock.get(), "0.70") as never);
-      await waitForRuntime(() => setup.engine.hotResearchCacheForTest().filter((entry) => entry.marketId === "market_runtime").length === 1);
-      await new Promise((resolve) => setTimeout(resolve, 0));
       await setup.engine.referenceTickForTest(runtimeReferenceTick(setup.clock.get()));
-      await waitForRuntime(() => setup.engine.hotResearchCacheForTest().filter((entry) => entry.marketId === "market_runtime").length === 2);
-      const warmRoles = setup.calls.map((call) => call.role);
-      expect(warmRoles).toEqual(expect.arrayContaining(["market_microstructure_scanner", "crypto_market_scanner"]));
-      expect(warmRoles).not.toContain("news_x_intelligence_scanner");
-      const tradeTriggerAt = Date.now();
       await setup.engine.registerTriggerForResearch(runtimeTriggerAt(setup.clock.get(), "hot_runtime", { severity: 2 }));
-      await waitForRuntime(async () => (await setup.journal.queryEvents({ types: ["PAPER_FILL"] })).length === 1);
-      const afterTrigger = setup.calls.filter((call) => call.at >= tradeTriggerAt);
-      expect(afterTrigger.map((call) => call.role)).toEqual(["fair_probability_analyst"]);
-      expect((await setup.journal.queryEvents({ types: ["PAPER_ORDER_CREATED"] })).length).toBe(1);
-      expect((await setup.journal.queryEvents({ types: ["PAPER_FILL"] })).length).toBe(1);
-      expect((await setup.journal.queryEvents({ types: ["GROK_SIGNAL_ACCEPTED"] })).length).toBe(1);
-      const alphaRisk = (await setup.journal.queryEvents({ types: ["RISK_EVALUATION"] }))
-        .map((event) => event.payload as { alpha?: Record<string, unknown> })
-        .find((payload) => payload.alpha)?.alpha;
-      expect(alphaRisk).toMatchObject({
-        alphaSubmittedFairProbability: 0.61,
-        fairProbabilityForTradedOutcome: 0.61,
-        tradedOutcome: "UP",
-        usedComplement: false,
-        executionStyle: "TAKER",
-        takerExecutableVwap: "0.4",
-        currentExecutablePrice: "0.4",
-        quantity: expect.any(String),
-        executableNotionalUsd: expect.any(String),
-        costUsdPerShare: expect.any(String),
-        netEvUsdPerShare: expect.any(Number),
-        grossEvUsdTotal: expect.any(String),
-        netEvUsdTotal: expect.any(String),
-        expectedROI: expect.any(Number),
-        decisionTimestamp: expect.any(String),
-        scoutAgesMs: expect.any(Array),
-        provenance: expect.any(Array),
-      });
-      expect(Number(alphaRisk?.rawEdgeUsdPerShare)).toBeCloseTo(0.21, 8);
-      expect((afterTrigger.find((call) => call.role === "fair_probability_analyst")?.systemPrompt ?? "")).toContain("not independent votes");
-      expect((afterTrigger.find((call) => call.role === "fair_probability_analyst")?.systemPrompt ?? "")).toContain("correlated evidence");
+      expect(setup.calls).toHaveLength(0);
+      expect(setup.engine.hotResearchCacheForTest()).toHaveLength(0);
+      expect(setup.engine.state.latestConsensus?.authority).toBe("NATIVE_DETERMINISTIC_V1");
+      expect(await setup.journal.queryEvents({ types: ["PAPER_ORDER_CREATED", "PAPER_FILL", "GROK_SIGNAL_ACCEPTED"] })).toHaveLength(0);
     } finally {
       await setup.engine.stop().catch(() => undefined);
     }
   });
 
-  it("filters a severity-3 economic trigger to Alpha only in the internal xAI path", async () => {
+  it("keeps severity-3 native decisions free of xAI activation", async () => {
     const setup = await createRuntimeProduct();
     try {
-      const preFilterRoles = rolesForTriggerKind("BOOK_IMBALANCE", 3);
-      expect(preFilterRoles).toEqual(expect.arrayContaining([
-        "market_microstructure_scanner", "crypto_market_scanner", "fair_probability_analyst", "strategy_supervisor",
-      ]));
-
       await setup.market.emitSnapshot(runtimeSnapshot("UP", "up-runtime", 1, setup.clock.get(), "0.40") as never);
       await setup.market.emitSnapshot(runtimeSnapshot("DOWN", "down-runtime", 1, setup.clock.get(), "0.70") as never);
-      await waitForRuntime(() => setup.engine.hotResearchCacheForTest().some((entry) => entry.role === "market_microstructure_scanner"));
-      await new Promise((resolve) => setTimeout(resolve, 0));
       await setup.engine.referenceTickForTest(runtimeReferenceTick(setup.clock.get(), "severity3_reference"));
-      await waitForRuntime(() => setup.engine.hotResearchCacheForTest().some((entry) => entry.role === "crypto_market_scanner"));
-      await new Promise((resolve) => setTimeout(resolve, 0));
-
-      const tradeAt = Date.now();
-      const callIndex = setup.calls.length;
       await setup.engine.registerTriggerForResearch(runtimeTriggerAt(setup.clock.get(), "severity3_hot_trade", { severity: 3 }));
-      await waitForRuntime(async () => (await setup.journal.queryEvents({ types: ["PAPER_FILL"] })).length === 1);
-
-      const afterTrigger = setup.calls.slice(callIndex).filter((call) => call.at >= tradeAt);
-      expect(afterTrigger.map((call) => call.role)).toEqual(["fair_probability_analyst"]);
-      expect(afterTrigger.some((call) => call.role === "strategy_supervisor")).toBe(false);
-      expect(afterTrigger.some((call) => call.role === "risk_hedge_analyst")).toBe(false);
-      expect(afterTrigger.every((call) => !["market_microstructure_scanner", "crypto_market_scanner", "news_x_intelligence_scanner"].includes(call.role))).toBe(true);
-      expect(await setup.journal.queryEvents({ types: ["PAPER_ORDER_CREATED"] })).toHaveLength(1);
-      expect(await setup.journal.queryEvents({ types: ["PAPER_FILL"] })).toHaveLength(1);
+      expect(setup.calls).toHaveLength(0);
+      expect(setup.engine.state.latestConsensus?.authority).toBe("NATIVE_DETERMINISTIC_V1");
+      expect(await setup.journal.queryEvents({ types: ["PAPER_ORDER_CREATED", "PAPER_FILL", "GROK_SIGNAL_ACCEPTED"] })).toHaveLength(0);
     } finally {
       await setup.engine.stop().catch(() => undefined);
     }
@@ -568,16 +494,11 @@ describe("EngineService xAI product path", () => {
     try {
       await setup.market.emitSnapshot(runtimeSnapshot("UP", "up-runtime", 1, setup.clock.get(), "0.40") as never);
       await setup.market.emitSnapshot(runtimeSnapshot("DOWN", "down-runtime", 1, setup.clock.get(), "0.70") as never);
-      await waitForRuntime(() => setup.engine.hotResearchCacheForTest().length === 1);
-      await new Promise((resolve) => setTimeout(resolve, 0));
       await setup.engine.referenceTickForTest(runtimeReferenceTick(setup.clock.get()));
-      await waitForRuntime(() => setup.engine.hotResearchCacheForTest().length === 2);
-      const beforeTrigger = setup.calls.length;
       setup.clock.advance(2_000);
       await setup.engine.registerTriggerForResearch(runtimeTriggerAt(setup.clock.get(), "expired_runtime", { severity: 2 }));
-      await new Promise((resolve) => setTimeout(resolve, 30));
       expect(setup.engine.hotResearchCacheForTest()).toHaveLength(0);
-      expect(setup.calls.slice(beforeTrigger).filter((call) => call.role === "fair_probability_analyst")).toHaveLength(0);
+      expect(setup.calls).toHaveLength(0);
       expect(await setup.journal.queryEvents({ types: ["PAPER_ORDER_CREATED", "PAPER_FILL"] })).toHaveLength(0);
     } finally {
       await setup.engine.stop().catch(() => undefined);
@@ -589,60 +510,29 @@ describe("EngineService xAI product path", () => {
     try {
       await setup.market.emitSnapshot(runtimeSnapshot("UP", "up-runtime", 1, setup.clock.get(), "0.40") as never);
       await setup.market.emitSnapshot(runtimeSnapshot("DOWN", "down-runtime", 1, setup.clock.get(), "0.70") as never);
-      await waitForRuntime(() => setup.engine.hotResearchCacheForTest().length === 1);
-      await new Promise((resolve) => setTimeout(resolve, 0));
       await setup.engine.referenceTickForTest(runtimeReferenceTick(setup.clock.get()));
-      await waitForRuntime(() => setup.engine.hotResearchCacheForTest().length === 2);
-      const before = setup.calls.length;
       setup.market.markTokenSync("up-runtime", "GAPPED");
       await setup.engine.registerTriggerForResearch(runtimeTriggerAt(setup.clock.get(), "unsync_runtime", { severity: 2 }));
-      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(setup.calls).toHaveLength(0);
       expect(await setup.journal.queryEvents({ types: ["PAPER_ORDER_CREATED", "PAPER_FILL"] })).toHaveLength(0);
-      const after = setup.calls.slice(before);
-      expect(after.every((call) => call.context.market?.synchronized !== true || call.context.market.snapshots.length === 0)).toBe(true);
     } finally {
       await setup.engine.stop().catch(() => undefined);
     }
   });
 
-  it("routes refreshes by precursor owner and refreshes micro before its TTL expires", async () => {
+  it("does not route native triggers through precursor refreshes", async () => {
     const setup = await createRuntimeProduct({
       XAI_SCOUT_MICRO_TTL_MS: "3000", XAI_SCOUT_CRYPTO_TTL_MS: "9000", XAI_SCOUT_NEWS_TTL_MS: "30000",
     });
     try {
       await setup.market.emitSnapshot(runtimeSnapshot("UP", "up-runtime", 1, setup.clock.get(), "0.40") as never);
       await setup.market.emitSnapshot(runtimeSnapshot("DOWN", "down-runtime", 1, setup.clock.get(), "0.70") as never);
-      await waitForRuntime(() => setup.calls.length === 1);
-      expect(setup.calls.map((call) => call.role)).toEqual(["market_microstructure_scanner"]);
-      await new Promise((resolve) => setTimeout(resolve, 0));
       await setup.engine.referenceTickForTest(runtimeReferenceTick(setup.clock.get(), "source_reference"));
-      await waitForRuntime(() => setup.calls.length === 2);
-      expect(setup.calls.map((call) => call.role)).toEqual(["market_microstructure_scanner", "crypto_market_scanner"]);
-      expect(setup.calls.map((call) => call.role)).not.toContain("news_x_intelligence_scanner");
-      await new Promise((resolve) => setTimeout(resolve, 0));
-
-      // Micro TTL is 3s and its 1s headroom makes it due at t=2s, while the
-      // cache remains usable until t=3s. The refresh gap is not trigger cooldown.
-      setup.clock.advance(2_000);
-      await setup.market.emitSnapshot(runtimeSnapshot("UP", "up-runtime", 2, setup.clock.get(), "0.40") as never);
-      await setup.market.emitSnapshot(runtimeSnapshot("DOWN", "down-runtime", 2, setup.clock.get(), "0.70") as never);
-      await waitForRuntime(() => setup.calls.length === 3);
-      expect(setup.calls.map((call) => call.role)).toEqual([
-        "market_microstructure_scanner", "crypto_market_scanner", "market_microstructure_scanner",
-      ]);
-      // The call counter is incremented when inference starts. Wait for the
-      // refresh admission to finish writing the fresh cache entry before
-      // opening the economic trigger window; otherwise a slow CI runner can
-      // classify the in-flight refresh as a post-trigger role call.
-      await waitForRuntime(() => setup.engine.hotResearchCacheForTest().some((entry) =>
-        entry.role === "market_microstructure_scanner"
-        && entry.generatedAt === new Date(setup.clock.get()).toISOString()));
-      await new Promise((resolve) => setTimeout(resolve, 0));
-
-      const tradeAt = Date.now();
       await setup.engine.registerTriggerForResearch(runtimeTriggerAt(setup.clock.get(), "duty_cycle_trade", { severity: 2 }));
-      await waitForRuntime(async () => (await setup.journal.queryEvents({ types: ["PAPER_FILL"] })).length === 1);
-      expect(setup.calls.filter((call) => call.at >= tradeAt).map((call) => call.role)).toEqual(["fair_probability_analyst"]);
+      expect(setup.calls).toHaveLength(0);
+      expect(setup.engine.hotResearchCacheForTest()).toHaveLength(0);
+      expect(setup.engine.state.latestConsensus?.authority).toBe("NATIVE_DETERMINISTIC_V1");
+      expect(await setup.journal.queryEvents({ types: ["PAPER_ORDER_CREATED", "PAPER_FILL", "GROK_SIGNAL_ACCEPTED"] })).toHaveLength(0);
     } finally {
       await setup.engine.stop().catch(() => undefined);
     }
@@ -653,7 +543,7 @@ describe("EngineService xAI product path", () => {
     try {
       await setup.market.emitSnapshot(runtimeSnapshot("UP", "up-runtime", 1, setup.clock.get(), "0.40") as never);
       await setup.market.emitSnapshot(runtimeSnapshot("DOWN", "down-runtime", 1, setup.clock.get(), "0.70") as never);
-      await waitForRuntime(() => setup.calls.length === 1);
+      expect(setup.calls).toHaveLength(0);
       setup.clock.advance(10_000);
       await setup.engine.tickMaintenance();
       expect(["ENTRY_CLOSED", "COMPLETED"]).toContain(setup.engine.experimentManifest()?.status);
@@ -675,37 +565,26 @@ describe("EngineService xAI product path", () => {
     try {
       await setup.market.emitSnapshot(runtimeSnapshot("UP", "up-runtime", 1, setup.clock.get(), "0.40") as never);
       await setup.market.emitSnapshot(runtimeSnapshot("DOWN", "down-runtime", 1, setup.clock.get(), "0.70") as never);
-      await waitForRuntime(() => setup.calls.length === 1);
-      await new Promise((resolve) => setTimeout(resolve, 0));
       await setup.engine.referenceTickForTest(runtimeReferenceTick(setup.clock.get(), "budget_reference"));
       await setup.engine.registerTriggerForResearch(runtimeTriggerAt(setup.clock.get(), "budget_exhausted", { severity: 2 }));
-      await waitForRuntime(async () => (await setup.journal.queryEvents({ types: ["GROK_ACTIVATION_DECISION"] })).some((event) => String((event.payload as { reason?: string }).reason).includes("BUDGET_EXHAUSTED")));
-      expect(setup.calls.map((call) => call.role)).toEqual(["market_microstructure_scanner"]);
+      expect(setup.calls).toHaveLength(0);
       expect(await setup.journal.queryEvents({ types: ["PAPER_ORDER_CREATED", "PAPER_FILL"] })).toHaveLength(0);
-      expect(setup.engine.activation.runtimeBudgetSnapshot()).toMatchObject({ limit: 1, used: 1, remaining: 0 });
-      expect(await setup.engine.metrics.registry.metrics()).toMatch(/grok_scout_refresh_skipped_total\{reason="BUDGET_EXHAUSTED"\} 1/);
+      expect(setup.engine.activation.runtimeBudgetSnapshot()).toMatchObject({ limit: 1, used: 0, remaining: 1 });
     } finally {
       await setup.engine.stop().catch(() => undefined);
     }
   });
 
-  it("labels maker calibration with the maker limit and separate taker reference", async () => {
+  it("does not create a Grok maker calibration in native mode", async () => {
     const setup = await createRuntimeProduct({ PAPER_EXECUTION_STYLE: "MAKER" });
     try {
       await setup.market.emitSnapshot(runtimeSnapshot("UP", "up-runtime", 1, setup.clock.get(), "0.40") as never);
       await setup.market.emitSnapshot(runtimeSnapshot("DOWN", "down-runtime", 1, setup.clock.get(), "0.70") as never);
-      await waitForRuntime(() => setup.calls.length === 1);
-      await new Promise((resolve) => setTimeout(resolve, 0));
       await setup.engine.referenceTickForTest(runtimeReferenceTick(setup.clock.get(), "maker_reference"));
-      await waitForRuntime(() => setup.calls.length === 2);
       await setup.engine.registerTriggerForResearch(runtimeTriggerAt(setup.clock.get(), "maker_calibration", { severity: 2 }));
-      await waitForRuntime(async () => (await setup.journal.queryEvents({ types: ["RISK_EVALUATION"] })).some((event) => Boolean((event.payload as { alpha?: unknown }).alpha)));
-      const alpha = (await setup.journal.queryEvents({ types: ["RISK_EVALUATION"] }))
-        .map((event) => (event.payload as { alpha?: Record<string, unknown> }).alpha)
-        .find((item) => item) as Record<string, unknown>;
-      expect(alpha).toMatchObject({ executionStyle: "MAKER", makerLimitPrice: "0.39", takerReferenceVwap: "0.4" });
-      expect(alpha.currentExecutablePrice).toBeUndefined();
-      expect(alpha.takerExecutableVwap).toBeUndefined();
+      expect(setup.calls).toHaveLength(0);
+      expect(setup.engine.state.latestConsensus?.authority).toBe("NATIVE_DETERMINISTIC_V1");
+      expect(await setup.journal.queryEvents({ types: ["RISK_EVALUATION", "PAPER_ORDER_CREATED", "PAPER_FILL", "GROK_SIGNAL_ACCEPTED"] })).toHaveLength(0);
     } finally {
       await setup.engine.stop().catch(() => undefined);
     }

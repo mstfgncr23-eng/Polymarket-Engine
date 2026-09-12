@@ -53,7 +53,7 @@ export default function Dashboard({ initial }: { initial: DashboardSnapshot | nu
         <Kpi label="Equity" value={money(balance?.equity)} hint={`Cash ${money(balance?.cash)}`} />
         <Kpi label="Net P&L" value={money(balance?.netEconomicPnl)} hint={`Trading ${money(balance?.netTradingPnl)} · DD ${money(balance?.drawdown)}`} />
         <Kpi label="Open positions" value={String(data.positions.length)} hint={`${data.positions.filter((p) => Number(p.unpairedQuantity) > 0).length} unhedged`} />
-        <Kpi label="Grok Bot signals" value={String(data.grokActivity.acceptedSignals)} hint={data.grokActivity.lastSeenAt ? `last ${age(data.grokActivity.lastSeenAt)} · ${data.grokActivity.rejectedSignals} rejected` : "no persisted signals"} />
+        <Kpi label="External research signals" value={String(data.grokActivity.acceptedSignals)} hint={data.grokActivity.lastSeenAt ? `last ${age(data.grokActivity.lastSeenAt)} · ${data.grokActivity.rejectedSignals} rejected · non-authoritative` : "no persisted signals"} />
         <Kpi label="Experiment" value={data.engine.experimentStatus ?? "—"} hint={formatDuration(data.engine.uptimeSeconds)} />
       </section>
 
