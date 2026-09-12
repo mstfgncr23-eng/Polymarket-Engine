@@ -2,9 +2,13 @@ import type { DashboardSnapshot } from "./types";
 
 export type StreamStatus = "CONNECTING" | "LIVE" | "DEGRADED";
 
+export const SSE_RECONNECT_GRACE_MS = 10_000;
+const EVENT_SOURCE_CONNECTING = 0;
+
 export interface EngineEventSource {
   onopen: ((ev: Event) => void) | null;
   onerror: ((ev: Event) => void) | null;
+  readonly readyState?: number;
   addEventListener(type: string, listener: (event: MessageEvent<string>) => void): void;
   close(): void;
 }
@@ -31,6 +35,8 @@ function asSnapshot(value: unknown): DashboardSnapshot | null {
  * Single EventSource to `/api/engine/events` plus one bounded snapshot recovery per disconnect.
  * Relies on native EventSource reconnect; does not open a second source or poll.
  * Recovery is scoped to a generation so a late response cannot overwrite a newer SSE snapshot.
+ * Native EventSource reconnects get a short grace period so planned proxy rotation does not
+ * present a transient transport reconnect as an engine degradation.
  */
 export function startEngineLiveTransport(
   handlers: LiveTransportHandlers,
@@ -45,7 +51,32 @@ export function startEngineLiveTransport(
   let generation = 0;
   let recoveredGeneration = -1;
   let recoveryAbort: AbortController | undefined;
+  let degradedTimer: ReturnType<typeof setTimeout> | undefined;
   const source = new EventSourceImpl(eventsUrl);
+
+  const clearDegradedTimer = () => {
+    if (degradedTimer === undefined) return;
+    clearTimeout(degradedTimer);
+    degradedTimer = undefined;
+  };
+
+  const markLive = () => {
+    clearDegradedTimer();
+    handlers.onStatus("LIVE");
+  };
+
+  const markDegradedNow = () => {
+    clearDegradedTimer();
+    handlers.onStatus("DEGRADED");
+  };
+
+  const scheduleDegraded = () => {
+    if (disposed || degradedTimer !== undefined) return;
+    degradedTimer = setTimeout(() => {
+      degradedTimer = undefined;
+      if (!disposed) handlers.onStatus("DEGRADED");
+    }, SSE_RECONNECT_GRACE_MS);
+  };
 
   const invalidateRecovery = () => {
     generation += 1;
@@ -75,11 +106,12 @@ export function startEngineLiveTransport(
   source.onopen = () => {
     if (disposed) return;
     invalidateRecovery();
-    handlers.onStatus("LIVE");
+    markLive();
   };
   source.onerror = () => {
     if (disposed) return;
-    handlers.onStatus("DEGRADED");
+    if (source.readyState === EVENT_SOURCE_CONNECTING) scheduleDegraded();
+    else markDegradedNow();
     recoverSnapshot();
   };
   source.addEventListener("snapshot", (event) => {
@@ -87,20 +119,21 @@ export function startEngineLiveTransport(
     try {
       const snapshot = asSnapshot(JSON.parse(event.data) as unknown);
       if (!snapshot) {
-        handlers.onStatus("DEGRADED");
+        markDegradedNow();
         return;
       }
       invalidateRecovery();
       handlers.onSnapshot(snapshot);
-      handlers.onStatus("LIVE");
+      markLive();
     } catch {
-      handlers.onStatus("DEGRADED");
+      markDegradedNow();
     }
   });
 
   return {
     close() {
       disposed = true;
+      clearDegradedTimer();
       invalidateRecovery();
       source.close();
     },
