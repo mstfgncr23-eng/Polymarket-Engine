@@ -1,3 +1,4 @@
+import { canonicalAssetIdentity } from "./asset-map.js";
 import { d } from "./calculations.js";
 import { qualificationConfigSchema, type QualificationConfig } from "./config.js";
 import type { FeeSchedule, QualificationReasonCode } from "./domain.js";
@@ -45,9 +46,9 @@ const DIRECTIONAL_TEXT = /\b(up\s*or\s*down|updown|higher\s+or\s+lower)\b/i;
 
 export function extractUnderlyingAsset(slug: string, title: string, tags: readonly string[]): string | null {
   const slugMatch = slug.match(DIRECTIONAL_SLUG);
-  if (slugMatch?.[1]) return slugMatch[1].toUpperCase();
+  if (slugMatch?.[1]) return canonicalAssetIdentity(slugMatch[1]);
   const tagged = tags.map((tag) => tag.trim()).find((tag) => /^[A-Z0-9]{2,12}$/.test(tag) && !CRYPTO_CATEGORY_TAG.test(tag));
-  if (tagged) return tagged.toUpperCase();
+  if (tagged) return canonicalAssetIdentity(tagged);
   return null;
 }
 
