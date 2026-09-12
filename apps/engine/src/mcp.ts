@@ -7,6 +7,7 @@ import {
   createId,
   DECISION_EVENT_TYPES,
   grokSignalSubmissionSchema,
+  marketMicrostructureOutputSchema,
   parseGrokWritePayload,
   clientMayCallWriteTool,
   GrokSignalValidationError,
@@ -146,6 +147,20 @@ const grokWriteInputShape = {
   ]),
   output: z.record(z.string(), z.unknown()),
 };
+
+const microSubmitSignalInputShape = {
+  ...grokWriteInputShape,
+  agentId: z.literal("market_microstructure_scanner"),
+  role: z.literal("market_microstructure_scanner"),
+  output: marketMicrostructureOutputSchema,
+};
+
+export function mcpWriteInputShapeForClient(clientId: string, tool: string) {
+  return clientId === "market_microstructure_scanner" && tool === "submit_signal"
+    ? microSubmitSignalInputShape
+    : grokWriteInputShape;
+}
+
 
 export class McpSecurityGate {
   private readonly tokens: Array<{ clientId: string; digest: Buffer; fingerprint: string }>;
@@ -463,7 +478,7 @@ export function createGrokMcpServer(clientId: string, dependencies: McpDependenc
 
   server.registerTool("submit_signal", {
     description: "Submit one schema-validated Grok Bot research signal. Never creates an order and exposes no wallet capability.",
-    inputSchema: grokWriteInputShape, annotations: write,
+    inputSchema: mcpWriteInputShapeForClient(clientId, "submit_signal"), annotations: write,
   }, writeHandler("submit_signal"));
 
   server.registerTool("submit_analysis", {

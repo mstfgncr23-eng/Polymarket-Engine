@@ -257,6 +257,9 @@ export class ExperimentSummaryAccumulator {
         this.hedgeDurationSum += duration;
         this.hedgeDurationN += 1;
       }
+    } else if (type === "CONSENSUS_DECISION" && (event.payload as { authority?: unknown }).authority === "NATIVE_DETERMINISTIC_V1") {
+      this.modelCounts.NATIVE_DETERMINISTIC_V1 = (this.modelCounts.NATIVE_DETERMINISTIC_V1 ?? 0) + 1;
+      this.modelCosts.NATIVE_DETERMINISTIC_V1 = this.modelCosts.NATIVE_DETERMINISTIC_V1 ?? 0;
     } else if (type === "GROK_SIGNAL_ACCEPTED" || type === "AGENT_OUTPUT") {
       const output = event.payload as { agentId?: string; usage?: { estimatedCostUsd?: number | null } };
       if (output.agentId) {

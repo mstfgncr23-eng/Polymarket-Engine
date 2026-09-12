@@ -215,6 +215,34 @@ export class TriggerEngine {
     return this.admitReferenceTick(tick).triggers;
   }
 
+  /**
+   * Returns the directional move across the same bounded time window used by
+   * admitReferenceTick(). This is intentionally O(1) and returns null for an
+   * empty or overflowed window so native decisions fail closed.
+   */
+  referenceMovement(asset: string): {
+    moveBps: number;
+    windowMs: number;
+    sourceTimestamp: string;
+  } | null {
+    const window = this.ticksByAsset.get(asset);
+    if (!window || window.hasOverflowed) return null;
+    const first = window.first();
+    const last = window.last();
+    if (!first || !last || first.sourceMs > last.sourceMs) return null;
+    try {
+      const moveBps = d(last.tick.price).minus(first.tick.price).div(first.tick.price).mul(10_000).toNumber();
+      if (!Number.isFinite(moveBps)) return null;
+      return {
+        moveBps,
+        windowMs: last.sourceMs - first.sourceMs,
+        sourceTimestamp: last.tick.sourceTimestamp,
+      };
+    } catch {
+      return null;
+    }
+  }
+
   ingestPosition(position: Position, traceId: string, asset: string | null): TriggerEvent[] {
     const unpaired = Number(position.unpairedQuantity);
     if (unpaired <= 0) return [];

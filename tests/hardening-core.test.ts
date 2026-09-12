@@ -2,11 +2,9 @@ import { describe, expect, it } from "vitest";
 import {
   PaperLedger,
   TriggerEngine,
-  buildConsensus,
   classifySettledOutcome,
   createId,
   decidePaperOrder,
-  defaultConsensusConfig,
   evaluateRisk,
   executableFairEdge,
   parsePublicBinaryResolution,
@@ -17,9 +15,19 @@ import {
   startExperiment,
   triggerConfigSchema,
   type TriggerKind,
+  type ConsensusDecision,
 } from "@pm/core";
 import { classifyBinanceExchangeInfo } from "@pm/market-data";
 import { fill, now, safeRisk, snapshot } from "./fixtures.js";
+
+function nativeConsensus(overrides: Partial<ConsensusDecision> = {}): ConsensusDecision {
+  return {
+    id: createId("consensus"), traceId: "trace", triggerId: "trig", consensusDirection: "UP",
+    consensusConfidence: 0.8, agentAgreement: 1, signalFreshness: 1, conflicts: [], estimatedEdge: 0.02,
+    evidenceIds: ["e"], calculatedAt: now.toISOString(), authority: "NATIVE_DETERMINISTIC_V1",
+    fairProbability: 0.5, marketProbability: 0.5, featureVector: {}, ...overrides,
+  };
+}
 
 describe("A/E trigger books are per outcome", () => {
   it("does not emit a fake SPREAD_CHANGE when UP is followed by DOWN", () => {
@@ -97,12 +105,9 @@ describe("F/G trigger families and six-role reachability", () => {
     const failed = engine.ingestPosition(position, "trace2", "BTC");
     expect(failed.some((item) => item.kind === "FAILED_HEDGE")).toBe(true);
 
-    const consensus = buildConsensus({
-      traceId: "trace", triggerId: "trig", deterministicEdge: 0.02, now: new Date(t), config: defaultConsensusConfig,
-      signals: [
-        { agentId: "fair_probability_analyst", direction: "UP", confidence: 0.9, expiresAt: new Date(t + 60_000).toISOString(), evidenceIds: ["e1"] },
-        { agentId: "crypto_market_scanner", direction: "DOWN", confidence: 0.8, expiresAt: new Date(t + 60_000).toISOString(), evidenceIds: ["e2"] },
-      ],
+    const consensus = nativeConsensus({
+      consensusDirection: "FLAT", agentAgreement: 0.1, conflicts: ["DIRECTION_DISAGREEMENT"],
+      calculatedAt: new Date(t).toISOString(), evidenceIds: ["e1", "e2"],
     });
     expect(engine.ingestConsensus(consensus, up.marketId, "BTC").some((item) => item.kind === "SEVERE_DISAGREEMENT")).toBe(true);
     expect(engine.ingestScheduledReview("review").some((item) => item.kind === "SCHEDULED_REVIEW")).toBe(true);
@@ -208,13 +213,7 @@ describe("I fair probability is diagnostic only", () => {
       asks: [{ price: "0.48", quantity: "5" }, { price: "0.52", quantity: "20" }],
       bids: [{ price: "0.47", quantity: "20" }],
     });
-    const consensus = buildConsensus({
-      traceId: "t", triggerId: "g", deterministicEdge: 0.04, now, config: defaultConsensusConfig,
-      signals: [
-        { agentId: "fair_probability_analyst", direction: "UP", confidence: 0.9, expiresAt: new Date(now.getTime() + 60_000).toISOString(), evidenceIds: ["e"] },
-        { agentId: "market_microstructure_scanner", direction: "UP", confidence: 0.9, expiresAt: new Date(now.getTime() + 60_000).toISOString(), evidenceIds: ["e"] },
-      ],
-    });
+    const consensus = nativeConsensus({ traceId: "t", triggerId: "g", estimatedEdge: 0.04, calculatedAt: now.toISOString() });
     const decision = decidePaperOrder({
       candidate: {
         strategyId: "temporal-pair-hedge", strategyVersion: "v1", marketId: book.marketId, tokenId: book.tokenId,

@@ -46,6 +46,10 @@ export class ReferenceTickWindow {
     return this.count > 0 ? this.slots[this.head] : undefined;
   }
 
+  last(): StoredReferenceTick | undefined {
+    return this.count > 0 ? this.slots[(this.head + this.count - 1) % this.maxEntries] : undefined;
+  }
+
   push(tick: ReferenceTick, sourceMs = Date.parse(tick.sourceTimestamp)): ReferenceWindowPushResult {
     if (this.overflowed) {
       return { accepted: false, overflow: true, stale: false, size: this.count };

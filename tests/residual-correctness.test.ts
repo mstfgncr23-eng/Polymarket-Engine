@@ -343,7 +343,6 @@ describe("bounded-state pruning", () => {
       expect(after.recentTrades).toBe(0);
       expect(after.activeTriggers).toBe(0);
       expect(after.signalsByTrigger).toBe(0);
-      expect(after.lastEvaluatedSignalCount).toBe(0);
     } finally {
       await engine.stop();
     }

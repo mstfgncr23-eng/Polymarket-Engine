@@ -330,7 +330,7 @@ describe("Step-4 retention classes and gates", () => {
     await journal.append(ev("TRIGGER_EVENT", "2026-09-01T00:00:00.000Z", { kind: "BOOK_IMBALANCE" }, "trig-old"));
     await journal.append(ev("MARKET_SNAPSHOT", "2026-09-01T00:00:00.000Z", { marketId: "m" }, "snap-old"));
     await journal.append(ev("PAPER_FILL", "2026-09-01T00:00:00.000Z", { ...fill("UP", "0.40") }, "fill-old"));
-    await journal.persistExperimentReport({
+    const persisted = await journal.persistExperimentReport({
       experimentId: "exp-1", reportKind: "final", schemaVersion: 1, generatedAt: persistedAt.toISOString(),
       complete: true, truncated: false, sourceEventCount: 3,
       sourceWindowStart: null, sourceWindowEnd: null, sourceFenceOccurredAt: null, sourceFenceId: null,
@@ -342,7 +342,7 @@ describe("Step-4 retention classes and gates", () => {
     }));
     const result = await manager.runCycle({
       experiment: { id: "exp-1", status: "COMPLETED" },
-      now: new Date("2026-09-10T00:00:00.000Z"),
+      now: new Date(Date.parse(persisted.report.persistedAt) + 2),
       degraded: false, failClosed: false, databaseUp: true,
     });
     expect(result.transientEligible).toBe(true);

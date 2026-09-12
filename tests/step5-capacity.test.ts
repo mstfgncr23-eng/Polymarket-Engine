@@ -131,8 +131,8 @@ describe("Step 5 sustained capacity harness", () => {
   it("classifies retained state from completed cleanup cycles", () => {
     const cycle = (atMs: number, value: number, before = value + 5): RetainedCleanupCycleObservation => ({
       atMs,
-      before: { activeTriggers: before, triggerProvenance: before, provenanceInvalid: 0, signalsByTrigger: before, lastEvaluatedSignalCount: before },
-      after: { activeTriggers: value, triggerProvenance: value, provenanceInvalid: 0, signalsByTrigger: value, lastEvaluatedSignalCount: value },
+      before: { activeTriggers: before, triggerProvenance: before, provenanceInvalid: 0, signalsByTrigger: before },
+      after: { activeTriggers: value, triggerProvenance: value, provenanceInvalid: 0, signalsByTrigger: value },
     });
     expect(classifyRetainedCleanupCycles([cycle(0, 1)], "activeTriggers").classification).toBe("insufficient_samples");
     expect(classifyRetainedCleanupCycles([cycle(0, 1), cycle(60_000, 1), cycle(120_000, 1), cycle(180_000, 1)], "activeTriggers").classification).toBe("plateau");
@@ -158,7 +158,7 @@ describe("Step 5 sustained capacity harness", () => {
       const cycles = setup.engine.retainedCleanupCyclesForTest();
       expect(cycles).toHaveLength(4);
       expect(cycles[0]?.before.activeTriggers).toBe(1);
-      expect(cycles[0]?.after).toEqual({ activeTriggers: 0, triggerProvenance: 0, provenanceInvalid: 0, signalsByTrigger: 0, lastEvaluatedSignalCount: 0 });
+      expect(cycles[0]?.after).toEqual({ activeTriggers: 0, triggerProvenance: 0, provenanceInvalid: 0, signalsByTrigger: 0 });
       for (const cycle of cycles.slice(1)) expect(cycle.after).toEqual(cycles[0]!.after);
       expect(classifyRetainedCleanupCycles(cycles, "activeTriggers").classification).toBe("plateau");
       expect(classifyRetainedCleanupCycles(cycles, "triggerProvenance").classification).toBe("plateau");

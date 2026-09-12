@@ -608,11 +608,9 @@ describe("D+E+F — end-to-end trigger provenance", () => {
     await engine.stop();
   });
 
-  it("6: submitGrokSignal is stale after source epoch invalidates an in-flight activation", async () => {
+  it("6: submitGrokSignal is stale after source epoch invalidates a native trigger", async () => {
     const { ScriptedMarketAdapter, discoveryReport, qualified } = await import("./paper-engine-testkit.js");
     const activation = new HeldActivationBridge();
-    let release!: () => void;
-    activation.hold = new Promise<void>((resolve) => { release = resolve; });
     const scripted = new ScriptedMarketAdapter();
     scripted.queue(discoveryReport([qualified("btc-mkt", "BTC", "btc-up", "btc-down")]));
     const journal = new MemoryEventJournal();
@@ -625,9 +623,9 @@ describe("D+E+F — end-to-end trigger provenance", () => {
     expect((await engine.beginExperiment()).ok).toBe(true);
     await scripted.waitForHandlers();
     await scripted.emitSnapshot(bookSnapshot("UP", "0.48"));
-    await waitFor(() => activation.calls >= 1);
+    await waitFor(() => engine.state.recentTriggers.some((item) => item.kind === "BOOK_IMBALANCE"));
+    expect(activation.calls).toBe(0);
     scripted.emitGap(["btc-up"]);
-    release();
     await drainRuntime(engine);
     const trigger = engine.state.recentTriggers.find((item) => item.kind === "BOOK_IMBALANCE");
     expect(trigger).toBeTruthy();

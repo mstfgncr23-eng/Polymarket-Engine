@@ -218,7 +218,7 @@ Report kind: ${summary.reportKind}
 
 - Maximum directional exposure: $${summary.maximumDirectionalExposureUsd.toFixed(2)}
 - Average unhedged duration: ${summary.averageUnhedgedDurationMs.toFixed(0)} ms
-- Grok Bot signals: ${JSON.stringify(summary.modelInvocationCounts)}
+- Decision model invocations: ${JSON.stringify(summary.modelInvocationCounts)}
 - PnL by market: ${JSON.stringify(summary.pnlByMarket)}
 - PnL by asset: ${JSON.stringify(summary.pnlByAsset)}
 - Fills by market / asset: ${JSON.stringify(summary.fillsByMarket)} / ${JSON.stringify(summary.fillsByAsset)}

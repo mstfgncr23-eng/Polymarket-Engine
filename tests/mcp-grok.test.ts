@@ -104,7 +104,7 @@ describe("Grok signal inbox", () => {
     expect(await engine.submitGrokSignal(submission(trigger, "fair_probability_analyst", fairOutput()), "market_microstructure_scanner")).toMatchObject({ status: "identity_mismatch" });
   });
 
-  it("assembles consensus only after minimum fresh role evidence and does not invent orders without a live book", async () => {
+  it("retains role evidence without assembling an economic consensus", async () => {
     const { engine } = await testEngine();
     engine.state.marketSnapshots.set("up", snapshot({ marketId: "btc", tokenId: "up" }));
     const trigger = researchTrigger();
@@ -112,7 +112,7 @@ describe("Grok signal inbox", () => {
     await engine.submitGrokSignal(submission(trigger, "market_microstructure_scanner", microstructureOutput()), "market_microstructure_scanner");
     expect(engine.state.latestConsensus).toBeNull();
     await engine.submitGrokSignal(submission(trigger, "fair_probability_analyst", fairOutput()), "fair_probability_analyst");
-    expect(engine.state.latestConsensus?.consensusDirection).toBe("UP");
+    expect(engine.state.latestConsensus).toBeNull();
     expect(engine.ledger.positions.size).toBe(0);
   });
 
@@ -268,7 +268,10 @@ describe("authenticated MCP HTTP", () => {
         jsonrpc: "2.0", id: 1, method: "tools/call",
         params: { name: "submit_signal", arguments: impersonating },
       });
-      expect(JSON.stringify(result.json)).toContain("IDENTITY_CLIENT_MISMATCH");
+      const body = JSON.stringify(result.json);
+      expect(body).toContain("Input validation error");
+      expect(body).toContain("market_microstructure_scanner");
+      expect(body).toContain("agentId");
       expect(ctx.engine.state.grokActivity.acceptedSignals).toBe(0);
       expect(ctx.engine.state.latestAgents.size).toBe(0);
     } finally { await ctx.server.close(); }

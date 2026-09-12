@@ -629,9 +629,8 @@ describe("Step 5 live-feed experiment start gate", () => {
       expect((await pending).ok).toBe(true);
       expect((setup.engine as unknown as { isExperimentWindowOpen: () => boolean }).isExperimentWindowOpen()).toBe(true);
       expect((setup.engine as unknown as { isCanonicalWindowAdmission: (type: string) => boolean }).isCanonicalWindowAdmission("TRIGGER_EVENT")).toBe(true);
-      await setup.engine.registerTriggerForResearch(researchTrigger("validated-activation"));
-      await waitFor(() => activation.calls > 0);
-      expect(activation.calls).toBeGreaterThan(0);
+      await setup.engine.registerTriggerForResearch(researchTrigger("validated-native-decision"));
+      expect(activation.calls).toBe(0);
     } finally {
       setup.engine.setStartPostCommitValidationHoldForTest(null);
       await setup.engine.stop();

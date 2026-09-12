@@ -3,6 +3,8 @@ export * from "./bounded-ingress.js";
 export * from "./ingress-bounds.js";
 export * from "./market-stream-transport.js";
 export * from "./polymarket.js";
+export * from "./polymarket-sharded.js";
+export { ShardedPolymarketMarketDataAdapter as PolymarketMarketDataAdapter } from "./polymarket-sharded.js";
 export * from "./reconnect.js";
 export * from "./reference-feed.js";
 export * from "./scripted-market-transport.js";

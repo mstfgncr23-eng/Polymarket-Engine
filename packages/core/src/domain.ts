@@ -17,6 +17,8 @@ export function createId(prefix: string): string {
 export const sideSchema = z.enum(["BUY", "SELL"]);
 export const outcomeSchema = z.enum(["UP", "DOWN"]);
 export const directionSchema = z.enum(["UP", "DOWN", "FLAT"]);
+export const decisionAuthoritySchema = z.enum(["NATIVE_DETERMINISTIC_V1", "ALPHA", "LEGACY_EXTERNAL"]);
+export type DecisionAuthority = z.infer<typeof decisionAuthoritySchema>;
 export type Side = z.infer<typeof sideSchema>;
 export type Outcome = z.infer<typeof outcomeSchema>;
 export type Direction = z.infer<typeof directionSchema>;
@@ -277,6 +279,12 @@ export const consensusDecisionSchema = z.object({
   estimatedEdge: z.number().min(-1).max(1),
   evidenceIds: z.array(idSchema),
   calculatedAt: timestampSchema,
+  /** Optional so historical external-consensus rows remain readable. */
+  authority: decisionAuthoritySchema.optional(),
+  /** Native compatibility evidence; absent on historical external rows. */
+  fairProbability: probabilitySchema.optional(),
+  marketProbability: probabilitySchema.optional(),
+  featureVector: z.record(z.string(), z.unknown()).optional(),
 });
 export type ConsensusDecision = z.infer<typeof consensusDecisionSchema>;
 

@@ -57,7 +57,7 @@ export interface CapacitySample {
     utilization: number;
   };
   cpu: { processMs: number; userMs: number; systemMs: number };
-  trigger: { queued: number; inFlight: number; active: number; provenance: number; provenanceInvalid: number; signalsByTrigger: number; lastEvaluatedSignalCount: number; dedupe: number };
+  trigger: { queued: number; inFlight: number; active: number; provenance: number; provenanceInvalid: number; signalsByTrigger: number; dedupe: number };
   journal: { active: number; waiting: number; criticalWaiting: number; noncriticalWaiting: number };
   ingress: { depth: number; bytes: number; highWaterEvents: number; highWaterBytes: number; accepted: number; processed: number; gaps: number };
   reference: { accepted: number; windowEntries: number; retryTimers: number };
@@ -68,7 +68,7 @@ export interface CapacitySample {
   instrumentation: { sampleRingSize: number; journalEvents: number; journalEventIds: number; journalCommitSeqById: number; journalMutations: number };
 }
 
-export type RetainedCleanupMetric = "activeTriggers" | "triggerProvenance" | "provenanceInvalid" | "signalsByTrigger" | "lastEvaluatedSignalCount";
+export type RetainedCleanupMetric = "activeTriggers" | "triggerProvenance" | "provenanceInvalid" | "signalsByTrigger";
 export interface RetainedCleanupCycleObservation {
   atMs: number;
   before: Record<RetainedCleanupMetric, number>;
@@ -400,7 +400,7 @@ export async function runSustainedCapacityHarness(input: CapacityHarnessOptions 
       memory: { rss: memory.rss, heapUsed: memory.heapUsed, heapTotal: memory.heapTotal, external: memory.external, arrayBuffers: memory.arrayBuffers ?? 0 },
       eventLoop: { delayP99Ms, delayMaxMs, delayP99HighWaterMs, delayMaxHighWaterMs, utilization: Number(utilization.utilization.toFixed(5)) },
       cpu: { processMs: (cpu.user + cpu.system) / 1000, userMs: cpu.user / 1000, systemMs: cpu.system / 1000 },
-      trigger: { queued: supervisor.totalQueued, inFlight: supervisor.totalInFlight, active: bookkeeping.activeTriggers, provenance: bookkeeping.triggerProvenance, provenanceInvalid: bookkeeping.provenanceInvalid, signalsByTrigger: bookkeeping.signalsByTrigger, lastEvaluatedSignalCount: bookkeeping.lastEvaluatedSignalCount, dedupe: engine.triggerDedupeEntryCount() },
+      trigger: { queued: supervisor.totalQueued, inFlight: supervisor.totalInFlight, active: bookkeeping.activeTriggers, provenance: bookkeeping.triggerProvenance, provenanceInvalid: bookkeeping.provenanceInvalid, signalsByTrigger: bookkeeping.signalsByTrigger, dedupe: engine.triggerDedupeEntryCount() },
       journal: { active: admission.active, waiting: admission.waiting, criticalWaiting: admission.criticalWaiting, noncriticalWaiting: admission.noncriticalWaiting },
       ingress: { depth: ingress.depth, bytes: ingress.bytes, highWaterEvents: ingress.highWaterEvents, highWaterBytes: ingress.highWaterBytes, accepted: ingress.accepted, processed: ingress.processed, gaps: ingress.gapTotal },
       reference: { accepted: workload.referenceTicksSent, windowEntries: engine.referenceWindowTotalEntriesForTest(), retryTimers: engine.referenceRetryTimerCountForTest() },
@@ -535,7 +535,6 @@ export async function runSustainedCapacityHarness(input: CapacityHarnessOptions 
     triggerProvenance: classifyMetric(samples, "triggerProvenance", (item) => item.trigger.provenance, warmupSamples, "retained"),
     provenanceInvalid: classifyMetric(samples, "provenanceInvalid", (item) => item.trigger.provenanceInvalid, warmupSamples, "retained"),
     signalsByTrigger: classifyMetric(samples, "signalsByTrigger", (item) => item.trigger.signalsByTrigger, warmupSamples, "retained"),
-    lastEvaluatedSignalCount: classifyMetric(samples, "lastEvaluatedSignalCount", (item) => item.trigger.lastEvaluatedSignalCount, warmupSamples, "retained"),
     triggerDedupe: classifyMetric(samples, "triggerDedupe", (item) => item.trigger.dedupe, warmupSamples, "retained"),
     marketSnapshots: classifyMetric(samples, "marketSnapshots", (item) => item.state.marketSnapshots, warmupSamples),
     marketCache: classifyMetric(samples, "marketCache", (item) => item.state.marketCache, warmupSamples),
@@ -550,7 +549,7 @@ export async function runSustainedCapacityHarness(input: CapacityHarnessOptions 
     supervisorBusyKeys: classifyMetric(samples, "supervisorBusyKeys", (item) => item.supervisor.busyKeys, warmupSamples),
   };
   const cleanupCycles = engine.retainedCleanupCyclesForTest() as RetainedCleanupCycleObservation[];
-  const retainedMetrics: RetainedCleanupMetric[] = ["activeTriggers", "triggerProvenance", "provenanceInvalid", "signalsByTrigger", "lastEvaluatedSignalCount"];
+  const retainedMetrics: RetainedCleanupMetric[] = ["activeTriggers", "triggerProvenance", "provenanceInvalid", "signalsByTrigger"];
   for (const name of retainedMetrics) {
     const metric = metrics[name];
     if (!metric) continue;
@@ -603,7 +602,7 @@ export async function runSustainedCapacityHarness(input: CapacityHarnessOptions 
   }
   // Hard-bounded windows/registries are checked by their architectural
   // invariant above; only lifecycle-retained identities must plateau.
-  const retainedGrowthMetrics = ["activeTriggers", "triggerProvenance", "provenanceInvalid", "signalsByTrigger", "lastEvaluatedSignalCount", "triggerDedupe", "settledMarkets", "settlementBackoff"];
+  const retainedGrowthMetrics = ["activeTriggers", "triggerProvenance", "provenanceInvalid", "signalsByTrigger", "triggerDedupe", "settledMarkets", "settlementBackoff"];
   if (options.durationMs >= 3_000 && cleanupCycles.length < 2) blockers.push("INSUFFICIENT_LOCAL_EVIDENCE:retained_cleanup_cycles");
   for (const name of retainedGrowthMetrics) {
     const classification = metrics[name]?.classification;

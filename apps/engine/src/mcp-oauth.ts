@@ -466,7 +466,22 @@ function validRedirectUri(value: string): boolean {
   try {
     const url = new URL(value);
     const loopback = ["localhost", "127.0.0.1", "[::1]", "::1"].includes(url.hostname);
-    return (url.protocol === "https:" || (url.protocol === "http:" && loopback)) && !url.hash && !/[\s\u0000-\u001f]/.test(value);
+
+    const cursorNative =
+      url.protocol === "cursor:" &&
+      url.hostname === "anysphere.cursor-mcp" &&
+      url.pathname === "/oauth/callback" &&
+      !url.port &&
+      !url.username &&
+      !url.password &&
+      !url.search &&
+      !url.hash;
+
+    return (
+      url.protocol === "https:" ||
+      (url.protocol === "http:" && loopback) ||
+      cursorNative
+    ) && !url.hash && !/[\s\u0000-\u001f]/.test(value);
   } catch { return false; }
 }
 function validCodeVerifier(value: string): boolean { return /^[A-Za-z0-9._~-]{43,128}$/.test(value); }
