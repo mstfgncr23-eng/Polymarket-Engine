@@ -159,13 +159,13 @@ function transientFromEvent(event: DashboardSnapshot["decisionFeed"][number], st
   };
 }
 
-export function initializeGalaxyMotionState(snapshot: DashboardSnapshot, startFrame: number, nowMs: number): GalaxyMotionState {
+export function initializeGalaxyMotionState(snapshot: DashboardSnapshot, _startFrame: number, _nowMs: number): GalaxyMotionState {
   const events = semanticEvents(snapshot);
   return {
     seenEventIds: events.map((event) => event.id),
     referenceTimestamps: referenceTimestampMap(snapshot),
     scannerTimestamps: scannerTimestampMap(snapshot),
-    transients: events.slice(0, 3).map((event) => transientFromEvent(event, startFrame, nowMs)).filter((event): event is GalaxyTransient => Boolean(event)),
+    transients: [],
     lastReferencePulseAtMs: 0,
     lastMarketPulseAtMs: 0,
   };

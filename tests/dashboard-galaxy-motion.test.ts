@@ -70,13 +70,29 @@ describe("Galaxy scene model", () => {
 });
 
 describe("bounded Galaxy motion", () => {
-  it("seeds only a bounded set of real semantic events and does not duplicate repeated snapshots", () => {
-    const data = snapshot({ decisionFeed: Array.from({ length: 30 }, (_, index) => event(`event-${index}`, index % 2 ? "NATIVE_DECISION_COMPLETE" : "TRIGGER_LEVEL_2")) });
+  it("treats historical semantic events in the initial snapshot as baseline only", () => {
+    const data = snapshot({ decisionFeed: [
+      event("historical-decision", "NATIVE_DECISION_COMPLETE"),
+      event("historical-trigger", "TRIGGER_LEVEL_2"),
+    ] });
     const initial = initializeGalaxyMotionState(data, 20, 1_000);
-    expect(initial.transients).toHaveLength(3);
-    expect(initial.transients.every((item) => data.decisionFeed.some((candidate) => candidate.id === item.id))).toBe(true);
+    expect(initial.seenEventIds).toEqual(["historical-decision", "historical-trigger"]);
+    expect(initial.transients).toEqual([]);
+
     const repeated = advanceGalaxyMotionState(initial, data, 24, 1_200);
-    expect(repeated.transients.map((item) => item.id)).toEqual(initial.transients.map((item) => item.id));
+    expect(repeated.transients).toEqual([]);
+  });
+
+  it("creates a semantic transient only for an event first observed in a later snapshot", () => {
+    const initialData = snapshot({ decisionFeed: [event("historical-decision", "NATIVE_DECISION_COMPLETE")] });
+    const initial = initializeGalaxyMotionState(initialData, 20, 1_000);
+    const later = snapshot({ decisionFeed: [
+      event("new-fill", "PAPER_FILL"),
+      ...initialData.decisionFeed,
+    ] });
+
+    const advanced = advanceGalaxyMotionState(initial, later, 30, 1_500);
+    expect(advanced.transients).toEqual([expect.objectContaining({ id: "new-fill", kind: "fill", startFrame: 30 })]);
   });
 
   it("coalesces real reference and market timestamp changes without inventing pulses", () => {
