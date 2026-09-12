@@ -1,5 +1,5 @@
 import type { DashboardSnapshot } from "../../lib/types";
-import { formatAge, referenceTone, toneForState } from "../../lib/dashboard-selectors";
+import { formatTime, referenceTone, toneForState } from "../../lib/dashboard-selectors";
 import { StatusPill } from "./primitives";
 
 export function ExperimentBar({ snapshot, stream }: { snapshot: DashboardSnapshot | null; stream: "CONNECTING" | "LIVE" | "DEGRADED" }) {
@@ -19,6 +19,6 @@ export function ExperimentBar({ snapshot, stream }: { snapshot: DashboardSnapsho
       <StatusPill label={`DISCOVERY ${discovery}`} tone={toneForState(discovery)} />
       <StatusPill label={`MARKETS ${monitoring}`} tone={toneForState(monitoring)} />
     </div>
-    <p className="freshnessLine">Snapshot {formatAge(snapshot?.generatedAt)} · experiment elapsed time unavailable from this snapshot</p>
+    <p className="freshnessLine">Snapshot {formatTime(snapshot?.generatedAt)} · experiment elapsed time unavailable from this snapshot</p>
   </header>;
 }

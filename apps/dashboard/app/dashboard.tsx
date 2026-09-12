@@ -8,13 +8,11 @@ import { DecisionIntelligence } from "./components/decision-intelligence";
 import { EmptyState } from "./components/primitives";
 import { ExecutionStream } from "./components/execution-stream";
 import { ExperimentBar } from "./components/experiment-bar";
-import { ExternalResearch } from "./components/external-research";
 import { GalaxySystemMap } from "./components/galaxy-system-map";
 import { MarketUniverse } from "./components/market-universe";
-import { MissionTimeline } from "./components/mission-timeline";
-import { OpenPositions } from "./components/open-positions";
 import { PortfolioPanel } from "./components/portfolio-panel";
 import { RiskPanel } from "./components/risk-panel";
+import { SecondaryDock } from "./components/secondary-dock";
 import { SystemHealth } from "./components/system-health";
 
 export default function Dashboard({ initial }: { initial: DashboardSnapshot | null }) {
@@ -41,13 +39,15 @@ export default function Dashboard({ initial }: { initial: DashboardSnapshot | nu
   return <main className="dashboardShell">
     <ExperimentBar snapshot={data} stream={stream} />
     {!data ? <section className="dashboardEmpty"><EmptyState title="ENGINE SNAPSHOT UNAVAILABLE" detail="The dashboard has no cached values to invent. It will recover when the private engine stream reconnects." /></section> : <>
-      <GalaxySystemMap snapshot={data} />
-      <div className="dashboardGrid dashboardGrid--two"><MarketUniverse snapshot={data} /><DecisionIntelligence snapshot={data} /></div>
-      <div className="dashboardGrid dashboardGrid--two"><PortfolioPanel snapshot={data} /><ExecutionStream snapshot={data} /></div>
-      <div className="dashboardGrid dashboardGrid--two"><RiskPanel snapshot={data} /><SystemHealth snapshot={data} /></div>
-      <div className="dashboardGrid dashboardGrid--two"><OpenPositions snapshot={data} /><MissionTimeline snapshot={data} /></div>
-      <div className="dashboardGrid dashboardGrid--wide"><ExternalResearch snapshot={data} /></div>
-      <footer className="dashboardFooter"><span>Snapshot {formatTime(data.generatedAt)}</span><span>All orders simulated · persisted engine values only · external research is diagnostic</span></footer>
+      <div className="dashboardStage">
+        <div className="primaryPlane">
+          <aside className="controlRail controlRail--left"><MarketUniverse snapshot={data} /><SystemHealth snapshot={data} /></aside>
+          <GalaxySystemMap snapshot={data} />
+          <aside className="controlRail controlRail--right"><DecisionIntelligence snapshot={data} /><RiskPanel snapshot={data} /><ExecutionStream snapshot={data} /></aside>
+        </div>
+        <div className="operationsDock"><PortfolioPanel snapshot={data} /><SecondaryDock snapshot={data} /></div>
+      </div>
+      <footer className="dashboardFooter"><span>Snapshot {formatTime(data.generatedAt)}</span><span>Paper simulation · persisted engine values only · external research is diagnostic</span></footer>
     </>}
   </main>;
 }

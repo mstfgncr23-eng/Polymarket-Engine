@@ -7,13 +7,13 @@ export function DecisionIntelligence({ snapshot }: { snapshot: DashboardSnapshot
   const event = latest(nativeDecisionEvents(snapshot));
   const vector = decision?.featureVector ?? {};
   return <Panel title="Latest Decisions" kicker="DECISION INTELLIGENCE" meta={decision ? formatTime(decision.calculatedAt) : "awaiting decision"}>
-    {!decision ? <EmptyState title="AWAITING DECISION" detail="No native deterministic decision is present in the authoritative snapshot." /> : <>
+    {!decision ? <EmptyState title="AWAITING DECISION" detail="No consensus decision is present in the authoritative snapshot." /> : <>
       <div className="decisionHero"><div><span className="nodeEyebrow">DECISION AUTHORITY</span><strong>{decision.consensusDirection}</strong><span>{decisionAuthorityLabel(decision)}</span></div><StatusPill label={decisionAuthorityLabel(decision)} tone={decisionAuthorityTone(decision)} /></div>
       <div className="metricGrid metricGrid--four">
-        <Metric label="Confidence" value={formatPercent(decision.consensusConfidence)} detail="native consensus" />
-        <Metric label="Fair probability" value={formatPercent(decision.fairProbability)} detail="native output" />
-        <Metric label="Market probability" value={formatPercent(decision.marketProbability)} detail="native input" />
-        <Metric label="Estimated edge" value={formatBasisPoints(decision.estimatedEdge)} detail="native calculation" tone={decision.estimatedEdge > 0 ? "healthy" : "warning"} />
+        <Metric label="Confidence" value={formatPercent(decision.consensusConfidence)} detail="consensus" />
+        <Metric label="Fair probability" value={formatPercent(decision.fairProbability)} detail="decision output" />
+        <Metric label="Market probability" value={formatPercent(decision.marketProbability)} detail="market input" />
+        <Metric label="Estimated edge" value={formatBasisPoints(decision.estimatedEdge)} detail="decision calculation" tone={decision.estimatedEdge > 0 ? "healthy" : "warning"} />
       </div>
       <div className="decisionDetails"><DataValue label="Agreement" value={formatPercent(decision.agentAgreement)} /><DataValue label="Signal freshness" value={formatPercent(decision.signalFreshness)} /><DataValue label="Calculated" value={formatTime(decision.calculatedAt)} /><DataValue label="Decision event" value={event ? shortId(event.id) : "—"} /></div>
       {event && <div className="eventCallout"><span className="sectionLabel">Latest native event</span><strong>{eventSummary(event)}</strong><small>{formatTime(event.at)} · trace {shortId(event.traceId)}</small></div>}

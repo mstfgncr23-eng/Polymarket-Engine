@@ -123,11 +123,13 @@ export function formatTime(value: string | null | undefined): string {
   return Number.isFinite(date.getTime()) ? date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "—";
 }
 
-export function formatAge(value: string | null | undefined): string {
+export function formatAge(value: string | null | undefined, relativeTo?: string | number | Date): string {
   if (!value) return "—";
   const timestamp = new Date(value).getTime();
   if (!Number.isFinite(timestamp)) return "—";
-  const seconds = Math.max(0, Math.floor((Date.now() - timestamp) / 1_000));
+  const referenceTime = relativeTo === undefined ? Date.now() : new Date(relativeTo).getTime();
+  if (!Number.isFinite(referenceTime)) return "—";
+  const seconds = Math.max(0, Math.floor((referenceTime - timestamp) / 1_000));
   if (seconds < 60) return `${seconds}s ago`;
   if (seconds < 3_600) return `${Math.floor(seconds / 60)}m ago`;
   return `${Math.floor(seconds / 3_600)}h ago`;
