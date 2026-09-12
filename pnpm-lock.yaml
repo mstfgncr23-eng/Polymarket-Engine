@@ -26,6 +26,9 @@ importers:
 
   apps/dashboard:
     dependencies:
+      '@remotion/player':
+        specifier: 4.0.516
+        version: 4.0.516(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
       next:
         specifier: 16.3.3
         version: 16.3.3(@opentelemetry/api@1.9.1)(@types/node@26.4.0)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
@@ -35,6 +38,9 @@ importers:
       react-dom:
         specifier: 19.2.8
         version: 19.2.8(react@19.2.8)
+      remotion:
+        specifier: 4.0.516
+        version: 4.0.516(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
     devDependencies:
       '@types/node':
         specifier: 26.4.0
@@ -1112,6 +1118,12 @@ packages:
   '@polymarket/types@0.2.0':
     resolution: {integrity: sha512-j+cr9vZ6ICq88KyTmQMBG1dTtejpruSJntv9TWuGeb3f0inFQFKv+Q/Xc5H0lYUBehBkax3GjcqFTkVTNejMJQ==}
     engines: {node: '>=24'}
+
+  '@remotion/player@4.0.516':
+    resolution: {integrity: sha512-yPm3WSs9cfj9NiTRvjHJFhMgKolyUkaslrxIcF4rzCnlgKARClIvxoVP1m4w3FMx/jecscX3LNg3OSLca7lbTw==}
+    peerDependencies:
+      react: '>=16.8.0'
+      react-dom: '>=16.8.0'
 
   '@rolldown/binding-android-arm-eabi@1.2.6':
     resolution: {integrity: sha512-b+jTcARdTiFLI6jB4a5XjTm0RWd6KcRfQj/I2356fxUZemiho9zQLxo0RtCuMDAyKcLo6cEltkgbQp6d1+sjjQ==}
@@ -2343,6 +2355,12 @@ packages:
   real-require@1.0.0:
     resolution: {integrity: sha512-P4nbQYQfePJxRSmY+v/KINxVucm4NF3p3s7pJveMTtom52FR4YGltUQLB8idDXwDDWW+eYrWDFbuzUnjoWHF7g==}
 
+  remotion@4.0.516:
+    resolution: {integrity: sha512-soUOkBf7xMfhWIZuZ82pf2iHmsumjtnRVCztA27wXd8xjcM6YSPI3LPNL+x/wSo7eiUadkF6GBIpDGU1l6bAzg==}
+    peerDependencies:
+      react: '>=16.8.0'
+      react-dom: '>=16.8.0'
+
   require-from-string@2.0.2:
     resolution: {integrity: sha512-Xf0nWe6RseziFMu+Ap9biiUbmplq6S9/p+7w7YXP/JBHhrUDDUhwa+vANyubuqfZWTveU//DYVGsDG7RKL/vEw==}
     engines: {node: '>=0.10.0'}
@@ -3286,6 +3304,12 @@ snapshots:
     dependencies:
       neverthrow: 8.2.0
       type-fest: 5.9.0
+
+  '@remotion/player@4.0.516(react-dom@19.2.8(react@19.2.8))(react@19.2.8)':
+    dependencies:
+      react: 19.2.8
+      react-dom: 19.2.8(react@19.2.8)
+      remotion: 4.0.516(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
 
   '@rolldown/binding-android-arm-eabi@1.2.6':
     optional: true
@@ -4314,6 +4338,11 @@ snapshots:
   real-require@0.2.0: {}
 
   real-require@1.0.0: {}
+
+  remotion@4.0.516(react-dom@19.2.8(react@19.2.8))(react@19.2.8):
+    dependencies:
+      react: 19.2.8
+      react-dom: 19.2.8(react@19.2.8)
 
   require-from-string@2.0.2: {}
 
