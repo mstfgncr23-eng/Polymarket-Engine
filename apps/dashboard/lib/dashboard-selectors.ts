@@ -1,6 +1,7 @@
 import type { DashboardSnapshot } from "./types";
 
 export type Tone = "healthy" | "warning" | "critical" | "neutral";
+export const NATIVE_AUTHORITY = "NATIVE_DETERMINISTIC_V1";
 
 export const AGENT_ROLES = [
   ["market_microstructure_scanner", "Market Microstructure"],
@@ -84,6 +85,18 @@ export function referenceTone(snapshot: DashboardSnapshot): Tone {
   return "healthy";
 }
 
+export function decisionAuthorityLabel(consensus: DashboardSnapshot["consensus"]): string {
+  if (!consensus) return "—";
+  if (consensus.authority === NATIVE_AUTHORITY) return NATIVE_AUTHORITY;
+  if (consensus.authority) return consensus.authority;
+  return "AUTHORITY UNAVAILABLE";
+}
+
+export function decisionAuthorityTone(consensus: DashboardSnapshot["consensus"]): Tone {
+  if (!consensus) return "neutral";
+  return consensus.authority === NATIVE_AUTHORITY ? "healthy" : "warning";
+}
+
 export function formatMoney(value: string | number | null | undefined): string {
   if (value === null || value === undefined || value === "") return "—";
   const number = Number(value);
@@ -139,7 +152,8 @@ export function eventSummary(event: DashboardEvent): string {
   return parts.join(" · ") || (event.marketId ? shortId(event.marketId) : "System event");
 }
 
-export function pulseToken(snapshot: DashboardSnapshot, node: "reference" | "market" | "trigger" | "core" | "risk" | "execution" | "portfolio"): string | null {
+/** Semantic lifecycle pulses only; high-frequency market/reference traffic is deliberately excluded in V1. */
+export function pulseToken(snapshot: DashboardSnapshot, node: "trigger" | "core" | "risk" | "execution" | "portfolio"): string | null {
   const event = snapshot.decisionFeed.find((candidate) => {
     const type = candidate.type;
     if (node === "trigger") return type.startsWith("TRIGGER_LEVEL_");

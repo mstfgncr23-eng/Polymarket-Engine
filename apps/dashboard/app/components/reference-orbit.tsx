@@ -3,9 +3,8 @@ import type { DashboardSnapshot } from "../../lib/types";
 import { formatAge, referenceTone, toneForState } from "../../lib/dashboard-selectors";
 import { StatusPill } from "./primitives";
 
-export function ReferenceOrbit({ feeds, overallTone, pulse }: { feeds: NonNullable<DashboardSnapshot["health"]["referenceFeeds"]>; overallTone: ReturnType<typeof referenceTone>; pulse?: string | null }) {
+export function ReferenceOrbit({ feeds, overallTone }: { feeds: NonNullable<DashboardSnapshot["health"]["referenceFeeds"]>; overallTone: ReturnType<typeof referenceTone> }) {
   return <article className={`referenceNode systemNode--${overallTone}`} aria-labelledby="reference-node-title">
-    {pulse && <span className="nodePulse" key={pulse} aria-hidden="true" />}
     <div className="nodeTopline"><span className="nodeEyebrow">MARKET / REFERENCE DATA</span><StatusPill label={feeds.length ? `${feeds.length} FEEDS` : "NO FEEDS"} tone={overallTone} /></div>
     <h3 id="reference-node-title">Reference Galaxy</h3>
     <p className="nodeDetail">Connection state only · prices and momentum are not exposed in the dashboard snapshot.</p>

@@ -1,14 +1,14 @@
 import type { DashboardSnapshot } from "../../lib/types";
-import { eventSummary, formatBasisPoints, formatPercent, formatTime, latest, nativeDecisionEvents, shortId } from "../../lib/dashboard-selectors";
+import { decisionAuthorityLabel, decisionAuthorityTone, eventSummary, formatBasisPoints, formatPercent, formatTime, latest, nativeDecisionEvents, shortId } from "../../lib/dashboard-selectors";
 import { DataValue, EmptyState, Metric, Panel, StatusPill } from "./primitives";
 
 export function DecisionIntelligence({ snapshot }: { snapshot: DashboardSnapshot }) {
   const decision = snapshot.consensus;
   const event = latest(nativeDecisionEvents(snapshot));
   const vector = decision?.featureVector ?? {};
-  return <Panel title="Latest Native Decisions" kicker="DECISION INTELLIGENCE" meta={decision ? formatTime(decision.calculatedAt) : "awaiting decision"}>
+  return <Panel title="Latest Decisions" kicker="DECISION INTELLIGENCE" meta={decision ? formatTime(decision.calculatedAt) : "awaiting decision"}>
     {!decision ? <EmptyState title="AWAITING DECISION" detail="No native deterministic decision is present in the authoritative snapshot." /> : <>
-      <div className="decisionHero"><div><span className="nodeEyebrow">NATIVE AUTHORITY</span><strong>{decision.consensusDirection}</strong><span>{decision.authority ?? "NATIVE_DETERMINISTIC_V1"}</span></div><StatusPill label="NATIVE_DETERMINISTIC_V1" tone="healthy" /></div>
+      <div className="decisionHero"><div><span className="nodeEyebrow">DECISION AUTHORITY</span><strong>{decision.consensusDirection}</strong><span>{decisionAuthorityLabel(decision)}</span></div><StatusPill label={decisionAuthorityLabel(decision)} tone={decisionAuthorityTone(decision)} /></div>
       <div className="metricGrid metricGrid--four">
         <Metric label="Confidence" value={formatPercent(decision.consensusConfidence)} detail="native consensus" />
         <Metric label="Fair probability" value={formatPercent(decision.fairProbability)} detail="native output" />

@@ -5,6 +5,8 @@ import {
   formatBasisPoints,
   formatMoney,
   formatPercent,
+  decisionAuthorityLabel,
+  decisionAuthorityTone,
   missionEvents,
   nativeDecisionEvents,
   pulseToken,
@@ -49,11 +51,25 @@ describe("dashboard data selectors", () => {
     expect(referenceTone(snapshot())).toBe("neutral");
   });
 
+  it("never infers native authority for historical or incomplete consensus rows", () => {
+    const native: NonNullable<DashboardSnapshot["consensus"]> = { consensusDirection: "UP", consensusConfidence: .8, agentAgreement: .9, signalFreshness: 1, conflicts: [], estimatedEdge: .02, calculatedAt: "2026-09-12T00:00:00.000Z", authority: "NATIVE_DETERMINISTIC_V1" };
+    const external = { ...native, authority: "EXTERNAL_CONSENSUS_V0" };
+    const { authority: _historicalAuthority, ...historical } = native;
+    expect(decisionAuthorityLabel(native)).toBe("NATIVE_DETERMINISTIC_V1");
+    expect(decisionAuthorityTone(native)).toBe("healthy");
+    expect(decisionAuthorityLabel(external)).toBe("EXTERNAL_CONSENSUS_V0");
+    expect(decisionAuthorityTone(external)).toBe("warning");
+    expect(decisionAuthorityLabel(historical)).toBe("AUTHORITY UNAVAILABLE");
+    expect(decisionAuthorityTone(historical)).toBe("warning");
+  });
+
   it("formats real scalar values without inventing fallbacks", () => {
     expect(formatMoney("12.30")).toBe("$12.30");
     expect(formatMoney(null)).toBe("—");
     expect(formatPercent(.425)).toBe("42.5%");
+    expect(formatPercent(undefined)).toBe("—");
     expect(formatBasisPoints(.0025)).toBe("25bp");
+    expect(formatBasisPoints(undefined)).toBe("—");
     expect(equityPoints([{ at: "a", equity: "1", drawdown: "0" }])).toBeNull();
   });
 });
