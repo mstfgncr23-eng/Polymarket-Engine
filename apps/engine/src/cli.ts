@@ -19,6 +19,7 @@ import { retentionConfigFromEnv } from "./retention-manager.js";
 import { PolymarketMarketDataAdapter, ReferenceFeedRegistry, createRestProbe } from "@pm/market-data";
 import { startRuntime } from "./runtime.js";
 import { exportExperimentArchive } from "./archive.js";
+import { evaluateLiveFeedSmokeGate } from "./live-feed-smoke-gate.js";
 
 const command = process.argv[2] ?? "help";
 
@@ -167,18 +168,18 @@ if (command === "experiment:start") {
   const assets = [...new Set(report.qualified.map((item) => item.asset).filter((item): item is string => Boolean(item)))];
   let polymarketMessages = 0;
   const referenceMessages: Record<string, number> = {};
+  const referenceResolutions: Array<{ asset: string; supported: boolean; status: string; symbol: string | null; reason: string; detail?: string }> = [];
   let finish!: () => void;
   const complete = new Promise<void>((resolve) => { finish = resolve; });
-  const check = () => {
-    const refCount = Object.values(referenceMessages).reduce((sum, value) => sum + value, 0);
-    const waitingForReference = Object.keys(referenceMessages).length > 0;
-    if (polymarketMessages > 0 && (!waitingForReference || refCount > 0)) finish();
-  };
-  if (subscribeTokenIds.length > 0) void market.run(subscribeTokenIds, { onSnapshot: () => { polymarketMessages += 1; check(); }, onConnection: () => undefined, onError: (error) => { failures.push(`polymarket:${error.message}`); } }, abort.signal);
+  const status = () => evaluateLiveFeedSmokeGate({
+    polymarketMessages,
+    referenceMessages,
+    referenceStatuses: referenceResolutions.map((resolution) => resolution.status),
+  });
+  const check = () => { if (status().settled) finish(); };
   const restBase = process.env.REFERENCE_REST_BASE_URL ?? "https://api.binance.com";
   const wsBase = process.env.REFERENCE_WS_BASE_URL ?? "wss://data-stream.binance.vision/ws";
   const registry = new ReferenceFeedRegistry(wsBase, restBase, 15_000, undefined, createRestProbe(restBase));
-  const referenceResolutions: Array<{ asset: string; supported: boolean; status: string; symbol: string | null; reason: string; detail?: string }> = [];
   for (const asset of assets) {
     const resolution = await registry.resolve(asset);
     referenceResolutions.push({
@@ -203,16 +204,21 @@ if (command === "experiment:start") {
       onError: (error) => { failures.push(`reference:${asset}:${error.message}`); },
     }, abort.signal);
   }
+  if (subscribeTokenIds.length > 0) void market.run(subscribeTokenIds, {
+    onSnapshot: () => { polymarketMessages += 1; check(); },
+    onConnection: () => undefined,
+    onError: (error) => { failures.push(`polymarket:${error.message}`); },
+  }, abort.signal);
   check();
   await Promise.race([complete, new Promise<void>((resolve) => setTimeout(resolve, 25_000))]);
   abort.abort("smoke complete");
-  const refCount = Object.values(referenceMessages).reduce((sum, value) => sum + value, 0);
+  const gate = status();
   const rejectReasons: Record<string, number> = {};
   for (const item of report.rejected) {
     for (const code of item.reasonCodes) rejectReasons[code] = (rejectReasons[code] ?? 0) + 1;
   }
   const result = {
-    ok: polymarketMessages > 0,
+    ok: gate.ok,
     discoveredMarkets: report.discovered.length,
     qualifiedMarkets: report.qualified.map((market) => ({ id: market.id, slug: market.slug, asset: market.asset, tokens: market.tokens.length })),
     rejectedReasonCounts: rejectReasons,
@@ -224,7 +230,7 @@ if (command === "experiment:start") {
     referenceFeeds: referenceResolutions,
     polymarketMessages,
     referenceMessages,
-    referenceMessageCount: refCount,
+    referenceMessageCount: gate.referenceMessageCount,
     failures,
   };
   console.log(JSON.stringify(result, null, 2));
