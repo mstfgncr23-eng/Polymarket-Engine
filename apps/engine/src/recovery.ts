@@ -66,6 +66,7 @@ export const RECOVERY_FAILURE_REASONS = [
   "invariant",
   "unknown_type",
   "cursor_fence",
+  "astra_authority_unavailable",
 ] as const;
 export type RecoveryFailureReason = (typeof RECOVERY_FAILURE_REASONS)[number];
 

@@ -372,7 +372,7 @@ export class EngineService {
     });
     this.astraBudget = new AstraDailyBudget(env.ASTRA_MAX_DAILY_COST_USD);
     this.astraLearner = new AstraBatchLearner();
-    this.astraService = env.ASTRA_ENABLED && this.astraClient
+    this.astraService = this.astraClient
       ? new EngineAstraDecisionService({
         client: this.astraClient,
         deepUncertaintyThreshold: env.ASTRA_DEEP_UNCERTAINTY_THRESHOLD,
@@ -897,6 +897,28 @@ export class EngineService {
 
   private experimentMode(): "48H_ASTRA_PAPER_EXPERIMENT" | "48H_NATIVE_PAPER_EXPERIMENT" {
     return this.env.ASTRA_ENABLED ? "48H_ASTRA_PAPER_EXPERIMENT" : "48H_NATIVE_PAPER_EXPERIMENT";
+  }
+
+  /**
+   * An active experiment owns economic authority through its manifest. The
+   * environment flag is only consulted for IDLE/new experiments, so a restart
+   * cannot silently switch the current experiment between Astra and Native.
+   */
+  private economicAuthority(): typeof ASTRA_BRAIN_AUTHORITY | typeof NATIVE_DETERMINISTIC_AUTHORITY {
+    const active = this.experiment?.status === "RUNNING" || this.experiment?.status === "ENTRY_CLOSED";
+    const persisted = active ? this.experiment?.modelConfiguration.authority : undefined;
+    if (persisted === ASTRA_BRAIN_AUTHORITY || persisted === NATIVE_DETERMINISTIC_AUTHORITY) return persisted;
+    return this.env.ASTRA_ENABLED ? ASTRA_BRAIN_AUTHORITY : NATIVE_DETERMINISTIC_AUTHORITY;
+  }
+
+  private assertRecoveredEconomicAuthorityAvailable(): void {
+    const active = this.experiment?.status === "RUNNING" || this.experiment?.status === "ENTRY_CLOSED";
+    if (active && this.experiment?.modelConfiguration.authority === ASTRA_BRAIN_AUTHORITY && !this.astraService) {
+      throw new RecoveryFailClosedError(
+        "astra_authority_unavailable",
+        `active experiment ${this.experiment.id} requires ASTRA_BRAIN_V1 but the Astra runtime/client is unavailable`,
+      );
+    }
   }
 
   private modelConfiguration(): Record<string, unknown> {
@@ -1556,6 +1578,7 @@ export class EngineService {
         if (!report.ok) throw new RecoveryFailClosedError("invariant", report.reasons.join(","));
         this.syncRecoveredProjection();
       }
+      this.assertRecoveredEconomicAuthorityAvailable();
       this.syncExperimentWindow();
       if (this.experiment?.status === "RUNNING" && this.experiment.startValidationPending) {
         await this.commitAbortedStart(this.experiment, "EXPERIMENT_START_VALIDATION_INCOMPLETE_RECOVERY");
@@ -1991,25 +2014,31 @@ export class EngineService {
       return;
     }
     this.state.addTrigger(trigger);
-    if (this.env.ASTRA_ENABLED) {
+    if (this.economicAuthority() === ASTRA_BRAIN_AUTHORITY) {
       if (trigger.marketId && this.ledger.positions.get(trigger.marketId)?.unpairedOutcome) {
         await this.evaluateDeterministicHedgeBypass(trigger);
         return;
       }
-      const astraBookkeepingStarted = performance.now();
-      this.state.addActivation({
-        triggerId: trigger.id, reason: "ASTRA_BRAIN_V1", at: this.nowFn().toISOString(),
-        provider: "openai", grokWakeObserved: false,
+      await this.experimentBoundaryGate.run(async () => {
+        // Linearize speculative Astra admission with close-entries. No Astra
+        // bookkeeping, gate mutation, model call, or budget reservation may
+        // begin after the first-leg window has closed.
+        if (!experimentAllowsFirstLeg(this.experiment)) return;
+        const astraBookkeepingStarted = performance.now();
+        this.state.addActivation({
+          triggerId: trigger.id, reason: "ASTRA_BRAIN_V1", at: this.nowFn().toISOString(),
+          provider: "openai", grokWakeObserved: false,
+        });
+        await this.persistReportInput(createJournalEvent({
+          traceId: trigger.traceId, type: "GROK_ACTIVATION_DECISION", aggregateType: "activation", aggregateId: trigger.id,
+          payload: {
+            triggerId: trigger.id, marketId: trigger.marketId, asset: trigger.asset ?? null,
+            reason: "ASTRA_BRAIN_V1", activate: false, authority: ASTRA_BRAIN_AUTHORITY,
+          },
+        }));
+        this.metrics.idleActivationBookkeepingDuration.observe((performance.now() - astraBookkeepingStarted) / 1000);
+        await this.evaluateAstraDecisionForTrigger(trigger, provenance, { provenance, marketEpochFence, feedGeneration });
       });
-      await this.persistReportInput(createJournalEvent({
-        traceId: trigger.traceId, type: "GROK_ACTIVATION_DECISION", aggregateType: "activation", aggregateId: trigger.id,
-        payload: {
-          triggerId: trigger.id, marketId: trigger.marketId, asset: trigger.asset ?? null,
-          reason: "ASTRA_BRAIN_V1", activate: false, authority: ASTRA_BRAIN_AUTHORITY,
-        },
-      }));
-      this.metrics.idleActivationBookkeepingDuration.observe((performance.now() - astraBookkeepingStarted) / 1000);
-      await this.evaluateAstraDecisionForTrigger(trigger, provenance, { provenance, marketEpochFence, feedGeneration });
       return;
     }
     const nativeBookkeepingStarted = performance.now();
@@ -2104,6 +2133,7 @@ export class EngineService {
     provenance: TriggerProvenance,
     admissionFence: AstraFirstLegAdmissionFence,
   ): Promise<void> {
+    if (!experimentAllowsFirstLeg(this.experiment)) return;
     if (!this.astraService) {
       this.metrics.astraFailures.inc({ stage: "FAST", reason: "CLIENT_UNAVAILABLE" });
       this.metrics.astraFailureTotals.inc({ stage: "FAST", reason: "CLIENT_UNAVAILABLE" });
@@ -3942,7 +3972,7 @@ export class EngineService {
         const outcome = classifySettledOutcome(realizedDelta, positionBefore.totalFees);
         this.record("POSITION_SETTLED", positionBefore.id, marketId, { outcome, realizedDelta }, asset);
         this.metrics.openPositions.set(this.ledger.positions.size);
-        if (this.env.ASTRA_ENABLED) {
+        if (this.economicAuthority() === ASTRA_BRAIN_AUTHORITY) {
           const correlations = this.astraExecutionCorrelations.get(marketId) ?? [];
           const totalQuantity = correlations.reduce((sum, row) => sum + Number(row.quantity), 0);
           if (correlations.length === 0 || !Number.isFinite(totalQuantity) || totalQuantity <= 0) {

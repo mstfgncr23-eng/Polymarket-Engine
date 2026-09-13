@@ -19,6 +19,9 @@ import { AstraClientError, estimateAstraDecisionInputTokens, OpenAIAstraClient }
 import { AstraBudgetError, AstraDecisionService } from "../apps/engine/src/astra/service.js";
 import { EngineService } from "../apps/engine/src/engine.js";
 import { NoopGrokActivationBridge } from "../apps/engine/src/activation/index.js";
+import { evaluateExperimentPreflight } from "../apps/engine/src/preflight.js";
+import { ExperimentSummaryAccumulator } from "../apps/engine/src/report.js";
+import { createJournalEvent, MemoryEventJournal } from "@pm/db";
 import { feeSchedule, fill, now, safeRisk, snapshot } from "./fixtures.js";
 import { ScriptedMarketAdapter, ScriptedReferenceRegistry, discoveryReport, qualified, qualifiedPaperEnv } from "./paper-engine-testkit.js";
 
@@ -57,6 +60,189 @@ describe("Astra Brain V1 deterministic boundary", () => {
       expect(accepted.accepted).toBe(true);
     }
     expect(evaluateAstraOpportunityGate({ ...{ featurePacket: packet, now, marketSynchronized: false, triggerProvenanceValid: true } }).reason).toBe("UNSYNCHRONIZED");
+  });
+
+  it("does not call Astra outside the open first-leg window", async () => {
+    const clock = { value: now.getTime() };
+    const market = new ScriptedMarketAdapter();
+    const marketId = "astra-window-market";
+    const discovered = qualified(marketId, "BTC", "window-up", "window-down", new Date(clock.value + 900_000).toISOString());
+    market.queue(discoveryReport([discovered]));
+    const journal = new MemoryEventJournal();
+    const referenceRegistry = new ScriptedReferenceRegistry();
+    referenceRegistry.resolve = async (asset) => ({ asset, supported: false, symbol: null, url: null, reason: "REFERENCE_UNSUPPORTED", status: "UNSUPPORTED_DEFINITIVE" });
+    const calls: string[] = [];
+    const engine = new EngineService(qualifiedPaperEnv({ ASTRA_ENABLED: "true", ESTIMATED_INFRA_COST_PER_HOUR_USD: "0" }), journal, { error: () => undefined }, {
+      market: market as never, referenceRegistry: referenceRegistry as never, activation: new NoopGrokActivationBridge(), now: () => new Date(clock.value),
+      astraClient: { decide: async (request) => {
+        calls.push(request.stage);
+        return { output: astraModelOutputSchema.parse({ action: "NO_TRADE", fairProbabilityUp: 0.5, confidence: 0.8, uncertainty: 0.1, reasonCodes: ["WINDOW_TEST"] }), usage: { inputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1, reasoningTokens: 0, costUsd: 0 }, providerRequestId: `window-${calls.length}` };
+      } },
+    });
+    try {
+      await engine.start(); await market.waitForHandlers();
+      const up = snapshot({ marketId, tokenId: "window-up", outcome: "UP", asset: "BTC", receivedAt: new Date(clock.value).toISOString(), sourceTimestamp: new Date(clock.value).toISOString(), asks: [{ price: "0.48", quantity: "300" }], bids: [{ price: "0.47", quantity: "300" }] });
+      const down = snapshot({ marketId, tokenId: "window-down", outcome: "DOWN", asset: "BTC", receivedAt: new Date(clock.value).toISOString(), sourceTimestamp: new Date(clock.value).toISOString(), asks: [{ price: "0.49", quantity: "300" }], bids: [{ price: "0.48", quantity: "300" }] });
+      await market.emitSnapshot(up); await market.emitSnapshot(down);
+
+      await engine.registerTriggerForResearch(trigger(up, "idle-window"));
+      expect(calls).toHaveLength(0);
+      expect(engine.astraBudgetSnapshotForTest().spentUsd).toBe(0);
+      expect(await journal.queryEvents({ types: ["ASTRA_MODEL_INVOCATION"] })).toHaveLength(0);
+
+      expect((await engine.beginExperiment()).ok).toBe(true);
+      expect((await journal.queryEvents({ types: ["EXPERIMENT_PREFLIGHT"] })).at(-1)?.payload).toMatchObject({
+        checks: { activationProvider: "openai", decisionAuthority: "ASTRA_BRAIN_V1", localExecution: false, externalInference: true, grokDisabled: true, mcpRoles: [], missingRoles: [] },
+      });
+      await engine.registerTriggerForResearch(trigger(up, "running-window"));
+      const runningCalls = calls.length;
+      expect(runningCalls).toBeGreaterThan(0);
+
+      expect((await engine.closeExperimentEntries()).ok).toBe(true);
+      await engine.registerTriggerForResearch(trigger(up, "closed-window"));
+      expect(calls).toHaveLength(runningCalls);
+
+      await engine.completeExperimentForTest();
+      await engine.registerTriggerForResearch(trigger(up, "completed-window"));
+      expect(calls).toHaveLength(runningCalls);
+      expect(await journal.queryEvents({ types: ["ASTRA_MODEL_INVOCATION"] })).toHaveLength(runningCalls);
+    } finally {
+      await engine.stop();
+    }
+  });
+
+  it("keeps persisted Astra authority across a restart when the environment flag is disabled", async () => {
+    const clock = { value: now.getTime() };
+    const market = new ScriptedMarketAdapter();
+    const marketId = "astra-authority-restart";
+    const discovered = qualified(marketId, "BTC", "authority-up", "authority-down", new Date(clock.value + 900_000).toISOString());
+    market.queue(discoveryReport([discovered]));
+    const journal = new MemoryEventJournal();
+    const referenceRegistry = new ScriptedReferenceRegistry();
+    referenceRegistry.resolve = async (asset) => ({ asset, supported: false, symbol: null, url: null, reason: "REFERENCE_UNSUPPORTED", status: "UNSUPPORTED_DEFINITIVE" });
+    const calls: string[] = [];
+    const client: AstraClient = { decide: async (request) => {
+      calls.push(request.stage);
+      return { output: astraModelOutputSchema.parse({ action: "NO_TRADE", fairProbabilityUp: 0.5, confidence: 0.8, uncertainty: 0.1, reasonCodes: ["AUTHORITY_RESTART"] }), usage: { inputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1, reasoningTokens: 0, costUsd: 0 }, providerRequestId: `authority-${calls.length}` };
+    } };
+    const first = new EngineService(qualifiedPaperEnv({ ASTRA_ENABLED: "true", ESTIMATED_INFRA_COST_PER_HOUR_USD: "0" }), journal, { error: () => undefined }, {
+      market: market as never, referenceRegistry: referenceRegistry as never, activation: new NoopGrokActivationBridge(), astraClient: client, now: () => new Date(clock.value),
+    });
+    await first.start(); await market.waitForHandlers();
+    expect((await first.beginExperiment()).ok).toBe(true);
+    expect(first.experimentManifest()?.modelConfiguration.authority).toBe("ASTRA_BRAIN_V1");
+    await first.stop();
+
+    market.queue(discoveryReport([discovered]));
+    const second = new EngineService(qualifiedPaperEnv({ ASTRA_ENABLED: "false", ESTIMATED_INFRA_COST_PER_HOUR_USD: "0" }), journal, { error: () => undefined }, {
+      market: market as never, referenceRegistry: referenceRegistry as never, activation: new NoopGrokActivationBridge(), astraClient: client, now: () => new Date(clock.value),
+    });
+    try {
+      await second.start(); await market.waitForHandlers();
+      expect(second.experimentManifest()?.modelConfiguration.authority).toBe("ASTRA_BRAIN_V1");
+      const up = snapshot({ marketId, tokenId: "authority-up", outcome: "UP", asset: "BTC", receivedAt: new Date(clock.value).toISOString(), sourceTimestamp: new Date(clock.value).toISOString(), asks: [{ price: "0.48", quantity: "300" }], bids: [{ price: "0.47", quantity: "300" }] });
+      const down = snapshot({ marketId, tokenId: "authority-down", outcome: "DOWN", asset: "BTC", receivedAt: new Date(clock.value).toISOString(), sourceTimestamp: new Date(clock.value).toISOString(), asks: [{ price: "0.49", quantity: "300" }], bids: [{ price: "0.48", quantity: "300" }] });
+      await market.emitSnapshot(up); await market.emitSnapshot(down);
+      await second.registerTriggerForResearch(trigger(up, "authority-after-restart"));
+      expect(calls.length).toBeGreaterThan(0);
+      expect(await journal.queryEvents({ types: ["NATIVE_DECISION_COMPLETE"] })).toHaveLength(0);
+    } finally {
+      await second.stop();
+    }
+  });
+
+  it("fails closed instead of falling back to Native for an active Astra experiment without a client", async () => {
+    const journal = new MemoryEventJournal();
+    const market = new ScriptedMarketAdapter();
+    const marketId = "astra-authority-blocked";
+    const discovered = qualified(marketId, "BTC", "blocked-up", "blocked-down", new Date(now.getTime() + 900_000).toISOString());
+    market.queue(discoveryReport([discovered]));
+    const first = new EngineService(qualifiedPaperEnv({ ASTRA_ENABLED: "true", ESTIMATED_INFRA_COST_PER_HOUR_USD: "0" }), journal, { error: () => undefined }, {
+      market: market as never, referenceRegistry: new ScriptedReferenceRegistry() as never, activation: new NoopGrokActivationBridge(),
+      astraClient: { decide: async () => ({ output: astraModelOutputSchema.parse({ action: "NO_TRADE", fairProbabilityUp: 0.5, confidence: 0.5, uncertainty: 0.1, reasonCodes: ["SEED"] }), usage: { inputTokens: 1, cachedInputTokens: 0, outputTokens: 1, reasoningTokens: 0, costUsd: 0, cacheWriteTokens: 0 }, providerRequestId: "seed" }) },
+    });
+    await first.start(); await market.waitForHandlers();
+    expect((await first.beginExperiment()).ok).toBe(true);
+    await first.closeExperimentEntries();
+    await first.stop();
+
+    market.queue(discoveryReport([discovered]));
+    const recovered = new EngineService(qualifiedPaperEnv({ ASTRA_ENABLED: "false", ESTIMATED_INFRA_COST_PER_HOUR_USD: "0" }), journal, { error: () => undefined }, {
+      market: market as never, referenceRegistry: new ScriptedReferenceRegistry() as never, activation: new NoopGrokActivationBridge(),
+    });
+    await expect(recovered.start()).rejects.toThrow("astra_authority_unavailable");
+    expect(recovered.recoveryFailClosedForTest()).toBe(true);
+    await recovered.stop();
+  });
+
+  it("keeps persisted Native authority when Astra is enabled after restart", async () => {
+    const clock = { value: now.getTime() };
+    const market = new ScriptedMarketAdapter();
+    const marketId = "native-authority-restart";
+    const discovered = qualified(marketId, "BTC", "native-up", "native-down", new Date(clock.value + 900_000).toISOString());
+    market.queue(discoveryReport([discovered]));
+    const journal = new MemoryEventJournal();
+    const referenceRegistry = new ScriptedReferenceRegistry();
+    referenceRegistry.resolve = async (asset) => ({ asset, supported: false, symbol: null, url: null, reason: "REFERENCE_UNSUPPORTED", status: "UNSUPPORTED_DEFINITIVE" });
+    const first = new EngineService(qualifiedPaperEnv({ ASTRA_ENABLED: "false", ESTIMATED_INFRA_COST_PER_HOUR_USD: "0" }), journal, { error: () => undefined }, {
+      market: market as never, referenceRegistry: referenceRegistry as never, activation: new NoopGrokActivationBridge(), now: () => new Date(clock.value),
+    });
+    await first.start(); await market.waitForHandlers();
+    expect((await first.beginExperiment()).ok).toBe(true);
+    expect(first.experimentManifest()?.modelConfiguration.authority).toBe("NATIVE_DETERMINISTIC_V1");
+    await first.stop();
+
+    const calls: string[] = [];
+    const client: AstraClient = { decide: async (request) => {
+      calls.push(request.stage);
+      return { output: astraModelOutputSchema.parse({ action: "NO_TRADE", fairProbabilityUp: 0.5, confidence: 0.8, uncertainty: 0.1, reasonCodes: ["MUST_NOT_ROUTE"] }), usage: { inputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1, reasoningTokens: 0, costUsd: 0 }, providerRequestId: "must-not-route" };
+    } };
+    market.queue(discoveryReport([discovered]));
+    const second = new EngineService(qualifiedPaperEnv({ ASTRA_ENABLED: "true", ESTIMATED_INFRA_COST_PER_HOUR_USD: "0" }), journal, { error: () => undefined }, {
+      market: market as never, referenceRegistry: referenceRegistry as never, activation: new NoopGrokActivationBridge(), astraClient: client, now: () => new Date(clock.value),
+    });
+    try {
+      await second.start(); await market.waitForHandlers();
+      const up = snapshot({ marketId, tokenId: "native-up", outcome: "UP", asset: "BTC", receivedAt: new Date(clock.value).toISOString(), sourceTimestamp: new Date(clock.value).toISOString(), asks: [{ price: "0.48", quantity: "300" }], bids: [{ price: "0.47", quantity: "300" }] });
+      const down = snapshot({ marketId, tokenId: "native-down", outcome: "DOWN", asset: "BTC", receivedAt: new Date(clock.value).toISOString(), sourceTimestamp: new Date(clock.value).toISOString(), asks: [{ price: "0.49", quantity: "300" }], bids: [{ price: "0.48", quantity: "300" }] });
+      await market.emitSnapshot(up); await market.emitSnapshot(down);
+      await second.registerTriggerForResearch(trigger(up, "native-after-restart"));
+      expect(second.experimentManifest()?.modelConfiguration.authority).toBe("NATIVE_DETERMINISTIC_V1");
+      expect(calls).toHaveLength(0);
+      expect(second.state.latestConsensus?.authority).toBe("NATIVE_DETERMINISTIC_V1");
+    } finally {
+      await second.stop();
+    }
+  });
+
+  it("derives Astra regime reporting from canonical decisions without an unknown invocation regime", () => {
+    const accumulator = new ExperimentSummaryAccumulator("astra-report-regime");
+    const invocation = (stage: "FAST" | "DEEP" | "BATCH") => createJournalEvent({
+      traceId: `invocation-${stage}`, type: "ASTRA_MODEL_INVOCATION", aggregateType: "astra_invocation", aggregateId: `invocation-${stage}`,
+      payload: { authority: "ASTRA_BRAIN_V1", stage, usage: { costUsd: 0 }, providerRequestId: stage },
+    });
+    const decision = (regime: "TRENDING" | "VOLATILE") => createJournalEvent({
+      traceId: `decision-${regime}`, type: "ASTRA_DECISION", aggregateType: "astra", aggregateId: `decision-${regime}`,
+      payload: { authority: "ASTRA_BRAIN_V1", featurePacket: { regime }, stages: ["FAST", "DEEP"], decision: { action: "NO_TRADE" } },
+    });
+    accumulator.fold(invocation("FAST")); accumulator.fold(invocation("DEEP")); accumulator.fold(invocation("BATCH"));
+    accumulator.fold(decision("TRENDING")); accumulator.fold(decision("VOLATILE"));
+    const summary = accumulator.finalize();
+    expect(summary.performanceByMarketRegime).toMatchObject({ TRENDING: { source: "ASTRA_DECISION", stage: "DEEP" }, VOLATILE: { source: "ASTRA_DECISION", stage: "DEEP" } });
+    expect(summary.performanceByMarketRegime.unknown).toBeUndefined();
+  });
+
+  it("reports truthful Astra preflight authority metadata without changing Native or legacy Grok modes", () => {
+    const market = qualified("preflight-astra", "BTC", "preflight-up", "preflight-down");
+    const entryMarkets = [{ marketId: market.id, asset: market.asset, referenceRequired: false, blockedStatus: null, yesTokenId: "preflight-up", noTokenId: "preflight-down", endDate: market.endDate, feeScheduleKnown: true, binarySafe: true, monitored: true }];
+    const base = { databaseUp: true, discoveryStatus: "MONITORING", qualifiedOrManaged: 1, tokenConfiguredPath: true, entryMarkets, reference: [], mcpRoleTokens: [], bootstrapFailed: false } as const;
+    const astra = evaluateExperimentPreflight({ ...base, env: qualifiedPaperEnv({ ASTRA_ENABLED: "true", GROK_ACTIVATION_PROVIDER: "noop" }), mode: "48H_ASTRA_PAPER_EXPERIMENT" });
+    expect(astra.checks).toMatchObject({ activationProvider: "openai", decisionAuthority: "ASTRA_BRAIN_V1", localExecution: false, externalInference: true, grokDisabled: true, grokResearchRequired: false, mcpRoles: [], missingRoles: [] });
+    expect(astra.warnings).not.toContain("GROK_WAKE_NOT_VALIDATED");
+    const native = evaluateExperimentPreflight({ ...base, env: qualifiedPaperEnv({ ASTRA_ENABLED: "false" }), mode: "48H_NATIVE_PAPER_EXPERIMENT" });
+    expect(native.checks).toMatchObject({ activationProvider: "native_deterministic", decisionAuthority: "NATIVE_DETERMINISTIC_V1", localExecution: true, externalInference: false, grokDisabled: true });
+    const grok = evaluateExperimentPreflight({ ...base, env: qualifiedPaperEnv({ ASTRA_ENABLED: "false" }), mode: "48H_GROK_PAPER_EXPERIMENT" });
+    expect(grok.checks).toMatchObject({ decisionAuthority: "LEGACY_EXTERNAL", grokDisabled: false, grokResearchRequired: true });
   });
 
   it("keeps the first-leg cap at $12.50 while hedges retain the existing $25 ceiling", () => {

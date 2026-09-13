@@ -265,7 +265,17 @@ export class ExperimentSummaryAccumulator {
       const stageKey = `ASTRA_${stage}`;
       this.modelCounts[stageKey] = (this.modelCounts[stageKey] ?? 0) + 1;
       this.modelCosts[stageKey] = (this.modelCosts[stageKey] ?? 0) + (usage?.costUsd ?? 0);
-      this.regimes[String((event.payload as { featurePacket?: { regime?: unknown } }).featurePacket?.regime ?? "unknown")] = { stage };
+    } else if (type === "ASTRA_DECISION" && (event.payload as { authority?: unknown }).authority === "ASTRA_BRAIN_V1") {
+      // Invocation events intentionally contain only bounded provider audit
+      // data. The canonical decision is the single per-trigger source for
+      // regime attribution; never manufacture an "unknown" regime for a
+      // Fast/Deep or BATCH invocation.
+      const payload = event.payload as { featurePacket?: { regime?: unknown }; stages?: unknown };
+      const regime = payload.featurePacket?.regime;
+      if (typeof regime === "string" && regime.length > 0 && regime !== "unknown") {
+        const stages = Array.isArray(payload.stages) ? payload.stages.filter((stage): stage is string => typeof stage === "string") : [];
+        this.regimes[regime] = { source: "ASTRA_DECISION", stage: stages.at(-1) ?? "DECISION" };
+      }
     } else if (type === "CONSENSUS_DECISION" && (event.payload as { authority?: unknown }).authority === "NATIVE_DETERMINISTIC_V1") {
       this.modelCounts.NATIVE_DETERMINISTIC_V1 = (this.modelCounts.NATIVE_DETERMINISTIC_V1 ?? 0) + 1;
       this.modelCosts.NATIVE_DETERMINISTIC_V1 = this.modelCosts.NATIVE_DETERMINISTIC_V1 ?? 0;

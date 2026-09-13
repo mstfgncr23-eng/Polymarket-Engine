@@ -34,7 +34,11 @@ export async function startRuntime(envInput: NodeJS.ProcessEnv = process.env): P
   const oauthBootstrapTokens = resolveOAuthApprovalBootstrap(envInput, env.GROK_MCP_OAUTH_ENABLED);
   const logger = pino({ level: env.LOG_LEVEL, base: { service: "polymarket-engine", tradingMode: "paper" } });
   const journal = createJournal(env, logger);
-  const astraClient = env.ASTRA_ENABLED && env.ASTRA_API_KEY
+  // An active recovered Astra experiment owns its authority even when the
+  // deployment flag changes. The client is still opt-in by key presence; the
+  // engine will fail closed during recovery if that active authority cannot be
+  // satisfied.
+  const astraClient = env.ASTRA_API_KEY
     ? new OpenAIAstraClient({
       apiKey: env.ASTRA_API_KEY, model: env.ASTRA_MODEL,
       reasoning: { FAST: env.ASTRA_FAST_REASONING, DEEP: env.ASTRA_DEEP_REASONING, BATCH: env.ASTRA_BATCH_REASONING },

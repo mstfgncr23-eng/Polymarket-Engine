@@ -92,7 +92,7 @@ export function evaluateExperimentPreflight(input: {
     if (input.env.GROK_ACTIVATION_PROVIDER === "xai" && (!input.env.XAI_API_KEY || !input.env.XAI_MODEL)) {
       blockers.push("XAI_ACTIVATION_UNCONFIGURED");
     }
-  } else if (!nativePaper && input.env.GROK_ACTIVATION_PROVIDER === "noop") {
+  } else if (!nativePaper && !astraPaper && input.env.GROK_ACTIVATION_PROVIDER === "noop") {
     warnings.push("GROK_WAKE_NOT_VALIDATED");
   }
   const blocked = input.reference.filter((item) => isProviderBlocked(item.status));
@@ -120,17 +120,17 @@ export function evaluateExperimentPreflight(input: {
       tokenConfiguredPath: input.tokenConfiguredPath === true,
       genuineEntryQualified: genuineEntries.length,
       manualTokensMonitorOnly: input.tokenConfiguredPath === true && genuineEntries.length === 0,
-      activationProvider: nativePaper ? "native_deterministic" : input.env.GROK_ACTIVATION_PROVIDER,
-      decisionAuthority: nativePaper ? "NATIVE_DETERMINISTIC_V1" : "LEGACY_EXTERNAL",
-      localExecution: nativePaper,
-      externalInference: !nativePaper,
-      grokDisabled: nativePaper,
+      activationProvider: astraPaper ? "openai" : nativePaper ? "native_deterministic" : input.env.GROK_ACTIVATION_PROVIDER,
+      decisionAuthority: astraPaper ? "ASTRA_BRAIN_V1" : nativePaper ? "NATIVE_DETERMINISTIC_V1" : "LEGACY_EXTERNAL",
+      localExecution: astraPaper ? false : nativePaper,
+      externalInference: astraPaper ? true : !nativePaper,
+      grokDisabled: astraPaper || nativePaper,
       grokWakeValidated: false,
       grokResearchRequired: requireGrok,
       experimentMode: mode,
       overloadFailClosed: input.overloadFailClosed === true,
-      mcpRoles: nativePaper ? [] : tokens,
-      missingRoles: nativePaper ? [] : missingRoles,
+      mcpRoles: astraPaper || nativePaper ? [] : tokens,
+      missingRoles: astraPaper || nativePaper ? [] : missingRoles,
       reference: input.reference,
       entryMarkets: entries,
     },
