@@ -11,6 +11,7 @@ import {
   triggerConfigSchema,
   triggerDedupeScopeKey,
   type MarketSnapshot,
+  type ReferenceTick,
   type TriggerEvent,
 } from "@pm/core";
 import { snapshot as fixtureSnapshot } from "./fixtures.js";
@@ -189,6 +190,40 @@ describe("Part 2 Tests B intentional cooldown policy", () => {
     expect(engine.dedupeEntryCount()).toBe(0);
     expect(SAFETY_ESCALATION_KINDS).not.toContain("SCHEDULED_REVIEW");
     expect(triggerDedupeScopeKey("m", "BTC", "BOOK_IMBALANCE")).toBe("m:BTC:BOOK_IMBALANCE");
+  });
+
+  it("resets experiment suppression and review timing without losing feed warm state", () => {
+    let t = Date.parse("2026-08-31T12:00:00.000Z");
+    const engine = new TriggerEngine(triggerConfigSchema.parse({
+      cooldownMs: 60_000, imbalanceThreshold: 0.5, pairCostThreshold: 1,
+      referenceRapidMoveBps: 10, scheduledReviewIntervalMs: 900_000,
+    }), () => new Date(t));
+    const up = book({ marketId: "btc-mkt", tokenId: "btc-up", outcome: "UP", asset: "BTC", asks: [{ price: "0.48", quantity: "10" }] });
+    const down = book({ marketId: "btc-mkt", tokenId: "btc-down", outcome: "DOWN", asset: "BTC", eventId: "down-1", sequence: 2, asks: [{ price: "0.49", quantity: "10" }] });
+    engine.ingestMarket(up);
+    engine.ingestMarket({ ...up, eventId: "up-duplicate", sequence: 3 });
+    expect(engine.dedupeEntryCount()).toBeGreaterThan(0);
+    expect(engine.ingestScheduledReview("review-before")).toHaveLength(1);
+    expect(engine.ingestScheduledReview("review-suppressed")).toHaveLength(0);
+    engine.ingestMarket(down);
+    const firstTick: ReferenceTick = {
+      eventId: "reference-1", traceId: "reference-trace-1", asset: "BTC", symbol: "BTCUSDT", venue: "test",
+      price: "100", quantity: "1", sourceTimestamp: new Date(t).toISOString(), receivedAt: new Date(t).toISOString(), tradeId: "1",
+    };
+    engine.ingestReference(firstTick);
+    const warmReference = engine.referenceWindowTotalEntries();
+    const warmMarkets = engine.marketsForAsset("BTC");
+    expect(warmReference).toBe(1);
+    expect(warmMarkets).toEqual(["btc-mkt"]);
+
+    engine.resetExperimentBoundaryState();
+
+    expect(engine.dedupeEntryCount()).toBe(0);
+    expect(engine.ingestScheduledReview("review-after")).toHaveLength(1);
+    expect(engine.referenceWindowTotalEntries()).toBe(warmReference);
+    expect(engine.marketsForAsset("BTC")).toEqual(warmMarkets);
+    expect(engine.ingestMarket({ ...down, eventId: "down-after-reset", sequence: 4 })
+      .some((item) => item.kind === "PAIR_COST_OPPORTUNITY")).toBe(true);
   });
 });
 

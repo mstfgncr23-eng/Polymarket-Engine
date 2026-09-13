@@ -172,6 +172,7 @@ export async function createApiServer(input: {
   getAlphaResearchContext?(triggerId: string): Record<string, unknown> | null;
   startExperiment?: () => Promise<Record<string, unknown>>;
   closeExperimentEntries?: () => Promise<Record<string, unknown>>;
+  prepareNextExperiment?: () => Promise<Record<string, unknown>>;
   engineReadToken?: string;
   operatorToken?: string;
   metricsToken?: string;
@@ -366,6 +367,15 @@ export async function createApiServer(input: {
     if (!auth.ok) return reply.code(401).send({ error: "ENGINE_OPERATOR_UNAUTHORIZED" });
     if (!input.closeExperimentEntries) return reply.code(503).send({ error: "EXPERIMENT_CLOSE_ENTRIES_UNAVAILABLE" });
     const result = await input.closeExperimentEntries();
+    if (result.ok === false) return reply.code(409).send(result);
+    return result;
+  });
+  app.post("/api/operator/experiment/prepare-next", async (request, reply) => {
+    if (!input.operatorToken) return reply.code(401).send({ error: "ENGINE_OPERATOR_UNAUTHORIZED" });
+    const auth = protect(request, input.operatorToken, true);
+    if (!auth.ok) return reply.code(401).send({ error: "ENGINE_OPERATOR_UNAUTHORIZED" });
+    if (!input.prepareNextExperiment) return reply.code(503).send({ error: "EXPERIMENT_PREPARE_NEXT_UNAVAILABLE" });
+    const result = await input.prepareNextExperiment();
     if (result.ok === false) return reply.code(409).send(result);
     return result;
   });

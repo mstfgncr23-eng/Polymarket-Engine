@@ -328,6 +328,64 @@ describe("PR18 hot operational storage lifecycle", () => {
     expect([...replay.values()].every((row) => row.lifecycleState !== "open")).toBe(true);
   });
 
+  it("closes a prepared replay identity when its prepared experiment starts and bounds repeated turnover", async () => {
+    const journal = new MemoryEventJournal();
+    let cursor = 0;
+    const previousId = "exp-prepared-previous";
+    const nextId = "exp-prepared-next";
+    const preparedInput = {
+      operationKey: `experiment:${previousId}:prepared`, type: "EXPERIMENT_PREPARED", aggregateType: "experiment", aggregateId: previousId,
+      payload: { experiment: { id: nextId, status: "IDLE" }, previousExperimentId: previousId },
+    } as const;
+    const prepared = await journal.commitDurableTransition(preparedInput, cursor);
+    cursor = prepared.sequence;
+    await journal.compactDurableTransitionsThrough(cursor, { maxRows: 1, batchSize: 1, maxReplayKeys: 8, maxBatches: 1, budgetMs: 1000 });
+    const replay = (journal as unknown as { compactedByKey: Map<string, { lifecycleState?: string; scopeId?: string | null }> }).compactedByKey;
+    expect(replay.get(preparedInput.operationKey)).toMatchObject({ lifecycleState: "open", scopeId: nextId });
+
+    const retryBeforeStart = await journal.commitDurableTransition(preparedInput, cursor);
+    expect(retryBeforeStart).toMatchObject({ inserted: false, existing: true, sequence: prepared.sequence });
+    const startedInput = {
+      operationKey: `experiment:${nextId}:started`, type: "EXPERIMENT_STARTED", aggregateType: "experiment", aggregateId: nextId,
+      payload: { experiment: { id: nextId, status: "RUNNING" } },
+    } as const;
+    const started = await journal.commitDurableTransition(startedInput, cursor);
+    cursor = started.sequence;
+    const completedInput = {
+      operationKey: `experiment:${nextId}:completed`, type: "EXPERIMENT_COMPLETED", aggregateType: "experiment", aggregateId: nextId,
+      payload: { experiment: { id: nextId, status: "COMPLETED" } },
+    } as const;
+    const completed = await journal.commitDurableTransition(completedInput, cursor);
+    cursor = completed.sequence;
+    await journal.compactDurableTransitionsThrough(cursor, { maxRows: 10, batchSize: 10, maxReplayKeys: 8, maxBatches: 1, budgetMs: 1000 });
+    expect(replay.get(preparedInput.operationKey)).toMatchObject({ lifecycleState: "closed", scopeId: nextId });
+    expect((await journal.commitDurableTransition(preparedInput, cursor)).existing).toBe(true);
+
+    for (let cycle = 0; cycle < 12; cycle += 1) {
+      const cyclePrevious = `cycle-previous-${cycle}`;
+      const cycleId = `cycle-next-${cycle}`;
+      const cyclePrepared = await journal.commitDurableTransition({
+        operationKey: `experiment:${cyclePrevious}:prepared`, type: "EXPERIMENT_PREPARED", aggregateType: "experiment", aggregateId: cyclePrevious,
+        payload: { experiment: { id: cycleId, status: "IDLE" }, previousExperimentId: cyclePrevious },
+      }, cursor);
+      cursor = cyclePrepared.sequence;
+      const cycleStarted = await journal.commitDurableTransition({
+        operationKey: `experiment:${cycleId}:started`, type: "EXPERIMENT_STARTED", aggregateType: "experiment", aggregateId: cycleId,
+        payload: { experiment: { id: cycleId, status: "RUNNING" } },
+      }, cursor);
+      cursor = cycleStarted.sequence;
+      const cycleCompleted = await journal.commitDurableTransition({
+        operationKey: `experiment:${cycleId}:completed`, type: "EXPERIMENT_COMPLETED", aggregateType: "experiment", aggregateId: cycleId,
+        payload: { experiment: { id: cycleId, status: "COMPLETED" } },
+      }, cursor);
+      cursor = cycleCompleted.sequence;
+      await journal.compactDurableTransitionsThrough(cursor, { maxRows: 3, batchSize: 3, maxReplayKeys: 4, maxBatches: 1, budgetMs: 1000 });
+    }
+    const footprint = journal.storageFootprintForTest();
+    expect(footprint.durable_replay_keys.rows).toBeLessThanOrEqual(4);
+    expect([...replay.values()].every((row) => row.lifecycleState !== "open")).toBe(true);
+  });
+
   it("enforces report-write capability for rollup persistence", async () => {
     const journal = new MemoryEventJournal();
     const rollup = {
@@ -607,6 +665,63 @@ describe("PR18 hot operational storage lifecycle", () => {
     expect(typeof manifest.archiveBundleHash).toBe("string");
     expect((await readFile(result.summaryPath, "utf8")).length).toBeGreaterThan(0);
     expect((await readFile(result.reportPath, "utf8")).length).toBeGreaterThan(0);
+  });
+
+  it.skipIf(!process.env.STEP4_TEST_DATABASE_URL)("PG17 closes prepared replay identities after start without pinning them", { timeout: 30_000 }, async () => {
+    const url = new URL(process.env.STEP4_TEST_DATABASE_URL!);
+    expect(["localhost", "127.0.0.1"]).toContain(url.hostname);
+    const journal = new PostgresEventJournal(process.env.STEP4_TEST_DATABASE_URL!, fileURLToPath(new URL("../packages/db/migrations", import.meta.url)));
+    const suffix = Date.now();
+    const previousId = `pg-prepared-previous-${suffix}`;
+    const nextId = `pg-prepared-next-${suffix}`;
+    const preparedInput = {
+      operationKey: `experiment:${previousId}:prepared`, type: "EXPERIMENT_PREPARED", aggregateType: "experiment", aggregateId: previousId,
+      payload: { experiment: { id: nextId, status: "IDLE" }, previousExperimentId: previousId },
+    } as const;
+    await journal.initialize();
+    const client = (journal as unknown as { client: any }).client;
+    const replayLifecycle = async (operationKey: string): Promise<{ lifecycle_state: string; scope_id: string | null } | undefined> => {
+      const rows = await client`SELECT lifecycle_state, scope_id FROM durable_replay_keys WHERE operation_key = ${operationKey}`;
+      return rows[0] as { lifecycle_state: string; scope_id: string | null } | undefined;
+    };
+    try {
+      let cursor = await journal.latestDurableSequence();
+      const prepared = await journal.commitDurableTransition(preparedInput, cursor);
+      cursor = prepared.sequence;
+      await fencePgRecovery(journal, cursor);
+      await journal.compactDurableTransitionsThrough(cursor, { maxRows: 10_000, batchSize: 10_000, maxReplayKeys: 8, maxBatches: 1, budgetMs: 1000 });
+      expect(await journal.readDurableByOperationKey(preparedInput.operationKey)).toMatchObject({ type: "EXPERIMENT_PREPARED" });
+      expect(await replayLifecycle(preparedInput.operationKey)).toEqual({ lifecycle_state: "open", scope_id: nextId });
+      expect((await journal.commitDurableTransition(preparedInput, cursor)).existing).toBe(true);
+
+      const startedInput = {
+        operationKey: `experiment:${nextId}:started`, type: "EXPERIMENT_STARTED", aggregateType: "experiment", aggregateId: nextId,
+        payload: { experiment: { id: nextId, status: "RUNNING" } },
+      } as const;
+      const started = await journal.commitDurableTransition(startedInput, cursor);
+      cursor = started.sequence;
+      await fencePgRecovery(journal, cursor);
+      await journal.compactDurableTransitionsThrough(cursor, { maxRows: 10_000, batchSize: 10_000, maxReplayKeys: 1, maxBatches: 1, budgetMs: 1000 });
+      expect(await replayLifecycle(preparedInput.operationKey)).toEqual({ lifecycle_state: "closed", scope_id: nextId });
+      expect(await journal.readDurableByOperationKey(preparedInput.operationKey)).toMatchObject({ type: "EXPERIMENT_PREPARED" });
+
+      const closedBeforeChurn = await client`SELECT count(*)::int AS count FROM durable_replay_keys WHERE lifecycle_state <> 'open'`;
+      const churnCount = Number(closedBeforeChurn[0]?.count ?? 0) + 1;
+      for (let index = 0; index < churnCount; index += 1) {
+        const churn = await journal.commitDurableTransition({
+          operationKey: `prepared-churn:${suffix}:${index}`,
+          type: "POSITION_SETTLED", aggregateType: "position", aggregateId: `prepared-churn:${suffix}:${index}`,
+          payload: { marketId: `prepared-churn-market:${suffix}:${index}` },
+        }, cursor);
+        cursor = churn.sequence;
+      }
+      await fencePgRecovery(journal, cursor);
+      await journal.compactDurableTransitionsThrough(cursor, { maxRows: 10_000, batchSize: 10_000, maxReplayKeys: 1, maxBatches: 1, budgetMs: 1000 });
+      expect(await replayLifecycle(preparedInput.operationKey)).toBeUndefined();
+      expect(await journal.readDurableByOperationKey(preparedInput.operationKey)).toBeNull();
+    } finally {
+      await journal.close();
+    }
   });
 
   it("exports a non-empty interim archive for a running experiment using its durable start time", async () => {

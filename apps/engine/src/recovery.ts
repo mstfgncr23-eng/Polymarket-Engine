@@ -28,7 +28,7 @@ import { z, ZodError } from "zod";
  *
  * A  CRITICAL / replay-authoritative (this log is the recovery source):
  *    EXPERIMENT_STARTED, EXPERIMENT_START_VALIDATED, EXPERIMENT_START_ABORTED,
- *    EXPERIMENT_ENTRY_CLOSED, EXPERIMENT_COMPLETED
+ *    EXPERIMENT_PREPARED, EXPERIMENT_ENTRY_CLOSED, EXPERIMENT_COMPLETED
  *    PAPER_MAKER_RESERVED, PAPER_MAKER_RELEASED, PAPER_ORDER_CANCELLED
  *    PAPER_FILL (taker + maker partial/full)
  *    POSITION_SETTLED (includes resolution payoffs; no provider call on replay)
@@ -188,6 +188,11 @@ export function durableIdentityConflicts(
         !== hashDurablePayload(pick(incoming, ["aiCost", "infrastructureCost", "accrualKey"]));
     case "EXPERIMENT_STARTED":
     case "EXPERIMENT_START_VALIDATED":
+    case "EXPERIMENT_START_ABORTED":
+      return false;
+    case "EXPERIMENT_PREPARED":
+      return hashDurablePayload({ previousExperimentId: existing.previousExperimentId ?? null })
+        !== hashDurablePayload({ previousExperimentId: incoming.previousExperimentId ?? null });
     case "EXPERIMENT_ENTRY_CLOSED":
     case "EXPERIMENT_COMPLETED":
     case "LEDGER_MARK_TO_MARKET":
@@ -289,8 +294,13 @@ export function applyDurableTransition(state: RecoverableEngineState, transition
     case "EXPERIMENT_STARTED":
     case "EXPERIMENT_START_VALIDATED":
     case "EXPERIMENT_START_ABORTED":
+    case "EXPERIMENT_PREPARED":
     case "EXPERIMENT_ENTRY_CLOSED":
     case "EXPERIMENT_COMPLETED":
+        if (transition.type === "EXPERIMENT_PREPARED") {
+          applyPreparedExperiment(state, transition.payload);
+          return;
+        }
         state.experiment = experimentManifestSchema.parse(transition.payload.experiment ?? transition.payload);
         if (transition.type === "EXPERIMENT_STARTED") {
           const at = state.experiment.startedAt ? new Date(state.experiment.startedAt) : new Date(transition.occurredAt);
@@ -365,6 +375,58 @@ export function applyDurableTransition(state: RecoverableEngineState, transition
     if (error instanceof RecoveryFailClosedError) throw error;
     throw new RecoveryFailClosedError("malformed", `malformed ${transition.type} seq=${transition.sequence}: ${error instanceof Error ? error.message : String(error)}`);
   }
+}
+
+const preparedExperimentPayloadSchema = z.object({
+  experiment: experimentManifestSchema,
+  previousExperimentId: z.string().min(1).max(160),
+  ledger: ledgerStateSchema,
+  positions: z.array(positionSchema),
+  restingOrders: z.array(restingPaperOrderSchema),
+  makerReservations: z.record(z.string(), z.string()),
+  astraExecutionCorrelations: z.array(astraExecutionCorrelationSchema),
+  settledMarkets: z.array(z.string()),
+  lastInfrastructureAccrualAt: z.number().int().nonnegative(),
+});
+
+function applyPreparedExperiment(state: RecoverableEngineState, raw: Record<string, unknown>): void {
+  const payload = preparedExperimentPayloadSchema.parse(raw);
+  const manifest = payload.experiment;
+  if (manifest.status !== "IDLE" || manifest.startedAt !== null || manifest.entryClosesAt !== null || manifest.completedAt !== null) {
+    throw new RecoveryFailClosedError("invariant", "EXPERIMENT_PREPARED must carry a fresh IDLE manifest");
+  }
+  if (payload.previousExperimentId === manifest.id || payload.positions.length > 0 || payload.restingOrders.length > 0
+    || Object.keys(payload.makerReservations).length > 0 || payload.astraExecutionCorrelations.length > 0 || payload.settledMarkets.length > 0) {
+    throw new RecoveryFailClosedError("invariant", "EXPERIMENT_PREPARED payload is not an empty run baseline");
+  }
+  const ledger = payload.ledger;
+  const starting = d(ledger.startingBalance);
+  if (!starting.gt(0)
+    || ledger.startingBalance !== manifest.startingBalance
+    || !d(ledger.cash).eq(starting)
+    || !d(ledger.reservedCash).eq(0)
+    || !d(ledger.positionValue).eq(0)
+    || !d(ledger.equity).eq(starting)
+    || !d(ledger.realizedPnl).eq(0)
+    || !d(ledger.unrealizedPnl).eq(0)
+    || !d(ledger.grossPnl).eq(0)
+    || !d(ledger.fees).eq(0)
+    || !d(ledger.slippage).eq(0)
+    || !d(ledger.aiCost).eq(0)
+    || !d(ledger.infrastructureCost).eq(0)
+    || !d(ledger.netTradingPnl).eq(0)
+    || !d(ledger.netEconomicPnl).eq(0)
+    || !d(ledger.highWaterMark).eq(starting)
+    || !d(ledger.drawdown).eq(0)) {
+    throw new RecoveryFailClosedError("invariant", "EXPERIMENT_PREPARED payload is not a fresh zeroed ledger");
+  }
+  state.ledger.restore(ledger, []);
+  state.experiment = manifest;
+  state.restingOrders.clear();
+  state.makerReservations.clear();
+  state.astraExecutionCorrelations.clear();
+  state.settledMarkets.clear();
+  state.lastInfrastructureAccrualAt = payload.lastInfrastructureAccrualAt;
 }
 
 function applyFillReservation(
@@ -501,6 +563,7 @@ export const CRITICAL_AUDIT_TYPES = [
   "EXPERIMENT_STARTED",
   "EXPERIMENT_START_VALIDATED",
   "EXPERIMENT_START_ABORTED",
+  "EXPERIMENT_PREPARED",
   "EXPERIMENT_ENTRY_CLOSED",
   "EXPERIMENT_COMPLETED",
   "LEDGER_MARK_TO_MARKET",
