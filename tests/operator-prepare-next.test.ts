@@ -247,7 +247,7 @@ describe("prepare-next paper experiment boundary", () => {
     }
   });
 
-  it("unconditionally fences an old-generation P0 trigger across preparation while preserving same-run hedging", async () => {
+  it("freezes new P0 admission after the prepare drain point and preserves same-run hedging", async () => {
     const test = await setup();
     let releaseReportLoad!: () => void;
     let reportLoadStarted!: () => void;
@@ -255,21 +255,8 @@ describe("prepare-next paper experiment boundary", () => {
     const reportLoadStartedPromise = new Promise<void>((resolve) => { reportLoadStarted = resolve; });
     const originalLoadReport = test.journal.loadExperimentReport.bind(test.journal);
     let heldReportLoad = false;
-    let releaseBlockers!: () => void;
-    const blockerGate = new Promise<void>((resolve) => { releaseBlockers = resolve; });
-    let blockerHoldsEntered!: () => void;
-    const blockerHoldsEnteredPromise = new Promise<void>((resolve) => { blockerHoldsEntered = resolve; });
-    let blockerHoldCount = 0;
-    const blockerHold = {
-      then: (onFulfilled: (value: void) => unknown) => {
-        blockerHoldCount += 1;
-        if (blockerHoldCount === 4) blockerHoldsEntered();
-        return blockerGate.then(onFulfilled);
-      },
-    } as unknown as Promise<void>;
     let stalePending: Promise<void> | undefined;
-    let blockerPendings: Promise<void>[] = [];
-    const stale = p0Trigger("stale");
+    const stale = p0Trigger("stale-after-drain");
     const sameRun = p0Trigger("same-run");
 
     try {
@@ -301,20 +288,18 @@ describe("prepare-next paper experiment boundary", () => {
         return originalLoadReport(experimentId, reportKind);
       };
 
-      test.engine.setProcessTriggerHoldForTest(blockerHold);
       const preparePromise = test.engine.prepareNextExperiment();
       await reportLoadStartedPromise;
 
-      // The prepare operation has already passed its unresolved-work check,
-      // but has not crossed the durable boundary yet. Fill every P0 worker
-      // with old-generation work so the stale trigger remains queued until
-      // the new generation is authoritative.
-      blockerPendings = ["one", "two", "three", "four"].map((suffix) => test.engine.registerTriggerForResearch(p0Trigger(`blocker-${suffix}`, `blocker-${suffix}-mkt`)));
-      await blockerHoldsEnteredPromise;
+      // prepare-next has frozen trigger admission and already observed a stable
+      // zero-unresolved supervisor snapshot. A P0 arriving now must never enter
+      // the supervisor, so there is no await window that can cross the boundary.
       stalePending = test.engine.registerTriggerForResearch(stale);
-      await waitFor(() => test.engine.runtimeSupervisorSnapshot().lanes.p0.queued >= 1);
-      releaseReportLoad();
+      await stalePending;
+      expect(test.engine.runtimeSupervisorSnapshot().unresolved).toBe(0);
+      expect(await test.journal.readTrace(stale.traceId)).toEqual([]);
 
+      releaseReportLoad();
       expect((await preparePromise).ok).toBe(true);
       const next = test.engine.experimentManifest()!;
       expect(next.id).not.toBe(previous.id);
@@ -322,33 +307,61 @@ describe("prepare-next paper experiment boundary", () => {
       expect((await test.engine.beginExperiment()).ok).toBe(true);
       expect(test.engine.experimentManifest()?.status).toBe("RUNNING");
 
-      // Put a fresh-run unpaired position on the same market. The stale P0
-      // trigger must not be able to reinterpret it as its own hedge.
       await test.engine.applyObservedFill({
         ...fill("UP", "0.40", "10"), id: "fresh-run-first-leg", orderId: "fresh-run-first-leg-order",
         marketId: "btc-mkt", tokenId: "btc-up", timestamp: new Date(START_MS).toISOString(),
       });
-      const beforeStaleRelease = test.engine.ledger.snapshot();
-      test.engine.setProcessTriggerHoldForTest(null);
-      releaseBlockers();
-      await Promise.all([...blockerPendings, stalePending]);
-
-      expect(test.engine.ledger.snapshot()).toEqual(beforeStaleRelease);
+      const beforeSameRun = test.engine.ledger.snapshot();
       expect(await test.journal.readTrace(stale.traceId)).toEqual([]);
-      expect(await test.journal.queryEvents({ types: ["ASTRA_DECISION", "RISK_EVALUATION", "PAPER_ORDER_CREATED"], experimentId: next.id })).toEqual([]);
+      expect(test.engine.ledger.snapshot()).toEqual(beforeSameRun);
 
-      // The same P0 hedge in the current generation remains ordinary behavior.
+      // The fence is scoped only to prepare-next. Once the boundary has
+      // completed, current-generation deterministic hedging remains immediate
+      // and does not wait for Astra.
       await test.engine.registerTriggerForResearch(sameRun);
       const sameRunEvents = await test.journal.readTrace(sameRun.traceId);
       expect(sameRunEvents.some((event) => event.type === "ASTRA_DECISION" && event.payload.bypass === "DETERMINISTIC_HEDGE")).toBe(true);
       expect(sameRunEvents.some((event) => event.type === "RISK_EVALUATION")).toBe(true);
     } finally {
-      test.engine.setProcessTriggerHoldForTest(null);
       releaseReportLoad();
-      releaseBlockers();
-      await Promise.all(blockerPendings.map((pending) => pending.catch(() => undefined)));
       await stalePending?.catch(() => undefined);
       test.journal.loadExperimentReport = originalLoadReport;
+      await test.engine.stop();
+    }
+  });
+
+  it("blocks prepare on trigger work admitted before the freeze, then succeeds after that work drains", async () => {
+    const test = await setup();
+    let releaseTrigger!: () => void;
+    const triggerHold = new Promise<void>((resolve) => { releaseTrigger = resolve; });
+    let pending: Promise<void> | undefined;
+
+    try {
+      expect((await test.engine.beginExperiment()).ok).toBe(true);
+      await test.engine.completeExperimentForTest();
+      expect((await test.engine.ensureSourceSealForTest()).sealed).toBe(true);
+      await test.engine.writeFinalReportForTest();
+
+      test.engine.setProcessTriggerHoldForTest(triggerHold);
+      pending = test.engine.registerTriggerForResearch(p0Trigger("pre-freeze-inflight"));
+      await waitFor(() => test.engine.runtimeSupervisorSnapshot().lanes.p0.inFlight === 1);
+
+      const blocked = await test.engine.prepareNextExperiment();
+      expect(blocked).toMatchObject({ ok: false, blockers: ["RUNTIME_WORK_UNRESOLVED"] });
+      expect((await test.journal.queryDurableTransitions({ types: ["EXPERIMENT_PREPARED"], limit: 8 }))).toHaveLength(0);
+
+      test.engine.setProcessTriggerHoldForTest(null);
+      releaseTrigger();
+      await pending;
+      await waitFor(() => test.engine.runtimeSupervisorSnapshot().unresolved === 0);
+
+      const prepared = await test.engine.prepareNextExperiment();
+      expect(prepared).toMatchObject({ ok: true, experiment: { status: "IDLE" } });
+      expect((await test.journal.queryDurableTransitions({ types: ["EXPERIMENT_PREPARED"], limit: 8 }))).toHaveLength(1);
+    } finally {
+      test.engine.setProcessTriggerHoldForTest(null);
+      releaseTrigger();
+      await pending?.catch(() => undefined);
       await test.engine.stop();
     }
   });

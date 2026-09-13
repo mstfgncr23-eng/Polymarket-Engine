@@ -278,6 +278,8 @@ export class EngineService {
   private experimentRunGeneration = 0;
   /** Keeps ingress out of the transient post-commit/start-validation window. */
   private experimentStartPending = false;
+  /** Freezes new trigger admission while prepare-next proves a stable drained boundary. */
+  private experimentPreparePending = false;
   private checkpointSequence = 0;
   private lastAppliedDurableCursor = 0;
   private derivedAuditCursor = 0;
@@ -898,9 +900,14 @@ export class EngineService {
       if (this.state.journalDegraded || this.overload.state === "FAIL_CLOSED" || this.overload.hasIntegrityFault) {
         return { ok: false, blockers: ["JOURNAL_NOT_HEALTHY"], experiment: current };
       }
-      if (this.supervisor.snapshot().unresolved > 0) {
-        return { ok: false, blockers: ["RUNTIME_WORK_UNRESOLVED"], experiment: current };
-      }
+      this.experimentPreparePending = true;
+      try {
+        // Freeze new trigger admission before taking the drain snapshot. Once
+        // unresolved reaches zero it cannot increase again until this prepare
+        // attempt exits, so no old-run trigger can cross the durable boundary.
+        if (this.supervisor.snapshot().unresolved > 0) {
+          return { ok: false, blockers: ["RUNTIME_WORK_UNRESOLVED"], experiment: current };
+        }
       if (this.astraBatchFlight || this.astraBatchPending) {
         return { ok: false, blockers: ["ASTRA_BATCH_FINALIZATION_IN_FLIGHT"], experiment: current };
       }
@@ -995,7 +1002,10 @@ export class EngineService {
           ok: true, experiment: this.experiment, checkpoint: "degraded", warnings: ["CHECKPOINT_DEGRADED"],
         };
       }
-      return { ok: true, experiment: this.experiment, checkpoint: "ok" };
+        return { ok: true, experiment: this.experiment, checkpoint: "ok" };
+      } finally {
+        this.experimentPreparePending = false;
+      }
     });
   }
   /** Test-only view of current entry-feed eligibility. */
@@ -2064,11 +2074,15 @@ export class EngineService {
     if (this.started && !this.state.recoveryComplete) {
       return { admitted: false, reason: "fail_closed", done: Promise.resolve() };
     }
+    const lane = triggerWorkLane(trigger.kind);
+    if (this.experimentPreparePending) {
+      this.metrics.runtimeWorkRejected.inc({ lane, reason: "admission_closed" });
+      return { admitted: false, reason: "admission_closed", done: Promise.resolve() };
+    }
     if (this.sourceSealBlocksAdmission()) {
       return { admitted: false, reason: "source_sealed", done: Promise.resolve() };
     }
     const resolved = provenance ?? this.captureProvenance(trigger);
-    const lane = triggerWorkLane(trigger.kind);
     const marketEpochFence = resolved.kind === "MARKET" && Object.keys(resolved.tokenEpochs).length > 0
       ? new Map(Object.entries(resolved.tokenEpochs))
       : this.captureMarketEpochFence(trigger);
@@ -2144,6 +2158,7 @@ export class EngineService {
     if (runGeneration !== this.experimentRunGeneration) return;
     if (this.processTriggerHold) await this.processTriggerHold;
     if (signal?.aborted) return;
+    if (runGeneration !== this.experimentRunGeneration) return;
     // A trigger emitted while a start is pending cannot begin an active
     // canonical research chain. Existing hedge/settlement obligations remain
     // governed by their normal lane.
@@ -2155,6 +2170,8 @@ export class EngineService {
     this.metrics.triggers.inc({ kind: trigger.kind, severity: String(trigger.severity) });
     this.record(`TRIGGER_LEVEL_${trigger.severity}`, trigger.traceId, trigger.marketId, { triggerId: trigger.id, kind: trigger.kind, asset: trigger.asset ?? null }, trigger.asset ?? null);
     await this.persistReportInput(createJournalEvent({ traceId: trigger.traceId, type: "TRIGGER_EVENT", aggregateType: "trigger", aggregateId: trigger.id, payload: trigger, sourceEventId: trigger.sourceEventIds[0] ?? null }), signal);
+    if (signal?.aborted) return;
+    if (runGeneration !== this.experimentRunGeneration) return;
     this.rememberProvenance(trigger.id, provenance);
     this.activeTriggers.set(trigger.id, trigger);
     if (!this.isProvenanceCurrentlyValid(trigger.id, provenance)) {
