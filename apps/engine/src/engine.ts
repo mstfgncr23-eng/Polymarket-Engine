@@ -134,7 +134,7 @@ import { createGrokActivationBridge } from "./activation/index.js";
 import type { GrokRoleContext, GrokSubmissionMode, RoleRunOutcome } from "./activation/role-runner.js";
 import { HotResearchCache, isScoutRole, SCOUT_ROLES } from "./activation/hot-research-cache.js";
 import { BoundedJournalWriter } from "./journal-writer.js";
-import { AstraBudgetError, AstraDecisionService as EngineAstraDecisionService } from "./astra/service.js";
+import { AstraBudgetError, AstraDeepFailureError, AstraDecisionService as EngineAstraDecisionService, AstraStageAccountingError, type AstraStageSuccess } from "./astra/service.js";
 import { AstraClientError } from "./astra/client.js";
 import { evaluateExperimentPreflight, isGenuineEntryQualifiedMarket } from "./preflight.js";
 import { CrashInjectedError, CrashInjector, type CrashInjectionPoint } from "./crash-injection.js";
@@ -265,6 +265,8 @@ export class EngineService {
   private readonly astraGateState = new Map<string, number>();
   private astraBatchFlight: Promise<void> | null = null;
   private astraBatchPending: Omit<AstraBatchRequest, "stage"> | null = null;
+  private astraBatchAbort: AbortController | null = null;
+  private astraBatchFinalizationPending = false;
   private tokenIds: string[] = [];
   private tokenIdSet = new Set<string>();
   private marketLoopStarted = false;
@@ -369,7 +371,7 @@ export class EngineService {
     this.astraClient = adapters?.astraClient ?? null;
     this.astraMemory = new AstraMemoryStore({
       maxEntries: env.ASTRA_MEMORY_MAX_ENTRIES, maxLessons: env.ASTRA_MEMORY_MAX_LESSONS, maxBytes: env.ASTRA_MEMORY_MAX_BYTES,
-    });
+    }, this.nowFn);
     this.astraBudget = new AstraDailyBudget(env.ASTRA_MAX_DAILY_COST_USD);
     this.astraLearner = new AstraBatchLearner();
     this.astraService = this.astraClient
@@ -381,7 +383,17 @@ export class EngineService {
         memory: this.astraMemory, budget: this.astraBudget,
         maxOutputTokens: {
           FAST: env.ASTRA_FAST_MAX_OUTPUT_TOKENS, DEEP: env.ASTRA_DEEP_MAX_OUTPUT_TOKENS, BATCH: env.ASTRA_BATCH_MAX_OUTPUT_TOKENS,
-        }, inputUsdPerM: env.ASTRA_INPUT_USD_PER_M, outputUsdPerM: env.ASTRA_OUTPUT_USD_PER_M,
+        },
+        inputUsdPerM: env.ASTRA_INPUT_USD_PER_M,
+        cachedInputUsdPerM: env.ASTRA_CACHED_INPUT_USD_PER_M,
+        cacheWriteUsdPerM: env.ASTRA_CACHE_WRITE_USD_PER_M,
+        outputUsdPerM: env.ASTRA_OUTPUT_USD_PER_M,
+        nowFn: this.nowFn,
+        beforeStageDispatch: async (stage) => stage === "BATCH"
+          ? this.canAcceptAstraBatchResult(this.experiment?.id ?? null)
+          : this.ensureFirstLegEntryOpen(),
+        onBudgetChange: (stage) => this.checkpointAstraBudget(stage),
+        onStageSuccess: (input) => this.accountAstraStage(input),
       })
       : null;
     this.marketAdapter = adapters?.market ?? new PolymarketMarketDataAdapter();
@@ -2023,7 +2035,7 @@ export class EngineService {
         // Linearize speculative Astra admission with close-entries. No Astra
         // bookkeeping, gate mutation, model call, or budget reservation may
         // begin after the first-leg window has closed.
-        if (!experimentAllowsFirstLeg(this.experiment)) return;
+        if (!(await this.ensureFirstLegEntryOpen())) return;
         const astraBookkeepingStarted = performance.now();
         this.state.addActivation({
           triggerId: trigger.id, reason: "ASTRA_BRAIN_V1", at: this.nowFn().toISOString(),
@@ -2041,28 +2053,154 @@ export class EngineService {
       });
       return;
     }
-    const nativeBookkeepingStarted = performance.now();
-    this.activation.ensureLatency(trigger);
-    this.state.setActivationLatency(this.activation.snapshot());
-    await this.persistReportInput(createJournalEvent({
-      traceId: trigger.traceId, type: "GROK_ACTIVATION_DECISION", aggregateType: "activation", aggregateId: trigger.id,
-      payload: {
-        triggerId: trigger.id, marketId: trigger.marketId, asset: trigger.asset ?? null,
-        reason: "NATIVE_DETERMINISTIC_ONLY", activate: false, authority: NATIVE_DETERMINISTIC_AUTHORITY,
-      },
-    }));
-    this.state.addActivation({
-      triggerId: trigger.id, reason: "NATIVE_DETERMINISTIC_ONLY", at: this.nowFn().toISOString(),
-      provider: "native_deterministic", grokWakeObserved: false,
+    await this.experimentBoundaryGate.run(async () => {
+      const nativeBookkeepingStarted = performance.now();
+      this.activation.ensureLatency(trigger);
+      this.state.setActivationLatency(this.activation.snapshot());
+      await this.persistReportInput(createJournalEvent({
+        traceId: trigger.traceId, type: "GROK_ACTIVATION_DECISION", aggregateType: "activation", aggregateId: trigger.id,
+        payload: {
+          triggerId: trigger.id, marketId: trigger.marketId, asset: trigger.asset ?? null,
+          reason: "NATIVE_DETERMINISTIC_ONLY", activate: false, authority: NATIVE_DETERMINISTIC_AUTHORITY,
+        },
+      }));
+      this.state.addActivation({
+        triggerId: trigger.id, reason: "NATIVE_DETERMINISTIC_ONLY", at: this.nowFn().toISOString(),
+        provider: "native_deterministic", grokWakeObserved: false,
+      });
+      this.metrics.idleActivationBookkeepingDuration.observe((performance.now() - nativeBookkeepingStarted) / 1000);
+      this.record("NATIVE_DECISION_EVALUATION", trigger.traceId, trigger.marketId, {
+        authority: NATIVE_DETERMINISTIC_AUTHORITY, triggerId: trigger.id, expiresAt: trigger.expiresAt,
+      }, trigger.asset ?? null);
+      await this.evaluateNativeDecisionForTrigger(trigger, provenance);
     });
-    this.metrics.idleActivationBookkeepingDuration.observe((performance.now() - nativeBookkeepingStarted) / 1000);
-    this.record("NATIVE_DECISION_EVALUATION", trigger.traceId, trigger.marketId, {
-      authority: NATIVE_DETERMINISTIC_AUTHORITY, triggerId: trigger.id, expiresAt: trigger.expiresAt,
-    }, trigger.asset ?? null);
-    await this.evaluateNativeDecisionForTrigger(trigger, provenance);
     } finally {
       this.metrics.noteProcessTriggerEnd(started);
     }
+  }
+
+  /**
+   * The entry deadline is an economic admission fence, not merely a
+   * maintenance hint. Callers use this while holding experimentBoundaryGate.
+   */
+  private async ensureFirstLegEntryOpen(): Promise<boolean> {
+    if (experimentAllowsFirstLeg(this.experiment, this.nowFn())) return true;
+    const current = this.experiment;
+    const now = this.nowFn();
+    if (current?.status === "RUNNING" && current.entryClosesAt && now.getTime() >= new Date(current.entryClosesAt).getTime()) {
+      await this.commitExperimentStatus({ ...current, status: "ENTRY_CLOSED", completedAt: null, markToMarketAt: null });
+    }
+    return false;
+  }
+
+  private async checkpointAstraBudget(stage: "FAST" | "DEEP" | "BATCH"): Promise<void> {
+    if (!this.experiment || this.state.database !== "UP") {
+      if (stage !== "BATCH") this.failClosedIntegrity(new Error("ASTRA_BUDGET_CHECKPOINT_UNAVAILABLE"));
+      throw new Error("ASTRA_BUDGET_CHECKPOINT_UNAVAILABLE");
+    }
+    try {
+      await this.checkpoint();
+    } catch (error) {
+      if (stage !== "BATCH") this.failClosedIntegrity(error);
+      throw error;
+    }
+  }
+
+  private canAcceptAstraBatchResult(experimentId: string | null | undefined): boolean {
+    return Boolean(experimentId)
+      && Boolean(this.experiment)
+      && this.experiment?.id === experimentId
+      && this.experiment?.status !== "COMPLETED"
+      && !this.sourceSealing && !this.sourceSealed
+      && !this.astraBatchFinalizationPending;
+  }
+
+  private async accountAstraStage(input: AstraStageSuccess): Promise<boolean> {
+    const experimentId = input.experimentId ?? this.experiment?.id ?? null;
+    if (!experimentId) return false;
+    const occurredAt = this.nowFn();
+    const invocation = createJournalEvent({
+      id: derivedAuditEventId("ASTRA_MODEL_INVOCATION", `${input.traceId}:${input.stage}`),
+      traceId: input.traceId, type: "ASTRA_MODEL_INVOCATION", aggregateType: "astra_invocation", aggregateId: `${input.traceId}:${input.stage}`,
+      occurredAt,
+      payload: {
+        authority: ASTRA_BRAIN_AUTHORITY, stage: input.stage, experimentId,
+        providerRequestId: input.result.providerRequestId,
+        reasoningEffort: input.stage === "FAST" ? this.env.ASTRA_FAST_REASONING : input.stage === "DEEP" ? this.env.ASTRA_DEEP_REASONING : this.env.ASTRA_BATCH_REASONING,
+        latencyMs: input.result.latencyMs ?? null, status: "success", usage: input.result.usage, model: this.env.ASTRA_MODEL,
+      },
+    });
+    if (input.stage === "BATCH") {
+      if (!this.canAcceptAstraBatchResult(experimentId)) return false;
+      if (!(await this.persistAstraBatchAudit([invocation], experimentId))) {
+        // Provider usage is still billable even when the non-economic audit
+        // append is unavailable. Retain the bounded provider cost when the
+        // experiment is still live, but never allow a late fenced result to
+        // mutate the report/ledger after finalization has begun.
+        if (input.result.usage.costUsd > 0 && this.canAcceptAstraBatchResult(experimentId)) {
+          await this.accrueAstraCost(input.result.usage.costUsd, `${input.traceId}:${input.stage}`, occurredAt.toISOString());
+        }
+        return false;
+      }
+      if (!this.canAcceptAstraBatchResult(experimentId)) return false;
+    } else {
+      await this.persistAstraCanonicalBatch([invocation]);
+    }
+    if (input.result.usage.costUsd > 0) {
+      if (input.stage === "BATCH" && !this.canAcceptAstraBatchResult(experimentId)) return false;
+      await this.accrueAstraCost(input.result.usage.costUsd, `${input.traceId}:${input.stage}`, occurredAt.toISOString());
+    }
+    return true;
+  }
+
+  private async persistAstraBatchAudit(events: readonly JournalEvent[], experimentId: string): Promise<boolean> {
+    if (!this.canAcceptAstraBatchResult(experimentId)) return false;
+    const admitted = events.filter((event) => this.isReportInputPersistenceAdmitted(event.type));
+    if (admitted.length === 0) return false;
+    const stamped = admitted.map((event) => ({ ...event, payload: { ...event.payload, experimentId } }));
+    try {
+      await this.journalAdmission.run("consensus", false, async () => {
+        await this.metrics.observeDirectJournal("ASTRA_BATCH", async () => {
+          await this.journal.appendMany(stamped);
+        });
+      }, undefined, { reportInput: true });
+      return true;
+    } catch (error) {
+      // Batch learning is non-economic. Its bounded audit failure is recorded
+      // by the caller and must not latch global trading fail-closed.
+      this.logger.error({ err: error, experimentId, traceId: stamped[0]?.traceId ?? null }, "Astra batch audit append failed");
+      return false;
+    }
+  }
+
+  private async persistAstraDeepFailure(trigger: TriggerEvent, featurePacket: AstraFeaturePacket, error: AstraDeepFailureError): Promise<void> {
+    const marketProbabilityUp = clampProbability((featurePacket.upMid + (1 - featurePacket.downMid)) / 2);
+    const decision: AstraDecision = {
+      authority: ASTRA_BRAIN_AUTHORITY, action: "NO_TRADE", direction: "FLAT",
+      fairProbabilityUp: marketProbabilityUp, confidence: 0, uncertainty: 1,
+      expiresAt: featurePacket.expiresAt, reasonCodes: [error.reason], rationaleCode: error.reason,
+      usage: { inputTokens: 0, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0, costUsd: 0 },
+      providerRequestId: null,
+    };
+    this.metrics.astraFailures.inc({ stage: "DEEP", reason: error.reason });
+    this.metrics.astraFailureTotals.inc({ stage: "DEEP", reason: error.reason });
+    if (error.reason === "DEEP_TIMEOUT") this.metrics.astraTimeouts.inc({ stage: "DEEP" });
+    await this.persistAstraCanonicalBatch([
+      createJournalEvent({
+        id: derivedAuditEventId("ASTRA_FAILURE", trigger.id),
+        traceId: trigger.traceId, type: "ASTRA_FAILURE", aggregateType: "astra", aggregateId: trigger.id,
+        payload: { authority: ASTRA_BRAIN_AUTHORITY, stage: "DEEP", reason: error.reason, decisionSource: "FAIL_CLOSED" },
+      }),
+      createJournalEvent({
+        id: derivedAuditEventId("ASTRA_DECISION", `${trigger.id}:fail-closed`),
+        traceId: trigger.traceId, type: "ASTRA_DECISION", aggregateType: "astra", aggregateId: trigger.id,
+        payload: {
+          authority: ASTRA_BRAIN_AUTHORITY, marketId: trigger.marketId, asset: trigger.asset ?? null,
+          featurePacket, decision, stages: ["FAST", "DEEP"], accepted: false,
+          decisionSource: "FAIL_CLOSED", failureReason: error.reason,
+        },
+      }),
+    ]);
   }
 
   /**
@@ -2133,7 +2271,7 @@ export class EngineService {
     provenance: TriggerProvenance,
     admissionFence: AstraFirstLegAdmissionFence,
   ): Promise<void> {
-    if (!experimentAllowsFirstLeg(this.experiment)) return;
+    if (!(await this.ensureFirstLegEntryOpen())) return;
     if (!this.astraService) {
       this.metrics.astraFailures.inc({ stage: "FAST", reason: "CLIENT_UNAVAILABLE" });
       this.metrics.astraFailureTotals.inc({ stage: "FAST", reason: "CLIENT_UNAVAILABLE" });
@@ -2225,18 +2363,10 @@ export class EngineService {
       consensus.authority = ASTRA_BRAIN_AUTHORITY;
       consensus.featureVector = { ...featurePacket, fairProbabilityUp: result.decision.fairProbabilityUp };
       this.state.latestConsensus = consensus;
-      const batch = result.invocations.map((invocation, index) => createJournalEvent({
-        traceId: trigger.traceId, type: "ASTRA_MODEL_INVOCATION", aggregateType: "astra_invocation", aggregateId: `${trigger.id}:${index}`,
-        payload: {
-          authority: ASTRA_BRAIN_AUTHORITY, stage: result.stages[index], providerRequestId: invocation.providerRequestId,
-          reasoningEffort: result.stages[index] === "FAST" ? this.env.ASTRA_FAST_REASONING : result.stages[index] === "DEEP" ? this.env.ASTRA_DEEP_REASONING : this.env.ASTRA_BATCH_REASONING,
-          latencyMs: invocation.latencyMs ?? null, status: "success", usage: invocation.usage, model: this.env.ASTRA_MODEL,
-        },
-      }));
-      batch.push(createJournalEvent({
+      const batch = [createJournalEvent({
         traceId: trigger.traceId, type: "ASTRA_DECISION", aggregateType: "astra", aggregateId: trigger.id,
         payload: { authority: ASTRA_BRAIN_AUTHORITY, marketId: trigger.marketId, asset, featurePacket, decision: result.decision, stages: result.stages },
-      }));
+      })];
       batch.push(createJournalEvent({
         traceId: trigger.traceId, type: "CONSENSUS_DECISION", aggregateType: "consensus", aggregateId: consensus.id,
         payload: { ...consensus, authority: ASTRA_BRAIN_AUTHORITY, marketId: trigger.marketId, asset },
@@ -2251,10 +2381,6 @@ export class EngineService {
       }));
       await this.persistAstraCanonicalBatch(batch);
       this.metrics.astraJournalBatchSize.observe(batch.length);
-      if (result.decision.usage.costUsd > 0) {
-        await this.accrueAstraCost(result.decision.usage.costUsd, trigger.id, featurePacket.observedAt);
-        await this.checkpoint();
-      }
       await this.evaluateTrade(trigger, consensus, native, ASTRA_BRAIN_AUTHORITY, result.decision, admissionFence);
       this.astraMemory.add({
         id: `astra:${trigger.id}`, marketId: trigger.marketId, ...(asset ? { asset } : {}), regime: featurePacket.regime, kind: "DECISION", createdAt: featurePacket.observedAt, expiresAt: featurePacket.expiresAt,
@@ -2265,13 +2391,17 @@ export class EngineService {
         }, outcome: "OPEN",
       });
     } catch (error) {
+      if (error instanceof AstraDeepFailureError) {
+        await this.persistAstraDeepFailure(trigger, featurePacket, error);
+        return;
+      }
       const type = error instanceof AstraBudgetError ? "ASTRA_BUDGET_BLOCK" : "ASTRA_FAILURE";
       if (error instanceof AstraClientError && error.dispatchState === "DISPATCHED_UNKNOWN") {
         await this.checkpointAstraBudgetAfterUnknownFailure();
       }
       if (error instanceof AstraBudgetError) this.metrics.astraBudgetBlocked.inc();
       else {
-        const stage = error instanceof AstraClientError ? (error.stage ?? "FAST") : "FAST";
+        const stage = error instanceof AstraClientError ? (error.stage ?? "FAST") : error instanceof AstraStageAccountingError ? error.stage : "FAST";
         const timeout = error instanceof AstraClientError && error.message === "ASTRA_REQUEST_TIMEOUT";
         this.metrics.astraFailures.inc({ stage, reason: timeout ? "TIMEOUT" : "MODEL_OR_PERSISTENCE" });
         this.metrics.astraFailureTotals.inc({ stage, reason: "MODEL_OR_PERSISTENCE" });
@@ -2307,9 +2437,11 @@ export class EngineService {
    * with the latest compact aggregate rather than growing a promise queue.
    */
   private scheduleAstraBatchLearn(update: { calibration: { samples: number; brierSum: number; reliability: number }; sampleIds: string[] }, traceId: string): void {
-    if (!this.astraService || !this.astraClient?.learn || this.state.draining) return;
+    const experimentId = this.experiment?.id;
+    if (!this.astraService || !this.astraClient?.learn || this.state.draining || !experimentId || this.astraBatchFinalizationPending || this.sourceSealing || this.sourceSealed) return;
     this.astraBatchPending = {
       traceId,
+      experimentId,
       observedAt: this.nowFn().toISOString(),
       aggregate: {
         sampleIds: update.sampleIds.slice(-64),
@@ -2320,11 +2452,15 @@ export class EngineService {
     };
     if (this.astraBatchFlight) return;
     const run = async (): Promise<void> => {
-      while (this.astraBatchPending && !this.state.draining) {
+      while (this.astraBatchPending && !this.state.draining && !this.astraBatchFinalizationPending) {
         const request = this.astraBatchPending;
         this.astraBatchPending = null;
+        const requestExperimentId = request.experimentId;
+        if (!requestExperimentId) continue;
+        const abort = new AbortController();
+        this.astraBatchAbort = abort;
         try {
-          const result = await this.astraService!.learn(request);
+          const result = await this.astraService!.learn({ ...request, signal: abort.signal });
           if (!result) continue;
           const stage = "BATCH" as const;
           this.metrics.astraInvocations.inc({ stage, status: "success" });
@@ -2336,6 +2472,20 @@ export class EngineService {
           this.metrics.astraReasoningTokens.inc({ stage }, result.usage.reasoningTokens);
           this.metrics.astraCostUsd.inc({ stage }, result.usage.costUsd);
           this.metrics.astraLatencySeconds.observe({ stage }, (result.latencyMs ?? 0) / 1000);
+          if (!this.canAcceptAstraBatchResult(requestExperimentId)) continue;
+          const updateEvent = createJournalEvent({
+            id: derivedAuditEventId("ASTRA_LEARNING_UPDATE", request.traceId),
+            traceId: request.traceId, type: "ASTRA_LEARNING_UPDATE", aggregateType: "astra_learner", aggregateId: requestExperimentId,
+            payload: {
+              authority: ASTRA_BRAIN_AUTHORITY, source: "ASTRA_BATCH_LEARNER", experimentId: requestExperimentId,
+              sampleIds: request.aggregate.sampleIds, sampleCount: request.aggregate.sampleCount,
+              calibration: request.aggregate.calibration, lessons: result.output.lessons,
+            },
+          });
+          if (!(await this.persistAstraBatchAudit([updateEvent], requestExperimentId))) continue;
+          if (!this.canAcceptAstraBatchResult(requestExperimentId)) continue;
+          // Activate new lessons only after the provider result and its audit
+          // have crossed their bounded non-economic durability boundary.
           this.astraLearner.applyLessons(result.output.lessons);
           const now = this.nowFn();
           for (const [index, lesson] of result.output.lessons.entries()) {
@@ -2345,28 +2495,6 @@ export class EngineService {
               summary: `${lesson.scope}:${lesson.lesson}`,
               features: { confidence: lesson.confidence },
             });
-          }
-          await this.persistAstraCanonicalBatch([
-            createJournalEvent({
-              traceId: request.traceId, type: "ASTRA_MODEL_INVOCATION", aggregateType: "astra_invocation", aggregateId: `batch:${request.traceId}`,
-              payload: {
-                authority: ASTRA_BRAIN_AUTHORITY, stage, providerRequestId: result.providerRequestId,
-                reasoningEffort: this.env.ASTRA_BATCH_REASONING, latencyMs: result.latencyMs ?? null,
-                status: "success", usage: result.usage, model: this.env.ASTRA_MODEL,
-              },
-            }),
-            createJournalEvent({
-              traceId: request.traceId, type: "ASTRA_LEARNING_UPDATE", aggregateType: "astra_learner", aggregateId: this.experiment?.id ?? "paper",
-              payload: {
-                authority: ASTRA_BRAIN_AUTHORITY, source: "ASTRA_BATCH_LEARNER",
-                sampleIds: request.aggregate.sampleIds, sampleCount: request.aggregate.sampleCount,
-                calibration: request.aggregate.calibration, lessons: result.output.lessons,
-              },
-            }),
-          ]);
-          if (result.usage.costUsd > 0) {
-            await this.accrueAstraCost(result.usage.costUsd, `batch:${request.traceId}`, request.observedAt);
-            await this.checkpoint();
           }
           this.metrics.astraLearningUpdates.inc({ status: "success" });
           this.metrics.astraMemoryEntries.set(this.astraMemory.counts().entries + this.astraMemory.counts().lessons);
@@ -2394,13 +2522,16 @@ export class EngineService {
           } catch {
             // Batch learning is non-economic; its audit failure must not stop trading.
           }
+        } finally {
+          if (this.astraBatchAbort === abort) this.astraBatchAbort = null;
         }
       }
     };
     this.astraBatchFlight = run().finally(() => {
       this.astraBatchFlight = null;
       const pending = this.astraBatchPending;
-      if (pending && !this.state.draining) {
+      if (this.sourceSealed || this.experiment?.status === "COMPLETED") this.astraBatchFinalizationPending = true;
+      else if (pending && !this.state.draining && !this.astraBatchFinalizationPending) {
         this.astraBatchPending = null;
         this.scheduleAstraBatchLearn({
           calibration: pending.aggregate.calibration,
@@ -2408,6 +2539,29 @@ export class EngineService {
         }, pending.traceId);
       }
     });
+  }
+
+  private async waitForAstraBatchBeforeFinalization(experimentId: string): Promise<void> {
+    if (this.experiment?.id !== experimentId) return;
+    this.astraBatchFinalizationPending = true;
+    this.astraBatchPending = null;
+    const flight = this.astraBatchFlight;
+    if (!flight) {
+      this.astraBatchFinalizationPending = false;
+      return;
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const finished = await Promise.race([
+      flight.then(() => true, () => true),
+      new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), this.env.ASTRA_BATCH_TIMEOUT_MS); }),
+    ]);
+    if (timer) clearTimeout(timer);
+    if (finished) {
+      this.astraBatchFinalizationPending = false;
+      return;
+    }
+    this.astraBatchAbort?.abort("EXPERIMENT_FINALIZING");
+    this.logger.error({ experimentId }, "Astra batch finalization timeout; late result will be discarded");
   }
 
   private async checkpointAstraBudgetAfterUnknownFailure(): Promise<void> {
@@ -2955,7 +3109,7 @@ export class EngineService {
     if (candidate.intent === "OPEN_FIRST_LEG" && this.experimentStartPending) return;
     if (!this.adapterTokenSynchronized(candidate.tokenId)) return;
     if (candidate.intent === "OPEN_FIRST_LEG" && this.overload.state === "FAIL_CLOSED") return;
-    if (candidate.intent === "OPEN_FIRST_LEG" && !experimentAllowsFirstLeg(this.experiment)) return;
+    if (candidate.intent === "OPEN_FIRST_LEG" && !experimentAllowsFirstLeg(this.experiment, this.nowFn())) return;
     if (candidate.intent === "OPEN_FIRST_LEG" && !this.entryQualified.has(candidate.marketId)) return;
     if (candidate.intent === "OPEN_FIRST_LEG" && !this.isMarketSynchronized(candidate.marketId)) return;
     if (candidate.intent === "OPEN_FIRST_LEG" && assetNeedsReliableReference(this.referenceRequired.get(candidate.marketId), this.referenceUnreliable, this.assetByMarket.get(candidate.marketId))) return;
@@ -3020,7 +3174,7 @@ export class EngineService {
         externalSignalsLastMinute: 0,
         lastStrategyTradeAt: this.lastTradeAt,
         duplicateTrade: (this.recentTrades.get(duplicateKey) ?? 0) > now.getTime() - this.riskLimits.strategyCooldownMs,
-        experimentEntryOpen: candidate.intent === "HEDGE_SECOND_LEG" ? experimentAllowsHedge(this.experiment) : experimentAllowsFirstLeg(this.experiment),
+        experimentEntryOpen: candidate.intent === "HEDGE_SECOND_LEG" ? experimentAllowsHedge(this.experiment) : experimentAllowsFirstLeg(this.experiment, now),
         executionErrorsLastHour: this.executionErrors.filter((at) => now.getTime() - at < 3_600_000).length,
         externalRiskRecommendedVeto: false, shuttingDown: this.state.draining,
       },
@@ -3077,7 +3231,7 @@ export class EngineService {
       return;
     }
     if (candidate.intent === "OPEN_FIRST_LEG" && authority === ASTRA_BRAIN_AUTHORITY && astraAdmissionFence) {
-      const rejection = this.astraFirstLegRevalidationRejection(trigger, candidate.marketId, candidate.tokenId, astraAdmissionFence);
+      const rejection = await this.astraFirstLegRevalidationRejection(trigger, candidate.marketId, candidate.tokenId, astraAdmissionFence);
       if (rejection) {
         this.metrics.astraBookRevalidations.inc({ result: "rejected", reason: rejection });
         await this.persistReportInput(createJournalEvent({
@@ -3102,6 +3256,10 @@ export class EngineService {
     astraFirstLegDecision?: AstraFirstLegDecision,
   ): Promise<void> {
     if (intent === "OPEN_FIRST_LEG" && this.experimentStartPending) return;
+    // This is the last economic admission fence. Keep it immediately before
+    // the order-created mutation so a slow risk/journal path cannot turn an
+    // expired first-leg window into a new order.
+    if (intent === "OPEN_FIRST_LEG" && !(await this.ensureFirstLegEntryOpen())) return;
     this.metrics.paperOrders.inc({ type: order.orderType });
     this.record("PAPER_ORDER_CREATED", order.traceId, order.marketId, { orderId: order.id, type: order.orderType, intent }, decisionSnapshot.asset ?? null);
     await this.persistReportInput(createJournalEvent({
@@ -3480,7 +3638,7 @@ export class EngineService {
     if (this.env.GROK_ACTIVATION_PROVIDER !== "xai"
       || this.experiment?.modelConfiguration.authority === NATIVE_DETERMINISTIC_AUTHORITY
       || this.experiment?.status !== "RUNNING"
-      || !experimentAllowsFirstLeg(this.experiment)
+      || !experimentAllowsFirstLeg(this.experiment, this.nowFn())
       || (this.experiment.entryClosesAt !== null && this.nowFn().getTime() >= new Date(this.experiment.entryClosesAt).getTime())) return;
     // No bounded news context is produced by ordinary market/reference
     // ingress. Never spend a call to manufacture a "no news" answer.
@@ -3857,12 +4015,18 @@ export class EngineService {
       const closed: ExperimentManifest = {
         ...next, status: "ENTRY_CLOSED", completedAt: null, markToMarketAt: null,
       };
-      if (this.experiment.status !== "ENTRY_CLOSED") await this.commitExperimentStatus(closed);
+      await this.experimentBoundaryGate.run(async () => {
+        if (this.experiment?.status === "RUNNING") await this.commitExperimentStatus(closed);
+      });
     }
     if (next.status === "COMPLETED" && this.experiment?.status !== "COMPLETED") {
-      await this.commitExperimentStatus(next);
+      await this.experimentBoundaryGate.run(async () => {
+        if (this.experiment?.status !== "COMPLETED") await this.commitExperimentStatus(next);
+      });
     } else if (next.status === "ENTRY_CLOSED" && this.experiment?.status !== "ENTRY_CLOSED" && this.experiment?.status !== "COMPLETED") {
-      await this.commitExperimentStatus(next);
+      await this.experimentBoundaryGate.run(async () => {
+        if (this.experiment?.status !== "ENTRY_CLOSED" && this.experiment?.status !== "COMPLETED") await this.commitExperimentStatus(next);
+      });
     }
     this.syncExperimentWindow();
     const stillOpen = openPositionsRemain(this.ledger.positions.values());
@@ -4181,6 +4345,9 @@ export class EngineService {
   }
 
   private async commitExperimentStatus(next: ExperimentManifest): Promise<void> {
+    if (next.status === "COMPLETED" && this.experiment?.status !== "COMPLETED") {
+      await this.waitForAstraBatchBeforeFinalization(next.id);
+    }
     const type = next.status === "ENTRY_CLOSED" ? "EXPERIMENT_ENTRY_CLOSED"
       : next.status === "COMPLETED" ? "EXPERIMENT_COMPLETED"
       : null;
@@ -4772,11 +4939,13 @@ export class EngineService {
   idleGrokSubmissionCountForTest(): number { return this.idleGrokSubmissions.size; }
   sourceSealStateForTest() { return { sealing: this.sourceSealing, sealed: this.sourceSealed, generation: this.sourceSealGeneration }; }
   async completeExperimentForTest(): Promise<void> {
-    if (!this.experiment) throw new Error("NO_EXPERIMENT");
-    await this.commitExperimentStatus({
-      ...this.experiment,
-      status: "COMPLETED",
-      completedAt: this.nowFn().toISOString(),
+    await this.experimentBoundaryGate.run(async () => {
+      if (!this.experiment) throw new Error("NO_EXPERIMENT");
+      await this.commitExperimentStatus({
+        ...this.experiment,
+        status: "COMPLETED",
+        completedAt: this.nowFn().toISOString(),
+      });
     });
   }
   async ensureSourceSealForTest() {
@@ -5018,12 +5187,12 @@ export class EngineService {
     return false;
   }
 
-  private astraFirstLegRevalidationRejection(
+  private async astraFirstLegRevalidationRejection(
     trigger: TriggerEvent,
     marketId: string,
     tokenId: string,
     fence: AstraFirstLegAdmissionFence,
-  ): string | null {
+  ): Promise<string | null> {
     if (!this.isProvenanceCurrentlyValid(trigger.id, fence.provenance)) return "PROVENANCE_CHANGED";
     if (this.experimentFeedGeneration !== fence.feedGeneration || this.marketEpochFenceStale(fence.marketEpochFence)) return "EPOCH_CHANGED";
     const now = this.nowFn();
@@ -5031,7 +5200,10 @@ export class EngineService {
     if (!this.isTriggerActionable(trigger.id) || !Number.isFinite(expiresAt) || expiresAt <= now.getTime()) return "TRIGGER_EXPIRED";
     if (!this.adapterTokenSynchronized(tokenId)) return "TOKEN_UNSYNCHRONIZED";
     if (!this.isMarketSynchronized(marketId)) return "MARKET_UNSYNCHRONIZED";
-    if (!experimentAllowsFirstLeg(this.experiment)) return "ENTRY_CLOSED";
+    if (!experimentAllowsFirstLeg(this.experiment, now)) {
+      await this.ensureFirstLegEntryOpen();
+      return "ENTRY_CLOSED";
+    }
     const asset = trigger.asset ?? this.assetByMarket.get(marketId);
     if (this.referenceRequired.get(marketId) === true) {
       if (!asset || assetNeedsReliableReference(true, this.referenceUnreliable, asset)) return "REFERENCE_INVALID";

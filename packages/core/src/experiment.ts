@@ -70,11 +70,13 @@ export function refreshExperiment(
   return manifest;
 }
 
-export function experimentAllowsFirstLeg(manifest: ExperimentManifest | null): boolean {
+export function experimentAllowsFirstLeg(manifest: ExperimentManifest | null, now = new Date()): boolean {
   // A durable EXPERIMENT_STARTED row is intentionally pending until the
   // feed/reference validation transition is authoritative.  Legacy manifests
-  // without the optional field remain compatible.
-  return manifest?.status === "RUNNING" && manifest.startValidationPending !== true;
+  // without an entry deadline cannot safely admit a new first leg.
+  if (manifest?.status !== "RUNNING" || manifest.startValidationPending === true || !manifest.entryClosesAt) return false;
+  const deadline = new Date(manifest.entryClosesAt).getTime();
+  return Number.isFinite(deadline) && now.getTime() < deadline;
 }
 
 export function experimentAllowsHedge(manifest: ExperimentManifest | null): boolean {
@@ -196,7 +198,7 @@ Report kind: ${summary.reportKind}
 - Settlement PnL: $${summary.settlementPnlUsd.toFixed(2)}
 - Settlements: ${summary.settlementCount}
 - Unresolved positions: ${summary.unresolvedPositionCount}
-- AI cost (legacy ledger field, should remain $0 without OpenAI): $${summary.aiCostUsd.toFixed(2)}
+- AI cost (durable ledger): $${summary.aiCostUsd.toFixed(2)}
 - Estimated infrastructure cost: $${summary.estimatedInfrastructureCostUsd.toFixed(2)}
 - Economic PnL: $${summary.economicPnlUsd.toFixed(2)}
 - Maximum drawdown: $${summary.maximumDrawdownUsd.toFixed(2)}
@@ -225,7 +227,7 @@ Report kind: ${summary.reportKind}
 - Fees / slippage by market: ${JSON.stringify(summary.feesByMarket)} / ${JSON.stringify(summary.slippageByMarket)}
 - Opportunities / vetoes by market: ${JSON.stringify(summary.opportunitiesByMarket)} / ${JSON.stringify(summary.vetoesByMarket)}
 - Event counts (activity, not PnL) by market / asset: ${JSON.stringify(summary.eventCountByMarket)} / ${JSON.stringify(summary.eventCountByAsset)}
-- OpenAI token cost: $0 (runtime inference is not billed here)
+- Astra/OpenAI model cost: $${(summary.modelCostByAgentUsd.ASTRA_BRAIN_V1 ?? 0).toFixed(2)}
 - Failures: ${JSON.stringify(summary.failureStatistics)}
 
 This report is computed from the append-only decision/accounting journal. Raw high-frequency telemetry is sampled.

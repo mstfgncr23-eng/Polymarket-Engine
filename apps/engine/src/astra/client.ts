@@ -112,7 +112,12 @@ export class OpenAIAstraClient implements AstraClient {
         store: false,
       }, { signal: controller.signal });
       if (!response.output_parsed) throw new AstraClientError("ASTRA_STRUCTURED_OUTPUT_MISSING", request.stage);
-      const output = astraModelOutputSchema.parse(response.output_parsed);
+      let output;
+      try {
+        output = astraModelOutputSchema.parse(response.output_parsed);
+      } catch {
+        throw new AstraClientError("ASTRA_STRUCTURED_OUTPUT_INVALID", request.stage);
+      }
       const usage = response.usage;
       const inputTokens = usage?.input_tokens ?? 0;
       const cachedInputTokens = usage?.input_tokens_details?.cached_tokens ?? 0;
@@ -167,7 +172,12 @@ export class OpenAIAstraClient implements AstraClient {
         store: false,
       }, { signal: controller.signal });
       if (!response.output_parsed) throw new AstraClientError("ASTRA_STRUCTURED_OUTPUT_MISSING", request.stage);
-      const output = astraBatchOutputSchema.parse(response.output_parsed);
+      let output;
+      try {
+        output = astraBatchOutputSchema.parse(response.output_parsed);
+      } catch {
+        throw new AstraClientError("ASTRA_STRUCTURED_OUTPUT_INVALID", request.stage);
+      }
       const usage = response.usage;
       const inputTokens = usage?.input_tokens ?? 0;
       const cachedInputTokens = usage?.input_tokens_details?.cached_tokens ?? 0;

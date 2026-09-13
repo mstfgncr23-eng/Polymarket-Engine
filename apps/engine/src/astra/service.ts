@@ -9,10 +9,19 @@ import {
   type AstraDecisionRequest,
   type AstraDecisionRequestContext,
   type AstraFeaturePacket,
+  type AstraModelOutput,
   type AstraModelResult,
   type AstraStage,
 } from "@pm/core";
 import { AstraClientError, estimateAstraBatchInputTokens, estimateAstraDecisionInputTokens } from "./client.js";
+
+export type AstraBudgetChange = "RESERVE" | "SETTLE" | "REFUND";
+export interface AstraStageSuccess {
+  stage: AstraStage;
+  traceId: string;
+  experimentId?: string | null;
+  result: AstraModelResult | AstraBatchResult;
+}
 
 export interface AstraServiceOptions {
   client: AstraClient;
@@ -23,7 +32,13 @@ export interface AstraServiceOptions {
   budget: AstraDailyBudget;
   maxOutputTokens: Record<AstraStage, number>;
   inputUsdPerM: number;
+  cachedInputUsdPerM?: number;
+  cacheWriteUsdPerM?: number;
   outputUsdPerM: number;
+  nowFn?: () => Date;
+  beforeStageDispatch?: (stage: AstraStage) => Promise<boolean>;
+  onBudgetChange?: (stage: AstraStage, change: AstraBudgetChange) => Promise<void>;
+  onStageSuccess?: (input: AstraStageSuccess) => Promise<boolean | void>;
 }
 
 export type AstraServiceResult = {
@@ -50,7 +65,12 @@ export class AstraDecisionService {
       || input.featurePacket.regime === "VOLATILE"
       || input.featurePacket.regime === "DISLOCATED";
     if (fast.result.output.action !== "NO_TRADE" && highRisk) {
-      const deep = await this.invoke({ ...requestBase, stage: "DEEP", fastProposal: fast.result.output });
+      let deep: { result: AstraModelResult; reservedUsd: number };
+      try {
+        deep = await this.invoke({ ...requestBase, stage: "DEEP", fastProposal: fast.result.output });
+      } catch (error) {
+        throw new AstraDeepFailureError(deepFailureReason(error), fast.result.output);
+      }
       selected = deep.result;
       invocations.push(deep.result);
       stages.push("DEEP");
@@ -81,40 +101,104 @@ export class AstraDecisionService {
   async learn(input: Omit<AstraBatchRequest, "stage">): Promise<AstraBatchResult | null> {
     if (!this.options.client.learn) return null;
     const request: AstraBatchRequest = { ...input, stage: "BATCH" };
-    const now = new Date(request.observedAt);
+    if (this.options.beforeStageDispatch && !(await this.options.beforeStageDispatch("BATCH"))) return null;
+    const now = this.currentTime();
     const inputTokensEstimate = estimateAstraBatchInputTokens(request);
-    const reserve = (inputTokensEstimate / 1_000_000) * this.options.inputUsdPerM
+    const reserve = (inputTokensEstimate / 1_000_000) * this.worstInputRate()
       + (this.options.maxOutputTokens.BATCH / 1_000_000) * this.options.outputUsdPerM;
     if (!this.options.budget.reserve(reserve, now)) throw new AstraBudgetError();
     try {
-      const result = await this.options.client.learn(request);
-      this.options.budget.settle(reserve, result.usage.costUsd, now);
-      return result;
+      await this.notifyBudget(request.stage, "RESERVE");
     } catch (error) {
-      this.options.budget.settle(reserve, this.isUnknownBillableFailure(error) ? reserve : 0, now);
+      this.options.budget.settle(reserve, 0, this.currentTime());
+      await this.notifyBudgetBestEffort(request.stage, "REFUND");
       throw error;
     }
+    let result: AstraBatchResult;
+    try {
+      result = await this.options.client.learn(request);
+    } catch (error) {
+      const unknown = this.isUnknownBillableFailure(error);
+      this.options.budget.settle(reserve, unknown ? reserve : 0, this.currentTime());
+      await this.notifyBudget(request.stage, unknown ? "SETTLE" : "REFUND");
+      throw error;
+    }
+    await this.notifyStageSuccess({ stage: "BATCH", traceId: request.traceId, experimentId: request.experimentId, result });
+    this.options.budget.settle(reserve, result.usage.costUsd, this.currentTime());
+    await this.notifyBudget(request.stage, "SETTLE");
+    return result;
   }
 
   private async invoke(request: AstraDecisionRequest): Promise<{ result: AstraModelResult; reservedUsd: number }> {
-    const now = new Date(request.featurePacket.observedAt);
+    if (this.options.beforeStageDispatch && !(await this.options.beforeStageDispatch(request.stage))) {
+      throw new AstraStageAdmissionError(request.stage);
+    }
+    const now = this.currentTime();
     const inputTokensEstimate = estimateAstraDecisionInputTokens(request);
-    const reserve = (inputTokensEstimate / 1_000_000) * this.options.inputUsdPerM
+    const reserve = (inputTokensEstimate / 1_000_000) * this.worstInputRate()
       + (this.options.maxOutputTokens[request.stage] / 1_000_000) * this.options.outputUsdPerM;
     if (!this.options.budget.reserve(reserve, now)) throw new AstraBudgetError();
     try {
-      const result = await this.options.client.decide(request);
-      this.options.budget.settle(reserve, result.usage.costUsd, now);
-      return { result, reservedUsd: reserve };
+      await this.notifyBudget(request.stage, "RESERVE");
     } catch (error) {
-      this.options.budget.settle(reserve, this.isUnknownBillableFailure(error) ? reserve : 0, now);
+      this.options.budget.settle(reserve, 0, this.currentTime());
+      await this.notifyBudgetBestEffort(request.stage, "REFUND");
       throw error;
     }
+    let result: AstraModelResult;
+    try {
+      result = await this.options.client.decide(request);
+    } catch (error) {
+      const unknown = this.isUnknownBillableFailure(error);
+      this.options.budget.settle(reserve, unknown ? reserve : 0, this.currentTime());
+      await this.notifyBudget(request.stage, unknown ? "SETTLE" : "REFUND");
+      throw error;
+    }
+    await this.notifyStageSuccess({ stage: request.stage, traceId: request.traceId, result });
+    this.options.budget.settle(reserve, result.usage.costUsd, this.currentTime());
+    await this.notifyBudget(request.stage, "SETTLE");
+    return { result, reservedUsd: reserve };
+  }
+
+  private currentTime(): Date { return this.options.nowFn?.() ?? new Date(); }
+  private worstInputRate(): number {
+    return Math.max(this.options.inputUsdPerM, this.options.cachedInputUsdPerM ?? this.options.inputUsdPerM, this.options.cacheWriteUsdPerM ?? this.options.inputUsdPerM);
+  }
+  private async notifyBudget(stage: AstraStage, change: AstraBudgetChange): Promise<void> {
+    await this.options.onBudgetChange?.(stage, change);
+  }
+  private async notifyBudgetBestEffort(stage: AstraStage, change: AstraBudgetChange): Promise<void> {
+    try { await this.notifyBudget(stage, change); } catch { /* original failure remains authoritative */ }
+  }
+  private async notifyStageSuccess(input: AstraStageSuccess): Promise<void> {
+    const accounted = await this.options.onStageSuccess?.(input);
+    if (accounted === false) throw new AstraStageAccountingError(input.stage);
   }
 
   private isUnknownBillableFailure(error: unknown): boolean {
     return !(error instanceof AstraClientError) || error.dispatchState !== "NOT_DISPATCHED";
   }
+}
+
+export class AstraStageAccountingError extends Error {
+  constructor(readonly stage: AstraStage) { super(`ASTRA_STAGE_ACCOUNTING_FAILED:${stage}`); this.name = "AstraStageAccountingError"; }
+}
+
+export class AstraStageAdmissionError extends Error {
+  constructor(readonly stage: AstraStage) { super(`ASTRA_STAGE_ADMISSION_CLOSED:${stage}`); this.name = "AstraStageAdmissionError"; }
+}
+
+export type AstraDeepFailureReason = "DEEP_TIMEOUT" | "DEEP_INVALID_RESPONSE" | "DEEP_FAILED";
+export class AstraDeepFailureError extends Error {
+  constructor(readonly reason: AstraDeepFailureReason, readonly fastProposal: AstraModelOutput) {
+    super(reason); this.name = "AstraDeepFailureError";
+  }
+}
+
+function deepFailureReason(error: unknown): AstraDeepFailureReason {
+  if (error instanceof AstraClientError && error.message === "ASTRA_REQUEST_TIMEOUT") return "DEEP_TIMEOUT";
+  if (error instanceof AstraClientError && ["ASTRA_STRUCTURED_OUTPUT_MISSING", "ASTRA_STRUCTURED_OUTPUT_INVALID"].includes(error.message)) return "DEEP_INVALID_RESPONSE";
+  return "DEEP_FAILED";
 }
 
 export class AstraBudgetError extends Error {

@@ -23,7 +23,10 @@ export type AstraMemoryState = z.infer<typeof astraMemoryStateSchema>;
 export class AstraMemoryStore {
   private entries: AstraMemoryEntry[] = [];
   private lessons: AstraMemoryEntry[] = [];
-  constructor(private readonly limits: { maxEntries: number; maxLessons: number; maxBytes: number }) {}
+  constructor(
+    private readonly limits: { maxEntries: number; maxLessons: number; maxBytes: number },
+    private readonly nowFn: () => Date = () => new Date(),
+  ) {}
   add(entry: AstraMemoryEntry): void {
     const parsed = astraMemoryEntrySchema.parse(entry);
     const target = parsed.kind === "LESSON" ? this.lessons : this.entries;
@@ -32,8 +35,10 @@ export class AstraMemoryStore {
   }
   relevant(limit = 8, match?: { marketId?: string | null; asset?: string | null; regime?: string | null }): AstraMemoryEntry[] {
     const boundedLimit = Math.max(0, Math.min(limit, 32));
-    if (!match) return [...this.entries, ...this.lessons].slice(-boundedLimit).map((entry) => structuredClone(entry));
-    const matching = [...this.entries, ...this.lessons].filter((entry) => {
+    const nowMs = this.nowFn().getTime();
+    const active = [...this.entries, ...this.lessons].filter((entry) => entry.expiresAt === null || new Date(entry.expiresAt).getTime() > nowMs);
+    if (!match) return active.slice(-boundedLimit).map((entry) => structuredClone(entry));
+    const matching = active.filter((entry) => {
       const marketMatch = !match.marketId || !entry.marketId || entry.marketId === match.marketId;
       const assetMatch = !match.asset || !entry.asset || entry.asset === match.asset;
       const regimeMatch = !match.regime || !entry.regime || entry.regime === match.regime;
@@ -83,5 +88,10 @@ export class AstraDailyBudget {
   }
   snapshot(now = new Date()): AstraBudgetState { this.roll(now); return { ...this.state }; }
   restore(state: AstraBudgetState): void { this.state = astraBudgetStateSchema.parse(state); }
-  private roll(now: Date): void { const day = now.toISOString().slice(0, 10); if (this.state.day !== day) this.state = { day, spentUsd: 0, calls: 0 }; }
+  private roll(now: Date): void {
+    const day = now.toISOString().slice(0, 10);
+    // Billing time can move backwards relative to a stale event or a corrected
+    // system clock. Never erase a newer day's conservative spend in that case.
+    if (!this.state.day || day > this.state.day) this.state = { day, spentUsd: 0, calls: 0 };
+  }
 }

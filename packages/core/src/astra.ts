@@ -111,6 +111,8 @@ export interface AstraModelResult {
 export interface AstraBatchRequest {
   stage: "BATCH";
   traceId: string;
+  /** Owning experiment identity used to fence late learning completions. */
+  experimentId?: string | null;
   observedAt: string;
   aggregate: {
     sampleIds: readonly string[];
