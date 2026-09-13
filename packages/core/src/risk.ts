@@ -53,6 +53,7 @@ export function evaluateRisk(input: RiskInput, limits: RiskLimits): RiskEvaluati
   const vetoes: RiskReasonCode[] = [];
   const age = (value: Date | null) => value ? input.now.getTime() - value.getTime() : Number.POSITIVE_INFINITY;
   const hedge = input.intent === "HEDGE_SECOND_LEG";
+  const maxFirstLegOrderSizeUsd = limits.maxFirstLegOrderSizeUsd ?? limits.maxOrderSizeUsd;
   const marketExposure = input.projectedMarketExposureUsd ?? (hedge ? input.marketExposureUsd : d(input.marketExposureUsd).plus(input.orderSizeUsd).toFixed());
   const assetExposure = input.projectedAssetExposureUsd ?? (hedge ? (input.assetExposureUsd ?? "0") : d(input.assetExposureUsd ?? "0").plus(input.orderSizeUsd).toFixed());
   const totalExposure = input.projectedTotalExposureUsd ?? (hedge ? input.totalExposureUsd : d(input.totalExposureUsd).plus(input.orderSizeUsd).toFixed());
@@ -74,6 +75,7 @@ export function evaluateRisk(input: RiskInput, limits: RiskLimits): RiskEvaluati
   if (d(input.dailyPnlUsd).lte(d(limits.maxDailyPaperLossUsd).negated())) vetoes.push("DAILY_LOSS_LIMIT");
   if (d(input.drawdownUsd).gte(limits.maxDrawdownUsd)) vetoes.push("MAX_DRAWDOWN");
   if (d(input.orderSizeUsd).gt(limits.maxOrderSizeUsd)) vetoes.push("MAX_ORDER_SIZE");
+  if (!hedge && d(input.orderSizeUsd).gt(maxFirstLegOrderSizeUsd)) vetoes.push("MAX_FIRST_LEG_ORDER_SIZE");
   if (d(marketExposure).gt(limits.maxMarketExposureUsd)) vetoes.push("MAX_MARKET_EXPOSURE");
   if (d(assetExposure).gt(limits.maxAssetExposureUsd)) vetoes.push("MAX_ASSET_EXPOSURE");
   if (d(totalExposure).gt(limits.maxTotalExposureUsd)) vetoes.push("MAX_TOTAL_EXPOSURE");

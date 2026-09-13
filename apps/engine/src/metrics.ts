@@ -26,7 +26,7 @@ const COUNT_BUCKETS = [1, 2, 5, 10, 25, 50, 100, 250, 800];
 export function classifyJournalMetricClass(type: string): JournalMetricClass {
   if (type.startsWith("TRIGGER_") || type === "GROK_RESEARCH_AVAILABLE") return "trigger";
   if (type.startsWith("GROK_ACTIVATION") || type === "GROK_SIGNAL_ACCEPTED") return "activation";
-  if (type === "CONSENSUS_DECISION" || type === "SEVERE_DISAGREEMENT") return "consensus";
+  if (type === "CONSENSUS_DECISION" || type === "SEVERE_DISAGREEMENT" || type === "BOOK_REVALIDATION_REJECTED" || type.startsWith("ASTRA_")) return "consensus";
   if (
     type.startsWith("PAPER_")
     || type.startsWith("POSITION_")
@@ -55,6 +55,32 @@ export class EngineMetrics {
   readonly triggers = new Counter({ name: "triggers_total", help: "Triggers", labelNames: ["kind", "severity"], registers: [this.registry] });
   readonly mcpInteractions = new Counter({ name: "grok_mcp_interactions_total", help: "Authenticated and rejected Grok MCP interactions", labelNames: ["status", "method"], registers: [this.registry] });
   readonly grokSignals = new Counter({ name: "grok_signals_total", help: "Grok Bot signal submissions", labelNames: ["agent", "status"], registers: [this.registry] });
+  readonly astraInvocations = new Counter({ name: "astra_model_invocations_total", help: "Astra Responses API invocations", labelNames: ["stage", "status"], registers: [this.registry] });
+  readonly astraInvocationTotals = new Counter({ name: "astra_invocations_total", help: "Astra invocations by bounded stage and status", labelNames: ["stage", "status"], registers: [this.registry] });
+  readonly astraTimeouts = new Counter({ name: "astra_timeouts_total", help: "Astra timeouts by bounded stage", labelNames: ["stage"], registers: [this.registry] });
+  readonly astraInputTokens = new Counter({ name: "astra_input_tokens_total", help: "Astra input tokens", labelNames: ["stage"], registers: [this.registry] });
+  readonly astraCachedInputTokens = new Counter({ name: "astra_cached_input_tokens_total", help: "Astra cached input tokens", labelNames: ["stage"], registers: [this.registry] });
+  readonly astraCacheWriteTokens = new Counter({ name: "astra_cache_write_tokens_total", help: "Astra cache-write input tokens", labelNames: ["stage"], registers: [this.registry] });
+  readonly astraOutputTokens = new Counter({ name: "astra_output_tokens_total", help: "Astra output tokens", labelNames: ["stage"], registers: [this.registry] });
+  readonly astraReasoningTokens = new Counter({ name: "astra_reasoning_tokens_total", help: "Astra reasoning token breakdown", labelNames: ["stage"], registers: [this.registry] });
+  readonly astraGateDecisions = new Counter({ name: "astra_opportunity_gate_total", help: "Deterministic Astra gate outcomes", labelNames: ["reason"], registers: [this.registry] });
+  readonly astraGateResults = new Counter({ name: "astra_opportunity_gate_results_total", help: "Deterministic Astra gate results", labelNames: ["result", "reason"], registers: [this.registry] });
+  readonly astraDeepReviews = new Counter({ name: "astra_deep_review_total", help: "Selective Deep review outcomes", labelNames: ["result", "reason"], registers: [this.registry] });
+  readonly astraBookRevalidations = new Counter({ name: "astra_book_revalidation_total", help: "Current-book revalidation outcomes", labelNames: ["result", "reason"], registers: [this.registry] });
+  readonly astraFailures = new Counter({ name: "astra_failures_total", help: "Fail-closed Astra failures by bounded stage and reason", labelNames: ["stage", "reason"], registers: [this.registry] });
+  readonly astraFailureTotals = new Counter({ name: "astra_failures_by_stage_total", help: "Fail-closed Astra failures by bounded stage and reason", labelNames: ["stage", "reason"], registers: [this.registry] });
+  readonly astraBudgetBlocked = new Counter({ name: "astra_budget_blocked_total", help: "Astra calls blocked by daily budget", registers: [this.registry] });
+  readonly astraCostUsd = new Counter({ name: "astra_cost_usd_total", help: "Estimated Astra inference cost by bounded stage", labelNames: ["stage"], registers: [this.registry] });
+  readonly astraLatency = new Histogram({ name: "astra_decision_latency_seconds", help: "Astra decision latency", labelNames: ["stage"], buckets: DURATION_BUCKETS, registers: [this.registry] });
+  readonly astraLatencySeconds = new Histogram({ name: "astra_latency_seconds", help: "Astra latency by bounded stage", labelNames: ["stage"], buckets: DURATION_BUCKETS, registers: [this.registry] });
+  readonly astraJournalBatchSize = new Histogram({ name: "astra_journal_batch_size", help: "Canonical Astra facts committed per barrier", buckets: COUNT_BUCKETS, registers: [this.registry] });
+  readonly astraJournalBatchLatency = new Histogram({ name: "astra_journal_batch_latency_seconds", help: "Canonical Astra batch barrier latency", buckets: DURATION_BUCKETS, registers: [this.registry] });
+  readonly astraJournalCanonicalDropped = new Counter({ name: "astra_journal_canonical_dropped_total", help: "Canonical Astra facts dropped; should remain zero", registers: [this.registry] });
+  readonly astraLearningSamples = new Gauge({ name: "astra_learning_samples", help: "Settled samples in Astra calibration", registers: [this.registry] });
+  readonly astraLearningUpdates = new Counter({ name: "astra_learning_updates_total", help: "Astra bounded learning updates", labelNames: ["status"], registers: [this.registry] });
+  readonly astraMemoryEntries = new Gauge({ name: "astra_memory_entries", help: "Bounded Astra memory entries", registers: [this.registry] });
+  readonly polymarketReconnectDuration = new Histogram({ name: "polymarket_reconnect_duration_seconds", help: "Polymarket close-to-connected recovery duration", buckets: [0.1, 0.5, 1, 2, 5, 10, 30, 60, 300], registers: [this.registry] });
+  readonly polymarketCloseClassifications = new Counter({ name: "polymarket_close_classification_total", help: "Polymarket close classifications", labelNames: ["kind"], registers: [this.registry] });
   readonly paperOrders = new Counter({ name: "paper_orders_total", help: "Paper orders", labelNames: ["type"], registers: [this.registry] });
   readonly paperFills = new Counter({ name: "paper_fills_total", help: "Paper fills", labelNames: ["role"], registers: [this.registry] });
   readonly riskVetoes = new Counter({ name: "risk_veto_total", help: "Risk vetoes", labelNames: ["reason"], registers: [this.registry] });

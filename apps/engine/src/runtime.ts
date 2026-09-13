@@ -4,6 +4,7 @@ import { MemoryEventJournal, PostgresEventJournal, type EventJournal } from "@pm
 import { EngineService, parseEnv } from "./engine.js";
 import { MCP_OAUTH_ROLES } from "./mcp-oauth.js";
 import { createApiServer } from "./server.js";
+import { OpenAIAstraClient } from "./astra/client.js";
 
 export interface Runtime {
   engine: EngineService;
@@ -33,7 +34,17 @@ export async function startRuntime(envInput: NodeJS.ProcessEnv = process.env): P
   const oauthBootstrapTokens = resolveOAuthApprovalBootstrap(envInput, env.GROK_MCP_OAUTH_ENABLED);
   const logger = pino({ level: env.LOG_LEVEL, base: { service: "polymarket-engine", tradingMode: "paper" } });
   const journal = createJournal(env, logger);
-  const engine = new EngineService(env, journal, logger);
+  const astraClient = env.ASTRA_ENABLED && env.ASTRA_API_KEY
+    ? new OpenAIAstraClient({
+      apiKey: env.ASTRA_API_KEY, model: env.ASTRA_MODEL,
+      reasoning: { FAST: env.ASTRA_FAST_REASONING, DEEP: env.ASTRA_DEEP_REASONING, BATCH: env.ASTRA_BATCH_REASONING },
+      timeoutMs: { FAST: env.ASTRA_FAST_TIMEOUT_MS, DEEP: env.ASTRA_DEEP_TIMEOUT_MS, BATCH: env.ASTRA_BATCH_TIMEOUT_MS },
+      maxOutputTokens: { FAST: env.ASTRA_FAST_MAX_OUTPUT_TOKENS, DEEP: env.ASTRA_DEEP_MAX_OUTPUT_TOKENS, BATCH: env.ASTRA_BATCH_MAX_OUTPUT_TOKENS },
+      maxConcurrency: { FAST: env.ASTRA_FAST_MAX_CONCURRENCY, DEEP: env.ASTRA_DEEP_MAX_CONCURRENCY },
+      pricing: { inputUsdPerM: env.ASTRA_INPUT_USD_PER_M, cachedInputUsdPerM: env.ASTRA_CACHED_INPUT_USD_PER_M, cacheWriteUsdPerM: env.ASTRA_CACHE_WRITE_USD_PER_M, outputUsdPerM: env.ASTRA_OUTPUT_USD_PER_M },
+    })
+    : undefined;
+  const engine = new EngineService(env, journal, logger, { astraClient });
   const server = await createApiServer({
     state: engine.state, journal, metrics: engine.metrics, sse: engine.sse,
     dashboardOrigin: env.DASHBOARD_ORIGIN, logger: { level: env.LOG_LEVEL },

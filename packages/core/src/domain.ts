@@ -17,7 +17,7 @@ export function createId(prefix: string): string {
 export const sideSchema = z.enum(["BUY", "SELL"]);
 export const outcomeSchema = z.enum(["UP", "DOWN"]);
 export const directionSchema = z.enum(["UP", "DOWN", "FLAT"]);
-export const decisionAuthoritySchema = z.enum(["NATIVE_DETERMINISTIC_V1", "ALPHA", "LEGACY_EXTERNAL"]);
+export const decisionAuthoritySchema = z.enum(["NATIVE_DETERMINISTIC_V1", "ASTRA_BRAIN_V1", "ALPHA", "LEGACY_EXTERNAL"]);
 export type DecisionAuthority = z.infer<typeof decisionAuthoritySchema>;
 export type Side = z.infer<typeof sideSchema>;
 export type Outcome = z.infer<typeof outcomeSchema>;
@@ -299,6 +299,7 @@ export const riskReasonCodeSchema = z.enum([
   "DAILY_LOSS_LIMIT",
   "MAX_DRAWDOWN",
   "MAX_ORDER_SIZE",
+  "MAX_FIRST_LEG_ORDER_SIZE",
   "MAX_MARKET_EXPOSURE",
   "MAX_TOTAL_EXPOSURE",
   "MAX_DIRECTIONAL_EXPOSURE",

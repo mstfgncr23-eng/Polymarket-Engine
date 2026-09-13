@@ -75,6 +75,9 @@ importers:
       fastify:
         specifier: 5.12.1
         version: 5.12.1
+      openai:
+        specifier: 7.8.0
+        version: 7.8.0(zod@4.5.4)
       pino:
         specifier: 10.3.1
         version: 10.3.1
@@ -2218,6 +2221,30 @@ packages:
   once@1.4.0:
     resolution: {integrity: sha512-lNaJgI+2Q5URQBkccEKHTQOPaXdUxnZZElQTZY0MFUAuaEqe1E+Nyvgdz/aIyNi6Z9MzO5dv1H8n58/GELp3+w==}
 
+  openai@7.8.0:
+    resolution: {integrity: sha512-/2g9JzdnXNcjX1W/UlSNu+OdSFDAaAVt0n9Onom0kPenH54o59G2WrX/xjTnr26UHNSh6hxcAf58doGYRme2rw==}
+    engines: {node: '>=22.0.0'}
+    peerDependencies:
+      '@aws-sdk/credential-provider-node': '>=3.972.0 <4'
+      '@smithy/hash-node': '>=4.3.0 <5'
+      '@smithy/signature-v4': '>=5.4.0 <6'
+      undici: '>=5 <9'
+      ws: ^8.21.0
+      zod: ^3.25 || ^4.0
+    peerDependenciesMeta:
+      '@aws-sdk/credential-provider-node':
+        optional: true
+      '@smithy/hash-node':
+        optional: true
+      '@smithy/signature-v4':
+        optional: true
+      undici:
+        optional: true
+      ws:
+        optional: true
+      zod:
+        optional: true
+
   ox@0.14.43:
     resolution: {integrity: sha512-dbzxFZNi7jzeYkd/IXE3pEISlCbOSb+iVEXzYnb93bI22St/WtoZalRb8z43cwRBaifP9vXzPKG3lISLR2RnxA==}
     peerDependencies:
@@ -4213,6 +4240,10 @@ snapshots:
   once@1.4.0:
     dependencies:
       wrappy: 1.0.2
+
+  openai@7.8.0(zod@4.5.4):
+    optionalDependencies:
+      zod: 4.5.4
 
   ox@0.14.43(typescript@7.0.2)(zod@4.5.4):
     dependencies:

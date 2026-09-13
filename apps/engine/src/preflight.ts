@@ -1,6 +1,6 @@
 import type { EngineEnv } from "@pm/core";
 
-export type ExperimentActivationMode = "MONITOR_ONLY" | "48H_GROK_PAPER_EXPERIMENT" | "48H_NATIVE_PAPER_EXPERIMENT";
+export type ExperimentActivationMode = "MONITOR_ONLY" | "48H_GROK_PAPER_EXPERIMENT" | "48H_NATIVE_PAPER_EXPERIMENT" | "48H_ASTRA_PAPER_EXPERIMENT";
 
 export interface PreflightEntryMarket {
   marketId: string;
@@ -61,6 +61,7 @@ export function evaluateExperimentPreflight(input: {
   const mode = input.mode ?? "MONITOR_ONLY";
   const grokPaper = mode === "48H_GROK_PAPER_EXPERIMENT";
   const nativePaper = mode === "48H_NATIVE_PAPER_EXPERIMENT";
+  const astraPaper = mode === "48H_ASTRA_PAPER_EXPERIMENT";
   const blockers: string[] = [];
   const warnings: string[] = [];
   if (input.env.TRADING_MODE !== "paper") blockers.push("TRADING_MODE_NOT_PAPER");
@@ -69,7 +70,7 @@ export function evaluateExperimentPreflight(input: {
   if (input.bootstrapFailed) blockers.push("UNRESOLVED_BOOTSTRAP_FAILURE");
   const entries = input.entryMarkets ?? [];
   const genuineEntries = entries.filter(isGenuineEntryQualifiedMarket);
-  if (grokPaper || nativePaper) {
+  if (grokPaper || nativePaper || astraPaper) {
     if (genuineEntries.length === 0) blockers.push("NO_ENTRY_QUALIFIED_MARKET");
   } else {
     const hasMarketPath = genuineEntries.length > 0 || input.qualifiedOrManaged > 0 || input.tokenConfiguredPath === true;
@@ -79,7 +80,7 @@ export function evaluateExperimentPreflight(input: {
   const missingRoles = REQUIRED_ROLES.filter((role) => !tokens.includes(role));
   // Native authority is deliberately independent of the legacy Grok/MCP
   // control plane, even when old compatibility flags remain configured.
-  const requireGrok = !nativePaper && (grokPaper || input.env.EXPERIMENT_REQUIRES_GROK);
+  const requireGrok = !nativePaper && !astraPaper && (grokPaper || input.env.EXPERIMENT_REQUIRES_GROK);
   if (requireGrok) {
     if (input.env.GROK_ACTIVATION_PROVIDER === "noop") blockers.push("GROK_ACTIVATION_NOOP");
     // The in-process xAI runtime uses the EngineService binding directly;

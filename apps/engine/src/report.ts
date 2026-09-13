@@ -257,6 +257,15 @@ export class ExperimentSummaryAccumulator {
         this.hedgeDurationSum += duration;
         this.hedgeDurationN += 1;
       }
+    } else if (type === "ASTRA_MODEL_INVOCATION" && (event.payload as { authority?: unknown }).authority === "ASTRA_BRAIN_V1") {
+      const stage = String((event.payload as { stage?: unknown }).stage ?? "DECISION");
+      const usage = (event.payload as { usage?: { costUsd?: number } }).usage;
+      this.modelCounts.ASTRA_BRAIN_V1 = (this.modelCounts.ASTRA_BRAIN_V1 ?? 0) + 1;
+      this.modelCosts.ASTRA_BRAIN_V1 = (this.modelCosts.ASTRA_BRAIN_V1 ?? 0) + (usage?.costUsd ?? 0);
+      const stageKey = `ASTRA_${stage}`;
+      this.modelCounts[stageKey] = (this.modelCounts[stageKey] ?? 0) + 1;
+      this.modelCosts[stageKey] = (this.modelCosts[stageKey] ?? 0) + (usage?.costUsd ?? 0);
+      this.regimes[String((event.payload as { featurePacket?: { regime?: unknown } }).featurePacket?.regime ?? "unknown")] = { stage };
     } else if (type === "CONSENSUS_DECISION" && (event.payload as { authority?: unknown }).authority === "NATIVE_DETERMINISTIC_V1") {
       this.modelCounts.NATIVE_DETERMINISTIC_V1 = (this.modelCounts.NATIVE_DETERMINISTIC_V1 ?? 0) + 1;
       this.modelCosts.NATIVE_DETERMINISTIC_V1 = this.modelCosts.NATIVE_DETERMINISTIC_V1 ?? 0;
@@ -266,6 +275,9 @@ export class ExperimentSummaryAccumulator {
         this.modelCounts[output.agentId] = (this.modelCounts[output.agentId] ?? 0) + 1;
         this.modelCosts[output.agentId] = (this.modelCosts[output.agentId] ?? 0) + (output.usage?.estimatedCostUsd ?? 0);
       }
+    } else if (type === "ASTRA_FAILURE" || type === "ASTRA_BUDGET_BLOCK") {
+      const code = String((event.payload as { reason?: unknown }).reason ?? type);
+      this.failureStatistics[code] = (this.failureStatistics[code] ?? 0) + 1;
     } else if (type === "AGENT_FAILURE") {
       const code = String((event.payload as { code?: unknown }).code ?? "UNKNOWN");
       this.failureStatistics[code] = (this.failureStatistics[code] ?? 0) + 1;

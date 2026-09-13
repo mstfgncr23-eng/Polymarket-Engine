@@ -10,6 +10,8 @@ export interface TelemetryStats {
   pendingWrites: number;
 }
 
+export interface CanonicalBatchStats { batches: number; events: number; }
+
 export class BoundedJournalWriter {
   private readonly queue: JournalEvent[] = [];
   private pendingWrites = 0;
@@ -18,6 +20,8 @@ export class BoundedJournalWriter {
   private flushed = 0;
   private flushing = false;
   private sampleCounter = 0;
+  private canonicalBatches = 0;
+  private canonicalEvents = 0;
 
   constructor(
     private readonly journal: EventJournal,
@@ -37,6 +41,21 @@ export class BoundedJournalWriter {
 
   stats(): TelemetryStats {
     return { queued: this.queue.length, dropped: this.dropped, sampled: this.sampled, flushed: this.flushed, pendingWrites: this.pendingWrites };
+  }
+
+  canonicalStats(): CanonicalBatchStats { return { batches: this.canonicalBatches, events: this.canonicalEvents }; }
+
+  /**
+   * Writes a bounded canonical batch behind the same caller-owned admission
+   * barrier as the individual decision path. Economic callers await this
+   * method before an order can be submitted; it is never sampled or dropped.
+   */
+  async persistCanonicalBatch(events: readonly JournalEvent[]): Promise<void> {
+    if (events.length === 0) return;
+    if (events.some((event) => !isReportInputEventType(event.type))) throw new Error("CANONICAL_BATCH_CONTAINS_NON_REPORT_INPUT");
+    await this.journal.appendMany(events);
+    this.canonicalBatches += 1;
+    this.canonicalEvents += events.length;
   }
 
   async persist(event: JournalEvent): Promise<void> {

@@ -16,6 +16,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "smoke": "pnpm --filter @pm/engine smoke",
+    "smoke:astra": "pnpm --filter @pm/engine smoke:astra",
     "smoke:live": "pnpm --filter @pm/engine smoke:live",
     "experiment:start": "pnpm --filter @pm/engine experiment:start",
     "report": "pnpm --filter @pm/engine report",
