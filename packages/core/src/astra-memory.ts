@@ -79,7 +79,7 @@ export class AstraDailyBudget {
     this.roll(now);
     const reserved = Math.max(0, reservedUsd);
     const actual = Math.max(0, actualUsd);
-    this.state.spentUsd = Math.max(0, this.state.spentUsd - reserved + actual);
+    this.state.spentUsd = Math.min(this.maxUsd, Math.max(0, this.state.spentUsd - reserved + actual));
   }
   snapshot(now = new Date()): AstraBudgetState { this.roll(now); return { ...this.state }; }
   restore(state: AstraBudgetState): void { this.state = astraBudgetStateSchema.parse(state); }

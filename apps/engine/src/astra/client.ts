@@ -13,6 +13,53 @@ import {
   type AstraUsage,
 } from "@pm/core";
 
+const FAST_SYSTEM_PROMPT = "You are Astra Brain V1 Fast. Return only the requested structured economic decision. Use BUY_UP, BUY_DOWN, or NO_TRADE. Do not invent missing facts or expose chain-of-thought.";
+const DEEP_SYSTEM_PROMPT = "You are Astra Brain V1 Deep Review. Return only the requested structured economic decision. Treat the exact Fast proposal as a proposal to audit: explicitly challenge it, look for reasons it is wrong, and then confirm it, veto it with NO_TRADE, or flip its direction. Do not invent missing facts or expose chain-of-thought.";
+const BATCH_SYSTEM_PROMPT = "You are Astra Batch Learner V1. Return only a bounded list of concise lessons as structured output. Do not change configuration or risk policy. Do not invent missing facts.";
+
+function decisionTask(request: AstraDecisionRequest): Record<string, unknown> {
+  return {
+    task: "Evaluate this already-gated binary-market opportunity.",
+    stage: request.stage,
+    featurePacket: request.featurePacket,
+    memory: request.memory.slice(-8),
+    portfolio: request.portfolio,
+    ...(request.stage === "DEEP" ? { fastProposal: request.fastProposal } : {}),
+  };
+}
+
+function boundedInputTokenUpperBound(value: unknown): number {
+  // UTF-8 byte count is a conservative token upper bound for the bounded
+  // request payload; the envelope margin covers SDK serialization overhead.
+  return Math.ceil(Buffer.byteLength(JSON.stringify(value), "utf8") * 1.25) + 512;
+}
+
+export function estimateAstraDecisionInputTokens(request: AstraDecisionRequest): number {
+  return boundedInputTokenUpperBound({
+    prompt_cache_key: `astra-brain-v1:${request.stage}`,
+    input: [
+      { role: "system", content: request.stage === "DEEP" ? DEEP_SYSTEM_PROMPT : FAST_SYSTEM_PROMPT },
+      { role: "user", content: JSON.stringify(decisionTask(request)) },
+    ],
+    text: { format: zodTextFormat(astraModelOutputSchema, "astra_decision") },
+  });
+}
+
+export function estimateAstraBatchInputTokens(request: AstraBatchRequest): number {
+  return boundedInputTokenUpperBound({
+    prompt_cache_key: "astra-brain-v1:BATCH",
+    input: [
+      { role: "system", content: BATCH_SYSTEM_PROMPT },
+      { role: "user", content: JSON.stringify({
+        task: "Summarize compact settled-outcome statistics into reusable lessons.",
+        stage: "BATCH",
+        aggregate: request.aggregate,
+      }) },
+    ],
+    text: { format: zodTextFormat(astraBatchOutputSchema, "astra_batch_lessons") },
+  });
+}
+
 export interface AstraOpenAIOptions {
   apiKey: string;
   model: string;
@@ -51,24 +98,14 @@ export class OpenAIAstraClient implements AstraClient {
     try {
       if (request.signal?.aborted) throw new AstraClientError("ASTRA_REQUEST_ABORTED", request.stage, "NOT_DISPATCHED");
       if (lease.remainingMs <= 0) throw new AstraClientError("ASTRA_REQUEST_TIMEOUT", request.stage, "NOT_DISPATCHED");
-      const task = {
-        task: "Evaluate this already-gated binary-market opportunity.",
-        stage: request.stage,
-        featurePacket: request.featurePacket,
-        memory: request.memory.slice(-8),
-        portfolio: request.portfolio,
-        ...(request.stage === "DEEP" ? { fastProposal: request.fastProposal } : {}),
-      };
       dispatched = true;
       const response = await this.client.responses.parse({
         model: this.options.model,
         prompt_cache_key: `astra-brain-v1:${request.stage}`,
         reasoning: { effort: this.options.reasoning[request.stage] },
         input: [
-          { role: "system", content: request.stage === "DEEP"
-            ? "You are Astra Brain V1 Deep Review. Return only the requested structured economic decision. Treat the exact Fast proposal as a proposal to audit: explicitly challenge it, look for reasons it is wrong, and then confirm it, veto it with NO_TRADE, or flip its direction. Do not invent missing facts or expose chain-of-thought."
-            : "You are Astra Brain V1 Fast. Return only the requested structured economic decision. Use BUY_UP, BUY_DOWN, or NO_TRADE. Do not invent missing facts or expose chain-of-thought." },
-          { role: "user", content: JSON.stringify(task) },
+          { role: "system", content: request.stage === "DEEP" ? DEEP_SYSTEM_PROMPT : FAST_SYSTEM_PROMPT },
+          { role: "user", content: JSON.stringify(decisionTask(request)) },
         ],
         text: { format: zodTextFormat(astraModelOutputSchema, "astra_decision") },
         max_output_tokens: this.options.maxOutputTokens[request.stage],
@@ -118,7 +155,7 @@ export class OpenAIAstraClient implements AstraClient {
         prompt_cache_key: "astra-brain-v1:BATCH",
         reasoning: { effort: this.options.reasoning.BATCH },
         input: [
-          { role: "system", content: "You are Astra Batch Learner V1. Return only a bounded list of concise lessons as structured output. Do not change configuration or risk policy. Do not invent missing facts." },
+          { role: "system", content: BATCH_SYSTEM_PROMPT },
           { role: "user", content: JSON.stringify({
             task: "Summarize compact settled-outcome statistics into reusable lessons.",
             stage: "BATCH",

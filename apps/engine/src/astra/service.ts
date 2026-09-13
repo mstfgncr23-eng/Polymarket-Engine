@@ -12,7 +12,7 @@ import {
   type AstraModelResult,
   type AstraStage,
 } from "@pm/core";
-import { AstraClientError } from "./client.js";
+import { AstraClientError, estimateAstraBatchInputTokens, estimateAstraDecisionInputTokens } from "./client.js";
 
 export interface AstraServiceOptions {
   client: AstraClient;
@@ -82,7 +82,7 @@ export class AstraDecisionService {
     if (!this.options.client.learn) return null;
     const request: AstraBatchRequest = { ...input, stage: "BATCH" };
     const now = new Date(request.observedAt);
-    const inputTokensEstimate = Math.ceil(JSON.stringify(request.aggregate).length / 4);
+    const inputTokensEstimate = estimateAstraBatchInputTokens(request);
     const reserve = (inputTokensEstimate / 1_000_000) * this.options.inputUsdPerM
       + (this.options.maxOutputTokens.BATCH / 1_000_000) * this.options.outputUsdPerM;
     if (!this.options.budget.reserve(reserve, now)) throw new AstraBudgetError();
@@ -98,7 +98,7 @@ export class AstraDecisionService {
 
   private async invoke(request: AstraDecisionRequest): Promise<{ result: AstraModelResult; reservedUsd: number }> {
     const now = new Date(request.featurePacket.observedAt);
-    const inputTokensEstimate = Math.ceil(JSON.stringify({ featurePacket: request.featurePacket, memory: request.memory, portfolio: request.portfolio }).length / 4);
+    const inputTokensEstimate = estimateAstraDecisionInputTokens(request);
     const reserve = (inputTokensEstimate / 1_000_000) * this.options.inputUsdPerM
       + (this.options.maxOutputTokens[request.stage] / 1_000_000) * this.options.outputUsdPerM;
     if (!this.options.budget.reserve(reserve, now)) throw new AstraBudgetError();
