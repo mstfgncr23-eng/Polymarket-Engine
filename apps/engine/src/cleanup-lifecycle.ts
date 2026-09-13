@@ -43,9 +43,10 @@ interface ExperimentRow {
   completedAt: string | null;
   abortedAt: string | null;
   validatedAt: string | null;
+  preparedAt: string | null;
 }
 
-const LIFECYCLE_TYPES = ["EXPERIMENT_STARTED", "EXPERIMENT_START_VALIDATED", "EXPERIMENT_START_ABORTED", "EXPERIMENT_ENTRY_CLOSED", "EXPERIMENT_COMPLETED"] as const;
+const LIFECYCLE_TYPES = ["EXPERIMENT_STARTED", "EXPERIMENT_START_VALIDATED", "EXPERIMENT_START_ABORTED", "EXPERIMENT_PREPARED", "EXPERIMENT_ENTRY_CLOSED", "EXPERIMENT_COMPLETED"] as const;
 
 function experimentIdFromPayload(payload: Record<string, unknown>, aggregateId: string): string | null {
   const nested = payload.experiment;
@@ -66,7 +67,8 @@ function startedAtFrom(payload: Record<string, unknown>, occurredAt: string): st
 }
 
 function applyLifecycleEvent(byId: Map<string, ExperimentRow>, type: string, id: string, occurredAt: string, payload: Record<string, unknown>): void {
-  const current = byId.get(id) ?? { id, startedAt: null, entryClosedAt: null, completedAt: null, abortedAt: null, validatedAt: null };
+  const current = byId.get(id) ?? { id, startedAt: null, entryClosedAt: null, completedAt: null, abortedAt: null, validatedAt: null, preparedAt: null };
+  if (type === "EXPERIMENT_PREPARED") current.preparedAt = current.preparedAt ?? occurredAt;
   if (type === "EXPERIMENT_STARTED") current.startedAt = current.startedAt ?? startedAtFrom(payload, occurredAt);
   if (type === "EXPERIMENT_START_VALIDATED") current.validatedAt = current.validatedAt ?? occurredAt;
   if (type === "EXPERIMENT_ENTRY_CLOSED") current.entryClosedAt = current.entryClosedAt ?? occurredAt;
@@ -95,7 +97,7 @@ async function loadDurableExperimentRows(journal: EventJournal): Promise<{ rows:
           const completedAt = status === "COMPLETED" && typeof experiment?.completedAt === "string" ? experiment.completedAt : null;
           const abortedAt = status === "ABORTED_START" && typeof experiment?.abortedAt === "string" ? experiment.abortedAt : null;
           const validatedAt = status !== "ABORTED_START" && status !== "IDLE" ? (typeof experiment?.startValidatedAt === "string" ? experiment.startValidatedAt : startedAt) : null;
-          byId.set(id, { id, startedAt, entryClosedAt, completedAt, abortedAt, validatedAt });
+          byId.set(id, { id, startedAt, entryClosedAt, completedAt, abortedAt, validatedAt, preparedAt: null });
         }
         const cursorValue = payload.durableCursor;
         const cursor = typeof cursorValue === "number" && Number.isInteger(cursorValue) ? cursorValue : checkpoint.sequence;
@@ -132,7 +134,7 @@ async function loadDurableExperimentRows(journal: EventJournal): Promise<{ rows:
 
 async function loadJournalExperimentRows(journal: EventJournal): Promise<ExperimentRow[] | null> {
   try {
-    const startedPage = await pageJournalEventsByTypes(journal, ["EXPERIMENT_STARTED", "EXPERIMENT_START_VALIDATED", "EXPERIMENT_START_ABORTED"]);
+    const startedPage = await pageJournalEventsByTypes(journal, ["EXPERIMENT_STARTED", "EXPERIMENT_START_VALIDATED", "EXPERIMENT_START_ABORTED", "EXPERIMENT_PREPARED"]);
     const closedPage = await pageJournalEventsByTypes(journal, ["EXPERIMENT_ENTRY_CLOSED"]);
     const completedPage = await pageJournalEventsByTypes(journal, ["EXPERIMENT_COMPLETED"]);
     if (startedPage.overflow || closedPage.overflow || completedPage.overflow) return null;
@@ -153,6 +155,7 @@ function stateFor(row: ExperimentRow): Exclude<CleanupLifecycleState, "PROVEN_NO
   if (row.completedAt) return "COMPLETED";
   if (row.entryClosedAt) return "ACTIVE_ENTRY_CLOSED";
   if (row.startedAt) return "ACTIVE_RUNNING";
+  if (row.preparedAt) return "IDLE";
   return "IDLE";
 }
 
@@ -202,8 +205,8 @@ function chooseRow(rows: ExperimentRow[], hintId: string | null): { chosen: Expe
   if (active.length === 1) return { chosen: active[0]!, state: stateFor(active[0]!) };
   if (rows.length === 0) return { chosen: null, state: "PROVEN_NO_ACTIVE_EXPERIMENT" };
   const chosen = rows.reduce((latest, row) => {
-    const t = Date.parse(row.completedAt ?? row.entryClosedAt ?? row.startedAt ?? "") || 0;
-    const lt = Date.parse(latest.completedAt ?? latest.entryClosedAt ?? latest.startedAt ?? "") || 0;
+    const t = Date.parse(row.completedAt ?? row.entryClosedAt ?? row.startedAt ?? row.preparedAt ?? "") || 0;
+    const lt = Date.parse(latest.completedAt ?? latest.entryClosedAt ?? latest.startedAt ?? latest.preparedAt ?? "") || 0;
     return t >= lt ? row : latest;
   });
   return { chosen, state: stateFor(chosen) };

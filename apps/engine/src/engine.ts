@@ -87,6 +87,7 @@ import {
   DurableCursorBehindError,
   IdempotencyConflictError,
   isCanonicalFinalReport,
+  hashExperimentReport,
   JournalAppendAbortedError,
   isJournalAppendAbortedError,
   isJournalAppendDeadlineError,
@@ -273,6 +274,8 @@ export class EngineService {
   private experiment: ExperimentManifest | null = null;
   /** Monotonic fence for feed/discovery invalidations racing experiment start. */
   private experimentFeedGeneration = 0;
+  /** Generation fence preventing pre-boundary trigger work from entering the next run. */
+  private experimentRunGeneration = 0;
   /** Keeps ingress out of the transient post-commit/start-validation window. */
   private experimentStartPending = false;
   private checkpointSequence = 0;
@@ -728,7 +731,8 @@ export class EngineService {
       if (!gatedPreflight.ok) return { ...gatedPreflight, ok: false };
       const now = this.nowFn();
       const next = startExperiment({
-        id: undefined, durationHours: this.env.EXPERIMENT_DURATION_HOURS, strategyVersion: this.strategy.version,
+        id: this.experiment?.status === "IDLE" ? this.experiment.id : undefined,
+        durationHours: this.env.EXPERIMENT_DURATION_HOURS, strategyVersion: this.strategy.version,
         riskConfiguration: this.riskLimits,
         modelConfiguration: this.modelConfiguration(),
         startingBalance: this.ledger.snapshot().startingBalance, systemVersion: "0.1.0",
@@ -863,6 +867,135 @@ export class EngineService {
       };
       await this.commitExperimentStatus(closed);
       return { ok: true, experiment: this.experiment };
+    });
+  }
+
+  /**
+   * Advance a completed experiment to a new, durable IDLE baseline. The
+   * previous report and lifecycle remain historical authority; this boundary
+   * only becomes visible after EXPERIMENT_PREPARED is committed.
+   */
+  async prepareNextExperiment(): Promise<Record<string, unknown>> {
+    return this.experimentBoundaryGate.run(async () => {
+      const current = this.experiment;
+      if (!current) return { ok: false, blockers: ["NO_CURRENT_EXPERIMENT"], experiment: current };
+      if (current.status !== "COMPLETED") {
+        return { ok: false, blockers: ["EXPERIMENT_NOT_COMPLETED"], experiment: current };
+      }
+      if (!this.state.recoveryComplete) {
+        return { ok: false, blockers: ["RECOVERY_NOT_READY"], experiment: current };
+      }
+      if (this.state.database !== "UP") {
+        return { ok: false, blockers: ["POSTGRES_UNHEALTHY"], experiment: current };
+      }
+      try {
+        if (!(await this.journal.healthCheck())) {
+          return { ok: false, blockers: ["POSTGRES_UNHEALTHY"], experiment: current };
+        }
+      } catch {
+        return { ok: false, blockers: ["POSTGRES_UNHEALTHY"], experiment: current };
+      }
+      if (this.state.journalDegraded || this.overload.state === "FAIL_CLOSED" || this.overload.hasIntegrityFault) {
+        return { ok: false, blockers: ["JOURNAL_NOT_HEALTHY"], experiment: current };
+      }
+      if (this.supervisor.snapshot().unresolved > 0) {
+        return { ok: false, blockers: ["RUNTIME_WORK_UNRESOLVED"], experiment: current };
+      }
+      if (this.astraBatchFlight || this.astraBatchPending) {
+        return { ok: false, blockers: ["ASTRA_BATCH_FINALIZATION_IN_FLIGHT"], experiment: current };
+      }
+      if (this.sourceSealPersistInFlight || this.sourceSealFlight) {
+        return { ok: false, blockers: ["SOURCE_SEAL_IN_FLIGHT"], experiment: current };
+      }
+
+      const report = await this.journal.loadExperimentReport(current.id, "final");
+      if (!report) return { ok: false, blockers: ["FINAL_REPORT_MISSING"], experiment: current };
+      if (!isCanonicalFinalReport(report)) {
+        return { ok: false, blockers: ["FINAL_REPORT_NOT_COMPLETE"], experiment: current };
+      }
+      if (report.experimentId !== current.id || report.contentHash !== hashExperimentReport(report)) {
+        return { ok: false, blockers: ["FINAL_REPORT_INVALID"], experiment: current };
+      }
+      const seal = await loadSourceSeal(this.journal, current.id);
+      const sealPayload = seal?.payload as { experimentId?: unknown; startedAt?: unknown; completedAt?: unknown; sealed?: unknown } | undefined;
+      if (!seal || sealPayload?.sealed !== true || sealPayload.experimentId !== current.id
+        || sealPayload.startedAt !== current.startedAt || sealPayload.completedAt !== current.completedAt) {
+        return { ok: false, blockers: ["SOURCE_SEAL_MISSING"], experiment: current };
+      }
+      const unresolvedIntegrity = await loadUnresolvedReportSourceIntegrity(this.journal, current.id);
+      if (unresolvedIntegrity.length > 0) {
+        return { ok: false, blockers: ["REPORT_SOURCE_INTEGRITY_UNRESOLVED"], experiment: current };
+      }
+      const reportedSummary = report.canonicalSummary;
+      if (Number(reportedSummary.unresolvedPositionCount ?? 0) > 0 || Number(reportedSummary.incompleteUnhedgedPositions ?? 0) > 0) {
+        return { ok: false, blockers: ["REPORT_HAS_UNRESOLVED_OBLIGATIONS"], experiment: current };
+      }
+
+      const ledger = this.ledger.snapshot();
+      const openPositions = [...this.ledger.positions.values()].filter((position) => d(position.upQuantity).gt(0) || d(position.downQuantity).gt(0));
+      const restingOrders = [...this.restingOrders.values()].filter((order) => d(order.remaining).gt(0));
+      const makerReservations = [...this.makerReservations.entries()].filter(([, amount]) => d(amount).gt(0));
+      const blockers: string[] = [];
+      if (openPositions.length > 0 || this.ledger.positions.size > 0) blockers.push("OPEN_POSITIONS_REMAIN");
+      if (restingOrders.length > 0 || this.restingOrders.size > 0) blockers.push("RESTING_ORDERS_REMAIN");
+      if (makerReservations.length > 0 || this.makerReservations.size > 0) blockers.push("MAKER_RESERVATIONS_REMAIN");
+      if (!d(ledger.reservedCash).eq(0)) blockers.push("RESERVED_CASH_REMAIN");
+      if (this.obligationMarketIds().size > 0) blockers.push("UNRESOLVED_ECONOMIC_OBLIGATIONS");
+      if (blockers.length > 0) return { ok: false, blockers, experiment: current };
+
+      const now = this.nowFn();
+      const startingBalance = String(this.env.PAPER_START_BALANCE);
+      const freshLedger = new PaperLedger(startingBalance, now).snapshot();
+      const next = createIdleExperiment({
+        durationHours: this.env.EXPERIMENT_DURATION_HOURS, strategyVersion: this.strategy.version,
+        riskConfiguration: this.riskLimits, modelConfiguration: this.modelConfiguration(),
+        startingBalance, systemVersion: "0.1.0",
+        gitSha: process.env.GIT_SHA ?? process.env.FLY_IMAGE_REF ?? "unknown",
+        closePolicy: this.env.EXPERIMENT_CLOSE_POLICY,
+      });
+      const operationKey = `experiment:${current.id}:prepared`;
+      await this.commitAuthoritative({
+        operationKey,
+        type: "EXPERIMENT_PREPARED",
+        aggregateType: "experiment",
+        aggregateId: current.id,
+        occurredAt: now,
+        buildPayload: () => ({
+          experiment: next,
+          previousExperimentId: current.id,
+          ledger: freshLedger,
+          positions: [],
+          restingOrders: [],
+          makerReservations: {},
+          astraExecutionCorrelations: [],
+          settledMarkets: [],
+          lastInfrastructureAccrualAt: now.getTime(),
+          derivedAudit: [{
+            id: derivedAuditEventId("EXPERIMENT_PREPARED", next.id),
+            type: "EXPERIMENT_PREPARED",
+            aggregateType: "experiment",
+            aggregateId: next.id,
+            traceId: next.id,
+            payload: {
+              experimentId: next.id, previousExperimentId: current.id, status: "IDLE",
+              startingBalance, preparedAt: now.toISOString(),
+            },
+          }],
+        }),
+      });
+
+      try {
+        await this.checkpoint();
+      } catch (error) {
+        this.state.journalDegraded = true;
+        this.record("EXPERIMENT_PREPARE_CHECKPOINT_DEGRADED", next.id, null, {
+          status: "IDLE", message: error instanceof Error ? error.message : String(error),
+        });
+        return {
+          ok: true, experiment: this.experiment, checkpoint: "degraded", warnings: ["CHECKPOINT_DEGRADED"],
+        };
+      }
+      return { ok: true, experiment: this.experiment, checkpoint: "ok" };
     });
   }
   /** Test-only view of current entry-feed eligibility. */
@@ -1378,6 +1511,7 @@ export class EngineService {
     const bag = this.recoverableBag();
     applyDurableTransition(bag, transition);
     this.adoptRecoveredBag(bag);
+    if (transition.type === "EXPERIMENT_PREPARED") this.resetPreparedRuntimeState();
     this.lastAppliedDurableCursor = transition.sequence;
     this.metrics.durableTransitionLastAppliedSequence.set(this.lastAppliedDurableCursor);
     return true;
@@ -1783,7 +1917,7 @@ export class EngineService {
     }
   }
 
-  private experimentDerivedAudit(type: "EXPERIMENT_STARTED" | "EXPERIMENT_START_VALIDATED" | "EXPERIMENT_START_ABORTED" | "EXPERIMENT_ENTRY_CLOSED" | "EXPERIMENT_COMPLETED", experiment: ExperimentManifest): DerivedAuditRecord {
+  private experimentDerivedAudit(type: "EXPERIMENT_STARTED" | "EXPERIMENT_START_VALIDATED" | "EXPERIMENT_START_ABORTED" | "EXPERIMENT_PREPARED" | "EXPERIMENT_ENTRY_CLOSED" | "EXPERIMENT_COMPLETED", experiment: ExperimentManifest): DerivedAuditRecord {
     return {
       id: derivedAuditEventId(type, experiment.id),
       type,
@@ -1939,6 +2073,7 @@ export class EngineService {
       ? new Map(Object.entries(resolved.tokenEpochs))
       : this.captureMarketEpochFence(trigger);
     const feedGeneration = this.experimentFeedGeneration;
+    const runGeneration = this.experimentRunGeneration;
     this.lastAdmittedMarketEpochFence = marketEpochFence;
     const result = this.supervisor.admit({
       id: trigger.id,
@@ -1954,7 +2089,7 @@ export class EngineService {
           this.metrics.triggersSuppressed.inc({ kind: trigger.kind, severity: String(trigger.severity) });
           return;
         }
-        await this.processTrigger(trigger, signal, marketEpochFence, resolved, feedGeneration);
+        await this.processTrigger(trigger, signal, marketEpochFence, resolved, feedGeneration, runGeneration);
       },
     });
     if (!result.admitted) {
@@ -2000,11 +2135,13 @@ export class EngineService {
     marketEpochFence: ReadonlyMap<string, number> | null = null,
     provenance: TriggerProvenance = { kind: "NONE" },
     feedGeneration = this.experimentFeedGeneration,
+    runGeneration = this.experimentRunGeneration,
   ): Promise<void> {
     this.metrics.noteProcessTriggerStart();
     const started = performance.now();
     try {
     if (signal?.aborted) return;
+    if (runGeneration !== this.experimentRunGeneration && !isRiskHedgeSettlementTrigger(trigger.kind)) return;
     if (this.processTriggerHold) await this.processTriggerHold;
     if (signal?.aborted) return;
     // A trigger emitted while a start is pending cannot begin an active
@@ -2032,6 +2169,7 @@ export class EngineService {
         return;
       }
       await this.experimentBoundaryGate.run(async () => {
+        if (runGeneration !== this.experimentRunGeneration) return;
         // Linearize speculative Astra admission with close-entries. No Astra
         // bookkeeping, gate mutation, model call, or budget reservation may
         // begin after the first-leg window has closed.
@@ -2054,6 +2192,7 @@ export class EngineService {
       return;
     }
     await this.experimentBoundaryGate.run(async () => {
+      if (runGeneration !== this.experimentRunGeneration) return;
       const nativeBookkeepingStarted = performance.now();
       this.activation.ensureLatency(trigger);
       this.state.setActivationLatency(this.activation.snapshot());
@@ -2151,6 +2290,35 @@ export class EngineService {
       await this.accrueAstraCost(input.result.usage.costUsd, `${input.traceId}:${input.stage}`, occurredAt.toISOString());
     }
     return true;
+  }
+
+  private resetPreparedRuntimeState(): void {
+    this.experimentRunGeneration += 1;
+    this.noteExperimentFeedInvalidation();
+    this.clearResearchActivationState();
+    this.idleGrokSubmissions.clear();
+    this.recentTrades.clear();
+    this.signalReceivedTimes.length = 0;
+    this.executionErrors = [];
+    this.lastTradeAt = null;
+    this.settlementBackoff.clear();
+    this.astraGateState.clear();
+    this.scoutRefreshContexts.clear();
+    this.scoutRefreshLastAt.clear();
+    this.scoutRefreshInFlight.clear();
+    this.scoutRefreshSubmissionKeys.clear();
+    this.lastAdmittedMarketEpochFence = null;
+    this.reportGenerated = false;
+    this.abortSourceSealPersist();
+    this.sourceSealing = false;
+    this.sourceSealed = false;
+    this.clearReportSourceIntegrity();
+    this.astraBatchPending = null;
+    this.astraBatchFinalizationPending = false;
+    this.state.latestAgents.clear();
+    this.state.latestConsensus = null;
+    this.state.latestRisk = null;
+    this.state.setActivationLatency([]);
   }
 
   private async persistAstraBatchAudit(events: readonly JournalEvent[], experimentId: string): Promise<boolean> {

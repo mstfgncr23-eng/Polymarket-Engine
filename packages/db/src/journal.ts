@@ -1582,7 +1582,7 @@ function replayLifecycleState(row: Pick<DurableTransition, "type" | "payload">):
   // bounded pressure/TTL eviction is safe. Minimal fixtures without a fill
   // payload retain the historical closed behavior.
   if (row.type === "PAPER_FILL" && row.payload && typeof row.payload === "object" && "fill" in row.payload) return "open";
-  if (row.type === "PAPER_MAKER_RESERVED" || row.type === "EXPERIMENT_STARTED") return "open";
+  if (row.type === "PAPER_MAKER_RESERVED" || row.type === "EXPERIMENT_STARTED" || row.type === "EXPERIMENT_PREPARED") return "open";
   if (row.type === "REPORT_SOURCE_INTEGRITY_FAULT") return "open";
   return "closed";
 }
