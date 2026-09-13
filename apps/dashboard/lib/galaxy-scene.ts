@@ -7,6 +7,7 @@ import {
   formatTime,
   latest,
   referenceTone,
+  shortId,
   toneForState,
   triggerEvents,
   type Tone,
@@ -16,6 +17,7 @@ import type { DashboardSnapshot } from "./types";
 export const GALAXY_FPS = 30;
 export const GALAXY_DURATION_IN_FRAMES = GALAXY_FPS * 60 * 10;
 export const MAX_GALAXY_TRANSIENTS = 12;
+export const MAX_GALAXY_POSITION_SATELLITES = 8;
 export const GALAXY_TRANSIENT_LIFETIME_MS = 4_000;
 const MAX_SEEN_EVENT_IDS = 64;
 const MAX_TRACKED_REFERENCES = 32;
@@ -109,6 +111,7 @@ export interface GalaxySceneModel {
     equity: string;
     cash: string;
     positions: number;
+    satellites: Array<{ id: string; label: string }>;
   };
 }
 
@@ -289,6 +292,10 @@ export function buildGalaxySceneModel(snapshot: DashboardSnapshot): GalaxySceneM
       equity: formatMoney(snapshot.balance.equity),
       cash: formatMoney(snapshot.balance.cash),
       positions: snapshot.positions.length,
+      satellites: snapshot.positions.slice(0, MAX_GALAXY_POSITION_SATELLITES).map((position) => ({
+        id: position.id,
+        label: shortId(position.marketId, 12),
+      })),
     },
   };
 }

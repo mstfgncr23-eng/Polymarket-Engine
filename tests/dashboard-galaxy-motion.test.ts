@@ -33,7 +33,25 @@ describe("Galaxy scene model", () => {
     expect(model.core).toMatchObject({ available: false, authority: "—", fairProbability: "—", marketProbability: "—" });
     expect(model.reference).toMatchObject({ connected: 0, tone: "neutral", feeds: [] });
     expect(model.risk).toMatchObject({ status: "NOT RUN", tone: "neutral" });
-    expect(model.portfolio).toMatchObject({ status: "EMPTY", positions: 0, equity: "$1000.00" });
+    expect(model.portfolio).toMatchObject({ status: "EMPTY", positions: 0, equity: "$1000.00", satellites: [] });
+  });
+
+  it("projects open-position satellites from the real snapshot ledger only", () => {
+    const empty = buildGalaxySceneModel(snapshot());
+    expect(empty.portfolio.satellites).toEqual([]);
+
+    const withPositions = buildGalaxySceneModel(snapshot({
+      positions: [
+        { id: "pos-1", marketId: "market-alpha-123456789", upQuantity: "2", downQuantity: "0", pairedQuantity: "0", unpairedQuantity: "2", unpairedOutcome: "UP", averageUpCost: "0.4", averageDownCost: "0", openedAt: "2026-09-12T11:00:00.000Z", updatedAt: "2026-09-12T11:00:00.000Z" },
+        { id: "pos-2", marketId: "m2", upQuantity: "1", downQuantity: "0", pairedQuantity: "0", unpairedQuantity: "1", unpairedOutcome: "UP", averageUpCost: "0.5", averageDownCost: "0", openedAt: "2026-09-12T11:00:00.000Z", updatedAt: "2026-09-12T11:00:00.000Z" },
+      ],
+    }));
+    expect(withPositions.portfolio.positions).toBe(2);
+    expect(withPositions.portfolio.satellites).toEqual([
+      expect.objectContaining({ id: "pos-1", label: expect.stringContaining("market") }),
+      expect.objectContaining({ id: "pos-2", label: "m2" }),
+    ]);
+    expect(withPositions.portfolio.satellites.every((satellite) => !("upQuantity" in satellite) && !("equity" in satellite))).toBe(true);
   });
 
   it("preserves historical and external decision authority without inventing native fields", () => {
