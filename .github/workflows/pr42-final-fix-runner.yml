@@ -74,7 +74,7 @@ jobs:
 
       - name: Focused correctness tests
         working-directory: work
-        run: pnpm test -- tests/operator-prepare-next.test.ts tests/stability-trigger-hot-path.test.ts tests/astra-final-correctness.test.ts
+        run: pnpm exec vitest run tests/operator-prepare-next.test.ts tests/stability-trigger-hot-path.test.ts tests/astra-final-correctness.test.ts
 
       - name: Typecheck
         working-directory: work
