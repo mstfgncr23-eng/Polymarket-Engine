@@ -65,6 +65,20 @@ export class TriggerEngine {
     private readonly observer?: TriggerEmitObserver,
   ) {}
 
+  /**
+   * Clear only suppression/timing state owned by the completed experiment.
+   * Live books, pair projections, reference windows, market windows, and the
+   * asset index intentionally survive the experiment boundary.
+   */
+  resetExperimentBoundaryState(): void {
+    this.emittedByMarket.clear();
+    this.dedupeOrder.length = 0;
+    this.dedupeOrderHead = 0;
+    this.dedupeCount = 0;
+    this.dedupeLiveEntries = 0;
+    this.lastScheduledReviewAt = 0;
+  }
+
   noteMarketWindow(marketId: string, asset: string | null, endDate: string | null): void {
     const parsed = endDate ? Date.parse(endDate) : Number.NaN;
     this.windows.set(marketId, {

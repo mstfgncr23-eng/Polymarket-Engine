@@ -2294,6 +2294,7 @@ export class EngineService {
 
   private resetPreparedRuntimeState(): void {
     this.experimentRunGeneration += 1;
+    this.triggerEngine.resetExperimentBoundaryState();
     this.noteExperimentFeedInvalidation();
     this.clearResearchActivationState();
     this.idleGrokSubmissions.clear();
@@ -2301,6 +2302,7 @@ export class EngineService {
     this.signalReceivedTimes.length = 0;
     this.executionErrors = [];
     this.lastTradeAt = null;
+    this.lastScheduledReviewAt = 0;
     this.settlementBackoff.clear();
     this.astraGateState.clear();
     this.scoutRefreshContexts.clear();

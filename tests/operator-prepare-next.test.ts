@@ -1,5 +1,5 @@
 import { MemoryEventJournal } from "@pm/db";
-import { createId, type TriggerEvent } from "@pm/core";
+import { createId, type ReferenceTick, type TriggerEvent } from "@pm/core";
 import { describe, expect, it } from "vitest";
 import { EngineService } from "../apps/engine/src/engine.js";
 import { NoopGrokActivationBridge } from "../apps/engine/src/activation/index.js";
@@ -110,6 +110,18 @@ describe("prepare-next paper experiment boundary", () => {
     const server = await operatorServer(test.engine, test.journal);
     try {
       expect((await test.engine.beginExperiment()).ok).toBe(true);
+      await test.market.emitSnapshot(snapshot({
+        marketId: "btc-mkt", tokenId: "btc-up", outcome: "UP", asset: "BTC",
+        receivedAt: new Date(test.clock.nowMs).toISOString(), sourceTimestamp: new Date(test.clock.nowMs).toISOString(),
+      }));
+      expect(test.engine.triggerDedupeEntryCount()).toBeGreaterThan(0);
+      const warmReferenceTick: ReferenceTick = {
+        eventId: "prepare-warm-reference", traceId: "prepare-warm-reference-trace", asset: "BTC", symbol: "BTCUSDT", venue: "test",
+        price: "100", quantity: "1", sourceTimestamp: new Date(test.clock.nowMs).toISOString(), receivedAt: new Date(test.clock.nowMs).toISOString(), tradeId: "1",
+      };
+      await test.engine.ingestReferenceTickForTest(warmReferenceTick);
+      const warmReferenceEntries = test.engine.referenceWindowTotalEntriesForTest();
+      expect(warmReferenceEntries).toBeGreaterThan(0);
       await test.engine.completeExperimentForTest();
       expect((await test.engine.ensureSourceSealForTest()).sealed).toBe(true);
       await test.engine.writeFinalReportForTest();
@@ -146,6 +158,8 @@ describe("prepare-next paper experiment boundary", () => {
       expect(test.engine.astraExecutionCorrelationsForTest()).toEqual([]);
       expect(test.engine.settledMarketsForTest().size).toBe(0);
       expect(test.engine.runtimeBookkeepingForTest()).toMatchObject({ signalReceivedTimes: 0, executionErrors: 0, recentTrades: 0, activeTriggers: 0, signalsByTrigger: 0 });
+      expect(test.engine.triggerDedupeEntryCount()).toBe(0);
+      expect(test.engine.referenceWindowTotalEntriesForTest()).toBe(warmReferenceEntries);
       expect(test.engine.astraBudgetSnapshotForTest()).toEqual(budgetBefore);
       expect(test.engine.reportGeneratedForTest()).toBe(false);
       expect(test.engine.sourceSealStateForTest()).toMatchObject({ sealing: false, sealed: false });

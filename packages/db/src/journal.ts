@@ -596,7 +596,16 @@ export class MemoryEventJournal implements EventJournal {
     }
     const closedExperiments = new Set(victims.filter((row) => row.type === "EXPERIMENT_COMPLETED" || row.type === "EXPERIMENT_START_ABORTED").map((row) => row.aggregateId));
     for (const experimentId of closedExperiments) {
-      for (const row of this.compactedByKey.values()) if (row.type === "EXPERIMENT_STARTED" && row.aggregateId === experimentId) row.lifecycleState = "closed";
+      for (const row of this.compactedByKey.values()) {
+        if (row.type === "EXPERIMENT_STARTED" && row.aggregateId === experimentId) row.lifecycleState = "closed";
+        if (row.type === "EXPERIMENT_PREPARED" && row.scopeId === experimentId) row.lifecycleState = "closed";
+      }
+    }
+    const startedExperiments = new Set(victims.filter((row) => row.type === "EXPERIMENT_STARTED").map((row) => row.aggregateId));
+    for (const experimentId of startedExperiments) {
+      for (const row of this.compactedByKey.values()) {
+        if (row.type === "EXPERIMENT_PREPARED" && row.scopeId === experimentId) row.lifecycleState = "closed";
+      }
     }
     const repairedExperiments = new Set(victims.filter((row) => row.type === "REPORT_SOURCE_INTEGRITY_REPAIRED")
       .map((row) => typeof row.payload.experimentId === "string" ? row.payload.experimentId : row.aggregateId));
@@ -1250,6 +1259,11 @@ export class PostgresEventJournal implements EventJournal {
       const closedExperimentIds = rows.filter((item) => item.type === "EXPERIMENT_COMPLETED" || item.type === "EXPERIMENT_START_ABORTED").map((row) => row.aggregateId);
       if (closedExperimentIds.length > 0) {
         await tx.update(durableReplayKeys).set({ lifecycleState: "closed" }).where(and(eq(durableReplayKeys.type, "EXPERIMENT_STARTED"), inArray(durableReplayKeys.aggregateId, closedExperimentIds)));
+        await tx.update(durableReplayKeys).set({ lifecycleState: "closed" }).where(and(eq(durableReplayKeys.type, "EXPERIMENT_PREPARED"), inArray(durableReplayKeys.scopeId, closedExperimentIds)));
+      }
+      const startedExperimentIds = rows.filter((item) => item.type === "EXPERIMENT_STARTED").map((row) => row.aggregateId);
+      if (startedExperimentIds.length > 0) {
+        await tx.update(durableReplayKeys).set({ lifecycleState: "closed" }).where(and(eq(durableReplayKeys.type, "EXPERIMENT_PREPARED"), inArray(durableReplayKeys.scopeId, startedExperimentIds)));
       }
       const repairedExperimentIds = rows.filter((item) => item.type === "REPORT_SOURCE_INTEGRITY_REPAIRED").map((row) => {
         const payload = row.payload as Record<string, unknown>;
@@ -1596,6 +1610,12 @@ function replayScopeId(row: Pick<DurableTransition, "type" | "payload" | "aggreg
   if (row.type === "POSITION_SETTLED" && typeof payload.marketId === "string") return payload.marketId;
   if (row.type === "PAPER_MAKER_RESERVED" || row.type === "PAPER_MAKER_RELEASED" || row.type === "PAPER_ORDER_CANCELLED") {
     return typeof payload.orderId === "string" ? payload.orderId : row.aggregateId;
+  }
+  if (row.type === "EXPERIMENT_PREPARED") {
+    const experiment = payload.experiment;
+    if (experiment && typeof experiment === "object" && typeof (experiment as Record<string, unknown>).id === "string") {
+      return (experiment as Record<string, unknown>).id as string;
+    }
   }
   if (row.type.startsWith("EXPERIMENT_")) return typeof payload.experimentId === "string" ? payload.experimentId : row.aggregateId;
   return null;
