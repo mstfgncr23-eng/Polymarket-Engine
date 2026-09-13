@@ -20,6 +20,8 @@ import { PolymarketMarketDataAdapter, ReferenceFeedRegistry, createRestProbe } f
 import { startRuntime } from "./runtime.js";
 import { exportExperimentArchive } from "./archive.js";
 import { evaluateLiveFeedSmokeGate } from "./live-feed-smoke-gate.js";
+import { OpenAIAstraClient } from "./astra/client.js";
+import { astraFeaturePacketSchema } from "@pm/core";
 
 const command = process.argv[2] ?? "help";
 
@@ -131,6 +133,29 @@ if (command === "experiment:start") {
   const ledger = new PaperLedger(1000, now);
   const position = ledger.applyFill(fill);
   console.log(JSON.stringify({ ok: true, traceId, consensus: consensus.consensusDirection, fillPrice: fill.fillPrice, feeUsd: fill.feeUsd, cash: ledger.snapshot().cash, position }, null, 2));
+} else if (command === "smoke:astra") {
+  if (process.env.ASTRA_ENABLED !== "1" && process.env.ASTRA_ENABLED !== "true") throw new Error("ASTRA_SMOKE_REQUIRES_ASTRA_ENABLED");
+  const apiKey = process.env.ASTRA_API_KEY;
+  if (!apiKey) throw new Error("ASTRA_API_KEY_REQUIRED_FOR_SMOKE");
+  const now = new Date();
+  const traceId = createId("trace");
+  const featurePacket = astraFeaturePacketSchema.parse({
+    schemaVersion: 1, marketId: "astra-smoke-market", asset: "BTC", triggerId: createId("trigger"), traceId,
+    observedAt: now.toISOString(), expiresAt: new Date(now.getTime() + 30_000).toISOString(),
+    upMid: 0.48, downMid: 0.51, upImbalance: 0.25, downImbalance: -0.1,
+    upSpreadBps: 100, downSpreadBps: 100, upDepthUsd: 100, downDepthUsd: 100,
+    pairAskCost: 0.99, recentMoveBps: 20, recentVolatilityBps: 10, referenceFreshnessMs: 50,
+    timeToExpiryMs: 30_000, regime: "TRENDING", triggerKind: "BOOK_IMBALANCE", triggerSeverity: 1,
+  });
+  const client = new OpenAIAstraClient({
+    apiKey, model: process.env.ASTRA_MODEL ?? "gpt-6-astra",
+    reasoning: { FAST: "low", DEEP: "medium", BATCH: "high" },
+    timeoutMs: { FAST: 5_000, DEEP: 5_000, BATCH: 20_000 },
+    maxOutputTokens: { FAST: 256, DEEP: 768, BATCH: 2_048 }, maxConcurrency: { FAST: 1, DEEP: 1 },
+    pricing: { inputUsdPerM: 10, cachedInputUsdPerM: 1, outputUsdPerM: 50 },
+  });
+  const result = await client.decide({ stage: "FAST", traceId, triggerId: featurePacket.triggerId, featurePacket, memory: [], portfolio: { drawdownUtilization: 0, unhedgedUtilization: 0, openPositionCount: 0 } });
+  console.log(JSON.stringify({ ok: true, stage: "FAST", structuredOutput: result.output, usage: result.usage }, null, 2));
 } else if (command === "live-discovery-diag") {
   const market = new PolymarketMarketDataAdapter();
   const report = await market.discoverCryptoMarkets([], 40);
@@ -236,5 +261,5 @@ if (command === "experiment:start") {
   console.log(JSON.stringify(result, null, 2));
   if (!result.ok) process.exitCode = 1;
 } else {
-  console.log("Usage: tsx src/cli.ts <smoke|live-feed-smoke|live-discovery-diag|experiment:start|report|journal-cleanup|archive:export>");
+  console.log("Usage: tsx src/cli.ts <smoke|smoke:astra|live-feed-smoke|live-discovery-diag|experiment:start|report|journal-cleanup|archive:export>");
 }

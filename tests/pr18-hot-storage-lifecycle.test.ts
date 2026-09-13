@@ -609,6 +609,28 @@ describe("PR18 hot operational storage lifecycle", () => {
     expect((await readFile(result.reportPath, "utf8")).length).toBeGreaterThan(0);
   });
 
+  it("exports a non-empty interim archive for a running experiment using its durable start time", async () => {
+    const journal = new MemoryEventJournal();
+    const startedAt = "2026-01-01T00:00:00.000Z";
+    await journal.commitDurableTransition({
+      operationKey: "experiment:exp-pr18:started",
+      type: "EXPERIMENT_STARTED", aggregateType: "experiment", aggregateId: "exp-pr18",
+      payload: { experiment: { id: "exp-pr18", status: "RUNNING", startedAt, completedAt: null, strategyVersion: "test", riskConfiguration: {}, modelConfiguration: {}, systemVersion: "test", gitSha: "test" } },
+      occurredAt: new Date(startedAt),
+    }, 0);
+    await journal.append(event("RISK_EVALUATION", "running-archive-risk", "2026-01-01T00:00:01.000Z", { accepted: false, marketId: "m1" }));
+    const directory = await mkdtemp(join(tmpdir(), "pr18-running-archive-"));
+    const result = await exportExperimentArchive(journal, { experimentId: "exp-pr18", directory });
+    const manifest = JSON.parse(await readFile(result.manifestPath, "utf8")) as Record<string, unknown>;
+    const summary = JSON.parse(await readFile(result.summaryPath, "utf8")) as Record<string, unknown>;
+    expect(manifest.experimentStart).toBe(startedAt);
+    expect(manifest.experimentStatus).toBe("RUNNING");
+    expect(manifest.sourceEventCount).toBeGreaterThan(0);
+    expect(summary.reportKind).toBe("interim");
+    expect(summary.complete).toBe(false);
+    expect(summary.truncated).toBe(true);
+  });
+
   it("returns hot operational counts to the same floor across repeated completed lifecycles", async () => {
     const journal = new MemoryEventJournal();
     const floors: Array<{ durable: number; canonical: number; checkpoints: number; rollups: number }> = [];

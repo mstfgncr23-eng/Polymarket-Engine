@@ -2,6 +2,8 @@ import { z } from "zod";
 
 export const riskLimitsSchema = z.object({
   maxOrderSizeUsd: z.number().positive().default(25),
+  /** Separate cap for new first legs; hedge legs retain maxOrderSizeUsd. */
+  maxFirstLegOrderSizeUsd: z.number().positive().max(25).default(12.5),
   maxMarketExposureUsd: z.number().positive().default(100),
   maxAssetExposureUsd: z.number().positive().default(150),
   maxTotalExposureUsd: z.number().positive().default(300),
@@ -113,6 +115,38 @@ export const engineEnvSchema = z.object({
   XAI_SCOUT_MICRO_TTL_MS: z.coerce.number().int().positive().max(120_000).default(5_000),
   XAI_SCOUT_CRYPTO_TTL_MS: z.coerce.number().int().positive().max(300_000).default(15_000),
   XAI_SCOUT_NEWS_TTL_MS: z.coerce.number().int().positive().max(3_600_000).default(60_000),
+  /** Astra is fully opt-in and never enabled by the presence of a key alone. */
+  ASTRA_ENABLED: z.preprocess(
+    (value) => value === undefined ? undefined : value === true || value === "true" || value === "1",
+    z.boolean().optional(),
+  ).default(false),
+  ASTRA_API_KEY: z.string().min(1).optional(),
+  ASTRA_MODEL: z.string().min(1).default("gpt-6-astra"),
+  ASTRA_FAST_REASONING: z.enum(["low", "medium", "high", "xhigh", "max"]).default("low"),
+  ASTRA_DEEP_REASONING: z.enum(["low", "medium", "high", "xhigh", "max"]).default("medium"),
+  ASTRA_BATCH_REASONING: z.enum(["low", "medium", "high", "xhigh", "max"]).default("high"),
+  ASTRA_FAST_TIMEOUT_MS: z.coerce.number().int().positive().max(30_000).default(1_500),
+  ASTRA_DEEP_TIMEOUT_MS: z.coerce.number().int().positive().max(60_000).default(3_000),
+  ASTRA_BATCH_TIMEOUT_MS: z.coerce.number().int().positive().max(120_000).default(20_000),
+  ASTRA_FAST_MAX_OUTPUT_TOKENS: z.coerce.number().int().positive().max(4_096).default(256),
+  ASTRA_DEEP_MAX_OUTPUT_TOKENS: z.coerce.number().int().positive().max(8_192).default(768),
+  ASTRA_BATCH_MAX_OUTPUT_TOKENS: z.coerce.number().int().positive().max(16_384).default(2_048),
+  ASTRA_FAST_MAX_CONCURRENCY: z.coerce.number().int().positive().max(16).default(4),
+  ASTRA_DEEP_MAX_CONCURRENCY: z.coerce.number().int().positive().max(8).default(2),
+  ASTRA_MAX_DAILY_COST_USD: z.coerce.number().positive().max(100).default(5),
+  ASTRA_INPUT_USD_PER_M: z.coerce.number().nonnegative().default(10),
+  ASTRA_CACHED_INPUT_USD_PER_M: z.coerce.number().nonnegative().default(1),
+  ASTRA_CACHE_WRITE_USD_PER_M: z.coerce.number().nonnegative().default(12.5),
+  ASTRA_OUTPUT_USD_PER_M: z.coerce.number().nonnegative().default(50),
+  ASTRA_GATE_COOLDOWN_MS: z.coerce.number().int().nonnegative().max(3_600_000).default(2_000),
+  ASTRA_GATE_MAX_FINGERPRINTS: z.coerce.number().int().positive().max(4_096).default(256),
+  ASTRA_DEEP_UNCERTAINTY_THRESHOLD: z.coerce.number().min(0).max(1).default(0.35),
+  ASTRA_DEEP_DRAWDOWN_UTILIZATION_THRESHOLD: z.coerce.number().min(0).max(1).default(0.7),
+  ASTRA_DEEP_UNHEDGED_UTILIZATION_THRESHOLD: z.coerce.number().min(0).max(1).default(0.7),
+  ASTRA_BATCH_SETTLEMENT_THRESHOLD: z.coerce.number().int().positive().max(500).default(25),
+  ASTRA_MEMORY_MAX_ENTRIES: z.coerce.number().int().positive().max(512).default(64),
+  ASTRA_MEMORY_MAX_LESSONS: z.coerce.number().int().positive().max(32).default(8),
+  ASTRA_MEMORY_MAX_BYTES: z.coerce.number().int().positive().max(1_000_000).default(16_384),
   DISCOVERY_INTERVAL_MS: z.coerce.number().int().positive().default(300_000),
   MAX_QUALIFIED_MARKETS: z.coerce.number().int().positive().default(40),
   ESTIMATED_INFRA_COST_PER_HOUR_USD: z.coerce.number().nonnegative().default(0.08),
@@ -162,6 +196,7 @@ export function assertProductionEngineEnv(env: EngineEnv): void {
   if (!env.DATABASE_URL) throw new Error("DATABASE_URL_REQUIRED_FOR_POSTGRES_JOURNAL");
   if (!env.ENGINE_READ_TOKEN) throw new Error("ENGINE_READ_TOKEN_REQUIRED_IN_PRODUCTION");
   if (!env.ENGINE_OPERATOR_TOKEN) throw new Error("ENGINE_OPERATOR_TOKEN_REQUIRED_IN_PRODUCTION");
+  if (env.ASTRA_ENABLED && !env.ASTRA_API_KEY) throw new Error("ASTRA_API_KEY_REQUIRED_WHEN_ENABLED");
 }
 
 export function parseEngineEnv(env: NodeJS.ProcessEnv): EngineEnv {

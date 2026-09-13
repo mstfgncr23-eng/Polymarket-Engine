@@ -23,6 +23,8 @@ export interface StrategyContext {
   snapshots: Record<Outcome, MarketSnapshot | null>;
   position: Position | null;
   maxOrderSizeUsd: number;
+  /** Optional stricter cap for an OPEN_FIRST_LEG candidate. */
+  maxFirstLegOrderSizeUsd?: number;
   /** Minimum locked pair value in USD/share for a $1 binary payout. */
   minimumLockedPairEdge: number;
 }
@@ -63,7 +65,7 @@ export class TemporalPairHedgeStrategy implements Strategy {
     const snapshot = context.snapshots[outcome];
     const ask = snapshot?.asks[0];
     if (!snapshot || !ask) return null;
-    const quantity = decimal(context.maxOrderSizeUsd / Number(ask.price));
+    const quantity = decimal((context.maxFirstLegOrderSizeUsd ?? context.maxOrderSizeUsd) / Number(ask.price));
     return {
       strategyId: this.id, strategyVersion: this.version, marketId: snapshot.marketId,
       tokenId: snapshot.tokenId, outcome, side: "BUY", quantity, limitPrice: ask.price,

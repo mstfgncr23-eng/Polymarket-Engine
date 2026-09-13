@@ -33,13 +33,22 @@ export interface RestingPaperOrder {
   queueAhead: string;
   remaining: string;
   observedAt: string;
+  astraFirstLegDecision?: AstraFirstLegDecision;
 }
+
+export const astraFirstLegDecisionSchema = z.object({
+  decisionId: z.string().min(1).max(160),
+  triggerId: z.string().min(1).max(160),
+  fairProbabilityUp: z.number().min(0).max(1),
+}).strict();
+export type AstraFirstLegDecision = z.infer<typeof astraFirstLegDecisionSchema>;
 
 export const restingPaperOrderSchema = z.object({
   order: paperOrderSchema,
   queueAhead: decimalStringSchema,
   remaining: decimalStringSchema,
   observedAt: timestampSchema,
+  astraFirstLegDecision: astraFirstLegDecisionSchema.optional(),
 });
 
 export function createRestingMakerOrder(order: PaperOrder, snapshot: MarketSnapshot): RestingPaperOrder {

@@ -257,6 +257,25 @@ export class ExperimentSummaryAccumulator {
         this.hedgeDurationSum += duration;
         this.hedgeDurationN += 1;
       }
+    } else if (type === "ASTRA_MODEL_INVOCATION" && (event.payload as { authority?: unknown }).authority === "ASTRA_BRAIN_V1") {
+      const stage = String((event.payload as { stage?: unknown }).stage ?? "DECISION");
+      const usage = (event.payload as { usage?: { costUsd?: number } }).usage;
+      this.modelCounts.ASTRA_BRAIN_V1 = (this.modelCounts.ASTRA_BRAIN_V1 ?? 0) + 1;
+      this.modelCosts.ASTRA_BRAIN_V1 = (this.modelCosts.ASTRA_BRAIN_V1 ?? 0) + (usage?.costUsd ?? 0);
+      const stageKey = `ASTRA_${stage}`;
+      this.modelCounts[stageKey] = (this.modelCounts[stageKey] ?? 0) + 1;
+      this.modelCosts[stageKey] = (this.modelCosts[stageKey] ?? 0) + (usage?.costUsd ?? 0);
+    } else if (type === "ASTRA_DECISION" && (event.payload as { authority?: unknown }).authority === "ASTRA_BRAIN_V1") {
+      // Invocation events intentionally contain only bounded provider audit
+      // data. The canonical decision is the single per-trigger source for
+      // regime attribution; never manufacture an "unknown" regime for a
+      // Fast/Deep or BATCH invocation.
+      const payload = event.payload as { featurePacket?: { regime?: unknown }; stages?: unknown };
+      const regime = payload.featurePacket?.regime;
+      if (typeof regime === "string" && regime.length > 0 && regime !== "unknown") {
+        const stages = Array.isArray(payload.stages) ? payload.stages.filter((stage): stage is string => typeof stage === "string") : [];
+        this.regimes[regime] = { source: "ASTRA_DECISION", stage: stages.at(-1) ?? "DECISION" };
+      }
     } else if (type === "CONSENSUS_DECISION" && (event.payload as { authority?: unknown }).authority === "NATIVE_DETERMINISTIC_V1") {
       this.modelCounts.NATIVE_DETERMINISTIC_V1 = (this.modelCounts.NATIVE_DETERMINISTIC_V1 ?? 0) + 1;
       this.modelCosts.NATIVE_DETERMINISTIC_V1 = this.modelCosts.NATIVE_DETERMINISTIC_V1 ?? 0;
@@ -266,6 +285,9 @@ export class ExperimentSummaryAccumulator {
         this.modelCounts[output.agentId] = (this.modelCounts[output.agentId] ?? 0) + 1;
         this.modelCosts[output.agentId] = (this.modelCosts[output.agentId] ?? 0) + (output.usage?.estimatedCostUsd ?? 0);
       }
+    } else if (type === "ASTRA_FAILURE" || type === "ASTRA_BUDGET_BLOCK") {
+      const code = String((event.payload as { reason?: unknown }).reason ?? type);
+      this.failureStatistics[code] = (this.failureStatistics[code] ?? 0) + 1;
     } else if (type === "AGENT_FAILURE") {
       const code = String((event.payload as { code?: unknown }).code ?? "UNKNOWN");
       this.failureStatistics[code] = (this.failureStatistics[code] ?? 0) + 1;

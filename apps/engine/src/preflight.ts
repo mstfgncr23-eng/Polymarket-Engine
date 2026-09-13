@@ -1,6 +1,6 @@
 import type { EngineEnv } from "@pm/core";
 
-export type ExperimentActivationMode = "MONITOR_ONLY" | "48H_GROK_PAPER_EXPERIMENT" | "48H_NATIVE_PAPER_EXPERIMENT";
+export type ExperimentActivationMode = "MONITOR_ONLY" | "48H_GROK_PAPER_EXPERIMENT" | "48H_NATIVE_PAPER_EXPERIMENT" | "48H_ASTRA_PAPER_EXPERIMENT";
 
 export interface PreflightEntryMarket {
   marketId: string;
@@ -61,6 +61,7 @@ export function evaluateExperimentPreflight(input: {
   const mode = input.mode ?? "MONITOR_ONLY";
   const grokPaper = mode === "48H_GROK_PAPER_EXPERIMENT";
   const nativePaper = mode === "48H_NATIVE_PAPER_EXPERIMENT";
+  const astraPaper = mode === "48H_ASTRA_PAPER_EXPERIMENT";
   const blockers: string[] = [];
   const warnings: string[] = [];
   if (input.env.TRADING_MODE !== "paper") blockers.push("TRADING_MODE_NOT_PAPER");
@@ -69,7 +70,7 @@ export function evaluateExperimentPreflight(input: {
   if (input.bootstrapFailed) blockers.push("UNRESOLVED_BOOTSTRAP_FAILURE");
   const entries = input.entryMarkets ?? [];
   const genuineEntries = entries.filter(isGenuineEntryQualifiedMarket);
-  if (grokPaper || nativePaper) {
+  if (grokPaper || nativePaper || astraPaper) {
     if (genuineEntries.length === 0) blockers.push("NO_ENTRY_QUALIFIED_MARKET");
   } else {
     const hasMarketPath = genuineEntries.length > 0 || input.qualifiedOrManaged > 0 || input.tokenConfiguredPath === true;
@@ -79,7 +80,7 @@ export function evaluateExperimentPreflight(input: {
   const missingRoles = REQUIRED_ROLES.filter((role) => !tokens.includes(role));
   // Native authority is deliberately independent of the legacy Grok/MCP
   // control plane, even when old compatibility flags remain configured.
-  const requireGrok = !nativePaper && (grokPaper || input.env.EXPERIMENT_REQUIRES_GROK);
+  const requireGrok = !nativePaper && !astraPaper && (grokPaper || input.env.EXPERIMENT_REQUIRES_GROK);
   if (requireGrok) {
     if (input.env.GROK_ACTIVATION_PROVIDER === "noop") blockers.push("GROK_ACTIVATION_NOOP");
     // The in-process xAI runtime uses the EngineService binding directly;
@@ -91,7 +92,7 @@ export function evaluateExperimentPreflight(input: {
     if (input.env.GROK_ACTIVATION_PROVIDER === "xai" && (!input.env.XAI_API_KEY || !input.env.XAI_MODEL)) {
       blockers.push("XAI_ACTIVATION_UNCONFIGURED");
     }
-  } else if (!nativePaper && input.env.GROK_ACTIVATION_PROVIDER === "noop") {
+  } else if (!nativePaper && !astraPaper && input.env.GROK_ACTIVATION_PROVIDER === "noop") {
     warnings.push("GROK_WAKE_NOT_VALIDATED");
   }
   const blocked = input.reference.filter((item) => isProviderBlocked(item.status));
@@ -119,17 +120,17 @@ export function evaluateExperimentPreflight(input: {
       tokenConfiguredPath: input.tokenConfiguredPath === true,
       genuineEntryQualified: genuineEntries.length,
       manualTokensMonitorOnly: input.tokenConfiguredPath === true && genuineEntries.length === 0,
-      activationProvider: nativePaper ? "native_deterministic" : input.env.GROK_ACTIVATION_PROVIDER,
-      decisionAuthority: nativePaper ? "NATIVE_DETERMINISTIC_V1" : "LEGACY_EXTERNAL",
-      localExecution: nativePaper,
-      externalInference: !nativePaper,
-      grokDisabled: nativePaper,
+      activationProvider: astraPaper ? "openai" : nativePaper ? "native_deterministic" : input.env.GROK_ACTIVATION_PROVIDER,
+      decisionAuthority: astraPaper ? "ASTRA_BRAIN_V1" : nativePaper ? "NATIVE_DETERMINISTIC_V1" : "LEGACY_EXTERNAL",
+      localExecution: astraPaper ? false : nativePaper,
+      externalInference: astraPaper ? true : !nativePaper,
+      grokDisabled: astraPaper || nativePaper,
       grokWakeValidated: false,
       grokResearchRequired: requireGrok,
       experimentMode: mode,
       overloadFailClosed: input.overloadFailClosed === true,
-      mcpRoles: nativePaper ? [] : tokens,
-      missingRoles: nativePaper ? [] : missingRoles,
+      mcpRoles: astraPaper || nativePaper ? [] : tokens,
+      missingRoles: astraPaper || nativePaper ? [] : missingRoles,
       reference: input.reference,
       entryMarkets: entries,
     },

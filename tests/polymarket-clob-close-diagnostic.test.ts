@@ -158,6 +158,7 @@ describe("Polymarket CLOB remote close diagnostics", () => {
     expect(classifyClobRemoteClose({ code: 1001, wasClean: true })).toBe("clean_remote_close");
     expect(classifyClobRemoteClose({ code: 1006, wasClean: false })).toBe("abnormal_remote_close");
     expect(classifyClobRemoteClose({ code: 1000, wasClean: false })).toBe("abnormal_remote_close");
+    expect(classifyClobRemoteClose({ code: 1013, wasClean: false })).toBe("slow_consumer");
   });
 
   it("propagates abnormal remote close diagnostics and keeps the existing reconnect delay path", async () => {

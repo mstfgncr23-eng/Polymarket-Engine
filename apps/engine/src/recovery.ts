@@ -11,6 +11,7 @@ import {
   type PaperFill,
   type Position,
   type RestingPaperOrder,
+  astraFirstLegDecisionSchema,
 } from "@pm/core";
 import {
   CHECKPOINT_SCHEMA_VERSION,
@@ -65,6 +66,7 @@ export const RECOVERY_FAILURE_REASONS = [
   "invariant",
   "unknown_type",
   "cursor_fence",
+  "astra_authority_unavailable",
 ] as const;
 export type RecoveryFailureReason = (typeof RECOVERY_FAILURE_REASONS)[number];
 
@@ -130,6 +132,7 @@ export function cloneRecoverableState(state: RecoverableEngineState): Recoverabl
     experiment: state.experiment ? structuredClone(state.experiment) : null,
     restingOrders: new Map([...state.restingOrders.entries()].map(([id, order]) => [id, structuredClone(order)])),
     makerReservations: new Map(state.makerReservations),
+    astraExecutionCorrelations: new Map([...state.astraExecutionCorrelations.entries()].map(([marketId, rows]) => [marketId, structuredClone(rows)])),
     settledMarkets: new Set(state.settledMarkets),
     lastInfrastructureAccrualAt: state.lastInfrastructureAccrualAt,
   };
@@ -201,15 +204,42 @@ export interface RecoverableEngineState {
   experiment: ExperimentManifest | null;
   restingOrders: Map<string, RestingPaperOrder>;
   makerReservations: Map<string, string>;
+  astraExecutionCorrelations: Map<string, AstraExecutionCorrelation[]>;
   settledMarkets: Set<string>;
   lastInfrastructureAccrualAt: number;
 }
+
+export interface AstraExecutionCorrelation {
+  decisionId: string;
+  triggerId: string;
+  fillId: string;
+  orderId: string;
+  traceId: string;
+  positionId: string;
+  marketId: string;
+  outcome: "UP" | "DOWN";
+  quantity: string;
+  fairProbabilityUp: number;
+  recordedAt: string;
+}
+
+const astraExecutionCorrelationSchema = astraFirstLegDecisionSchema.extend({
+  fillId: z.string().min(1).max(160),
+  orderId: z.string().min(1).max(160),
+  traceId: z.string().min(1).max(160),
+  positionId: z.string().min(1).max(160),
+  marketId: z.string().min(1).max(160),
+  outcome: z.enum(["UP", "DOWN"]),
+  quantity: z.string().min(1).max(80),
+  recordedAt: z.string().datetime({ offset: true }),
+}).strict();
 
 const fillPayloadSchema = z.object({
   fill: paperFillSchema,
   positionId: z.string().min(1),
   reservationAfter: z.string().nullable(),
   restingAfter: restingPaperOrderSchema.nullable().optional(),
+  astraExecutionCorrelation: astraExecutionCorrelationSchema.optional(),
 });
 
 const reservePayloadSchema = z.object({
@@ -293,6 +323,14 @@ export function applyDurableTransition(state: RecoverableEngineState, transition
         const payload = fillPayloadSchema.parse(transition.payload);
         applyFillReservation(state, payload.fill, payload.reservationAfter, new Date(transition.occurredAt));
         state.ledger.applyFill(payload.fill, { positionId: payload.positionId });
+        if (payload.astraExecutionCorrelation) {
+          const rows = state.astraExecutionCorrelations.get(payload.fill.marketId) ?? [];
+          if (!rows.some((row) => row.fillId === payload.astraExecutionCorrelation!.fillId)) {
+            rows.push(payload.astraExecutionCorrelation);
+            while (rows.length > 32) rows.shift();
+            state.astraExecutionCorrelations.set(payload.fill.marketId, rows);
+          }
+        }
         if (payload.restingAfter) {
           if (!d(payload.restingAfter.remaining).gt(0)) state.restingOrders.delete(payload.fill.orderId);
           else state.restingOrders.set(payload.fill.orderId, payload.restingAfter);
