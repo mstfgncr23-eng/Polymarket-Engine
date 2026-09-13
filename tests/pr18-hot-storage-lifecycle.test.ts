@@ -679,13 +679,19 @@ describe("PR18 hot operational storage lifecycle", () => {
       payload: { experiment: { id: nextId, status: "IDLE" }, previousExperimentId: previousId },
     } as const;
     await journal.initialize();
+    const client = (journal as unknown as { client: any }).client;
+    const replayLifecycle = async (operationKey: string): Promise<{ lifecycle_state: string; scope_id: string | null } | undefined> => {
+      const rows = await client`SELECT lifecycle_state, scope_id FROM durable_replay_keys WHERE operation_key = ${operationKey}`;
+      return rows[0] as { lifecycle_state: string; scope_id: string | null } | undefined;
+    };
     try {
       let cursor = await journal.latestDurableSequence();
       const prepared = await journal.commitDurableTransition(preparedInput, cursor);
       cursor = prepared.sequence;
       await fencePgRecovery(journal, cursor);
-      await journal.compactDurableTransitionsThrough(cursor, { maxRows: 1, batchSize: 1, maxReplayKeys: 8, maxBatches: 1, budgetMs: 1000 });
+      await journal.compactDurableTransitionsThrough(cursor, { maxRows: 10_000, batchSize: 10_000, maxReplayKeys: 8, maxBatches: 1, budgetMs: 1000 });
       expect(await journal.readDurableByOperationKey(preparedInput.operationKey)).toMatchObject({ type: "EXPERIMENT_PREPARED" });
+      expect(await replayLifecycle(preparedInput.operationKey)).toEqual({ lifecycle_state: "open", scope_id: nextId });
       expect((await journal.commitDurableTransition(preparedInput, cursor)).existing).toBe(true);
 
       const startedInput = {
@@ -695,7 +701,23 @@ describe("PR18 hot operational storage lifecycle", () => {
       const started = await journal.commitDurableTransition(startedInput, cursor);
       cursor = started.sequence;
       await fencePgRecovery(journal, cursor);
-      await journal.compactDurableTransitionsThrough(cursor, { maxRows: 1, batchSize: 1, maxReplayKeys: 1, maxBatches: 1, budgetMs: 1000 });
+      await journal.compactDurableTransitionsThrough(cursor, { maxRows: 10_000, batchSize: 10_000, maxReplayKeys: 1, maxBatches: 1, budgetMs: 1000 });
+      expect(await replayLifecycle(preparedInput.operationKey)).toEqual({ lifecycle_state: "closed", scope_id: nextId });
+      expect(await journal.readDurableByOperationKey(preparedInput.operationKey)).toMatchObject({ type: "EXPERIMENT_PREPARED" });
+
+      const closedBeforeChurn = await client`SELECT count(*)::int AS count FROM durable_replay_keys WHERE lifecycle_state <> 'open'`;
+      const churnCount = Number(closedBeforeChurn[0]?.count ?? 0) + 1;
+      for (let index = 0; index < churnCount; index += 1) {
+        const churn = await journal.commitDurableTransition({
+          operationKey: `prepared-churn:${suffix}:${index}`,
+          type: "POSITION_SETTLED", aggregateType: "position", aggregateId: `prepared-churn:${suffix}:${index}`,
+          payload: { marketId: `prepared-churn-market:${suffix}:${index}` },
+        }, cursor);
+        cursor = churn.sequence;
+      }
+      await fencePgRecovery(journal, cursor);
+      await journal.compactDurableTransitionsThrough(cursor, { maxRows: 10_000, batchSize: 10_000, maxReplayKeys: 1, maxBatches: 1, budgetMs: 1000 });
+      expect(await replayLifecycle(preparedInput.operationKey)).toBeUndefined();
       expect(await journal.readDurableByOperationKey(preparedInput.operationKey)).toBeNull();
     } finally {
       await journal.close();
