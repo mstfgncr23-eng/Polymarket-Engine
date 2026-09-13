@@ -20,6 +20,8 @@ export interface AstraOpenAIOptions {
   timeoutMs: Record<AstraStage, number>;
   maxOutputTokens: Record<AstraStage, number>;
   maxConcurrency: Record<"FAST" | "DEEP", number>;
+  /** Admission is fail-fast by default; any configured waiters are finite and deadline-bound. */
+  maxWaiters?: Partial<Record<"FAST" | "DEEP" | "BATCH", number>>;
   pricing: { inputUsdPerM: number; cachedInputUsdPerM: number; cacheWriteUsdPerM?: number; outputUsdPerM: number };
   client?: OpenAI;
 }
@@ -32,35 +34,41 @@ export class OpenAIAstraClient implements AstraClient {
   private readonly batch: BoundedSemaphore;
   constructor(private readonly options: AstraOpenAIOptions) {
     this.client = options.client ?? new OpenAI({ apiKey: options.apiKey });
-    this.fast = new BoundedSemaphore(options.maxConcurrency.FAST);
-    this.deep = new BoundedSemaphore(options.maxConcurrency.DEEP);
-    this.batch = new BoundedSemaphore(1);
+    this.fast = new BoundedSemaphore(options.maxConcurrency.FAST, options.maxWaiters?.FAST ?? 0);
+    this.deep = new BoundedSemaphore(options.maxConcurrency.DEEP, options.maxWaiters?.DEEP ?? 0);
+    this.batch = new BoundedSemaphore(1, options.maxWaiters?.BATCH ?? 0);
   }
 
   async decide(request: AstraDecisionRequest): Promise<AstraModelResult> {
-    if (request.stage === "BATCH") throw new AstraClientError("ASTRA_BATCH_REQUIRES_LEARN", request.stage);
     const semaphore = request.stage === "DEEP" ? this.deep : this.fast;
-    const release = await semaphore.acquire();
     const started = performance.now();
+    const lease = await semaphore.acquire(request.stage, this.options.timeoutMs[request.stage], request.signal);
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), this.options.timeoutMs[request.stage]);
+    const timeout = lease.remainingMs > 0 ? setTimeout(() => controller.abort(), lease.remainingMs) : undefined;
     const abortRequest = () => controller.abort();
     request.signal?.addEventListener("abort", abortRequest, { once: true });
+    let dispatched = false;
     try {
-      if (request.signal?.aborted) throw new AstraClientError("ASTRA_REQUEST_ABORTED", request.stage);
+      if (request.signal?.aborted) throw new AstraClientError("ASTRA_REQUEST_ABORTED", request.stage, "NOT_DISPATCHED");
+      if (lease.remainingMs <= 0) throw new AstraClientError("ASTRA_REQUEST_TIMEOUT", request.stage, "NOT_DISPATCHED");
+      const task = {
+        task: "Evaluate this already-gated binary-market opportunity.",
+        stage: request.stage,
+        featurePacket: request.featurePacket,
+        memory: request.memory.slice(-8),
+        portfolio: request.portfolio,
+        ...(request.stage === "DEEP" ? { fastProposal: request.fastProposal } : {}),
+      };
+      dispatched = true;
       const response = await this.client.responses.parse({
         model: this.options.model,
         prompt_cache_key: `astra-brain-v1:${request.stage}`,
         reasoning: { effort: this.options.reasoning[request.stage] },
         input: [
-          { role: "system", content: "You are Astra Brain V1. Return only the requested structured economic decision. Use BUY_UP, BUY_DOWN, or NO_TRADE. Do not invent missing facts." },
-          { role: "user", content: JSON.stringify({
-            task: "Evaluate this already-gated binary-market opportunity.",
-            stage: request.stage,
-            featurePacket: request.featurePacket,
-            memory: request.memory.slice(-8),
-            portfolio: request.portfolio,
-          }) },
+          { role: "system", content: request.stage === "DEEP"
+            ? "You are Astra Brain V1 Deep Review. Return only the requested structured economic decision. Treat the exact Fast proposal as a proposal to audit: explicitly challenge it, look for reasons it is wrong, and then confirm it, veto it with NO_TRADE, or flip its direction. Do not invent missing facts or expose chain-of-thought."
+            : "You are Astra Brain V1 Fast. Return only the requested structured economic decision. Use BUY_UP, BUY_DOWN, or NO_TRADE. Do not invent missing facts or expose chain-of-thought." },
+          { role: "user", content: JSON.stringify(task) },
         ],
         text: { format: zodTextFormat(astraModelOutputSchema, "astra_decision") },
         max_output_tokens: this.options.maxOutputTokens[request.stage],
@@ -83,25 +91,28 @@ export class OpenAIAstraClient implements AstraClient {
     } catch (error) {
       if (error instanceof AstraClientError) throw error;
       if (controller.signal.aborted) {
-        throw new AstraClientError(request.signal?.aborted ? "ASTRA_REQUEST_ABORTED" : "ASTRA_REQUEST_TIMEOUT", request.stage);
+        throw new AstraClientError(request.signal?.aborted ? "ASTRA_REQUEST_ABORTED" : "ASTRA_REQUEST_TIMEOUT", request.stage, dispatched ? "DISPATCHED_UNKNOWN" : "NOT_DISPATCHED");
       }
-      throw new AstraClientError("ASTRA_REQUEST_FAILED", request.stage);
+      throw new AstraClientError("ASTRA_REQUEST_FAILED", request.stage, dispatched ? "DISPATCHED_UNKNOWN" : "NOT_DISPATCHED");
     } finally {
-      clearTimeout(timeout);
+      if (timeout) clearTimeout(timeout);
       request.signal?.removeEventListener("abort", abortRequest);
-      release();
+      lease.release();
     }
   }
 
   async learn(request: AstraBatchRequest): Promise<AstraBatchResult> {
-    const release = await this.batch.acquire();
     const started = performance.now();
+    const lease = await this.batch.acquire(request.stage, this.options.timeoutMs.BATCH, request.signal);
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), this.options.timeoutMs.BATCH);
+    const timeout = lease.remainingMs > 0 ? setTimeout(() => controller.abort(), lease.remainingMs) : undefined;
     const abortRequest = () => controller.abort();
     request.signal?.addEventListener("abort", abortRequest, { once: true });
+    let dispatched = false;
     try {
-      if (request.signal?.aborted) throw new AstraClientError("ASTRA_REQUEST_ABORTED", request.stage);
+      if (request.signal?.aborted) throw new AstraClientError("ASTRA_REQUEST_ABORTED", request.stage, "NOT_DISPATCHED");
+      if (lease.remainingMs <= 0) throw new AstraClientError("ASTRA_REQUEST_TIMEOUT", request.stage, "NOT_DISPATCHED");
+      dispatched = true;
       const response = await this.client.responses.parse({
         model: this.options.model,
         prompt_cache_key: "astra-brain-v1:BATCH",
@@ -139,34 +150,89 @@ export class OpenAIAstraClient implements AstraClient {
     } catch (error) {
       if (error instanceof AstraClientError) throw error;
       if (controller.signal.aborted) {
-        throw new AstraClientError(request.signal?.aborted ? "ASTRA_REQUEST_ABORTED" : "ASTRA_REQUEST_TIMEOUT", request.stage);
+        throw new AstraClientError(request.signal?.aborted ? "ASTRA_REQUEST_ABORTED" : "ASTRA_REQUEST_TIMEOUT", request.stage, dispatched ? "DISPATCHED_UNKNOWN" : "NOT_DISPATCHED");
       }
-      throw new AstraClientError("ASTRA_REQUEST_FAILED", request.stage);
+      throw new AstraClientError("ASTRA_REQUEST_FAILED", request.stage, dispatched ? "DISPATCHED_UNKNOWN" : "NOT_DISPATCHED");
     } finally {
-      clearTimeout(timeout);
+      if (timeout) clearTimeout(timeout);
       request.signal?.removeEventListener("abort", abortRequest);
-      release();
+      lease.release();
     }
+  }
+
+  concurrencySnapshot(stage: "FAST" | "DEEP" | "BATCH"): { active: number; waiting: number; maxWaiters: number; limit: number } {
+    return (stage === "FAST" ? this.fast : stage === "DEEP" ? this.deep : this.batch).snapshot();
   }
 }
 
+export type AstraDispatchState = "NOT_DISPATCHED" | "DISPATCHED_UNKNOWN";
+
 export class AstraClientError extends Error {
-  constructor(message: string, readonly stage?: AstraStage) { super(message); this.name = "AstraClientError"; }
+  constructor(message: string, readonly stage?: AstraStage, readonly dispatchState: AstraDispatchState = "DISPATCHED_UNKNOWN") { super(message); this.name = "AstraClientError"; }
 }
 
 class BoundedSemaphore {
   private active = 0;
-  private readonly waiting: Array<() => void> = [];
-  constructor(private readonly limit: number) {}
-  async acquire(): Promise<() => void> {
-    if (this.active >= this.limit) await new Promise<void>((resolve) => this.waiting.push(resolve));
-    this.active += 1;
+  private readonly waiting: Array<{ tryGrant: () => boolean }> = [];
+  private readonly maxWaiters: number;
+  constructor(private readonly limit: number, maxWaiters: number) {
+    this.maxWaiters = Number.isFinite(maxWaiters) ? Math.max(0, Math.floor(maxWaiters)) : 0;
+  }
+  async acquire(stage: AstraStage, timeoutMs: number, signal?: AbortSignal): Promise<{ release: () => void; remainingMs: number }> {
+    const deadline = performance.now() + Math.max(0, timeoutMs);
+    if (signal?.aborted) throw new AstraClientError("ASTRA_REQUEST_ABORTED", stage, "NOT_DISPATCHED");
+    if (this.active < this.limit) {
+      this.active += 1;
+      return { release: this.makeRelease(), remainingMs: deadline - performance.now() };
+    }
+    if (this.waiting.length >= this.maxWaiters) throw new AstraClientError("ASTRA_CONCURRENCY_SATURATED", stage, "NOT_DISPATCHED");
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let timer: NodeJS.Timeout | undefined;
+      let waiter: { tryGrant: () => boolean };
+      const remove = () => {
+        const index = this.waiting.indexOf(waiter);
+        if (index >= 0) this.waiting.splice(index, 1);
+        if (timer) clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+      };
+      const fail = (message: "ASTRA_REQUEST_TIMEOUT" | "ASTRA_REQUEST_ABORTED") => {
+        if (settled) return;
+        settled = true;
+        remove();
+        reject(new AstraClientError(message, stage, "NOT_DISPATCHED"));
+      };
+      const onAbort = () => fail("ASTRA_REQUEST_ABORTED");
+      waiter = {
+        tryGrant: () => {
+          if (settled) return false;
+          if (signal?.aborted) { fail("ASTRA_REQUEST_ABORTED"); return false; }
+          if (performance.now() >= deadline) { fail("ASTRA_REQUEST_TIMEOUT"); return false; }
+          settled = true;
+          remove();
+          this.active += 1;
+          resolve({ release: this.makeRelease(), remainingMs: deadline - performance.now() });
+          return true;
+        },
+      };
+      this.waiting.push(waiter);
+      if (signal) signal.addEventListener("abort", onAbort, { once: true });
+      timer = setTimeout(() => fail("ASTRA_REQUEST_TIMEOUT"), Math.max(0, deadline - performance.now()));
+    });
+  }
+  snapshot(): { active: number; waiting: number; maxWaiters: number; limit: number } {
+    return { active: this.active, waiting: this.waiting.length, maxWaiters: this.maxWaiters, limit: this.limit };
+  }
+  private makeRelease(): () => void {
     let released = false;
     return () => {
       if (released) return;
       released = true;
       this.active = Math.max(0, this.active - 1);
-      this.waiting.shift()?.();
+      while (this.active < this.limit && this.waiting.length > 0) {
+        const waiter = this.waiting.shift();
+        if (waiter?.tryGrant()) break;
+      }
     };
   }
 }

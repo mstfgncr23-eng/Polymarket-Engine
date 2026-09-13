@@ -84,8 +84,7 @@ export const astraFeaturePacketSchema = z.object({
 }).strict();
 export type AstraFeaturePacket = z.infer<typeof astraFeaturePacketSchema>;
 
-export interface AstraDecisionRequest {
-  stage: AstraStage;
+export interface AstraDecisionRequestContext {
   traceId: string;
   triggerId: string;
   featurePacket: AstraFeaturePacket;
@@ -97,6 +96,10 @@ export interface AstraDecisionRequest {
   };
   signal?: AbortSignal;
 }
+
+export type AstraDecisionRequest =
+  | (AstraDecisionRequestContext & { stage: "FAST" })
+  | (AstraDecisionRequestContext & { stage: "DEEP"; fastProposal: AstraModelOutput });
 
 export interface AstraModelResult {
   output: AstraModelOutput;

@@ -77,8 +77,9 @@ export class AstraDailyBudget {
   reserve(amountUsd: number, now: Date): boolean { return this.spend(amountUsd, now); }
   settle(reservedUsd: number, actualUsd: number, now: Date): void {
     this.roll(now);
-    const refund = Math.max(0, reservedUsd - Math.max(0, actualUsd));
-    this.state.spentUsd = Math.max(0, this.state.spentUsd - refund);
+    const reserved = Math.max(0, reservedUsd);
+    const actual = Math.max(0, actualUsd);
+    this.state.spentUsd = Math.max(0, this.state.spentUsd - reserved + actual);
   }
   snapshot(now = new Date()): AstraBudgetState { this.roll(now); return { ...this.state }; }
   restore(state: AstraBudgetState): void { this.state = astraBudgetStateSchema.parse(state); }

@@ -7,10 +7,12 @@ import {
   type AstraBatchResult,
   type AstraDecision,
   type AstraDecisionRequest,
+  type AstraDecisionRequestContext,
   type AstraFeaturePacket,
   type AstraModelResult,
   type AstraStage,
 } from "@pm/core";
+import { AstraClientError } from "./client.js";
 
 export interface AstraServiceOptions {
   client: AstraClient;
@@ -34,7 +36,7 @@ export type AstraServiceResult = {
 export class AstraDecisionService {
   constructor(private readonly options: AstraServiceOptions) {}
 
-  async decide(input: Omit<AstraDecisionRequest, "stage" | "memory"> & { featurePacket: AstraFeaturePacket }): Promise<AstraServiceResult> {
+  async decide(input: Omit<AstraDecisionRequestContext, "memory">): Promise<AstraServiceResult> {
     const requestBase = { ...input, memory: this.options.memory.relevant(8, { marketId: input.featurePacket.marketId, asset: input.featurePacket.asset, regime: input.featurePacket.regime }) };
     const fast = await this.invoke({ ...requestBase, stage: "FAST" });
     const invocations = [fast.result];
@@ -48,7 +50,7 @@ export class AstraDecisionService {
       || input.featurePacket.regime === "VOLATILE"
       || input.featurePacket.regime === "DISLOCATED";
     if (fast.result.output.action !== "NO_TRADE" && highRisk) {
-      const deep = await this.invoke({ ...requestBase, stage: "DEEP" });
+      const deep = await this.invoke({ ...requestBase, stage: "DEEP", fastProposal: fast.result.output });
       selected = deep.result;
       invocations.push(deep.result);
       stages.push("DEEP");
@@ -89,7 +91,7 @@ export class AstraDecisionService {
       this.options.budget.settle(reserve, result.usage.costUsd, now);
       return result;
     } catch (error) {
-      this.options.budget.settle(reserve, 0, now);
+      this.options.budget.settle(reserve, this.isUnknownBillableFailure(error) ? reserve : 0, now);
       throw error;
     }
   }
@@ -105,9 +107,13 @@ export class AstraDecisionService {
       this.options.budget.settle(reserve, result.usage.costUsd, now);
       return { result, reservedUsd: reserve };
     } catch (error) {
-      this.options.budget.settle(reserve, 0, now);
+      this.options.budget.settle(reserve, this.isUnknownBillableFailure(error) ? reserve : 0, now);
       throw error;
     }
+  }
+
+  private isUnknownBillableFailure(error: unknown): boolean {
+    return !(error instanceof AstraClientError) || error.dispatchState !== "NOT_DISPATCHED";
   }
 }
 

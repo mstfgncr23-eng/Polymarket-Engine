@@ -2114,7 +2114,6 @@ export class EngineService {
       triggerProvenanceValid: this.isProvenanceCurrentlyValid(trigger.id, provenance),
       referenceRequired: this.referenceRequired.get(trigger.marketId) === true,
       minDepthUsd: this.riskLimits.minLiquidityUsd, maxSpreadBps: this.riskLimits.maxSpread * 10_000,
-      maxPairAskCost: 1 - this.riskLimits.minExpectedEdge,
       cooldownUntilMs: Math.max(
         this.astraGateState.get(trigger.marketId) ?? 0,
         this.astraGateState.get(this.astraGateFingerprint(featurePacket)) ?? 0,
