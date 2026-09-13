@@ -65,6 +65,7 @@ export async function startRuntime(envInput: NodeJS.ProcessEnv = process.env): P
       resource: event.resource ?? null,
     }, "mcp oauth event"),
     startExperiment: () => engine.beginExperiment(),
+    closeExperimentEntries: () => engine.closeExperimentEntries(),
     engineReadToken: env.ENGINE_READ_TOKEN,
     operatorToken: env.ENGINE_OPERATOR_TOKEN,
     metricsToken: env.METRICS_TOKEN,

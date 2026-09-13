@@ -171,6 +171,7 @@ export async function createApiServer(input: {
   isTriggerActionable?(triggerId: string): boolean;
   getAlphaResearchContext?(triggerId: string): Record<string, unknown> | null;
   startExperiment?: () => Promise<Record<string, unknown>>;
+  closeExperimentEntries?: () => Promise<Record<string, unknown>>;
   engineReadToken?: string;
   operatorToken?: string;
   metricsToken?: string;
@@ -358,6 +359,15 @@ export async function createApiServer(input: {
     if (!auth.ok) return reply.code(401).send({ error: "ENGINE_OPERATOR_UNAUTHORIZED" });
     if (!input.startExperiment) return reply.code(503).send({ error: "EXPERIMENT_START_UNAVAILABLE" });
     return input.startExperiment();
+  });
+  app.post("/api/operator/experiment/close-entries", async (request, reply) => {
+    if (!input.operatorToken) return reply.code(401).send({ error: "ENGINE_OPERATOR_UNAUTHORIZED" });
+    const auth = protect(request, input.operatorToken, true);
+    if (!auth.ok) return reply.code(401).send({ error: "ENGINE_OPERATOR_UNAUTHORIZED" });
+    if (!input.closeExperimentEntries) return reply.code(503).send({ error: "EXPERIMENT_CLOSE_ENTRIES_UNAVAILABLE" });
+    const result = await input.closeExperimentEntries();
+    if (result.ok === false) return reply.code(409).send(result);
+    return result;
   });
   app.get("/events", async (request, reply) => {
     const denied = await requireRead(request, reply);

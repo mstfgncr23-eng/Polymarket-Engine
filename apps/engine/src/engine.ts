@@ -767,6 +767,31 @@ export class EngineService {
       return { ok: true, experiment: this.experiment, preflight };
     });
   }
+
+  async closeExperimentEntries(): Promise<Record<string, unknown>> {
+    return this.experimentBoundaryGate.run(async () => {
+      const current = this.experiment;
+      if (!current || current.status === "IDLE" || current.status === "CREATED") {
+        return { ok: false, blockers: ["NO_CURRENT_EXPERIMENT"], experiment: current };
+      }
+      if (current.status === "ENTRY_CLOSED" || current.status === "COMPLETED") {
+        return { ok: true, experiment: current };
+      }
+      if (current.status !== "RUNNING") {
+        return { ok: false, blockers: ["EXPERIMENT_NOT_RUNNING"], experiment: current };
+      }
+
+      const closed: ExperimentManifest = {
+        ...current,
+        status: "ENTRY_CLOSED",
+        entryClosesAt: this.nowFn().toISOString(),
+        completedAt: null,
+        markToMarketAt: null,
+      };
+      await this.commitExperimentStatus(closed);
+      return { ok: true, experiment: this.experiment };
+    });
+  }
   /** Test-only view of current entry-feed eligibility. */
   experimentFeedBlockersForTest(): string[] { return this.experimentFeedBlockers(); }
 
