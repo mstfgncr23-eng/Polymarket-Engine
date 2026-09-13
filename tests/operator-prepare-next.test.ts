@@ -1,4 +1,5 @@
 import { MemoryEventJournal } from "@pm/db";
+import { createId, type TriggerEvent } from "@pm/core";
 import { describe, expect, it } from "vitest";
 import { EngineService } from "../apps/engine/src/engine.js";
 import { NoopGrokActivationBridge } from "../apps/engine/src/activation/index.js";
@@ -11,9 +12,27 @@ import {
   qualified,
   qualifiedPaperEnv,
 } from "./paper-engine-testkit.js";
-import { fill } from "./fixtures.js";
+import { fill, snapshot } from "./fixtures.js";
 
 const START_MS = Date.parse("2026-09-01T00:00:00.000Z");
+
+async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
+  const started = Date.now();
+  while (!predicate()) {
+    if (Date.now() - started > timeoutMs) throw new Error("waitFor timeout");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+function p0Trigger(suffix: string, marketId = "btc-mkt"): TriggerEvent {
+  const traceId = createId(`trace-${suffix}`);
+  return {
+    id: createId(`trigger-${suffix}`), traceId, marketId, asset: "BTC", source: "risk",
+    kind: "SCHEDULED_REVIEW", severity: 0, score: 1, dedupeKey: `dedupe-${suffix}`, evidence: {},
+    sourceEventIds: [createId(`source-${suffix}`)], evidenceIds: [],
+    createdAt: new Date(START_MS).toISOString(), expiresAt: new Date(START_MS + 60_000).toISOString(),
+  };
+}
 
 async function setup(input: { journal?: MemoryEventJournal; nowMs?: number; closePolicy?: "observe_until_settlement" | "mark_to_market" } = {}) {
   const clock = { nowMs: input.nowMs ?? START_MS };
@@ -210,6 +229,112 @@ describe("prepare-next paper experiment boundary", () => {
       expect(test.engine.experimentManifest()?.status).toBe("COMPLETED");
       expect((await test.journal.queryDurableTransitions({ types: ["EXPERIMENT_PREPARED"], limit: 8 }))).toHaveLength(0);
     } finally {
+      await test.engine.stop();
+    }
+  });
+
+  it("unconditionally fences an old-generation P0 trigger across preparation while preserving same-run hedging", async () => {
+    const test = await setup();
+    let releaseReportLoad!: () => void;
+    let reportLoadStarted!: () => void;
+    const reportLoadGate = new Promise<void>((resolve) => { releaseReportLoad = resolve; });
+    const reportLoadStartedPromise = new Promise<void>((resolve) => { reportLoadStarted = resolve; });
+    const originalLoadReport = test.journal.loadExperimentReport.bind(test.journal);
+    let heldReportLoad = false;
+    let releaseBlockers!: () => void;
+    const blockerGate = new Promise<void>((resolve) => { releaseBlockers = resolve; });
+    let blockerHoldsEntered!: () => void;
+    const blockerHoldsEnteredPromise = new Promise<void>((resolve) => { blockerHoldsEntered = resolve; });
+    let blockerHoldCount = 0;
+    const blockerHold = {
+      then: (onFulfilled: (value: void) => unknown) => {
+        blockerHoldCount += 1;
+        if (blockerHoldCount === 4) blockerHoldsEntered();
+        return blockerGate.then(onFulfilled);
+      },
+    } as unknown as Promise<void>;
+    let stalePending: Promise<void> | undefined;
+    let blockerPendings: Promise<void>[] = [];
+    const stale = p0Trigger("stale");
+    const sameRun = p0Trigger("same-run");
+
+    try {
+      expect((await test.engine.beginExperiment()).ok).toBe(true);
+      const up = snapshot({
+        marketId: "btc-mkt", tokenId: "btc-up", outcome: "UP", asset: "BTC",
+        receivedAt: new Date(START_MS).toISOString(), sourceTimestamp: new Date(START_MS).toISOString(),
+        asks: [{ price: "0.48", quantity: "300" }], bids: [{ price: "0.47", quantity: "300" }],
+      });
+      const down = snapshot({
+        marketId: "btc-mkt", tokenId: "btc-down", outcome: "DOWN", asset: "BTC",
+        receivedAt: new Date(START_MS).toISOString(), sourceTimestamp: new Date(START_MS).toISOString(),
+        asks: [{ price: "0.51", quantity: "300" }], bids: [{ price: "0.50", quantity: "300" }],
+      });
+      await test.market.emitSnapshot(up);
+      await test.market.emitSnapshot(down);
+      await waitFor(() => test.engine.runtimeSupervisorSnapshot().unresolved === 0);
+      await test.engine.completeExperimentForTest();
+      expect((await test.engine.ensureSourceSealForTest()).sealed).toBe(true);
+      await test.engine.writeFinalReportForTest();
+      const previous = test.engine.experimentManifest()!;
+
+      test.journal.loadExperimentReport = async (experimentId, reportKind = "final") => {
+        if (!heldReportLoad) {
+          heldReportLoad = true;
+          reportLoadStarted();
+          await reportLoadGate;
+        }
+        return originalLoadReport(experimentId, reportKind);
+      };
+
+      test.engine.setProcessTriggerHoldForTest(blockerHold);
+      const preparePromise = test.engine.prepareNextExperiment();
+      await reportLoadStartedPromise;
+
+      // The prepare operation has already passed its unresolved-work check,
+      // but has not crossed the durable boundary yet. Fill every P0 worker
+      // with old-generation work so the stale trigger remains queued until
+      // the new generation is authoritative.
+      blockerPendings = ["one", "two", "three", "four"].map((suffix) => test.engine.registerTriggerForResearch(p0Trigger(`blocker-${suffix}`, `blocker-${suffix}-mkt`)));
+      await blockerHoldsEnteredPromise;
+      stalePending = test.engine.registerTriggerForResearch(stale);
+      await waitFor(() => test.engine.runtimeSupervisorSnapshot().lanes.p0.queued >= 1);
+      releaseReportLoad();
+
+      expect((await preparePromise).ok).toBe(true);
+      const next = test.engine.experimentManifest()!;
+      expect(next.id).not.toBe(previous.id);
+      expect(next.status).toBe("IDLE");
+      expect((await test.engine.beginExperiment()).ok).toBe(true);
+      expect(test.engine.experimentManifest()?.status).toBe("RUNNING");
+
+      // Put a fresh-run unpaired position on the same market. The stale P0
+      // trigger must not be able to reinterpret it as its own hedge.
+      await test.engine.applyObservedFill({
+        ...fill("UP", "0.40", "10"), id: "fresh-run-first-leg", orderId: "fresh-run-first-leg-order",
+        marketId: "btc-mkt", tokenId: "btc-up", timestamp: new Date(START_MS).toISOString(),
+      });
+      const beforeStaleRelease = test.engine.ledger.snapshot();
+      test.engine.setProcessTriggerHoldForTest(null);
+      releaseBlockers();
+      await Promise.all([...blockerPendings, stalePending]);
+
+      expect(test.engine.ledger.snapshot()).toEqual(beforeStaleRelease);
+      expect(await test.journal.readTrace(stale.traceId)).toEqual([]);
+      expect(await test.journal.queryEvents({ types: ["ASTRA_DECISION", "RISK_EVALUATION", "PAPER_ORDER_CREATED"], experimentId: next.id })).toEqual([]);
+
+      // The same P0 hedge in the current generation remains ordinary behavior.
+      await test.engine.registerTriggerForResearch(sameRun);
+      const sameRunEvents = await test.journal.readTrace(sameRun.traceId);
+      expect(sameRunEvents.some((event) => event.type === "ASTRA_DECISION" && event.payload.bypass === "DETERMINISTIC_HEDGE")).toBe(true);
+      expect(sameRunEvents.some((event) => event.type === "RISK_EVALUATION")).toBe(true);
+    } finally {
+      test.engine.setProcessTriggerHoldForTest(null);
+      releaseReportLoad();
+      releaseBlockers();
+      await Promise.all(blockerPendings.map((pending) => pending.catch(() => undefined)));
+      await stalePending?.catch(() => undefined);
+      test.journal.loadExperimentReport = originalLoadReport;
       await test.engine.stop();
     }
   });

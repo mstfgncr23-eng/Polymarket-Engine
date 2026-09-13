@@ -2141,7 +2141,7 @@ export class EngineService {
     const started = performance.now();
     try {
     if (signal?.aborted) return;
-    if (runGeneration !== this.experimentRunGeneration && !isRiskHedgeSettlementTrigger(trigger.kind)) return;
+    if (runGeneration !== this.experimentRunGeneration) return;
     if (this.processTriggerHold) await this.processTriggerHold;
     if (signal?.aborted) return;
     // A trigger emitted while a start is pending cannot begin an active
