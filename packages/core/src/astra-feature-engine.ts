@@ -27,7 +27,10 @@ export function buildAstraFeaturePacket(input: AstraFeatureInput): AstraFeatureP
   const down = bookFeatures(input.down);
   if (!up || !down) return null;
   const expiresAtMs = Date.parse(input.trigger.expiresAt);
-  if (!Number.isFinite(expiresAtMs) || expiresAtMs <= input.now.getTime()) return null;
+  // Expiry is an admission concern, not a feature-extraction failure. Build a
+  // valid packet with timeToExpiryMs=0 and let the deterministic opportunity
+  // gate reject it as STALE before any provider dispatch or budget reservation.
+  if (!Number.isFinite(expiresAtMs)) return null;
   const reference = input.reference;
   const usableReference = reference && reference.freshness === "fresh" ? reference : null;
   const move = finiteOrNull(usableReference?.recentMoveBps);
@@ -98,12 +101,21 @@ interface BookFeatures { mid: number; bid: number; ask: number; imbalance: numbe
 function bookFeatures(snapshot: MarketSnapshot): BookFeatures | null {
   const bid = snapshot.bids[0];
   const ask = snapshot.asks[0];
-  if (!bid || !ask) return null;
+  // A one-sided/empty book is valid market state but not a model feature
+  // failure. First reject malformed levels that are present; otherwise encode
+  // a zero-depth sentinel so the deterministic gate owns NO_LIQUIDITY.
+  if (!bid || !ask) {
+    if ((bid && !validTopLevel(bid)) || (ask && !validTopLevel(ask))) return null;
+    return emptyBookFeatures();
+  }
   const bidPrice = Number(bid.price); const askPrice = Number(ask.price);
   const bidQty = Number(bid.quantity); const askQty = Number(ask.quantity);
   if (![bidPrice, askPrice, bidQty, askQty].every(Number.isFinite) || askPrice < bidPrice || bidQty < 0 || askQty < 0) return null;
+  if (bidPrice < 0 || askPrice > 1) return null;
   const denominator = bidQty + askQty;
-  if (denominator <= 0 || bidPrice < 0 || askPrice > 1) return null;
+  if (denominator <= 0) {
+    return { mid: (bidPrice + askPrice) / 2, bid: bidPrice, ask: askPrice, imbalance: 0, spreadBps: (askPrice - bidPrice) * 10_000, depthUsd: 0 };
+  }
   const depthUsd = snapshot.asks.slice(0, 5).reduce((sum, level) => sum + Number(level.price) * Number(level.quantity), 0);
   if (!Number.isFinite(depthUsd) || depthUsd < 0) return null;
   return {
@@ -115,6 +127,12 @@ function bookFeatures(snapshot: MarketSnapshot): BookFeatures | null {
     depthUsd,
   };
 }
+function validTopLevel(level: { price: string; quantity: string }): boolean {
+  const price = Number(level.price);
+  const quantity = Number(level.quantity);
+  return Number.isFinite(price) && Number.isFinite(quantity) && price >= 0 && price <= 1 && quantity >= 0;
+}
+function emptyBookFeatures(): BookFeatures { return { mid: 0, bid: 0, ask: 0, imbalance: 0, spreadBps: 0, depthUsd: 0 }; }
 function validDate(value: Date): boolean { return value instanceof Date && Number.isFinite(value.getTime()); }
 function finiteOrNull(value: number | null | undefined): number | null { return value !== null && value !== undefined && Number.isFinite(value) ? value : null; }
 function nonnegativeOrNull(value: number | null | undefined): number | null { const next = finiteOrNull(value); return next === null ? null : Math.max(0, next); }

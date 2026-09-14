@@ -2,6 +2,7 @@ import { z } from "zod";
 
 export const ASTRA_FAST_MAX_DISPATCHES_PER_HOUR = 12;
 export const ASTRA_FAST_MAX_DISPATCHES_PER_HOUR_LIMIT = 10_000;
+export const ASTRA_FAST_MAX_MARKETS = 256;
 export const ASTRA_FAST_MIN_DISPATCH_INTERVAL_MS = 5_000;
 export const ASTRA_FAST_MARKET_COOLDOWN_MS = 60_000;
 
@@ -112,7 +113,9 @@ export class AstraDispatchGovernor {
   }
   private minIntervalMs(): number { return Math.max(0, Math.floor(this.options.minDispatchIntervalMs ?? ASTRA_FAST_MIN_DISPATCH_INTERVAL_MS)); }
   private marketCooldownMs(): number { return Math.max(0, Math.floor(this.options.marketCooldownMs ?? ASTRA_FAST_MARKET_COOLDOWN_MS)); }
-  private maxMarkets(): number { return Math.max(1, Math.floor(this.options.maxMarkets ?? 256)); }
+  private maxMarkets(): number {
+    return Math.min(ASTRA_FAST_MAX_MARKETS, Math.max(1, Math.floor(this.options.maxMarkets ?? ASTRA_FAST_MAX_MARKETS)));
+  }
 
   private prune(nowMs: number): void {
     const cutoff = nowMs - 3_600_000;

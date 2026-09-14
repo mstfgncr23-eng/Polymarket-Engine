@@ -1,4 +1,4 @@
-﻿import type { CSSProperties } from "react";
+import type { CSSProperties } from "react";
 import {
   buildGalaxyVisualSlots,
   coreCaptionLines,
@@ -281,8 +281,6 @@ function Satellite({
       <text x={label.x} y={label.y} textAnchor="middle" className="galaxySatelliteLabel">{slot.label}</text>
       {label.showDetail ? <text x={label.x} y={label.y + 11} textAnchor="middle" className="galaxySatelliteDetail">{slot.detail}</text> : null}
     </> : null}
-    {slot.kind === "market" ? <title>{`${model.market.status} Â· ${model.market.outcomes} outcomes`}</title> : null}
+    {slot.kind === "market" ? <title>{`${model.market.status} · ${model.market.outcomes} outcomes`}</title> : null}
   </g>;
 }
-
-

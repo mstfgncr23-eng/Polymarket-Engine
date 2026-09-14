@@ -40,8 +40,39 @@ export interface StreamedExperimentSummary {
 
 export const ANALYTICS_ROLLUP_SCHEMA_VERSION = 1;
 
+/**
+ * Analytics rollups are persisted as Postgres jsonb. Hash the exact JSON
+ * storage representation, not the richer in-memory JS object. In particular,
+ * JSON storage drops object properties whose value is undefined and converts
+ * non-finite numbers to null. Hashing before this round-trip made a freshly
+ * written rollup unverifiable after restart.
+ */
+function jsonStorageRoundTrip(value: Record<string, unknown>): Record<string, unknown> {
+  const encoded = JSON.stringify(value);
+  if (encoded === undefined) throw new Error("ANALYTICS_ROLLUP_NOT_JSON_SERIALIZABLE");
+  const parsed = JSON.parse(encoded) as unknown;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("ANALYTICS_ROLLUP_NOT_JSON_OBJECT");
+  }
+  return parsed as Record<string, unknown>;
+}
+
 export function hashAnalyticsRollup(accumulator: Record<string, unknown>): string {
-  return createHash("sha256").update(canonicalJson(accumulator)).digest("hex");
+  return createHash("sha256").update(canonicalJson(jsonStorageRoundTrip(accumulator))).digest("hex");
+}
+
+/**
+ * Compatibility for schema-v1 rollups written before json-storage hashing.
+ * The old accumulator serializer emitted `lastLedger: undefined` when no PNL
+ * snapshot had been observed. canonicalJson hashed that key as the literal
+ * text `undefined`, while jsonb correctly dropped it. Reconstruct only that
+ * exact historical shape; every other mismatch remains fail-closed.
+ */
+function matchesLegacyV1AnalyticsHash(accumulator: Record<string, unknown>, expectedHash: string): boolean {
+  if (Object.prototype.hasOwnProperty.call(accumulator, "lastLedger")) return false;
+  const legacyShape = { ...accumulator, lastLedger: undefined };
+  const legacyHash = createHash("sha256").update(canonicalJson(legacyShape)).digest("hex");
+  return legacyHash === expectedHash;
 }
 
 function hashAnalyticsCoverage(input: { experimentId: string; schemaVersion: number; sourceEventCount: number; sourceCommitSeq: number; sourceFenceId: string | null; sourceFenceOccurredAt: string | null; sourceRecordedAt: string | null; stableRead: boolean; accumulatorHash: string }): string {
@@ -65,14 +96,15 @@ export async function persistVerifiedAnalyticsRollup(
     if (input.sourceFenceOccurredAt && fenceEvent.occurredAt !== input.sourceFenceOccurredAt) return null;
   }
   const existing = journal.loadAnalyticsRollup ? await journal.loadAnalyticsRollup(input.experimentId, input.rollupKind ?? "canonical") : null;
-  const contentHash = hashAnalyticsRollup(input.accumulator);
+  const storageAccumulator = jsonStorageRoundTrip(input.accumulator);
+  const contentHash = hashAnalyticsRollup(storageAccumulator);
   const rollup = {
     experimentId: input.experimentId, rollupKind: input.rollupKind ?? "canonical", schemaVersion: ANALYTICS_ROLLUP_SCHEMA_VERSION,
     sourceCursor: input.sourceCursor, sourceFenceId: input.sourceFenceId ?? null, sourceFenceOccurredAt: input.sourceFenceOccurredAt ?? null,
     sourceEventCount: coveredCount, sourceCommitSeq: input.sourceCommitSeq ?? 0, sourceRecordedAt: input.sourceRecordedAt ?? null,
     stableRead: input.stableRead ?? true,
     previousContentHash: input.baseContentHash !== undefined ? input.baseContentHash : (input.previousContentHash !== undefined ? input.previousContentHash : existing?.contentHash ?? null),
-    accumulator: input.accumulator, contentHash, verified: true, createdAt: new Date().toISOString(),
+    accumulator: storageAccumulator, contentHash, verified: true, createdAt: new Date().toISOString(),
   };
   (rollup as { coverageHash?: string }).coverageHash = hashAnalyticsCoverage({ experimentId: rollup.experimentId, schemaVersion: rollup.schemaVersion, sourceEventCount: rollup.sourceEventCount, sourceCommitSeq: rollup.sourceCommitSeq, sourceFenceId: rollup.sourceFenceId, sourceFenceOccurredAt: rollup.sourceFenceOccurredAt, sourceRecordedAt: rollup.sourceRecordedAt, stableRead: rollup.stableRead, accumulatorHash: contentHash });
   return journal.persistAnalyticsRollup(rollup);
@@ -81,7 +113,10 @@ export async function persistVerifiedAnalyticsRollup(
 export async function loadVerifiedAnalyticsRollup(journal: EventJournal, experimentId: string, rollupKind = "canonical"): Promise<import("@pm/db").AnalyticsRollup | null> {
   if (!journal.loadAnalyticsRollup) return null;
   const row = await journal.loadAnalyticsRollup(experimentId, rollupKind);
-  if (!row || !row.verified || row.schemaVersion !== ANALYTICS_ROLLUP_SCHEMA_VERSION || row.stableRead === false || hashAnalyticsRollup(row.accumulator) !== row.contentHash) return null;
+  if (!row || !row.verified || row.schemaVersion !== ANALYTICS_ROLLUP_SCHEMA_VERSION || row.stableRead === false) return null;
+  const storageHashMatches = hashAnalyticsRollup(row.accumulator) === row.contentHash;
+  const legacyV1HashMatches = !storageHashMatches && matchesLegacyV1AnalyticsHash(row.accumulator, row.contentHash);
+  if (!storageHashMatches && !legacyV1HashMatches) return null;
   if (row.coverageHash && row.coverageHash !== hashAnalyticsCoverage({ experimentId: row.experimentId, schemaVersion: row.schemaVersion, sourceEventCount: row.sourceEventCount ?? 0, sourceCommitSeq: row.sourceCommitSeq ?? 0, sourceFenceId: row.sourceFenceId, sourceFenceOccurredAt: row.sourceFenceOccurredAt, sourceRecordedAt: row.sourceRecordedAt ?? null, stableRead: row.stableRead ?? false, accumulatorHash: row.contentHash })) return null;
   return row;
 }

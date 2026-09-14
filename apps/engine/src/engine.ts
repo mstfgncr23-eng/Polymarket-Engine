@@ -2294,7 +2294,11 @@ export class EngineService {
       types: ["ASTRA_PROVIDER_DISPATCH_AUTHORIZED", "ASTRA_PROVIDER_DISPATCH_STARTED"],
       experimentId,
       from: new Date(nowMs - 3_600_000),
-      limit: this.env.ASTRA_FAST_MAX_DISPATCHES_PER_HOUR,
+      // Each real dispatch may have one durable authorization row and one
+      // best-effort started row. Read both rows for every possible dispatch;
+      // limiting this query to twelve rows would restore only six attempts and
+      // weaken the rolling governor after restart.
+      limit: this.env.ASTRA_FAST_MAX_DISPATCHES_PER_HOUR * 2,
       order: "desc",
     });
     const seen = new Set<string>();
@@ -2378,7 +2382,10 @@ export class EngineService {
       // Consume only after beginDispatch confirms that the SDK request was
       // created. The gate remains held, so no concurrent market can observe
       // the admission between the governor check and this consume.
-      if (context.stage === "FAST") this.astraGovernor.consume(context.marketId ?? "unknown", occurredAt.getTime());
+      // The rolling interval is measured from the actual SDK boundary, not
+      // from the earlier authorization timestamp. A slow durable write must
+      // not make two real provider starts appear artificially close together.
+      if (context.stage === "FAST") this.astraGovernor.consume(context.marketId ?? "unknown", this.nowFn().getTime());
       this.metrics.astraProviderDispatchStarted.inc({ stage: context.stage });
       // The authorization row above is the durable prerequisite. This
       // post-begin row is best effort so an audit outage cannot release the
@@ -2768,6 +2775,9 @@ export class EngineService {
         accepted: true, action: result.decision.action, direction: result.decision.direction, stages: result.stages,
       }, asset);
       await this.evaluateTrade(trigger, consensus, native, ASTRA_BRAIN_AUTHORITY, result.decision, admissionFence);
+      if (this.researchIngressBlocked()
+        || admissionFence.experimentId !== this.experiment?.id
+        || admissionFence.runGeneration !== this.experimentRunGeneration) return;
       this.astraMemory.add({
         id: `astra:${trigger.id}`, marketId: trigger.marketId, ...(asset ? { asset } : {}), regime: featurePacket.regime, kind: "DECISION", createdAt: featurePacket.observedAt, expiresAt: featurePacket.expiresAt,
         summary: `${result.decision.direction}:${result.decision.rationaleCode}`, features: {
@@ -3489,7 +3499,12 @@ export class EngineService {
       && (astraAdmissionFence.experimentId !== this.experiment?.id
         || astraAdmissionFence.runGeneration !== this.experimentRunGeneration)) return;
     if (this.researchIngressBlocked()) return;
-    if (!this.isTriggerActionable(trigger.id)) return;
+    // An Astra result with an admission fence must reach the final
+    // revalidation check even when a market epoch changed while the provider
+    // was in flight. That path emits the explicit rejection evidence; it can
+    // never submit because the revalidation is immediately before the order.
+    if (!this.isTriggerActionable(trigger.id)
+      && !(authority === ASTRA_BRAIN_AUTHORITY && astraAdmissionFence)) return;
     const pair = this.snapshots.get(trigger.marketId ?? "");
     if (!pair) return;
     const position = this.ledger.positions.get(trigger.marketId ?? "") ?? null;
@@ -3497,7 +3512,12 @@ export class EngineService {
       const next = refreshExperiment(this.experiment, this.nowFn(), { openPositions: openPositionsRemain(this.ledger.positions.values()) });
       if (next.status !== this.experiment.status) {
         if (next.status === "COMPLETED") {
-          await this.finalizeExperiment(next);
+          // This call originates from the current Astra decision pipeline.
+          // Its provider operation has completed, but the outer in-flight
+          // counter is intentionally held until all post-response fencing is
+          // done. Let finalization ignore that one current pipeline without
+          // ignoring any other provider operation.
+          await this.finalizeExperiment(next, authority === ASTRA_BRAIN_AUTHORITY && Boolean(astraAdmissionFence));
         } else {
           await this.commitExperimentStatus(next);
         }
@@ -4787,7 +4807,7 @@ export class EngineService {
    * batch promises while holding the gate would serialize unrelated lifecycle
    * operations behind network latency and create close/report races.
    */
-  private async finalizeExperiment(next: ExperimentManifest): Promise<boolean> {
+  private async finalizeExperiment(next: ExperimentManifest, currentDecisionInFlight = false): Promise<boolean> {
     if (next.status !== "COMPLETED") return false;
     if (this.experiment?.status === "COMPLETED") return true;
     if (this.experiment?.id !== next.id) return false;
@@ -4795,7 +4815,8 @@ export class EngineService {
     this.astraFinalizationPending = true;
     try {
       const deadline = Date.now() + Math.max(this.env.ASTRA_BATCH_TIMEOUT_MS, this.env.ASTRA_FAST_TIMEOUT_MS) + 1_000;
-      while (this.astraDecisionInFlight > 0) {
+      const currentDecisionAllowance = currentDecisionInFlight ? 1 : 0;
+      while (this.astraDecisionInFlight > currentDecisionAllowance) {
         if (Date.now() >= deadline) return false;
         await new Promise((resolve) => setTimeout(resolve, 5));
       }
@@ -4810,7 +4831,7 @@ export class EngineService {
         if (this.experiment?.id !== next.id || this.experiment?.status === "COMPLETED") return;
         // The provider drain is complete before entering this short durable
         // transition. Recheck the fence because the gate may have queued.
-        if (this.astraDecisionInFlight > 0 || !this.astraFinalizationPending) return;
+        if (this.astraDecisionInFlight > currentDecisionAllowance || !this.astraFinalizationPending) return;
         await this.commitExperimentStatus(next);
       });
       return this.experiment?.id === next.id && (this.experiment.status as string) === "COMPLETED";

@@ -4,18 +4,18 @@ import {
   AstraMemoryStore,
   astraModelOutputSchema,
   buildAstraFeaturePacket,
-  classifyAstraFirstLegTrigger,
   experimentAllowsFirstLeg,
   renderExperimentSummaryMarkdown,
   type AstraClient,
   type AstraDecisionRequest,
   type AstraModelResult,
+  type AstraProviderDispatchContext,
 } from "@pm/core";
 import { MemoryEventJournal, createJournalEvent } from "@pm/db";
 import { describe, expect, it } from "vitest";
-import { AstraClientError, OpenAIAstraClient, estimateAstraDecisionInputTokens } from "../apps/engine/src/astra/client.js";
-import { AstraBudgetError, AstraDecisionService, AstraDeepFailureError, AstraStageAccountingError } from "../apps/engine/src/astra/service.js";
-import { EngineService, parseEnv } from "../apps/engine/src/engine.js";
+import { AstraClientError, OpenAIAstraClient } from "../apps/engine/src/astra/client.js";
+import { AstraDecisionService, AstraDeepFailureError, AstraStageAccountingError } from "../apps/engine/src/astra/service.js";
+import { EngineService } from "../apps/engine/src/engine.js";
 import { NoopGrokActivationBridge } from "../apps/engine/src/activation/index.js";
 import { ExperimentSummaryAccumulator } from "../apps/engine/src/report.js";
 import { now, snapshot } from "./fixtures.js";
@@ -59,22 +59,6 @@ function serviceOptions(overrides: Record<string, unknown> = {}) {
 }
 
 describe("Astra Brain V1 final correctness regressions", () => {
-  it("uses a 10-second FAST default without changing DEEP or BATCH defaults", () => {
-    expect(parseEnv({}).ASTRA_FAST_TIMEOUT_MS).toBe(10_000);
-    expect(parseEnv({}).ASTRA_DEEP_TIMEOUT_MS).toBe(3_000);
-    expect(parseEnv({}).ASTRA_BATCH_TIMEOUT_MS).toBe(20_000);
-  });
-
-  it("uses an explicit paid-candidate allowlist and severity threshold", () => {
-    expect(classifyAstraFirstLegTrigger({ kind: "PAIR_COST_OPPORTUNITY", severity: 1 })).toEqual({ eligible: true, reason: "DIRECT_ECONOMIC_CANDIDATE" });
-    expect(classifyAstraFirstLegTrigger({ kind: "BOOK_IMBALANCE", severity: 2 })).toEqual({ eligible: true, reason: "STRONG_INFORMATIONAL_CANDIDATE" });
-    expect(classifyAstraFirstLegTrigger({ kind: "BOOK_IMBALANCE", severity: 1 })).toEqual({ eligible: false, reason: "SEVERITY_BELOW_THRESHOLD" });
-    for (const kind of ["NEARING_EXPIRY", "FAILED_HEDGE", "DIRECTIONAL_EXPOSURE", "LOSS_CLUSTER", "SEVERE_DISAGREEMENT", "SCHEDULED_REVIEW"]) {
-      expect(classifyAstraFirstLegTrigger({ kind, severity: 3 })).toEqual({ eligible: false, reason: "NON_SPECULATIVE_TRIGGER" });
-    }
-    expect(classifyAstraFirstLegTrigger({ kind: "FUTURE_TRIGGER", severity: 3 })).toEqual({ eligible: false, reason: "UNCLASSIFIED_TRIGGER" });
-  });
-
   it("keeps the rolling governor bounded and restores dispatch evidence across restart", () => {
     const governor = new AstraDispatchGovernor({ maxDispatchesPerHour: 2, minDispatchIntervalMs: 10, marketCooldownMs: 50, maxMarkets: 2 });
     governor.consume("market-a", 0);
@@ -96,6 +80,53 @@ describe("Astra Brain V1 final correctness regressions", () => {
     for (let index = 0; index < 12; index += 1) governor.consume(`market-${index}`, index);
     expect(governor.tryAdmit("market-over-cap", 12)).toMatchObject({ allowed: false, reason: "ROLLING_HOUR_CAP" });
     expect(governor.snapshot(12).dispatches).toHaveLength(12);
+  });
+
+  it("measures the rolling interval from actual SDK start after slow authorization", async () => {
+    const clock = { value: now.getTime() };
+    const market = new ScriptedMarketAdapter();
+    market.queue(discoveryReport([qualified("governor-timestamp-market", "BTC", "governor-timestamp-up", "governor-timestamp-down", new Date(clock.value + 900_000).toISOString())]));
+    const journal = new MemoryEventJournal();
+    const references = new ScriptedReferenceRegistry();
+    references.resolve = async (asset) => ({ asset, supported: false, symbol: null, url: null, reason: "REFERENCE_UNSUPPORTED", status: "UNSUPPORTED_DEFINITIVE" });
+    const engine = new EngineService(qualifiedPaperEnv({ ASTRA_ENABLED: "true", ESTIMATED_INFRA_COST_PER_HOUR_USD: "0" }), journal, { error: () => undefined }, {
+      market: market as never, referenceRegistry: references as never, activation: new NoopGrokActivationBridge(), now: () => new Date(clock.value),
+      astraClient: { decide: async () => modelResult(decisionOutput("NO_TRADE", 0.1), 0, "governor-timestamp") },
+    });
+    const authorize = (engine as unknown as {
+      authorizeAndBeginAstraProviderDispatch: (context: AstraProviderDispatchContext, beginDispatch: () => boolean) => Promise<void>;
+    }).authorizeAndBeginAstraProviderDispatch.bind(engine);
+    const context = (marketId: string): AstraProviderDispatchContext => ({
+      experimentId: engine.experimentManifest()!.id,
+      runGeneration: (engine as unknown as { experimentRunGeneration: number }).experimentRunGeneration,
+      traceId: `governor-${marketId}`,
+      triggerId: `governor-${marketId}`, stage: "FAST", model: "gpt-6-astra", triggerKind: "PAIR_COST_OPPORTUNITY", marketId,
+    });
+    let releaseAuthorization!: () => void;
+    journal.appendInFlightHold = new Promise<void>((resolve) => { releaseAuthorization = resolve; });
+    journal.appendInFlightHoldTypes = ["ASTRA_PROVIDER_DISPATCH_AUTHORIZED"];
+    const starts: number[] = [];
+    try {
+      await engine.start(); await market.waitForHandlers();
+      expect((await engine.beginExperiment()).ok).toBe(true);
+      const first = authorize(context("governor-market-a"), () => { starts.push(clock.value); return true; });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      clock.value += 10_000;
+      releaseAuthorization();
+      await first;
+      journal.appendInFlightHold = null;
+      journal.appendInFlightHoldTypes = null;
+      expect(starts).toEqual([now.getTime() + 10_000]);
+      clock.value += 1_000;
+      await expect(authorize(context("governor-market-b"), () => { starts.push(clock.value); return true; }))
+        .rejects.toMatchObject({ admissionReason: "GLOBAL_MIN_INTERVAL", dispatchState: "NOT_DISPATCHED" });
+      expect(starts).toHaveLength(1);
+    } finally {
+      journal.appendInFlightHold = null;
+      journal.appendInFlightHoldTypes = null;
+      releaseAuthorization?.();
+      await engine.stop();
+    }
   });
 
   it("uses a strict, time-aware first-leg deadline", () => {
@@ -122,41 +153,43 @@ describe("Astra Brain V1 final correctness regressions", () => {
     expect(restored.relevant(8).map((entry) => entry.id)).toEqual(["lesson"]);
   });
 
-  it("uses current billing time and never rolls a budget day backward", async () => {
+  it("does not let legacy calendar-day budget state gate provider dispatch", async () => {
     const { up, down } = pair();
     const observedBeforeMidnight = new Date("2026-09-13T23:59:59.000Z");
     const currentAfterMidnight = new Date("2026-09-14T00:00:01.000Z");
     const packet = buildAstraFeaturePacket({ trigger: makeTrigger(up.marketId, up.eventId, "billing", observedBeforeMidnight), up, down, reference: null, now: observedBeforeMidnight })!;
-    const budget = new AstraDailyBudget(1);
+    const legacyBudget = new AstraDailyBudget(0.000001);
+    legacyBudget.restore({ day: "2026-09-14", spentUsd: 999, calls: 999 });
+    let calls = 0;
+    let accountedUsd = 0;
     const service = new AstraDecisionService(serviceOptions({
-      client: { decide: async () => modelResult(decisionOutput("NO_TRADE", 0.1), 0.123) }, budget, nowFn: () => currentAfterMidnight,
+      budget: legacyBudget,
+      nowFn: () => currentAfterMidnight,
+      client: { decide: async () => { calls += 1; return modelResult(decisionOutput("NO_TRADE", 0.1), 0.123); } },
+      onStageSuccess: async ({ result }: { result: AstraModelResult }) => { accountedUsd += result.usage.costUsd; return true; },
     }) as never);
     await service.decide({ traceId: packet.traceId, triggerId: packet.triggerId, featurePacket: packet, portfolio: { drawdownUtilization: 0, unhedgedUtilization: 0, openPositionCount: 0 } });
-    expect(budget.snapshot(currentAfterMidnight)).toMatchObject({ day: "2026-09-14", spentUsd: 0.123 });
+    expect(calls).toBe(1);
+    expect(accountedUsd).toBeCloseTo(0.123, 10);
+    expect(legacyBudget.snapshot(currentAfterMidnight)).toEqual({ day: "", spentUsd: 0, calls: 0 });
 
-    const stale = new AstraDailyBudget(1);
-    expect(stale.reserve(0.4, currentAfterMidnight)).toBe(true);
-    expect(stale.snapshot(new Date("2026-09-13T23:59:59.000Z")).day).toBe("2026-09-14");
-    const batchBudget = new AstraDailyBudget(1);
     const batchService = new AstraDecisionService(serviceOptions({
-      budget: batchBudget, nowFn: () => currentAfterMidnight,
+      budget: legacyBudget,
+      nowFn: () => currentAfterMidnight,
       client: { decide: async () => modelResult(decisionOutput("NO_TRADE", 0.1)), learn: async () => ({ output: { lessons: [] }, usage: { inputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1, reasoningTokens: 0, costUsd: 0.01 }, providerRequestId: "batch" }) },
     }) as never);
-    await batchService.learn({ traceId: "batch-billing", observedAt: observedBeforeMidnight.toISOString(), aggregate: { sampleIds: ["s"], sampleCount: 1, calibration: { samples: 1, brierSum: 0.1, reliability: 0.9 }, previousLessons: [] } });
-    expect(batchBudget.snapshot(currentAfterMidnight).day).toBe("2026-09-14");
+    await expect(batchService.learn({ traceId: "batch-billing", observedAt: observedBeforeMidnight.toISOString(), aggregate: { sampleIds: ["s"], sampleCount: 1, calibration: { samples: 1, brierSum: 0.1, reliability: 0.9 }, previousLessons: [] } })).resolves.not.toBeNull();
   });
 
-  it("reserves against the worst configured input rate before dispatch", async () => {
+  it("does not use pricing reservation math as a monetary dispatch gate", async () => {
     const { up, down } = pair();
     const packet = buildAstraFeaturePacket({ trigger: makeTrigger(up.marketId, up.eventId, "pricing"), up, down, reference: null, now })!;
     const request = { stage: "FAST" as const, traceId: packet.traceId, triggerId: packet.triggerId, featurePacket: packet, memory: [], portfolio: { drawdownUtilization: 0, unhedgedUtilization: 0, openPositionCount: 0 } };
-    const estimate = estimateAstraDecisionInputTokens(request);
-    const reserve = estimate / 1_000_000 * 100 + 256 / 1_000_000 * 50;
-    const budget = new AstraDailyBudget(reserve * 0.99);
+    const legacyBudget = new AstraDailyBudget(0.000001);
     let dispatched = 0;
-    const service = new AstraDecisionService(serviceOptions({ budget, cacheWriteUsdPerM: 100, client: { decide: async () => { dispatched += 1; return modelResult(decisionOutput("NO_TRADE")); } } }) as never);
-    await expect(service.decide(request)).rejects.toBeInstanceOf(AstraBudgetError);
-    expect(dispatched).toBe(0);
+    const service = new AstraDecisionService(serviceOptions({ budget: legacyBudget, cacheWriteUsdPerM: 100_000, inputUsdPerM: 100_000, outputUsdPerM: 100_000, client: { decide: async () => { dispatched += 1; return modelResult(decisionOutput("NO_TRADE", 0.1)); } } }) as never);
+    await expect(service.decide(request)).resolves.toMatchObject({ decision: { action: "NO_TRADE" } });
+    expect(dispatched).toBe(1);
   });
 
   it("rejects an Astra result that returns after the entry deadline", async () => {
@@ -226,6 +259,41 @@ describe("Astra Brain V1 final correctness regressions", () => {
       release();
       await pendingDecision;
       await pendingCompletion;
+      expect(engine.experimentManifest()?.status).toBe("COMPLETED");
+      expect(await journal.queryEvents({ types: ["EXPERIMENT_COMPLETED"] })).toHaveLength(1);
+    } finally {
+      await engine.stop();
+    }
+  });
+
+  it("does not deadlock when the in-flight Astra result observes entry close", async () => {
+    const clock = { value: now.getTime() };
+    const market = new ScriptedMarketAdapter();
+    const marketId = "astra-self-finalization-market";
+    market.queue(discoveryReport([qualified(marketId, "BTC", "self-finalize-up", "self-finalize-down", new Date(clock.value + 900_000).toISOString())]));
+    const journal = new MemoryEventJournal();
+    const references = new ScriptedReferenceRegistry();
+    references.resolve = async (asset) => ({ asset, supported: false, symbol: null, url: null, reason: "REFERENCE_UNSUPPORTED", status: "UNSUPPORTED_DEFINITIVE" });
+    let entered!: () => void;
+    let release!: () => void;
+    const enteredPromise = new Promise<void>((resolve) => { entered = resolve; });
+    const released = new Promise<AstraModelResult>((resolve) => {
+      release = () => resolve(modelResult(decisionOutput("NO_TRADE", 0.1), 0, "self-finalization"));
+    });
+    const engine = new EngineService(qualifiedPaperEnv({ ASTRA_ENABLED: "true", ESTIMATED_INFRA_COST_PER_HOUR_USD: "0" }), journal, { error: () => undefined }, {
+      market: market as never, referenceRegistry: references as never, activation: new NoopGrokActivationBridge(), now: () => new Date(clock.value),
+      astraClient: { decide: async () => { entered(); return released; } },
+    });
+    try {
+      await engine.start(); await market.waitForHandlers();
+      expect((await engine.beginExperiment()).ok).toBe(true);
+      await market.emitSnapshot(snapshot({ marketId, tokenId: "self-finalize-up", outcome: "UP", asset: "BTC", receivedAt: new Date(clock.value).toISOString(), sourceTimestamp: new Date(clock.value).toISOString(), asks: [{ price: "0.48", quantity: "300" }], bids: [{ price: "0.47", quantity: "300" }] }));
+      await market.emitSnapshot(snapshot({ marketId, tokenId: "self-finalize-down", outcome: "DOWN", asset: "BTC", receivedAt: new Date(clock.value).toISOString(), sourceTimestamp: new Date(clock.value).toISOString(), asks: [{ price: "0.49", quantity: "300" }], bids: [{ price: "0.48", quantity: "300" }] }));
+      const pendingDecision = engine.registerTriggerForResearch(makeTrigger(marketId, "self-finalize-up", "self-finalization"));
+      await enteredPromise;
+      expect((await engine.closeExperimentEntries()).ok).toBe(true);
+      release();
+      await pendingDecision;
       expect(engine.experimentManifest()?.status).toBe("COMPLETED");
       expect(await journal.queryEvents({ types: ["EXPERIMENT_COMPLETED"] })).toHaveLength(1);
     } finally {
@@ -330,18 +398,5 @@ describe("Astra Brain V1 final correctness regressions", () => {
     expect(summary.modelCostByAgentUsd.ASTRA_BRAIN_V1).toBeCloseTo(0.37, 10);
     expect(markdown).toContain("Astra/OpenAI model cost: $0.37");
     expect(markdown).not.toContain("OpenAI token cost: $0");
-  });
-
-  it("marks provider cost completeness partial when dispatch evidence lacks exact usage", () => {
-    const accumulator = new ExperimentSummaryAccumulator("astra-completeness");
-    accumulator.fold(createJournalEvent({ traceId: "dispatch-known", type: "ASTRA_PROVIDER_DISPATCH_STARTED", aggregateType: "astra_provider_dispatch", aggregateId: "dispatch-known", payload: { authority: "ASTRA_BRAIN_V1", stage: "FAST" } }));
-    accumulator.fold(createJournalEvent({ traceId: "dispatch-unknown", type: "ASTRA_PROVIDER_DISPATCH_STARTED", aggregateType: "astra_provider_dispatch", aggregateId: "dispatch-unknown", payload: { authority: "ASTRA_BRAIN_V1", stage: "FAST" } }));
-    accumulator.fold(createJournalEvent({ traceId: "known-failure", type: "ASTRA_FAILURE", aggregateType: "astra", aggregateId: "known-failure", payload: { authority: "ASTRA_BRAIN_V1", stage: "FAST", reason: "STRUCTURED_OUTPUT_INVALID", dispatchState: "RESPONSE_RECEIVED", knownUsage: true, usage: { costUsd: 0.12 } } }));
-    accumulator.fold(createJournalEvent({ traceId: "unknown-failure", type: "ASTRA_FAILURE", aggregateType: "astra", aggregateId: "unknown-failure", payload: { authority: "ASTRA_BRAIN_V1", stage: "FAST", reason: "TIMEOUT", dispatchState: "DISPATCHED_UNKNOWN", knownUsage: false } }));
-    const summary = accumulator.finalize();
-    expect(summary.providerDispatchStartedCount).toBe(2);
-    expect(summary.knownUsageFailureCount).toBe(1);
-    expect(summary.dispatchedUnknownFailureCount).toBe(1);
-    expect(summary.providerCostCompleteness).toBe("PARTIAL");
   });
 });

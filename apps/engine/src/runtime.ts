@@ -5,6 +5,7 @@ import { EngineService, parseEnv } from "./engine.js";
 import { MCP_OAUTH_ROLES } from "./mcp-oauth.js";
 import { createApiServer } from "./server.js";
 import { OpenAIAstraClient } from "./astra/client.js";
+import { installAstraLiveDecisionBridge } from "./astra/live-decision-bridge.js";
 
 export interface Runtime {
   engine: EngineService;
@@ -49,6 +50,15 @@ export async function startRuntime(envInput: NodeJS.ProcessEnv = process.env): P
     })
     : undefined;
   const engine = new EngineService(env, journal, logger, { astraClient });
+  const removeLiveDecisionBridge = installAstraLiveDecisionBridge(journal, {
+    recentTriggers: () => engine.state.recentTriggers,
+    publish: (item) => {
+      engine.state.record(item);
+      engine.sse.publish("decision", item);
+      engine.sse.publish("snapshot", () => engine.state.snapshot());
+    },
+    onError: (error, event) => logger.warn({ err: error, eventId: event.id, eventType: event.type }, "live Astra decision projection failed"),
+  });
   const server = await createApiServer({
     state: engine.state, journal, metrics: engine.metrics, sse: engine.sse,
     dashboardOrigin: env.DASHBOARD_ORIGIN, logger: { level: env.LOG_LEVEL },
@@ -97,6 +107,7 @@ export async function startRuntime(envInput: NodeJS.ProcessEnv = process.env): P
       if (stopped) return;
       stopped = true;
       await engine.stop().catch((error) => logger.error({ err: error }, "engine shutdown failed"));
+      removeLiveDecisionBridge();
       await server.close().catch((error) => logger.error({ err: error }, "http shutdown failed"));
     },
   };
