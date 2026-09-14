@@ -1,6 +1,7 @@
 import { ASTRA_BRAIN_AUTHORITY } from "@pm/core";
 import { createJournalEvent, MemoryEventJournal } from "@pm/db";
 import { describe, expect, it } from "vitest";
+import { decisionActivityLabel, decisionActivityTone } from "../apps/dashboard/lib/dashboard-selectors.js";
 import {
   installAstraLiveDecisionBridge,
   projectCanonicalAstraDecisionEvent,
@@ -112,6 +113,27 @@ describe("canonical Astra -> live dashboard bridge", () => {
     expect(projectCanonicalAstraDecisionEvent(batch, [trigger])).toBeNull();
   });
 
+  it("keeps gate rejection and fail-closed decision semantics distinct in the dashboard", () => {
+    const gate = projectCanonicalAstraDecisionEvent(event("ASTRA_DECISION", {
+      authority: ASTRA_BRAIN_AUTHORITY,
+      accepted: false,
+      gateReason: "NO_LIQUIDITY",
+    }, "label-gate"), [trigger])!;
+    const failClosed = projectCanonicalAstraDecisionEvent(event("ASTRA_DECISION", {
+      authority: ASTRA_BRAIN_AUTHORITY,
+      accepted: false,
+      decisionSource: "FAIL_CLOSED",
+      failureReason: "DEEP_TIMEOUT",
+      decision: { direction: "FLAT", rationaleCode: "NO_TRADE" },
+    }, "label-fail-closed"), [trigger])!;
+
+    expect(decisionActivityLabel(gate)).toBe("ASTRA GATE REJECTED");
+    expect(decisionActivityTone(gate)).toBe("warning");
+    expect(decisionActivityLabel(failClosed)).toBe("ASTRA FAIL-CLOSED");
+    expect(decisionActivityTone(failClosed)).toBe("critical");
+    expect(failClosed.detail.reason).toBe("DEEP_TIMEOUT");
+  });
+
   it("publishes only after persistence succeeds, dedupes retries, and waits for appendMany completion", async () => {
     const journal = new MemoryEventJournal();
     const published: LiveDecisionFeedItem[] = [];
@@ -131,12 +153,20 @@ describe("canonical Astra -> live dashboard bridge", () => {
       await journal.append(gate);
       expect(published.map((item) => item.id)).toEqual([gate.id]);
 
+      let release!: () => void;
+      const hold = new Promise<void>((resolve) => { release = resolve; });
+      journal.setAppendInFlightHoldForTest(hold, ["ASTRA_MODEL_INVOCATION"]);
       const invocation = event("ASTRA_MODEL_INVOCATION", { authority: ASTRA_BRAIN_AUTHORITY, stage: "FAST", status: "SUCCESS" }, "batch-invocation");
       const decision = event("ASTRA_DECISION", {
         authority: ASTRA_BRAIN_AUTHORITY,
         decision: { action: "NO_TRADE", direction: "FLAT", confidence: 0.7, uncertainty: 0.2, rationaleCode: "NO_EDGE" },
       }, "batch-decision");
-      await journal.appendMany([invocation, decision]);
+      const pendingBatch = journal.appendMany([invocation, decision]);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(published.map((item) => item.id)).toEqual([gate.id]);
+      release();
+      await pendingBatch;
+      journal.setAppendInFlightHoldForTest(null);
       expect(published.map((item) => item.id)).toEqual([gate.id, invocation.id, decision.id]);
 
       const failed = event("ASTRA_FAILURE", { authority: ASTRA_BRAIN_AUTHORITY, reason: "CLIENT_UNAVAILABLE" }, "failed-append");
@@ -145,6 +175,7 @@ describe("canonical Astra -> live dashboard bridge", () => {
       expect(published.some((item) => item.id === failed.id)).toBe(false);
       expect(errors).toEqual([]);
     } finally {
+      journal.setAppendInFlightHoldForTest(null);
       uninstall();
     }
 
