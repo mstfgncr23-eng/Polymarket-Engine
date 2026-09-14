@@ -3,6 +3,7 @@ import {
   TemporalPairHedgeStrategy,
   TriggerEngine,
   createId,
+  ASTRA_FAST_MAX_DISPATCHES_PER_HOUR_LIMIT,
   decidePaperOrder,
   defaultNativeDecisionConfig,
   evaluateNativeDecision,
@@ -79,6 +80,7 @@ import {
   type AstraDecision,
   type AstraFeaturePacket,
   type AstraProviderDispatchContext,
+  type JournalKeysetCursor,
   rolesForTriggerKind,
 } from "@pm/core";
 import {
@@ -191,6 +193,7 @@ const IDLE_GROK_IDEMPOTENCY_TTL_MS = 5 * 60_000;
 const SCOUT_REFRESH_STATE_TTL_MS = 60_000;
 const SCOUT_REFRESH_CONTEXT_MAX = 128;
 const SCOUT_REFRESH_RETRY_GAP_MS = 1_000;
+const ASTRA_GOVERNOR_RECOVERY_SCAN_CEILING = ASTRA_FAST_MAX_DISPATCHES_PER_HOUR_LIMIT;
 const ASTRA_BOUNDED_FAILURE_REASONS = new Set([
   "TIMEOUT", "CONCURRENCY_SATURATED", "REQUEST_FAILED", "REQUEST_ABORTED",
   "STRUCTURED_OUTPUT_MISSING", "STRUCTURED_OUTPUT_INVALID", "STAGE_ADMISSION_CLOSED",
@@ -418,7 +421,7 @@ export class EngineService {
         outputUsdPerM: env.ASTRA_OUTPUT_USD_PER_M,
         nowFn: this.nowFn,
         beforeStageDispatch: async (stage) => stage === "BATCH"
-          ? this.canAcceptAstraBatchResult(this.experiment?.id ?? null)
+          ? this.canAcceptAstraBatchResult(this.experiment?.id ?? null, this.experimentRunGeneration)
           : true,
         model: env.ASTRA_MODEL,
         onStageSuccess: (input) => this.accountAstraStage(input),
@@ -2277,43 +2280,64 @@ export class EngineService {
     return false;
   }
 
-  private canAcceptAstraBatchResult(experimentId: string | null | undefined): boolean {
+  private canAcceptAstraBatchResult(experimentId: string | null | undefined, runGeneration?: number): boolean {
     return Boolean(experimentId)
       && Boolean(this.experiment)
       && this.experiment?.id === experimentId
+      && (runGeneration == null || runGeneration === this.experimentRunGeneration)
       && this.experiment?.status !== "COMPLETED"
       && !this.sourceSealing && !this.sourceSealed
       && !this.astraBatchFinalizationPending;
   }
 
   private async restoreAstraGovernorFromJournal(): Promise<void> {
-    const experimentId = this.experiment?.id;
-    if (!experimentId) return;
     const nowMs = this.nowFn().getTime();
-    const events = await this.journal.queryEvents({
-      types: ["ASTRA_PROVIDER_DISPATCH_AUTHORIZED", "ASTRA_PROVIDER_DISPATCH_STARTED"],
-      experimentId,
-      from: new Date(nowMs - 3_600_000),
-      // Each real dispatch may have one durable authorization row and one
-      // best-effort started row. Read both rows for every possible dispatch;
-      // limiting this query to twelve rows would restore only six attempts and
-      // weaken the rolling governor after restart.
-      limit: this.env.ASTRA_FAST_MAX_DISPATCHES_PER_HOUR * 2,
-      order: "desc",
-    });
-    const seen = new Set<string>();
-    this.astraGovernor.restoreFromEvidence(events
-      .filter((event) => event.payload.stage === "FAST")
-      .filter((event) => {
-        const key = event.aggregateId || `${event.traceId}:${event.payload.stage}`;
-        if (seen.has(key)) return false;
-        seen.add(key);
-        return true;
-      })
-      .map((event) => ({
-        occurredAt: event.occurredAt,
-        marketId: typeof event.payload.marketId === "string" ? event.payload.marketId : undefined,
-      })), nowMs);
+    const types = ["ASTRA_PROVIDER_DISPATCH_AUTHORIZED", "ASTRA_PROVIDER_DISPATCH_STARTED"] as const;
+    const from = new Date(nowMs - 3_600_000);
+    // recordedAt is assigned by the journal's wall clock, while nowFn may be
+    // a deterministic market clock in tests or a replay clock during recovery.
+    const recordedAtTo = new Date();
+    const through = await this.journal.peekLatestKeyset({ types, from, recordedAtTo });
+    if (!through) {
+      this.astraGovernor.restoreFromEvidence([], nowMs);
+      return;
+    }
+    const pageSize = Math.max(1, Math.min(this.recoveryPageSize, 256));
+    let after: JournalKeysetCursor | undefined;
+    let scanned = 0;
+    const evidence = new Map<string, { occurredAt: string; marketId?: string; started: boolean }>();
+    for (;;) {
+      const events = await this.journal.queryEventsKeyset({ types, from, recordedAtTo, after, through, limit: pageSize });
+      if (events.length === 0) break;
+      scanned += events.length;
+      if (scanned > ASTRA_GOVERNOR_RECOVERY_SCAN_CEILING) {
+        throw new RecoveryFailClosedError("malformed", "Astra governor recovery scan exceeded its bounded ceiling");
+      }
+      for (const event of events) {
+        if (event.payload.stage !== "FAST") continue;
+        const payloadDispatchId = event.payload.dispatchId;
+        const key = typeof payloadDispatchId === "string" && payloadDispatchId.length > 0
+          ? payloadDispatchId
+          : event.aggregateId || event.traceId + ":" + String(event.payload.stage);
+        const existing = evidence.get(key);
+        const marketId = typeof event.payload.marketId === "string" ? event.payload.marketId : undefined;
+        const started = event.type === "ASTRA_PROVIDER_DISPATCH_STARTED";
+        if (!existing || started) {
+          evidence.set(key, {
+            occurredAt: started || !existing ? event.occurredAt : existing.occurredAt,
+            ...(marketId ? { marketId } : existing?.marketId ? { marketId: existing.marketId } : {}),
+            started: started || existing?.started === true,
+          });
+        }
+      }
+      const last = events[events.length - 1]!;
+      after = { occurredAt: last.occurredAt, id: last.id };
+      if (events.length < pageSize) break;
+    }
+    this.astraGovernor.restoreFromEvidence([...evidence.values()].map((event) => ({
+      occurredAt: event.occurredAt,
+      marketId: event.marketId,
+    })), nowMs);
   }
 
   /**
@@ -2334,6 +2358,10 @@ export class EngineService {
         this.metrics.astraProviderDispatchBlocked.inc({ reason: "FINALIZATION_PENDING" });
         throw new AstraClientError("ASTRA_PROVIDER_DISPATCH_BLOCKED", context.stage, "NOT_DISPATCHED", { admissionReason: "FINALIZATION_PENDING" });
       }
+      if (context.stage === "BATCH" && (this.sourceSealing || this.sourceSealed || this.astraBatchFinalizationPending)) {
+        this.metrics.astraProviderDispatchBlocked.inc({ reason: "FINALIZATION_PENDING" });
+        throw new AstraClientError("ASTRA_PROVIDER_DISPATCH_BLOCKED", context.stage, "NOT_DISPATCHED", { admissionReason: "FINALIZATION_PENDING" });
+      }
       if (context.stage !== "BATCH" && !experimentAllowsFirstLeg(this.experiment, this.nowFn())) {
         this.metrics.astraProviderDispatchBlocked.inc({ reason: "ENTRY_CLOSED" });
         throw new AstraClientError("ASTRA_PROVIDER_DISPATCH_BLOCKED", context.stage, "NOT_DISPATCHED", { admissionReason: "ENTRY_CLOSED" });
@@ -2350,6 +2378,7 @@ export class EngineService {
         authority: ASTRA_BRAIN_AUTHORITY,
         experimentId: context.experimentId,
         runGeneration: context.runGeneration,
+        dispatchId: context.traceId + ":" + context.stage,
         traceId: context.traceId,
         triggerId: context.triggerId,
         stage: context.stage,
@@ -2359,11 +2388,11 @@ export class EngineService {
         admissionClass: "PAID_FIRST_LEG_CANDIDATE",
       };
       const authorization = createJournalEvent({
-        id: derivedAuditEventId("ASTRA_PROVIDER_DISPATCH_AUTHORIZED", `${context.traceId}:${context.stage}`),
+        id: derivedAuditEventId("ASTRA_PROVIDER_DISPATCH_AUTHORIZED", context.traceId + ":" + context.stage),
         traceId: context.traceId,
         type: "ASTRA_PROVIDER_DISPATCH_AUTHORIZED",
         aggregateType: "astra_provider_dispatch",
-        aggregateId: `${context.traceId}:${context.stage}`,
+        aggregateId: context.traceId + ":" + context.stage,
         occurredAt,
         payload: evidencePayload,
       });
@@ -2391,11 +2420,11 @@ export class EngineService {
       // post-begin row is best effort so an audit outage cannot release the
       // client semaphore while the already-started SDK request is in flight.
       void this.persistAstraCanonicalBatch([createJournalEvent({
-        id: derivedAuditEventId("ASTRA_PROVIDER_DISPATCH_STARTED", `${context.traceId}:${context.stage}`),
+        id: derivedAuditEventId("ASTRA_PROVIDER_DISPATCH_STARTED", context.traceId + ":" + context.stage),
         traceId: context.traceId,
         type: "ASTRA_PROVIDER_DISPATCH_STARTED",
         aggregateType: "astra_provider_dispatch",
-        aggregateId: `${context.traceId}:${context.stage}`,
+        aggregateId: context.traceId + ":" + context.stage,
         occurredAt: this.nowFn(),
         payload: { ...evidencePayload, dispatchStarted: true },
       })]).catch((error) => this.logger.error({ err: error, traceId: context.traceId }, "Astra dispatch-start audit append failed"));
@@ -2408,6 +2437,7 @@ export class EngineService {
   private async accountAstraStage(input: AstraStageSuccess): Promise<boolean> {
     const experimentId = input.experimentId ?? this.experiment?.id ?? null;
     if (!experimentId) return false;
+    if (input.runGeneration != null && !this.isCurrentAstraRun(experimentId, input.runGeneration)) return false;
     const occurredAt = this.nowFn();
     const invocation = createJournalEvent({
       id: derivedAuditEventId("ASTRA_MODEL_INVOCATION", `${input.traceId}:${input.stage}`),
@@ -2421,23 +2451,23 @@ export class EngineService {
       },
     });
     if (input.stage === "BATCH") {
-      if (!this.canAcceptAstraBatchResult(experimentId)) return false;
-      if (!(await this.persistAstraBatchAudit([invocation], experimentId))) {
+      if (!this.canAcceptAstraBatchResult(experimentId, input.runGeneration)) return false;
+      if (!(await this.persistAstraBatchAudit([invocation], experimentId, input.runGeneration))) {
         // Provider usage is still billable even when the non-economic audit
         // append is unavailable. Retain the bounded provider cost when the
         // experiment is still live, but never allow a late fenced result to
         // mutate the report/ledger after finalization has begun.
-        if (input.result.usage.costUsd > 0 && this.canAcceptAstraBatchResult(experimentId)) {
+        if (input.result.usage.costUsd > 0 && this.canAcceptAstraBatchResult(experimentId, input.runGeneration)) {
           await this.accrueAstraCost(input.result.usage.costUsd, `${input.traceId}:${input.stage}`, occurredAt.toISOString(), experimentId);
         }
         return false;
       }
-      if (!this.canAcceptAstraBatchResult(experimentId)) return false;
+      if (!this.canAcceptAstraBatchResult(experimentId, input.runGeneration)) return false;
     } else {
       await this.persistAstraCanonicalBatch([invocation]);
     }
     if (input.result.usage.costUsd > 0) {
-      if (input.stage === "BATCH" && !this.canAcceptAstraBatchResult(experimentId)) return false;
+      if (input.stage === "BATCH" && !this.canAcceptAstraBatchResult(experimentId, input.runGeneration)) return false;
       await this.accrueAstraCost(input.result.usage.costUsd, `${input.traceId}:${input.stage}`, occurredAt.toISOString(), experimentId);
     }
     return true;
@@ -2453,6 +2483,8 @@ export class EngineService {
     if (!error.knownUsage || !error.usage) return true;
     const experimentId = input.experimentId ?? this.experiment?.id ?? null;
     if (!experimentId || error.usage.costUsd <= 0) return true;
+    if (input.runGeneration != null && !this.isCurrentAstraRun(experimentId, input.runGeneration)) return true;
+    if (input.stage === "BATCH" && !this.canAcceptAstraBatchResult(experimentId, input.runGeneration)) return true;
     await this.accrueAstraCost(
       error.usage.costUsd,
       // Success accounting and known-usage recovery share one durable
@@ -2465,9 +2497,14 @@ export class EngineService {
     return true;
   }
 
+  private isCurrentAstraRun(experimentId: string, runGeneration: number): boolean {
+    return Boolean(this.experiment)
+      && this.experiment?.id === experimentId
+      && this.experimentRunGeneration === runGeneration;
+  }
+
   private resetPreparedRuntimeState(): void {
     this.experimentRunGeneration += 1;
-    this.astraGovernor.reset();
     this.triggerEngine.resetExperimentBoundaryState();
     this.noteExperimentFeedInvalidation();
     this.clearResearchActivationState();
@@ -2498,8 +2535,8 @@ export class EngineService {
     this.state.setActivationLatency([]);
   }
 
-  private async persistAstraBatchAudit(events: readonly JournalEvent[], experimentId: string): Promise<boolean> {
-    if (!this.canAcceptAstraBatchResult(experimentId)) return false;
+  private async persistAstraBatchAudit(events: readonly JournalEvent[], experimentId: string, runGeneration?: number): Promise<boolean> {
+    if (!this.canAcceptAstraBatchResult(experimentId, runGeneration)) return false;
     const admitted = events.filter((event) => this.isReportInputPersistenceAdmitted(event.type));
     if (admitted.length === 0) return false;
     const stamped = admitted.map((event) => ({ ...event, payload: { ...event.payload, experimentId } }));
@@ -2787,6 +2824,8 @@ export class EngineService {
         }, outcome: "OPEN",
       });
     } catch (error) {
+      if (admissionFence.experimentId !== this.experiment?.id
+        || admissionFence.runGeneration !== this.experimentRunGeneration) return;
       if (error instanceof AstraDeepFailureError) {
         await this.persistAstraDeepFailure(trigger, featurePacket, error, admissionFence);
         return;
@@ -2851,10 +2890,12 @@ export class EngineService {
    */
   private scheduleAstraBatchLearn(update: { calibration: { samples: number; brierSum: number; reliability: number }; sampleIds: string[] }, traceId: string): void {
     const experimentId = this.experiment?.id;
+    const runGeneration = this.experimentRunGeneration;
     if (!this.astraService || !this.astraClient?.learn || this.state.draining || !experimentId || this.astraBatchFinalizationPending || this.sourceSealing || this.sourceSealed) return;
     this.astraBatchPending = {
       traceId,
       experimentId,
+      runGeneration,
       observedAt: this.nowFn().toISOString(),
       aggregate: {
         sampleIds: update.sampleIds.slice(-64),
@@ -2862,6 +2903,7 @@ export class EngineService {
         calibration: { ...update.calibration },
         previousLessons: this.astraLearner.snapshot().lessons,
       },
+      providerDispatchAuthorization: (context, beginDispatch) => this.authorizeAndBeginAstraProviderDispatch(context, beginDispatch),
     };
     if (this.astraBatchFlight) return;
     const run = async (): Promise<void> => {
@@ -2885,7 +2927,7 @@ export class EngineService {
           this.metrics.astraReasoningTokens.inc({ stage }, result.usage.reasoningTokens);
           this.metrics.astraCostUsd.inc({ stage }, result.usage.costUsd);
           this.metrics.astraLatencySeconds.observe({ stage }, (result.latencyMs ?? 0) / 1000);
-          if (!this.canAcceptAstraBatchResult(requestExperimentId)) continue;
+          if (!this.canAcceptAstraBatchResult(requestExperimentId, request.runGeneration)) continue;
           const updateEvent = createJournalEvent({
             id: derivedAuditEventId("ASTRA_LEARNING_UPDATE", request.traceId),
             traceId: request.traceId, type: "ASTRA_LEARNING_UPDATE", aggregateType: "astra_learner", aggregateId: requestExperimentId,
@@ -2895,8 +2937,8 @@ export class EngineService {
               calibration: request.aggregate.calibration, lessons: result.output.lessons,
             },
           });
-          if (!(await this.persistAstraBatchAudit([updateEvent], requestExperimentId))) continue;
-          if (!this.canAcceptAstraBatchResult(requestExperimentId)) continue;
+          if (!(await this.persistAstraBatchAudit([updateEvent], requestExperimentId, request.runGeneration))) continue;
+          if (!this.canAcceptAstraBatchResult(requestExperimentId, request.runGeneration)) continue;
           // Activate new lessons only after the provider result and its audit
           // have crossed their bounded non-economic durability boundary.
           this.astraLearner.applyLessons(result.output.lessons);
@@ -2924,12 +2966,13 @@ export class EngineService {
           if (timeout) this.metrics.astraTimeouts.inc({ stage });
           this.metrics.astraLearningUpdates.inc({ status: "failed" });
           try {
+            if (!this.canAcceptAstraBatchResult(requestExperimentId, request.runGeneration)) continue;
             await this.persistReportInput(createJournalEvent({
               traceId: request.traceId,
               type: "ASTRA_FAILURE",
-              aggregateType: "astra_learner", aggregateId: this.experiment?.id ?? "paper",
+              aggregateType: "astra_learner", aggregateId: requestExperimentId ?? "paper",
               payload: {
-                authority: ASTRA_BRAIN_AUTHORITY, stage,
+                authority: ASTRA_BRAIN_AUTHORITY, stage, experimentId: requestExperimentId, runGeneration: request.runGeneration,
                 reason: batchReason,
                 dispatchState: originalProviderError?.dispatchState ?? (accountingError ? "RESPONSE_RECEIVED" : "NOT_DISPATCHED"),
                 providerRequestId: originalProviderError?.providerRequestId ?? null,
@@ -2950,12 +2993,21 @@ export class EngineService {
       this.astraBatchFlight = null;
       const pending = this.astraBatchPending;
       if (this.sourceSealed || this.experiment?.status === "COMPLETED") this.astraBatchFinalizationPending = true;
-      else if (pending && !this.state.draining && !this.astraBatchFinalizationPending) {
+      else if (pending
+        && pending.experimentId === this.experiment?.id
+        && pending.runGeneration === this.experimentRunGeneration
+        && !this.state.draining
+        && !this.astraBatchFinalizationPending) {
         this.astraBatchPending = null;
         this.scheduleAstraBatchLearn({
           calibration: pending.aggregate.calibration,
           sampleIds: pending.aggregate.sampleIds.slice(),
         }, pending.traceId);
+      } else if (pending
+        && (pending.experimentId !== this.experiment?.id || pending.runGeneration !== this.experimentRunGeneration)) {
+        // A pending request belongs to the old run. Never resnapshot it into
+        // the new experiment when an older flight finally settles.
+        this.astraBatchPending = null;
       }
     });
   }
@@ -3512,12 +3564,10 @@ export class EngineService {
       const next = refreshExperiment(this.experiment, this.nowFn(), { openPositions: openPositionsRemain(this.ledger.positions.values()) });
       if (next.status !== this.experiment.status) {
         if (next.status === "COMPLETED") {
-          // This call originates from the current Astra decision pipeline.
-          // Its provider operation has completed, but the outer in-flight
-          // counter is intentionally held until all post-response fencing is
-          // done. Let finalization ignore that one current pipeline without
-          // ignoring any other provider operation.
-          await this.finalizeExperiment(next, authority === ASTRA_BRAIN_AUTHORITY && Boolean(astraAdmissionFence));
+          // The provider counter is decremented immediately after the service
+          // returns, before post-response fencing reaches this method. Every
+          // other provider operation must still drain before completion.
+          await this.finalizeExperiment(next);
         } else {
           await this.commitExperimentStatus(next);
         }
@@ -4807,7 +4857,7 @@ export class EngineService {
    * batch promises while holding the gate would serialize unrelated lifecycle
    * operations behind network latency and create close/report races.
    */
-  private async finalizeExperiment(next: ExperimentManifest, currentDecisionInFlight = false): Promise<boolean> {
+  private async finalizeExperiment(next: ExperimentManifest): Promise<boolean> {
     if (next.status !== "COMPLETED") return false;
     if (this.experiment?.status === "COMPLETED") return true;
     if (this.experiment?.id !== next.id) return false;
@@ -4815,8 +4865,7 @@ export class EngineService {
     this.astraFinalizationPending = true;
     try {
       const deadline = Date.now() + Math.max(this.env.ASTRA_BATCH_TIMEOUT_MS, this.env.ASTRA_FAST_TIMEOUT_MS) + 1_000;
-      const currentDecisionAllowance = currentDecisionInFlight ? 1 : 0;
-      while (this.astraDecisionInFlight > currentDecisionAllowance) {
+      while (this.astraDecisionInFlight > 0) {
         if (Date.now() >= deadline) return false;
         await new Promise((resolve) => setTimeout(resolve, 5));
       }
@@ -4831,7 +4880,7 @@ export class EngineService {
         if (this.experiment?.id !== next.id || this.experiment?.status === "COMPLETED") return;
         // The provider drain is complete before entering this short durable
         // transition. Recheck the fence because the gate may have queued.
-        if (this.astraDecisionInFlight > currentDecisionAllowance || !this.astraFinalizationPending) return;
+        if (this.astraDecisionInFlight > 0 || !this.astraFinalizationPending) return;
         await this.commitExperimentStatus(next);
       });
       return this.experiment?.id === next.id && (this.experiment.status as string) === "COMPLETED";

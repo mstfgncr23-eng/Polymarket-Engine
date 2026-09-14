@@ -18,6 +18,7 @@ export interface AstraStageSuccess {
   stage: AstraStage;
   traceId: string;
   experimentId?: string | null;
+  runGeneration?: number;
   result: AstraModelResult | AstraBatchResult;
 }
 
@@ -26,6 +27,7 @@ export interface AstraStageFailure {
   traceId: string;
   triggerId: string;
   experimentId?: string | null;
+  runGeneration?: number;
   error: AstraClientError;
 }
 
@@ -153,6 +155,7 @@ export class AstraDecisionService {
         traceId: request.traceId,
         triggerId: request.traceId,
         experimentId: request.experimentId,
+        runGeneration: request.runGeneration,
         error: asAstraClientError(error, request.stage),
       });
       throw error;
@@ -161,6 +164,7 @@ export class AstraDecisionService {
       stage: "BATCH",
       traceId: request.traceId,
       experimentId: request.experimentId,
+      runGeneration: request.runGeneration,
       result,
     }, request.traceId);
     return result;
@@ -188,6 +192,7 @@ export class AstraDecisionService {
         traceId: request.traceId,
         triggerId: request.triggerId,
         experimentId: request.experimentId,
+        runGeneration: request.runGeneration,
         error: asAstraClientError(error, request.stage),
       });
       throw error;
@@ -196,6 +201,7 @@ export class AstraDecisionService {
       stage: request.stage,
       traceId: request.traceId,
       experimentId: request.experimentId,
+      runGeneration: request.runGeneration,
       result,
     }, request.triggerId);
     return result;
@@ -223,6 +229,7 @@ export class AstraDecisionService {
         traceId: input.traceId,
         triggerId,
         experimentId: input.experimentId,
+        runGeneration: input.runGeneration,
         error: asAstraClientError(accounting, input.stage),
       });
       throw accounting;
