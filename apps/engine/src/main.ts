@@ -1,5 +1,7 @@
+import { assertProductionStorageLifecycle } from "./production-storage-gate.js";
 import { startRuntime } from "./runtime.js";
 
+assertProductionStorageLifecycle();
 const runtime = await startRuntime();
 let shuttingDown = false;
 
