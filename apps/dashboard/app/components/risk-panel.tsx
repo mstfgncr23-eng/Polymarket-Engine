@@ -39,9 +39,9 @@ function pendingRiskState(snapshot: DashboardSnapshot): { title: string; detail:
 
 export function RiskPanel({ snapshot }: { snapshot: DashboardSnapshot }) {
   const risk = snapshot.risk;
-  const pending = risk ? null : pendingRiskState(snapshot);
-  return <Panel title="Risk Guardian" kicker="CAPITAL PROTECTION" meta={risk ? formatTime(risk.evaluatedAt) : pending?.at ? formatTime(pending.at) : "not evaluated"}>
-    {!risk ? <EmptyState title={pending?.title} detail={pending?.detail} /> : <>
+  const pending = pendingRiskState(snapshot);
+  return <Panel title="Risk Guardian" kicker="CAPITAL PROTECTION" meta={risk ? formatTime(risk.evaluatedAt) : pending.at ? formatTime(pending.at) : "not evaluated"}>
+    {!risk ? <EmptyState title={pending.title} detail={pending.detail} /> : <>
       <div className="riskHero"><StatusPill label={risk.accepted ? "ACCEPTED" : "VETOED"} tone={risk.accepted ? "healthy" : "critical"} /><strong>{risk.accepted ? "Risk checks passed" : "Execution blocked by risk"}</strong><span>{risk.vetoes.length} vetoes persisted</span></div>
       <div className="metricGrid metricGrid--four"><Metric label="Utilization checks" value={String(Object.keys(risk.utilization).length)} detail="reported dimensions" /><Metric label="Vetoes" value={String(risk.vetoes.length)} detail="persisted reasons" tone={risk.vetoes.length ? "critical" : "healthy"} /><Metric label="Evaluated" value={formatTime(risk.evaluatedAt)} detail="risk timestamp" /><Metric label="Decision" value={risk.accepted ? "PASS" : "BLOCK"} detail="authoritative risk state" tone={risk.accepted ? "healthy" : "critical"} /></div>
       <div className="utilizationList">{Object.entries(risk.utilization).length === 0 ? <span className="muted">No utilization dimensions reported.</span> : Object.entries(risk.utilization).map(([key, value]) => <div className="utilizationRow" key={key}><span>{key}</span><div className="utilizationBar"><i style={{ width: `${Math.max(0, Math.min(100, value * 100))}%` }} /></div><DataValue label="" value={formatPercent(value)} /></div>)}</div>
