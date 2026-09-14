@@ -115,7 +115,7 @@ describe("Astra Brain V1 final correctness regressions", () => {
     const request = { stage: "FAST" as const, traceId: packet.traceId, triggerId: packet.triggerId, featurePacket: packet, memory: [], portfolio: { drawdownUtilization: 0, unhedgedUtilization: 0, openPositionCount: 0 } };
     const legacyBudget = new AstraDailyBudget(0.000001);
     let dispatched = 0;
-    const service = new AstraDecisionService(serviceOptions({ budget: legacyBudget, cacheWriteUsdPerM: 100_000, inputUsdPerM: 100_000, outputUsdPerM: 100_000, client: { decide: async () => { dispatched += 1; return modelResult(decisionOutput("NO_TRADE")); } } }) as never);
+    const service = new AstraDecisionService(serviceOptions({ budget: legacyBudget, cacheWriteUsdPerM: 100_000, inputUsdPerM: 100_000, outputUsdPerM: 100_000, client: { decide: async () => { dispatched += 1; return modelResult(decisionOutput("NO_TRADE", 0.1)); } } }) as never);
     await expect(service.decide(request)).resolves.toMatchObject({ decision: { action: "NO_TRADE" } });
     expect(dispatched).toBe(1);
   });
