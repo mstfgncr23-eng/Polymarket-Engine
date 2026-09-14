@@ -22,6 +22,9 @@ export interface DashboardSnapshot {
   positions: Array<{ id: string; marketId: string; upQuantity: string; downQuantity: string; pairedQuantity: string; unpairedQuantity: string; unpairedOutcome: string | null; averageUpCost: string; averageDownCost: string; openedAt: string; updatedAt: string }>;
   latestAgents: Partial<Record<string, GrokAgentSignal>>;
   consensus: {
+    id?: string;
+    traceId?: string;
+    triggerId?: string;
     consensusDirection: string;
     consensusConfidence: number;
     agentAgreement: number;
@@ -34,11 +37,11 @@ export interface DashboardSnapshot {
     marketProbability?: number;
     featureVector?: Record<string, unknown>;
   } | null;
-  risk: { accepted: boolean; vetoes: string[]; utilization: Record<string, number>; evaluatedAt: string } | null;
+  risk: { id?: string; traceId?: string; accepted: boolean; vetoes: string[]; utilization: Record<string, number>; evaluatedAt: string } | null;
   scanner: Array<{ marketId: string; asset?: string | null; outcome: string; bid: string | null; ask: string | null; spread: number | null; depthUsd: number; lastMessageAt: string }>;
   decisionFeed: Array<{ id: string; at: string; type: string; traceId: string; marketId: string | null; asset?: string | null; detail: Record<string, unknown> }>;
   grokActivity: { acceptedSignals: number; rejectedSignals: number; duplicates: number; unauthorizedCalls: number; rateLimitedCalls: number; lastSeenAt: string | null; byAgent: Record<string, number> };
-  recentTriggers: Array<{ id: string; kind: string; severity: number; marketId: string | null; asset?: string | null; createdAt: string; expiresAt: string }>;
+  recentTriggers: Array<{ id: string; traceId?: string; kind: string; severity: number; marketId: string | null; asset?: string | null; createdAt: string; expiresAt: string }>;
   activations?: Array<{ triggerId: string; role?: string; provider: string; ok?: boolean; skipped?: boolean; errorCode?: string | null; reason?: string; grokWakeObserved: false; at: string }>;
   activationLatency?: Array<{ triggerId: string; triggerCreatedAt: string; activationRequestedAt: string | null; activationSentAt: string | null; firstMcpRequestAt: string | null; firstAcceptedSignalAt: string | null }>;
   unattributedMcp?: { lastAt: string | null; count: number; lastTool: string | null };
