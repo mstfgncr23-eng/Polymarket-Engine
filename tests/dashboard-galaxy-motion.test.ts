@@ -144,4 +144,36 @@ describe("bounded Galaxy motion", () => {
     }
     expect(expireGalaxyMotionState(state, 10_000).transients).toEqual([]);
   });
+
+  it("maps ASTRA_DECISION as a decision transient only after first observation", () => {
+    const initialData = snapshot({ decisionFeed: [event("historical-astra", "ASTRA_DECISION")] });
+    const initial = initializeGalaxyMotionState(initialData, 20, 1_000);
+    expect(initial.seenEventIds).toEqual(["historical-astra"]);
+    expect(initial.transients).toEqual([]);
+
+    const later = snapshot({ decisionFeed: [
+      event("new-astra", "ASTRA_DECISION"),
+      ...initialData.decisionFeed,
+    ] });
+    const advanced = advanceGalaxyMotionState(initial, later, 30, 1_500);
+    expect(advanced.transients).toEqual([
+      expect.objectContaining({ id: "new-astra", kind: "decision", startFrame: 30, marketId: "market-1", asset: "BTC" }),
+    ]);
+
+    const repeated = advanceGalaxyMotionState(advanced, later, 40, 1_800);
+    expect(repeated.transients).toHaveLength(1);
+    expect(repeated.transients[0]?.id).toBe("new-astra");
+  });
+
+  it("still caps ASTRA_DECISION bursts at MAX_GALAXY_TRANSIENTS", () => {
+    const initial = initializeGalaxyMotionState(snapshot(), 0, 1_000);
+    const burst = snapshot({ decisionFeed: Array.from({ length: 40 }, (_, index) => event(`astra-burst-${index}`, "ASTRA_DECISION")) });
+    let state = initial;
+    for (let batch = 0; batch < 8; batch += 1) {
+      state = advanceGalaxyMotionState(state, { ...burst, decisionFeed: burst.decisionFeed.slice(batch * 5) }, batch * 10, 2_000 + batch * 50);
+      expect(state.transients.length).toBeLessThanOrEqual(MAX_GALAXY_TRANSIENTS);
+    }
+    expect(state.transients.every((item) => item.kind === "decision")).toBe(true);
+  });
+
 });

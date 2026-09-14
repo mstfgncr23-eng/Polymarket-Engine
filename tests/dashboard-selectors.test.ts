@@ -32,13 +32,14 @@ describe("dashboard data selectors", () => {
     const data = snapshot({ decisionFeed: [
       { id: "trigger", at: "2026-09-12T00:00:01.000Z", type: "TRIGGER_LEVEL_2", traceId: "trace-1", marketId: "market-1", asset: "BTC", detail: { kind: "REFERENCE_MOVE", direction: "UP" } },
       { id: "decision", at: "2026-09-12T00:00:02.000Z", type: "NATIVE_DECISION_COMPLETE", traceId: "trace-2", marketId: "market-1", detail: { direction: "UP" } },
+      { id: "astra", at: "2026-09-12T00:00:02.500Z", type: "ASTRA_DECISION", traceId: "trace-2b", marketId: "market-1", detail: { direction: "UP" } },
       { id: "fill", at: "2026-09-12T00:00:03.000Z", type: "PAPER_FILL", traceId: "trace-3", marketId: "market-1", detail: { fillId: "fill-1", orderId: "order-1", price: "0.40", quantity: "2", role: "TAKER" } },
       { id: "noise", at: "2026-09-12T00:00:04.000Z", type: "GROK_SIGNAL_ACCEPTED", traceId: "trace-4", marketId: null, detail: {} },
     ] });
     expect(triggerEvents(data).map((event) => event.id)).toEqual(["trigger"]);
     expect(nativeDecisionEvents(data).map((event) => event.id)).toEqual(["decision"]);
     expect(executionEvents(data).map((event) => event.id)).toEqual(["fill"]);
-    expect(missionEvents(data).map((event) => event.id)).toEqual(["trigger", "decision", "fill"]);
+    expect(missionEvents(data).map((event) => event.id)).toEqual(["trigger", "decision", "astra", "fill"]);
     expect(pulseToken(data, "core")).toBe("decision");
     expect(eventSummary(executionEvents(data)[0]!)).toContain("fill fill-1");
   });

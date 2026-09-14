@@ -2,6 +2,7 @@ import type { DashboardSnapshot } from "./types";
 
 export type Tone = "healthy" | "warning" | "critical" | "neutral";
 export const NATIVE_AUTHORITY = "NATIVE_DETERMINISTIC_V1";
+export const ASTRA_AUTHORITY = "ASTRA_BRAIN_V1";
 
 export const AGENT_ROLES = [
   ["market_microstructure_scanner", "Market Microstructure"],
@@ -21,7 +22,7 @@ export const EXECUTION_EVENT_TYPES = [
 
 export const MISSION_EVENT_TYPES = [
   "TRIGGER_LEVEL_1", "TRIGGER_LEVEL_2", "TRIGGER_LEVEL_3",
-  "NATIVE_DECISION_EVALUATION", "NATIVE_DECISION_COMPLETE",
+  "NATIVE_DECISION_EVALUATION", "NATIVE_DECISION_COMPLETE", "ASTRA_DECISION",
   "RISK_ACCEPT", "RISK_VETO", "PAPER_ORDER_CREATED", "PAPER_FILL",
   "PAPER_ORDER_CANCELLED", "PAPER_EXECUTION_ERROR", "POSITION_SETTLED",
 ] as const;
@@ -85,6 +86,10 @@ export function referenceTone(snapshot: DashboardSnapshot): Tone {
   return "healthy";
 }
 
+function isHealthyAuthority(authority: string | null | undefined): boolean {
+  return authority === NATIVE_AUTHORITY || authority === ASTRA_AUTHORITY;
+}
+
 export function decisionAuthorityLabel(consensus: DashboardSnapshot["consensus"]): string {
   if (!consensus) return "—";
   if (consensus.authority === NATIVE_AUTHORITY) return NATIVE_AUTHORITY;
@@ -94,7 +99,7 @@ export function decisionAuthorityLabel(consensus: DashboardSnapshot["consensus"]
 
 export function decisionAuthorityTone(consensus: DashboardSnapshot["consensus"]): Tone {
   if (!consensus) return "neutral";
-  return consensus.authority === NATIVE_AUTHORITY ? "healthy" : "warning";
+  return isHealthyAuthority(consensus.authority) ? "healthy" : "warning";
 }
 
 export function formatMoney(value: string | number | null | undefined): string {
@@ -159,7 +164,7 @@ export function pulseToken(snapshot: DashboardSnapshot, node: "trigger" | "core"
   const event = snapshot.decisionFeed.find((candidate) => {
     const type = candidate.type;
     if (node === "trigger") return type.startsWith("TRIGGER_LEVEL_");
-    if (node === "core") return type === "NATIVE_DECISION_COMPLETE";
+    if (node === "core") return type === "NATIVE_DECISION_COMPLETE" || type === "ASTRA_DECISION";
     if (node === "risk") return type === "RISK_ACCEPT" || type === "RISK_VETO";
     if (node === "execution") return (EXECUTION_EVENT_TYPES as readonly string[]).includes(type);
     if (node === "portfolio") return type === "PAPER_FILL" || type === "POSITION_SETTLED";

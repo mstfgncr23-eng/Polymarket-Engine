@@ -1,5 +1,6 @@
-import type { GalaxyMotionKind, GalaxySceneModel } from "./galaxy-scene";
+import type { GalaxyMotionKind, GalaxySceneModel, GalaxyTransient } from "./galaxy-scene";
 import { MAX_GALAXY_POSITION_SATELLITES } from "./galaxy-scene";
+import { ASTRA_AUTHORITY } from "./dashboard-selectors";
 
 export const GALAXY_VIEW = {
   width: 1200,
@@ -61,6 +62,7 @@ export interface GalaxyVisualSlot {
   tone: string;
   size: "core" | "primary" | "secondary" | "tick";
   available?: boolean;
+  marketId?: string | null;
 }
 
 export const GALAXY_ORBITS: readonly GalaxyOrbitDef[] = [
@@ -178,15 +180,67 @@ export function eventOrbitId(kind: GalaxyMotionKind): GalaxyOrbitId | "core" {
   return "reference";
 }
 
+export function galaxyCoreIdentity(model: GalaxySceneModel): { kicker: string; title: string; detail: string } {
+  const authority = model.core.authority;
+  if (authority === ASTRA_AUTHORITY) {
+    return {
+      kicker: "ASTRA",
+      title: "DECISION CORE",
+      detail: model.core.available ? model.core.direction : "AWAITING",
+    };
+  }
+  if (!model.core.available || authority === "—" || authority === "AUTHORITY UNAVAILABLE") {
+    return {
+      kicker: "DECISION CORE",
+      title: "AWAITING",
+      detail: model.core.available ? model.core.direction : "AWAITING",
+    };
+  }
+  return {
+    kicker: "DECISION CORE",
+    title: "DECISION CORE",
+    detail: model.core.direction,
+  };
+}
+
+function satelliteMatchesSettlement(
+  event: Pick<GalaxyTransient, "marketId" | "asset" | "positionId">,
+  satellite: { id: string; marketId?: string | null; label?: string },
+): boolean {
+  if (event.positionId && satellite.id === event.positionId) return true;
+  if (event.marketId && satellite.marketId && satellite.marketId === event.marketId) return true;
+  if (event.asset && satellite.label === event.asset) return true;
+  return false;
+}
+
+/** Correlate settlement animation to one matching satellite, else only the portfolio/ledger node. */
+export function settlementAppliesToSlot(
+  event: Pick<GalaxyTransient, "kind" | "marketId" | "asset" | "positionId">,
+  slot: Pick<GalaxyVisualSlot, "kind" | "id" | "label" | "marketId">,
+  satellites: Array<{ id: string; marketId?: string | null; label?: string }>,
+): boolean {
+  if (event.kind !== "settlement") return false;
+  const matched = satellites.find((satellite) => satelliteMatchesSettlement(event, satellite));
+  if (matched) {
+    return slot.kind === "position" && (
+      slot.id === matched.id
+      || (Boolean(event.marketId) && slot.marketId === event.marketId)
+      || (Boolean(event.positionId) && slot.id === event.positionId)
+    );
+  }
+  return slot.kind === "portfolio";
+}
+
 export function buildGalaxyVisualSlots(model: GalaxySceneModel): GalaxyVisualSlot[] {
+  const identity = galaxyCoreIdentity(model);
   const slots: GalaxyVisualSlot[] = [
     {
       id: "core",
       kind: "core",
       orbitId: "core",
       angle: 0,
-      label: "ASTRA",
-      detail: model.core.available ? model.core.direction : "AWAITING",
+      label: identity.kicker,
+      detail: identity.detail,
       tone: model.core.authorityTone,
       size: "core",
       available: model.core.available,
@@ -282,6 +336,7 @@ export function buildGalaxyVisualSlots(model: GalaxySceneModel): GalaxyVisualSlo
       detail: "OPEN",
       tone: model.portfolio.tone,
       size: "secondary",
+      marketId: satellite.marketId,
     });
   }
 

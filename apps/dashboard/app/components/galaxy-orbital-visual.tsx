@@ -4,11 +4,13 @@ import {
   GALAXY_VIEW,
   buildGalaxyVisualSlots,
   eventOrbitId,
+  galaxyCoreIdentity,
   galaxyOrbit,
   labelAnchor,
   orbitDepthPaths,
   orbitPolyline,
   projectOrbitPoint,
+  settlementAppliesToSlot,
   type GalaxyOrbitDef,
   type GalaxyProjectedPoint,
   type GalaxyVisualSlot,
@@ -110,6 +112,7 @@ export function GalaxyOrbitalVisual({
     + (reducedMotion ? 0 : Math.sin(seconds * 0.82) * 0.018)
     + (corePulse < 78 ? ramp(corePulse, [0, 12, 78], [0, 0.16, 0]) : 0);
   const core = slots.find((slot) => slot.kind === "core")!;
+  const identity = galaxyCoreIdentity(model);
   const executionSlot = slots.find((slot) => slot.kind === "execution")!;
   const executionPoint = orbitPoint(galaxyOrbit("execution"), executionSlot.angle, seconds, reducedMotion, 0.12);
   const corePoint: GalaxyProjectedPoint = { x: GALAXY_VIEW.cx, y: GALAXY_VIEW.cy, z: 80, scale: 1 };
@@ -118,7 +121,7 @@ export function GalaxyOrbitalVisual({
     .filter((slot) => slot.kind !== "core")
     .map((slot) => ({ slot, point: orbitPoint(galaxyOrbit(slot.orbitId === "core" ? "halo" : slot.orbitId), slot.angle, seconds, reducedMotion, slot.size === "tick" ? 0.35 : 0.08) }))
     .sort((left, right) => left.point.z - right.point.z);
-  const satelliteProps = { model, transients, frame, durationInFrames, settlementPulse, triggerPulse, marketPulse };
+  const satelliteProps = { model, transients, frame, durationInFrames, settlementPulse, settlementEvent, triggerPulse, marketPulse };
 
   return <div
     className={`galaxyOrbital${ambient ? " galaxyOrbital--ambient" : ""}`}
@@ -235,9 +238,9 @@ export function GalaxyOrbitalVisual({
         <circle r="52" fill={`url(#galaxy-core-fill-${paintId})`} stroke="rgba(255,236,196,.82)" strokeWidth="1.4" />
         <circle r="18" fill="#fff8e4" opacity="0.96" />
       </g>
-      <text x={GALAXY_VIEW.cx} y={GALAXY_VIEW.cy - 10} textAnchor="middle" className="galaxyCoreKicker">ASTRA</text>
-      <text x={GALAXY_VIEW.cx} y={GALAXY_VIEW.cy + 6} textAnchor="middle" className="galaxyCoreTitle">DECISION CORE</text>
-      <text x={GALAXY_VIEW.cx} y={GALAXY_VIEW.cy + 22} textAnchor="middle" className="galaxyCoreDetail">{core.detail}</text>
+      <text x={GALAXY_VIEW.cx} y={GALAXY_VIEW.cy - 10} textAnchor="middle" className="galaxyCoreKicker">{identity.kicker}</text>
+      <text x={GALAXY_VIEW.cx} y={GALAXY_VIEW.cy + 6} textAnchor="middle" className="galaxyCoreTitle">{identity.title}</text>
+      <text x={GALAXY_VIEW.cx} y={GALAXY_VIEW.cy + 22} textAnchor="middle" className="galaxyCoreDetail">{identity.detail}</text>
 
       {GALAXY_ORBITS.map((orbit) => {
         const depth = orbitDepthPaths(orbit, 80, parallax);
@@ -251,7 +254,7 @@ export function GalaxyOrbitalVisual({
     </svg>
 
     <div className="galaxyOrbitalHud" aria-hidden="true">
-      <span><i>DIR</i><b>{core.detail}</b></span>
+      <span><i>DIR</i><b>{identity.detail}</b></span>
       <span><i>AUTH</i><b>{model.core.authority}</b></span>
       <span><i>FAIR</i><b>{model.core.fairProbability}</b></span>
       <span><i>MKT</i><b>{model.core.marketProbability}</b></span>
@@ -271,6 +274,7 @@ function Satellite({
   frame,
   durationInFrames,
   settlementPulse,
+  settlementEvent,
   triggerPulse,
   marketPulse,
 }: {
@@ -281,18 +285,25 @@ function Satellite({
   frame: number;
   durationInFrames: number;
   settlementPulse: number;
+  settlementEvent: GalaxyTransient | undefined;
   triggerPulse: number;
   marketPulse: number;
 }) {
   const label = labelAnchor(point);
   const radius = slot.size === "primary" ? 5.4 : slot.size === "secondary" ? 3.6 : 1.7;
+  const satellites = model.portfolio.satellites;
+  const settlementApplies = settlementEvent
+    ? settlementAppliesToSlot(settlementEvent, slot, satellites)
+    : false;
   const activity = transients.find((event) => {
     if (slot.kind === "reference") return event.kind === "reference" && event.asset === slot.label;
-    if (slot.kind === "position") return event.kind === "settlement";
+    if (slot.kind === "position" || slot.kind === "portfolio") {
+      return event.kind === "settlement" && settlementAppliesToSlot(event, slot, satellites);
+    }
     return eventOrbitId(event.kind) === slot.orbitId;
   });
   const activityFrame = activity ? elapsedFrames(frame, activity, durationInFrames) : 999;
-  const settling = slot.kind === "position" && settlementPulse < 82;
+  const settling = settlementApplies && settlementPulse < 82;
   const scale = point.scale * (settling ? ramp(settlementPulse, [0, 18, 82], [1, 0.35, 1]) : 1);
   const pulse = (slot.kind === "trigger" && triggerPulse < 64)
     || (slot.kind === "market" && marketPulse < 64)

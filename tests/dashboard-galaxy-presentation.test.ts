@@ -7,6 +7,8 @@ import {
   MAX_VISIBLE_POSITIONS,
   MAX_VISIBLE_REFERENCES,
   buildGalaxyVisualSlots,
+  galaxyCoreIdentity,
+  settlementAppliesToSlot,
   marketTickCount,
   orbitDepthPaths,
   orbitPolyline,
@@ -104,4 +106,44 @@ describe("Galaxy orbital presentation", () => {
     expect(live.filter((slot) => slot.kind === "position")).toEqual([expect.objectContaining({ id: "pos-1" })]);
     expect(live.filter((slot) => slot.kind === "reference").map((slot) => slot.label)).toEqual(["BTC", "ETH"]);
   });
+
+  it("presents ASTRA identity only for ASTRA_BRAIN_V1 authority", () => {
+    const baseDecision = {
+      consensusDirection: "UP",
+      consensusConfidence: .61,
+      agentAgreement: .8,
+      signalFreshness: .9,
+      conflicts: [],
+      estimatedEdge: .02,
+      calculatedAt: "2026-09-12T12:00:00.000Z",
+    };
+
+    const astra = galaxyCoreIdentity(buildGalaxySceneModel(snapshot({ consensus: { ...baseDecision, authority: "ASTRA_BRAIN_V1" } })));
+    expect(astra).toEqual({ kicker: "ASTRA", title: "DECISION CORE", detail: "UP" });
+
+    const native = galaxyCoreIdentity(buildGalaxySceneModel(snapshot({ consensus: { ...baseDecision, authority: "NATIVE_DETERMINISTIC_V1" } })));
+    expect(native.kicker).toBe("DECISION CORE");
+    expect(native.detail).toBe("UP");
+    expect(native.kicker).not.toBe("ASTRA");
+
+    const missing = galaxyCoreIdentity(buildGalaxySceneModel(snapshot({ consensus: null })));
+    expect(missing).toMatchObject({ kicker: "DECISION CORE", title: "AWAITING" });
+  });
+
+  it("targets settlement animation to the matching satellite or portfolio only", () => {
+    const satellites = [
+      { id: "pos-a", marketId: "market-a", label: "market-a" },
+      { id: "pos-b", marketId: "market-b", label: "market-b" },
+    ];
+    const settlementA = { kind: "settlement", marketId: "market-a", asset: "BTC", positionId: null };
+    expect(settlementAppliesToSlot(settlementA, { kind: "position", id: "pos-a", label: "market-a", marketId: "market-a" }, satellites)).toBe(true);
+    expect(settlementAppliesToSlot(settlementA, { kind: "position", id: "pos-b", label: "market-b", marketId: "market-b" }, satellites)).toBe(false);
+    expect(settlementAppliesToSlot(settlementA, { kind: "portfolio", id: "portfolio", label: "LEDGER", marketId: null }, satellites)).toBe(false);
+
+    const orphan = { kind: "settlement", marketId: "market-gone", asset: null, positionId: "pos-gone" };
+    expect(settlementAppliesToSlot(orphan, { kind: "position", id: "pos-a", label: "market-a", marketId: "market-a" }, satellites)).toBe(false);
+    expect(settlementAppliesToSlot(orphan, { kind: "position", id: "pos-b", label: "market-b", marketId: "market-b" }, satellites)).toBe(false);
+    expect(settlementAppliesToSlot(orphan, { kind: "portfolio", id: "portfolio", label: "LEDGER", marketId: null }, satellites)).toBe(true);
+  });
+
 });
