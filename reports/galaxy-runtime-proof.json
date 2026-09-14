@@ -1,0 +1,32 @@
+{
+  "shots": [
+    "C:\\Users\\acer\\Documents\\Codex\\Polymarket-Engine-astra-brain-v1\\reports\\galaxy-runtime-dpr1-t0.png",
+    "C:\\Users\\acer\\Documents\\Codex\\Polymarket-Engine-astra-brain-v1\\reports\\galaxy-runtime-dpr1-t3.png",
+    "C:\\Users\\acer\\Documents\\Codex\\Polymarket-Engine-astra-brain-v1\\reports\\galaxy-runtime-dpr1-t6.png",
+    "C:\\Users\\acer\\Documents\\Codex\\Polymarket-Engine-astra-brain-v1\\reports\\galaxy-runtime-dpr1-t9.png",
+    "C:\\Users\\acer\\Documents\\Codex\\Polymarket-Engine-astra-brain-v1\\reports\\galaxy-runtime-dpr1-t12.png",
+    "C:\\Users\\acer\\Documents\\Codex\\Polymarket-Engine-astra-brain-v1\\reports\\galaxy-runtime-dpr2-t0.png",
+    "C:\\Users\\acer\\Documents\\Codex\\Polymarket-Engine-astra-brain-v1\\reports\\galaxy-runtime-dpr2-t3.png",
+    "C:\\Users\\acer\\Documents\\Codex\\Polymarket-Engine-astra-brain-v1\\reports\\galaxy-runtime-dpr2-t6.png",
+    "C:\\Users\\acer\\Documents\\Codex\\Polymarket-Engine-astra-brain-v1\\reports\\galaxy-runtime-dpr2-t9.png",
+    "C:\\Users\\acer\\Documents\\Codex\\Polymarket-Engine-astra-brain-v1\\reports\\galaxy-runtime-dpr2-t12.png"
+  ],
+  "fps": {
+    "browser": "Chromium (Playwright)",
+    "viewport": "1280x860",
+    "dpr": 1,
+    "environment": "Windows laptop",
+    "samples": 320,
+    "p50_ms": 3,
+    "p95_ms": 4.9,
+    "p99_ms": 12.4,
+    "max_ms": 40.1,
+    "mean_ms": 3.437,
+    "paint_budget_fps": 290.99,
+    "raf_interval_mean_ms": 61.728,
+    "raf_interval_p95_ms": 66.7,
+    "achieved_display_fps": 16.2,
+    "note": "paint_* from data-field-frame-ms; achieved_display_fps from rAF intervals (headless may throttle)"
+  },
+  "fallback": "C:\\Users\\acer\\Documents\\Codex\\Polymarket-Engine-astra-brain-v1\\reports\\galaxy-runtime-fallback.png"
+}

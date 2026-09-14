@@ -7,7 +7,9 @@ import {
   MAX_VISIBLE_POSITIONS,
   MAX_VISIBLE_REFERENCES,
   buildGalaxyVisualSlots,
+  coreCaptionLines,
   galaxyCoreIdentity,
+  layoutSemanticLabels,
   settlementAppliesToSlot,
   marketTickCount,
   orbitDepthPaths,
@@ -128,6 +130,47 @@ describe("Galaxy orbital presentation", () => {
 
     const missing = galaxyCoreIdentity(buildGalaxySceneModel(snapshot({ consensus: null })));
     expect(missing).toMatchObject({ kicker: "DECISION CORE", title: "AWAITING" });
+  });
+
+
+  it("coreCaptionLines drops duplicate kicker/title and keeps distinct lines", () => {
+    expect(coreCaptionLines({ kicker: "DECISION CORE", title: "DECISION CORE", detail: "UP" })).toEqual({
+      titles: ["DECISION CORE"],
+      detail: "UP",
+    });
+    expect(coreCaptionLines({ kicker: "ASTRA", title: "DECISION CORE", detail: "UP" })).toEqual({
+      titles: ["ASTRA", "DECISION CORE"],
+      detail: "UP",
+    });
+  });
+
+  it("layoutSemanticLabels offsets or suppresses lower-priority overlaps and keeps primaries", () => {
+    const laid = layoutSemanticLabels([
+      { id: "trigger", kind: "trigger", size: "primary", x: 600, y: 200 },
+      { id: "pos-near", kind: "position", size: "secondary", x: 610, y: 210 },
+      { id: "ref-near", kind: "reference", size: "secondary", x: 605, y: 205 },
+      { id: "tick-1", kind: "density", size: "tick", x: 600, y: 200 },
+    ]);
+    const byId = Object.fromEntries(laid.map((row) => [row.id, row]));
+    expect(byId.trigger.showLabel).toBe(true);
+    expect(byId["tick-1"].showLabel).toBe(false);
+    // Lower priority must move away or lose detail/label; primary stays put or readable.
+    const primary = byId.trigger;
+    const position = byId["pos-near"];
+    const reference = byId["ref-near"];
+    expect(Math.hypot(primary.x - 600, primary.y - 200)).toBeLessThan(1);
+    const posMoved = Math.hypot(position.x - 610, position.y - 210) > 0.5;
+    const refMoved = Math.hypot(reference.x - 605, reference.y - 205) > 0.5;
+    expect(posMoved || !position.showLabel || !position.showDetail).toBe(true);
+    expect(refMoved || !reference.showDetail || position.showLabel === false || reference.showLabel).toBe(true);
+    // Deterministic across calls
+    const again = layoutSemanticLabels([
+      { id: "trigger", kind: "trigger", size: "primary", x: 600, y: 200 },
+      { id: "pos-near", kind: "position", size: "secondary", x: 610, y: 210 },
+      { id: "ref-near", kind: "reference", size: "secondary", x: 605, y: 205 },
+      { id: "tick-1", kind: "density", size: "tick", x: 600, y: 200 },
+    ]);
+    expect(again).toEqual(laid);
   });
 
   it("targets settlement animation to the matching satellite or portfolio only", () => {

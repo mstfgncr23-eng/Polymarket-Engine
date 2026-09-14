@@ -23,10 +23,13 @@
     "archive:export": "pnpm --filter @pm/engine archive:export",
     "bench:stability": "tsx scripts/stability-hot-path-bench.ts",
     "bench:sustained": "tsx scripts/sustained-capacity-harness.ts",
-    "bench:retention": "tsx scripts/report-retention-bench.ts"
+    "bench:retention": "tsx scripts/report-retention-bench.ts",
+    "galaxy:runtime-proof": "node apps/dashboard/scripts/galaxy-runtime-proof.cjs"
   },
   "devDependencies": {
+    "@playwright/test": "^1.63.0",
     "@types/node": "26.4.0",
+    "playwright": "^1.63.0",
     "tsup": "8.5.1",
     "tsx": "4.23.13",
     "typescript": "7.0.2",

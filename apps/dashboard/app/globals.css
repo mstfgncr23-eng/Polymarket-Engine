@@ -216,9 +216,12 @@ td { padding: 10px 9px; border-top: 1px solid rgba(127, 164, 220, .1); text-alig
 .galaxyOrbitalNebula { position: absolute; border-radius: 50%; pointer-events: none; }
 .galaxyOrbitalNebula--far { top: 40px; left: 90px; width: 980px; height: 420px; background: radial-gradient(ellipse, rgba(180, 96, 28, .18), rgba(80, 36, 10, .06) 52%, transparent 76%); }
 .galaxyOrbitalNebula--near { right: 40px; bottom: 40px; width: 420px; height: 240px; background: radial-gradient(ellipse, rgba(120, 58, 16, .12), transparent 72%); }
-.galaxyOrbitalField { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
+.galaxyFieldCanvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 0; }
+.galaxyFieldSvgFallback { display: block; }
+.galaxyOrbitalField { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; z-index: 1; }
+.galaxyOrbitalWash { z-index: 0; opacity: .35; }
 .galaxyOrbitStroke { fill: none; stroke-linecap: round; }
-.galaxyCoreKicker { fill: #ffe7b0; font: 800 8px Inter, ui-sans-serif, sans-serif; letter-spacing: .32em; }
+.galaxyCoreKicker { fill: #ffe7b0; font: 800 8px Inter, ui-sans-serif, sans-serif; letter-spacing: .18em; }
 .galaxyCoreTitle { fill: #fff3d6; font: 800 10px Inter, ui-sans-serif, sans-serif; letter-spacing: .18em; }
 .galaxyCoreDetail { fill: #ffd27a; font: 800 11px Inter, ui-sans-serif, sans-serif; letter-spacing: .22em; }
 .galaxySatelliteLabel { fill: #f0e2c4; font: 800 9px Inter, ui-sans-serif, sans-serif; letter-spacing: .12em; }
@@ -340,3 +343,4 @@ td { padding: 10px 9px; border-top: 1px solid rgba(127, 164, 220, .1); text-alig
 @media (prefers-reduced-motion: reduce) {
   .galaxyPlayerShell { transition: none; }
 }
+
