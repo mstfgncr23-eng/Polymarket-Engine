@@ -102,9 +102,12 @@ function bookFeatures(snapshot: MarketSnapshot): BookFeatures | null {
   const bid = snapshot.bids[0];
   const ask = snapshot.asks[0];
   // A one-sided/empty book is valid market state but not a model feature
-  // failure. Encode a zero-depth sentinel so the deterministic gate owns the
-  // NO_LIQUIDITY rejection and no provider call is made.
-  if (!bid || !ask) return emptyBookFeatures();
+  // failure. First reject malformed levels that are present; otherwise encode
+  // a zero-depth sentinel so the deterministic gate owns NO_LIQUIDITY.
+  if (!bid || !ask) {
+    if ((bid && !validTopLevel(bid)) || (ask && !validTopLevel(ask))) return null;
+    return emptyBookFeatures();
+  }
   const bidPrice = Number(bid.price); const askPrice = Number(ask.price);
   const bidQty = Number(bid.quantity); const askQty = Number(ask.quantity);
   if (![bidPrice, askPrice, bidQty, askQty].every(Number.isFinite) || askPrice < bidPrice || bidQty < 0 || askQty < 0) return null;
@@ -123,6 +126,11 @@ function bookFeatures(snapshot: MarketSnapshot): BookFeatures | null {
     spreadBps: (askPrice - bidPrice) * 10_000,
     depthUsd,
   };
+}
+function validTopLevel(level: { price: string; quantity: string }): boolean {
+  const price = Number(level.price);
+  const quantity = Number(level.quantity);
+  return Number.isFinite(price) && Number.isFinite(quantity) && price >= 0 && price <= 1 && quantity >= 0;
 }
 function emptyBookFeatures(): BookFeatures { return { mid: 0, bid: 0, ask: 0, imbalance: 0, spreadBps: 0, depthUsd: 0 }; }
 function validDate(value: Date): boolean { return value instanceof Date && Number.isFinite(value.getTime()); }
