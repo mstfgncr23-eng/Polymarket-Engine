@@ -1,4 +1,4 @@
-:root {
+﻿:root {
   color-scheme: dark;
   --bg: #040712;
   --bg-soft: #070d1b;
@@ -217,6 +217,7 @@ td { padding: 10px 9px; border-top: 1px solid rgba(127, 164, 220, .1); text-alig
 .galaxyOrbitalNebula--far { top: 40px; left: 90px; width: 980px; height: 420px; background: radial-gradient(ellipse, rgba(180, 96, 28, .18), rgba(80, 36, 10, .06) 52%, transparent 76%); }
 .galaxyOrbitalNebula--near { right: 40px; bottom: 40px; width: 420px; height: 240px; background: radial-gradient(ellipse, rgba(120, 58, 16, .12), transparent 72%); }
 .galaxyFieldCanvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 0; }
+.galaxyFieldSvgFallback { display: block; }
 .galaxyOrbitalField { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; z-index: 1; }
 .galaxyOrbitalWash { z-index: 0; opacity: .35; }
 .galaxyOrbitStroke { fill: none; stroke-linecap: round; }
@@ -342,3 +343,4 @@ td { padding: 10px 9px; border-top: 1px solid rgba(127, 164, 220, .1); text-alig
 @media (prefers-reduced-motion: reduce) {
   .galaxyPlayerShell { transition: none; }
 }
+

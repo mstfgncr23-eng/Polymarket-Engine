@@ -1,4 +1,4 @@
-import type { CSSProperties } from "react";
+﻿import type { CSSProperties } from "react";
 import {
   buildGalaxyVisualSlots,
   eventOrbitId,
@@ -20,6 +20,8 @@ export type GalaxyOrbitalVisualProps = {
   reducedMotion: boolean;
   durationInFrames: number;
   ambient?: boolean;
+  forceFieldFallback?: boolean;
+  freezeTimeSec?: number | null;
 };
 
 const MARKER_RADIUS: Record<string, number> = {
@@ -94,6 +96,8 @@ export function GalaxyOrbitalVisual({
   reducedMotion,
   durationInFrames,
   ambient = false,
+  forceFieldFallback = false,
+  freezeTimeSec = null,
 }: GalaxyOrbitalVisualProps) {
   const seconds = frame / GALAXY_FPS;
   const slots = buildGalaxyVisualSlots(model);
@@ -130,6 +134,8 @@ export function GalaxyOrbitalVisual({
       transients={transients}
       frame={frame}
       durationInFrames={durationInFrames}
+      forceFallback={forceFieldFallback}
+      freezeTimeSec={freezeTimeSec}
     />
     <div className="galaxyOrbitalWash" />
     <svg className="galaxyOrbitalField" viewBox={`0 0 ${GALAXY_VIEW.width} ${GALAXY_VIEW.height}`} role="img" aria-hidden="true">
@@ -254,6 +260,8 @@ function Satellite({
       <text x={label.x} y={label.y} textAnchor="middle" className="galaxySatelliteLabel">{slot.label}</text>
       <text x={label.x} y={label.y + 11} textAnchor="middle" className="galaxySatelliteDetail">{slot.detail}</text>
     </> : null}
-    {slot.kind === "market" ? <title>{`${model.market.status} · ${model.market.outcomes} outcomes`}</title> : null}
+    {slot.kind === "market" ? <title>{`${model.market.status} Â· ${model.market.outcomes} outcomes`}</title> : null}
   </g>;
 }
+
+
