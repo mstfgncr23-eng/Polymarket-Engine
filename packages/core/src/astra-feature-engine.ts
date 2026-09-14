@@ -101,12 +101,18 @@ interface BookFeatures { mid: number; bid: number; ask: number; imbalance: numbe
 function bookFeatures(snapshot: MarketSnapshot): BookFeatures | null {
   const bid = snapshot.bids[0];
   const ask = snapshot.asks[0];
-  if (!bid || !ask) return null;
+  // A one-sided/empty book is valid market state but not a model feature
+  // failure. Encode a zero-depth sentinel so the deterministic gate owns the
+  // NO_LIQUIDITY rejection and no provider call is made.
+  if (!bid || !ask) return emptyBookFeatures();
   const bidPrice = Number(bid.price); const askPrice = Number(ask.price);
   const bidQty = Number(bid.quantity); const askQty = Number(ask.quantity);
   if (![bidPrice, askPrice, bidQty, askQty].every(Number.isFinite) || askPrice < bidPrice || bidQty < 0 || askQty < 0) return null;
+  if (bidPrice < 0 || askPrice > 1) return null;
   const denominator = bidQty + askQty;
-  if (denominator <= 0 || bidPrice < 0 || askPrice > 1) return null;
+  if (denominator <= 0) {
+    return { mid: (bidPrice + askPrice) / 2, bid: bidPrice, ask: askPrice, imbalance: 0, spreadBps: (askPrice - bidPrice) * 10_000, depthUsd: 0 };
+  }
   const depthUsd = snapshot.asks.slice(0, 5).reduce((sum, level) => sum + Number(level.price) * Number(level.quantity), 0);
   if (!Number.isFinite(depthUsd) || depthUsd < 0) return null;
   return {
@@ -118,6 +124,7 @@ function bookFeatures(snapshot: MarketSnapshot): BookFeatures | null {
     depthUsd,
   };
 }
+function emptyBookFeatures(): BookFeatures { return { mid: 0, bid: 0, ask: 0, imbalance: 0, spreadBps: 0, depthUsd: 0 }; }
 function validDate(value: Date): boolean { return value instanceof Date && Number.isFinite(value.getTime()); }
 function finiteOrNull(value: number | null | undefined): number | null { return value !== null && value !== undefined && Number.isFinite(value) ? value : null; }
 function nonnegativeOrNull(value: number | null | undefined): number | null { const next = finiteOrNull(value); return next === null ? null : Math.max(0, next); }
