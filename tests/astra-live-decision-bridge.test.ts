@@ -23,7 +23,7 @@ function event(type: string, payload: Record<string, unknown>, suffix = type.toL
     type,
     aggregateType: "astra",
     aggregateId: trigger.id,
-    occurredAt: at,
+    occurredAt: new Date(at),
     payload,
   });
 }
