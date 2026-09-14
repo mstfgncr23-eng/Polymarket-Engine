@@ -170,6 +170,176 @@ export function labelAnchor(point: GalaxyProjectedPoint): GalaxyProjectedPoint {
   };
 }
 
+/** Title lines for the core caption. When kicker === title, draw a single title (no duplicate). */
+export function coreCaptionLines(identity: { kicker: string; title: string; detail: string }): {
+  titles: string[];
+  detail: string;
+} {
+  if (identity.kicker === identity.title) {
+    return { titles: [identity.title], detail: identity.detail };
+  }
+  return { titles: [identity.kicker, identity.title], detail: identity.detail };
+}
+
+export type SemanticLabelNode = {
+  id: string;
+  kind: GalaxyVisualKind | "tick";
+  size: GalaxyVisualSlot["size"];
+  x: number;
+  y: number;
+};
+
+export type LaidOutSemanticLabel = {
+  id: string;
+  kind: GalaxyVisualKind | "tick";
+  x: number;
+  y: number;
+  showLabel: boolean;
+  showDetail: boolean;
+};
+
+function semanticLabelPriority(kind: GalaxyVisualKind | "tick", size: GalaxyVisualSlot["size"]): number {
+  if (size === "tick" || kind === "density") return 0;
+  if (kind === "trigger" || kind === "risk" || kind === "execution" || kind === "market" || kind === "portfolio") return 3;
+  if (kind === "reference") return 2;
+  if (kind === "position") return 1;
+  return 0;
+}
+
+const LABEL_MIN_DIST = 54;
+const LABEL_PAD_X = 48;
+const LABEL_PAD_Y_TOP = 28;
+const LABEL_PAD_Y_BOTTOM = 52;
+const RADIAL_OFFSETS = [16, 28] as const;
+
+function clampLabelXY(x: number, y: number): { x: number; y: number } {
+  return {
+    x: clamp(x, LABEL_PAD_X, GALAXY_VIEW.width - LABEL_PAD_X),
+    y: clamp(y, LABEL_PAD_Y_TOP, GALAXY_VIEW.height - LABEL_PAD_Y_BOTTOM),
+  };
+}
+
+function outwardUnit(x: number, y: number): { ux: number; uy: number } {
+  const dx = x - GALAXY_VIEW.cx;
+  const dy = y - GALAXY_VIEW.cy;
+  const length = Math.hypot(dx, dy) || 1;
+  return { ux: dx / length, uy: dy / length };
+}
+
+/**
+ * Deterministic overlap resolution for satellite labels.
+ * Primary kinds stay readable; lower-priority labels are offset, then lose detail, then hide.
+ */
+export function layoutSemanticLabels(nodes: readonly SemanticLabelNode[]): LaidOutSemanticLabel[] {
+  type Working = LaidOutSemanticLabel & { priority: number; size: GalaxyVisualSlot["size"] };
+  const working: Working[] = nodes.map((node) => {
+    const priority = semanticLabelPriority(node.kind, node.size);
+    const clamped = clampLabelXY(node.x, node.y);
+    return {
+      id: node.id,
+      kind: node.kind,
+      x: clamped.x,
+      y: clamped.y,
+      showLabel: priority > 0,
+      showDetail: priority > 0,
+      priority,
+      size: node.size,
+    };
+  });
+
+  // Stable order: higher priority first, then id for determinism.
+  const order = working
+    .map((_, index) => index)
+    .sort((a, b) => {
+      const pa = working[a]!.priority;
+      const pb = working[b]!.priority;
+      if (pb !== pa) return pb - pa;
+      return working[a]!.id.localeCompare(working[b]!.id);
+    });
+
+  for (let oi = 0; oi < order.length; oi += 1) {
+    const i = order[oi]!;
+    const self = working[i]!;
+    if (!self.showLabel) continue;
+
+    for (let oj = 0; oj < oi; oj += 1) {
+      const j = order[oj]!;
+      const other = working[j]!;
+      if (!other.showLabel) continue;
+
+      const dist = Math.hypot(self.x - other.x, self.y - other.y);
+      if (dist >= LABEL_MIN_DIST) continue;
+
+      // Lower priority loses (self is later in priority-sorted order when priorities differ).
+      // When equal priority, the later id loses.
+      const selfLoses = self.priority < other.priority
+        || (self.priority === other.priority && self.id.localeCompare(other.id) > 0);
+      if (!selfLoses) continue;
+
+      // Primary kinds: prefer offset / hide detail over full hide.
+      const keepReadable = self.priority >= 3;
+      const { ux, uy } = outwardUnit(self.x, self.y);
+      let resolved = false;
+      for (const offset of RADIAL_OFFSETS) {
+        const next = clampLabelXY(self.x + ux * offset, self.y + uy * offset);
+        const nextDist = Math.hypot(next.x - other.x, next.y - other.y);
+        if (nextDist >= LABEL_MIN_DIST) {
+          self.x = next.x;
+          self.y = next.y;
+          resolved = true;
+          break;
+        }
+      }
+      if (resolved) continue;
+
+      // Still colliding: hide detail first.
+      self.showDetail = false;
+      // Re-check distance after offset attempts failed — try one more combined max offset.
+      const maxed = clampLabelXY(self.x + ux * RADIAL_OFFSETS[1], self.y + uy * RADIAL_OFFSETS[1]);
+      self.x = maxed.x;
+      self.y = maxed.y;
+      const after = Math.hypot(self.x - other.x, self.y - other.y);
+      if (after >= LABEL_MIN_DIST) continue;
+
+      if (!keepReadable) {
+        self.showLabel = false;
+        self.showDetail = false;
+      }
+    }
+  }
+
+  // Second pass: pairwise among still-visible to catch chains.
+  for (let oi = 0; oi < order.length; oi += 1) {
+    const i = order[oi]!;
+    const self = working[i]!;
+    if (!self.showLabel) continue;
+    for (let oj = 0; oj < oi; oj += 1) {
+      const j = order[oj]!;
+      const other = working[j]!;
+      if (!other.showLabel) continue;
+      const dist = Math.hypot(self.x - other.x, self.y - other.y);
+      if (dist >= LABEL_MIN_DIST) continue;
+      const selfLoses = self.priority < other.priority
+        || (self.priority === other.priority && self.id.localeCompare(other.id) > 0);
+      if (!selfLoses) continue;
+      if (self.showDetail) {
+        self.showDetail = false;
+      } else if (self.priority < 3) {
+        self.showLabel = false;
+      }
+    }
+  }
+
+  return working.map(({ id, kind, x, y, showLabel, showDetail }) => ({
+    id,
+    kind,
+    x,
+    y,
+    showLabel,
+    showDetail,
+  }));
+}
+
 export function eventOrbitId(kind: GalaxyMotionKind): GalaxyOrbitId | "core" {
   if (kind === "decision") return "core";
   if (kind === "trigger") return "trigger";

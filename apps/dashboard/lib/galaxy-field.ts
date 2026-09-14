@@ -1,4 +1,4 @@
-﻿export const FIELD_FILAMENT_COUNT = 48;
+export const FIELD_FILAMENT_COUNT = 48;
 export const FIELD_PRIMARY_COUNT = 8;
 export const FIELD_SECONDARY_COUNT = 20;
 export const FIELD_BACKGROUND_COUNT = 20;
@@ -419,13 +419,13 @@ export function stepPackets(
 
 function tierAlphaMul(tier: FilamentTier, edgeOn: number): number {
   if (tier === "primary") return 1;
-  if (tier === "secondary") return 0.55 * (1 - edgeOn * 0.35);
+  if (tier === "secondary") return 0.68 * (1 - edgeOn * 0.35);
   return 0.22 * (1 - edgeOn * 0.55);
 }
 
 function tierWidthMul(tier: FilamentTier): number {
-  if (tier === "primary") return 1.35;
-  if (tier === "secondary") return 0.85;
+  if (tier === "primary") return 1.75;
+  if (tier === "secondary") return 0.95;
   return 0.55;
 }
 
@@ -456,7 +456,7 @@ function paintCore(
   const bloom = (1 + mods.coreBloom * 0.45) * bloomScale;
 
   const halo = ctx.createRadialGradient(cx, cy, 0, cx, cy, 78 * bloom);
-  halo.addColorStop(0, "rgba(255, 168, 64, 0.22)");
+  halo.addColorStop(0, "rgba(255, 168, 64, 0.28)");
   halo.addColorStop(0.4, "rgba(180, 96, 28, 0.1)");
   halo.addColorStop(1, "rgba(0, 0, 0, 0)");
   ctx.fillStyle = halo;
@@ -465,7 +465,7 @@ function paintCore(
   ctx.fill();
 
   const amber = ctx.createRadialGradient(cx, cy, 0, cx, cy, 24 * bloom);
-  amber.addColorStop(0, "rgba(255, 200, 110, 0.78)");
+  amber.addColorStop(0, "rgba(255, 200, 110, 0.86)");
   amber.addColorStop(0.55, "rgba(230, 130, 42, 0.4)");
   amber.addColorStop(1, "rgba(0, 0, 0, 0)");
   ctx.fillStyle = amber;
@@ -535,7 +535,8 @@ function strokeSegmentPass(
       }
 
       const depth = clamp((midZ + 300) / 600, 0, 1);
-      const alpha = (0.05 + depth * 0.32) * alphaMul;
+      const alphaBase = seed.tier === "primary" ? (0.12 + depth * 0.48) : (0.05 + depth * 0.32);
+      const alpha = alphaBase * alphaMul;
       // Outer fade: points far from canvas center get softer.
       const dist = Math.hypot((a.x + c.x) * 0.5 - FIELD_VIEW.cx, (a.y + c.y) * 0.5 - FIELD_VIEW.cy);
       const outer = clamp(1 - (dist - 420) / 280, 0.25, 1);
@@ -555,8 +556,8 @@ function strokeSegmentPass(
       ctx.lineJoin = "round";
       ctx.lineCap = "round";
       if (bloomMul > 0.05 && seed.tier === "primary" && s % 7 === 0) {
-        ctx.shadowColor = `rgba(255, 170, 60, ${0.22 * segAlpha * bloomMul})`;
-        ctx.shadowBlur = 5 * bloomMul;
+        ctx.shadowColor = `rgba(255, 170, 60, ${0.34 * segAlpha * bloomMul})`;
+        ctx.shadowBlur = 7 * bloomMul;
       } else {
         ctx.shadowBlur = 0;
       }

@@ -1,12 +1,15 @@
 ﻿import type { CSSProperties } from "react";
 import {
   buildGalaxyVisualSlots,
+  coreCaptionLines,
   eventOrbitId,
   galaxyCoreIdentity,
   labelAnchor,
+  layoutSemanticLabels,
   settlementAppliesToSlot,
   type GalaxyProjectedPoint,
   type GalaxyVisualSlot,
+  type LaidOutSemanticLabel,
 } from "../../lib/galaxy-presentation";
 import { GALAXY_VIEW } from "../../lib/galaxy-presentation";
 import { projectMarkerInField } from "../../lib/galaxy-field";
@@ -123,7 +126,15 @@ export function GalaxyOrbitalVisual({
     .filter((slot) => slot.kind !== "core")
     .map((slot) => ({ slot, point: markerPoint(slot, seconds, reducedMotion) }))
     .sort((left, right) => left.point.z - right.point.z);
-  const satelliteProps = { model, transients, frame, durationInFrames, settlementPulse, settlementEvent, triggerPulse, marketPulse };
+  const caption = coreCaptionLines(identity);
+  const labelLayouts = layoutSemanticLabels(
+    nodes.map(({ slot, point }) => {
+      const anchor = labelAnchor(point);
+      return { id: slot.id, kind: slot.kind, size: slot.size, x: anchor.x, y: anchor.y };
+    }),
+  );
+  const labelById = new Map(labelLayouts.map((layout) => [layout.id, layout]));
+  const satelliteProps = { model, transients, frame, durationInFrames, settlementPulse, settlementEvent, triggerPulse, marketPulse, labelById };
 
   return <div
     className={`galaxyOrbital${ambient ? " galaxyOrbital--ambient" : ""}`}
@@ -186,9 +197,15 @@ export function GalaxyOrbitalVisual({
       <g className="galaxyCoreGroup" style={{ transform: `translate(${GALAXY_VIEW.cx}px, ${GALAXY_VIEW.cy}px) scale(${coreScale})`, transformOrigin: "0 0" } as CSSProperties}>
         <circle r="52" fill="transparent" />
       </g>
-      <text x={GALAXY_VIEW.cx} y={GALAXY_VIEW.cy - 10} textAnchor="middle" className="galaxyCoreKicker">{identity.kicker}</text>
-      <text x={GALAXY_VIEW.cx} y={GALAXY_VIEW.cy + 6} textAnchor="middle" className="galaxyCoreTitle">{identity.title}</text>
-      <text x={GALAXY_VIEW.cx} y={GALAXY_VIEW.cy + 22} textAnchor="middle" className="galaxyCoreDetail">{identity.detail}</text>
+      {caption.titles.length === 1 ? (
+        <text x={GALAXY_VIEW.cx} y={GALAXY_VIEW.cy - 2} textAnchor="middle" className="galaxyCoreTitle">{caption.titles[0]}</text>
+      ) : (
+        <>
+          <text x={GALAXY_VIEW.cx} y={GALAXY_VIEW.cy - 10} textAnchor="middle" className="galaxyCoreKicker">{caption.titles[0]}</text>
+          <text x={GALAXY_VIEW.cx} y={GALAXY_VIEW.cy + 6} textAnchor="middle" className="galaxyCoreTitle">{caption.titles[1]}</text>
+        </>
+      )}
+      <text x={GALAXY_VIEW.cx} y={GALAXY_VIEW.cy + 22} textAnchor="middle" className="galaxyCoreDetail">{caption.detail}</text>
 
       {nodes.filter(({ point }) => point.z >= 36).map(({ slot, point }) => <Satellite key={`front-${slot.id}`} slot={slot} point={point} {...satelliteProps} />)}
     </svg>
@@ -217,6 +234,7 @@ function Satellite({
   settlementEvent,
   triggerPulse,
   marketPulse,
+  labelById,
 }: {
   slot: GalaxyVisualSlot;
   point: GalaxyProjectedPoint;
@@ -228,8 +246,11 @@ function Satellite({
   settlementEvent: GalaxyTransient | undefined;
   triggerPulse: number;
   marketPulse: number;
+  labelById: Map<string, LaidOutSemanticLabel>;
 }) {
-  const label = labelAnchor(point);
+  const fallback = labelAnchor(point);
+  const layout = labelById.get(slot.id);
+  const label = layout ?? { x: fallback.x, y: fallback.y, showLabel: slot.size !== "tick", showDetail: slot.size !== "tick" };
   const radius = slot.size === "primary" ? 5.4 : slot.size === "secondary" ? 3.6 : 1.7;
   const satellites = model.portfolio.satellites;
   const settlementApplies = settlementEvent
@@ -256,9 +277,9 @@ function Satellite({
       {pulse ? <circle r={radius + 7} fill="none" stroke={fill} opacity="0.45" /> : null}
       <circle r={radius} fill={fill} stroke="rgba(255,244,220,.55)" strokeWidth="0.7" />
     </g>
-    {slot.size !== "tick" ? <>
+    {slot.size !== "tick" && label.showLabel ? <>
       <text x={label.x} y={label.y} textAnchor="middle" className="galaxySatelliteLabel">{slot.label}</text>
-      <text x={label.x} y={label.y + 11} textAnchor="middle" className="galaxySatelliteDetail">{slot.detail}</text>
+      {label.showDetail ? <text x={label.x} y={label.y + 11} textAnchor="middle" className="galaxySatelliteDetail">{slot.detail}</text> : null}
     </> : null}
     {slot.kind === "market" ? <title>{`${model.market.status} Â· ${model.market.outcomes} outcomes`}</title> : null}
   </g>;
