@@ -65,6 +65,104 @@ export function latest<T>(items: T[]): T | null {
   return items[0] ?? null;
 }
 
+function timeValue(value: string | null | undefined): number {
+  if (!value) return Number.NEGATIVE_INFINITY;
+  const parsed = new Date(value).getTime();
+  return Number.isFinite(parsed) ? parsed : Number.NEGATIVE_INFINITY;
+}
+
+function newestByTime<T>(items: readonly T[], at: (item: T) => string | null | undefined): T | null {
+  let selected: T | null = null;
+  let selectedAt = Number.NEGATIVE_INFINITY;
+  for (const item of items) {
+    const candidateAt = timeValue(at(item));
+    if (candidateAt > selectedAt) {
+      selected = item;
+      selectedAt = candidateAt;
+    }
+  }
+  return selected;
+}
+
+export function latestTrigger(snapshot: DashboardSnapshot): DashboardSnapshot["recentTriggers"][number] | null {
+  return newestByTime(snapshot.recentTriggers, (trigger) => trigger.createdAt);
+}
+
+export function latestDecisionActivity(snapshot: DashboardSnapshot): DashboardEvent | null {
+  return newestByTime(decisionActivityEvents(snapshot), (event) => event.at);
+}
+
+/** Latest decision activity belonging to the newest trigger when trace identity is available. */
+export function pipelineDecisionActivity(snapshot: DashboardSnapshot): DashboardEvent | null {
+  const trigger = latestTrigger(snapshot);
+  const events = decisionActivityEvents(snapshot);
+  if (!trigger) return newestByTime(events, (event) => event.at);
+
+  if (trigger.traceId) {
+    const sameTrace = newestByTime(events.filter((event) => event.traceId === trigger.traceId), (event) => event.at);
+    return sameTrace && timeValue(sameTrace.at) >= timeValue(trigger.createdAt) ? sameTrace : null;
+  }
+
+  const newest = newestByTime(events, (event) => event.at);
+  return newest && timeValue(newest.at) >= timeValue(trigger.createdAt) ? newest : null;
+}
+
+function activityInvalidatesDecision(event: DashboardEvent): boolean {
+  return event.type === "ASTRA_FAILURE"
+    || event.type === "ASTRA_BUDGET_BLOCK"
+    || event.type === "BOOK_REVALIDATION_REJECTED"
+    || (event.type === "ASTRA_DECISION" && event.detail.accepted === false);
+}
+
+/**
+ * Dashboard consensus is a projection, not authority. Hide a prior projection
+ * once a newer trigger/pipeline has superseded it instead of presenting stale
+ * economic state as the current decision.
+ */
+export function currentConsensus(snapshot: DashboardSnapshot): DashboardSnapshot["consensus"] {
+  const consensus = snapshot.consensus;
+  if (!consensus) return null;
+  const consensusAt = timeValue(consensus.calculatedAt);
+  const trigger = latestTrigger(snapshot);
+
+  if (trigger && timeValue(trigger.createdAt) > consensusAt) {
+    const sameTrigger = Boolean(consensus.triggerId && consensus.triggerId === trigger.id);
+    const sameTrace = Boolean(consensus.traceId && trigger.traceId && consensus.traceId === trigger.traceId);
+    if (!sameTrigger && !sameTrace) return null;
+  }
+
+  const activity = pipelineDecisionActivity(snapshot);
+  if (activity && timeValue(activity.at) > consensusAt) {
+    const sameTrace = Boolean(consensus.traceId && activity.traceId === consensus.traceId);
+    if (!sameTrace || activityInvalidatesDecision(activity)) return null;
+  }
+
+  return consensus;
+}
+
+/** Same rule for the risk projection: a newer pipeline must not inherit an old veto/pass. */
+export function currentRisk(snapshot: DashboardSnapshot): DashboardSnapshot["risk"] {
+  const risk = snapshot.risk;
+  if (!risk) return null;
+  const riskAt = timeValue(risk.evaluatedAt);
+  const trigger = latestTrigger(snapshot);
+
+  if (trigger && timeValue(trigger.createdAt) > riskAt) {
+    const sameTrace = Boolean(risk.traceId && trigger.traceId && risk.traceId === trigger.traceId);
+    if (!sameTrace) return null;
+  }
+
+  const activity = pipelineDecisionActivity(snapshot);
+  if (activity && timeValue(activity.at) > riskAt) {
+    const sameTrace = Boolean(risk.traceId && activity.traceId === risk.traceId);
+    if (!sameTrace || activityInvalidatesDecision(activity)) return null;
+  }
+
+  const consensus = currentConsensus(snapshot);
+  if (consensus && timeValue(consensus.calculatedAt) > riskAt) return null;
+  return risk;
+}
+
 export function toneForState(state: string | null | undefined): Tone {
   switch (state) {
     case "CONNECTED":
