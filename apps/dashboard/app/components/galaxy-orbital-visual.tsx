@@ -152,7 +152,7 @@ export function GalaxyOrbitalVisual({
         opacity={reducedMotion ? 0.42 : 0.2 + 0.38 * ((Math.sin((frame + index * 13) / 36) + 1) / 2)}
       />)}
 
-      <ellipse cx={GALAXY_VIEW.cx} cy={GALAXY_VIEW.cy + 8} rx="470" ry="168" fill={`url(#galaxy-disk-${paintId})`} opacity="0.9" />
+      <ellipse cx={GALAXY_VIEW.cx} cy={GALAXY_VIEW.cy + 10} rx="520" ry="210" fill={`url(#galaxy-disk-${paintId})`} opacity="0.95" />
 
       {GALAXY_ORBITS.map((orbit) => {
         const path = orbitPolyline(orbit, 80, parallax);
@@ -165,7 +165,7 @@ export function GalaxyOrbitalVisual({
       })}
 
       {GALAXY_ORBITS.flatMap((orbit) => [0, 1].flatMap((lane) => {
-        const trail = Array.from({ length: reducedMotion ? 1 : 4 }, (_, ghost) => {
+        const trail = Array.from({ length: reducedMotion ? 1 : 5 }, (_, ghost) => {
           const angle = orbit.phase + lane * 2.05 + seconds * orbit.speed + ghost * -0.09;
           const point = projectOrbitPoint(orbit, reducedMotion ? orbit.phase + lane * 2.05 : angle, parallax);
           return { key: `${orbit.id}-${lane}-${ghost}`, point, ghost, orbit, lane };
@@ -230,13 +230,14 @@ export function GalaxyOrbitalVisual({
       {nodes.filter(({ point }) => point.z < 36).map(({ slot, point }) => <Satellite key={`behind-${slot.id}`} slot={slot} point={point} {...satelliteProps} />)}
 
       <g className="galaxyCoreGroup" style={{ transform: `translate(${GALAXY_VIEW.cx}px, ${GALAXY_VIEW.cy}px) scale(${coreScale})`, transformOrigin: "0 0" } as CSSProperties}>
-        <circle r="102" fill="rgba(255,168,64,.08)" />
-        <circle r="74" fill="rgba(255,176,72,.14)" />
-        <circle r="46" fill={`url(#galaxy-core-fill-${paintId})`} stroke="rgba(255,236,196,.78)" strokeWidth="1.3" />
-        <circle r="16" fill="#fff8e4" opacity="0.95" />
+        <circle r="118" fill="rgba(255,168,64,.10)" />
+        <circle r="86" fill="rgba(255,176,72,.16)" />
+        <circle r="52" fill={`url(#galaxy-core-fill-${paintId})`} stroke="rgba(255,236,196,.82)" strokeWidth="1.4" />
+        <circle r="18" fill="#fff8e4" opacity="0.96" />
       </g>
-      <text x={GALAXY_VIEW.cx} y={GALAXY_VIEW.cy - 6} textAnchor="middle" className="galaxyCoreKicker">ASTRA</text>
-      <text x={GALAXY_VIEW.cx} y={GALAXY_VIEW.cy + 10} textAnchor="middle" className="galaxyCoreTitle">DECISION CORE</text>
+      <text x={GALAXY_VIEW.cx} y={GALAXY_VIEW.cy - 10} textAnchor="middle" className="galaxyCoreKicker">ASTRA</text>
+      <text x={GALAXY_VIEW.cx} y={GALAXY_VIEW.cy + 6} textAnchor="middle" className="galaxyCoreTitle">DECISION CORE</text>
+      <text x={GALAXY_VIEW.cx} y={GALAXY_VIEW.cy + 22} textAnchor="middle" className="galaxyCoreDetail">{core.detail}</text>
 
       {GALAXY_ORBITS.map((orbit) => {
         const depth = orbitDepthPaths(orbit, 80, parallax);

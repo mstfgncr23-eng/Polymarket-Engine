@@ -5,8 +5,8 @@ export const GALAXY_VIEW = {
   width: 1200,
   height: 760,
   cx: 600,
-  cy: 386,
-  focal: 1680,
+  cy: 372,
+  focal: 1580,
 } as const;
 
 export const MAX_MARKET_TICKS = 18;
@@ -64,13 +64,13 @@ export interface GalaxyVisualSlot {
 }
 
 export const GALAXY_ORBITS: readonly GalaxyOrbitDef[] = [
-  { id: "halo", radius: 132, aspect: 0.92, rotateX: 1.26, rotateZ: -0.18, speed: 0.52, phase: 0.4, stroke: "rgba(255,188,96,.40)" },
-  { id: "trigger", radius: 204, aspect: 0.78, rotateX: 0.86, rotateZ: -0.52, speed: 0.34, phase: 1.7, stroke: "rgba(236,176,86,.34)" },
-  { id: "risk", radius: 272, aspect: 1.00, rotateX: 1.18, rotateZ: 0.16, speed: 0.26, phase: 3.1, stroke: "rgba(220,164,82,.30)" },
-  { id: "execution", radius: 344, aspect: 0.72, rotateX: 0.68, rotateZ: -0.38, speed: 0.20, phase: 5.0, stroke: "rgba(208,152,78,.28)" },
-  { id: "market", radius: 412, aspect: 0.88, rotateX: 1.04, rotateZ: 0.28, speed: 0.15, phase: 2.2, stroke: "rgba(196,144,76,.24)" },
-  { id: "portfolio", radius: 478, aspect: 0.70, rotateX: 0.78, rotateZ: -0.22, speed: 0.11, phase: 4.4, stroke: "rgba(184,136,74,.20)" },
-  { id: "reference", radius: 536, aspect: 0.96, rotateX: 1.24, rotateZ: 0.10, speed: 0.08, phase: 0.9, stroke: "rgba(172,128,78,.18)" },
+  { id: "halo", radius: 148, aspect: 0.90, rotateX: 1.08, rotateZ: -0.16, speed: 0.52, phase: 0.4, stroke: "rgba(255,188,96,.42)" },
+  { id: "trigger", radius: 228, aspect: 0.76, rotateX: 0.72, rotateZ: -0.48, speed: 0.34, phase: 1.7, stroke: "rgba(236,176,86,.36)" },
+  { id: "risk", radius: 298, aspect: 0.98, rotateX: 0.98, rotateZ: 0.14, speed: 0.26, phase: 3.1, stroke: "rgba(220,164,82,.32)" },
+  { id: "execution", radius: 368, aspect: 0.74, rotateX: 0.58, rotateZ: -0.36, speed: 0.20, phase: 5.0, stroke: "rgba(208,152,78,.30)" },
+  { id: "market", radius: 438, aspect: 0.86, rotateX: 0.88, rotateZ: 0.24, speed: 0.15, phase: 2.2, stroke: "rgba(196,144,76,.26)" },
+  { id: "portfolio", radius: 500, aspect: 0.72, rotateX: 0.66, rotateZ: -0.20, speed: 0.11, phase: 4.4, stroke: "rgba(184,136,74,.22)" },
+  { id: "reference", radius: 540, aspect: 0.90, rotateX: 0.98, rotateZ: 0.08, speed: 0.08, phase: 0.9, stroke: "rgba(172,128,78,.20)" },
 ];
 
 const PARKED_ANGLE: Record<Exclude<GalaxyOrbitId, "halo" | "reference">, number> = {
