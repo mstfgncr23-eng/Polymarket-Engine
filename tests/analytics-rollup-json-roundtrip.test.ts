@@ -63,8 +63,9 @@ describe("analytics rollup JSONB hash compatibility", () => {
     const loaded = await loadVerifiedAnalyticsRollup(journal, "exp-rollup");
     expect(loaded?.contentHash).toBe(contentHash);
 
+    const otherStored = JSON.parse(JSON.stringify(emptySnapshot("exp-other"))) as Record<string, unknown>;
     const unrelatedLegacyHash = createHash("sha256")
-      .update(canonicalJson({ ...stored, someUnknownLegacyField: undefined }))
+      .update(canonicalJson({ ...otherStored, someUnknownLegacyField: undefined }))
       .digest("hex");
     const other = new MemoryEventJournal();
     await other.persistAnalyticsRollup!({
@@ -79,7 +80,7 @@ describe("analytics rollup JSONB hash compatibility", () => {
       sourceRecordedAt: null,
       stableRead: true,
       previousContentHash: null,
-      accumulator: { ...stored, experimentId: "exp-other" },
+      accumulator: otherStored,
       contentHash: unrelatedLegacyHash,
       verified: true,
       createdAt: "2026-09-14T00:00:00.000Z",
