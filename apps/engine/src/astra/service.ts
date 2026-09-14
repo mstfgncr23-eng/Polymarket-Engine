@@ -309,6 +309,7 @@ function deepFailureReason(error: unknown): AstraDeepFailureReason {
 
 function asAstraClientError(error: unknown, stage: AstraStage): AstraClientError {
   if (error instanceof AstraClientError) return error;
+  if (error instanceof AstraStageAccountingError && error.providerError) return error.providerError;
   if (error instanceof AstraStageAccountingError && error.result) {
     return new AstraClientError("ASTRA_REQUEST_FAILED", stage, "RESPONSE_RECEIVED", {
       providerRequestId: error.result.providerRequestId,

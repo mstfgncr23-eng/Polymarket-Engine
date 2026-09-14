@@ -2298,10 +2298,11 @@ export class EngineService {
     // a deterministic market clock in tests or a replay clock during recovery.
     const recordedAtTo = new Date();
     const through = await this.journal.peekLatestKeyset({ types, from, recordedAtTo });
-    if (!through) {
-      this.astraGovernor.restoreFromEvidence([], nowMs);
-      return;
-    }
+    // hydrateCheckpointPayload already restored and pruned the checkpointed
+    // governor. If no recent journal page exists, preserve that durable state;
+    // replacing it with an empty governor would reopen paid capacity on a
+    // restart when evidence is unavailable or has been compacted.
+    if (!through) return;
     const pageSize = Math.max(1, Math.min(this.recoveryPageSize, 256));
     let after: JournalKeysetCursor | undefined;
     let scanned = 0;
@@ -2374,25 +2375,27 @@ export class EngineService {
         }
       }
       const occurredAt = this.nowFn();
+      const dispatchId = context.traceId + ":" + context.stage;
+      const admissionClass = context.stage === "BATCH" ? "BATCH_LEARNING" : "PAID_FIRST_LEG_CANDIDATE";
       const evidencePayload = {
         authority: ASTRA_BRAIN_AUTHORITY,
         experimentId: context.experimentId,
         runGeneration: context.runGeneration,
-        dispatchId: context.traceId + ":" + context.stage,
+        dispatchId,
         traceId: context.traceId,
         triggerId: context.triggerId,
         stage: context.stage,
         model: context.model,
         triggerKind: context.triggerKind,
         marketId: context.marketId,
-        admissionClass: "PAID_FIRST_LEG_CANDIDATE",
+        admissionClass,
       };
       const authorization = createJournalEvent({
-        id: derivedAuditEventId("ASTRA_PROVIDER_DISPATCH_AUTHORIZED", context.traceId + ":" + context.stage),
+        id: derivedAuditEventId("ASTRA_PROVIDER_DISPATCH_AUTHORIZED", dispatchId),
         traceId: context.traceId,
         type: "ASTRA_PROVIDER_DISPATCH_AUTHORIZED",
         aggregateType: "astra_provider_dispatch",
-        aggregateId: context.traceId + ":" + context.stage,
+        aggregateId: dispatchId,
         occurredAt,
         payload: evidencePayload,
       });
@@ -2420,16 +2423,16 @@ export class EngineService {
       // post-begin row is best effort so an audit outage cannot release the
       // client semaphore while the already-started SDK request is in flight.
       void this.persistAstraCanonicalBatch([createJournalEvent({
-        id: derivedAuditEventId("ASTRA_PROVIDER_DISPATCH_STARTED", context.traceId + ":" + context.stage),
+        id: derivedAuditEventId("ASTRA_PROVIDER_DISPATCH_STARTED", dispatchId),
         traceId: context.traceId,
         type: "ASTRA_PROVIDER_DISPATCH_STARTED",
         aggregateType: "astra_provider_dispatch",
-        aggregateId: context.traceId + ":" + context.stage,
+        aggregateId: dispatchId,
         occurredAt: this.nowFn(),
         payload: { ...evidencePayload, dispatchStarted: true },
       })]).catch((error) => this.logger.error({ err: error, traceId: context.traceId }, "Astra dispatch-start audit append failed"));
       this.record("ASTRA_PROVIDER_DISPATCH_STARTED", context.traceId, context.marketId, {
-        stage: context.stage, model: context.model, triggerKind: context.triggerKind, admissionClass: "PAID_FIRST_LEG_CANDIDATE",
+        stage: context.stage, model: context.model, triggerKind: context.triggerKind, admissionClass,
       });
     });
   }
@@ -2444,7 +2447,7 @@ export class EngineService {
       traceId: input.traceId, type: "ASTRA_MODEL_INVOCATION", aggregateType: "astra_invocation", aggregateId: `${input.traceId}:${input.stage}`,
       occurredAt,
       payload: {
-        authority: ASTRA_BRAIN_AUTHORITY, stage: input.stage, experimentId,
+        authority: ASTRA_BRAIN_AUTHORITY, stage: input.stage, experimentId, dispatchId: `${input.traceId}:${input.stage}`,
         providerRequestId: input.result.providerRequestId,
         reasoningEffort: input.stage === "FAST" ? this.env.ASTRA_FAST_REASONING : input.stage === "DEEP" ? this.env.ASTRA_DEEP_REASONING : this.env.ASTRA_BATCH_REASONING,
         latencyMs: input.result.latencyMs ?? null, status: "success", usage: input.result.usage, model: this.env.ASTRA_MODEL,
@@ -2583,7 +2586,7 @@ export class EngineService {
         id: derivedAuditEventId("ASTRA_FAILURE", trigger.id),
         traceId: trigger.traceId, type: "ASTRA_FAILURE", aggregateType: "astra", aggregateId: trigger.id,
         payload: {
-          authority: ASTRA_BRAIN_AUTHORITY, experimentId: admissionFence.experimentId, stage: "DEEP", reason: failureReason,
+          authority: ASTRA_BRAIN_AUTHORITY, experimentId: admissionFence.experimentId, stage: "DEEP", dispatchId: `${trigger.traceId}:DEEP`, reason: failureReason,
           dispatchState: providerError?.dispatchState ?? "DISPATCHED_UNKNOWN",
           providerRequestId: providerError?.providerRequestId ?? null,
           knownUsage: providerError?.knownUsage === true,
@@ -2681,7 +2684,7 @@ export class EngineService {
     if (!this.astraService) {
       this.metrics.astraFailures.inc({ stage: "FAST", reason: "CLIENT_UNAVAILABLE" });
       this.metrics.astraFailureTotals.inc({ stage: "FAST", reason: "CLIENT_UNAVAILABLE" });
-      await this.persistReportInput(createJournalEvent({ traceId: trigger.traceId, type: "ASTRA_FAILURE", aggregateType: "astra", aggregateId: trigger.id, payload: { authority: ASTRA_BRAIN_AUTHORITY, experimentId: admissionFence.experimentId, reason: "CLIENT_UNAVAILABLE", dispatchState: "NOT_DISPATCHED" } }));
+      await this.persistReportInput(createJournalEvent({ traceId: trigger.traceId, type: "ASTRA_FAILURE", aggregateType: "astra", aggregateId: trigger.id, payload: { authority: ASTRA_BRAIN_AUTHORITY, experimentId: admissionFence.experimentId, stage: "FAST", dispatchId: `${trigger.traceId}:FAST`, reason: "CLIENT_UNAVAILABLE", dispatchState: "NOT_DISPATCHED" } }));
       this.record("ASTRA_FAILURE", trigger.traceId, trigger.marketId, { stage: "FAST", reason: "CLIENT_UNAVAILABLE", dispatchState: "NOT_DISPATCHED" }, trigger.asset ?? null);
       return;
     }
@@ -2718,7 +2721,7 @@ export class EngineService {
       },
     });
     if (!featurePacket) {
-      await this.persistReportInput(createJournalEvent({ traceId: trigger.traceId, type: "ASTRA_FAILURE", aggregateType: "astra", aggregateId: trigger.id, payload: { reason: "FEATURE_EXTRACTION_FAILED", authority: ASTRA_BRAIN_AUTHORITY, experimentId: admissionFence.experimentId, dispatchState: "NOT_DISPATCHED" } }));
+      await this.persistReportInput(createJournalEvent({ traceId: trigger.traceId, type: "ASTRA_FAILURE", aggregateType: "astra", aggregateId: trigger.id, payload: { reason: "FEATURE_EXTRACTION_FAILED", authority: ASTRA_BRAIN_AUTHORITY, experimentId: admissionFence.experimentId, stage: "FAST", dispatchId: `${trigger.traceId}:FAST`, dispatchState: "NOT_DISPATCHED" } }));
       this.record("ASTRA_FAILURE", trigger.traceId, trigger.marketId, { stage: "FAST", reason: "FEATURE_EXTRACTION_FAILED", dispatchState: "NOT_DISPATCHED" }, asset ?? null);
       return;
     }
@@ -2850,7 +2853,7 @@ export class EngineService {
       await this.persistReportInput(createJournalEvent({
         traceId: trigger.traceId, type: "ASTRA_FAILURE", aggregateType: "astra", aggregateId: trigger.id,
         payload: {
-          authority: ASTRA_BRAIN_AUTHORITY, experimentId: admissionFence.experimentId, stage, reason, dispatchState,
+          authority: ASTRA_BRAIN_AUTHORITY, experimentId: admissionFence.experimentId, stage, dispatchId: `${trigger.traceId}:${stage}`, reason, dispatchState,
           providerRequestId: originalProviderError?.providerRequestId ?? null,
           knownUsage: originalProviderError?.knownUsage === true || accountingUsage !== undefined,
           usage: originalProviderError?.usage ?? accountingUsage ?? null,
@@ -2972,7 +2975,7 @@ export class EngineService {
               type: "ASTRA_FAILURE",
               aggregateType: "astra_learner", aggregateId: requestExperimentId ?? "paper",
               payload: {
-                authority: ASTRA_BRAIN_AUTHORITY, stage, experimentId: requestExperimentId, runGeneration: request.runGeneration,
+                authority: ASTRA_BRAIN_AUTHORITY, stage, dispatchId: `${request.traceId}:${stage}`, experimentId: requestExperimentId, runGeneration: request.runGeneration,
                 reason: batchReason,
                 dispatchState: originalProviderError?.dispatchState ?? (accountingError ? "RESPONSE_RECEIVED" : "NOT_DISPATCHED"),
                 providerRequestId: originalProviderError?.providerRequestId ?? null,
@@ -4864,7 +4867,7 @@ export class EngineService {
 
     this.astraFinalizationPending = true;
     try {
-      const deadline = Date.now() + Math.max(this.env.ASTRA_BATCH_TIMEOUT_MS, this.env.ASTRA_FAST_TIMEOUT_MS) + 1_000;
+      const deadline = Date.now() + Math.max(this.env.ASTRA_BATCH_TIMEOUT_MS, this.env.ASTRA_FAST_TIMEOUT_MS, this.env.ASTRA_DEEP_TIMEOUT_MS) + 1_000;
       while (this.astraDecisionInFlight > 0) {
         if (Date.now() >= deadline) return false;
         await new Promise((resolve) => setTimeout(resolve, 5));

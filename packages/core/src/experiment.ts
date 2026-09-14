@@ -116,7 +116,11 @@ export interface ExperimentSummary {
   slippageUsd: number;
   netTradingPnlUsd: number;
   aiCostUsd: number;
+  providerDispatchAuthorizedCount: number;
   providerDispatchStartedCount: number;
+  providerDispatchUnresolvedAuthorizationCount: number;
+  providerDispatchTrackingOverflow: boolean;
+  providerDispatchTrackingIncomplete: boolean;
   successfulModelInvocationCount: number;
   knownUsageFailureCount: number;
   dispatchedUnknownFailureCount: number;
@@ -205,7 +209,7 @@ Report kind: ${summary.reportKind}
 - Settlements: ${summary.settlementCount}
 - Unresolved positions: ${summary.unresolvedPositionCount}
 - AI cost (durable ledger): $${summary.aiCostUsd.toFixed(2)}
-- Provider cost completeness: ${summary.providerCostCompleteness} (dispatches ${summary.providerDispatchStartedCount}, successful ${summary.successfulModelInvocationCount}, known-usage failures ${summary.knownUsageFailureCount}, unknown ${summary.dispatchedUnknownFailureCount})
+- Provider cost completeness: ${summary.providerCostCompleteness} (authorized ${summary.providerDispatchAuthorizedCount}, dispatches ${summary.providerDispatchStartedCount}, unresolved authorization ${summary.providerDispatchUnresolvedAuthorizationCount}, successful ${summary.successfulModelInvocationCount}, known-usage failures ${summary.knownUsageFailureCount}, unknown ${summary.dispatchedUnknownFailureCount}, tracking overflow ${summary.providerDispatchTrackingOverflow}, tracking incomplete ${summary.providerDispatchTrackingIncomplete})
 - Estimated infrastructure cost: $${summary.estimatedInfrastructureCostUsd.toFixed(2)}
 - Economic PnL: $${summary.economicPnlUsd.toFixed(2)}
 - Maximum drawdown: $${summary.maximumDrawdownUsd.toFixed(2)}
