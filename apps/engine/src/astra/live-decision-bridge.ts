@@ -177,17 +177,21 @@ export function installAstraLiveDecisionBridge(
     }
   };
 
+  const reportProjectionError = (error: unknown, event: JournalEvent) => {
+    try { sink.onError?.(error, event); } catch { /* committed persistence must remain authoritative */ }
+  };
+
   const publish = (event: JournalEvent) => {
     if (publishedIds.has(event.id)) return;
-    const item = projectCanonicalAstraDecisionEvent(event, sink.recentTriggers());
-    if (!item) return;
     try {
+      const item = projectCanonicalAstraDecisionEvent(event, sink.recentTriggers());
+      if (!item) return;
       sink.publish(item);
       remember(event.id);
     } catch (error) {
       // Persistence has already succeeded. Observability must never turn a
       // committed fact into an economic failure or trigger a retry.
-      sink.onError?.(error, event);
+      reportProjectionError(error, event);
     }
   };
 
