@@ -27,7 +27,10 @@ export function buildAstraFeaturePacket(input: AstraFeatureInput): AstraFeatureP
   const down = bookFeatures(input.down);
   if (!up || !down) return null;
   const expiresAtMs = Date.parse(input.trigger.expiresAt);
-  if (!Number.isFinite(expiresAtMs) || expiresAtMs <= input.now.getTime()) return null;
+  // Expiry is an admission concern, not a feature-extraction failure. Build a
+  // valid packet with timeToExpiryMs=0 and let the deterministic opportunity
+  // gate reject it as STALE before any provider dispatch or budget reservation.
+  if (!Number.isFinite(expiresAtMs)) return null;
   const reference = input.reference;
   const usableReference = reference && reference.freshness === "fresh" ? reference : null;
   const move = finiteOrNull(usableReference?.recentMoveBps);
