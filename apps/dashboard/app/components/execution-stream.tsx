@@ -1,5 +1,5 @@
 import type { DashboardSnapshot } from "../../lib/types";
-import { decisionActivityEvents, eventSummary, executionEvents, formatTime, latest, shortId, toneForState } from "../../lib/dashboard-selectors";
+import { currentConsensus, currentRisk, eventSummary, executionEvents, formatTime, latest, latestTrigger, pipelineDecisionActivity, shortId, toneForState } from "../../lib/dashboard-selectors";
 import { EmptyState, Panel, StatusPill } from "./primitives";
 
 function detailValue(detail: Record<string, unknown>, ...keys: string[]): string {
@@ -8,17 +8,19 @@ function detailValue(detail: Record<string, unknown>, ...keys: string[]): string
 }
 
 function pendingExecutionState(snapshot: DashboardSnapshot): { title: string; detail: string } {
-  if (snapshot.risk) {
-    if (!snapshot.risk.accepted) return { title: "EXECUTION BLOCKED BY RISK", detail: `Risk vetoed the candidate: ${snapshot.risk.vetoes.join(", ") || "unspecified veto"}.` };
-    return { title: "RISK PASSED · EXECUTION WAITING", detail: "Risk accepted the candidate, but no paper order/fill/cancel/error has been persisted yet." };
+  const risk = currentRisk(snapshot);
+  if (risk) {
+    if (!risk.accepted) return { title: "EXECUTION BLOCKED BY RISK", detail: `Risk vetoed the current candidate: ${risk.vetoes.join(", ") || "unspecified veto"}.` };
+    return { title: "RISK PASSED · EXECUTION WAITING", detail: "Risk accepted the current candidate, but no paper order/fill/cancel/error has been persisted yet." };
   }
-  if (snapshot.consensus) return { title: "DECISION READY · RISK WAITING", detail: "An authoritative economic decision exists. Execution waits for the deterministic risk layer." };
 
-  const activity = latest(decisionActivityEvents(snapshot));
-  if (activity) return { title: "DECISION PIPELINE HAS NOT REACHED EXECUTION", detail: `${eventSummary(activity)}. No authoritative risk or paper execution event is present yet.` };
+  if (currentConsensus(snapshot)) return { title: "DECISION READY · RISK WAITING", detail: "An authoritative economic decision exists for the current pipeline. Execution waits for the deterministic risk layer." };
 
-  const trigger = snapshot.recentTriggers[0] ?? null;
-  if (trigger && snapshot.engine.experimentStatus === "RUNNING") return { title: "TRIGGER OBSERVED · EXECUTION WAITING", detail: `${trigger.kind} entered the decision pipeline. No executable decision has reached risk/execution yet.` };
+  const activity = pipelineDecisionActivity(snapshot);
+  if (activity) return { title: "DECISION PIPELINE HAS NOT REACHED EXECUTION", detail: `${eventSummary(activity)}. No matching authoritative risk or paper execution event is present for the current pipeline yet.` };
+
+  const trigger = latestTrigger(snapshot);
+  if (trigger && snapshot.engine.experimentStatus === "RUNNING") return { title: "TRIGGER OBSERVED · EXECUTION WAITING", detail: `${trigger.kind} entered the current decision pipeline. No executable decision has reached risk/execution for this trigger yet.` };
 
   return { title: "No paper execution events", detail: "Orders, fills, cancels, and errors will appear here when persisted." };
 }
