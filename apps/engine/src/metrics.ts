@@ -65,11 +65,14 @@ export class EngineMetrics {
   readonly astraReasoningTokens = new Counter({ name: "astra_reasoning_tokens_total", help: "Astra reasoning token breakdown", labelNames: ["stage"], registers: [this.registry] });
   readonly astraGateDecisions = new Counter({ name: "astra_opportunity_gate_total", help: "Deterministic Astra gate outcomes", labelNames: ["reason"], registers: [this.registry] });
   readonly astraGateResults = new Counter({ name: "astra_opportunity_gate_results_total", help: "Deterministic Astra gate results", labelNames: ["result", "reason"], registers: [this.registry] });
+  readonly astraPaidCandidates = new Counter({ name: "astra_paid_candidate_total", help: "Astra first-leg paid-candidate classification outcomes", labelNames: ["result", "reason"], registers: [this.registry] });
+  readonly astraProviderDispatchStarted = new Counter({ name: "astra_provider_dispatch_started_total", help: "Provider requests initiated after Engine authorization", labelNames: ["stage"], registers: [this.registry] });
+  readonly astraProviderDispatchBlocked = new Counter({ name: "astra_provider_dispatch_blocked_total", help: "Provider dispatches blocked before SDK invocation", labelNames: ["reason"], registers: [this.registry] });
+  readonly astraProviderDispatchUnknown = new Counter({ name: "astra_provider_dispatch_unknown_total", help: "Provider dispatches whose final provider outcome is unknown", labelNames: ["stage", "reason"], registers: [this.registry] });
   readonly astraDeepReviews = new Counter({ name: "astra_deep_review_total", help: "Selective Deep review outcomes", labelNames: ["result", "reason"], registers: [this.registry] });
   readonly astraBookRevalidations = new Counter({ name: "astra_book_revalidation_total", help: "Current-book revalidation outcomes", labelNames: ["result", "reason"], registers: [this.registry] });
   readonly astraFailures = new Counter({ name: "astra_failures_total", help: "Fail-closed Astra failures by bounded stage and reason", labelNames: ["stage", "reason"], registers: [this.registry] });
   readonly astraFailureTotals = new Counter({ name: "astra_failures_by_stage_total", help: "Fail-closed Astra failures by bounded stage and reason", labelNames: ["stage", "reason"], registers: [this.registry] });
-  readonly astraBudgetBlocked = new Counter({ name: "astra_budget_blocked_total", help: "Astra calls blocked by daily budget", registers: [this.registry] });
   readonly astraCostUsd = new Counter({ name: "astra_cost_usd_total", help: "Estimated Astra inference cost by bounded stage", labelNames: ["stage"], registers: [this.registry] });
   readonly astraLatency = new Histogram({ name: "astra_decision_latency_seconds", help: "Astra decision latency", labelNames: ["stage"], buckets: DURATION_BUCKETS, registers: [this.registry] });
   readonly astraLatencySeconds = new Histogram({ name: "astra_latency_seconds", help: "Astra latency by bounded stage", labelNames: ["stage"], buckets: DURATION_BUCKETS, registers: [this.registry] });

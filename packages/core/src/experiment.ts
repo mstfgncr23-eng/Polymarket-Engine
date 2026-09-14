@@ -116,6 +116,12 @@ export interface ExperimentSummary {
   slippageUsd: number;
   netTradingPnlUsd: number;
   aiCostUsd: number;
+  providerDispatchStartedCount: number;
+  successfulModelInvocationCount: number;
+  knownUsageFailureCount: number;
+  dispatchedUnknownFailureCount: number;
+  notDispatchedFailureCount: number;
+  providerCostCompleteness: "COMPLETE" | "PARTIAL" | "NONE";
   estimatedInfrastructureCostUsd: number;
   economicPnlUsd: number;
   maximumDrawdownUsd: number;
@@ -199,6 +205,7 @@ Report kind: ${summary.reportKind}
 - Settlements: ${summary.settlementCount}
 - Unresolved positions: ${summary.unresolvedPositionCount}
 - AI cost (durable ledger): $${summary.aiCostUsd.toFixed(2)}
+- Provider cost completeness: ${summary.providerCostCompleteness} (dispatches ${summary.providerDispatchStartedCount}, successful ${summary.successfulModelInvocationCount}, known-usage failures ${summary.knownUsageFailureCount}, unknown ${summary.dispatchedUnknownFailureCount})
 - Estimated infrastructure cost: $${summary.estimatedInfrastructureCostUsd.toFixed(2)}
 - Economic PnL: $${summary.economicPnlUsd.toFixed(2)}
 - Maximum drawdown: $${summary.maximumDrawdownUsd.toFixed(2)}

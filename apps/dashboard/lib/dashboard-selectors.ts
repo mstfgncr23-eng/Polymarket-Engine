@@ -23,6 +23,7 @@ export const EXECUTION_EVENT_TYPES = [
 export const MISSION_EVENT_TYPES = [
   "TRIGGER_LEVEL_1", "TRIGGER_LEVEL_2", "TRIGGER_LEVEL_3",
   "NATIVE_DECISION_EVALUATION", "NATIVE_DECISION_COMPLETE", "ASTRA_DECISION",
+  "ASTRA_PROVIDER_DISPATCH_STARTED", "ASTRA_FAILURE",
   "RISK_ACCEPT", "RISK_VETO", "PAPER_ORDER_CREATED", "PAPER_FILL",
   "PAPER_ORDER_CANCELLED", "PAPER_EXECUTION_ERROR", "POSITION_SETTLED",
 ] as const;
@@ -148,6 +149,18 @@ export function shortId(value: string | null | undefined, length = 18): string {
 export function eventSummary(event: DashboardEvent): string {
   const detail = event.detail;
   const parts: string[] = [];
+  if (event.type.startsWith("TRIGGER_LEVEL_") && detail.paidCandidate === "REJECTED") {
+    parts.push(`paid Astra rejected${typeof detail.paidCandidateReason === "string" ? ` · ${detail.paidCandidateReason}` : ""}`);
+  } else if (event.type.startsWith("TRIGGER_LEVEL_") && detail.paidCandidate === "ACCEPTED") {
+    parts.push("paid Astra candidate");
+  }
+  if (event.type === "ASTRA_PROVIDER_DISPATCH_STARTED") parts.push("provider dispatch started");
+  if (event.type === "ASTRA_FAILURE") {
+    if (typeof detail.reason === "string") parts.push(detail.reason);
+    if (typeof detail.dispatchState === "string") parts.push(detail.dispatchState);
+  }
+  if (typeof detail.stage === "string") parts.push(detail.stage);
+  if (typeof detail.gateReason === "string") parts.push(detail.gateReason);
   if (typeof detail.kind === "string") parts.push(detail.kind);
   if (typeof detail.direction === "string") parts.push(detail.direction);
   if (typeof detail.orderId === "string") parts.push(`order ${shortId(detail.orderId)}`);
@@ -164,7 +177,7 @@ export function pulseToken(snapshot: DashboardSnapshot, node: "trigger" | "core"
   const event = snapshot.decisionFeed.find((candidate) => {
     const type = candidate.type;
     if (node === "trigger") return type.startsWith("TRIGGER_LEVEL_");
-    if (node === "core") return type === "NATIVE_DECISION_COMPLETE" || type === "ASTRA_DECISION";
+    if (node === "core") return type === "NATIVE_DECISION_COMPLETE" || type === "ASTRA_DECISION" || type === "ASTRA_PROVIDER_DISPATCH_STARTED" || type === "ASTRA_FAILURE";
     if (node === "risk") return type === "RISK_ACCEPT" || type === "RISK_VETO";
     if (node === "execution") return (EXECUTION_EVENT_TYPES as readonly string[]).includes(type);
     if (node === "portfolio") return type === "PAPER_FILL" || type === "POSITION_SETTLED";

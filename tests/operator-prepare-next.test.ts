@@ -128,7 +128,6 @@ describe("prepare-next paper experiment boundary", () => {
       const previous = test.engine.experimentManifest()!;
       const oldReport = await test.journal.loadExperimentReport(previous.id, "final");
       expect(oldReport).toMatchObject({ experimentId: previous.id, reportKind: "final", complete: true, truncated: false });
-      const budgetBefore = test.engine.astraBudgetSnapshotForTest();
       test.engine.seedRuntimeBookkeepingForTest({ signalReceivedTimes: [test.clock.nowMs], executionErrors: [test.clock.nowMs], recentTrades: [["old", test.clock.nowMs]] });
 
       const response = await server.inject({
@@ -160,7 +159,7 @@ describe("prepare-next paper experiment boundary", () => {
       expect(test.engine.runtimeBookkeepingForTest()).toMatchObject({ signalReceivedTimes: 0, executionErrors: 0, recentTrades: 0, activeTriggers: 0, signalsByTrigger: 0 });
       expect(test.engine.triggerDedupeEntryCount()).toBe(0);
       expect(test.engine.referenceWindowTotalEntriesForTest()).toBe(warmReferenceEntries);
-      expect(test.engine.astraBudgetSnapshotForTest()).toEqual(budgetBefore);
+      expect(test.engine.astraGovernorSnapshotForTest().dispatches).toHaveLength(0);
       expect(test.engine.reportGeneratedForTest()).toBe(false);
       expect(test.engine.sourceSealStateForTest()).toMatchObject({ sealing: false, sealed: false });
 

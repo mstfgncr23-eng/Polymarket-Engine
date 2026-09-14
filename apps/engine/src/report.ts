@@ -62,6 +62,11 @@ export interface ExperimentSummaryAccumulatorSnapshot {
   pairRealizedGrossN: number;
   modelCounts: Record<string, number>;
   modelCosts: Record<string, number>;
+  providerDispatchStartedCount: number;
+  successfulModelInvocationCount: number;
+  knownUsageFailureCount: number;
+  dispatchedUnknownFailureCount: number;
+  notDispatchedFailureCount: number;
   failureStatistics: Record<string, number>;
   eventCountByMarket: Record<string, number>;
   eventCountByAsset: Record<string, number>;
@@ -119,6 +124,11 @@ export class ExperimentSummaryAccumulator {
   private pairRealizedGrossN = 0;
   private readonly modelCounts: Record<string, number> = {};
   private readonly modelCosts: Record<string, number> = {};
+  private providerDispatchStartedCount = 0;
+  private successfulModelInvocationCount = 0;
+  private knownUsageFailureCount = 0;
+  private dispatchedUnknownFailureCount = 0;
+  private notDispatchedFailureCount = 0;
   private readonly failureStatistics: Record<string, number> = {};
   private readonly eventCountByMarket: Record<string, number> = {};
   private readonly eventCountByAsset: Record<string, number> = {};
@@ -174,7 +184,10 @@ export class ExperimentSummaryAccumulator {
       makerOrders: this.makerOrders, takerOrders: this.takerOrders, fillCount: this.fillCount, makerFills: this.makerFills, takerFills: this.takerFills,
       firstLegCount: this.firstLegCount, hedgeCompleteCount: this.hedgeCompleteCount, hedgeDurationSum: this.hedgeDurationSum, hedgeDurationN: this.hedgeDurationN,
       pairRealizedNetSum: this.pairRealizedNetSum, pairRealizedNetN: this.pairRealizedNetN, pairRealizedGrossSum: this.pairRealizedGrossSum, pairRealizedGrossN: this.pairRealizedGrossN,
-      modelCounts: structuredClone(this.modelCounts), modelCosts: structuredClone(this.modelCosts), failureStatistics: structuredClone(this.failureStatistics),
+      modelCounts: structuredClone(this.modelCounts), modelCosts: structuredClone(this.modelCosts),
+      providerDispatchStartedCount: this.providerDispatchStartedCount, successfulModelInvocationCount: this.successfulModelInvocationCount,
+      knownUsageFailureCount: this.knownUsageFailureCount, dispatchedUnknownFailureCount: this.dispatchedUnknownFailureCount,
+      notDispatchedFailureCount: this.notDispatchedFailureCount, failureStatistics: structuredClone(this.failureStatistics),
       eventCountByMarket: structuredClone(this.eventCountByMarket), eventCountByAsset: structuredClone(this.eventCountByAsset), assetByMarket: [...this.assetByMarket.entries()],
       byMarket: structuredClone(this.byMarket), byAsset: structuredClone(this.byAsset), failedHedgeOpen: [...this.failedHedgeOpen], failedHedgeCount: this.failedHedgeCount,
       positionWins: this.positionWins, positionLosses: this.positionLosses, positionBreakeven: this.positionBreakeven, grossWins: this.grossWins, grossLosses: this.grossLosses, grossBreakeven: this.grossBreakeven, grossSeen: [...this.grossSeen],
@@ -192,6 +205,11 @@ export class ExperimentSummaryAccumulator {
     this.settledMarketIds.clear(); for (const id of snapshot.settledMarketIds ?? []) this.settledMarketIds.add(id); this.settledPositionIds.clear(); for (const id of snapshot.settledPositionIds ?? []) this.settledPositionIds.add(id);
     this.settlementCount = assign("settlementCount", 0); this.settlementPnlUsd = assign("settlementPnlUsd", 0); this.settlementBothQty = assign("settlementBothQty", 0); this.lastLedger = snapshot.lastLedger ? structuredClone(snapshot.lastLedger) : undefined;
     for (const key of ["maxDrawdown","riskCount","accepted","paperOrders","makerOrders","takerOrders","fillCount","makerFills","takerFills","firstLegCount","hedgeCompleteCount","hedgeDurationSum","hedgeDurationN","pairRealizedNetSum","pairRealizedNetN","pairRealizedGrossSum","pairRealizedGrossN","failedHedgeCount","positionWins","positionLosses","positionBreakeven","grossWins","grossLosses","grossBreakeven","rejectedWouldHaveWon","acceptedLost","worstUnhedgedUsd"] as const) (this as unknown as Record<string, unknown>)[key] = snapshot[key];
+    this.providerDispatchStartedCount = snapshot.providerDispatchStartedCount ?? 0;
+    this.successfulModelInvocationCount = snapshot.successfulModelInvocationCount ?? 0;
+    this.knownUsageFailureCount = snapshot.knownUsageFailureCount ?? 0;
+    this.dispatchedUnknownFailureCount = snapshot.dispatchedUnknownFailureCount ?? 0;
+    this.notDispatchedFailureCount = snapshot.notDispatchedFailureCount ?? 0;
     const replaceRecord = (target: Record<string, unknown>, source: Record<string, unknown> | undefined) => { for (const key of Object.keys(target)) delete target[key]; Object.assign(target, structuredClone(source ?? {})); };
     replaceRecord(this.modelCounts, snapshot.modelCounts); replaceRecord(this.modelCosts, snapshot.modelCosts); replaceRecord(this.failureStatistics, snapshot.failureStatistics); replaceRecord(this.eventCountByMarket, snapshot.eventCountByMarket); replaceRecord(this.eventCountByAsset, snapshot.eventCountByAsset); replaceRecord(this.byMarket, snapshot.byMarket); replaceRecord(this.byAsset, snapshot.byAsset); replaceRecord(this.agentSignals, snapshot.agentSignals); replaceRecord(this.regimes, snapshot.regimes); replaceRecord(this.hours, snapshot.hours);
     this.assetByMarket.clear(); for (const [key, value] of snapshot.assetByMarket ?? []) this.assetByMarket.set(key, value); this.failedHedgeOpen.clear(); for (const key of snapshot.failedHedgeOpen ?? []) this.failedHedgeOpen.add(key); this.grossSeen.clear(); for (const key of snapshot.grossSeen ?? []) this.grossSeen.add(key); this.worstUnhedgedEvent = snapshot.worstUnhedgedEvent ? structuredClone(snapshot.worstUnhedgedEvent) : null; this.highWaterBytes = 0; this.refreshHighWater();
@@ -257,7 +275,10 @@ export class ExperimentSummaryAccumulator {
         this.hedgeDurationSum += duration;
         this.hedgeDurationN += 1;
       }
+    } else if (type === "ASTRA_PROVIDER_DISPATCH_STARTED" && (event.payload as { authority?: unknown }).authority === "ASTRA_BRAIN_V1") {
+      this.providerDispatchStartedCount += 1;
     } else if (type === "ASTRA_MODEL_INVOCATION" && (event.payload as { authority?: unknown }).authority === "ASTRA_BRAIN_V1") {
+      this.successfulModelInvocationCount += 1;
       const stage = String((event.payload as { stage?: unknown }).stage ?? "DECISION");
       const usage = (event.payload as { usage?: { costUsd?: number } }).usage;
       this.modelCounts.ASTRA_BRAIN_V1 = (this.modelCounts.ASTRA_BRAIN_V1 ?? 0) + 1;
@@ -286,6 +307,11 @@ export class ExperimentSummaryAccumulator {
         this.modelCosts[output.agentId] = (this.modelCosts[output.agentId] ?? 0) + (output.usage?.estimatedCostUsd ?? 0);
       }
     } else if (type === "ASTRA_FAILURE" || type === "ASTRA_BUDGET_BLOCK") {
+      const failurePayload = event.payload as { dispatchState?: unknown; knownUsage?: unknown };
+      const dispatchState = failurePayload.dispatchState;
+      if (dispatchState === "RESPONSE_RECEIVED" && failurePayload.knownUsage === true) this.knownUsageFailureCount += 1;
+      else if (dispatchState === "RESPONSE_RECEIVED" || dispatchState === "DISPATCHED_UNKNOWN") this.dispatchedUnknownFailureCount += 1;
+      else this.notDispatchedFailureCount += 1;
       const code = String((event.payload as { reason?: unknown }).reason ?? type);
       this.failureStatistics[code] = (this.failureStatistics[code] ?? 0) + 1;
     } else if (type === "AGENT_FAILURE") {
@@ -346,6 +372,11 @@ export class ExperimentSummaryAccumulator {
     const netTradingPnl = Number(ledger?.netTradingPnl ?? 0);
     const aiCost = Number(ledger?.aiCost ?? 0);
     const infraCost = Number(ledger?.infrastructureCost ?? 0);
+    const knownProviderOutcomes = this.successfulModelInvocationCount + this.knownUsageFailureCount;
+    const accountingFailure = (this.failureStatistics.ACCOUNTING_FAILED ?? 0) > 0;
+    const providerCostCompleteness = accountingFailure || this.dispatchedUnknownFailureCount > 0 || knownProviderOutcomes < this.providerDispatchStartedCount
+      ? (knownProviderOutcomes > 0 ? "PARTIAL" : "NONE")
+      : "COMPLETE";
     const pairCosts = positions.filter((position) => Number(position.pairedQuantity) > 0).map((position) => Number(position.combinedPairCost));
     const netWl = { wins: this.positionWins, losses: this.positionLosses, breakeven: this.positionBreakeven };
     const grossWl = (this.grossWins + this.grossLosses + this.grossBreakeven) === 0
@@ -369,6 +400,12 @@ export class ExperimentSummaryAccumulator {
       grossWinLossDistribution: grossWl,
       grossPnlUsd: grossPnl, feesUsd: Number(ledger?.fees ?? 0), slippageUsd: Number(ledger?.slippage ?? 0),
       netTradingPnlUsd: netTradingPnl, aiCostUsd: aiCost, estimatedInfrastructureCostUsd: infraCost,
+      providerDispatchStartedCount: this.providerDispatchStartedCount,
+      successfulModelInvocationCount: this.successfulModelInvocationCount,
+      knownUsageFailureCount: this.knownUsageFailureCount,
+      dispatchedUnknownFailureCount: this.dispatchedUnknownFailureCount,
+      notDispatchedFailureCount: this.notDispatchedFailureCount,
+      providerCostCompleteness,
       economicPnlUsd: Number(ledger?.netEconomicPnl ?? netTradingPnl - aiCost - infraCost),
       maximumDrawdownUsd: Math.max(0, this.maxDrawdown),
       maximumDirectionalExposureUsd: Math.max(0, ...positions.map((position) => Number(position.unpairedQuantity) * Number(position.unpairedOutcome === "UP" ? position.averageUpCost : position.averageDownCost))),

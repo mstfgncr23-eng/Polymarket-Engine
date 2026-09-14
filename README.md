@@ -250,7 +250,7 @@ pnpm report                # stream a bounded summary; persist canonical row in 
 pnpm bench:retention       # report/retention boundedness diagnostic (not a capacity claim)
 ```
 
-Tests cover pair/PnL math, fee curve, slippage/VWAP, exposure/accounting, native decision math, stale/expired/budget/risk vetoes, maker/taker execution, insufficient depth, trigger dedupe, Grok non-authority continuity, malformed/duplicate/stale/unauthorized MCP behavior, forbidden trade-tool rejection, journal outage/recovery, reconnect backoff, feed parsing, exact-six topology, the hard live-order gate, multi-market isolation, Grok activation bridge/dedupe/rate limits, and identity-binding regressions.
+Tests cover pair/PnL math, fee curve, slippage/VWAP, exposure/accounting, native decision math, stale/expired/risk vetoes, bounded Astra paid-dispatch classification/governor behavior, maker/taker execution, insufficient depth, trigger dedupe, Grok non-authority continuity, malformed/duplicate/stale/unauthorized MCP behavior, forbidden trade-tool rejection, journal outage/recovery, reconnect backoff, feed parsing, exact-six topology, the hard live-order gate, multi-market isolation, Grok activation bridge/dedupe/rate limits, and identity-binding regressions.
 
 ## 48-hour procedure
 

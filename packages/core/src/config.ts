@@ -125,7 +125,8 @@ export const engineEnvSchema = z.object({
   ASTRA_FAST_REASONING: z.enum(["low", "medium", "high", "xhigh", "max"]).default("low"),
   ASTRA_DEEP_REASONING: z.enum(["low", "medium", "high", "xhigh", "max"]).default("medium"),
   ASTRA_BATCH_REASONING: z.enum(["low", "medium", "high", "xhigh", "max"]).default("high"),
-  ASTRA_FAST_TIMEOUT_MS: z.coerce.number().int().positive().max(30_000).default(1_500),
+  /** Maximum provider-response wall-clock deadline; starts at SDK dispatch. */
+  ASTRA_FAST_TIMEOUT_MS: z.coerce.number().int().positive().max(30_000).default(10_000),
   ASTRA_DEEP_TIMEOUT_MS: z.coerce.number().int().positive().max(60_000).default(3_000),
   ASTRA_BATCH_TIMEOUT_MS: z.coerce.number().int().positive().max(120_000).default(20_000),
   ASTRA_FAST_MAX_OUTPUT_TOKENS: z.coerce.number().int().positive().max(4_096).default(256),
@@ -133,7 +134,10 @@ export const engineEnvSchema = z.object({
   ASTRA_BATCH_MAX_OUTPUT_TOKENS: z.coerce.number().int().positive().max(16_384).default(2_048),
   ASTRA_FAST_MAX_CONCURRENCY: z.coerce.number().int().positive().max(16).default(4),
   ASTRA_DEEP_MAX_CONCURRENCY: z.coerce.number().int().positive().max(8).default(2),
-  ASTRA_MAX_DAILY_COST_USD: z.coerce.number().positive().max(100).default(5),
+  /** Hard safety cap; operators may not raise paid FAST dispatches above 12/hour. */
+  ASTRA_FAST_MAX_DISPATCHES_PER_HOUR: z.coerce.number().int().positive().max(12).default(12),
+  ASTRA_FAST_MIN_DISPATCH_INTERVAL_MS: z.coerce.number().int().nonnegative().max(3_600_000).default(5_000),
+  ASTRA_FAST_MARKET_COOLDOWN_MS: z.coerce.number().int().nonnegative().max(3_600_000).default(60_000),
   ASTRA_INPUT_USD_PER_M: z.coerce.number().nonnegative().default(10),
   ASTRA_CACHED_INPUT_USD_PER_M: z.coerce.number().nonnegative().default(1),
   ASTRA_CACHE_WRITE_USD_PER_M: z.coerce.number().nonnegative().default(12.5),
