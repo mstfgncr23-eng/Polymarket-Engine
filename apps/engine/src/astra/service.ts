@@ -28,6 +28,23 @@ export interface AstraServiceOptions {
   memory: AstraMemoryStore;
   beforeStageDispatch?: (stage: AstraStage) => Promise<boolean>;
   onStageSuccess?: (input: AstraStageSuccess) => Promise<boolean | void>;
+
+  /** @deprecated Ignored. Kept only so an old EngineService build can recover while the gate is removed. */
+  budget?: unknown;
+  /** @deprecated Budget-reservation inputs are no longer consumed by this service. */
+  maxOutputTokens?: Record<AstraStage, number>;
+  /** @deprecated Actual provider usage remains authoritative for cost accounting. */
+  inputUsdPerM?: number;
+  /** @deprecated Actual provider usage remains authoritative for cost accounting. */
+  cachedInputUsdPerM?: number;
+  /** @deprecated Actual provider usage remains authoritative for cost accounting. */
+  cacheWriteUsdPerM?: number;
+  /** @deprecated Actual provider usage remains authoritative for cost accounting. */
+  outputUsdPerM?: number;
+  /** @deprecated No calendar-day budget clock is used. */
+  nowFn?: () => Date;
+  /** @deprecated No budget reservation/settlement notifications are emitted. */
+  onBudgetChange?: (stage: AstraStage, change?: unknown) => Promise<void>;
 }
 
 export type AstraServiceResult = {
@@ -153,4 +170,16 @@ function deepFailureReason(error: unknown): AstraDeepFailureReason {
     return "DEEP_INVALID_RESPONSE";
   }
   return "DEEP_FAILED";
+}
+
+/**
+ * Historical source-compatibility only. The service never throws this after
+ * removal of the calendar-day budget gate.
+ * @deprecated
+ */
+export class AstraBudgetError extends Error {
+  constructor() {
+    super("ASTRA_DAILY_BUDGET_REMOVED");
+    this.name = "AstraBudgetError";
+  }
 }
