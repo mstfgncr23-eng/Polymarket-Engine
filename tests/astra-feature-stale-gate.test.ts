@@ -24,7 +24,7 @@ function trigger(expiresAt: string): TriggerEvent {
   };
 }
 
-describe("Astra stale trigger admission", () => {
+describe("Astra deterministic admission classification", () => {
   it("builds an expired packet and rejects it at the deterministic gate before provider dispatch", () => {
     const { up, down } = pair();
     const packet = buildAstraFeaturePacket({
@@ -44,11 +44,77 @@ describe("Astra stale trigger admission", () => {
     })).toMatchObject({ accepted: false, reason: "STALE" });
   });
 
+  it("routes a one-sided book to NO_LIQUIDITY instead of feature-extraction failure", () => {
+    const { up, down } = pair();
+    const oneSidedUp = { ...up, asks: [] };
+    const packet = buildAstraFeaturePacket({
+      trigger: trigger(new Date(now.getTime() + 30_000).toISOString()),
+      up: oneSidedUp,
+      down,
+      reference: null,
+      now,
+    });
+
+    expect(packet).not.toBeNull();
+    expect(packet?.upDepthUsd).toBe(0);
+    expect(evaluateAstraOpportunityGate({
+      featurePacket: packet!,
+      now,
+      marketSynchronized: true,
+      triggerProvenanceValid: true,
+      minDepthUsd: 25,
+      maxSpreadBps: 1_200,
+    })).toMatchObject({ accepted: false, reason: "NO_LIQUIDITY" });
+  });
+
+  it("routes a zero-top-quantity book to NO_LIQUIDITY", () => {
+    const { up, down } = pair();
+    const zeroTopUp = {
+      ...up,
+      bids: [{ price: "0.47", quantity: "0" }],
+      asks: [{ price: "0.48", quantity: "0" }],
+    };
+    const packet = buildAstraFeaturePacket({
+      trigger: trigger(new Date(now.getTime() + 30_000).toISOString()),
+      up: zeroTopUp,
+      down,
+      reference: null,
+      now,
+    });
+
+    expect(packet).not.toBeNull();
+    expect(packet?.upDepthUsd).toBe(0);
+    expect(evaluateAstraOpportunityGate({
+      featurePacket: packet!,
+      now,
+      marketSynchronized: true,
+      triggerProvenanceValid: true,
+      minDepthUsd: 25,
+      maxSpreadBps: 1_200,
+    })).toMatchObject({ accepted: false, reason: "NO_LIQUIDITY" });
+  });
+
   it("still fails feature extraction for an invalid expiry timestamp", () => {
     const { up, down } = pair();
     expect(buildAstraFeaturePacket({
       trigger: trigger("not-a-date"),
       up, down, reference: null, now,
+    })).toBeNull();
+  });
+
+  it("still fails closed for malformed executable book data", () => {
+    const { up, down } = pair();
+    const crossedUp = {
+      ...up,
+      bids: [{ price: "0.60", quantity: "10" }],
+      asks: [{ price: "0.40", quantity: "10" }],
+    };
+    expect(buildAstraFeaturePacket({
+      trigger: trigger(new Date(now.getTime() + 30_000).toISOString()),
+      up: crossedUp,
+      down,
+      reference: null,
+      now,
     })).toBeNull();
   });
 });
