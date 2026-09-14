@@ -7,6 +7,7 @@ import {
   formatTime,
   latest,
   referenceTone,
+  shortId,
   toneForState,
   triggerEvents,
   type Tone,
@@ -16,6 +17,7 @@ import type { DashboardSnapshot } from "./types";
 export const GALAXY_FPS = 30;
 export const GALAXY_DURATION_IN_FRAMES = GALAXY_FPS * 60 * 10;
 export const MAX_GALAXY_TRANSIENTS = 12;
+export const MAX_GALAXY_POSITION_SATELLITES = 8;
 export const GALAXY_TRANSIENT_LIFETIME_MS = 4_000;
 const MAX_SEEN_EVENT_IDS = 64;
 const MAX_TRACKED_REFERENCES = 32;
@@ -43,6 +45,8 @@ export interface GalaxyTransient {
   expiresAtMs: number;
   severity: number;
   asset: string | null;
+  marketId: string | null;
+  positionId?: string | null;
 }
 
 export interface GalaxyMotionState {
@@ -109,11 +113,13 @@ export interface GalaxySceneModel {
     equity: string;
     cash: string;
     positions: number;
+    satellites: Array<{ id: string; label: string; marketId: string }>;
   };
 }
 
 const semanticKinds: Partial<Record<string, GalaxyMotionKind>> = {
   NATIVE_DECISION_COMPLETE: "decision",
+  ASTRA_DECISION: "decision",
   RISK_ACCEPT: "risk-accept",
   RISK_VETO: "risk-veto",
   PAPER_ORDER_CREATED: "order",
@@ -146,6 +152,10 @@ function scannerTimestampMap(snapshot: DashboardSnapshot): Record<string, string
   return Object.fromEntries(snapshot.scanner.slice(0, MAX_TRACKED_MARKETS).map((row) => [`${row.marketId}:${row.outcome}`, row.lastMessageAt]));
 }
 
+function positionIdFromDetail(detail: DashboardSnapshot["decisionFeed"][number]["detail"]): string | null {
+  return typeof detail.positionId === "string" ? detail.positionId : null;
+}
+
 function transientFromEvent(event: DashboardSnapshot["decisionFeed"][number], startFrame: number, nowMs: number): GalaxyTransient | null {
   const kind = semanticKind(event.type);
   if (!kind) return null;
@@ -156,6 +166,8 @@ function transientFromEvent(event: DashboardSnapshot["decisionFeed"][number], st
     expiresAtMs: nowMs + GALAXY_TRANSIENT_LIFETIME_MS,
     severity: eventSeverity(event.type),
     asset: event.asset ?? null,
+    marketId: event.marketId ?? null,
+    positionId: positionIdFromDetail(event.detail),
   };
 }
 
@@ -202,6 +214,8 @@ export function advanceGalaxyMotionState(
       expiresAtMs: nowMs + GALAXY_TRANSIENT_LIFETIME_MS,
       severity: 1,
       asset: changedReference[0],
+      marketId: null,
+      positionId: null,
     });
   }
 
@@ -216,6 +230,8 @@ export function advanceGalaxyMotionState(
       expiresAtMs: nowMs + GALAXY_TRANSIENT_LIFETIME_MS,
       severity: 1,
       asset: null,
+      marketId: null,
+      positionId: null,
     });
   }
 
@@ -289,6 +305,11 @@ export function buildGalaxySceneModel(snapshot: DashboardSnapshot): GalaxySceneM
       equity: formatMoney(snapshot.balance.equity),
       cash: formatMoney(snapshot.balance.cash),
       positions: snapshot.positions.length,
+      satellites: snapshot.positions.slice(0, MAX_GALAXY_POSITION_SATELLITES).map((position) => ({
+        id: position.id,
+        label: shortId(position.marketId, 12),
+        marketId: position.marketId,
+      })),
     },
   };
 }

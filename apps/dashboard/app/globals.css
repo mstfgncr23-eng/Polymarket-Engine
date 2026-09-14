@@ -96,9 +96,7 @@ strong, h1, h2, h3 { color: var(--text); }
 .emptyOrb { display: block; width: 28px; height: 28px; border: 1px solid rgba(116, 217, 255, .56); border-radius: 50%; background: radial-gradient(circle, rgba(116, 217, 255, .25), transparent 66%); box-shadow: 0 0 30px rgba(116, 217, 255, .18); }
 
 .galaxyPanel { position: relative; }
-.galaxyMap { position: relative; display: grid; min-height: 570px; grid-template-columns: minmax(0, 1fr) minmax(300px, 1.25fr) minmax(0, 1fr); grid-template-rows: repeat(3, minmax(125px, 1fr)); grid-template-areas: "reference core risk" "market core execution" "trigger core portfolio"; gap: 14px; isolation: isolate; }
-.galaxyMap::before { position: absolute; z-index: -1; inset: 12% 16%; border-radius: 50%; background: radial-gradient(ellipse, rgba(93, 117, 235, .16), transparent 63%); content: ""; filter: blur(16px); animation: nebulaDrift 22s ease-in-out infinite alternate; }
-.galaxyMap::after { position: absolute; z-index: -1; inset: 0; background-image: radial-gradient(circle at 12% 19%, rgba(255,255,255,.42) 0 1px, transparent 1.5px), radial-gradient(circle at 81% 31%, rgba(116,217,255,.4) 0 1px, transparent 1.5px), radial-gradient(circle at 39% 87%, rgba(155,140,255,.35) 0 1px, transparent 1.5px), radial-gradient(circle at 92% 87%, rgba(255,255,255,.32) 0 1px, transparent 1.5px); background-size: 220px 180px, 290px 240px, 180px 220px, 260px 200px; opacity: .45; content: ""; }
+.galaxyMap { position: relative; width: 100%; height: 100%; min-height: 0; isolation: isolate; overflow: hidden; }
 .flowLines { position: absolute; z-index: 0; inset: 0; width: 100%; height: 100%; pointer-events: none; }
 .flowLine { fill: none; stroke: rgba(116, 217, 255, .36); stroke-width: 1.5; vector-effect: non-scaling-stroke; }
 .flowLine--reference { stroke: rgba(155, 140, 255, .45); }
@@ -181,15 +179,15 @@ td { padding: 10px 9px; border-top: 1px solid rgba(127, 164, 220, .1); text-alig
 
 @media (max-width: 1180px) {
   .experimentBar { grid-template-columns: 1fr 1fr; }.healthStrip { grid-column: 1 / -1; justify-content: flex-start; }.freshnessLine { grid-column: 1 / -1; }
-  .galaxyMap { grid-template-columns: minmax(0, 1fr) minmax(260px, 1.1fr) minmax(0, 1fr); }
+  .galaxyMap { min-height: 0; }
   .universeSplit, .healthGrid { grid-template-columns: 1fr; }.healthNotes { border-top: 1px solid var(--line); border-left: 0; }
 }
 @media (max-width: 820px) {
   .dashboardGrid--two, .dashboardGrid--wide { grid-template-columns: 1fr; }.metricGrid--four { grid-template-columns: repeat(2, minmax(0, 1fr)); }.ledgerGrid { grid-template-columns: repeat(3, 1fr); }.agentGrid { grid-template-columns: repeat(2, 1fr); }
-  .galaxyMap { grid-template-columns: 1fr 1fr; grid-template-rows: repeat(4, minmax(130px, auto)); grid-template-areas: "reference reference" "market trigger" "core risk" "execution portfolio"; min-height: 720px; }.mapCore { align-self: stretch; }.nativeCore { width: min(100%, 300px); min-height: 290px; }.flowLines { opacity: .5; }
+  .galaxyMap { min-height: 420px; }.mapCore { align-self: stretch; }.nativeCore { width: min(100%, 300px); min-height: 290px; }.flowLines { opacity: .5; }
 }
 @media (max-width: 560px) {
-  .dashboardShell { padding: 12px 10px 24px; }.experimentBar { grid-template-columns: 1fr; padding: 15px; }.healthStrip, .freshnessLine { grid-column: auto; }.healthStrip { justify-content: flex-start; }.experimentReadout { justify-content: flex-start; }.panel { padding: 14px; border-radius: 14px; }.panelHeader { display: grid; gap: 8px; }.panelMeta { text-align: left; }.metricGrid--four, .decisionDetails, .ledgerGrid, .agentGrid { grid-template-columns: 1fr 1fr; }.coreStats { grid-template-columns: repeat(2, 1fr); }.universeSplit { gap: 12px; }.galaxyMap { display: grid; grid-template-columns: 1fr; grid-template-rows: auto; grid-template-areas: "core" "reference" "market" "trigger" "risk" "execution" "portfolio"; min-height: auto; }.mapNode, .mapCore { align-self: stretch; }.nativeCore { width: min(100%, 292px); min-height: 292px; margin: 16px auto 22px; }.flowLines, .mapCaption { display: none; }.dashboardFooter { align-items: flex-start; flex-direction: column; }.utilizationRow { grid-template-columns: 100px minmax(60px, 1fr) 42px; }
+  .dashboardShell { padding: 12px 10px 24px; }.experimentBar { grid-template-columns: 1fr; padding: 15px; }.healthStrip, .freshnessLine { grid-column: auto; }.healthStrip { justify-content: flex-start; }.experimentReadout { justify-content: flex-start; }.panel { padding: 14px; border-radius: 14px; }.panelHeader { display: grid; gap: 8px; }.panelMeta { text-align: left; }.metricGrid--four, .decisionDetails, .ledgerGrid, .agentGrid { grid-template-columns: 1fr 1fr; }.coreStats { grid-template-columns: repeat(2, 1fr); }.universeSplit { gap: 12px; }.galaxyMap { min-height: 360px; }.mapNode, .mapCore { align-self: stretch; }.nativeCore { width: min(100%, 292px); min-height: 292px; margin: 16px auto 22px; }.flowLines, .mapCaption { display: none; }.dashboardFooter { align-items: flex-start; flex-direction: column; }.utilizationRow { grid-template-columns: 100px minmax(60px, 1fr) 42px; }
 }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; transition-duration: .01ms !important; } }
 
@@ -203,7 +201,7 @@ td { padding: 10px 9px; border-top: 1px solid rgba(127, 164, 220, .1); text-alig
 .secondaryDockPanel { overflow: hidden; }
 .secondaryDockPanel > .panel { height: 100%; border: 0; border-radius: 0; box-shadow: none; background: transparent; }
 
-.galaxyPanel { position: relative; isolation: isolate; border-color: rgba(116, 217, 255, .25); background: linear-gradient(155deg, rgba(8, 18, 36, .92), rgba(3, 7, 17, .98)); }
+.galaxyPanel { position: relative; isolation: isolate; border-color: rgba(214, 156, 82, .22); background: linear-gradient(155deg, rgba(12, 8, 6, .96), rgba(3, 2, 2, .99)); }
 .galaxySceneStack, .galaxyPlayerShell, .galaxyPlayer { position: relative; width: 100%; height: 100%; min-height: 0; overflow: hidden; }
 .galaxyFallbackUnderlay { position: absolute; z-index: 0; inset: 0; opacity: .78; }
 .galaxySceneStack--ready .galaxyPlayerShell { opacity: 1; }
@@ -212,98 +210,29 @@ td { padding: 10px 9px; border-top: 1px solid rgba(127, 164, 220, .1); text-alig
 .galaxyRuntime { position: absolute; z-index: 5; right: 10px; bottom: 8px; color: rgba(144, 171, 205, .6); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 7px; letter-spacing: .11em; pointer-events: none; }
 .remotionFailure { display: grid; width: 100%; height: 100%; place-items: center; color: var(--muted); font-size: 11px; }
 
-.remotionGalaxyScene { overflow: hidden; color: #eef7ff; background: radial-gradient(circle at 49% 47%, #101e3a 0, #071122 24%, #030814 60%, #02050d 100%); font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
-.sceneNebula { position: absolute; border-radius: 50%; filter: blur(42px); opacity: .5; }
-.sceneNebula--one { top: 85px; left: 280px; width: 580px; height: 290px; background: radial-gradient(ellipse, rgba(67, 115, 194, .2), rgba(68, 57, 144, .08) 48%, transparent 72%); }
-.sceneNebula--two { right: 15px; bottom: 32px; width: 460px; height: 270px; background: radial-gradient(ellipse, rgba(86, 60, 144, .14), rgba(16, 95, 117, .08) 52%, transparent 73%); }
-.sceneStars { position: absolute; inset: 0; }
-.sceneStars i { position: absolute; border-radius: 50%; background: #d9edff; box-shadow: 0 0 6px rgba(155, 210, 255, .7); }
-.constellationField { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
-.gravityOrbit { fill: none; stroke: rgba(115, 151, 202, .12); stroke-width: 1; stroke-dasharray: 3 9; }
-.gravityOrbit--inner { stroke: rgba(119, 217, 255, .13); stroke-dasharray: 1 7; }
-.constellationPath { fill: none; stroke: url(#route-cyan); stroke-width: 1.4; filter: url(#route-glow); }
-.constellationPath--reference { stroke: url(#route-violet); }
-.constellationPath--faint { opacity: .28; stroke-dasharray: 2 11; }
-.sceneMicroLabel { color: #86a0bf; font-size: 9px; font-weight: 800; letter-spacing: .19em; text-transform: uppercase; }
-.sceneStatus { --scene-tone: #71839e; display: inline-flex; align-items: center; gap: 7px; width: fit-content; margin-top: 7px; color: var(--scene-tone); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 9px; font-weight: 800; letter-spacing: .07em; }
-.sceneStatus i { width: 6px; height: 6px; border-radius: 50%; background: var(--scene-tone); box-shadow: 0 0 10px var(--scene-tone); }
+.remotionGalaxyScene { overflow: hidden; color: #f6ecd8; background: #050308; font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
+.galaxyOrbital { position: absolute; inset: 0; overflow: hidden; background: radial-gradient(circle at 50% 46%, #1a1008 0, #0b0704 28%, #050308 62%, #030203 100%); }
+.galaxyOrbitalWash { position: absolute; inset: 0; background: radial-gradient(circle at 50% 46%, rgba(255, 176, 82, .22), rgba(180, 96, 28, .08) 24%, transparent 46%); pointer-events: none; }
+.galaxyOrbitalNebula { position: absolute; border-radius: 50%; pointer-events: none; }
+.galaxyOrbitalNebula--far { top: 40px; left: 90px; width: 980px; height: 420px; background: radial-gradient(ellipse, rgba(180, 96, 28, .18), rgba(80, 36, 10, .06) 52%, transparent 76%); }
+.galaxyOrbitalNebula--near { right: 40px; bottom: 40px; width: 420px; height: 240px; background: radial-gradient(ellipse, rgba(120, 58, 16, .12), transparent 72%); }
+.galaxyOrbitalField { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
+.galaxyOrbitStroke { fill: none; stroke-linecap: round; }
+.galaxyCoreKicker { fill: #ffe7b0; font: 800 8px Inter, ui-sans-serif, sans-serif; letter-spacing: .32em; }
+.galaxyCoreTitle { fill: #fff3d6; font: 800 10px Inter, ui-sans-serif, sans-serif; letter-spacing: .18em; }
+.galaxyCoreDetail { fill: #ffd27a; font: 800 11px Inter, ui-sans-serif, sans-serif; letter-spacing: .22em; }
+.galaxySatelliteLabel { fill: #f0e2c4; font: 800 9px Inter, ui-sans-serif, sans-serif; letter-spacing: .12em; }
+.galaxySatelliteDetail { fill: #9a8868; font: 600 8px ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing: .05em; }
+.galaxyOrbitalHud { position: absolute; left: 12px; right: 12px; bottom: 10px; z-index: 3; display: flex; flex-wrap: wrap; justify-content: center; gap: 7px 12px; pointer-events: none; }
+.galaxyOrbitalHud span { display: grid; gap: 2px; min-width: 48px; max-width: 140px; text-align: center; }
+.galaxyOrbitalHud i { color: #8a7a64; font-size: 7px; font-style: normal; font-weight: 800; letter-spacing: .14em; }
+.galaxyOrbitalHud b { overflow: hidden; color: #f3ead8; font: 700 10px ui-monospace, SFMono-Regular, Consolas, monospace; text-overflow: ellipsis; white-space: nowrap; }
+.galaxyMap--fallback { background: radial-gradient(circle at 50% 46%, #1a1008 0, #0b0704 28%, #050308 62%, #030203 100%); }
+.galaxyOrbital--ambient .galaxyOrbitStroke { stroke-dasharray: 3 10; animation: galaxyOrbitDrift 28s linear infinite; }
+.galaxyOrbital--ambient .galaxyOrbitalWash { animation: galaxyCoreBreathe 6s ease-in-out infinite; }
 
-.referenceConstellation { position: absolute; top: 0; left: 0; width: 410px; height: 390px; }
-.referenceAnchor { position: absolute; top: 175px; left: 155px; display: grid; width: 102px; height: 102px; place-items: center; align-content: center; border: 1px solid rgba(155, 140, 255, .4); border-radius: 50%; background: radial-gradient(circle, rgba(90, 86, 178, .34), rgba(13, 20, 44, .9) 54%, rgba(5, 9, 19, .92)); box-shadow: 0 0 32px rgba(124, 113, 226, .2), inset 0 0 24px rgba(119, 217, 255, .08); text-align: center; }
-.referenceAnchor .sceneMicroLabel { font-size: 6px; letter-spacing: .13em; }
-.referenceAnchor strong { margin-top: 5px; color: #d7d4ff; font: 700 22px ui-monospace, monospace; }
-.referenceAnchor small { color: #71839e; font-size: 8px; }
-.referenceOrbitRing { position: absolute; top: 112px; left: 61px; width: 292px; height: 224px; border: 1px solid rgba(155, 140, 255, .18); border-radius: 50%; box-shadow: inset 0 0 35px rgba(155, 140, 255, .025); }
-.referenceBody { --feed-tone: #71839e; position: absolute; display: grid; width: 52px; height: 52px; place-items: center; align-content: center; border: 1px solid color-mix(in srgb, var(--feed-tone) 44%, transparent); border-radius: 50%; background: radial-gradient(circle at 38% 32%, color-mix(in srgb, var(--feed-tone) 20%, #101b30), #07101f 64%, #030710); box-shadow: 0 0 18px color-mix(in srgb, var(--feed-tone) 13%, transparent); text-align: center; }
-.referenceBody b { color: #eef7ff; font: 800 10px ui-monospace, monospace; letter-spacing: .06em; }
-.referenceBody small { margin-top: 2px; color: var(--feed-tone); font-size: 5px; font-weight: 800; letter-spacing: .07em; }
-.referenceAura, .referenceActivity { position: absolute; inset: -7px; border: 1px solid color-mix(in srgb, var(--feed-tone) 38%, transparent); border-radius: 50%; }
-.referenceActivity { inset: -4px; border-color: #a99cff; box-shadow: 0 0 18px rgba(155, 140, 255, .36); }
-.referenceBody--critical { opacity: .64; }
-
-.sensorNode { position: absolute; top: 484px; left: 110px; display: grid; width: 168px; height: 150px; place-items: center; align-content: center; overflow: visible; border: 1px solid rgba(116, 217, 255, .22); border-radius: 50% 50% 44% 44%; background: radial-gradient(circle, rgba(48, 106, 147, .16), rgba(5, 12, 24, .9) 62%); box-shadow: inset 0 0 30px rgba(116, 217, 255, .04); text-align: center; }
-.sensorNode::before, .sensorNode::after { position: absolute; inset: 17px; border: 1px solid rgba(116, 217, 255, .13); border-radius: 50%; content: ""; }
-.sensorNode::after { inset: 42px; }
-.sensorSweep { position: absolute; width: 64px; height: 1px; margin-left: 64px; background: linear-gradient(90deg, rgba(116, 217, 255, .72), transparent); transform-origin: -32px center; }
-.sensorWave { position: absolute; inset: 10px; border: 1px solid #78d9ff; border-radius: 50%; }
-.sensorNode strong { z-index: 1; margin-top: 6px; color: #bfeaff; font: 700 28px ui-monospace, monospace; }
-.sensorNode > small { z-index: 1; color: #71839e; font-size: 8px; }
-.sensorNode .sceneStatus { z-index: 1; }
-
-.pulsarNode { position: absolute; top: 477px; left: 348px; width: 80px; height: 80px; }
-.pulsarCore { position: absolute; inset: 27px; border: 1px solid rgba(116, 217, 255, .7); border-radius: 50%; background: #a6ebff; box-shadow: 0 0 10px #78d9ff, 0 0 28px rgba(116, 217, 255, .58); }
-.pulsarBeam { position: absolute; top: 39px; left: -25px; width: 130px; height: 1px; background: linear-gradient(90deg, transparent, rgba(116, 217, 255, .7), transparent); }
-.pulsarBeam--two { opacity: .38; }
-.celestialLabel { position: absolute; display: grid; gap: 3px; width: 160px; padding: 8px 10px; border-left: 1px solid rgba(116, 217, 255, .3); background: linear-gradient(90deg, rgba(4, 10, 22, .7), transparent); }
-.celestialLabel strong { font: 700 15px ui-monospace, monospace; }
-.celestialLabel small { overflow: hidden; color: #71839e; font-size: 7px; text-overflow: ellipsis; white-space: nowrap; }
-.celestialLabel--left { top: 77px; right: 22px; text-align: right; border-right: 1px solid rgba(116, 217, 255, .3); border-left: 0; background: linear-gradient(270deg, rgba(4, 10, 22, .72), transparent); }
-.celestialLabel--right { top: 48px; left: 58px; }
-
-.decisionStar { position: absolute; top: 278px; left: 516px; width: 170px; height: 170px; border-radius: 50%; }
-.coreGravity { position: absolute; border: 1px solid rgba(116, 217, 255, .22); border-radius: 50%; }
-.coreGravity--outer { inset: -54px -105px; border-color: rgba(116, 217, 255, .14); box-shadow: 0 0 34px rgba(116, 217, 255, .035); }
-.coreGravity--inner { inset: -28px -49px; border-color: rgba(155, 140, 255, .24); }
-.coreCorona { position: absolute; inset: -28px; border-radius: 50%; background: repeating-conic-gradient(from 12deg, rgba(116, 217, 255, .22) 0 2deg, transparent 2deg 10deg); filter: blur(3px); opacity: .76; }
-.coreSurface { position: absolute; inset: -7px; border: 1px solid rgba(174, 226, 255, .58); border-radius: 50%; background: radial-gradient(circle at 43% 36%, #e9fbff 0 3%, #7fdcff 8%, #376dac 23%, #182f68 45%, #09152d 72%); box-shadow: 0 0 20px rgba(132, 222, 255, .72), 0 0 66px rgba(82, 146, 226, .42), 0 0 112px rgba(88, 73, 188, .19), inset -20px -25px 45px rgba(2, 5, 15, .7); }
-.coreSurface::before { position: absolute; inset: 18px; border: 1px solid rgba(230, 250, 255, .14); border-radius: 50%; background: conic-gradient(from 90deg, transparent, rgba(225, 248, 255, .13), transparent 23%, rgba(155, 140, 255, .13), transparent 55%); content: ""; }
-.coreReadout { position: absolute; z-index: 2; inset: 0; display: grid; place-items: center; align-content: center; text-align: center; text-shadow: 0 1px 9px #020711; }
-.coreReadout .sceneMicroLabel { color: #d5f3ff; font-size: 7px; }
-.coreReadout > strong { margin-top: 8px; color: #f3fbff; font: 800 25px ui-monospace, monospace; letter-spacing: .04em; }
-.coreReadout > small { color: #c0d4e7; font-size: 8px; }
-.coreReadout .sceneStatus { max-width: 144px; justify-content: center; overflow: hidden; font-size: 6px; text-overflow: ellipsis; white-space: nowrap; }
-.coreReadoutGrid { position: absolute; top: 179px; left: -42px; display: grid; width: 254px; grid-template-columns: repeat(3, 1fr); gap: 4px; padding: 7px 9px; border: 1px solid rgba(116, 217, 255, .16); border-radius: 8px; background: rgba(3, 8, 18, .76); backdrop-filter: blur(9px); }
-.coreReadoutGrid span { display: grid; gap: 2px; }
-.coreReadoutGrid i { color: #71839e; font-size: 6px; font-style: normal; letter-spacing: .12em; }
-.coreReadoutGrid b { color: #e8f6ff; font: 700 9px ui-monospace, monospace; }
-
-.guardianNode { position: absolute; top: 308px; left: 786px; width: 94px; height: 94px; }
-.guardianField { position: absolute; border: 1px solid rgba(104, 224, 181, .35); border-radius: 46% 54% 51% 49%; }
-.guardianField--outer { inset: -18px; box-shadow: 0 0 25px rgba(104, 224, 181, .1), inset 0 0 18px rgba(104, 224, 181, .05); }
-.guardianField--inner { inset: 4px; border-color: rgba(104, 224, 181, .18); }
-.guardianCore { position: absolute; inset: 28px; border: 1px solid rgba(104, 224, 181, .66); border-radius: 50%; background: rgba(72, 170, 139, .38); box-shadow: 0 0 22px rgba(104, 224, 181, .34); }
-.guardianNode--critical .guardianField { border-color: rgba(241, 111, 132, .55); box-shadow: 0 0 28px rgba(241, 111, 132, .16); }
-.guardianNode--critical .guardianCore { border-color: #f16f84; background: rgba(159, 46, 66, .45); }
-
-.executionComet { position: absolute; top: 456px; left: 940px; width: 76px; height: 76px; }
-.executionTail { position: absolute; top: 34px; right: 43px; width: 112px; height: 7px; border-radius: 50%; background: linear-gradient(90deg, transparent, rgba(116, 217, 255, .11), rgba(116, 217, 255, .48)); filter: blur(2px); transform-origin: right center; }
-.executionCore { position: absolute; inset: 24px; border: 1px solid rgba(116, 217, 255, .7); border-radius: 38% 62% 54% 46%; background: #77d9ff; box-shadow: 0 0 13px #5cccf9, 0 0 28px rgba(72, 148, 212, .45); }
-.executionComet--critical .executionCore { border-color: #f16f84; background: #c84d64; box-shadow: 0 0 18px rgba(241, 111, 132, .6); }
-
-.portfolioMass { position: absolute; top: 568px; left: 1047px; width: 102px; height: 102px; }
-.portfolioCore { position: absolute; inset: 8px; border: 1px solid rgba(116, 217, 255, .3); border-radius: 50%; background: radial-gradient(circle at 36% 30%, #718aa9, #263a53 32%, #0d1828 72%); box-shadow: 0 0 32px rgba(87, 134, 177, .18), inset -14px -17px 25px rgba(2, 5, 12, .65); }
-.portfolioRing { position: absolute; top: 42px; left: -18px; width: 138px; height: 25px; border: 1px solid rgba(151, 183, 215, .34); border-radius: 50%; }
-.portfolioWave { position: absolute; inset: -8px; border: 1px solid #68e0b5; border-radius: 50%; }
-.portfolioReadout { position: absolute; right: 84px; bottom: -2px; display: grid; width: 176px; gap: 3px; padding: 8px 10px; border-right: 1px solid rgba(116, 217, 255, .26); background: linear-gradient(270deg, rgba(4, 10, 22, .7), transparent); text-align: right; }
-.portfolioReadout strong { color: #dcecff; font: 700 18px ui-monospace, monospace; }
-.portfolioReadout small { color: #71839e; font-size: 7px; }
-
-.galaxySignal { --signal-color: #78d9ff; position: absolute; z-index: 4; top: 0; left: 0; width: 8px; height: 8px; border: 1px solid #f4fbff; border-radius: 50%; background: var(--signal-color); box-shadow: 0 0 8px var(--signal-color), 0 0 22px var(--signal-color); offset-rotate: 0deg; }
-.galaxySignal::after { position: absolute; top: 2px; right: 4px; width: 35px; height: 2px; border-radius: 50%; background: linear-gradient(90deg, transparent, var(--signal-color)); content: ""; filter: blur(1px); }
-.sceneLegend { position: absolute; bottom: 16px; left: 18px; display: flex; align-items: center; gap: 10px; color: #617590; font-size: 7px; letter-spacing: .08em; text-transform: uppercase; }
-.sceneLegend > span { color: #8ecfeb; font-weight: 800; letter-spacing: .16em; }
-.sceneLegend i { width: 22px; height: 1px; background: rgba(116, 217, 255, .45); }
-.sceneLegend b { color: #8298b2; font-weight: 600; }
+@keyframes galaxyOrbitDrift { to { stroke-dashoffset: -180; } }
+@keyframes galaxyCoreBreathe { 0%, 100% { opacity: .7; } 50% { opacity: 1; } }
 
 @media (min-width: 1200px) {
   html, body { width: 100%; height: 100%; overflow: hidden; }
@@ -340,15 +269,9 @@ td { padding: 10px 9px; border-top: 1px solid rgba(127, 164, 220, .1); text-alig
   .emptyState p { font-size: 8px; }
   .emptyOrb { width: 18px; height: 18px; }
   .galaxyPanel { display: grid; height: 100%; min-height: 0; grid-template-rows: auto minmax(0, 1fr); overflow: hidden; padding: 0; }
-  .galaxyPanel > .panelHeader { padding: 9px 11px 7px; margin: 0; background: rgba(4, 10, 22, .42); }
-  .galaxyPanel > .galaxyMap { height: 100%; min-height: 0; }
-  .galaxyPanel .galaxyMap--fallback { padding: 8px; }
-  .galaxyMap--fallback .mapNode--reference { align-self: stretch; min-height: 0; overflow: hidden; }
-  .galaxyMap--fallback .referenceNode { height: 100%; min-height: 0; overflow: auto; padding: 9px; }
-  .galaxyMap--fallback .referenceNode h3 { margin-top: 6px; }
-  .galaxyMap--fallback .referenceNode .nodeDetail { display: none; }
-  .galaxyMap--fallback .referencePlanets { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; margin-top: 7px; }
-  .galaxyMap--fallback .referencePlanet { gap: 2px; padding: 5px; }
+  .galaxyPanel > .panelHeader { padding: 9px 11px 7px; margin: 0; background: rgba(12, 8, 6, .42); }
+  .galaxyPanel > .galaxyMap, .galaxyPanel > .galaxySceneStack { height: 100%; min-height: 0; }
+  .galaxyPanel .galaxyMap--fallback { padding: 0; }
   .controlRail--left .universeSplit { grid-template-columns: 1fr; gap: 8px; }
   .controlRail--left .universeSplit > div:first-child { order: 2; }
   .controlRail--left .metricGrid--four, .controlRail--right .metricGrid--four { grid-template-columns: repeat(2, minmax(0, 1fr)); }

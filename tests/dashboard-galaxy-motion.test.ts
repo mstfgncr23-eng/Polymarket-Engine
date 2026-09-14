@@ -33,7 +33,25 @@ describe("Galaxy scene model", () => {
     expect(model.core).toMatchObject({ available: false, authority: "—", fairProbability: "—", marketProbability: "—" });
     expect(model.reference).toMatchObject({ connected: 0, tone: "neutral", feeds: [] });
     expect(model.risk).toMatchObject({ status: "NOT RUN", tone: "neutral" });
-    expect(model.portfolio).toMatchObject({ status: "EMPTY", positions: 0, equity: "$1000.00" });
+    expect(model.portfolio).toMatchObject({ status: "EMPTY", positions: 0, equity: "$1000.00", satellites: [] });
+  });
+
+  it("projects open-position satellites from the real snapshot ledger only", () => {
+    const empty = buildGalaxySceneModel(snapshot());
+    expect(empty.portfolio.satellites).toEqual([]);
+
+    const withPositions = buildGalaxySceneModel(snapshot({
+      positions: [
+        { id: "pos-1", marketId: "market-alpha-123456789", upQuantity: "2", downQuantity: "0", pairedQuantity: "0", unpairedQuantity: "2", unpairedOutcome: "UP", averageUpCost: "0.4", averageDownCost: "0", openedAt: "2026-09-12T11:00:00.000Z", updatedAt: "2026-09-12T11:00:00.000Z" },
+        { id: "pos-2", marketId: "m2", upQuantity: "1", downQuantity: "0", pairedQuantity: "0", unpairedQuantity: "1", unpairedOutcome: "UP", averageUpCost: "0.5", averageDownCost: "0", openedAt: "2026-09-12T11:00:00.000Z", updatedAt: "2026-09-12T11:00:00.000Z" },
+      ],
+    }));
+    expect(withPositions.portfolio.positions).toBe(2);
+    expect(withPositions.portfolio.satellites).toEqual([
+      expect.objectContaining({ id: "pos-1", label: expect.stringContaining("market") }),
+      expect.objectContaining({ id: "pos-2", label: "m2" }),
+    ]);
+    expect(withPositions.portfolio.satellites.every((satellite) => !("upQuantity" in satellite) && !("equity" in satellite))).toBe(true);
   });
 
   it("preserves historical and external decision authority without inventing native fields", () => {
@@ -126,4 +144,36 @@ describe("bounded Galaxy motion", () => {
     }
     expect(expireGalaxyMotionState(state, 10_000).transients).toEqual([]);
   });
+
+  it("maps ASTRA_DECISION as a decision transient only after first observation", () => {
+    const initialData = snapshot({ decisionFeed: [event("historical-astra", "ASTRA_DECISION")] });
+    const initial = initializeGalaxyMotionState(initialData, 20, 1_000);
+    expect(initial.seenEventIds).toEqual(["historical-astra"]);
+    expect(initial.transients).toEqual([]);
+
+    const later = snapshot({ decisionFeed: [
+      event("new-astra", "ASTRA_DECISION"),
+      ...initialData.decisionFeed,
+    ] });
+    const advanced = advanceGalaxyMotionState(initial, later, 30, 1_500);
+    expect(advanced.transients).toEqual([
+      expect.objectContaining({ id: "new-astra", kind: "decision", startFrame: 30, marketId: "market-1", asset: "BTC" }),
+    ]);
+
+    const repeated = advanceGalaxyMotionState(advanced, later, 40, 1_800);
+    expect(repeated.transients).toHaveLength(1);
+    expect(repeated.transients[0]?.id).toBe("new-astra");
+  });
+
+  it("still caps ASTRA_DECISION bursts at MAX_GALAXY_TRANSIENTS", () => {
+    const initial = initializeGalaxyMotionState(snapshot(), 0, 1_000);
+    const burst = snapshot({ decisionFeed: Array.from({ length: 40 }, (_, index) => event(`astra-burst-${index}`, "ASTRA_DECISION")) });
+    let state = initial;
+    for (let batch = 0; batch < 8; batch += 1) {
+      state = advanceGalaxyMotionState(state, { ...burst, decisionFeed: burst.decisionFeed.slice(batch * 5) }, batch * 10, 2_000 + batch * 50);
+      expect(state.transients.length).toBeLessThanOrEqual(MAX_GALAXY_TRANSIENTS);
+    }
+    expect(state.transients.every((item) => item.kind === "decision")).toBe(true);
+  });
+
 });
