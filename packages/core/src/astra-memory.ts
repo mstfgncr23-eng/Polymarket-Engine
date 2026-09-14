@@ -75,3 +75,17 @@ export class AstraMemoryStore {
     }
   }
 }
+
+/**
+ * Recovery-only compatibility shell for checkpoints written before the
+ * calendar-day Astra budget was removed. It never gates dispatch, never tracks
+ * spend, and has no date/UTC rollover semantics. New code must not depend on it
+ * for cost control or accounting.
+ *
+ * @deprecated Ignore legacy `astraBudget` checkpoint payloads instead.
+ */
+export class AstraDailyBudget {
+  constructor(_legacyLimitUsd?: unknown) {}
+  snapshot(): null { return null; }
+  restore(_legacyState: unknown): void {}
+}
