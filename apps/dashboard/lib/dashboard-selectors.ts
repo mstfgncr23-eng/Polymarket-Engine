@@ -220,7 +220,12 @@ export function decisionActivityLabel(event: DashboardEvent | null): string {
   if (!event) return "AWAITING DECISION";
   switch (event.type) {
     case "ASTRA_MODEL_INVOCATION": return "ASTRA MODEL INVOKED";
-    case "ASTRA_DECISION": return event.detail.accepted === false ? "ASTRA GATE REJECTED" : "ASTRA DECISION";
+    case "ASTRA_DECISION": {
+      if (event.detail.accepted !== false) return "ASTRA DECISION";
+      if (event.detail.decisionSource === "FAIL_CLOSED") return "ASTRA FAIL-CLOSED";
+      if (typeof event.detail.gateReason === "string") return "ASTRA GATE REJECTED";
+      return "ASTRA DECISION REJECTED";
+    }
     case "ASTRA_DEEP_REVIEW": return "ASTRA DEEP REVIEW";
     case "ASTRA_FAILURE": return "ASTRA FAILURE";
     case "ASTRA_BUDGET_BLOCK": return "ASTRA BUDGET BLOCK";
@@ -235,7 +240,9 @@ export function decisionActivityLabel(event: DashboardEvent | null): string {
 export function decisionActivityTone(event: DashboardEvent | null): Tone {
   if (!event) return "neutral";
   if (["ASTRA_FAILURE", "ASTRA_BUDGET_BLOCK", "BOOK_REVALIDATION_REJECTED"].includes(event.type)) return "critical";
-  if (event.type === "ASTRA_DECISION" && event.detail.accepted === false) return "warning";
+  if (event.type === "ASTRA_DECISION" && event.detail.accepted === false) {
+    return event.detail.decisionSource === "FAIL_CLOSED" ? "critical" : "warning";
+  }
   if (event.type === "NATIVE_DECISION_EVALUATION" || event.type === "ASTRA_MODEL_INVOCATION" || event.type === "ASTRA_DEEP_REVIEW") return "warning";
   return "healthy";
 }
