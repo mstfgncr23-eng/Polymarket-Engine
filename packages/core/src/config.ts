@@ -133,7 +133,8 @@ export const engineEnvSchema = z.object({
   ASTRA_BATCH_MAX_OUTPUT_TOKENS: z.coerce.number().int().positive().max(16_384).default(2_048),
   ASTRA_FAST_MAX_CONCURRENCY: z.coerce.number().int().positive().max(16).default(4),
   ASTRA_DEEP_MAX_CONCURRENCY: z.coerce.number().int().positive().max(8).default(2),
-  ASTRA_MAX_DAILY_COST_USD: z.coerce.number().positive().max(100).default(5),
+  /** @deprecated Accepted for old deployments but ignored. There is no calendar-day Astra cost gate. */
+  ASTRA_MAX_DAILY_COST_USD: z.coerce.number().optional(),
   ASTRA_INPUT_USD_PER_M: z.coerce.number().nonnegative().default(10),
   ASTRA_CACHED_INPUT_USD_PER_M: z.coerce.number().nonnegative().default(1),
   ASTRA_CACHE_WRITE_USD_PER_M: z.coerce.number().nonnegative().default(12.5),

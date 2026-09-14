@@ -11,8 +11,8 @@ import {
 } from "@pm/core";
 import { MemoryEventJournal, createJournalEvent } from "@pm/db";
 import { describe, expect, it } from "vitest";
-import { AstraClientError, OpenAIAstraClient, estimateAstraDecisionInputTokens } from "../apps/engine/src/astra/client.js";
-import { AstraBudgetError, AstraDecisionService, AstraDeepFailureError, AstraStageAccountingError } from "../apps/engine/src/astra/service.js";
+import { AstraClientError, OpenAIAstraClient } from "../apps/engine/src/astra/client.js";
+import { AstraDecisionService, AstraDeepFailureError, AstraStageAccountingError } from "../apps/engine/src/astra/service.js";
 import { EngineService } from "../apps/engine/src/engine.js";
 import { NoopGrokActivationBridge } from "../apps/engine/src/activation/index.js";
 import { ExperimentSummaryAccumulator } from "../apps/engine/src/report.js";
@@ -81,41 +81,43 @@ describe("Astra Brain V1 final correctness regressions", () => {
     expect(restored.relevant(8).map((entry) => entry.id)).toEqual(["lesson"]);
   });
 
-  it("uses current billing time and never rolls a budget day backward", async () => {
+  it("does not let legacy calendar-day budget state gate provider dispatch", async () => {
     const { up, down } = pair();
     const observedBeforeMidnight = new Date("2026-09-13T23:59:59.000Z");
     const currentAfterMidnight = new Date("2026-09-14T00:00:01.000Z");
     const packet = buildAstraFeaturePacket({ trigger: makeTrigger(up.marketId, up.eventId, "billing", observedBeforeMidnight), up, down, reference: null, now: observedBeforeMidnight })!;
-    const budget = new AstraDailyBudget(1);
+    const legacyBudget = new AstraDailyBudget(0.000001);
+    legacyBudget.restore({ day: "2026-09-14", spentUsd: 999, calls: 999 });
+    let calls = 0;
+    let accountedUsd = 0;
     const service = new AstraDecisionService(serviceOptions({
-      client: { decide: async () => modelResult(decisionOutput("NO_TRADE", 0.1), 0.123) }, budget, nowFn: () => currentAfterMidnight,
+      budget: legacyBudget,
+      nowFn: () => currentAfterMidnight,
+      client: { decide: async () => { calls += 1; return modelResult(decisionOutput("NO_TRADE", 0.1), 0.123); } },
+      onStageSuccess: async ({ result }: { result: AstraModelResult }) => { accountedUsd += result.usage.costUsd; return true; },
     }) as never);
     await service.decide({ traceId: packet.traceId, triggerId: packet.triggerId, featurePacket: packet, portfolio: { drawdownUtilization: 0, unhedgedUtilization: 0, openPositionCount: 0 } });
-    expect(budget.snapshot(currentAfterMidnight)).toMatchObject({ day: "2026-09-14", spentUsd: 0.123 });
+    expect(calls).toBe(1);
+    expect(accountedUsd).toBeCloseTo(0.123, 10);
+    expect(legacyBudget.snapshot(currentAfterMidnight)).toEqual({ day: "", spentUsd: 0, calls: 0 });
 
-    const stale = new AstraDailyBudget(1);
-    expect(stale.reserve(0.4, currentAfterMidnight)).toBe(true);
-    expect(stale.snapshot(new Date("2026-09-13T23:59:59.000Z")).day).toBe("2026-09-14");
-    const batchBudget = new AstraDailyBudget(1);
     const batchService = new AstraDecisionService(serviceOptions({
-      budget: batchBudget, nowFn: () => currentAfterMidnight,
+      budget: legacyBudget,
+      nowFn: () => currentAfterMidnight,
       client: { decide: async () => modelResult(decisionOutput("NO_TRADE", 0.1)), learn: async () => ({ output: { lessons: [] }, usage: { inputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1, reasoningTokens: 0, costUsd: 0.01 }, providerRequestId: "batch" }) },
     }) as never);
-    await batchService.learn({ traceId: "batch-billing", observedAt: observedBeforeMidnight.toISOString(), aggregate: { sampleIds: ["s"], sampleCount: 1, calibration: { samples: 1, brierSum: 0.1, reliability: 0.9 }, previousLessons: [] } });
-    expect(batchBudget.snapshot(currentAfterMidnight).day).toBe("2026-09-14");
+    await expect(batchService.learn({ traceId: "batch-billing", observedAt: observedBeforeMidnight.toISOString(), aggregate: { sampleIds: ["s"], sampleCount: 1, calibration: { samples: 1, brierSum: 0.1, reliability: 0.9 }, previousLessons: [] } })).resolves.not.toBeNull();
   });
 
-  it("reserves against the worst configured input rate before dispatch", async () => {
+  it("does not use pricing reservation math as a monetary dispatch gate", async () => {
     const { up, down } = pair();
     const packet = buildAstraFeaturePacket({ trigger: makeTrigger(up.marketId, up.eventId, "pricing"), up, down, reference: null, now })!;
     const request = { stage: "FAST" as const, traceId: packet.traceId, triggerId: packet.triggerId, featurePacket: packet, memory: [], portfolio: { drawdownUtilization: 0, unhedgedUtilization: 0, openPositionCount: 0 } };
-    const estimate = estimateAstraDecisionInputTokens(request);
-    const reserve = estimate / 1_000_000 * 100 + 256 / 1_000_000 * 50;
-    const budget = new AstraDailyBudget(reserve * 0.99);
+    const legacyBudget = new AstraDailyBudget(0.000001);
     let dispatched = 0;
-    const service = new AstraDecisionService(serviceOptions({ budget, cacheWriteUsdPerM: 100, client: { decide: async () => { dispatched += 1; return modelResult(decisionOutput("NO_TRADE")); } } }) as never);
-    await expect(service.decide(request)).rejects.toBeInstanceOf(AstraBudgetError);
-    expect(dispatched).toBe(0);
+    const service = new AstraDecisionService(serviceOptions({ budget: legacyBudget, cacheWriteUsdPerM: 100_000, inputUsdPerM: 100_000, outputUsdPerM: 100_000, client: { decide: async () => { dispatched += 1; return modelResult(decisionOutput("NO_TRADE", 0.1)); } } }) as never);
+    await expect(service.decide(request)).resolves.toMatchObject({ decision: { action: "NO_TRADE" } });
+    expect(dispatched).toBe(1);
   });
 
   it("rejects an Astra result that returns after the entry deadline", async () => {

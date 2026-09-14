@@ -50,48 +50,43 @@ export class AstraMemoryStore {
     const entry = [...this.entries].reverse().find((item) => item.kind === "DECISION" && item.marketId === marketId);
     return entry ? structuredClone(entry) : null;
   }
-  snapshot(): AstraMemoryState { return { entries: structuredClone(this.entries), lessons: structuredClone(this.lessons) }; }
+  snapshot(): AstraMemoryState {
+    return { entries: structuredClone(this.entries), lessons: structuredClone(this.lessons) };
+  }
   restore(state: AstraMemoryState): void {
     const parsed = astraMemoryStateSchema.parse(state);
     this.entries = parsed.entries.map((entry) => structuredClone(entry));
     this.lessons = parsed.lessons.map((entry) => structuredClone(entry));
     this.trim();
   }
-  counts(): { entries: number; lessons: number; bytes: number } { return { entries: this.entries.length, lessons: this.lessons.length, bytes: Buffer.byteLength(JSON.stringify(this.snapshot())) }; }
+  counts(): { entries: number; lessons: number; bytes: number } {
+    return {
+      entries: this.entries.length,
+      lessons: this.lessons.length,
+      bytes: Buffer.byteLength(JSON.stringify(this.snapshot())),
+    };
+  }
   private trim(): void {
     while (this.entries.length > this.limits.maxEntries) this.entries.shift();
     while (this.lessons.length > this.limits.maxLessons) this.lessons.shift();
     while (Buffer.byteLength(JSON.stringify(this.snapshot())) > this.limits.maxBytes && (this.entries.length > 0 || this.lessons.length > 0)) {
-      if (this.entries.length > 0) this.entries.shift(); else this.lessons.shift();
+      if (this.entries.length > 0) this.entries.shift();
+      else this.lessons.shift();
     }
   }
 }
 
-export const astraBudgetStateSchema = z.object({
-  day: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).or(z.literal("")),
-  spentUsd: z.number().finite().nonnegative(),
-  calls: z.number().int().nonnegative(),
-}).strict();
-export type AstraBudgetState = z.infer<typeof astraBudgetStateSchema>;
-
+/**
+ * Recovery-only compatibility shell for checkpoints written before the
+ * calendar-day Astra budget was removed. It never gates dispatch, never tracks
+ * spend, and has no date/UTC rollover semantics.
+ *
+ * @deprecated Ignore legacy `astraBudget` checkpoint payloads instead.
+ */
 export class AstraDailyBudget {
-  private state: AstraBudgetState = { day: "", spentUsd: 0, calls: 0 };
-  constructor(private readonly maxUsd: number) {}
-  canSpend(amountUsd: number, now: Date): boolean { this.roll(now); return Number.isFinite(amountUsd) && amountUsd >= 0 && this.state.spentUsd + amountUsd <= this.maxUsd + 1e-9; }
-  spend(amountUsd: number, now: Date): boolean { if (!this.canSpend(amountUsd, now)) return false; this.state.spentUsd += amountUsd; this.state.calls += 1; return true; }
-  reserve(amountUsd: number, now: Date): boolean { return this.spend(amountUsd, now); }
-  settle(reservedUsd: number, actualUsd: number, now: Date): void {
-    this.roll(now);
-    const reserved = Math.max(0, reservedUsd);
-    const actual = Math.max(0, actualUsd);
-    this.state.spentUsd = Math.min(this.maxUsd, Math.max(0, this.state.spentUsd - reserved + actual));
+  constructor(_legacyLimitUsd?: unknown) {}
+  snapshot(_now?: Date): { day: ""; spentUsd: 0; calls: 0 } {
+    return { day: "", spentUsd: 0, calls: 0 };
   }
-  snapshot(now = new Date()): AstraBudgetState { this.roll(now); return { ...this.state }; }
-  restore(state: AstraBudgetState): void { this.state = astraBudgetStateSchema.parse(state); }
-  private roll(now: Date): void {
-    const day = now.toISOString().slice(0, 10);
-    // Billing time can move backwards relative to a stale event or a corrected
-    // system clock. Never erase a newer day's conservative spend in that case.
-    if (!this.state.day || day > this.state.day) this.state = { day, spentUsd: 0, calls: 0 };
-  }
+  restore(_legacyState: unknown): void {}
 }

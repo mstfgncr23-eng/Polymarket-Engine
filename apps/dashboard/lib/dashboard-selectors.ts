@@ -20,9 +20,21 @@ export const EXECUTION_EVENT_TYPES = [
   "PAPER_EXECUTION_ERROR",
 ] as const;
 
+export const DECISION_ACTIVITY_EVENT_TYPES = [
+  "NATIVE_DECISION_EVALUATION",
+  "NATIVE_DECISION_COMPLETE",
+  "CONSENSUS_DECISION",
+  "ASTRA_MODEL_INVOCATION",
+  "ASTRA_DECISION",
+  "ASTRA_DEEP_REVIEW",
+  "ASTRA_FAILURE",
+  "ASTRA_BUDGET_BLOCK",
+  "BOOK_REVALIDATION_REJECTED",
+] as const;
+
 export const MISSION_EVENT_TYPES = [
   "TRIGGER_LEVEL_1", "TRIGGER_LEVEL_2", "TRIGGER_LEVEL_3",
-  "NATIVE_DECISION_EVALUATION", "NATIVE_DECISION_COMPLETE", "ASTRA_DECISION",
+  ...DECISION_ACTIVITY_EVENT_TYPES,
   "RISK_ACCEPT", "RISK_VETO", "PAPER_ORDER_CREATED", "PAPER_FILL",
   "PAPER_ORDER_CANCELLED", "PAPER_EXECUTION_ERROR", "POSITION_SETTLED",
 ] as const;
@@ -37,6 +49,10 @@ export function nativeDecisionEvents(snapshot: DashboardSnapshot): DashboardEven
   return snapshot.decisionFeed.filter((event) => event.type === "NATIVE_DECISION_COMPLETE");
 }
 
+export function decisionActivityEvents(snapshot: DashboardSnapshot): DashboardEvent[] {
+  return snapshot.decisionFeed.filter((event) => (DECISION_ACTIVITY_EVENT_TYPES as readonly string[]).includes(event.type));
+}
+
 export function executionEvents(snapshot: DashboardSnapshot): DashboardEvent[] {
   return snapshot.decisionFeed.filter((event) => (EXECUTION_EVENT_TYPES as readonly string[]).includes(event.type));
 }
@@ -47,6 +63,104 @@ export function missionEvents(snapshot: DashboardSnapshot): DashboardEvent[] {
 
 export function latest<T>(items: T[]): T | null {
   return items[0] ?? null;
+}
+
+function timeValue(value: string | null | undefined): number {
+  if (!value) return Number.NEGATIVE_INFINITY;
+  const parsed = new Date(value).getTime();
+  return Number.isFinite(parsed) ? parsed : Number.NEGATIVE_INFINITY;
+}
+
+function newestByTime<T>(items: readonly T[], at: (item: T) => string | null | undefined): T | null {
+  let selected: T | null = null;
+  let selectedAt = Number.NEGATIVE_INFINITY;
+  for (const item of items) {
+    const candidateAt = timeValue(at(item));
+    if (candidateAt > selectedAt) {
+      selected = item;
+      selectedAt = candidateAt;
+    }
+  }
+  return selected;
+}
+
+export function latestTrigger(snapshot: DashboardSnapshot): DashboardSnapshot["recentTriggers"][number] | null {
+  return newestByTime(snapshot.recentTriggers, (trigger) => trigger.createdAt);
+}
+
+export function latestDecisionActivity(snapshot: DashboardSnapshot): DashboardEvent | null {
+  return newestByTime(decisionActivityEvents(snapshot), (event) => event.at);
+}
+
+/** Latest decision activity belonging to the newest trigger when trace identity is available. */
+export function pipelineDecisionActivity(snapshot: DashboardSnapshot): DashboardEvent | null {
+  const trigger = latestTrigger(snapshot);
+  const events = decisionActivityEvents(snapshot);
+  if (!trigger) return newestByTime(events, (event) => event.at);
+
+  if (trigger.traceId) {
+    const sameTrace = newestByTime(events.filter((event) => event.traceId === trigger.traceId), (event) => event.at);
+    return sameTrace && timeValue(sameTrace.at) >= timeValue(trigger.createdAt) ? sameTrace : null;
+  }
+
+  const newest = newestByTime(events, (event) => event.at);
+  return newest && timeValue(newest.at) >= timeValue(trigger.createdAt) ? newest : null;
+}
+
+function activityInvalidatesDecision(event: DashboardEvent): boolean {
+  return event.type === "ASTRA_FAILURE"
+    || event.type === "ASTRA_BUDGET_BLOCK"
+    || event.type === "BOOK_REVALIDATION_REJECTED"
+    || (event.type === "ASTRA_DECISION" && event.detail.accepted === false);
+}
+
+/**
+ * Dashboard consensus is a projection, not authority. Hide a prior projection
+ * once a newer trigger/pipeline has superseded it instead of presenting stale
+ * economic state as the current decision.
+ */
+export function currentConsensus(snapshot: DashboardSnapshot): DashboardSnapshot["consensus"] {
+  const consensus = snapshot.consensus;
+  if (!consensus) return null;
+  const consensusAt = timeValue(consensus.calculatedAt);
+  const trigger = latestTrigger(snapshot);
+
+  if (trigger && timeValue(trigger.createdAt) > consensusAt) {
+    const sameTrigger = Boolean(consensus.triggerId && consensus.triggerId === trigger.id);
+    const sameTrace = Boolean(consensus.traceId && trigger.traceId && consensus.traceId === trigger.traceId);
+    if (!sameTrigger && !sameTrace) return null;
+  }
+
+  const activity = pipelineDecisionActivity(snapshot);
+  if (activity && timeValue(activity.at) > consensusAt) {
+    const sameTrace = Boolean(consensus.traceId && activity.traceId === consensus.traceId);
+    if (!sameTrace || activityInvalidatesDecision(activity)) return null;
+  }
+
+  return consensus;
+}
+
+/** Same rule for the risk projection: a newer pipeline must not inherit an old veto/pass. */
+export function currentRisk(snapshot: DashboardSnapshot): DashboardSnapshot["risk"] {
+  const risk = snapshot.risk;
+  if (!risk) return null;
+  const riskAt = timeValue(risk.evaluatedAt);
+  const trigger = latestTrigger(snapshot);
+
+  if (trigger && timeValue(trigger.createdAt) > riskAt) {
+    const sameTrace = Boolean(risk.traceId && trigger.traceId && risk.traceId === trigger.traceId);
+    if (!sameTrace) return null;
+  }
+
+  const activity = pipelineDecisionActivity(snapshot);
+  if (activity && timeValue(activity.at) > riskAt) {
+    const sameTrace = Boolean(risk.traceId && activity.traceId === risk.traceId);
+    if (!sameTrace || activityInvalidatesDecision(activity)) return null;
+  }
+
+  const consensus = currentConsensus(snapshot);
+  if (consensus && timeValue(consensus.calculatedAt) > riskAt) return null;
+  return risk;
 }
 
 export function toneForState(state: string | null | undefined): Tone {
@@ -102,6 +216,37 @@ export function decisionAuthorityTone(consensus: DashboardSnapshot["consensus"])
   return isHealthyAuthority(consensus.authority) ? "healthy" : "warning";
 }
 
+export function decisionActivityLabel(event: DashboardEvent | null): string {
+  if (!event) return "AWAITING DECISION";
+  switch (event.type) {
+    case "ASTRA_MODEL_INVOCATION": return "ASTRA MODEL INVOKED";
+    case "ASTRA_DECISION": {
+      if (event.detail.accepted !== false) return "ASTRA DECISION";
+      if (event.detail.decisionSource === "FAIL_CLOSED") return "ASTRA FAIL-CLOSED";
+      if (typeof event.detail.gateReason === "string") return "ASTRA GATE REJECTED";
+      return "ASTRA DECISION REJECTED";
+    }
+    case "ASTRA_DEEP_REVIEW": return "ASTRA DEEP REVIEW";
+    case "ASTRA_FAILURE": return "ASTRA FAILURE";
+    case "ASTRA_BUDGET_BLOCK": return "ASTRA BUDGET BLOCK";
+    case "BOOK_REVALIDATION_REJECTED": return "BOOK REVALIDATION REJECTED";
+    case "NATIVE_DECISION_EVALUATION": return "NATIVE EVALUATION";
+    case "NATIVE_DECISION_COMPLETE": return "NATIVE DECISION";
+    case "CONSENSUS_DECISION": return "CONSENSUS DECISION";
+    default: return event.type;
+  }
+}
+
+export function decisionActivityTone(event: DashboardEvent | null): Tone {
+  if (!event) return "neutral";
+  if (["ASTRA_FAILURE", "ASTRA_BUDGET_BLOCK", "BOOK_REVALIDATION_REJECTED"].includes(event.type)) return "critical";
+  if (event.type === "ASTRA_DECISION" && event.detail.accepted === false) {
+    return event.detail.decisionSource === "FAIL_CLOSED" ? "critical" : "warning";
+  }
+  if (event.type === "NATIVE_DECISION_EVALUATION" || event.type === "ASTRA_MODEL_INVOCATION" || event.type === "ASTRA_DEEP_REVIEW") return "warning";
+  return "healthy";
+}
+
 export function formatMoney(value: string | number | null | undefined): string {
   if (value === null || value === undefined || value === "") return "—";
   const number = Number(value);
@@ -149,7 +294,11 @@ export function eventSummary(event: DashboardEvent): string {
   const detail = event.detail;
   const parts: string[] = [];
   if (typeof detail.kind === "string") parts.push(detail.kind);
+  if (typeof detail.stage === "string") parts.push(detail.stage);
   if (typeof detail.direction === "string") parts.push(detail.direction);
+  if (detail.accepted === false) parts.push("rejected");
+  if (typeof detail.gateReason === "string") parts.push(detail.gateReason);
+  if (typeof detail.reason === "string") parts.push(detail.reason);
   if (typeof detail.orderId === "string") parts.push(`order ${shortId(detail.orderId)}`);
   if (typeof detail.fillId === "string") parts.push(`fill ${shortId(detail.fillId)}`);
   if (typeof detail.price === "string") parts.push(`@ ${detail.price}`);
@@ -164,7 +313,7 @@ export function pulseToken(snapshot: DashboardSnapshot, node: "trigger" | "core"
   const event = snapshot.decisionFeed.find((candidate) => {
     const type = candidate.type;
     if (node === "trigger") return type.startsWith("TRIGGER_LEVEL_");
-    if (node === "core") return type === "NATIVE_DECISION_COMPLETE" || type === "ASTRA_DECISION";
+    if (node === "core") return (DECISION_ACTIVITY_EVENT_TYPES as readonly string[]).includes(type);
     if (node === "risk") return type === "RISK_ACCEPT" || type === "RISK_VETO";
     if (node === "execution") return (EXECUTION_EVENT_TYPES as readonly string[]).includes(type);
     if (node === "portfolio") return type === "PAPER_FILL" || type === "POSITION_SETTLED";
