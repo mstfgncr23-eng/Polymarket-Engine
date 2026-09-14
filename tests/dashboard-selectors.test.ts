@@ -5,6 +5,9 @@ import {
   formatBasisPoints,
   formatMoney,
   formatPercent,
+  decisionActivityEvents,
+  decisionActivityLabel,
+  decisionActivityTone,
   decisionAuthorityLabel,
   decisionAuthorityTone,
   missionEvents,
@@ -38,10 +41,26 @@ describe("dashboard data selectors", () => {
     ] });
     expect(triggerEvents(data).map((event) => event.id)).toEqual(["trigger"]);
     expect(nativeDecisionEvents(data).map((event) => event.id)).toEqual(["decision"]);
+    expect(decisionActivityEvents(data).map((event) => event.id)).toEqual(["decision", "astra"]);
     expect(executionEvents(data).map((event) => event.id)).toEqual(["fill"]);
     expect(missionEvents(data).map((event) => event.id)).toEqual(["trigger", "decision", "astra", "fill"]);
     expect(pulseToken(data, "core")).toBe("decision");
     expect(eventSummary(executionEvents(data)[0]!)).toContain("fill fill-1");
+  });
+
+  it("distinguishes Astra gate rejection, failure, and historical budget block", () => {
+    const rejected = { id: "r", at: "2026-09-12T00:00:00.000Z", type: "ASTRA_DECISION", traceId: "t", marketId: "m", detail: { accepted: false, gateReason: "NO_LIQUIDITY" } };
+    const failure = { ...rejected, id: "f", type: "ASTRA_FAILURE", detail: { reason: "TIMEOUT" } };
+    const budget = { ...rejected, id: "b", type: "ASTRA_BUDGET_BLOCK", detail: { reason: "DAILY_BUDGET_EXHAUSTED" } };
+    const data = snapshot({ decisionFeed: [rejected, failure, budget] });
+    expect(decisionActivityEvents(data)).toHaveLength(3);
+    expect(decisionActivityLabel(rejected)).toBe("ASTRA GATE REJECTED");
+    expect(decisionActivityTone(rejected)).toBe("warning");
+    expect(eventSummary(rejected)).toContain("NO_LIQUIDITY");
+    expect(decisionActivityLabel(failure)).toBe("ASTRA FAILURE");
+    expect(decisionActivityTone(failure)).toBe("critical");
+    expect(decisionActivityLabel(budget)).toBe("ASTRA BUDGET BLOCK");
+    expect(decisionActivityTone(budget)).toBe("critical");
   });
 
   it("uses dynamic reference feed states and preserves empty-state semantics", () => {
