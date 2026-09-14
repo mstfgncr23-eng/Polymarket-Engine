@@ -24,8 +24,11 @@ OpenAI Responses client.
   persisted.
 - Astra has no calendar-day monetary cutoff and no UTC reset. Cost is observed
   and durably accounted from provider usage. Dispatch remains bounded by
-  deterministic opportunity admission, first-leg windows, stage concurrency,
-  timeouts, output-token caps, and selective Deep review.
+  deterministic opportunity admission, first-leg windows, a hard rolling
+  maximum of 12 FAST dispatches per hour, a 5-second global interval, a
+  60-second per-market cooldown, stage concurrency, timeouts, output-token
+  caps, and selective Deep review. Governor evidence is restored from the
+  durable journal after restart, so recovery cannot reset the rolling limit.
 
 ## Configuration
 
@@ -38,6 +41,16 @@ input and is ignored. It has no default and does not gate or reset inference.
 Fast and Deep calls retain separate bounded concurrency, timeout, output-token,
 and uncertainty controls. Deep review is selective and triggered by the strict
 model output or the configured uncertainty threshold.
+
+The canonical `ASTRA_PROVIDER_DISPATCH_AUTHORIZED` fact is durably committed
+before the SDK request may begin. `ASTRA_PROVIDER_DISPATCH_STARTED` is recorded
+only after the SDK request operation has actually been created; if request
+construction fails, the attempt remains `NOT_DISPATCHED`. The dedicated OpenAI
+client uses `maxRetries=0`, so one admitted dispatch produces at most one
+provider attempt. `ASTRA_FAST_TIMEOUT_MS` is a maximum provider-operation
+deadline: its timer starts when the SDK request begins, successful responses are
+processed immediately, and no artificial sleep is introduced. Admission/gating
+time is outside that provider-response deadline.
 
 Fast is the ordinary first-leg economic decision. Deep is a deterministic,
 selective challenge pass; it is never called after Fast returns `NO_TRADE`, and
@@ -64,7 +77,10 @@ invocation counts and costs are reported separately for `ASTRA_FAST`,
 reconnect timing, and learning updates are observable through bounded metrics
 and canonical report inputs. Historical `ASTRA_BUDGET_BLOCK` facts remain
 readable for old reports but new Astra execution does not emit budget blocks.
-The existing completion and final-report flow remains unchanged.
+Provider failures preserve known usage when a response was received; timeout or
+abort races are accounted once, and `DISPATCHED_UNKNOWN` remains incomplete
+until exact provider completion evidence exists. The final-report flow waits for
+in-flight provider calls before close/report/source sealing.
 
 Recovery restores the experiment identity, authority, bounded memory, and
 calibration/lesson state from the existing checkpoint. Legacy checkpoints that

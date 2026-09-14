@@ -84,9 +84,29 @@ export const astraFeaturePacketSchema = z.object({
 }).strict();
 export type AstraFeaturePacket = z.infer<typeof astraFeaturePacketSchema>;
 
+export interface AstraProviderDispatchContext {
+  experimentId: string;
+  runGeneration: number;
+  traceId: string;
+  triggerId: string;
+  stage: AstraStage;
+  model: string;
+  triggerKind: string;
+  marketId: string | null;
+}
+
+/** Called after provider concurrency admission and immediately before SDK dispatch. */
+export type AstraProviderDispatchAuthorization = (
+  context: AstraProviderDispatchContext,
+  /** Returns true only when the SDK request was actually created. */
+  beginDispatch: () => boolean,
+) => Promise<void>;
+
 export interface AstraDecisionRequestContext {
   traceId: string;
   triggerId: string;
+  experimentId?: string | null;
+  runGeneration?: number;
   featurePacket: AstraFeaturePacket;
   memory: readonly Record<string, unknown>[];
   portfolio: {
@@ -94,6 +114,8 @@ export interface AstraDecisionRequestContext {
     unhedgedUtilization: number;
     openPositionCount: number;
   };
+  /** Engine-owned true provider-dispatch fence. Never included in model input. */
+  providerDispatchAuthorization?: AstraProviderDispatchAuthorization;
   signal?: AbortSignal;
 }
 
@@ -120,6 +142,8 @@ export interface AstraBatchRequest {
     calibration: { samples: number; brierSum: number; reliability: number };
     previousLessons: readonly AstraLesson[];
   };
+  runGeneration?: number;
+  providerDispatchAuthorization?: AstraProviderDispatchAuthorization;
   signal?: AbortSignal;
 }
 
@@ -131,6 +155,8 @@ export interface AstraBatchResult {
 }
 
 export interface AstraClient {
+  /** True when this client invokes providerDispatchAuthorization at its SDK boundary. */
+  readonly ownsProviderDispatchBoundary?: boolean;
   decide(request: AstraDecisionRequest): Promise<AstraModelResult>;
   learn?(request: AstraBatchRequest): Promise<AstraBatchResult>;
 }

@@ -33,7 +33,7 @@ function pair() {
 function trigger(up: ReturnType<typeof pair>["up"], suffix = "astra") {
   return {
     id: `${suffix}-trigger`, traceId: `${suffix}-trace`, marketId: up.marketId, asset: "BTC", source: "polymarket" as const,
-    kind: "SCHEDULED_REVIEW" as const, severity: 2 as const, score: 1, dedupeKey: `${suffix}-dedupe`, evidence: {}, sourceEventIds: [up.eventId], evidenceIds: [up.eventId],
+    kind: "PAIR_COST_OPPORTUNITY" as const, severity: 2 as const, score: 1, dedupeKey: `${suffix}-dedupe`, evidence: {}, sourceEventIds: [up.eventId], evidenceIds: [up.eventId],
     createdAt: now.toISOString(), expiresAt: new Date(now.getTime() + 30_000).toISOString(),
   };
 }
@@ -359,6 +359,62 @@ describe("Astra Brain V1 deterministic boundary", () => {
     expect((request?.input as Array<{ role: string; content: string }>)[0]?.content).toContain("challenge");
   });
 
+  it("starts the FAST response deadline at actual SDK dispatch and returns promptly", async () => {
+    const { up, down } = pair();
+    const packet = buildAstraFeaturePacket({ trigger: trigger(up, "dispatch-deadline"), up, down, reference: null, now })!;
+    let sdkCalls = 0;
+    const fakeSdk = { responses: { parse: vi.fn(() => {
+      sdkCalls += 1;
+      return new Promise((resolve) => setTimeout(() => resolve({ id: "fast-prompt", output_parsed: { action: "NO_TRADE", fairProbabilityUp: 0.5, confidence: 0.5, uncertainty: 0.1, reasonCodes: ["PROMPT"] }, usage: { input_tokens: 10, output_tokens: 2 } }), 2));
+    }) } } as never;
+    const client = new OpenAIAstraClient({
+      apiKey: "test-only-injected", model: "gpt-6-astra", reasoning: { FAST: "low", DEEP: "medium", BATCH: "high" },
+      timeoutMs: { FAST: 30, DEEP: 1_000, BATCH: 1_000 }, maxOutputTokens: { FAST: 256, DEEP: 768, BATCH: 2_048 },
+      maxConcurrency: { FAST: 1, DEEP: 1 }, pricing: { inputUsdPerM: 10, cachedInputUsdPerM: 1, outputUsdPerM: 50 }, client: fakeSdk,
+    });
+    const started = Date.now();
+    const result = await client.decide({
+      stage: "FAST", traceId: packet.traceId, triggerId: packet.triggerId, featurePacket: packet, memory: [],
+      portfolio: { drawdownUtilization: 0, unhedgedUtilization: 0, openPositionCount: 0 },
+      providerDispatchAuthorization: async (_context, beginDispatch) => {
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        expect(beginDispatch()).toBe(true);
+      },
+    });
+    expect(result.output.action).toBe("NO_TRADE");
+    expect(sdkCalls).toBe(1);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(40);
+    expect(Date.now() - started).toBeLessThan(120);
+  });
+
+  it("does not treat an unstarted SDK request as a provider dispatch", async () => {
+    const { up, down } = pair();
+    const packet = buildAstraFeaturePacket({ trigger: trigger(up, "dispatch-start"), up, down, reference: null, now })!;
+    let sdkCalls = 0;
+    const constructionFailure = new OpenAIAstraClient({
+      apiKey: "test-only-injected", model: "gpt-6-astra", reasoning: { FAST: "low", DEEP: "medium", BATCH: "high" },
+      timeoutMs: { FAST: 1_000, DEEP: 1_000, BATCH: 1_000 }, maxOutputTokens: { FAST: 256, DEEP: 768, BATCH: 2_048 },
+      maxConcurrency: { FAST: 1, DEEP: 1 }, pricing: { inputUsdPerM: 10, cachedInputUsdPerM: 1, outputUsdPerM: 50 },
+      client: { responses: { parse: () => { sdkCalls += 1; throw new Error("SDK_CONSTRUCTION_FAILED"); } } } as never,
+    });
+    await expect(constructionFailure.decide({ stage: "FAST", traceId: packet.traceId, triggerId: packet.triggerId, featurePacket: packet, memory: [], portfolio: { drawdownUtilization: 0, unhedgedUtilization: 0, openPositionCount: 0 } }))
+      .rejects.toMatchObject({ message: "ASTRA_REQUEST_ABORTED", dispatchState: "NOT_DISPATCHED" });
+    expect(sdkCalls).toBe(1);
+
+    const admissionDeclined = new OpenAIAstraClient({
+      apiKey: "test-only-injected", model: "gpt-6-astra", reasoning: { FAST: "low", DEEP: "medium", BATCH: "high" },
+      timeoutMs: { FAST: 1_000, DEEP: 1_000, BATCH: 1_000 }, maxOutputTokens: { FAST: 256, DEEP: 768, BATCH: 2_048 },
+      maxConcurrency: { FAST: 1, DEEP: 1 }, pricing: { inputUsdPerM: 10, cachedInputUsdPerM: 1, outputUsdPerM: 50 },
+      client: { responses: { parse: () => { sdkCalls += 1; return Promise.resolve({ id: "must-not-start", output_parsed: null }); } } } as never,
+    });
+    await expect(admissionDeclined.decide({
+      stage: "FAST", traceId: "declined-trace", triggerId: "declined-trigger", featurePacket: packet, memory: [],
+      portfolio: { drawdownUtilization: 0, unhedgedUtilization: 0, openPositionCount: 0 },
+      providerDispatchAuthorization: async () => undefined,
+    })).rejects.toMatchObject({ message: "ASTRA_REQUEST_ABORTED", dispatchState: "NOT_DISPATCHED" });
+    expect(sdkCalls).toBe(1);
+  });
+
   it("uses the bounded BATCH structured-output seam without network", async () => {
     const calls: Record<string, unknown>[] = [];
     const fakeSdk = { responses: { parse: async (input: Record<string, unknown>) => {
@@ -412,7 +468,7 @@ describe("Astra Brain V1 deterministic boundary", () => {
     })) } } as never;
     const client = new OpenAIAstraClient({
       apiKey: "test-only-injected", model: "gpt-6-astra", reasoning: { FAST: "low", DEEP: "medium", BATCH: "high" },
-      timeoutMs: { FAST: 40, DEEP: 40, BATCH: 40 }, maxOutputTokens: { FAST: 256, DEEP: 768, BATCH: 2_048 },
+      timeoutMs: { FAST: 40, DEEP: 40, BATCH: 40 }, admissionTimeoutMs: { FAST: 10, DEEP: 10 }, maxOutputTokens: { FAST: 256, DEEP: 768, BATCH: 2_048 },
       maxConcurrency: { FAST: 1, DEEP: 1 }, maxWaiters: { FAST: 1, DEEP: 1 }, pricing: { inputUsdPerM: 10, cachedInputUsdPerM: 1, outputUsdPerM: 50 }, client: fakeSdk,
     });
     const request = { stage: "FAST" as const, traceId: "wait-trace", triggerId: "wait-trigger", featurePacket: packet, memory: [], portfolio: { drawdownUtilization: 0, unhedgedUtilization: 0, openPositionCount: 0 } };

@@ -35,6 +35,7 @@ export const DECISION_ACTIVITY_EVENT_TYPES = [
 export const MISSION_EVENT_TYPES = [
   "TRIGGER_LEVEL_1", "TRIGGER_LEVEL_2", "TRIGGER_LEVEL_3",
   ...DECISION_ACTIVITY_EVENT_TYPES,
+  "ASTRA_PROVIDER_DISPATCH_STARTED",
   "RISK_ACCEPT", "RISK_VETO", "PAPER_ORDER_CREATED", "PAPER_FILL",
   "PAPER_ORDER_CANCELLED", "PAPER_EXECUTION_ERROR", "POSITION_SETTLED",
 ] as const;
@@ -293,7 +294,10 @@ export function shortId(value: string | null | undefined, length = 18): string {
 export function eventSummary(event: DashboardEvent): string {
   const detail = event.detail;
   const parts: string[] = [];
+  if (event.type === "ASTRA_PROVIDER_DISPATCH_STARTED") parts.push("provider dispatch started");
   if (typeof detail.kind === "string") parts.push(detail.kind);
+  if (detail.paidCandidate === "REJECTED") parts.push("paid Astra rejected");
+  if (detail.paidCandidate === "ACCEPTED") parts.push("paid Astra accepted");
   if (typeof detail.stage === "string") parts.push(detail.stage);
   if (typeof detail.direction === "string") parts.push(detail.direction);
   if (detail.accepted === false) parts.push("rejected");
@@ -313,7 +317,7 @@ export function pulseToken(snapshot: DashboardSnapshot, node: "trigger" | "core"
   const event = snapshot.decisionFeed.find((candidate) => {
     const type = candidate.type;
     if (node === "trigger") return type.startsWith("TRIGGER_LEVEL_");
-    if (node === "core") return (DECISION_ACTIVITY_EVENT_TYPES as readonly string[]).includes(type);
+    if (node === "core") return (DECISION_ACTIVITY_EVENT_TYPES as readonly string[]).includes(type) || type === "ASTRA_PROVIDER_DISPATCH_STARTED";
     if (node === "risk") return type === "RISK_ACCEPT" || type === "RISK_VETO";
     if (node === "execution") return (EXECUTION_EVENT_TYPES as readonly string[]).includes(type);
     if (node === "portfolio") return type === "PAPER_FILL" || type === "POSITION_SETTLED";

@@ -9,6 +9,7 @@ import {
   type AstraDecisionRequestContext,
   type AstraModelOutput,
   type AstraModelResult,
+  type AstraProviderDispatchContext,
   type AstraStage,
 } from "@pm/core";
 import { AstraClientError } from "./client.js";
@@ -17,7 +18,17 @@ export interface AstraStageSuccess {
   stage: AstraStage;
   traceId: string;
   experimentId?: string | null;
+  runGeneration?: number;
   result: AstraModelResult | AstraBatchResult;
+}
+
+export interface AstraStageFailure {
+  stage: AstraStage;
+  traceId: string;
+  triggerId: string;
+  experimentId?: string | null;
+  runGeneration?: number;
+  error: AstraClientError;
 }
 
 export interface AstraServiceOptions {
@@ -28,6 +39,7 @@ export interface AstraServiceOptions {
   memory: AstraMemoryStore;
   beforeStageDispatch?: (stage: AstraStage) => Promise<boolean>;
   onStageSuccess?: (input: AstraStageSuccess) => Promise<boolean | void>;
+  onStageFailure?: (input: AstraStageFailure) => Promise<boolean | void>;
 
   /** @deprecated Ignored. Kept only so an old EngineService build can recover while the gate is removed. */
   budget?: unknown;
@@ -45,6 +57,7 @@ export interface AstraServiceOptions {
   nowFn?: () => Date;
   /** @deprecated No budget reservation/settlement notifications are emitted. */
   onBudgetChange?: (stage: AstraStage, change?: unknown) => Promise<void>;
+  model?: string;
 }
 
 export type AstraServiceResult = {
@@ -84,7 +97,14 @@ export class AstraDecisionService {
       try {
         deep = await this.invoke({ ...requestBase, stage: "DEEP", fastProposal: fast.output });
       } catch (error) {
-        throw new AstraDeepFailureError(deepFailureReason(error), fast.output);
+        const accountingError = error instanceof AstraStageAccountingError ? error : undefined;
+        const providerError = error instanceof AstraClientError ? error : accountingError?.providerError;
+        throw new AstraDeepFailureError(
+          deepFailureReason(providerError ?? error),
+          fast.output,
+          providerError,
+          accountingError !== undefined,
+        );
       }
       selected = deep;
       invocations.push(deep);
@@ -117,13 +137,36 @@ export class AstraDecisionService {
     if (!this.options.client.learn) return null;
     const request: AstraBatchRequest = { ...input, stage: "BATCH" };
     if (this.options.beforeStageDispatch && !(await this.options.beforeStageDispatch("BATCH"))) return null;
-    const result = await this.options.client.learn(request);
-    await this.notifyStageSuccess({
+    let result: AstraBatchResult;
+    try {
+      const clientOwnsBoundary = this.options.client.ownsProviderDispatchBoundary === true;
+      if (request.providerDispatchAuthorization && !clientOwnsBoundary) {
+        let began = false;
+        await request.providerDispatchAuthorization(
+          this.batchDispatchContext(request),
+          () => { began = true; return true; },
+        );
+        if (!began) throw new AstraClientError("ASTRA_PROVIDER_DISPATCH_BLOCKED", request.stage, "NOT_DISPATCHED");
+      }
+      result = await this.options.client.learn(request);
+    } catch (error) {
+      await this.notifyStageFailure({
+        stage: request.stage,
+        traceId: request.traceId,
+        triggerId: request.traceId,
+        experimentId: request.experimentId,
+        runGeneration: request.runGeneration,
+        error: asAstraClientError(error, request.stage),
+      });
+      throw error;
+    }
+    await this.notifyStageSuccessWithRecovery({
       stage: "BATCH",
       traceId: request.traceId,
       experimentId: request.experimentId,
+      runGeneration: request.runGeneration,
       result,
-    });
+    }, request.traceId);
     return result;
   }
 
@@ -131,22 +174,112 @@ export class AstraDecisionService {
     if (this.options.beforeStageDispatch && !(await this.options.beforeStageDispatch(request.stage))) {
       throw new AstraStageAdmissionError(request.stage);
     }
-    const result = await this.options.client.decide(request);
-    await this.notifyStageSuccess({ stage: request.stage, traceId: request.traceId, result });
+    let result: AstraModelResult;
+    try {
+      const clientOwnsBoundary = this.options.client.ownsProviderDispatchBoundary === true;
+      if (request.providerDispatchAuthorization && !clientOwnsBoundary) {
+        let began = false;
+        await request.providerDispatchAuthorization(
+          this.dispatchContext(request),
+          () => { began = true; return true; },
+        );
+        if (!began) throw new AstraClientError("ASTRA_PROVIDER_DISPATCH_BLOCKED", request.stage, "NOT_DISPATCHED");
+      }
+      result = await this.options.client.decide(request);
+    } catch (error) {
+      await this.notifyStageFailure({
+        stage: request.stage,
+        traceId: request.traceId,
+        triggerId: request.triggerId,
+        experimentId: request.experimentId,
+        runGeneration: request.runGeneration,
+        error: asAstraClientError(error, request.stage),
+      });
+      throw error;
+    }
+    await this.notifyStageSuccessWithRecovery({
+      stage: request.stage,
+      traceId: request.traceId,
+      experimentId: request.experimentId,
+      runGeneration: request.runGeneration,
+      result,
+    }, request.triggerId);
     return result;
   }
 
   private async notifyStageSuccess(input: AstraStageSuccess): Promise<void> {
-    const accounted = await this.options.onStageSuccess?.(input);
-    if (accounted === false) throw new AstraStageAccountingError(input.stage);
+    let accounted: boolean | void;
+    try {
+      accounted = await this.options.onStageSuccess?.(input);
+    } catch (error) {
+      throw new AstraStageAccountingError(input.stage, input.result, error);
+    }
+    if (accounted === false) throw new AstraStageAccountingError(input.stage, input.result);
+  }
+
+  private async notifyStageSuccessWithRecovery(input: AstraStageSuccess, triggerId: string): Promise<void> {
+    try {
+      await this.notifyStageSuccess(input);
+    } catch (error) {
+      const accounting = error instanceof AstraStageAccountingError
+        ? error
+        : new AstraStageAccountingError(input.stage, input.result, error);
+      await this.notifyStageFailure({
+        stage: input.stage,
+        traceId: input.traceId,
+        triggerId,
+        experimentId: input.experimentId,
+        runGeneration: input.runGeneration,
+        error: asAstraClientError(accounting, input.stage),
+      });
+      throw accounting;
+    }
+  }
+
+  private async notifyStageFailure(input: AstraStageFailure): Promise<void> {
+    let accounted: boolean | void;
+    try {
+      accounted = await this.options.onStageFailure?.(input);
+    } catch (error) {
+      throw new AstraStageAccountingError(input.stage, undefined, error, input.error);
+    }
+    if (accounted === false) throw new AstraStageAccountingError(input.stage, undefined, undefined, input.error);
+  }
+
+  private dispatchContext(request: AstraDecisionRequest): AstraProviderDispatchContext {
+    return {
+      experimentId: request.experimentId ?? "unknown",
+      runGeneration: request.runGeneration ?? 0,
+      traceId: request.traceId,
+      triggerId: request.triggerId,
+      stage: request.stage,
+      model: this.options.model ?? "astra",
+      triggerKind: request.featurePacket.triggerKind,
+      marketId: request.featurePacket.marketId,
+    };
+  }
+
+  private batchDispatchContext(request: AstraBatchRequest): AstraProviderDispatchContext {
+    return {
+      experimentId: request.experimentId ?? "unknown",
+      runGeneration: request.runGeneration ?? 0,
+      traceId: request.traceId,
+      triggerId: request.traceId,
+      stage: "BATCH",
+      model: this.options.model ?? "astra",
+      triggerKind: "BATCH",
+      marketId: null,
+    };
   }
 }
 
 export class AstraStageAccountingError extends Error {
-  constructor(readonly stage: AstraStage) {
-    super(`ASTRA_STAGE_ACCOUNTING_FAILED:${stage}`);
-    this.name = "AstraStageAccountingError";
-  }
+  constructor(
+    readonly stage: AstraStage,
+    readonly result?: AstraModelResult | AstraBatchResult,
+    readonly cause?: unknown,
+    readonly providerError?: AstraClientError,
+  ) { super(`ASTRA_STAGE_ACCOUNTING_FAILED:${stage}`); this.name = "AstraStageAccountingError"; }
 }
 
 export class AstraStageAdmissionError extends Error {
@@ -158,10 +291,12 @@ export class AstraStageAdmissionError extends Error {
 
 export type AstraDeepFailureReason = "DEEP_TIMEOUT" | "DEEP_INVALID_RESPONSE" | "DEEP_FAILED";
 export class AstraDeepFailureError extends Error {
-  constructor(readonly reason: AstraDeepFailureReason, readonly fastProposal: AstraModelOutput) {
-    super(reason);
-    this.name = "AstraDeepFailureError";
-  }
+  constructor(
+    readonly reason: AstraDeepFailureReason,
+    readonly fastProposal: AstraModelOutput,
+    readonly providerError?: AstraClientError,
+    readonly accountingFailed = false,
+  ) { super(reason); this.name = "AstraDeepFailureError"; }
 }
 
 function deepFailureReason(error: unknown): AstraDeepFailureReason {
@@ -170,6 +305,20 @@ function deepFailureReason(error: unknown): AstraDeepFailureReason {
     return "DEEP_INVALID_RESPONSE";
   }
   return "DEEP_FAILED";
+}
+
+function asAstraClientError(error: unknown, stage: AstraStage): AstraClientError {
+  if (error instanceof AstraClientError) return error;
+  if (error instanceof AstraStageAccountingError && error.providerError) return error.providerError;
+  if (error instanceof AstraStageAccountingError && error.result) {
+    return new AstraClientError("ASTRA_REQUEST_FAILED", stage, "RESPONSE_RECEIVED", {
+      providerRequestId: error.result.providerRequestId,
+      usage: error.result.usage,
+      knownUsage: true,
+      latencyMs: error.result.latencyMs,
+    });
+  }
+  return new AstraClientError("ASTRA_REQUEST_FAILED", stage, "DISPATCHED_UNKNOWN");
 }
 
 /**

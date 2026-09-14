@@ -28,6 +28,19 @@ export type ExperimentSummaryExtras = Partial<Pick<ExperimentSummary,
   "status" | "closePolicy" | "reportKind" | "unresolvedPositionCount" | "metricsScope" | "complete" | "truncated" | "truncatedReason" | "generatedAt"
 >>;
 
+const PROVIDER_DISPATCH_TRACKING_LIMIT = 10_000;
+type ProviderDispatchTerminal = "KNOWN" | "UNKNOWN" | "NOT_DISPATCHED";
+interface ProviderDispatchLifecycle {
+  authorized: boolean;
+  started: boolean;
+  terminal: ProviderDispatchTerminal | null;
+  invocationObserved: boolean;
+  knownUsageFailureObserved: boolean;
+  unknownFailureObserved: boolean;
+  notDispatchedFailureObserved: boolean;
+  usageObserved: boolean;
+}
+
 export interface ExperimentSummaryAccumulatorSnapshot {
   schemaVersion: number;
   experimentId: string;
@@ -62,6 +75,16 @@ export interface ExperimentSummaryAccumulatorSnapshot {
   pairRealizedGrossN: number;
   modelCounts: Record<string, number>;
   modelCosts: Record<string, number>;
+  providerDispatchStartedCount: number;
+  providerDispatchAuthorizedCount?: number;
+  providerDispatchLifecycle?: Array<[string, ProviderDispatchLifecycle]>;
+  providerDispatchTrackingOverflow?: boolean;
+  providerDispatchTrackingIncomplete?: boolean;
+  providerKnownTerminalCount?: number;
+  successfulModelInvocationCount: number;
+  knownUsageFailureCount: number;
+  dispatchedUnknownFailureCount: number;
+  notDispatchedFailureCount: number;
   failureStatistics: Record<string, number>;
   eventCountByMarket: Record<string, number>;
   eventCountByAsset: Record<string, number>;
@@ -119,6 +142,16 @@ export class ExperimentSummaryAccumulator {
   private pairRealizedGrossN = 0;
   private readonly modelCounts: Record<string, number> = {};
   private readonly modelCosts: Record<string, number> = {};
+  private readonly providerDispatches = new Map<string, ProviderDispatchLifecycle>();
+  private providerDispatchAuthorizedCount = 0;
+  private providerDispatchStartedCount = 0;
+  private providerDispatchTrackingOverflow = false;
+  private providerDispatchTrackingIncomplete = false;
+  private providerKnownTerminalCount = 0;
+  private successfulModelInvocationCount = 0;
+  private knownUsageFailureCount = 0;
+  private dispatchedUnknownFailureCount = 0;
+  private notDispatchedFailureCount = 0;
   private readonly failureStatistics: Record<string, number> = {};
   private readonly eventCountByMarket: Record<string, number> = {};
   private readonly eventCountByAsset: Record<string, number> = {};
@@ -174,7 +207,15 @@ export class ExperimentSummaryAccumulator {
       makerOrders: this.makerOrders, takerOrders: this.takerOrders, fillCount: this.fillCount, makerFills: this.makerFills, takerFills: this.takerFills,
       firstLegCount: this.firstLegCount, hedgeCompleteCount: this.hedgeCompleteCount, hedgeDurationSum: this.hedgeDurationSum, hedgeDurationN: this.hedgeDurationN,
       pairRealizedNetSum: this.pairRealizedNetSum, pairRealizedNetN: this.pairRealizedNetN, pairRealizedGrossSum: this.pairRealizedGrossSum, pairRealizedGrossN: this.pairRealizedGrossN,
-      modelCounts: structuredClone(this.modelCounts), modelCosts: structuredClone(this.modelCosts), failureStatistics: structuredClone(this.failureStatistics),
+      modelCounts: structuredClone(this.modelCounts), modelCosts: structuredClone(this.modelCosts),
+      providerDispatchAuthorizedCount: this.providerDispatchAuthorizedCount,
+      providerDispatchLifecycle: [...this.providerDispatches.entries()].map(([id, state]) => [id, structuredClone(state)]),
+      providerDispatchTrackingOverflow: this.providerDispatchTrackingOverflow,
+      providerDispatchTrackingIncomplete: this.providerDispatchTrackingIncomplete,
+      providerKnownTerminalCount: this.providerKnownTerminalCount,
+      providerDispatchStartedCount: this.providerDispatchStartedCount, successfulModelInvocationCount: this.successfulModelInvocationCount,
+      knownUsageFailureCount: this.knownUsageFailureCount, dispatchedUnknownFailureCount: this.dispatchedUnknownFailureCount,
+      notDispatchedFailureCount: this.notDispatchedFailureCount, failureStatistics: structuredClone(this.failureStatistics),
       eventCountByMarket: structuredClone(this.eventCountByMarket), eventCountByAsset: structuredClone(this.eventCountByAsset), assetByMarket: [...this.assetByMarket.entries()],
       byMarket: structuredClone(this.byMarket), byAsset: structuredClone(this.byAsset), failedHedgeOpen: [...this.failedHedgeOpen], failedHedgeCount: this.failedHedgeCount,
       positionWins: this.positionWins, positionLosses: this.positionLosses, positionBreakeven: this.positionBreakeven, grossWins: this.grossWins, grossLosses: this.grossLosses, grossBreakeven: this.grossBreakeven, grossSeen: [...this.grossSeen],
@@ -192,6 +233,38 @@ export class ExperimentSummaryAccumulator {
     this.settledMarketIds.clear(); for (const id of snapshot.settledMarketIds ?? []) this.settledMarketIds.add(id); this.settledPositionIds.clear(); for (const id of snapshot.settledPositionIds ?? []) this.settledPositionIds.add(id);
     this.settlementCount = assign("settlementCount", 0); this.settlementPnlUsd = assign("settlementPnlUsd", 0); this.settlementBothQty = assign("settlementBothQty", 0); this.lastLedger = snapshot.lastLedger ? structuredClone(snapshot.lastLedger) : undefined;
     for (const key of ["maxDrawdown","riskCount","accepted","paperOrders","makerOrders","takerOrders","fillCount","makerFills","takerFills","firstLegCount","hedgeCompleteCount","hedgeDurationSum","hedgeDurationN","pairRealizedNetSum","pairRealizedNetN","pairRealizedGrossSum","pairRealizedGrossN","failedHedgeCount","positionWins","positionLosses","positionBreakeven","grossWins","grossLosses","grossBreakeven","rejectedWouldHaveWon","acceptedLost","worstUnhedgedUsd"] as const) (this as unknown as Record<string, unknown>)[key] = snapshot[key];
+    this.providerDispatchStartedCount = snapshot.providerDispatchStartedCount ?? 0;
+    this.providerDispatchAuthorizedCount = snapshot.providerDispatchAuthorizedCount ?? 0;
+    this.providerDispatchTrackingOverflow = snapshot.providerDispatchTrackingOverflow === true;
+    this.providerDispatchTrackingIncomplete = snapshot.providerDispatchTrackingIncomplete === true
+      || typeof snapshot.providerDispatchAuthorizedCount !== "number";
+    this.providerKnownTerminalCount = snapshot.providerKnownTerminalCount
+      ?? Math.max(0, (snapshot.successfulModelInvocationCount ?? 0) + (snapshot.knownUsageFailureCount ?? 0));
+    this.providerDispatches.clear();
+    if (Array.isArray(snapshot.providerDispatchLifecycle)) {
+      if (snapshot.providerDispatchLifecycle.length > PROVIDER_DISPATCH_TRACKING_LIMIT) this.providerDispatchTrackingOverflow = true;
+      for (const entry of snapshot.providerDispatchLifecycle.slice(0, PROVIDER_DISPATCH_TRACKING_LIMIT)) {
+        if (!Array.isArray(entry) || typeof entry[0] !== "string" || !entry[0]) {
+          this.providerDispatchTrackingIncomplete = true;
+          continue;
+        }
+        const state = entry[1];
+        if (!state || typeof state !== "object"
+          || typeof state.authorized !== "boolean" || typeof state.started !== "boolean"
+          || (state.terminal !== null && state.terminal !== "KNOWN" && state.terminal !== "UNKNOWN" && state.terminal !== "NOT_DISPATCHED")
+          || typeof state.invocationObserved !== "boolean" || typeof state.knownUsageFailureObserved !== "boolean"
+          || typeof state.unknownFailureObserved !== "boolean" || typeof state.notDispatchedFailureObserved !== "boolean"
+          || typeof state.usageObserved !== "boolean") {
+          this.providerDispatchTrackingIncomplete = true;
+          continue;
+        }
+        this.providerDispatches.set(entry[0], structuredClone(state));
+      }
+    }
+    this.successfulModelInvocationCount = snapshot.successfulModelInvocationCount ?? 0;
+    this.knownUsageFailureCount = snapshot.knownUsageFailureCount ?? 0;
+    this.dispatchedUnknownFailureCount = snapshot.dispatchedUnknownFailureCount ?? 0;
+    this.notDispatchedFailureCount = snapshot.notDispatchedFailureCount ?? 0;
     const replaceRecord = (target: Record<string, unknown>, source: Record<string, unknown> | undefined) => { for (const key of Object.keys(target)) delete target[key]; Object.assign(target, structuredClone(source ?? {})); };
     replaceRecord(this.modelCounts, snapshot.modelCounts); replaceRecord(this.modelCosts, snapshot.modelCosts); replaceRecord(this.failureStatistics, snapshot.failureStatistics); replaceRecord(this.eventCountByMarket, snapshot.eventCountByMarket); replaceRecord(this.eventCountByAsset, snapshot.eventCountByAsset); replaceRecord(this.byMarket, snapshot.byMarket); replaceRecord(this.byAsset, snapshot.byAsset); replaceRecord(this.agentSignals, snapshot.agentSignals); replaceRecord(this.regimes, snapshot.regimes); replaceRecord(this.hours, snapshot.hours);
     this.assetByMarket.clear(); for (const [key, value] of snapshot.assetByMarket ?? []) this.assetByMarket.set(key, value); this.failedHedgeOpen.clear(); for (const key of snapshot.failedHedgeOpen ?? []) this.failedHedgeOpen.add(key); this.grossSeen.clear(); for (const key of snapshot.grossSeen ?? []) this.grossSeen.add(key); this.worstUnhedgedEvent = snapshot.worstUnhedgedEvent ? structuredClone(snapshot.worstUnhedgedEvent) : null; this.highWaterBytes = 0; this.refreshHighWater();
@@ -257,14 +330,26 @@ export class ExperimentSummaryAccumulator {
         this.hedgeDurationSum += duration;
         this.hedgeDurationN += 1;
       }
+    } else if (type === "ASTRA_PROVIDER_DISPATCH_AUTHORIZED" && (event.payload as { authority?: unknown }).authority === "ASTRA_BRAIN_V1") {
+      this.noteProviderDispatchAuthorized(event);
+    } else if (type === "ASTRA_PROVIDER_DISPATCH_STARTED" && (event.payload as { authority?: unknown }).authority === "ASTRA_BRAIN_V1") {
+      this.noteProviderDispatchStarted(event);
     } else if (type === "ASTRA_MODEL_INVOCATION" && (event.payload as { authority?: unknown }).authority === "ASTRA_BRAIN_V1") {
-      const stage = String((event.payload as { stage?: unknown }).stage ?? "DECISION");
-      const usage = (event.payload as { usage?: { costUsd?: number } }).usage;
-      this.modelCounts.ASTRA_BRAIN_V1 = (this.modelCounts.ASTRA_BRAIN_V1 ?? 0) + 1;
-      this.modelCosts.ASTRA_BRAIN_V1 = (this.modelCosts.ASTRA_BRAIN_V1 ?? 0) + (usage?.costUsd ?? 0);
-      const stageKey = `ASTRA_${stage}`;
-      this.modelCounts[stageKey] = (this.modelCounts[stageKey] ?? 0) + 1;
-      this.modelCosts[stageKey] = (this.modelCosts[stageKey] ?? 0) + (usage?.costUsd ?? 0);
+      const lifecycle = this.providerDispatchLifecycleFor(event);
+      if (!lifecycle || !lifecycle.invocationObserved) {
+        if (lifecycle?.terminal === "NOT_DISPATCHED") this.providerDispatchTrackingIncomplete = true;
+        if (lifecycle) lifecycle.invocationObserved = true;
+        this.successfulModelInvocationCount += 1;
+        this.noteKnownProviderTerminal(lifecycle);
+        const stage = String((event.payload as { stage?: unknown }).stage ?? "DECISION");
+        const usage = (event.payload as { usage?: { costUsd?: number } }).usage;
+        this.modelCounts.ASTRA_BRAIN_V1 = (this.modelCounts.ASTRA_BRAIN_V1 ?? 0) + 1;
+        this.modelCosts.ASTRA_BRAIN_V1 = (this.modelCosts.ASTRA_BRAIN_V1 ?? 0) + (usage?.costUsd ?? 0);
+        const stageKey = `ASTRA_${stage}`;
+        this.modelCounts[stageKey] = (this.modelCounts[stageKey] ?? 0) + 1;
+        this.modelCosts[stageKey] = (this.modelCosts[stageKey] ?? 0) + (usage?.costUsd ?? 0);
+        if (lifecycle) lifecycle.usageObserved = usage != null && typeof usage.costUsd === "number";
+      }
     } else if (type === "ASTRA_DECISION" && (event.payload as { authority?: unknown }).authority === "ASTRA_BRAIN_V1") {
       // Invocation events intentionally contain only bounded provider audit
       // data. The canonical decision is the single per-trigger source for
@@ -286,8 +371,49 @@ export class ExperimentSummaryAccumulator {
         this.modelCosts[output.agentId] = (this.modelCosts[output.agentId] ?? 0) + (output.usage?.estimatedCostUsd ?? 0);
       }
     } else if (type === "ASTRA_FAILURE" || type === "ASTRA_BUDGET_BLOCK") {
+      const failurePayload = event.payload as { dispatchState?: unknown; knownUsage?: unknown };
+      const dispatchState = failurePayload.dispatchState;
+      const lifecycle = type === "ASTRA_BUDGET_BLOCK" || (dispatchState === "NOT_DISPATCHED" && !providerDispatchIdentity(event))
+        ? null
+        : this.providerDispatchLifecycleFor(event);
+      const knownUsage = dispatchState === "RESPONSE_RECEIVED" && failurePayload.knownUsage === true;
+      const unknownDispatch = dispatchState === "DISPATCHED_UNKNOWN"
+        || (dispatchState === "RESPONSE_RECEIVED" && !knownUsage);
+      const provenNotDispatched = dispatchState === "NOT_DISPATCHED";
+      let recordFailureStatistic = true;
+      if (knownUsage) {
+        const duplicate = lifecycle?.knownUsageFailureObserved === true;
+        if (!duplicate) {
+          if (lifecycle?.terminal === "NOT_DISPATCHED" || lifecycle?.terminal === "UNKNOWN") this.providerDispatchTrackingIncomplete = true;
+          if (lifecycle) lifecycle.knownUsageFailureObserved = true;
+          this.knownUsageFailureCount += 1;
+          this.noteKnownProviderTerminal(lifecycle);
+          this.noteProviderUsage(event, lifecycle);
+        }
+        recordFailureStatistic = !duplicate;
+      } else if (unknownDispatch) {
+        const duplicate = lifecycle?.unknownFailureObserved === true;
+        if (!duplicate) {
+          if (lifecycle?.terminal === "KNOWN" || lifecycle?.terminal === "NOT_DISPATCHED") this.providerDispatchTrackingIncomplete = true;
+          if (lifecycle) lifecycle.unknownFailureObserved = true;
+          this.dispatchedUnknownFailureCount += 1;
+        }
+        if (lifecycle) lifecycle.terminal = "UNKNOWN";
+        recordFailureStatistic = !duplicate;
+      } else {
+        const duplicate = lifecycle?.notDispatchedFailureObserved === true;
+        if (!duplicate) {
+          if (lifecycle?.terminal === "KNOWN" || lifecycle?.terminal === "UNKNOWN") this.providerDispatchTrackingIncomplete = true;
+          if (lifecycle) lifecycle.notDispatchedFailureObserved = true;
+          this.notDispatchedFailureCount += 1;
+        }
+        // Only an explicit NOT_DISPATCHED state closes an AUTHORIZED-only
+        // lifecycle. Legacy failures without dispatchState remain unresolved.
+        if (provenNotDispatched && lifecycle && lifecycle.terminal === null) lifecycle.terminal = "NOT_DISPATCHED";
+        recordFailureStatistic = !duplicate;
+      }
       const code = String((event.payload as { reason?: unknown }).reason ?? type);
-      this.failureStatistics[code] = (this.failureStatistics[code] ?? 0) + 1;
+      if (recordFailureStatistic) this.failureStatistics[code] = (this.failureStatistics[code] ?? 0) + 1;
     } else if (type === "AGENT_FAILURE") {
       const code = String((event.payload as { code?: unknown }).code ?? "UNKNOWN");
       this.failureStatistics[code] = (this.failureStatistics[code] ?? 0) + 1;
@@ -346,6 +472,14 @@ export class ExperimentSummaryAccumulator {
     const netTradingPnl = Number(ledger?.netTradingPnl ?? 0);
     const aiCost = Number(ledger?.aiCost ?? 0);
     const infraCost = Number(ledger?.infrastructureCost ?? 0);
+    const knownProviderOutcomes = this.providerKnownTerminalCount;
+    const accountingFailure = (this.failureStatistics.ACCOUNTING_FAILED ?? 0) > 0;
+    const unresolvedAuthorizationCount = this.providerDispatchUnresolvedAuthorizationCount();
+    const providerCostCompleteness = accountingFailure || this.dispatchedUnknownFailureCount > 0 || unresolvedAuthorizationCount > 0
+      || this.providerDispatchTrackingOverflow || this.providerDispatchTrackingIncomplete
+      || knownProviderOutcomes < this.providerDispatchStartedCount
+      ? (knownProviderOutcomes > 0 ? "PARTIAL" : "NONE")
+      : "COMPLETE";
     const pairCosts = positions.filter((position) => Number(position.pairedQuantity) > 0).map((position) => Number(position.combinedPairCost));
     const netWl = { wins: this.positionWins, losses: this.positionLosses, breakeven: this.positionBreakeven };
     const grossWl = (this.grossWins + this.grossLosses + this.grossBreakeven) === 0
@@ -369,6 +503,16 @@ export class ExperimentSummaryAccumulator {
       grossWinLossDistribution: grossWl,
       grossPnlUsd: grossPnl, feesUsd: Number(ledger?.fees ?? 0), slippageUsd: Number(ledger?.slippage ?? 0),
       netTradingPnlUsd: netTradingPnl, aiCostUsd: aiCost, estimatedInfrastructureCostUsd: infraCost,
+      providerDispatchAuthorizedCount: this.providerDispatchAuthorizedCount,
+      providerDispatchStartedCount: this.providerDispatchStartedCount,
+      providerDispatchUnresolvedAuthorizationCount: unresolvedAuthorizationCount,
+      providerDispatchTrackingOverflow: this.providerDispatchTrackingOverflow,
+      providerDispatchTrackingIncomplete: this.providerDispatchTrackingIncomplete,
+      successfulModelInvocationCount: this.successfulModelInvocationCount,
+      knownUsageFailureCount: this.knownUsageFailureCount,
+      dispatchedUnknownFailureCount: this.dispatchedUnknownFailureCount,
+      notDispatchedFailureCount: this.notDispatchedFailureCount,
+      providerCostCompleteness,
       economicPnlUsd: Number(ledger?.netEconomicPnl ?? netTradingPnl - aiCost - infraCost),
       maximumDrawdownUsd: Math.max(0, this.maxDrawdown),
       maximumDirectionalExposureUsd: Math.max(0, ...positions.map((position) => Number(position.unpairedQuantity) * Number(position.unpairedOutcome === "UP" ? position.averageUpCost : position.averageDownCost))),
@@ -407,6 +551,88 @@ export class ExperimentSummaryAccumulator {
       hedgeCompleteCount: this.hedgeCompleteCount,
       failedHedgeCount: this.failedHedgeCount,
     };
+  }
+
+  private providerDispatchLifecycleFor(event: JournalEvent): ProviderDispatchLifecycle | null {
+    const identity = providerDispatchIdentity(event);
+    if (!identity) {
+      this.providerDispatchTrackingIncomplete = true;
+      return null;
+    }
+    const existing = this.providerDispatches.get(identity);
+    if (existing) return existing;
+    if (this.providerDispatches.size >= PROVIDER_DISPATCH_TRACKING_LIMIT) {
+      this.providerDispatchTrackingOverflow = true;
+      return null;
+    }
+    const lifecycle: ProviderDispatchLifecycle = {
+      authorized: false,
+      started: false,
+      terminal: null,
+      invocationObserved: false,
+      knownUsageFailureObserved: false,
+      unknownFailureObserved: false,
+      notDispatchedFailureObserved: false,
+      usageObserved: false,
+    };
+    this.providerDispatches.set(identity, lifecycle);
+    return lifecycle;
+  }
+
+  private noteProviderDispatchAuthorized(event: JournalEvent): void {
+    const lifecycle = this.providerDispatchLifecycleFor(event);
+    if (!lifecycle) {
+      this.providerDispatchAuthorizedCount += 1;
+      return;
+    }
+    if (!lifecycle.authorized) {
+      lifecycle.authorized = true;
+      this.providerDispatchAuthorizedCount += 1;
+    }
+  }
+
+  private noteProviderDispatchStarted(event: JournalEvent): void {
+    const lifecycle = this.providerDispatchLifecycleFor(event);
+    if (!lifecycle) {
+      this.providerDispatchStartedCount += 1;
+      return;
+    }
+    if (lifecycle.terminal !== null) this.providerDispatchTrackingIncomplete = true;
+    if (!lifecycle.started) {
+      lifecycle.started = true;
+      this.providerDispatchStartedCount += 1;
+    }
+  }
+
+  private noteKnownProviderTerminal(lifecycle: ProviderDispatchLifecycle | null): void {
+    if (!lifecycle) {
+      this.providerKnownTerminalCount += 1;
+      return;
+    }
+    if (lifecycle.terminal !== "UNKNOWN" && lifecycle.terminal !== "KNOWN") {
+      lifecycle.terminal = "KNOWN";
+      this.providerKnownTerminalCount += 1;
+    }
+  }
+
+  private noteProviderUsage(event: JournalEvent, lifecycle: ProviderDispatchLifecycle | null): void {
+    const payload = event.payload as { stage?: unknown; usage?: { costUsd?: unknown } };
+    const costUsd = payload.usage?.costUsd;
+    if (typeof costUsd !== "number" || !Number.isFinite(costUsd)) return;
+    if (lifecycle?.usageObserved === true) return;
+    const stage = String(payload.stage ?? "DECISION");
+    this.modelCosts.ASTRA_BRAIN_V1 = (this.modelCosts.ASTRA_BRAIN_V1 ?? 0) + costUsd;
+    const stageKey = `ASTRA_${stage}`;
+    this.modelCosts[stageKey] = (this.modelCosts[stageKey] ?? 0) + costUsd;
+    if (lifecycle) lifecycle.usageObserved = true;
+  }
+
+  private providerDispatchUnresolvedAuthorizationCount(): number {
+    let unresolved = 0;
+    for (const lifecycle of this.providerDispatches.values()) {
+      if (lifecycle.authorized && lifecycle.terminal === null) unresolved += 1;
+    }
+    return unresolved;
   }
 
   private applyFillAttribution(byMarket: Record<string, MarketAssetAttribution>, byAsset: Record<string, MarketAssetAttribution>): void {
@@ -501,6 +727,7 @@ export class ExperimentSummaryAccumulator {
     let bytes = 2_048;
     bytes += this.fillReplay.size * 192;
     bytes += this.latestPositions.size * 256;
+    bytes += this.providerDispatches.size * 160;
     bytes += Object.keys(this.byMarket).length * 160 + Object.keys(this.byAsset).length * 160;
     bytes += (this.pairRealizedNetN + this.pairRealizedGrossN) * 8;
     this.highWaterBytes = Math.max(this.highWaterBytes, bytes);
@@ -535,6 +762,15 @@ function createFillReplay() {
     get feesUsd() { return this.fees.toNumber(); },
     get slippageUsd() { return this.slippage.toNumber(); },
   };
+}
+
+function providerDispatchIdentity(event: JournalEvent): string | null {
+  const payload = event.payload as { dispatchId?: unknown; stage?: unknown };
+  if (typeof payload.dispatchId === "string" && payload.dispatchId.length > 0) return payload.dispatchId;
+  const stage = typeof payload.stage === "string" && payload.stage.length > 0
+    ? payload.stage
+    : event.type === "ASTRA_MODEL_INVOCATION" ? "DECISION" : null;
+  return stage && event.traceId ? `${event.traceId}:${stage}` : null;
 }
 
 function foldFill(state: ReturnType<typeof createFillReplay>, fill: PaperFill): void {

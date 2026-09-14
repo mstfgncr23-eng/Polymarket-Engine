@@ -1,5 +1,5 @@
 import { MemoryEventJournal } from "@pm/db";
-import { createId, type ReferenceTick, type TriggerEvent } from "@pm/core";
+import { createId, type AstraProviderDispatchContext, type ReferenceTick, type TriggerEvent } from "@pm/core";
 import { describe, expect, it } from "vitest";
 import { EngineService } from "../apps/engine/src/engine.js";
 import { NoopGrokActivationBridge } from "../apps/engine/src/activation/index.js";
@@ -110,6 +110,15 @@ describe("prepare-next paper experiment boundary", () => {
     const server = await operatorServer(test.engine, test.journal);
     try {
       expect((await test.engine.beginExperiment()).ok).toBe(true);
+      const authorize = (test.engine as unknown as {
+        authorizeAndBeginAstraProviderDispatch: (context: AstraProviderDispatchContext, beginDispatch: () => boolean) => Promise<void>;
+      }).authorizeAndBeginAstraProviderDispatch.bind(test.engine);
+      await authorize({
+        experimentId: test.engine.experimentManifest()!.id,
+        runGeneration: (test.engine as unknown as { experimentRunGeneration: number }).experimentRunGeneration,
+        traceId: "prepare-governor-trace", triggerId: "prepare-governor-trigger", stage: "FAST",
+        model: "gpt-6-astra", triggerKind: "PAIR_COST_OPPORTUNITY", marketId: "btc-mkt",
+      }, () => true);
       await test.market.emitSnapshot(snapshot({
         marketId: "btc-mkt", tokenId: "btc-up", outcome: "UP", asset: "BTC",
         receivedAt: new Date(test.clock.nowMs).toISOString(), sourceTimestamp: new Date(test.clock.nowMs).toISOString(),
@@ -128,7 +137,6 @@ describe("prepare-next paper experiment boundary", () => {
       const previous = test.engine.experimentManifest()!;
       const oldReport = await test.journal.loadExperimentReport(previous.id, "final");
       expect(oldReport).toMatchObject({ experimentId: previous.id, reportKind: "final", complete: true, truncated: false });
-      const budgetBefore = test.engine.astraBudgetSnapshotForTest();
       test.engine.seedRuntimeBookkeepingForTest({ signalReceivedTimes: [test.clock.nowMs], executionErrors: [test.clock.nowMs], recentTrades: [["old", test.clock.nowMs]] });
 
       const response = await server.inject({
@@ -160,7 +168,7 @@ describe("prepare-next paper experiment boundary", () => {
       expect(test.engine.runtimeBookkeepingForTest()).toMatchObject({ signalReceivedTimes: 0, executionErrors: 0, recentTrades: 0, activeTriggers: 0, signalsByTrigger: 0 });
       expect(test.engine.triggerDedupeEntryCount()).toBe(0);
       expect(test.engine.referenceWindowTotalEntriesForTest()).toBe(warmReferenceEntries);
-      expect(test.engine.astraBudgetSnapshotForTest()).toEqual(budgetBefore);
+      expect(test.engine.astraGovernorSnapshotForTest().dispatches).toHaveLength(1);
       expect(test.engine.reportGeneratedForTest()).toBe(false);
       expect(test.engine.sourceSealStateForTest()).toMatchObject({ sealing: false, sealed: false });
 

@@ -9,6 +9,7 @@ import {
   type AstraBatchResult,
   type AstraDecisionRequest,
   type AstraModelResult,
+  type AstraProviderDispatchContext,
   type AstraStage,
   type AstraUsage,
 } from "@pm/core";
@@ -16,6 +17,17 @@ import {
 const FAST_SYSTEM_PROMPT = "You are Astra Brain V1 Fast. Return only the requested structured economic decision. Use BUY_UP, BUY_DOWN, or NO_TRADE. Do not invent missing facts or expose chain-of-thought.";
 const DEEP_SYSTEM_PROMPT = "You are Astra Brain V1 Deep Review. Return only the requested structured economic decision. Treat the exact Fast proposal as a proposal to audit: explicitly challenge it, look for reasons it is wrong, and then confirm it, veto it with NO_TRADE, or flip its direction. Do not invent missing facts or expose chain-of-thought.";
 const BATCH_SYSTEM_PROMPT = "You are Astra Batch Learner V1. Return only a bounded list of concise lessons as structured output. Do not change configuration or risk policy. Do not invent missing facts.";
+
+type ProviderResponse = {
+  id?: string | null;
+  output_parsed?: unknown;
+  usage?: {
+    input_tokens?: number;
+    input_tokens_details?: { cached_tokens?: number; cache_write_tokens?: number };
+    output_tokens?: number;
+    output_tokens_details?: { reasoning_tokens?: number };
+  } | null;
+};
 
 function decisionTask(request: AstraDecisionRequest): Record<string, unknown> {
   return {
@@ -29,8 +41,6 @@ function decisionTask(request: AstraDecisionRequest): Record<string, unknown> {
 }
 
 function boundedInputTokenUpperBound(value: unknown): number {
-  // UTF-8 byte count is a conservative token upper bound for the bounded
-  // request payload; the envelope margin covers SDK serialization overhead.
   return Math.ceil(Buffer.byteLength(JSON.stringify(value), "utf8") * 1.25) + 512;
 }
 
@@ -67,75 +77,103 @@ export interface AstraOpenAIOptions {
   timeoutMs: Record<AstraStage, number>;
   maxOutputTokens: Record<AstraStage, number>;
   maxConcurrency: Record<"FAST" | "DEEP", number>;
-  /** Admission is fail-fast by default; any configured waiters are finite and deadline-bound. */
   maxWaiters?: Partial<Record<"FAST" | "DEEP" | "BATCH", number>>;
+  /** Optional independent bound for queued admission; never arms the provider timer. */
+  admissionTimeoutMs?: Partial<Record<"FAST" | "DEEP" | "BATCH", number>>;
   pricing: { inputUsdPerM: number; cachedInputUsdPerM: number; cacheWriteUsdPerM?: number; outputUsdPerM: number };
   client?: OpenAI;
 }
 
 /** Dedicated Responses API client. No tools, web, files, raw history, or fallback provider. */
 export class OpenAIAstraClient implements AstraClient {
+  readonly ownsProviderDispatchBoundary = true as const;
   private readonly client: OpenAI;
   private readonly fast: BoundedSemaphore;
   private readonly deep: BoundedSemaphore;
   private readonly batch: BoundedSemaphore;
+
   constructor(private readonly options: AstraOpenAIOptions) {
-    this.client = options.client ?? new OpenAI({ apiKey: options.apiKey });
-    this.fast = new BoundedSemaphore(options.maxConcurrency.FAST, options.maxWaiters?.FAST ?? 0);
-    this.deep = new BoundedSemaphore(options.maxConcurrency.DEEP, options.maxWaiters?.DEEP ?? 0);
-    this.batch = new BoundedSemaphore(1, options.maxWaiters?.BATCH ?? 0);
+    // Engine policy is one admission -> one SDK attempt.
+    this.client = options.client ?? new OpenAI({ apiKey: options.apiKey, maxRetries: 0 });
+    this.fast = new BoundedSemaphore(options.maxConcurrency.FAST, options.maxWaiters?.FAST ?? 0, options.admissionTimeoutMs?.FAST ?? options.timeoutMs.FAST);
+    this.deep = new BoundedSemaphore(options.maxConcurrency.DEEP, options.maxWaiters?.DEEP ?? 0, options.admissionTimeoutMs?.DEEP ?? options.timeoutMs.DEEP);
+    this.batch = new BoundedSemaphore(1, options.maxWaiters?.BATCH ?? 0, options.admissionTimeoutMs?.BATCH ?? options.timeoutMs.BATCH);
   }
 
   async decide(request: AstraDecisionRequest): Promise<AstraModelResult> {
     const semaphore = request.stage === "DEEP" ? this.deep : this.fast;
     const started = performance.now();
-    const lease = await semaphore.acquire(request.stage, this.options.timeoutMs[request.stage], request.signal);
+    // This admission wait is finite but is not part of the provider-response
+    // deadline. The response timer is armed only by beginDispatch().
+    const lease = await semaphore.acquire(request.stage, request.signal);
     const controller = new AbortController();
-    const timeout = lease.remainingMs > 0 ? setTimeout(() => controller.abort(), lease.remainingMs) : undefined;
-    const abortRequest = () => controller.abort();
-    request.signal?.addEventListener("abort", abortRequest, { once: true });
+    let timeout: NodeJS.Timeout | undefined;
+    let rejectDeadline: ((error: AstraClientError) => void) | undefined;
+    let rejectAbort: ((error: AstraClientError) => void) | undefined;
     let dispatched = false;
+    let dispatchStarted = false;
+    const deadline = new Promise<never>((_, reject) => { rejectDeadline = reject; });
+    const aborted = new Promise<never>((_, reject) => { rejectAbort = reject; });
+    const abortRequest = () => {
+      controller.abort();
+      if (dispatched) rejectAbort?.(new AstraClientError("ASTRA_REQUEST_ABORTED", request.stage, "DISPATCHED_UNKNOWN", { latencyMs: performance.now() - started }));
+    };
+    request.signal?.addEventListener("abort", abortRequest, { once: true });
+    let providerRequest: Promise<ProviderResponse> | undefined;
     try {
       if (request.signal?.aborted) throw new AstraClientError("ASTRA_REQUEST_ABORTED", request.stage, "NOT_DISPATCHED");
-      if (lease.remainingMs <= 0) throw new AstraClientError("ASTRA_REQUEST_TIMEOUT", request.stage, "NOT_DISPATCHED");
-      dispatched = true;
-      const response = await this.client.responses.parse({
-        model: this.options.model,
-        prompt_cache_key: `astra-brain-v1:${request.stage}`,
-        reasoning: { effort: this.options.reasoning[request.stage] },
-        input: [
-          { role: "system", content: request.stage === "DEEP" ? DEEP_SYSTEM_PROMPT : FAST_SYSTEM_PROMPT },
-          { role: "user", content: JSON.stringify(decisionTask(request)) },
-        ],
-        text: { format: zodTextFormat(astraModelOutputSchema, "astra_decision") },
-        max_output_tokens: this.options.maxOutputTokens[request.stage],
-        store: false,
-      }, { signal: controller.signal });
-      if (!response.output_parsed) throw new AstraClientError("ASTRA_STRUCTURED_OUTPUT_MISSING", request.stage);
+      const beginDispatch = (): boolean => {
+        if (dispatchStarted || request.signal?.aborted) return false;
+        dispatchStarted = true;
+        try {
+          const requestPromise = this.client.responses.parse({
+            model: this.options.model,
+            prompt_cache_key: `astra-brain-v1:${request.stage}`,
+            reasoning: { effort: this.options.reasoning[request.stage] },
+            input: [
+              { role: "system", content: request.stage === "DEEP" ? DEEP_SYSTEM_PROMPT : FAST_SYSTEM_PROMPT },
+              { role: "user", content: JSON.stringify(decisionTask(request)) },
+            ],
+            text: { format: zodTextFormat(astraModelOutputSchema, "astra_decision") },
+            max_output_tokens: this.options.maxOutputTokens[request.stage],
+            store: false,
+          }, { signal: controller.signal }) as Promise<ProviderResponse>;
+          if (!requestPromise || typeof requestPromise.then !== "function") return false;
+          providerRequest = requestPromise;
+          dispatched = true;
+          // This is the actual maximum wall-clock provider operation
+          // deadline; admission and request construction are excluded.
+          timeout = setTimeout(() => {
+            controller.abort();
+            rejectDeadline?.(new AstraClientError("ASTRA_REQUEST_TIMEOUT", request.stage, "DISPATCHED_UNKNOWN", { latencyMs: performance.now() - started }));
+          }, this.options.timeoutMs[request.stage]);
+        } catch (error) {
+          return false;
+        }
+        return true;
+      };
+      const context = this.dispatchContext(request);
+      if (request.providerDispatchAuthorization) await request.providerDispatchAuthorization(context, beginDispatch);
+      else beginDispatch();
+      if (request.signal?.aborted) throw new AstraClientError("ASTRA_REQUEST_ABORTED", request.stage, dispatched ? "DISPATCHED_UNKNOWN" : "NOT_DISPATCHED");
+      if (!providerRequest) throw new AstraClientError("ASTRA_REQUEST_ABORTED", request.stage, "NOT_DISPATCHED");
+      const response = await Promise.race([providerRequest, deadline, aborted]);
+      const measured = usageFromResponse(response, this.options.pricing);
+      const details = { providerRequestId: response.id ?? null, usage: measured.usage, knownUsage: measured.known, latencyMs: performance.now() - started };
+      if (response.output_parsed == null) throw new AstraClientError("ASTRA_STRUCTURED_OUTPUT_MISSING", request.stage, "RESPONSE_RECEIVED", details);
       let output;
       try {
         output = astraModelOutputSchema.parse(response.output_parsed);
       } catch {
-        throw new AstraClientError("ASTRA_STRUCTURED_OUTPUT_INVALID", request.stage);
+        throw new AstraClientError("ASTRA_STRUCTURED_OUTPUT_INVALID", request.stage, "RESPONSE_RECEIVED", details);
       }
-      const usage = response.usage;
-      const inputTokens = usage?.input_tokens ?? 0;
-      const cachedInputTokens = usage?.input_tokens_details?.cached_tokens ?? 0;
-      const outputTokens = usage?.output_tokens ?? 0;
-      const reasoningTokens = usage?.output_tokens_details?.reasoning_tokens ?? 0;
-      const cacheWriteTokens = usage?.input_tokens_details?.cache_write_tokens ?? 0;
-      const costUsd = (Math.max(0, inputTokens - cachedInputTokens - cacheWriteTokens) / 1_000_000) * this.options.pricing.inputUsdPerM
-        + (cachedInputTokens / 1_000_000) * this.options.pricing.cachedInputUsdPerM
-        + (cacheWriteTokens / 1_000_000) * (this.options.pricing.cacheWriteUsdPerM ?? this.options.pricing.inputUsdPerM)
-        + (outputTokens / 1_000_000) * this.options.pricing.outputUsdPerM;
-      const safeUsage: AstraUsage = { inputTokens, cachedInputTokens, cacheWriteTokens, outputTokens, reasoningTokens, costUsd };
-      return { output, usage: safeUsage, providerRequestId: response.id ?? null, latencyMs: performance.now() - started };
+      return { output, usage: measured.usage, providerRequestId: response.id ?? null, latencyMs: performance.now() - started };
     } catch (error) {
       if (error instanceof AstraClientError) throw error;
       if (controller.signal.aborted) {
-        throw new AstraClientError(request.signal?.aborted ? "ASTRA_REQUEST_ABORTED" : "ASTRA_REQUEST_TIMEOUT", request.stage, dispatched ? "DISPATCHED_UNKNOWN" : "NOT_DISPATCHED");
+        throw new AstraClientError(request.signal?.aborted ? "ASTRA_REQUEST_ABORTED" : "ASTRA_REQUEST_TIMEOUT", request.stage, dispatched ? "DISPATCHED_UNKNOWN" : "NOT_DISPATCHED", { latencyMs: performance.now() - started });
       }
-      throw new AstraClientError("ASTRA_REQUEST_FAILED", request.stage, dispatched ? "DISPATCHED_UNKNOWN" : "NOT_DISPATCHED");
+      throw new AstraClientError("ASTRA_REQUEST_FAILED", request.stage, dispatched ? "DISPATCHED_UNKNOWN" : "NOT_DISPATCHED", { latencyMs: performance.now() - started });
     } finally {
       if (timeout) clearTimeout(timeout);
       request.signal?.removeEventListener("abort", abortRequest);
@@ -145,61 +183,86 @@ export class OpenAIAstraClient implements AstraClient {
 
   async learn(request: AstraBatchRequest): Promise<AstraBatchResult> {
     const started = performance.now();
-    const lease = await this.batch.acquire(request.stage, this.options.timeoutMs.BATCH, request.signal);
+    const lease = await this.batch.acquire(request.stage, request.signal);
     const controller = new AbortController();
-    const timeout = lease.remainingMs > 0 ? setTimeout(() => controller.abort(), lease.remainingMs) : undefined;
-    const abortRequest = () => controller.abort();
-    request.signal?.addEventListener("abort", abortRequest, { once: true });
+    let timeout: NodeJS.Timeout | undefined;
+    let rejectDeadline: ((error: AstraClientError) => void) | undefined;
+    let rejectAbort: ((error: AstraClientError) => void) | undefined;
     let dispatched = false;
+    let dispatchStarted = false;
+    const deadline = new Promise<never>((_, reject) => { rejectDeadline = reject; });
+    const aborted = new Promise<never>((_, reject) => { rejectAbort = reject; });
+    const abortRequest = () => {
+      controller.abort();
+      if (dispatched) rejectAbort?.(new AstraClientError("ASTRA_REQUEST_ABORTED", request.stage, "DISPATCHED_UNKNOWN", { latencyMs: performance.now() - started }));
+    };
+    request.signal?.addEventListener("abort", abortRequest, { once: true });
+    let providerRequest: Promise<ProviderResponse> | undefined;
     try {
       if (request.signal?.aborted) throw new AstraClientError("ASTRA_REQUEST_ABORTED", request.stage, "NOT_DISPATCHED");
-      if (lease.remainingMs <= 0) throw new AstraClientError("ASTRA_REQUEST_TIMEOUT", request.stage, "NOT_DISPATCHED");
-      dispatched = true;
-      const response = await this.client.responses.parse({
-        model: this.options.model,
-        prompt_cache_key: "astra-brain-v1:BATCH",
-        reasoning: { effort: this.options.reasoning.BATCH },
-        input: [
-          { role: "system", content: BATCH_SYSTEM_PROMPT },
-          { role: "user", content: JSON.stringify({
-            task: "Summarize compact settled-outcome statistics into reusable lessons.",
-            stage: "BATCH",
-            aggregate: request.aggregate,
-          }) },
-        ],
-        text: { format: zodTextFormat(astraBatchOutputSchema, "astra_batch_lessons") },
-        max_output_tokens: this.options.maxOutputTokens.BATCH,
-        store: false,
-      }, { signal: controller.signal });
-      if (!response.output_parsed) throw new AstraClientError("ASTRA_STRUCTURED_OUTPUT_MISSING", request.stage);
+      const beginDispatch = (): boolean => {
+        if (dispatchStarted || request.signal?.aborted) return false;
+        dispatchStarted = true;
+        try {
+          const requestPromise = this.client.responses.parse({
+            model: this.options.model,
+            prompt_cache_key: "astra-brain-v1:BATCH",
+            reasoning: { effort: this.options.reasoning.BATCH },
+            input: [
+              { role: "system", content: BATCH_SYSTEM_PROMPT },
+              { role: "user", content: JSON.stringify({
+                task: "Summarize compact settled-outcome statistics into reusable lessons.",
+                stage: "BATCH",
+                aggregate: request.aggregate,
+              }) },
+            ],
+            text: { format: zodTextFormat(astraBatchOutputSchema, "astra_batch_lessons") },
+            max_output_tokens: this.options.maxOutputTokens[request.stage],
+            store: false,
+          }, { signal: controller.signal }) as Promise<ProviderResponse>;
+          if (!requestPromise || typeof requestPromise.then !== "function") return false;
+          providerRequest = requestPromise;
+          dispatched = true;
+          timeout = setTimeout(() => {
+            controller.abort();
+            rejectDeadline?.(new AstraClientError("ASTRA_REQUEST_TIMEOUT", request.stage, "DISPATCHED_UNKNOWN", { latencyMs: performance.now() - started }));
+          }, this.options.timeoutMs.BATCH);
+        } catch (error) {
+          return false;
+        }
+        return true;
+      };
+      if (request.providerDispatchAuthorization) {
+        await request.providerDispatchAuthorization({
+          experimentId: request.experimentId ?? "unknown",
+          runGeneration: request.runGeneration ?? 0,
+          traceId: request.traceId,
+          triggerId: request.traceId,
+          stage: "BATCH",
+          model: this.options.model,
+          triggerKind: "BATCH",
+          marketId: null,
+        }, beginDispatch);
+      } else beginDispatch();
+      if (request.signal?.aborted) throw new AstraClientError("ASTRA_REQUEST_ABORTED", request.stage, dispatched ? "DISPATCHED_UNKNOWN" : "NOT_DISPATCHED");
+      if (!providerRequest) throw new AstraClientError("ASTRA_REQUEST_ABORTED", request.stage, "NOT_DISPATCHED");
+      const response = await Promise.race([providerRequest, deadline, aborted]);
+      const measured = usageFromResponse(response, this.options.pricing);
+      const details = { providerRequestId: response.id ?? null, usage: measured.usage, knownUsage: measured.known, latencyMs: performance.now() - started };
+      if (response.output_parsed == null) throw new AstraClientError("ASTRA_STRUCTURED_OUTPUT_MISSING", request.stage, "RESPONSE_RECEIVED", details);
       let output;
       try {
         output = astraBatchOutputSchema.parse(response.output_parsed);
       } catch {
-        throw new AstraClientError("ASTRA_STRUCTURED_OUTPUT_INVALID", request.stage);
+        throw new AstraClientError("ASTRA_STRUCTURED_OUTPUT_INVALID", request.stage, "RESPONSE_RECEIVED", details);
       }
-      const usage = response.usage;
-      const inputTokens = usage?.input_tokens ?? 0;
-      const cachedInputTokens = usage?.input_tokens_details?.cached_tokens ?? 0;
-      const outputTokens = usage?.output_tokens ?? 0;
-      const reasoningTokens = usage?.output_tokens_details?.reasoning_tokens ?? 0;
-      const cacheWriteTokens = usage?.input_tokens_details?.cache_write_tokens ?? 0;
-      const costUsd = (Math.max(0, inputTokens - cachedInputTokens - cacheWriteTokens) / 1_000_000) * this.options.pricing.inputUsdPerM
-        + (cachedInputTokens / 1_000_000) * this.options.pricing.cachedInputUsdPerM
-        + (cacheWriteTokens / 1_000_000) * (this.options.pricing.cacheWriteUsdPerM ?? this.options.pricing.inputUsdPerM)
-        + (outputTokens / 1_000_000) * this.options.pricing.outputUsdPerM;
-      return {
-        output,
-        usage: { inputTokens, cachedInputTokens, cacheWriteTokens, outputTokens, reasoningTokens, costUsd },
-        providerRequestId: response.id ?? null,
-        latencyMs: performance.now() - started,
-      };
+      return { output, usage: measured.usage, providerRequestId: response.id ?? null, latencyMs: performance.now() - started };
     } catch (error) {
       if (error instanceof AstraClientError) throw error;
       if (controller.signal.aborted) {
-        throw new AstraClientError(request.signal?.aborted ? "ASTRA_REQUEST_ABORTED" : "ASTRA_REQUEST_TIMEOUT", request.stage, dispatched ? "DISPATCHED_UNKNOWN" : "NOT_DISPATCHED");
+        throw new AstraClientError(request.signal?.aborted ? "ASTRA_REQUEST_ABORTED" : "ASTRA_REQUEST_TIMEOUT", request.stage, dispatched ? "DISPATCHED_UNKNOWN" : "NOT_DISPATCHED", { latencyMs: performance.now() - started });
       }
-      throw new AstraClientError("ASTRA_REQUEST_FAILED", request.stage, dispatched ? "DISPATCHED_UNKNOWN" : "NOT_DISPATCHED");
+      throw new AstraClientError("ASTRA_REQUEST_FAILED", request.stage, dispatched ? "DISPATCHED_UNKNOWN" : "NOT_DISPATCHED", { latencyMs: performance.now() - started });
     } finally {
       if (timeout) clearTimeout(timeout);
       request.signal?.removeEventListener("abort", abortRequest);
@@ -210,23 +273,92 @@ export class OpenAIAstraClient implements AstraClient {
   concurrencySnapshot(stage: "FAST" | "DEEP" | "BATCH"): { active: number; waiting: number; maxWaiters: number; limit: number } {
     return (stage === "FAST" ? this.fast : stage === "DEEP" ? this.deep : this.batch).snapshot();
   }
+
+  private dispatchContext(request: AstraDecisionRequest): AstraProviderDispatchContext {
+    return {
+      experimentId: request.experimentId ?? "unknown",
+      runGeneration: request.runGeneration ?? 0,
+      traceId: request.traceId,
+      triggerId: request.triggerId,
+      stage: request.stage,
+      model: this.options.model,
+      triggerKind: request.featurePacket.triggerKind,
+      marketId: request.featurePacket.marketId,
+    };
+  }
 }
 
-export type AstraDispatchState = "NOT_DISPATCHED" | "DISPATCHED_UNKNOWN";
+export type AstraDispatchState = "NOT_DISPATCHED" | "DISPATCHED_UNKNOWN" | "RESPONSE_RECEIVED";
+export type AstraFailureCode =
+  | "TIMEOUT"
+  | "CONCURRENCY_SATURATED"
+  | "REQUEST_FAILED"
+  | "REQUEST_ABORTED"
+  | "STRUCTURED_OUTPUT_MISSING"
+  | "STRUCTURED_OUTPUT_INVALID"
+  | "STAGE_ADMISSION_CLOSED"
+  | "ACCOUNTING_FAILED"
+  | "PERSISTENCE_FAILED";
 
 export class AstraClientError extends Error {
-  constructor(message: string, readonly stage?: AstraStage, readonly dispatchState: AstraDispatchState = "DISPATCHED_UNKNOWN") { super(message); this.name = "AstraClientError"; }
+  readonly failureCode: AstraFailureCode;
+  readonly providerRequestId: string | null;
+  readonly usage: AstraUsage | null;
+  readonly knownUsage: boolean;
+  readonly latencyMs: number | null;
+  readonly admissionReason: string | null;
+  constructor(
+    message: string,
+    readonly stage?: AstraStage,
+    readonly dispatchState: AstraDispatchState = "DISPATCHED_UNKNOWN",
+    details: { providerRequestId?: string | null; usage?: AstraUsage; knownUsage?: boolean; latencyMs?: number; admissionReason?: string } = {},
+  ) {
+    super(message); this.name = "AstraClientError";
+    this.failureCode = failureCodeFor(message);
+    this.providerRequestId = details.providerRequestId ?? null;
+    this.usage = details.usage ?? null;
+    this.knownUsage = details.knownUsage === true;
+    this.latencyMs = details.latencyMs ?? null;
+    this.admissionReason = details.admissionReason ?? null;
+  }
+}
+
+function failureCodeFor(message: string): AstraFailureCode {
+  switch (message) {
+    case "ASTRA_REQUEST_TIMEOUT": return "TIMEOUT";
+    case "ASTRA_CONCURRENCY_SATURATED": return "CONCURRENCY_SATURATED";
+    case "ASTRA_REQUEST_ABORTED": return "REQUEST_ABORTED";
+    case "ASTRA_STRUCTURED_OUTPUT_MISSING": return "STRUCTURED_OUTPUT_MISSING";
+    case "ASTRA_STRUCTURED_OUTPUT_INVALID": return "STRUCTURED_OUTPUT_INVALID";
+    case "ASTRA_PROVIDER_DISPATCH_BLOCKED": return "STAGE_ADMISSION_CLOSED";
+    case "ASTRA_PROVIDER_DISPATCH_EVIDENCE_FAILED": return "PERSISTENCE_FAILED";
+    default: return "REQUEST_FAILED";
+  }
+}
+
+function usageFromResponse(response: ProviderResponse, pricing: AstraOpenAIOptions["pricing"]): { usage: AstraUsage; known: boolean } {
+  const raw = response.usage;
+  const inputTokens = raw?.input_tokens ?? 0;
+  const cachedInputTokens = raw?.input_tokens_details?.cached_tokens ?? 0;
+  const outputTokens = raw?.output_tokens ?? 0;
+  const reasoningTokens = raw?.output_tokens_details?.reasoning_tokens ?? 0;
+  const cacheWriteTokens = raw?.input_tokens_details?.cache_write_tokens ?? 0;
+  const costUsd = (Math.max(0, inputTokens - cachedInputTokens - cacheWriteTokens) / 1_000_000) * pricing.inputUsdPerM
+    + (cachedInputTokens / 1_000_000) * pricing.cachedInputUsdPerM
+    + (cacheWriteTokens / 1_000_000) * (pricing.cacheWriteUsdPerM ?? pricing.inputUsdPerM)
+    + (outputTokens / 1_000_000) * pricing.outputUsdPerM;
+  return { usage: { inputTokens, cachedInputTokens, cacheWriteTokens, outputTokens, reasoningTokens, costUsd }, known: raw != null };
 }
 
 class BoundedSemaphore {
   private active = 0;
   private readonly waiting: Array<{ tryGrant: () => boolean }> = [];
   private readonly maxWaiters: number;
-  constructor(private readonly limit: number, maxWaiters: number) {
+  constructor(private readonly limit: number, maxWaiters: number, private readonly admissionTimeoutMs: number) {
     this.maxWaiters = Number.isFinite(maxWaiters) ? Math.max(0, Math.floor(maxWaiters)) : 0;
   }
-  async acquire(stage: AstraStage, timeoutMs: number, signal?: AbortSignal): Promise<{ release: () => void; remainingMs: number }> {
-    const deadline = performance.now() + Math.max(0, timeoutMs);
+  async acquire(stage: AstraStage, signal?: AbortSignal): Promise<{ release: () => void; remainingMs: number }> {
+    const deadline = performance.now() + Math.max(0, this.admissionTimeoutMs);
     if (signal?.aborted) throw new AstraClientError("ASTRA_REQUEST_ABORTED", stage, "NOT_DISPATCHED");
     if (this.active < this.limit) {
       this.active += 1;
