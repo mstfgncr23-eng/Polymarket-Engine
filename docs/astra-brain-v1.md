@@ -9,19 +9,23 @@ OpenAI Responses client.
 ## Safety boundary
 
 - No Native fallback exists when Astra is enabled. Missing structured output,
-  timeout, budget exhaustion, stale data, journal failure, and failed current
-  book revalidation fail closed.
+  timeout, stale data, journal failure, and failed current-book revalidation
+  fail closed.
 - Existing unpaired positions use the deterministic hedge path directly. Astra
   is not called for a hedge, and the existing `$25` hedge cap remains intact.
 - New first legs use a separate `$12.50` cap. This is enforced in strategy
   sizing and in deterministic risk evaluation.
 - The existing journal and durable mutation gate remain the economic authority.
   Per-trigger Astra facts are bounded and appended in a single canonical batch
-  before an order can be submitted. Astra usage cost is recorded through the
-  existing authoritative operating-cost transition.
-- Memory, daily budget state, and the bounded learner checkpoint are included
-  in the existing verified engine checkpoint. No raw history, secrets, or
-  chain-of-thought are persisted.
+  before an order can be submitted. Successful provider usage is recorded
+  through the existing authoritative operating-cost transition.
+- Memory and the bounded learner checkpoint are included in the existing
+  verified engine checkpoint. No raw history, secrets, or chain-of-thought are
+  persisted.
+- Astra has no calendar-day monetary cutoff and no UTC reset. Cost is observed
+  and durably accounted from provider usage. Dispatch remains bounded by
+  deterministic opportunity admission, first-leg windows, stage concurrency,
+  timeouts, output-token caps, and selective Deep review.
 
 ## Configuration
 
@@ -29,10 +33,11 @@ Astra is disabled by default. When enabled in production, `ASTRA_API_KEY` is
 required by configuration validation and must be supplied through the runtime
 environment only. The application does not read keys from files or log them.
 
-The default daily inference budget is `$5`. Fast and Deep calls have separate
-bounded concurrency, timeout, output-token, and uncertainty controls. Deep
-review is selective and triggered by the strict model output or the configured
-uncertainty threshold.
+`ASTRA_MAX_DAILY_COST_USD` is accepted only as a deprecated deployment-compatibility
+input and is ignored. It has no default and does not gate or reset inference.
+Fast and Deep calls retain separate bounded concurrency, timeout, output-token,
+and uncertainty controls. Deep review is selective and triggered by the strict
+model output or the configured uncertainty threshold.
 
 Fast is the ordinary first-leg economic decision. Deep is a deterministic,
 selective challenge pass; it is never called after Fast returns `NO_TRADE`, and
@@ -55,13 +60,15 @@ Settlement observations feed a bounded batch learner for calibration and
 counterfactual evidence. Reproducible counterfactuals are computed only from
 recorded execution facts; otherwise they are marked unavailable. Astra
 invocation counts and costs are reported separately for `ASTRA_FAST`,
-`ASTRA_DEEP`, and `ASTRA_BATCH`. Usage, failures, budget blocks, gate outcomes,
-deep reviews, reconnect timing, and learning updates are observable through
-bounded metrics and canonical report inputs. The existing completion and
-final-report flow remains unchanged.
+`ASTRA_DEEP`, and `ASTRA_BATCH`. Usage, failures, gate outcomes, deep reviews,
+reconnect timing, and learning updates are observable through bounded metrics
+and canonical report inputs. Historical `ASTRA_BUDGET_BLOCK` facts remain
+readable for old reports but new Astra execution does not emit budget blocks.
+The existing completion and final-report flow remains unchanged.
 
-Recovery restores the experiment identity, authority, bounded memory,
-calibration/lesson state, and daily cost state from the existing checkpoint;
-old Native checkpoints remain readable. Native V1 remains available for the
-default mode and historical compatibility, but it is not an economic fallback
-when Astra is enabled.
+Recovery restores the experiment identity, authority, bounded memory, and
+calibration/lesson state from the existing checkpoint. Legacy checkpoints that
+contain `astraBudget` remain recoverable, but that field is ignored and never
+controls dispatch. Old Native checkpoints remain readable. Native V1 remains
+available for the default mode and historical compatibility, but it is not an
+economic fallback when Astra is enabled.
