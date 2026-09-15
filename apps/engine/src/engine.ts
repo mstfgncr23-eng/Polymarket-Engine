@@ -2476,7 +2476,7 @@ export class EngineService {
     if (candidate.intent === "OPEN_FIRST_LEG" && this.experimentStartPending) return;
     if (!this.adapterTokenSynchronized(candidate.tokenId)) return;
     if (candidate.intent === "OPEN_FIRST_LEG" && this.overload.state === "FAIL_CLOSED") return;
-    if (candidate.intent === "OPEN_FIRST_LEG" && !experimentAllowsFirstLeg(this.experiment)) return;
+    if (candidate.intent === "OPEN_FIRST_LEG" && !experimentAllowsFirstLeg(this.experiment, this.nowFn())) return;
     if (candidate.intent === "OPEN_FIRST_LEG" && !this.entryQualified.has(candidate.marketId)) return;
     if (candidate.intent === "OPEN_FIRST_LEG" && !this.isMarketSynchronized(candidate.marketId)) return;
     if (candidate.intent === "OPEN_FIRST_LEG" && assetNeedsReliableReference(this.referenceRequired.get(candidate.marketId), this.referenceUnreliable, this.assetByMarket.get(candidate.marketId))) return;
@@ -2532,7 +2532,7 @@ export class EngineService {
         externalSignalsLastMinute: 0,
         lastStrategyTradeAt: this.lastTradeAt,
         duplicateTrade: (this.recentTrades.get(duplicateKey) ?? 0) > now.getTime() - this.riskLimits.strategyCooldownMs,
-        experimentEntryOpen: candidate.intent === "HEDGE_SECOND_LEG" ? experimentAllowsHedge(this.experiment) : experimentAllowsFirstLeg(this.experiment),
+        experimentEntryOpen: candidate.intent === "HEDGE_SECOND_LEG" ? experimentAllowsHedge(this.experiment) : experimentAllowsFirstLeg(this.experiment, this.nowFn()),
         executionErrorsLastHour: this.executionErrors.filter((at) => now.getTime() - at < 3_600_000).length,
         externalRiskRecommendedVeto: false, shuttingDown: this.state.draining,
       },
@@ -2949,7 +2949,7 @@ export class EngineService {
     if (this.env.GROK_ACTIVATION_PROVIDER !== "xai"
       || this.experiment?.modelConfiguration.authority === NATIVE_DETERMINISTIC_AUTHORITY
       || this.experiment?.status !== "RUNNING"
-      || !experimentAllowsFirstLeg(this.experiment)
+      || !experimentAllowsFirstLeg(this.experiment, this.nowFn())
       || (this.experiment.entryClosesAt !== null && this.nowFn().getTime() >= new Date(this.experiment.entryClosesAt).getTime())) return;
     // No bounded news context is produced by ordinary market/reference
     // ingress. Never spend a call to manufacture a "no news" answer.
