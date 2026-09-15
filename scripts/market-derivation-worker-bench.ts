@@ -14,16 +14,16 @@ import {
   compactBookSidesForDerivation,
   deriveBook,
   deriveBookFromSides,
+  marketSnapshotSchema,
   TriggerEngine,
   triggerConfigSchema,
   type BookDerived,
   type MarketSnapshot,
-} from "@pm/core";
+} from "../packages/core/src/index.ts";
 import { MarketDerivationWorkerService } from "../apps/engine/src/market-derivation-service.ts";
-import { snapshot as fixtureSnapshot } from "../tests/fixtures.ts";
 
-const ITERATIONS = 2_000;
-const WARMUP = 50;
+const ITERATIONS = 8_000;
+const WARMUP = 100;
 const LEVELS = 45;
 
 function levels(count: number, start: number, seed: number): Array<{ price: string; quantity: string }> {
@@ -33,14 +33,37 @@ function levels(count: number, start: number, seed: number): Array<{ price: stri
   }));
 }
 
+const NOW = "2026-08-31T12:00:00.000Z";
+const FEE = {
+  rate: "0.07",
+  exponent: 1,
+  takerOnly: true,
+  rebateRate: "0.2",
+  source: "configured_test_fixture" as const,
+  effectiveAt: NOW,
+};
+
 function makeSnapshot(index: number): MarketSnapshot {
-  return fixtureSnapshot({
+  return marketSnapshotSchema.parse({
     eventId: `m-${index}`,
-    sequence: index + 1,
+    traceId: `t-${index}`,
+    marketId: "btc-15m",
     tokenId: index % 2 === 0 ? "up" : "down",
     outcome: index % 2 === 0 ? "UP" : "DOWN",
-    bids: levels(LEVELS, 0.10, index),
-    asks: levels(LEVELS, 0.55, index * 3),
+    bids: levels(LEVELS, 0.10, index).map((level, levelIndex) => (
+      levelIndex < 5 ? { ...level, quantity: String(200 + (index % 17)) } : level
+    )),
+    asks: levels(LEVELS, 0.55, index * 3).map((level, levelIndex) => (
+      levelIndex < 5 ? { ...level, quantity: String(1 + (index % 3)) } : level
+    )),
+    lastTradePrice: "0.48",
+    tickSize: "0.01",
+    minOrderSize: "1",
+    feeSchedule: FEE,
+    sourceTimestamp: NOW,
+    receivedAt: NOW,
+    sequence: index + 1,
+    hash: `h-${index}`,
   });
 }
 
