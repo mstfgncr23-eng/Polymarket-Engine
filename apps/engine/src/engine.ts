@@ -2105,8 +2105,27 @@ export class EngineService {
 
   private async ingestMarketSnapshot(snapshot: MarketSnapshot): Promise<TriggerEvent[]> {
     if (!this.derivationWorker) return this.triggerEngine.ingestMarket(snapshot);
+    const fence = {
+      runGeneration: this.experimentRunGeneration,
+      experimentId: this.experiment?.id ?? null,
+      startPending: this.experimentStartPending,
+      preparePending: this.experimentPreparePending,
+    };
     const { derived } = await this.derivationWorker.deriveSnapshot(snapshot);
+    if (this.marketSnapshotFenceStale(fence)) return [];
     return this.triggerEngine.ingestMarketWithDerived(snapshot, derived);
+  }
+
+  private marketSnapshotFenceStale(fence: {
+    runGeneration: number;
+    experimentId: string | null;
+    startPending: boolean;
+    preparePending: boolean;
+  }): boolean {
+    if (fence.runGeneration !== this.experimentRunGeneration) return true;
+    if (fence.experimentId !== (this.experiment?.id ?? null)) return true;
+    if (this.experimentPreparePending) return true;
+    return fence.startPending !== this.experimentStartPending;
   }
 
   private async onReferenceTick(tick: ReferenceTick): Promise<void> {

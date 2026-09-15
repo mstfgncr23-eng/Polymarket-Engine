@@ -190,6 +190,7 @@ export class MarketDerivationWorkerService {
           this.disabled = true;
           this.available = false;
           if (this.pending?.id === id) this.finish(pending, "timeout", this.fallback(pending));
+          void this.killQuiet();
         }, this.timeoutMs),
       };
       pending.timer.unref();

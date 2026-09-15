@@ -1,3 +1,4 @@
+import { Worker } from "node:worker_threads";
 import { describe, expect, it } from "vitest";
 import {
   deriveBook,
@@ -97,6 +98,7 @@ describe("PR52 worker failure fallback", () => {
     const result = await service.deriveSnapshot(STREAM[0]!);
     expect(result.status).toBe("timeout");
     expect(result.derived).toEqual(deriveBook(STREAM[0]!));
+    expect((service as unknown as { worker: Worker | null }).worker).toBeNull();
     const next = await service.deriveSnapshot(STREAM[1]!);
     expect(next.status).toBe("fallback");
     await new Promise((resolve) => setTimeout(resolve, 50));
@@ -141,6 +143,37 @@ describe("PR52 worker shutdown", () => {
       stop,
       new Promise((_, reject) => setTimeout(() => reject(new Error("WORKER_STOP_HUNG")), 2_000)),
     ]);
+  });
+
+  it("does not admit triggers if experiment generation changes during worker await", async () => {
+    const started = await startQualifiedEngine({
+      MARKET_DERIVATION_WORKER_ENABLED: "true",
+      MARKET_DERIVATION_WORKER_TIMEOUT_MS: "2000",
+    });
+    const delayed = new MarketDerivationWorkerService({ timeoutMs: 2_000, workerData: { delayMs: 80 } });
+    expect(await delayed.start()).toBe(true);
+    (started.engine as unknown as { derivationWorker: MarketDerivationWorkerService | null }).derivationWorker = delayed;
+    try {
+      const snap = book({
+        tokenId: "btc-up",
+        marketId: "btc-mkt",
+        bids: [{ price: "0.47", quantity: "100" }],
+        asks: [{ price: "0.48", quantity: "1" }],
+      });
+      const pending = started.market.emitSnapshot(snap);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      (started.engine as unknown as { experimentRunGeneration: number }).experimentRunGeneration += 1;
+      await pending;
+      const item = started.engine.metrics.registry.getSingleMetric("triggers_emitted_total");
+      const data = item ? await item.get() : { values: [] };
+      const emitted = data.values
+        .filter((point) => !point.metricName?.endsWith("_created") && !point.metricName?.endsWith("_bucket"))
+        .reduce((sum, point) => sum + point.value, 0);
+      expect(emitted).toBe(0);
+    } finally {
+      await delayed.stop();
+      await started.engine.stop();
+    }
   });
 
   it("engine stop joins the worker when the flag is on", async () => {

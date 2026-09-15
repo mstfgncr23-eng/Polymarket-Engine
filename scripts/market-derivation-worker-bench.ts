@@ -7,7 +7,7 @@
  *
  *   pnpm bench:market-derivation-worker
  */
-import { performance } from "node:perf_hooks";
+import { performance, monitorEventLoopDelay } from "node:perf_hooks";
 import { cpus } from "node:os";
 import { writeFileSync } from "node:fs";
 import {
@@ -81,19 +81,29 @@ function cpuMs(start: NodeJS.CpuUsage): number {
   return (used.user + used.system) / 1000;
 }
 
-async function withTimerProbe<T>(work: () => Promise<T>): Promise<{ result: T; maxTimerDelayMs: number }> {
-  let expected = Date.now() + 5;
+async function withTimerProbe<T>(work: () => Promise<T>): Promise<{ result: T; maxTimerDelayMs: number; eventLoopDelayMaxMs: number }> {
+  const intervalMs = 5;
+  let expected = Date.now() + intervalMs;
   let maxTimerDelayMs = 0;
+  let callbacks = 0;
   const timer = setInterval(() => {
+    callbacks += 1;
     const now = Date.now();
     maxTimerDelayMs = Math.max(maxTimerDelayMs, now - expected);
-    expected = now + 5;
-  }, 5);
+    expected = now + intervalMs;
+  }, intervalMs);
   timer.unref();
+  const histogram = monitorEventLoopDelay({ resolution: 1 });
+  histogram.enable();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const workStarted = Date.now();
   try {
     const result = await work();
-    return { result, maxTimerDelayMs };
+    if (callbacks === 0) maxTimerDelayMs = Math.max(0, Date.now() - workStarted - intervalMs);
+    histogram.disable();
+    return { result, maxTimerDelayMs, eventLoopDelayMaxMs: Number((histogram.max / 1e6).toFixed(3)) };
   } finally {
+    histogram.disable();
     clearInterval(timer);
   }
 }
@@ -190,6 +200,7 @@ const report = {
     opsPerSec: Number((iterations / (syncWallMs / 1000)).toFixed(1)),
     eventLoopUtilization: Number(syncElu.toFixed(4)),
     maxTimerDelayMs: syncProbe.maxTimerDelayMs,
+    eventLoopDelayMaxMs: syncProbe.eventLoopDelayMaxMs,
   },
   worker: {
     wallMs: Number(workerWallMs.toFixed(3)),
@@ -197,6 +208,7 @@ const report = {
     opsPerSec: Number((iterations / (workerWallMs / 1000)).toFixed(1)),
     eventLoopUtilization: Number(workerElu.toFixed(4)),
     maxTimerDelayMs: workerProbe.maxTimerDelayMs,
+    eventLoopDelayMaxMs: workerProbe.eventLoopDelayMaxMs,
     success: workerProbe.result.success,
     roundTripAvgMs: Number((roundTripSum / iterations).toFixed(3)),
     roundTripMaxMs: Number(roundTripMax.toFixed(3)),
