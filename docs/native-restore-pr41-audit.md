@@ -51,7 +51,7 @@ Do not carry any Astra admission, provider, model, budget, memory, correlation, 
 
 Files:
 - `packages/market-data/src/bounded-clob-market.ts`
-- `tests/polymarket-clob-close-diagnostic.test.ts`
+- native regression extracted into `tests/native-restore-ws-1013.test.ts`
 - optional metric-only pieces from `apps/engine/src/metrics.ts` / `engine.ts`
 
 Keep behavior:
@@ -149,8 +149,8 @@ Applied on `restore/native-baseline`:
 - [x] strict time-aware first-leg helper
 - [x] dedicated native regression tests for both
 - [ ] native close-vs-entry race fence in EngineService
-- [ ] optional WS 1013 diagnostic
+- [x] optional WS 1013 diagnostic + native regression
 - [ ] PR53 beginExperiment residue gate
 - [ ] PR50 market-data optimization
 - [ ] current dashboard visual layer / native selector adaptation
-- [ ] storage watchdog
+- [x] storage watchdog scaffold
