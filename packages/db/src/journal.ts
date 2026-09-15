@@ -117,6 +117,7 @@ function rollupAuthorizesCanonicalDelete(rollup: AnalyticsRollup | null, input: 
   if (typeof rollup.sourceEventCount !== "number" || !Number.isInteger(rollup.sourceEventCount) || rollup.sourceEventCount < 0) return false;
   if (typeof accumulatorEventCount !== "number" || !Number.isInteger(accumulatorEventCount) || rollup.sourceEventCount !== accumulatorEventCount) return false;
   if (input.sourceCursor !== rollup.sourceCursor) return false;
+  if ((rollup.sourceEventCount ?? 0) > 0 && !rollup.sourceFenceId) return false;
   if (input.sourceCommitSeq != null && input.sourceCommitSeq !== (rollup.sourceCommitSeq ?? 0)) return false;
   if (!rollup.sourceFenceOccurredAt || !rollup.sourceRecordedAt) return false;
   if (input.sourceRecordedAt && (!rollup.sourceRecordedAt || input.sourceRecordedAt.toISOString() !== rollup.sourceRecordedAt)) return false;
@@ -692,8 +693,10 @@ export class MemoryEventJournal implements EventJournal {
       const newCoverage = stored.sourceEventCount ?? 0;
       const oldSeq = existing.sourceCommitSeq ?? 0;
       const newSeq = stored.sourceCommitSeq ?? 0;
-      if (newCoverage < oldCoverage || newSeq < oldSeq) return structuredClone(existing);
-      if (newCoverage === oldCoverage && newSeq === oldSeq) {
+      const oldCursor = existing.sourceCursor;
+      const newCursor = stored.sourceCursor;
+      if (newCoverage < oldCoverage || newSeq < oldSeq || (newCoverage === oldCoverage && newSeq === oldSeq && newCursor < oldCursor)) return structuredClone(existing);
+      if (newCoverage === oldCoverage && newSeq === oldSeq && newCursor === oldCursor) {
         if (existing.contentHash !== stored.contentHash) throw new Error("ANALYTICS_ROLLUP_CONFLICT");
         return structuredClone(existing);
       }
@@ -712,7 +715,9 @@ export class MemoryEventJournal implements EventJournal {
     const cap = Math.max(0, Math.floor(input.limit));
     const before = input.occurredBefore?.getTime() ?? Number.POSITIVE_INFINITY;
     const victims = this.events.filter((event) => CANONICAL_REPORT_INPUT_EVENT_TYPES.includes(event.type as (typeof CANONICAL_REPORT_INPUT_EVENT_TYPES)[number]))
-      .filter((event) => (event.payload as { experimentId?: unknown }).experimentId === input.experimentId && Date.parse(event.occurredAt) <= before)
+      // Keep the immutable source-fence event itself. The fence proves the
+      // rollup boundary for the next compaction and must survive deletion.
+      .filter((event) => (event.payload as { experimentId?: unknown }).experimentId === input.experimentId && Date.parse(event.occurredAt) < before)
       .filter((event) => input.sourceCommitSeq == null || (this.commitSeqById.get(event.id) ?? Number.POSITIVE_INFINITY) <= input.sourceCommitSeq)
       .filter((event) => input.sourceRecordedAt == null || Date.parse(event.recordedAt) <= input.sourceRecordedAt.getTime())
       .slice(0, cap);
@@ -1345,8 +1350,10 @@ export class PostgresEventJournal implements EventJournal {
       const newSeq = rollup.sourceCommitSeq ?? 0;
       if (existing) {
         const oldCount = Number(existing.sourceEventCount ?? 0); const oldSeq = Number(existing.sourceCommitSeq ?? 0);
-        if (newCount < oldCount || newSeq < oldSeq) return existing;
-        if (newCount === oldCount && newSeq === oldSeq) {
+        const oldCursor = Number(existing.sourceCursor ?? 0);
+        const newCursor = Number(rollup.sourceCursor ?? 0);
+        if (newCount < oldCount || newSeq < oldSeq || (newCount === oldCount && newSeq === oldSeq && newCursor < oldCursor)) return existing;
+        if (newCount === oldCount && newSeq === oldSeq && newCursor === oldCursor) {
           if (existing.contentHash !== rollup.contentHash) throw new Error("ANALYTICS_ROLLUP_CONFLICT");
           return existing;
         }
@@ -1376,7 +1383,8 @@ export class PostgresEventJournal implements EventJournal {
     const rowSeq = Number(row.sourceCommitSeq ?? 0);
     const requestedCount = rollup.sourceEventCount ?? 0;
     const requestedSeq = rollup.sourceCommitSeq ?? 0;
-    const rowIsStrictlyNewer = rowCount > requestedCount || (rowCount === requestedCount && rowSeq > requestedSeq);
+    const rowIsStrictlyNewer = rowCount > requestedCount || (rowCount === requestedCount && rowSeq > requestedSeq)
+      || (rowCount === requestedCount && rowSeq === requestedSeq && Number(row.sourceCursor ?? 0) > Number(rollup.sourceCursor ?? 0));
     if (row.contentHash !== rollup.contentHash && !rowIsStrictlyNewer) throw new Error("ANALYTICS_ROLLUP_CONFLICT");
     return {
       experimentId: row.experimentId, rollupKind: row.rollupKind, schemaVersion: row.schemaVersion, sourceCursor: Number(row.sourceCursor),
@@ -1407,7 +1415,7 @@ export class PostgresEventJournal implements EventJournal {
       WHERE id IN (
         SELECT id FROM journal_events
         WHERE type = ANY(${types}) AND (payload->>'experimentId') = ${input.experimentId}
-          AND occurred_at <= ${before.toISOString()}
+          AND occurred_at < ${before.toISOString()}
           AND commit_seq <= ${sourceCommitSeq}
           AND (${sourceRecordedAt == null} OR recorded_at <= ${(sourceRecordedAt ?? new Date()).toISOString()})
         ORDER BY occurred_at ASC, id ASC LIMIT ${cap}

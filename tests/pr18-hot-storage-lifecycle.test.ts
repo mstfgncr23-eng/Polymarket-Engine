@@ -783,7 +783,9 @@ describe("PR18 hot operational storage lifecycle", () => {
       expect(counts.events).toBeLessThanOrEqual(64);
     }
     expect(floors.map((item) => item.durable)).toEqual([0, 0, 0]);
-    expect(floors.map((item) => item.canonical)).toEqual([0, 0, 0]);
+    // The source-fence event is intentionally retained as the anchor for the
+    // next verified rollup/compaction cycle.
+    expect(floors.map((item) => item.canonical)).toEqual([1, 2, 3]);
     expect(floors.map((item) => item.checkpoints)).toEqual([2, 4, 6]);
     expect(floors.map((item) => item.rollups)).toEqual([1, 2, 3]);
     expect(await journal.latestDurableSequence()).toBe(63);
@@ -792,7 +794,7 @@ describe("PR18 hot operational storage lifecycle", () => {
       "durable_replay_keys", "durable_transitions", "engine_checkpoints", "experiment_report_rollups", "experiment_reports", "journal_events", "mcp_idempotency",
     ]);
     expect(footprint.durable_transitions.rows).toBe(0);
-    expect(footprint.journal_events.rows).toBe(0);
+    expect(footprint.journal_events.rows).toBe(3);
     expect(footprint.durable_replay_keys.rows).toBeLessThanOrEqual(64);
   });
 

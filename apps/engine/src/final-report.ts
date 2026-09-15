@@ -90,23 +90,44 @@ function hashAnalyticsCoverage(input: { experimentId: string; schemaVersion: num
  * so old v1 rows remain readable while remaining insufficient for destructive
  * compaction.
  */
-export function analyticsRollupHasDestructiveCoverage(rollup: { schemaVersion: number; verified: boolean; stableRead?: boolean; sourceEventCount?: number; coverageHash?: string; accumulator: Record<string, unknown> }): boolean {
-  if (!rollup.verified || rollup.schemaVersion !== ANALYTICS_ROLLUP_SCHEMA_VERSION || rollup.stableRead === false) return false;
+type AnalyticsCoverageRollup = { schemaVersion: number; verified: boolean; stableRead?: boolean; sourceEventCount?: number; coverageHash?: string; accumulator: Record<string, unknown> };
+
+function analyticsRollupHasCoverageFence(rollup: AnalyticsCoverageRollup): { economicCostComplete: boolean; decisionAuditComplete: boolean; decisionAuditOverflow: boolean } | null {
+  if (!rollup.verified || rollup.schemaVersion !== ANALYTICS_ROLLUP_SCHEMA_VERSION || rollup.stableRead === false) return null;
   // The coverage marker is only authoritative when the immutable metadata
   // fence that binds it to this exact rollup is present. This keeps old v1
   // rows readable while preventing a legacy row with a copied marker from
   // being treated as a complete prefix during report reconstruction.
-  if (!rollup.coverageHash) return false;
+  if (!rollup.coverageHash) return null;
   const coverage = rollup.accumulator.analyticsCoverage;
-  if (!coverage || typeof coverage !== "object" || Array.isArray(coverage)) return false;
+  if (!coverage || typeof coverage !== "object" || Array.isArray(coverage)) return null;
   const marker = coverage as { version?: unknown; economicCostComplete?: unknown; decisionAuditComplete?: unknown; decisionAuditOverflow?: unknown };
   const accumulatorEventCount = rollup.accumulator.eventCount;
-  if (typeof rollup.sourceEventCount !== "number" || !Number.isInteger(rollup.sourceEventCount) || rollup.sourceEventCount < 0) return false;
-  if (typeof accumulatorEventCount !== "number" || !Number.isInteger(accumulatorEventCount) || rollup.sourceEventCount !== accumulatorEventCount) return false;
-  return marker.version === ANALYTICS_ROLLUP_COVERAGE_VERSION
-    && marker.economicCostComplete === true
-    && marker.decisionAuditComplete === true
-    && marker.decisionAuditOverflow === false;
+  if (typeof rollup.sourceEventCount !== "number" || !Number.isInteger(rollup.sourceEventCount) || rollup.sourceEventCount < 0) return null;
+  if (typeof accumulatorEventCount !== "number" || !Number.isInteger(accumulatorEventCount) || rollup.sourceEventCount !== accumulatorEventCount) return null;
+  if (marker.version !== ANALYTICS_ROLLUP_COVERAGE_VERSION) return null;
+  return {
+    economicCostComplete: marker.economicCostComplete === true,
+    decisionAuditComplete: marker.decisionAuditComplete === true,
+    decisionAuditOverflow: marker.decisionAuditOverflow === true,
+  };
+}
+
+export function analyticsRollupHasEconomicCostCoverage(rollup: AnalyticsCoverageRollup): boolean {
+  const coverage = analyticsRollupHasCoverageFence(rollup);
+  return coverage?.economicCostComplete === true
+    && rollup.accumulator.operatingCostCoverage === "COMPLETE"
+    && Number.isInteger(rollup.accumulator.operatingCostSourceCursor)
+    && Number(rollup.accumulator.operatingCostSourceCursor) >= 0;
+}
+
+export function analyticsRollupHasDecisionAuditCoverage(rollup: AnalyticsCoverageRollup): boolean {
+  const coverage = analyticsRollupHasCoverageFence(rollup);
+  return coverage?.decisionAuditComplete === true && coverage.decisionAuditOverflow === false;
+}
+
+export function analyticsRollupHasDestructiveCoverage(rollup: AnalyticsCoverageRollup): boolean {
+  return analyticsRollupHasEconomicCostCoverage(rollup) && analyticsRollupHasDecisionAuditCoverage(rollup);
 }
 
 async function foldDurableOperatingCosts(
@@ -256,11 +277,13 @@ export async function streamExperimentSummary(
     }
   }
   const usableRollup = rollupRestored ? rollup : null;
-  const legacyPrefixProjectionMissing = Boolean(rollup && !rollupRestored
-    || usableRollup && !analyticsRollupHasDestructiveCoverage(usableRollup)
+  const legacyEconomicPrefixMissing = Boolean(rollup && !rollupRestored
+    || usableRollup && !analyticsRollupHasEconomicCostCoverage(usableRollup)
       && ((usableRollup.sourceEventCount ?? 0) > 0 || usableRollup.sourceCursor > 0));
-  if (legacyPrefixProjectionMissing) {
+  if (legacyEconomicPrefixMissing) {
     acc.setOperatingCostSourceCursor(usableRollup?.sourceCursor ?? 0, false);
+  }
+  if (usableRollup && !analyticsRollupHasDecisionAuditCoverage(usableRollup)) {
     acc.setDecisionAuditCoverage(false);
   }
   const durableHighWater = await journal.latestDurableSequence();
@@ -270,7 +293,7 @@ export async function streamExperimentSummary(
     : { complete: false, cursor: durableStart };
   const durableCursor = durableScan.cursor;
   const durableCostScanComplete = durableScan.complete;
-  acc.setOperatingCostSourceCursor(durableCursor, durableCostScanComplete && !legacyPrefixProjectionMissing);
+  acc.setOperatingCostSourceCursor(durableCursor, durableCostScanComplete && !legacyEconomicPrefixMissing);
   let tailScanned = 0;
   const scan = await scanJournalEvents(journal, {
     types: CANONICAL_REPORT_INPUT_EVENT_TYPES,

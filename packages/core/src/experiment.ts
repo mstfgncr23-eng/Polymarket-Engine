@@ -202,7 +202,9 @@ export type AstraDecisionAuditOutcome =
   | "EXECUTION_GATE_REJECTED"
   | "BOOK_REVALIDATION_REJECT"
   | "ORDER_CREATED"
-  | "FILLED";
+  | "FILLED"
+  | "EXECUTION_ERROR"
+  | "CANCELLED";
 
 export interface AstraDecisionAuditDigest {
   id: string;
@@ -214,7 +216,10 @@ export interface AstraDecisionAuditDigest {
   action: "BUY_UP" | "BUY_DOWN" | "NO_TRADE" | null;
   direction: "UP" | "DOWN" | "FLAT" | null;
   stages: string[];
+  /** Model-supplied rationale only; execution and gate metadata is separate. */
   reasonCodes: string[];
+  /** Bounded execution/gate/audit evidence, never counted as model rationale. */
+  auditReasonCodes: string[];
   reasonEvidenceOverflowCount: number;
   outcome: AstraDecisionAuditOutcome;
   riskOutcome: "NOT_EVALUATED" | "ACCEPT" | "VETO";
@@ -240,6 +245,8 @@ export interface AstraDecisionAuditSummary {
   overflow: boolean;
   overflowCount: number;
   reasonEvidenceOverflowCount: number;
+  preProviderRejectReasons: Record<string, number>;
+  preProviderRejectReasonOverflow: boolean;
   maxDigestCount: number;
   maxBytes: number;
   coverage: "COMPLETE" | "PARTIAL" | "UNKNOWN";

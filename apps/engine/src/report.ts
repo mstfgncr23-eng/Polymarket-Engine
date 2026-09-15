@@ -30,10 +30,23 @@ export type ExperimentSummaryExtras = Partial<Pick<ExperimentSummary,
 >>;
 
 const PROVIDER_DISPATCH_TRACKING_LIMIT = 10_000;
-export const ASTRA_DECISION_AUDIT_MAX_DIGESTS = 256;
-export const ASTRA_DECISION_AUDIT_MAX_BYTES = 256 * 1_024;
+export const ASTRA_DECISION_AUDIT_MAX_FAST_DISPATCHES_PER_HOUR = 12;
+export const ASTRA_DECISION_AUDIT_MAX_EXPERIMENT_HOURS = 48;
+/** One provider digest represents the single FAST/DEEP economic decision. */
+export const ASTRA_DECISION_AUDIT_MAX_PROVIDER_DIGESTS = ASTRA_DECISION_AUDIT_MAX_FAST_DISPATCHES_PER_HOUR * ASTRA_DECISION_AUDIT_MAX_EXPERIMENT_HOURS;
+export const ASTRA_DECISION_AUDIT_MAX_DIGESTS = ASTRA_DECISION_AUDIT_MAX_PROVIDER_DIGESTS;
+/** Derived from the legal envelope at a conservative 768-byte structural budget per digest. */
+export const ASTRA_DECISION_AUDIT_MAX_BYTES = ASTRA_DECISION_AUDIT_MAX_PROVIDER_DIGESTS * 768;
 const ASTRA_DECISION_REASON_LIMIT = 6;
 const ASTRA_DECISION_REASON_MAX_LENGTH = 64;
+const ASTRA_AUDIT_REASON_LIMIT = 8;
+const PRE_PROVIDER_REASON_KEYS = [
+  "GLOBAL_MIN_INTERVAL", "MARKET_COOLDOWN", "ROLLING_HOUR_CAP", "CLIENT_UNAVAILABLE",
+  "FEATURE_EXTRACTION_FAILED", "STAGE_ADMISSION_CLOSED", "CONCURRENCY_SATURATED", "ENTRY_CLOSED",
+  "FINALIZATION_PENDING", "SOURCE_SEALED", "DISPATCH_ALREADY_AUTHORIZED", "DISPATCH_NOT_STARTED",
+  "EVIDENCE_PERSISTENCE_FAILED", "ACCOUNTING_FAILED",
+] as const;
+const PRE_PROVIDER_OTHER_REASON = "OTHER";
 type ProviderDispatchTerminal = "KNOWN" | "UNKNOWN" | "NOT_DISPATCHED";
 interface ProviderDispatchLifecycle {
   authorized: boolean;
@@ -73,6 +86,8 @@ interface AstraDecisionAuditCounters {
   overflow: boolean;
   overflowCount: number;
   reasonEvidenceOverflowCount: number;
+  preProviderRejectReasons: Record<string, number>;
+  preProviderRejectReasonOverflow: boolean;
 }
 
 interface AnalyticsCoverage {
@@ -367,7 +382,6 @@ export class ExperimentSummaryAccumulator {
       }
       if (!this.retainAstraDecisionDigest(structuredClone(digest))) this.decisionAuditCoverage = "UNKNOWN";
     }
-    if (snapshot.analyticsCoverage?.version !== 1 || snapshot.analyticsCoverage.economicCostComplete !== true) this.operatingCostCoverage = "UNKNOWN";
     for (const key of ["maxDrawdown","riskCount","accepted","paperOrders","makerOrders","takerOrders","fillCount","makerFills","takerFills","firstLegCount","hedgeCompleteCount","hedgeDurationSum","hedgeDurationN","pairRealizedNetSum","pairRealizedNetN","pairRealizedGrossSum","pairRealizedGrossN","failedHedgeCount","positionWins","positionLosses","positionBreakeven","grossWins","grossLosses","grossBreakeven","rejectedWouldHaveWon","acceptedLost","worstUnhedgedUsd"] as const) (this as unknown as Record<string, unknown>)[key] = snapshot[key];
     this.providerDispatchStartedCount = snapshot.providerDispatchStartedCount ?? 0;
     this.providerDispatchAuthorizedCount = snapshot.providerDispatchAuthorizedCount ?? 0;
@@ -508,7 +522,7 @@ export class ExperimentSummaryAccumulator {
         this.modelCosts[output.agentId] = (this.modelCosts[output.agentId] ?? 0) + (output.usage?.estimatedCostUsd ?? 0);
       }
     } else if (type === "ASTRA_FAILURE" || type === "ASTRA_BUDGET_BLOCK") {
-      const failurePayload = event.payload as { dispatchState?: unknown; knownUsage?: unknown };
+      const failurePayload = event.payload as { dispatchState?: unknown; knownUsage?: unknown; admissionReason?: unknown };
       const dispatchState = failurePayload.dispatchState;
       const lifecycle = type === "ASTRA_BUDGET_BLOCK" || (dispatchState === "NOT_DISPATCHED" && !providerDispatchIdentity(event))
         ? null
@@ -539,6 +553,9 @@ export class ExperimentSummaryAccumulator {
         recordFailureStatistic = !duplicate;
       } else {
         const duplicate = lifecycle?.notDispatchedFailureObserved === true;
+        const duplicateAuthorizationRetry = provenNotDispatched
+          && failurePayload.admissionReason === "DISPATCH_ALREADY_AUTHORIZED"
+          && lifecycle?.authorized === true;
         if (!duplicate) {
           if (lifecycle?.terminal === "KNOWN" || lifecycle?.terminal === "UNKNOWN") this.providerDispatchTrackingIncomplete = true;
           if (lifecycle) lifecycle.notDispatchedFailureObserved = true;
@@ -546,7 +563,10 @@ export class ExperimentSummaryAccumulator {
         }
         // Only an explicit NOT_DISPATCHED state closes an AUTHORIZED-only
         // lifecycle. Legacy failures without dispatchState remain unresolved.
-        if (provenNotDispatched && lifecycle && lifecycle.terminal === null) lifecycle.terminal = "NOT_DISPATCHED";
+        // A retry rejected by the one-shot authorization guard is not proof
+        // that the original AUTHORIZED request failed to start. Keep that
+        // original lifecycle unresolved after acknowledgement loss or crash.
+        if (provenNotDispatched && lifecycle && lifecycle.terminal === null && !duplicateAuthorizationRetry) lifecycle.terminal = "NOT_DISPATCHED";
         recordFailureStatistic = !duplicate;
       }
       const code = String((event.payload as { reason?: unknown }).reason ?? type);
@@ -611,7 +631,6 @@ export class ExperimentSummaryAccumulator {
     const netTradingPnl = Number(ledger?.netTradingPnl ?? 0);
     const ledgerAiCost = finiteNonNegativeNumber(ledger?.aiCost);
     const ledgerInfrastructureCost = finiteNonNegativeNumber(ledger?.infrastructureCost);
-    const hasLedgerCost = ledgerAiCost != null && ledgerInfrastructureCost != null;
     const aiCost = this.operatingCostCoverage === "COMPLETE" ? this.operatingAiCostUsd : (ledgerAiCost ?? 0);
     const infraCost = this.operatingCostCoverage === "COMPLETE" ? this.operatingInfrastructureCostUsd : (ledgerInfrastructureCost ?? 0);
     const knownProviderOutcomes = this.providerKnownTerminalCount;
@@ -627,7 +646,7 @@ export class ExperimentSummaryAccumulator {
     // the snapshot may predate that charge and must not make the report claim
     // complete economics.
     const economicCostCompleteness = providerCostCompleteness === "COMPLETE"
-      && (this.operatingCostCoverage === "COMPLETE" || hasLedgerCost) ? "COMPLETE" : "UNKNOWN";
+      && this.operatingCostCoverage === "COMPLETE" ? "COMPLETE" : "UNKNOWN";
     const pairCosts = positions.filter((position) => Number(position.pairedQuantity) > 0).map((position) => Number(position.combinedPairCost));
     const netWl = { wins: this.positionWins, losses: this.positionLosses, breakeven: this.positionBreakeven };
     const grossWl = (this.grossWins + this.grossLosses + this.grossBreakeven) === 0
@@ -726,7 +745,8 @@ export class ExperimentSummaryAccumulator {
         : source === "GATE_REJECT"
           ? "GATE_REJECTED"
           : action === "NO_TRADE" ? "MODEL_NO_TRADE" : "DIRECTIONAL_DECISION";
-    const reasonEvidence = collectAstraReasons(payload, nested);
+    const reasonEvidence = collectAstraReasons(nested);
+    const auditReasonEvidence = collectAstraAuditReasons(payload);
     const digest: AstraDecisionAuditDigest = {
       id: event.id,
       traceId: event.traceId,
@@ -738,13 +758,18 @@ export class ExperimentSummaryAccumulator {
       direction,
       stages,
       reasonCodes: reasonEvidence.values,
-      reasonEvidenceOverflowCount: reasonEvidence.overflowCount,
+      auditReasonCodes: auditReasonEvidence.values,
+      reasonEvidenceOverflowCount: reasonEvidence.overflowCount + auditReasonEvidence.overflowCount,
       outcome,
       riskOutcome: "NOT_EVALUATED",
       orderCreated: false,
       fillCount: 0,
     };
-    const retained = this.retainAstraDecisionDigest(digest);
+    // Gate, fail-closed, and deterministic-hedge outcomes are counted exactly
+    // but do not consume provider forensic slots. This prevents cheap
+    // pre-provider pressure from crowding out the legal 48h FAST envelope.
+    const retained = source === "PROVIDER" ? this.retainAstraDecisionDigest(digest) : true;
+    if (source === "GATE_REJECT") this.recordPreProviderRejectReason(payloadString(payload, "gateReason"));
     if (!retained) this.decisionAuditCoverage = "UNKNOWN";
     if (digest.reasonEvidenceOverflowCount > 0) this.decisionAuditCoverage = "UNKNOWN";
     this.bumpAstraDecisionCounters(digest);
@@ -753,29 +778,16 @@ export class ExperimentSummaryAccumulator {
   private noteAstraPreProviderReject(event: JournalEvent): void {
     const payload = event.payload as Record<string, unknown>;
     if (payload.authority !== "ASTRA_BRAIN_V1") return;
-    const id = `${event.id}:pre-provider`;
-    if (this.astraDecisionDigests.has(id)) return;
-    const reasonEvidence = collectAstraReasons(payload);
-    const digest: AstraDecisionAuditDigest = {
-      id,
-      traceId: event.traceId,
-      triggerId: payloadString(payload, "triggerId") ?? event.aggregateId,
-      marketId: payloadString(payload, "marketId"),
-      asset: payloadString(payload, "asset"),
-      source: "PRE_PROVIDER_REJECT",
-      action: null,
-      direction: "FLAT",
-      stages: boundedStringArray(payload.stage, 1, 16),
-      reasonCodes: reasonEvidence.values,
-      reasonEvidenceOverflowCount: reasonEvidence.overflowCount,
-      outcome: "PRE_PROVIDER_REJECTED",
-      riskOutcome: "NOT_EVALUATED",
-      orderCreated: false,
-      fillCount: 0,
-    };
-    if (!this.retainAstraDecisionDigest(digest)) this.decisionAuditCoverage = "UNKNOWN";
-    if (digest.reasonEvidenceOverflowCount > 0) this.decisionAuditCoverage = "UNKNOWN";
-    this.bumpAstraDecisionCounters(digest);
+    this.astraDecisionAuditCounters.preProviderRejectedCount += 1;
+    this.recordPreProviderRejectReason(payloadString(payload, "reason")
+      ?? payloadString(payload, "gateReason")
+      ?? payloadString(payload, "failureReason"));
+  }
+
+  private recordPreProviderRejectReason(reason: string | null): void {
+    const key = reason && (PRE_PROVIDER_REASON_KEYS as readonly string[]).includes(reason) ? reason : PRE_PROVIDER_OTHER_REASON;
+    const reasons = this.astraDecisionAuditCounters.preProviderRejectReasons;
+    reasons[key] = (reasons[key] ?? 0) + 1;
   }
 
   private retainAstraDecisionDigest(digest: AstraDecisionAuditDigest): boolean {
@@ -819,13 +831,13 @@ export class ExperimentSummaryAccumulator {
   }
 
   private noteAstraFunnel(event: JournalEvent): void {
-    if (event.type !== "RISK_EVALUATION" && event.type !== "BOOK_REVALIDATION_REJECTED" && event.type !== "PAPER_ORDER_CREATED" && event.type !== "PAPER_FILL" && event.type !== "ASTRA_COUNTERFACTUAL") return;
+    if (event.type !== "RISK_EVALUATION" && event.type !== "BOOK_REVALIDATION_REJECTED" && event.type !== "PAPER_ORDER_CREATED" && event.type !== "PAPER_FILL" && event.type !== "PAPER_EXECUTION_ERROR" && event.type !== "PAPER_ORDER_CANCELLED" && event.type !== "ASTRA_COUNTERFACTUAL") return;
     const digestId = this.astraDecisionByTrace.get(event.traceId);
     const digest = digestId ? this.astraDecisionDigests.get(digestId) : undefined;
     if (!digest) return;
     if (event.type === "ASTRA_COUNTERFACTUAL") {
       const executionOutcome = (event.payload as { executionOutcome?: unknown }).executionOutcome;
-      if (executionOutcome === "NO_EXECUTABLE_CANDIDATE" || executionOutcome === "EXECUTION_GATE_REJECTED" || executionOutcome === "ORDER_CREATED") digest.outcome = executionOutcome;
+      if (executionOutcome === "NO_EXECUTABLE_CANDIDATE" || executionOutcome === "EXECUTION_GATE_REJECTED" || executionOutcome === "ORDER_CREATED" || executionOutcome === "EXECUTION_ERROR" || executionOutcome === "CANCELLED") digest.outcome = executionOutcome;
       this.appendReasons(digest, boundedStringArray((event.payload as { reason?: unknown }).reason, 1, ASTRA_DECISION_REASON_MAX_LENGTH));
     } else if (event.type === "RISK_EVALUATION") {
       const accepted = (event.payload as { accepted?: unknown }).accepted === true;
@@ -844,23 +856,30 @@ export class ExperimentSummaryAccumulator {
     } else if (event.type === "PAPER_FILL") {
       digest.fillCount += 1;
       digest.outcome = "FILLED";
+    } else if (event.type === "PAPER_EXECUTION_ERROR") {
+      if (digest.fillCount === 0) digest.outcome = "EXECUTION_ERROR";
+      const payload = event.payload as Record<string, unknown>;
+      this.appendReasons(digest, boundedStringArray(payload.reason ?? payload.message, 1, ASTRA_DECISION_REASON_MAX_LENGTH));
+    } else if (event.type === "PAPER_ORDER_CANCELLED") {
+      if (digest.fillCount === 0) digest.outcome = "CANCELLED";
+      this.appendReasons(digest, boundedStringArray((event.payload as Record<string, unknown>).reason, 1, ASTRA_DECISION_REASON_MAX_LENGTH));
     }
   }
 
   private appendReasons(digest: AstraDecisionAuditDigest, reasons: string[]): void {
     for (const reason of reasons) {
-      if (digest.reasonCodes.includes(reason)) continue;
-      if (digest.reasonCodes.length >= ASTRA_DECISION_REASON_LIMIT) {
+      if (digest.auditReasonCodes.includes(reason)) continue;
+      if (digest.auditReasonCodes.length >= ASTRA_AUDIT_REASON_LIMIT) {
         digest.reasonEvidenceOverflowCount += 1;
         this.astraDecisionAuditCounters.reasonEvidenceOverflowCount += 1;
         this.decisionAuditCoverage = "UNKNOWN";
         continue;
       }
       const beforeBytes = astraDecisionDigestBytes(digest);
-      digest.reasonCodes.push(reason);
+      digest.auditReasonCodes.push(reason);
       const afterBytes = astraDecisionDigestBytes(digest);
       if (this.astraDecisionAuditBytes - beforeBytes + afterBytes > ASTRA_DECISION_AUDIT_MAX_BYTES) {
-        digest.reasonCodes.pop();
+        digest.auditReasonCodes.pop();
         digest.reasonEvidenceOverflowCount += 1;
         this.astraDecisionAuditCounters.reasonEvidenceOverflowCount += 1;
         this.decisionAuditCoverage = "UNKNOWN";
@@ -1126,16 +1145,20 @@ function boundedStringArray(value: unknown, limit: number, maxLength: number): s
     .map((item) => item.slice(0, maxLength)).slice(0, limit);
 }
 
-function collectAstraReasons(payload: Record<string, unknown>, decision?: Record<string, unknown> | null): { values: string[]; overflowCount: number } {
+function collectAstraReasons(decision?: Record<string, unknown> | null): { values: string[]; overflowCount: number } {
+  const reasons = boundedStringArray(decision?.reasonCodes, ASTRA_DECISION_REASON_LIMIT, ASTRA_DECISION_REASON_MAX_LENGTH);
+  const unique = [...new Set(reasons)];
+  return { values: unique.slice(0, ASTRA_DECISION_REASON_LIMIT), overflowCount: Math.max(0, unique.length - ASTRA_DECISION_REASON_LIMIT) };
+}
+
+function collectAstraAuditReasons(payload: Record<string, unknown>): { values: string[]; overflowCount: number } {
   const reasons = [
-    ...boundedStringArray(decision?.reasonCodes, ASTRA_DECISION_REASON_LIMIT, ASTRA_DECISION_REASON_MAX_LENGTH),
-    ...boundedStringArray(decision?.rationaleCode, 1, ASTRA_DECISION_REASON_MAX_LENGTH),
     ...boundedStringArray(payload.gateReason, 1, ASTRA_DECISION_REASON_MAX_LENGTH),
     ...boundedStringArray(payload.failureReason, 1, ASTRA_DECISION_REASON_MAX_LENGTH),
     ...boundedStringArray(payload.reason, 1, ASTRA_DECISION_REASON_MAX_LENGTH),
   ];
   const unique = [...new Set(reasons)];
-  return { values: unique.slice(0, ASTRA_DECISION_REASON_LIMIT), overflowCount: Math.max(0, unique.length - ASTRA_DECISION_REASON_LIMIT) };
+  return { values: unique.slice(0, ASTRA_AUDIT_REASON_LIMIT), overflowCount: Math.max(0, unique.length - ASTRA_AUDIT_REASON_LIMIT) };
 }
 
 function emptyAstraDecisionAuditCounters(): AstraDecisionAuditCounters {
@@ -1144,16 +1167,25 @@ function emptyAstraDecisionAuditCounters(): AstraDecisionAuditCounters {
     directionUpCount: 0, directionDownCount: 0, directionFlatCount: 0, fastOnlyCount: 0, deepDecisionCount: 0,
     failClosedCount: 0, deterministicHedgeBypassCount: 0, gateRejectedCount: 0, preProviderRejectedCount: 0,
     overflow: false, overflowCount: 0, reasonEvidenceOverflowCount: 0,
+    preProviderRejectReasons: Object.fromEntries([...PRE_PROVIDER_REASON_KEYS, PRE_PROVIDER_OTHER_REASON].map((key) => [key, 0])),
+    preProviderRejectReasonOverflow: false,
   };
 }
 
 function restoreAstraDecisionAuditCounters(input: AstraDecisionAuditCounters | undefined): AstraDecisionAuditCounters {
   const defaults = emptyAstraDecisionAuditCounters();
   if (!input || typeof input !== "object") return defaults;
+  const mutable = defaults as unknown as Record<string, unknown>;
   for (const key of Object.keys(defaults) as Array<keyof AstraDecisionAuditCounters>) {
     const value = input[key];
     if (key === "overflow") defaults[key] = value === true;
-    else if (typeof value === "number" && Number.isInteger(value) && value >= 0) defaults[key] = value;
+    else if (key === "preProviderRejectReasons" && value && typeof value === "object" && !Array.isArray(value)) {
+      for (const reason of Object.keys(defaults.preProviderRejectReasons)) {
+        const count = (value as Record<string, unknown>)[reason];
+        if (typeof count === "number" && Number.isInteger(count) && count >= 0) defaults.preProviderRejectReasons[reason] = count;
+      }
+    } else if (key === "preProviderRejectReasonOverflow") defaults[key] = value === true;
+    else if (typeof value === "number" && Number.isInteger(value) && value >= 0) mutable[key] = value;
   }
   return defaults;
 }
@@ -1174,8 +1206,9 @@ function isValidAstraDecisionDigest(value: unknown): value is AstraDecisionAudit
     && (value.direction === null || value.direction === "UP" || value.direction === "DOWN" || value.direction === "FLAT")
     && Array.isArray(value.stages) && value.stages.length <= 2 && value.stages.every((stage) => typeof stage === "string" && stage.length <= 16)
     && Array.isArray(value.reasonCodes) && value.reasonCodes.length <= ASTRA_DECISION_REASON_LIMIT && value.reasonCodes.every((reason) => typeof reason === "string" && reason.length <= ASTRA_DECISION_REASON_MAX_LENGTH)
+    && Array.isArray(value.auditReasonCodes) && value.auditReasonCodes.length <= ASTRA_AUDIT_REASON_LIMIT && value.auditReasonCodes.every((reason) => typeof reason === "string" && reason.length <= ASTRA_DECISION_REASON_MAX_LENGTH)
     && typeof value.reasonEvidenceOverflowCount === "number" && Number.isInteger(value.reasonEvidenceOverflowCount) && value.reasonEvidenceOverflowCount >= 0
-    && (value.outcome === "MODEL_NO_TRADE" || value.outcome === "DIRECTIONAL_DECISION" || value.outcome === "SYNTHETIC_FAIL_CLOSED" || value.outcome === "DETERMINISTIC_HEDGE_BYPASS" || value.outcome === "GATE_REJECTED" || value.outcome === "PRE_PROVIDER_REJECTED" || value.outcome === "RISK_ACCEPTED" || value.outcome === "RISK_VETO" || value.outcome === "NO_EXECUTABLE_CANDIDATE" || value.outcome === "EXECUTION_GATE_REJECTED" || value.outcome === "BOOK_REVALIDATION_REJECT" || value.outcome === "ORDER_CREATED" || value.outcome === "FILLED")
+    && (value.outcome === "MODEL_NO_TRADE" || value.outcome === "DIRECTIONAL_DECISION" || value.outcome === "SYNTHETIC_FAIL_CLOSED" || value.outcome === "DETERMINISTIC_HEDGE_BYPASS" || value.outcome === "GATE_REJECTED" || value.outcome === "PRE_PROVIDER_REJECTED" || value.outcome === "RISK_ACCEPTED" || value.outcome === "RISK_VETO" || value.outcome === "NO_EXECUTABLE_CANDIDATE" || value.outcome === "EXECUTION_GATE_REJECTED" || value.outcome === "BOOK_REVALIDATION_REJECT" || value.outcome === "ORDER_CREATED" || value.outcome === "FILLED" || value.outcome === "EXECUTION_ERROR" || value.outcome === "CANCELLED")
     && (value.riskOutcome === "NOT_EVALUATED" || value.riskOutcome === "ACCEPT" || value.riskOutcome === "VETO")
     && typeof value.orderCreated === "boolean"
     && typeof value.fillCount === "number" && Number.isInteger(value.fillCount) && value.fillCount >= 0;

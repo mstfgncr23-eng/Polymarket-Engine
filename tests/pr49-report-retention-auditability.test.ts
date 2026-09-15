@@ -241,8 +241,11 @@ describe("PR49 report cost and auditability", () => {
     expect(audit.gateRejectedCount).toBe(1);
     expect(audit.preProviderRejectedCount).toBe(2);
     expect(audit.digests.find((item) => item.id === "buy-up")?.outcome).toBe("ORDER_CREATED");
-    expect(audit.digests.find((item) => item.id === "gate")?.outcome).toBe("GATE_REJECTED");
-    expect(audit.digests.find((item) => item.id === "fail-closed")?.source).toBe("FAIL_CLOSED");
+    expect(audit.digests.find((item) => item.id === "gate")).toBeUndefined();
+    expect(audit.digests.find((item) => item.id === "fail-closed")).toBeUndefined();
+    expect(audit.preProviderRejectReasons.OTHER).toBe(1);
+    expect(audit.preProviderRejectReasons.CLIENT_UNAVAILABLE).toBe(1);
+    expect(audit.preProviderRejectReasons.ROLLING_HOUR_CAP).toBe(1);
   });
 
   it("I: FAST+DEEP is one economic decision with separate deep observability", () => {
@@ -260,19 +263,118 @@ describe("PR49 report cost and auditability", () => {
 
   it("J: decision digest and reason evidence remain hard-bounded with explicit overflow", () => {
     const acc = new ExperimentSummaryAccumulator(EXPERIMENT, { reportKind: "final", metricsScope: "complete", complete: true });
-    for (let index = 0; index < 300; index += 1) {
+    for (let index = 0; index < 600; index += 1) {
       acc.fold(astraDecision(`overflow-${index}`, `overflow-trace-${index}`, {
         action: "NO_TRADE", direction: "FLAT", reasonCodes: [`REASON_${index}`], rationaleCode: `REASON_${index}`,
       }));
     }
     const summary = acc.finalize();
-    expect(summary.astraDecisionAudit.providerDecisionCount).toBe(300);
-    expect(summary.astraDecisionAudit.digests).toHaveLength(256);
+    expect(summary.astraDecisionAudit.providerDecisionCount).toBe(600);
+    expect(summary.astraDecisionAudit.digests).toHaveLength(576);
     expect(summary.astraDecisionAudit.overflow).toBe(true);
     expect(summary.astraDecisionAudit.coverage).toBe("UNKNOWN");
-    expect(summary.astraDecisionAudit.maxDigestCount).toBe(256);
-    expect(acc.highWaterMarkBytes).toBeLessThan(300_000);
-    expect(JSON.stringify(acc.serialize()).length).toBeLessThan(300_000);
+    expect(summary.astraDecisionAudit.maxDigestCount).toBe(576);
+    expect(acc.highWaterMarkBytes).toBeLessThan(600_000);
+    expect(JSON.stringify(acc.serialize()).length).toBeLessThan(600_000);
+  });
+
+  it("retains the complete legal 48-hour FAST envelope while cheap rejects stay in exact buckets", () => {
+    const acc = new ExperimentSummaryAccumulator(EXPERIMENT, { reportKind: "final", metricsScope: "complete", complete: true });
+    for (let index = 0; index < 576; index += 1) {
+      acc.fold(providerDecision(`legal-${index}`, "NO_TRADE", "FLAT", ["FAST"]));
+    }
+    for (let index = 0; index < 10_000; index += 1) {
+      acc.fold(canonical("ASTRA_BUDGET_BLOCK", `cheap-${index}`, "2026-01-01T00:00:02.000Z", {
+        traceId: `cheap-trace-${index}`, authority: "ASTRA_BRAIN_V1", stage: "FAST", reason: index % 3 === 0 ? "GLOBAL_MIN_INTERVAL" : index % 3 === 1 ? "MARKET_COOLDOWN" : "ROLLING_HOUR_CAP",
+      }));
+    }
+    const audit = acc.finalize().astraDecisionAudit;
+    expect(audit.providerDecisionCount).toBe(576);
+    expect(audit.digests).toHaveLength(576);
+    expect(audit.overflow).toBe(false);
+    expect(audit.coverage).toBe("COMPLETE");
+    expect(audit.preProviderRejectedCount).toBe(10_000);
+    expect(audit.preProviderRejectReasons.GLOBAL_MIN_INTERVAL).toBe(3334);
+    expect(audit.preProviderRejectReasons.MARKET_COOLDOWN).toBe(3333);
+    expect(audit.preProviderRejectReasons.ROLLING_HOUR_CAP).toBe(3333);
+  });
+
+  it("keeps verified durable economics complete when only decision forensic capacity overflows", () => {
+    const acc = new ExperimentSummaryAccumulator(EXPERIMENT, { reportKind: "final", metricsScope: "complete", complete: true });
+    acc.foldDurableTransition(cost(1, "known-cost", "0.02752", "0.00526537"));
+    for (let index = 0; index < 600; index += 1) {
+      acc.fold(providerDecision(`economic-overflow-${index}`, "NO_TRADE", "FLAT"));
+    }
+    const summary = acc.finalize();
+    expect(summary.aiCostUsd).toBeCloseTo(0.02752, 10);
+    expect(summary.estimatedInfrastructureCostUsd).toBeCloseTo(0.00526537, 10);
+    expect(summary.economicPnlUsd).toBeCloseTo(-0.03278537, 10);
+    expect(summary.economicCostCompleteness).toBe("COMPLETE");
+    expect(summary.astraDecisionAudit.coverage).toBe("UNKNOWN");
+  });
+
+  it("does not turn a stale zero PNL snapshot and incomplete legacy prefix into complete zero economics", async () => {
+    const journal = new MemoryEventJournal();
+    const decision = providerDecision("legacy-provider", "NO_TRADE", "FLAT");
+    const pnl = canonical("PNL_SNAPSHOT", "stale-zero-pnl", "2026-01-01T00:00:02.000Z", {
+      traceId: decision.traceId, netTradingPnl: 0, aiCost: 0, infrastructureCost: 0,
+    });
+    await journal.appendMany([decision, pnl]);
+    const initial = await streamExperimentSummary(journal, { id: EXPERIMENT, startedAt: STARTED_AT }, { reportKind: "final", metricsScope: "complete", complete: true });
+    const legacy = { ...initial.accumulatorSnapshot! as unknown as Record<string, unknown> };
+    delete legacy.analyticsCoverage;
+    delete legacy.operatingAiCostUsd;
+    delete legacy.operatingInfrastructureCostUsd;
+    delete legacy.operatingCostTransitionCount;
+    delete legacy.operatingCostSourceCursor;
+    delete legacy.operatingCostCoverage;
+    await journal.persistAnalyticsRollup!({
+      experimentId: EXPERIMENT, rollupKind: "canonical", schemaVersion: 1, sourceCursor: 0,
+      sourceFenceId: pnl.id, sourceFenceOccurredAt: pnl.occurredAt, sourceEventCount: initial.accumulatorSnapshot!.eventCount,
+      sourceCommitSeq: initial.scan.fence.commitSeqTo, sourceRecordedAt: initial.scan.fence.recordedAtTo.toISOString(),
+      stableRead: true, previousContentHash: null, accumulator: legacy, contentHash: hashAnalyticsRollup(legacy), verified: true,
+      createdAt: "2026-01-02T00:00:00.000Z",
+    });
+    const rebuilt = await streamExperimentSummary(journal, { id: EXPERIMENT, startedAt: STARTED_AT }, { reportKind: "final", metricsScope: "complete", complete: true });
+    expect(rebuilt.summary.aiCostUsd).toBe(0);
+    expect(rebuilt.summary.estimatedInfrastructureCostUsd).toBe(0);
+    expect(rebuilt.summary.economicCostCompleteness).toBe("UNKNOWN");
+  });
+
+  it("keeps duplicate authorization retries separate and leaves the original dispatch unresolved", () => {
+    const acc = new ExperimentSummaryAccumulator(EXPERIMENT, { reportKind: "final", metricsScope: "complete", complete: true });
+    acc.fold(canonical("ASTRA_PROVIDER_DISPATCH_AUTHORIZED", "auth-original", "2026-01-01T00:00:01.000Z", {
+      dispatchId: "retry-trace:FAST", stage: "FAST", authority: "ASTRA_BRAIN_V1",
+    }));
+    acc.fold(canonical("ASTRA_FAILURE", "retry-failure", "2026-01-01T00:00:02.000Z", {
+      dispatchId: "retry-trace:FAST:retry", retryOfDispatchId: "retry-trace:FAST", stage: "FAST", authority: "ASTRA_BRAIN_V1",
+      admissionReason: "DISPATCH_ALREADY_AUTHORIZED", reason: "DISPATCH_ALREADY_AUTHORIZED", dispatchState: "NOT_DISPATCHED",
+    }));
+    const summary = acc.finalize();
+    expect(summary.providerDispatchUnresolvedAuthorizationCount).toBe(1);
+    expect(summary.notDispatchedFailureCount).toBe(1);
+    expect(summary.providerCostCompleteness).toBe("NONE");
+    expect(summary.economicCostCompleteness).toBe("UNKNOWN");
+  });
+
+  it("separates model rationale from execution metadata and records terminal execution outcomes", () => {
+    const acc = new ExperimentSummaryAccumulator(EXPERIMENT, { reportKind: "final", metricsScope: "complete", complete: true });
+    const modelReasons = ["R1", "R2", "R3", "R4", "R5", "R6"];
+    acc.fold(astraDecision("execution-error", "trace-execution-error", {
+      action: "BUY_UP", direction: "UP", reasonCodes: modelReasons, rationaleCode: "R1",
+    }));
+    acc.fold(canonical("PAPER_ORDER_CREATED", "execution-order", "2026-01-01T00:00:02.000Z", { traceId: "trace-execution-error", orderType: "TAKER" }));
+    acc.fold(canonical("PAPER_EXECUTION_ERROR", "execution-error-event", "2026-01-01T00:00:03.000Z", { traceId: "trace-execution-error", orderId: "execution-order", reason: "STALE_EXECUTION_SNAPSHOT" }));
+    acc.fold(providerDecision("cancelled", "BUY_DOWN", "DOWN"));
+    acc.fold(canonical("PAPER_ORDER_CANCELLED", "cancel-event", "2026-01-01T00:00:04.000Z", { traceId: "trace-cancelled", orderId: "cancelled-order", reason: "ENTRY_CLOSED" }));
+    const digests = acc.finalize().astraDecisionAudit.digests;
+    const failed = digests.find((item) => item.id === "execution-error");
+    const cancelled = digests.find((item) => item.id === "cancelled");
+    expect(failed?.reasonCodes).toEqual(modelReasons);
+    expect(failed?.auditReasonCodes).toContain("STALE_EXECUTION_SNAPSHOT");
+    expect(failed?.outcome).toBe("EXECUTION_ERROR");
+    expect(cancelled?.outcome).toBe("CANCELLED");
+    expect(cancelled?.auditReasonCodes).toContain("ENTRY_CLOSED");
   });
 
   it("K: covered Astra decision detail can be deleted and reconstructed from the verified rollup", async () => {
@@ -293,12 +395,30 @@ describe("PR49 report cost and auditability", () => {
       experimentId: EXPERIMENT, limit: 10, sourceCursor: rollup!.sourceCursor, sourceCommitSeq: rollup!.sourceCommitSeq,
       occurredBefore: new Date(rollup!.sourceFenceOccurredAt!), sourceRecordedAt: new Date(rollup!.sourceRecordedAt!),
     });
-    expect(deleted.deleted).toBe(2);
+    expect(deleted.deleted).toBe(1);
     expect(await journal.readJournalEventById(decision.id)).toBeNull();
+    expect(await journal.readJournalEventById(fence.id)).not.toBeNull();
+    await journal.commitDurableTransition({ operationKey: "post-compaction-tail", type: "INFRASTRUCTURE_COST_ACCRUED", aggregateType: "ledger", aggregateId: EXPERIMENT, payload: { experimentId: EXPERIMENT, aiCost: "0", infrastructureCost: "0.00526537" } }, rollup!.sourceCursor);
     const rebuilt = await streamExperimentSummary(journal, { id: EXPERIMENT, startedAt: STARTED_AT }, { reportKind: "final", metricsScope: "complete", complete: true });
     expect(rebuilt.summary.astraDecisionAudit.providerDecisionCount).toBe(1);
     expect(rebuilt.summary.astraDecisionAudit.noTradeCount).toBe(1);
     expect(rebuilt.summary.astraDecisionAudit.digests[0]?.reasonCodes).toContain("BOOK_EDGE");
+    expect(rebuilt.summary.estimatedInfrastructureCostUsd).toBeCloseTo(0.00526537, 10);
+    const rollup2 = await persistVerifiedAnalyticsRollup(journal, {
+      experimentId: EXPERIMENT, sourceCursor: rebuilt.durableCursor, sourceFenceId: fence.id,
+      sourceFenceOccurredAt: fence.occurredAt, sourceEventCount: rebuilt.accumulatorSnapshot!.eventCount,
+      sourceCommitSeq: rebuilt.scan.fence.commitSeqTo, sourceRecordedAt: rebuilt.scan.fence.recordedAtTo.toISOString(),
+      stableRead: rebuilt.scan.fence.stable, sourceCoverageComplete: rebuilt.scan.complete,
+      accumulator: rebuilt.accumulatorSnapshot! as unknown as Record<string, unknown>,
+    });
+    expect(rollup2?.sourceCursor).toBe(rebuilt.durableCursor);
+    expect(analyticsRollupHasDestructiveCoverage(rollup2!)).toBe(true);
+    const laterDelete = await journal.deleteCanonicalEventsThrough!({
+      experimentId: EXPERIMENT, limit: 10, sourceCursor: rollup2!.sourceCursor, sourceCommitSeq: rollup2!.sourceCommitSeq,
+      occurredBefore: new Date(rollup2!.sourceFenceOccurredAt!), sourceRecordedAt: new Date(rollup2!.sourceRecordedAt!),
+    });
+    expect(laterDelete.deleted).toBe(0);
+    expect(await journal.readJournalEventById(fence.id)).not.toBeNull();
   });
 
   it("L: execution counterfactuals distinguish no candidate, gate rejection, and order creation", () => {

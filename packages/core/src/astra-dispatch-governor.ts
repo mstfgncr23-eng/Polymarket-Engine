@@ -108,6 +108,33 @@ export class AstraDispatchGovernor {
     this.prune(nowMs);
   }
 
+  /**
+   * Merge a bounded recovery scan without weakening a checkpoint. A partial
+   * journal page can contain fewer FAST identities than the checkpoint that
+   * was already restored; in that case keep the checkpoint allowance state.
+   */
+  mergeEvidence(events: readonly { marketId?: unknown; occurredAt: string }[], nowMs = Date.now()): void {
+    this.prune(nowMs);
+    const observed = [...events]
+      .filter((event) => typeof event.occurredAt === "string")
+      .map((event) => ({ event, atMs: Date.parse(event.occurredAt) }))
+      .filter((item) => Number.isFinite(item.atMs))
+      .sort((a, b) => a.atMs - b.atMs)
+      .slice(-this.maxDispatches());
+    if (observed.length >= this.dispatches.length) {
+      this.dispatches = observed.map((item) => item.atMs);
+    }
+    for (const { event, atMs } of observed) {
+      this.lastDispatchAtMs = Math.max(this.lastDispatchAtMs ?? atMs, atMs);
+      if (typeof event.marketId === "string" && event.marketId.length > 0) {
+        const untilMs = atMs + this.marketCooldownMs();
+        this.marketCooldowns.set(event.marketId, Math.max(this.marketCooldowns.get(event.marketId) ?? 0, untilMs));
+      }
+    }
+    this.trimMarkets();
+    this.prune(nowMs);
+  }
+
   private maxDispatches(): number {
     return Math.min(ASTRA_FAST_MAX_DISPATCHES_PER_HOUR, Math.max(1, Math.floor(this.options.maxDispatchesPerHour ?? ASTRA_FAST_MAX_DISPATCHES_PER_HOUR)));
   }

@@ -137,6 +137,36 @@ describe("Astra Brain V1 final correctness regressions", () => {
     expect(engine.astraGovernorSnapshotForTest().dispatches).toHaveLength(1);
   });
 
+  it("does not weaken a checkpointed FAST governor when recovery evidence is partial", async () => {
+    const clock = { value: now.getTime() };
+    const journal = new MemoryEventJournal();
+    const engine = new EngineService(qualifiedPaperEnv({ ASTRA_ENABLED: "true" }), journal, { error: () => undefined }, {
+      market: new ScriptedMarketAdapter() as never,
+      referenceRegistry: new ScriptedReferenceRegistry() as never,
+      activation: new NoopGrokActivationBridge(), now: () => new Date(clock.value),
+    });
+    const internal = engine as unknown as {
+      astraGovernor: AstraDispatchGovernor;
+      restoreAstraGovernorFromJournal: () => Promise<void>;
+    };
+    internal.astraGovernor.restore({
+      dispatches: Array.from({ length: 12 }, (_, index) => ({ atMs: clock.value - 12_000 + index * 1_000 })),
+      lastDispatchAtMs: clock.value - 1_000, marketCooldowns: [],
+    }, clock.value);
+    await journal.append(createJournalEvent({
+      id: "partial-fast-recovery", traceId: "partial-fast-recovery", type: "ASTRA_PROVIDER_DISPATCH_AUTHORIZED",
+      aggregateType: "astra_provider_dispatch", aggregateId: "partial-fast-recovery:FAST",
+      occurredAt: new Date(clock.value - 500),
+      payload: { authority: "ASTRA_BRAIN_V1", stage: "FAST", dispatchId: "partial-fast-recovery:FAST" },
+    }));
+    await internal.restoreAstraGovernorFromJournal();
+    expect(engine.astraGovernorSnapshotForTest().dispatches).toHaveLength(12);
+    clock.value += 10_000;
+    expect(internal.astraGovernor.tryAdmit("partial-fresh-market", clock.value)).toMatchObject({
+      allowed: false, reason: "ROLLING_HOUR_CAP",
+    });
+  });
+
   it("serializes concurrent markets so the FAST governor cannot be oversubscribed", async () => {
     const clock = { value: now.getTime() };
     const market = new ScriptedMarketAdapter();
