@@ -29,11 +29,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 2
-      - name: Assert expected clean parent
+          fetch-depth: 0
+      - name: Assert clean engine input
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "10b3389cfaa1395ebdeb0e33341572258855f41c"
+          git merge-base --is-ancestor 10b3389cfaa1395ebdeb0e33341572258855f41c HEAD
+          git diff --quiet 10b3389cfaa1395ebdeb0e33341572258855f41c -- apps/engine/src/engine.ts
       - uses: pnpm/action-setup@v4
         with:
           version: 11.16.0
@@ -51,74 +52,74 @@ jobs:
           text = path.read_text()
 
           begin_old = '''      if (!this.state.newPaperEntryAllowed() || this.overload.state === "FAIL_CLOSED") {
-                const preflight = this.preflight(this.experimentMode());
-                return { ...preflight, ok: false, blockers: [...new Set([...preflight.blockers, "OVERLOAD_FAIL_CLOSED"])] };
-              }
+            const preflight = this.preflight(this.experimentMode());
+            return { ...preflight, ok: false, blockers: [...new Set([...preflight.blockers, "OVERLOAD_FAIL_CLOSED"])] };
+          }
           '''
           begin_new = '''      const startBlockers = [
-                ...(this.state.journalDegraded || this.overload.hasIntegrityFault ? ["JOURNAL_NOT_HEALTHY"] : []),
-                ...this.experimentEconomicResidueBlockers(),
-              ];
-              const entryBlocked = !this.state.newPaperEntryAllowed() || this.overload.state === "FAIL_CLOSED";
-              if (entryBlocked || startBlockers.length > 0) {
-                const preflight = this.preflight(this.experimentMode());
-                return {
-                  ...preflight,
-                  ok: false,
-                  blockers: [...new Set([
-                    ...preflight.blockers,
-                    ...startBlockers,
-                    ...(entryBlocked ? ["OVERLOAD_FAIL_CLOSED"] : []),
-                  ])],
-                };
-              }
+            ...(this.state.journalDegraded || this.overload.hasIntegrityFault ? ["JOURNAL_NOT_HEALTHY"] : []),
+            ...this.experimentEconomicResidueBlockers(),
+          ];
+          const entryBlocked = !this.state.newPaperEntryAllowed() || this.overload.state === "FAIL_CLOSED";
+          if (entryBlocked || startBlockers.length > 0) {
+            const preflight = this.preflight(this.experimentMode());
+            return {
+              ...preflight,
+              ok: false,
+              blockers: [...new Set([
+                ...preflight.blockers,
+                ...startBlockers,
+                ...(entryBlocked ? ["OVERLOAD_FAIL_CLOSED"] : []),
+              ])],
+            };
+          }
           '''
 
           prepare_old = '''      const ledger = this.ledger.snapshot();
-                const openPositions = [...this.ledger.positions.values()].filter((position) => d(position.upQuantity).gt(0) || d(position.downQuantity).gt(0));
-                const restingOrders = [...this.restingOrders.values()].filter((order) => d(order.remaining).gt(0));
-                const makerReservations = [...this.makerReservations.entries()].filter(([, amount]) => d(amount).gt(0));
-                const blockers: string[] = [];
-                if (openPositions.length > 0 || this.ledger.positions.size > 0) blockers.push("OPEN_POSITIONS_REMAIN");
-                if (restingOrders.length > 0 || this.restingOrders.size > 0) blockers.push("RESTING_ORDERS_REMAIN");
-                if (makerReservations.length > 0 || this.makerReservations.size > 0) blockers.push("MAKER_RESERVATIONS_REMAIN");
-                if (!d(ledger.reservedCash).eq(0)) blockers.push("RESERVED_CASH_REMAIN");
-                if (this.obligationMarketIds().size > 0) blockers.push("UNRESOLVED_ECONOMIC_OBLIGATIONS");
-                if (blockers.length > 0) return { ok: false, blockers, experiment: current };
+          const openPositions = [...this.ledger.positions.values()].filter((position) => d(position.upQuantity).gt(0) || d(position.downQuantity).gt(0));
+          const restingOrders = [...this.restingOrders.values()].filter((order) => d(order.remaining).gt(0));
+          const makerReservations = [...this.makerReservations.entries()].filter(([, amount]) => d(amount).gt(0));
+          const blockers: string[] = [];
+          if (openPositions.length > 0 || this.ledger.positions.size > 0) blockers.push("OPEN_POSITIONS_REMAIN");
+          if (restingOrders.length > 0 || this.restingOrders.size > 0) blockers.push("RESTING_ORDERS_REMAIN");
+          if (makerReservations.length > 0 || this.makerReservations.size > 0) blockers.push("MAKER_RESERVATIONS_REMAIN");
+          if (!d(ledger.reservedCash).eq(0)) blockers.push("RESERVED_CASH_REMAIN");
+          if (this.obligationMarketIds().size > 0) blockers.push("UNRESOLVED_ECONOMIC_OBLIGATIONS");
+          if (blockers.length > 0) return { ok: false, blockers, experiment: current };
           '''
           prepare_new = '''      const blockers = this.experimentEconomicResidueBlockers();
-                if (blockers.length > 0) return { ok: false, blockers, experiment: current };
+          if (blockers.length > 0) return { ok: false, blockers, experiment: current };
           '''
 
           obligation_old = '''  private obligationMarketIds(): Set<string> {
-              const ids = this.openPositionMarketIds();
-              for (const resting of this.restingOrders.values()) {
-                if (d(resting.remaining).gt(0)) ids.add(resting.order.marketId);
-              }
-              return ids;
+            const ids = this.openPositionMarketIds();
+            for (const resting of this.restingOrders.values()) {
+              if (d(resting.remaining).gt(0)) ids.add(resting.order.marketId);
             }
+            return ids;
+          }
           '''
           obligation_new = '''  private obligationMarketIds(): Set<string> {
-              const ids = this.openPositionMarketIds();
-              for (const resting of this.restingOrders.values()) {
-                if (d(resting.remaining).gt(0)) ids.add(resting.order.marketId);
-              }
-              return ids;
+            const ids = this.openPositionMarketIds();
+            for (const resting of this.restingOrders.values()) {
+              if (d(resting.remaining).gt(0)) ids.add(resting.order.marketId);
             }
+            return ids;
+          }
 
-            private experimentEconomicResidueBlockers(): string[] {
-              const ledger = this.ledger.snapshot();
-              const openPositions = [...this.ledger.positions.values()].filter((position) => d(position.upQuantity).gt(0) || d(position.downQuantity).gt(0));
-              const restingOrders = [...this.restingOrders.values()].filter((order) => d(order.remaining).gt(0));
-              const makerReservations = [...this.makerReservations.entries()].filter(([, amount]) => d(amount).gt(0));
-              const blockers: string[] = [];
-              if (openPositions.length > 0 || this.ledger.positions.size > 0) blockers.push("OPEN_POSITIONS_REMAIN");
-              if (restingOrders.length > 0 || this.restingOrders.size > 0) blockers.push("RESTING_ORDERS_REMAIN");
-              if (makerReservations.length > 0 || this.makerReservations.size > 0) blockers.push("MAKER_RESERVATIONS_REMAIN");
-              if (!d(ledger.reservedCash).eq(0)) blockers.push("RESERVED_CASH_REMAIN");
-              if (this.obligationMarketIds().size > 0) blockers.push("UNRESOLVED_ECONOMIC_OBLIGATIONS");
-              return blockers;
-            }
+          private experimentEconomicResidueBlockers(): string[] {
+            const ledger = this.ledger.snapshot();
+            const openPositions = [...this.ledger.positions.values()].filter((position) => d(position.upQuantity).gt(0) || d(position.downQuantity).gt(0));
+            const restingOrders = [...this.restingOrders.values()].filter((order) => d(order.remaining).gt(0));
+            const makerReservations = [...this.makerReservations.entries()].filter(([, amount]) => d(amount).gt(0));
+            const blockers: string[] = [];
+            if (openPositions.length > 0 || this.ledger.positions.size > 0) blockers.push("OPEN_POSITIONS_REMAIN");
+            if (restingOrders.length > 0 || this.restingOrders.size > 0) blockers.push("RESTING_ORDERS_REMAIN");
+            if (makerReservations.length > 0 || this.makerReservations.size > 0) blockers.push("MAKER_RESERVATIONS_REMAIN");
+            if (!d(ledger.reservedCash).eq(0)) blockers.push("RESERVED_CASH_REMAIN");
+            if (this.obligationMarketIds().size > 0) blockers.push("UNRESOLVED_ECONOMIC_OBLIGATIONS");
+            return blockers;
+          }
           '''
 
           for label, old, new in [
