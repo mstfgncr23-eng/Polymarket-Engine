@@ -70,11 +70,13 @@ export function refreshExperiment(
   return manifest;
 }
 
-export function experimentAllowsFirstLeg(manifest: ExperimentManifest | null): boolean {
+export function experimentAllowsFirstLeg(manifest: ExperimentManifest | null, now = new Date()): boolean {
   // A durable EXPERIMENT_STARTED row is intentionally pending until the
-  // feed/reference validation transition is authoritative.  Legacy manifests
-  // without the optional field remain compatible.
-  return manifest?.status === "RUNNING" && manifest.startValidationPending !== true;
+  // feed/reference validation transition is authoritative. A first leg is
+  // also forbidden once the durable entry deadline has arrived.
+  if (manifest?.status !== "RUNNING" || manifest.startValidationPending === true || !manifest.entryClosesAt) return false;
+  const deadline = new Date(manifest.entryClosesAt).getTime();
+  return Number.isFinite(deadline) && now.getTime() < deadline;
 }
 
 export function experimentAllowsHedge(manifest: ExperimentManifest | null): boolean {
