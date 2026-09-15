@@ -9,7 +9,7 @@ import {
   type EngineEnv,
 } from "@pm/core";
 import { isCanonicalFinalReport, type EventJournal } from "@pm/db";
-import { loadVerifiedAnalyticsRollup, persistVerifiedAnalyticsRollup, streamExperimentSummary } from "./final-report.js";
+import { analyticsRollupHasDestructiveCoverage, loadVerifiedAnalyticsRollup, persistVerifiedAnalyticsRollup, streamExperimentSummary } from "./final-report.js";
 
 export interface RetentionConfig {
   enabled: boolean;
@@ -326,18 +326,18 @@ export class RetentionManager {
         if (streamed.scan.fence.stable && streamed.scan.complete && !streamed.scan.truncated && !streamed.scan.interrupted && streamed.accumulatorSnapshot) {
           const rollup = await persistVerifiedAnalyticsRollup(this.journal, {
             experimentId: context.experiment.id,
-            sourceCursor: await this.journal.latestDurableSequence(),
+            sourceCursor: streamed.durableCursor,
             sourceFenceId: streamed.scan.fence.through?.id ?? null,
             sourceFenceOccurredAt: streamed.scan.fence.through?.occurredAt ?? null,
             sourceEventCount: streamed.accumulatorSnapshot.eventCount,
             sourceCommitSeq: streamed.scan.fence.commitSeqTo,
             sourceRecordedAt: streamed.scan.fence.recordedAtTo.toISOString(),
             stableRead: streamed.scan.fence.stable,
-            sourceCoverageComplete: streamed.scan.complete && !streamed.scan.truncated && !streamed.scan.interrupted,
+            sourceCoverageComplete: streamed.durableCostScanComplete && streamed.scan.complete && !streamed.scan.truncated && !streamed.scan.interrupted,
             baseContentHash: streamed.baseRollupContentHash,
             accumulator: streamed.accumulatorSnapshot as unknown as Record<string, unknown>,
           });
-          if (rollup?.verified && rollup.sourceFenceOccurredAt) {
+          if (rollup && analyticsRollupHasDestructiveCoverage(rollup) && rollup.sourceFenceOccurredAt) {
             await drainCanonical({
               experimentId: context.experiment!.id,
               occurredBefore: new Date(rollup.sourceFenceOccurredAt!),
@@ -356,7 +356,7 @@ export class RetentionManager {
         && this.journal.deleteCanonicalEventsThrough
       ) {
         const rollup = await loadVerifiedAnalyticsRollup(this.journal, context.experiment.id, "canonical");
-        if (rollup?.verified && rollup.sourceFenceOccurredAt && rollup.sourceCursor >= 0) {
+        if (rollup && analyticsRollupHasDestructiveCoverage(rollup) && rollup.sourceFenceOccurredAt && rollup.sourceCursor >= 0) {
           await drainCanonical({
             experimentId: context.experiment!.id,
             occurredBefore: new Date(rollup.sourceFenceOccurredAt!),

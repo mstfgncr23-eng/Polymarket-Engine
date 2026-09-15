@@ -2,6 +2,7 @@ import { and, asc, desc, eq, gt, gte, inArray, lt, lte, sql } from "drizzle-orm"
 import { drizzle } from "drizzle-orm/postgres-js";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
 import postgres from "postgres";
+import { createHash } from "node:crypto";
 import {
   CANONICAL_REPORT_INPUT_EVENT_TYPES,
   compareJournalEventOrder, createId, EVENT_PAGE_SIZE, EVENT_SCAN_CEILING, isProtectedJournalType,
@@ -16,6 +17,7 @@ import {
   isSemanticallyValidCheckpointPayload,
   durableTransitionInputSchema,
   hashDurablePayload,
+  canonicalJson,
   IdempotencyConflictError,
   type DurableCommitResult,
   type CompactedOperationKey,
@@ -75,6 +77,51 @@ export interface AnalyticsRollup {
   contentHash: string;
   verified: boolean;
   createdAt: string;
+}
+
+function analyticsAccumulatorHashForDelete(accumulator: Record<string, unknown>): string | null {
+  try {
+    const encoded = JSON.stringify(accumulator);
+    if (encoded === undefined) return null;
+    const stored = JSON.parse(encoded) as unknown;
+    if (!stored || typeof stored !== "object" || Array.isArray(stored)) return null;
+    return createHash("sha256").update(canonicalJson(stored)).digest("hex");
+  } catch {
+    return null;
+  }
+}
+
+function analyticsCoverageHashForDelete(rollup: AnalyticsRollup): string {
+  return createHash("sha256").update(canonicalJson({
+    experimentId: rollup.experimentId,
+    schemaVersion: rollup.schemaVersion,
+    sourceEventCount: rollup.sourceEventCount ?? 0,
+    sourceCommitSeq: rollup.sourceCommitSeq ?? 0,
+    sourceFenceId: rollup.sourceFenceId,
+    sourceFenceOccurredAt: rollup.sourceFenceOccurredAt,
+    sourceRecordedAt: rollup.sourceRecordedAt ?? null,
+    stableRead: rollup.stableRead ?? false,
+    accumulatorHash: rollup.contentHash,
+  })).digest("hex");
+}
+
+function rollupAuthorizesCanonicalDelete(rollup: AnalyticsRollup | null, input: { sourceCursor: number; sourceCommitSeq?: number; sourceRecordedAt?: Date; occurredBefore?: Date }): boolean {
+  if (!rollup || !rollup.verified || rollup.schemaVersion !== 1 || rollup.stableRead === false) return false;
+  if (analyticsAccumulatorHashForDelete(rollup.accumulator) !== rollup.contentHash) return false;
+  if (!rollup.coverageHash || analyticsCoverageHashForDelete(rollup) !== rollup.coverageHash) return false;
+  const coverage = rollup.accumulator.analyticsCoverage;
+  if (!coverage || typeof coverage !== "object" || Array.isArray(coverage)) return false;
+  const marker = coverage as { version?: unknown; economicCostComplete?: unknown; decisionAuditComplete?: unknown; decisionAuditOverflow?: unknown };
+  if (marker.version !== 1 || marker.economicCostComplete !== true || marker.decisionAuditComplete !== true || marker.decisionAuditOverflow !== false) return false;
+  const accumulatorEventCount = rollup.accumulator.eventCount;
+  if (typeof rollup.sourceEventCount !== "number" || !Number.isInteger(rollup.sourceEventCount) || rollup.sourceEventCount < 0) return false;
+  if (typeof accumulatorEventCount !== "number" || !Number.isInteger(accumulatorEventCount) || rollup.sourceEventCount !== accumulatorEventCount) return false;
+  if (input.sourceCursor !== rollup.sourceCursor) return false;
+  if (input.sourceCommitSeq != null && input.sourceCommitSeq !== (rollup.sourceCommitSeq ?? 0)) return false;
+  if (!rollup.sourceFenceOccurredAt || !rollup.sourceRecordedAt) return false;
+  if (input.sourceRecordedAt && (!rollup.sourceRecordedAt || input.sourceRecordedAt.toISOString() !== rollup.sourceRecordedAt)) return false;
+  if (input.occurredBefore && input.occurredBefore.toISOString() !== rollup.sourceFenceOccurredAt) return false;
+  return true;
 }
 
 export interface JournalAppendOptions {
@@ -661,10 +708,11 @@ export class MemoryEventJournal implements EventJournal {
   }
   async deleteCanonicalEventsThrough(input: { experimentId: string; occurredBefore?: Date; limit: number; sourceCursor: number; sourceCommitSeq?: number; sourceRecordedAt?: Date }): Promise<{ deleted: number }> {
     assertJournalCapability(this.access, "maintenance", "deleteCanonicalEventsThrough");
+    if (!rollupAuthorizesCanonicalDelete(this.rollups.get(`${input.experimentId}:canonical`) ?? null, input)) return { deleted: 0 };
     const cap = Math.max(0, Math.floor(input.limit));
     const before = input.occurredBefore?.getTime() ?? Number.POSITIVE_INFINITY;
     const victims = this.events.filter((event) => CANONICAL_REPORT_INPUT_EVENT_TYPES.includes(event.type as (typeof CANONICAL_REPORT_INPUT_EVENT_TYPES)[number]))
-      .filter((event) => (event.payload as { experimentId?: unknown }).experimentId === input.experimentId && Date.parse(event.occurredAt) < before)
+      .filter((event) => (event.payload as { experimentId?: unknown }).experimentId === input.experimentId && Date.parse(event.occurredAt) <= before)
       .filter((event) => input.sourceCommitSeq == null || (this.commitSeqById.get(event.id) ?? Number.POSITIVE_INFINITY) <= input.sourceCommitSeq)
       .filter((event) => input.sourceRecordedAt == null || Date.parse(event.recordedAt) <= input.sourceRecordedAt.getTime())
       .slice(0, cap);
@@ -1345,9 +1393,13 @@ export class PostgresEventJournal implements EventJournal {
     assertJournalCapability(this.access, "maintenance", "deleteCanonicalEventsThrough");
     const cap = Math.max(0, Math.min(500, Math.floor(input.limit)));
     if (cap <= 0) return { deleted: 0 };
-    // A cleanup-authoritative rollup must prove both the durable commit fence
-    // and the recorded-at fence. recorded_at alone is not commit authority.
-    if (input.sourceCommitSeq == null) return { deleted: 0 };
+    // A cleanup-authoritative rollup must prove both the durable commit fence,
+    // the recorded-at fence, and the new economic/audit projection. A legacy
+    // schema-v1 row remains readable but cannot authorize destructive cleanup.
+    const rollup = await this.loadAnalyticsRollup(input.experimentId, "canonical");
+    if (!rollup || !rollupAuthorizesCanonicalDelete(rollup, input)) return { deleted: 0 };
+    const sourceCommitSeq = rollup.sourceCommitSeq ?? 0;
+    const sourceRecordedAt = rollup.sourceRecordedAt ? new Date(rollup.sourceRecordedAt) : undefined;
     const before = input.occurredBefore ?? new Date();
     const types = [...CANONICAL_REPORT_INPUT_EVENT_TYPES] as string[];
     const result = await this.client`
@@ -1355,9 +1407,9 @@ export class PostgresEventJournal implements EventJournal {
       WHERE id IN (
         SELECT id FROM journal_events
         WHERE type = ANY(${types}) AND (payload->>'experimentId') = ${input.experimentId}
-          AND occurred_at < ${before.toISOString()}
-          AND commit_seq <= ${input.sourceCommitSeq}
-          AND (${input.sourceRecordedAt == null} OR recorded_at <= ${(input.sourceRecordedAt ?? new Date()).toISOString()})
+          AND occurred_at <= ${before.toISOString()}
+          AND commit_seq <= ${sourceCommitSeq}
+          AND (${sourceRecordedAt == null} OR recorded_at <= ${(sourceRecordedAt ?? new Date()).toISOString()})
         ORDER BY occurred_at ASC, id ASC LIMIT ${cap}
       )`;
     return { deleted: result.count ?? 0 };

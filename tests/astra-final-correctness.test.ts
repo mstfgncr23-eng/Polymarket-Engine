@@ -115,6 +115,28 @@ describe("Astra Brain V1 final correctness regressions", () => {
     expect(engine.astraGovernorSnapshotForTest().dispatches).toHaveLength(1);
   });
 
+  it("does not erase a checkpointed FAST governor when recent evidence is DEEP-only", async () => {
+    const clock = { value: now.getTime() };
+    const journal = new MemoryEventJournal();
+    const engine = new EngineService(qualifiedPaperEnv({ ASTRA_ENABLED: "true" }), journal, { error: () => undefined }, {
+      market: new ScriptedMarketAdapter() as never,
+      referenceRegistry: new ScriptedReferenceRegistry() as never,
+      activation: new NoopGrokActivationBridge(), now: () => new Date(clock.value),
+    });
+    const internal = engine as unknown as {
+      astraGovernor: AstraDispatchGovernor;
+      restoreAstraGovernorFromJournal: () => Promise<void>;
+    };
+    internal.astraGovernor.restore({ dispatches: [{ atMs: clock.value - 1_000 }], lastDispatchAtMs: clock.value - 1_000, marketCooldowns: [] }, clock.value);
+    await journal.append(createJournalEvent({
+      id: "deep-only-recovery-evidence", traceId: "deep-only-recovery", type: "ASTRA_PROVIDER_DISPATCH_AUTHORIZED",
+      aggregateType: "astra_provider_dispatch", aggregateId: "deep-only-recovery:DEEP",
+      occurredAt: new Date(clock.value), payload: { authority: "ASTRA_BRAIN_V1", stage: "DEEP", dispatchId: "deep-only-recovery:DEEP" },
+    }));
+    await internal.restoreAstraGovernorFromJournal();
+    expect(engine.astraGovernorSnapshotForTest().dispatches).toHaveLength(1);
+  });
+
   it("serializes concurrent markets so the FAST governor cannot be oversubscribed", async () => {
     const clock = { value: now.getTime() };
     const market = new ScriptedMarketAdapter();
@@ -142,6 +164,44 @@ describe("Astra Brain V1 final correctness regressions", () => {
       expect(outcomes.filter((outcome) => outcome.status === "rejected").map((outcome) => (outcome.reason as { admissionReason?: string }).admissionReason))
         .toEqual(["ROLLING_HOUR_CAP"]);
       expect(engine.astraGovernorSnapshotForTest().dispatches).toHaveLength(12);
+    } finally {
+      await engine.stop();
+    }
+  });
+
+  it("rejects a repeated dispatch identity before a second SDK attempt", async () => {
+    const clock = { value: now.getTime() };
+    const market = new ScriptedMarketAdapter();
+    const marketId = "duplicate-dispatch-market";
+    market.queue(discoveryReport([qualified(marketId, "BTC", "duplicate-up", "duplicate-down", new Date(clock.value + 900_000).toISOString())]));
+    const journal = new MemoryEventJournal();
+    const engine = new EngineService(qualifiedPaperEnv({
+      ASTRA_ENABLED: "true", ASTRA_FAST_MIN_DISPATCH_INTERVAL_MS: "0", ASTRA_FAST_MARKET_COOLDOWN_MS: "0",
+    }), journal, { error: () => undefined }, {
+      market: market as never,
+      referenceRegistry: new ScriptedReferenceRegistry() as never,
+      activation: new NoopGrokActivationBridge(), now: () => new Date(clock.value),
+    });
+    const authorize = (engine as unknown as {
+      authorizeAndBeginAstraProviderDispatch: (context: AstraProviderDispatchContext, beginDispatch: () => boolean) => Promise<void>;
+    }).authorizeAndBeginAstraProviderDispatch.bind(engine);
+    try {
+      await engine.start();
+      await market.waitForHandlers();
+      expect((await engine.beginExperiment()).ok).toBe(true);
+      const context = {
+        experimentId: engine.experimentManifest()!.id,
+        runGeneration: (engine as unknown as { experimentRunGeneration: number }).experimentRunGeneration,
+        traceId: "duplicate-dispatch", triggerId: "duplicate-dispatch", stage: "FAST" as const,
+        model: "gpt-6-astra", triggerKind: "PAIR_COST_OPPORTUNITY" as const, marketId,
+      };
+      let attempts = 0;
+      await authorize(context, () => { attempts += 1; return true; });
+      await expect(authorize(context, () => { attempts += 1; return true; })).rejects.toMatchObject({
+        dispatchState: "NOT_DISPATCHED", admissionReason: "DISPATCH_ALREADY_AUTHORIZED",
+      });
+      expect(attempts).toBe(1);
+      expect(engine.astraGovernorSnapshotForTest().dispatches).toHaveLength(1);
     } finally {
       await engine.stop();
     }
