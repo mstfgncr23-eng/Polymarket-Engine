@@ -773,9 +773,22 @@ export class EngineService {
       if (this.experiment?.status === "COMPLETED" || this.experiment?.status === "FAILED") {
         return { ok: false, blockers: ["EXPERIMENT_ALREADY_COMPLETED"], experiment: this.experiment };
       }
-      if (!this.state.newPaperEntryAllowed() || this.overload.state === "FAIL_CLOSED") {
+      const startBlockers = [
+        ...(this.state.journalDegraded || this.overload.hasIntegrityFault ? ["JOURNAL_NOT_HEALTHY"] : []),
+        ...this.experimentEconomicResidueBlockers(),
+      ];
+      const entryBlocked = !this.state.newPaperEntryAllowed() || this.overload.state === "FAIL_CLOSED";
+      if (entryBlocked || startBlockers.length > 0) {
         const preflight = this.preflight(this.experimentMode());
-        return { ...preflight, ok: false, blockers: [...new Set([...preflight.blockers, "OVERLOAD_FAIL_CLOSED"])] };
+        return {
+          ...preflight,
+          ok: false,
+          blockers: [...new Set([
+            ...preflight.blockers,
+            ...startBlockers,
+            ...(entryBlocked ? ["OVERLOAD_FAIL_CLOSED"] : []),
+          ])],
+        };
       }
       const preflight = this.preflight(this.experimentMode());
       const feedBlockers = this.experimentFeedBlockers();
@@ -995,16 +1008,7 @@ export class EngineService {
         return { ok: false, blockers: ["REPORT_HAS_UNRESOLVED_OBLIGATIONS"], experiment: current };
       }
 
-      const ledger = this.ledger.snapshot();
-      const openPositions = [...this.ledger.positions.values()].filter((position) => d(position.upQuantity).gt(0) || d(position.downQuantity).gt(0));
-      const restingOrders = [...this.restingOrders.values()].filter((order) => d(order.remaining).gt(0));
-      const makerReservations = [...this.makerReservations.entries()].filter(([, amount]) => d(amount).gt(0));
-      const blockers: string[] = [];
-      if (openPositions.length > 0 || this.ledger.positions.size > 0) blockers.push("OPEN_POSITIONS_REMAIN");
-      if (restingOrders.length > 0 || this.restingOrders.size > 0) blockers.push("RESTING_ORDERS_REMAIN");
-      if (makerReservations.length > 0 || this.makerReservations.size > 0) blockers.push("MAKER_RESERVATIONS_REMAIN");
-      if (!d(ledger.reservedCash).eq(0)) blockers.push("RESERVED_CASH_REMAIN");
-      if (this.obligationMarketIds().size > 0) blockers.push("UNRESOLVED_ECONOMIC_OBLIGATIONS");
+      const blockers = this.experimentEconomicResidueBlockers();
       if (blockers.length > 0) return { ok: false, blockers, experiment: current };
 
       const now = this.nowFn();
@@ -1332,6 +1336,20 @@ export class EngineService {
       if (d(resting.remaining).gt(0)) ids.add(resting.order.marketId);
     }
     return ids;
+  }
+
+  private experimentEconomicResidueBlockers(): string[] {
+    const ledger = this.ledger.snapshot();
+    const openPositions = [...this.ledger.positions.values()].filter((position) => d(position.upQuantity).gt(0) || d(position.downQuantity).gt(0));
+    const restingOrders = [...this.restingOrders.values()].filter((order) => d(order.remaining).gt(0));
+    const makerReservations = [...this.makerReservations.entries()].filter(([, amount]) => d(amount).gt(0));
+    const blockers: string[] = [];
+    if (openPositions.length > 0 || this.ledger.positions.size > 0) blockers.push("OPEN_POSITIONS_REMAIN");
+    if (restingOrders.length > 0 || this.restingOrders.size > 0) blockers.push("RESTING_ORDERS_REMAIN");
+    if (makerReservations.length > 0 || this.makerReservations.size > 0) blockers.push("MAKER_RESERVATIONS_REMAIN");
+    if (!d(ledger.reservedCash).eq(0)) blockers.push("RESERVED_CASH_REMAIN");
+    if (this.obligationMarketIds().size > 0) blockers.push("UNRESOLVED_ECONOMIC_OBLIGATIONS");
+    return blockers;
   }
 
   private vanishedRestingMarketIds(nextMarkets: ReadonlyMap<string, DiscoveredMarket>): string[] {
