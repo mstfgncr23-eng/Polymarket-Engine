@@ -16,6 +16,7 @@ export type BoundedMarketCloseIntent = "operator_shutdown" | "generation_change"
 export type ClobMarketCloseKind =
   | BoundedMarketCloseIntent
   | "clean_remote_close"
+  | "slow_consumer"
   | "abnormal_remote_close"
   | "socket_error"
   | "stale_heartbeat"
@@ -44,7 +45,9 @@ export function formatClobMarketClose(diagnostic: ClobMarketCloseDiagnostic): st
 
 export function classifyClobRemoteClose(input: Pick<ClobMarketCloseDiagnostic, "code" | "wasClean">):
   | "clean_remote_close"
+  | "slow_consumer"
   | "abnormal_remote_close" {
+  if (input.code === 1013) return "slow_consumer";
   return input.wasClean && (input.code === 1000 || input.code === 1001)
     ? "clean_remote_close"
     : "abnormal_remote_close";
