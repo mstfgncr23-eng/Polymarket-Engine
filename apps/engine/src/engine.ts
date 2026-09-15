@@ -118,6 +118,7 @@ import {
   type PolymarketFeedAnomaly,
 } from "@pm/market-data";
 import { EngineMetrics, classifyJournalMetricClass } from "./metrics.js";
+import { MarketDerivationWorkerService } from "./market-derivation-service.js";
 import { RestingOrderTokenIndex } from "./resting-order-index.js";
 import { SseHub } from "./server.js";
 import { EngineStateStore } from "./state.js";
@@ -347,6 +348,7 @@ export class EngineService {
   private maintenanceTimer: NodeJS.Timeout | null = null;
   private discoveryTimer: NodeJS.Timeout | null = null;
   private lastInfrastructureAccrualAt = Date.now();
+  private derivationWorker: MarketDerivationWorkerService | null = null;
   private lastScheduledReviewAt = 0;
   private lastAnomalyJournalAt = 0;
   private reportGenerated = false;
@@ -546,6 +548,7 @@ export class EngineService {
       this.state.setDiscoveryLoopActive(true);
       await this.runDiscovery();
     }
+    await this.startMarketDerivationWorker();
     this.startMarketLoop();
     if (this.legacyBtcAdapter) {
       void this.legacyBtcAdapter.run({
@@ -579,6 +582,7 @@ export class EngineService {
     this.supervisor.closeAdmission();
     this.record("ENGINE_DRAINING", this.experiment?.id ?? "engine", null, {});
     this.abort.abort("SIGTERM");
+    await this.stopMarketDerivationWorker();
     for (const timer of this.referenceRetryTimers.values()) clearTimeout(timer);
     this.referenceRetryTimers.clear();
     if (this.maintenanceTimer) clearInterval(this.maintenanceTimer);
@@ -2072,7 +2076,7 @@ export class EngineService {
       // Deterministic market state is a precursor for bounded scout warming;
       // this admission is intentionally separate from economic triggers.
       this.requestScoutRefresh(snapshot, "market");
-      const triggers = this.triggerEngine.ingestMarket(snapshot);
+      const triggers = await this.ingestMarketSnapshot(snapshot);
       for (const trigger of triggers) this.admitTrigger(trigger, this.provenanceForGenerated(trigger, "MARKET"));
     }
     const window = this.marketsById.get(snapshot.marketId);
@@ -2080,6 +2084,29 @@ export class EngineService {
     this.metrics.triggerDedupeEntries.set(this.triggerEngine.dedupeEntryCount());
     this.state.eventLatencyMs = performance.now() - started;
     this.metrics.eventLatency.observe((performance.now() - started) / 1000);
+  }
+
+  private async startMarketDerivationWorker(): Promise<void> {
+    if (!this.env.MARKET_DERIVATION_WORKER_ENABLED) return;
+    const worker = new MarketDerivationWorkerService({
+      timeoutMs: this.env.MARKET_DERIVATION_WORKER_TIMEOUT_MS,
+      observer: this.metrics.marketDerivationWorkerObserver(),
+    });
+    this.derivationWorker = worker;
+    await worker.start();
+  }
+
+  private async stopMarketDerivationWorker(): Promise<void> {
+    const worker = this.derivationWorker;
+    this.derivationWorker = null;
+    if (!worker) return;
+    await worker.stop();
+  }
+
+  private async ingestMarketSnapshot(snapshot: MarketSnapshot): Promise<TriggerEvent[]> {
+    if (!this.derivationWorker) return this.triggerEngine.ingestMarket(snapshot);
+    const { derived } = await this.derivationWorker.deriveSnapshot(snapshot);
+    return this.triggerEngine.ingestMarketWithDerived(snapshot, derived);
   }
 
   private async onReferenceTick(tick: ReferenceTick): Promise<void> {

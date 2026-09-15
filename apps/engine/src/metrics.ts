@@ -18,6 +18,8 @@ export const FORBIDDEN_METRIC_LABEL_NAMES = [
 ] as const;
 
 const DURATION_BUCKETS = [0.001, 0.005, 0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 1, 5];
+const WORKER_DURATION_BUCKETS = [0.0001, 0.00025, 0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 1];
+const MARKET_DERIVATION_WORKER_STATUSES = ["success", "fallback", "timeout", "error"] as const;
 const BYTE_BUCKETS = [1_000, 10_000, 50_000, 100_000, 250_000, 500_000, 1_000_000, 2_000_000];
 const LEVEL_BUCKETS = [1, 5, 10, 25, 50, 100, 250, 500, 1_000];
 const COUNT_BUCKETS = [1, 2, 5, 10, 25, 50, 100, 250, 800];
@@ -630,6 +632,23 @@ export class EngineMetrics {
     labelNames: ["status"],
     registers: [this.registry],
   });
+  readonly marketDerivationWorkerRequests = new Counter({
+    name: "market_derivation_worker_requests_total",
+    help: "BookDerived worker attempts by bounded status; fallback never skips trigger evaluation",
+    labelNames: ["status"],
+    registers: [this.registry],
+  });
+  readonly marketDerivationWorkerLatency = new Histogram({
+    name: "market_derivation_worker_latency_seconds",
+    help: "BookDerived worker round-trip including fallback path",
+    buckets: WORKER_DURATION_BUCKETS,
+    registers: [this.registry],
+  });
+  readonly marketDerivationWorkerInFlight = new Gauge({
+    name: "market_derivation_worker_in_flight",
+    help: "In-flight BookDerived worker requests (0 or 1)",
+    registers: [this.registry],
+  });
 
   private eventLoopUtilizationPrevious = performance.eventLoopUtilization();
   private processTriggerInFlightCount = 0;
@@ -676,6 +695,8 @@ export class EngineMetrics {
       this.recoveryReplayedTransitions.inc({ type }, 0);
     }
     for (const reason of RECOVERY_FAILURE_REASONS) this.recoveryFailures.inc({ reason }, 0);
+    for (const status of MARKET_DERIVATION_WORKER_STATUSES) this.marketDerivationWorkerRequests.inc({ status }, 0);
+    this.marketDerivationWorkerInFlight.set(0);
     this.checkpointWrites.inc({ status: "success" }, 0);
     this.checkpointWrites.inc({ status: "fence" }, 0);
     this.checkpointWrites.inc({ status: "failed" }, 0);
@@ -750,6 +771,16 @@ export class EngineMetrics {
     const allowed = [...INGRESS_GAP_REASONS, "full_book"];
     const bounded = allowed.includes(reason) ? reason : "full_book";
     this.marketIngressResync.inc({ reason: bounded });
+  }
+
+  marketDerivationWorkerObserver(): { onRequest(status: "success" | "fallback" | "timeout" | "error", latencySeconds: number): void; onInFlight(count: number): void } {
+    return {
+      onRequest: (status, latencySeconds) => {
+        this.marketDerivationWorkerRequests.inc({ status });
+        this.marketDerivationWorkerLatency.observe(latencySeconds);
+      },
+      onInFlight: (count) => this.marketDerivationWorkerInFlight.set(count),
+    };
   }
 
   normalizeObserver(): MarketNormalizeObserver {

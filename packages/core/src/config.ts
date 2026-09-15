@@ -191,6 +191,16 @@ export const engineEnvSchema = z.object({
     (value) => value === undefined ? undefined : value === true || value === "true" || value === "1",
     z.boolean().optional(),
   ).default(false),
+  /**
+   * Offload pure BookDerived calculation to one worker thread. Default OFF:
+   * production keeps the PR50 synchronous deriveBook path.
+   */
+  MARKET_DERIVATION_WORKER_ENABLED: z.preprocess(
+    (value) => value === undefined ? undefined : value === true || value === "true" || value === "1",
+    z.boolean().optional(),
+  ).default(false),
+  /** Hung-worker fallback budget. Does not change trigger semantics. */
+  MARKET_DERIVATION_WORKER_TIMEOUT_MS: z.coerce.number().int().positive().max(5_000).default(50),
 });
 export type EngineEnv = z.infer<typeof engineEnvSchema>;
 

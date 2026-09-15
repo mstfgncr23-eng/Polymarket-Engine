@@ -101,11 +101,14 @@ export class TriggerEngine {
   }
 
   ingestMarket(snapshot: MarketSnapshot): TriggerEvent[] {
+    return this.ingestMarketWithDerived(snapshot, deriveBook(snapshot));
+  }
+
+  ingestMarketWithDerived(snapshot: MarketSnapshot, derived: BookDerived): TriggerEvent[] {
     const started = performance.now();
     try {
       const key = bookKey(snapshot.marketId, snapshot.outcome);
       const previous = this.books.get(key);
-      const derived = deriveBook(snapshot);
       const candidates: Candidate[] = [];
       let newsScore = -1;
       const imbalance = derived.imbalanceAbs;

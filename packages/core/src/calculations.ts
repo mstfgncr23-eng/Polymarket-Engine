@@ -1,4 +1,5 @@
 import { Decimal } from "decimal.js";
+import { TRIGGER_STABILITY_BOUNDS } from "./stability-bounds.js";
 import type { BookLevel, FeeSchedule, MarketSnapshot, Position } from "./types-internal.js";
 
 Decimal.set({ precision: 40, rounding: Decimal.ROUND_HALF_UP });
@@ -97,7 +98,7 @@ export function bestPrice(snapshot: MarketSnapshot, side: "BUY" | "SELL"): strin
   return levels[0]?.price ?? null;
 }
 
-export function spread(snapshot: MarketSnapshot): string | null {
+export function spread(snapshot: Pick<MarketSnapshot, "bids" | "asks">): string | null {
   const bid = snapshot.bids[0];
   const ask = snapshot.asks[0];
   return bid && ask ? decimal(d(ask.price).minus(bid.price)) : null;
@@ -108,7 +109,10 @@ export function spread(snapshot: MarketSnapshot): string | null {
  * ratio→Number — same semantics as the original reduce. No Number-sum fast path
  * (intermediate sums are not IEEE-exact even when each quantity is).
  */
-export function bookImbalance(snapshot: MarketSnapshot, levels = 5): number {
+export function bookImbalance(
+  snapshot: Pick<MarketSnapshot, "bids" | "asks">,
+  levels = TRIGGER_STABILITY_BOUNDS.imbalanceLevels,
+): number {
   const bidN = Math.min(levels, snapshot.bids.length);
   const askN = Math.min(levels, snapshot.asks.length);
   let bid = d(0);
@@ -119,7 +123,10 @@ export function bookImbalance(snapshot: MarketSnapshot, levels = 5): number {
   return total.eq(0) ? 0 : bid.minus(ask).div(total).toNumber();
 }
 
-export function bookImbalanceReference(snapshot: MarketSnapshot, levels = 5): number {
+export function bookImbalanceReference(
+  snapshot: Pick<MarketSnapshot, "bids" | "asks">,
+  levels = TRIGGER_STABILITY_BOUNDS.imbalanceLevels,
+): number {
   const bid = snapshot.bids.slice(0, levels).reduce((sum, level) => sum.plus(level.quantity), d(0));
   const ask = snapshot.asks.slice(0, levels).reduce((sum, level) => sum.plus(level.quantity), d(0));
   const total = bid.plus(ask);
