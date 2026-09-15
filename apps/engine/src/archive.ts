@@ -34,7 +34,12 @@ export async function exportExperimentArchive(
     summary = summaryFromDurableReport(report);
     sourceEventCount = report.sourceEventCount; sourceFenceId = report.sourceFenceId; sourceFenceOccurredAt = report.sourceFenceOccurredAt; reportSchemaVersion = report.schemaVersion;
   } else {
-    const streamed = await streamExperimentSummary(journal, { id: input.experimentId }, { reportKind: "final", metricsScope: "complete", complete: false, truncated: true });
+    const historical = await deriveHistoricalManifest(journal, input.experimentId);
+    const streamed = await streamExperimentSummary(journal, {
+      id: input.experimentId,
+      startedAt: typeof historical.experimentStart === "string" ? historical.experimentStart : null,
+      completedAt: typeof historical.experimentEnd === "string" ? historical.experimentEnd : null,
+    }, { reportKind: "interim", metricsScope: "rolling", complete: false, truncated: true });
     summary = streamed.summary; sourceEventCount = streamed.scan.scanned; sourceFenceId = streamed.scan.fence.through?.id ?? null; sourceFenceOccurredAt = streamed.scan.fence.through?.occurredAt ?? null;
   }
   const rendered = renderExperimentSummaryMarkdown(summary);
