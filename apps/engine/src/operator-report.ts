@@ -84,14 +84,14 @@ export async function generateOperatorReport(
   if (streamed.accumulatorSnapshot) {
     await persistVerifiedAnalyticsRollup(journal, {
       experimentId: authoritative.id,
-      sourceCursor: await journal.latestDurableSequence(),
+      sourceCursor: streamed.durableCursor,
       sourceFenceId: streamed.scan.fence.through?.id ?? null,
       sourceFenceOccurredAt: streamed.scan.fence.through?.occurredAt ?? null,
       sourceEventCount: streamed.accumulatorSnapshot.eventCount,
       sourceCommitSeq: streamed.scan.fence.commitSeqTo,
       sourceRecordedAt: streamed.scan.fence.recordedAtTo.toISOString(),
       stableRead: streamed.scan.fence.stable,
-      sourceCoverageComplete: streamed.scan.complete && !streamed.scan.truncated && !streamed.scan.interrupted,
+      sourceCoverageComplete: streamed.durableCostScanComplete && streamed.scan.complete && !streamed.scan.truncated && !streamed.scan.interrupted,
       baseContentHash: streamed.baseRollupContentHash,
       accumulator: streamed.accumulatorSnapshot as unknown as Record<string, unknown>,
     });

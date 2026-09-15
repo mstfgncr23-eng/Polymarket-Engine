@@ -125,6 +125,15 @@ export class OpenAIAstraClient implements AstraClient {
       const beginDispatch = (): boolean => {
         if (dispatchStarted || request.signal?.aborted) return false;
         dispatchStarted = true;
+        // Arm the maximum provider-operation deadline at the exact SDK
+        // dispatch boundary, before entering the SDK call itself. Admission,
+        // semaphore waiting, and authorization durability remain outside this
+        // timer; a synchronous SDK call cannot silently consume unbounded
+        // provider time before the timer is installed.
+        timeout = setTimeout(() => {
+          controller.abort();
+          rejectDeadline?.(new AstraClientError("ASTRA_REQUEST_TIMEOUT", request.stage, "DISPATCHED_UNKNOWN", { latencyMs: performance.now() - started }));
+        }, this.options.timeoutMs[request.stage]);
         try {
           const requestPromise = this.client.responses.parse({
             model: this.options.model,
@@ -141,13 +150,8 @@ export class OpenAIAstraClient implements AstraClient {
           if (!requestPromise || typeof requestPromise.then !== "function") return false;
           providerRequest = requestPromise;
           dispatched = true;
-          // This is the actual maximum wall-clock provider operation
-          // deadline; admission and request construction are excluded.
-          timeout = setTimeout(() => {
-            controller.abort();
-            rejectDeadline?.(new AstraClientError("ASTRA_REQUEST_TIMEOUT", request.stage, "DISPATCHED_UNKNOWN", { latencyMs: performance.now() - started }));
-          }, this.options.timeoutMs[request.stage]);
         } catch (error) {
+          if (timeout) { clearTimeout(timeout); timeout = undefined; }
           return false;
         }
         return true;
@@ -203,6 +207,12 @@ export class OpenAIAstraClient implements AstraClient {
       const beginDispatch = (): boolean => {
         if (dispatchStarted || request.signal?.aborted) return false;
         dispatchStarted = true;
+        // The provider deadline begins at this SDK boundary, never while
+        // waiting for admission or canonical authorization evidence.
+        timeout = setTimeout(() => {
+          controller.abort();
+          rejectDeadline?.(new AstraClientError("ASTRA_REQUEST_TIMEOUT", request.stage, "DISPATCHED_UNKNOWN", { latencyMs: performance.now() - started }));
+        }, this.options.timeoutMs.BATCH);
         try {
           const requestPromise = this.client.responses.parse({
             model: this.options.model,
@@ -223,11 +233,8 @@ export class OpenAIAstraClient implements AstraClient {
           if (!requestPromise || typeof requestPromise.then !== "function") return false;
           providerRequest = requestPromise;
           dispatched = true;
-          timeout = setTimeout(() => {
-            controller.abort();
-            rejectDeadline?.(new AstraClientError("ASTRA_REQUEST_TIMEOUT", request.stage, "DISPATCHED_UNKNOWN", { latencyMs: performance.now() - started }));
-          }, this.options.timeoutMs.BATCH);
         } catch (error) {
+          if (timeout) { clearTimeout(timeout); timeout = undefined; }
           return false;
         }
         return true;

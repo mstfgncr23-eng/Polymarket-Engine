@@ -22,6 +22,7 @@ import {
 import {
   ExperimentSummaryAccumulator,
   includeCurrentExperimentEvent,
+  type DurableAccountingTransition,
   type ExperimentSummaryAccumulatorSnapshot,
   type ExperimentSummaryExtras,
 } from "./report.js";
@@ -36,9 +37,13 @@ export interface StreamedExperimentSummary {
   accumulatorSnapshot?: ExperimentSummaryAccumulatorSnapshot;
   /** Content hash of the rollup actually restored before scanning the tail. */
   baseRollupContentHash: string | null;
+  /** Durable high-water cursor folded into the accumulator. */
+  durableCursor: number;
+  durableCostScanComplete: boolean;
 }
 
 export const ANALYTICS_ROLLUP_SCHEMA_VERSION = 1;
+export const ANALYTICS_ROLLUP_COVERAGE_VERSION = 1;
 
 /**
  * Analytics rollups are persisted as Postgres jsonb. Hash the exact JSON
@@ -62,6 +67,16 @@ export function hashAnalyticsRollup(accumulator: Record<string, unknown>): strin
 }
 
 /**
+ * Rollup extras describe the consumer view (RUNNING vs ENTRY_CLOSED vs final),
+ * not the covered source prefix. They must not make an unchanged prefix look
+ * like conflicting source data when the lifecycle status advances.
+ */
+function hashRollupSourceAccumulator(accumulator: Record<string, unknown>): string {
+  const { extras: _extras, ...source } = accumulator;
+  return hashAnalyticsRollup(source);
+}
+
+/**
  * Compatibility for schema-v1 rollups written before json-storage hashing.
  * The old accumulator serializer emitted `lastLedger: undefined` when no PNL
  * snapshot had been observed. canonicalJson hashed that key as the literal
@@ -79,6 +94,124 @@ function hashAnalyticsCoverage(input: { experimentId: string; schemaVersion: num
   return createHash("sha256").update(canonicalJson(input)).digest("hex");
 }
 
+/**
+ * Only this explicit in-JSON marker can authorize deletion of canonical
+ * detail. It intentionally lives inside the existing schema-v1 accumulator,
+ * so old v1 rows remain readable while remaining insufficient for destructive
+ * compaction.
+ */
+type AnalyticsCoverageRollup = { schemaVersion: number; verified: boolean; stableRead?: boolean; sourceEventCount?: number; coverageHash?: string; accumulator: Record<string, unknown> };
+
+function analyticsRollupHasCoverageFence(rollup: AnalyticsCoverageRollup): { economicCostComplete: boolean; decisionAuditComplete: boolean; decisionAuditOverflow: boolean } | null {
+  if (!rollup.verified || rollup.schemaVersion !== ANALYTICS_ROLLUP_SCHEMA_VERSION || rollup.stableRead === false) return null;
+  // The coverage marker is only authoritative when the immutable metadata
+  // fence that binds it to this exact rollup is present. This keeps old v1
+  // rows readable while preventing a legacy row with a copied marker from
+  // being treated as a complete prefix during report reconstruction.
+  if (!rollup.coverageHash) return null;
+  const coverage = rollup.accumulator.analyticsCoverage;
+  if (!coverage || typeof coverage !== "object" || Array.isArray(coverage)) return null;
+  const marker = coverage as { version?: unknown; economicCostComplete?: unknown; decisionAuditComplete?: unknown; decisionAuditOverflow?: unknown };
+  const accumulatorEventCount = rollup.accumulator.eventCount;
+  if (typeof rollup.sourceEventCount !== "number" || !Number.isInteger(rollup.sourceEventCount) || rollup.sourceEventCount < 0) return null;
+  if (typeof accumulatorEventCount !== "number" || !Number.isInteger(accumulatorEventCount) || rollup.sourceEventCount !== accumulatorEventCount) return null;
+  if (marker.version !== ANALYTICS_ROLLUP_COVERAGE_VERSION) return null;
+  return {
+    economicCostComplete: marker.economicCostComplete === true,
+    decisionAuditComplete: marker.decisionAuditComplete === true,
+    decisionAuditOverflow: marker.decisionAuditOverflow === true,
+  };
+}
+
+export function analyticsRollupHasEconomicCostCoverage(rollup: AnalyticsCoverageRollup): boolean {
+  const coverage = analyticsRollupHasCoverageFence(rollup);
+  return coverage?.economicCostComplete === true
+    && rollup.accumulator.operatingCostCoverage === "COMPLETE"
+    && Number.isInteger(rollup.accumulator.operatingCostSourceCursor)
+    && Number(rollup.accumulator.operatingCostSourceCursor) >= 0;
+}
+
+export function analyticsRollupHasDecisionAuditCoverage(rollup: AnalyticsCoverageRollup): boolean {
+  const coverage = analyticsRollupHasCoverageFence(rollup);
+  return coverage?.decisionAuditComplete === true && coverage.decisionAuditOverflow === false;
+}
+
+export function analyticsRollupHasDestructiveCoverage(rollup: AnalyticsCoverageRollup): boolean {
+  return analyticsRollupHasEconomicCostCoverage(rollup) && analyticsRollupHasDecisionAuditCoverage(rollup);
+}
+
+async function foldDurableOperatingCosts(
+  journal: EventJournal,
+  accumulator: ExperimentSummaryAccumulator,
+  experimentId: string,
+  afterSequence: number,
+  throughSequence: number,
+  pageSize: number,
+  signal?: AbortSignal,
+): Promise<{ complete: boolean; cursor: number }> {
+  let after = afterSequence;
+  let experimentStartObserved = afterSequence > 0;
+  let preExperimentGap = false;
+  let preExperimentTargetEvidence = false;
+  for (;;) {
+    if (signal?.aborted) return { complete: false, cursor: after };
+    const page = await journal.queryDurableTransitions({
+      afterSequence: after,
+      limit: Math.max(1, Math.min(pageSize, 10_000)),
+    });
+    if (page.length === 0) return { complete: after >= throughSequence, cursor: after };
+    let advanced = false;
+    for (const transition of page) {
+      if (transition.sequence > throughSequence) {
+        const completeThrough = after >= throughSequence;
+        const completeCoverage = experimentStartObserved ? !preExperimentTargetEvidence : !preExperimentGap;
+        return { complete: completeThrough && completeCoverage, cursor: after };
+      }
+      if (!experimentStartObserved) {
+        if (transition.sequence !== after + 1) preExperimentGap = true;
+        if (durableTransitionStartsExperiment(transition, experimentId)) {
+          // Compacted transitions from earlier experiments may leave a global
+          // sequence hole. That hole is irrelevant once this experiment's
+          // durable start is observed; from that marker onward continuity is
+          // mandatory for exact cost reconstruction.
+          experimentStartObserved = true;
+          after = transition.sequence - 1;
+        } else {
+          const payload = transition.payload;
+          const transitionExperimentId = typeof payload.experimentId === "string" ? payload.experimentId : transition.aggregateId;
+          if (transitionExperimentId === experimentId && transition.type === "INFRASTRUCTURE_COST_ACCRUED") {
+            preExperimentTargetEvidence = true;
+            accumulator.foldDurableTransition(transition as DurableAccountingTransition);
+          }
+          after = Math.max(after, transition.sequence);
+          advanced = true;
+          continue;
+        }
+      }
+      if (transition.sequence !== after + 1) return { complete: false, cursor: after };
+      if (transition.sequence > throughSequence) return { complete: after >= throughSequence, cursor: after };
+      after = Math.max(after, transition.sequence);
+      advanced = true;
+      const payload = transition.payload;
+      const transitionExperimentId = typeof payload.experimentId === "string" ? payload.experimentId : transition.aggregateId;
+      if (transitionExperimentId === experimentId && transition.type === "INFRASTRUCTURE_COST_ACCRUED") {
+        accumulator.foldDurableTransition(transition as DurableAccountingTransition);
+      }
+    }
+    const complete = experimentStartObserved ? !preExperimentTargetEvidence : !preExperimentGap;
+    if (!advanced || after >= throughSequence) return { complete, cursor: after };
+    if (page.length < Math.max(1, Math.min(pageSize, 10_000))) return { complete, cursor: after };
+  }
+}
+
+function durableTransitionStartsExperiment(transition: { type: string; aggregateId: string; payload: Record<string, unknown> }, experimentId: string): boolean {
+  if (transition.type !== "EXPERIMENT_STARTED") return false;
+  if (transition.aggregateId === experimentId || transition.payload.experimentId === experimentId) return true;
+  const experiment = transition.payload.experiment;
+  return Boolean(experiment && typeof experiment === "object" && !Array.isArray(experiment)
+    && (experiment as { id?: unknown }).id === experimentId);
+}
+
 export async function persistVerifiedAnalyticsRollup(
   journal: EventJournal,
   input: { experimentId: string; sourceCursor: number; sourceFenceId?: string | null; sourceFenceOccurredAt?: string | null; sourceEventCount?: number; sourceCommitSeq?: number | null; sourceRecordedAt?: string | null; stableRead?: boolean; sourceCoverageComplete?: boolean; previousContentHash?: string | null; baseContentHash?: string | null; accumulator: Record<string, unknown>; rollupKind?: string },
@@ -86,22 +219,45 @@ export async function persistVerifiedAnalyticsRollup(
   if (!journal.persistAnalyticsRollup) return null;
   if (input.stableRead === false) return null;
   if (input.sourceCoverageComplete === false) return null;
-  const coveredCount = input.sourceEventCount ?? 0;
+  const accumulatorEventCount = typeof input.accumulator.eventCount === "number" && Number.isInteger(input.accumulator.eventCount)
+    ? input.accumulator.eventCount : 0;
+  const coveredCount = input.sourceEventCount ?? accumulatorEventCount;
+  const sourceCommitSeq = input.sourceCommitSeq ?? await journal.latestCommitSeq();
+  const sourceRecordedAt = input.sourceRecordedAt ?? new Date().toISOString();
   if (coveredCount > 0 && (!input.sourceFenceId || !input.sourceFenceOccurredAt)) return null;
   if (input.sourceFenceId && journal.readJournalEventById) {
     const fenceEvent = await journal.readJournalEventById(input.sourceFenceId);
     if (!fenceEvent || !CANONICAL_REPORT_INPUT_EVENT_TYPES.includes(fenceEvent.type as (typeof CANONICAL_REPORT_INPUT_EVENT_TYPES)[number])) return null;
-    const fenceExperimentId = typeof fenceEvent.payload.experimentId === "string" ? fenceEvent.payload.experimentId : fenceEvent.aggregateId;
+    const fencePayload = fenceEvent.payload as Record<string, unknown>;
+    const nestedExperiment = fencePayload.experiment;
+    const fenceExperimentId = typeof fencePayload.experimentId === "string"
+      ? fencePayload.experimentId
+      : nestedExperiment && typeof nestedExperiment === "object" && !Array.isArray(nestedExperiment) && typeof (nestedExperiment as { id?: unknown }).id === "string"
+        ? (nestedExperiment as { id: string }).id
+        : fenceEvent.aggregateType === "experiment" ? fenceEvent.aggregateId : null;
     if (fenceExperimentId !== input.experimentId) return null;
     if (input.sourceFenceOccurredAt && fenceEvent.occurredAt !== input.sourceFenceOccurredAt) return null;
   }
   const existing = journal.loadAnalyticsRollup ? await journal.loadAnalyticsRollup(input.experimentId, input.rollupKind ?? "canonical") : null;
   const storageAccumulator = jsonStorageRoundTrip(input.accumulator);
   const contentHash = hashAnalyticsRollup(storageAccumulator);
+  const sameSourceBoundary = existing
+    && existing.sourceCursor === input.sourceCursor
+    && (existing.sourceEventCount ?? 0) === coveredCount
+    && (existing.sourceCommitSeq ?? 0) === sourceCommitSeq
+    && existing.sourceFenceId === (input.sourceFenceId ?? null)
+    && existing.sourceFenceOccurredAt === (input.sourceFenceOccurredAt ?? null)
+    && (existing.stableRead ?? false) === (input.stableRead ?? true);
+  if (sameSourceBoundary && existing && hashRollupSourceAccumulator(existing.accumulator) === hashRollupSourceAccumulator(storageAccumulator)) {
+    // Lifecycle-only metadata (most notably status) is not source evidence.
+    // Keep the already durable row so a status transition cannot turn a safe
+    // active compaction into ANALYTICS_ROLLUP_CONFLICT.
+    return existing;
+  }
   const rollup = {
     experimentId: input.experimentId, rollupKind: input.rollupKind ?? "canonical", schemaVersion: ANALYTICS_ROLLUP_SCHEMA_VERSION,
     sourceCursor: input.sourceCursor, sourceFenceId: input.sourceFenceId ?? null, sourceFenceOccurredAt: input.sourceFenceOccurredAt ?? null,
-    sourceEventCount: coveredCount, sourceCommitSeq: input.sourceCommitSeq ?? 0, sourceRecordedAt: input.sourceRecordedAt ?? null,
+    sourceEventCount: coveredCount, sourceCommitSeq, sourceRecordedAt,
     stableRead: input.stableRead ?? true,
     previousContentHash: input.baseContentHash !== undefined ? input.baseContentHash : (input.previousContentHash !== undefined ? input.previousContentHash : existing?.contentHash ?? null),
     accumulator: storageAccumulator, contentHash, verified: true, createdAt: new Date().toISOString(),
@@ -128,11 +284,39 @@ export async function streamExperimentSummary(
   options: { signal?: AbortSignal; pageSize?: number; ceiling?: number } = {},
 ): Promise<StreamedExperimentSummary> {
   const rollup = await loadVerifiedAnalyticsRollup(journal, experiment.id);
-  const acc = new ExperimentSummaryAccumulator(experiment.id, extras);
+  let acc = new ExperimentSummaryAccumulator(experiment.id, extras);
+  let rollupRestored = rollup == null;
   const rollupSnapshot = rollup?.accumulator as unknown as ExperimentSummaryAccumulatorSnapshot | undefined;
   if (rollupSnapshot) {
-    try { acc.restore({ ...rollupSnapshot, extras }); } catch { /* stale/incompatible rollups are ignored */ }
+    try {
+      acc.restore({ ...rollupSnapshot, extras });
+      rollupRestored = true;
+    } catch {
+      // A hash-valid but locally incompatible accumulator cannot be used as a
+      // prefix. Rebuild the available detail from zero, but keep the result
+      // non-destructive until a complete replacement rollup is proven.
+      acc = new ExperimentSummaryAccumulator(experiment.id, extras);
+      rollupRestored = false;
+    }
   }
+  const usableRollup = rollupRestored ? rollup : null;
+  const legacyEconomicPrefixMissing = Boolean(rollup && !rollupRestored
+    || usableRollup && !analyticsRollupHasEconomicCostCoverage(usableRollup)
+      && ((usableRollup.sourceEventCount ?? 0) > 0 || usableRollup.sourceCursor > 0));
+  if (legacyEconomicPrefixMissing) {
+    acc.setOperatingCostSourceCursor(usableRollup?.sourceCursor ?? 0, false);
+  }
+  if (usableRollup && !analyticsRollupHasDecisionAuditCoverage(usableRollup)) {
+    acc.setDecisionAuditCoverage(false);
+  }
+  const durableHighWater = await journal.latestDurableSequence();
+  const durableStart = usableRollup?.sourceCursor ?? 0;
+  const durableScan = durableHighWater >= durableStart
+    ? await foldDurableOperatingCosts(journal, acc, experiment.id, durableStart, durableHighWater, options.pageSize ?? 500, options.signal)
+    : { complete: false, cursor: durableStart };
+  const durableCursor = durableScan.cursor;
+  const durableCostScanComplete = durableScan.complete;
+  acc.setOperatingCostSourceCursor(durableCursor, durableCostScanComplete && !legacyEconomicPrefixMissing);
   let tailScanned = 0;
   const scan = await scanJournalEvents(journal, {
     types: CANONICAL_REPORT_INPUT_EVENT_TYPES,
@@ -141,7 +325,7 @@ export async function streamExperimentSummary(
     // Commit sequence is the authoritative prefix boundary. Do not use the
     // prior rollup's occurredAt cursor: a newly committed event may carry an
     // older occurredAt and still belongs to the uncovered tail.
-    ...(rollup ? { commitSeqAfter: rollup.sourceCommitSeq ?? 0 } : {}),
+    ...(usableRollup ? { commitSeqAfter: usableRollup.sourceCommitSeq ?? 0 } : {}),
   }, {
     pageSize: options.pageSize,
     ceiling: options.ceiling,
@@ -157,23 +341,32 @@ export async function streamExperimentSummary(
       }
     },
   });
+  if (!scan.complete || scan.truncated || scan.interrupted) acc.setDecisionAuditCoverage(false);
   const summary = acc.finalize();
   summary.complete = Boolean(extras.complete ?? scan.complete) && !scan.truncated && !scan.interrupted && !summary.truncated;
   summary.truncated = scan.truncated || scan.interrupted || summary.truncated;
   summary.truncatedReason = summary.truncated ? (extras.truncatedReason ?? scan.truncatedReason ?? "SCAN_CEILING") : null;
   if (scan.interrupted) summary.complete = false;
-  const baseThrough = rollup && rollup.sourceFenceId && rollup.sourceFenceOccurredAt
-    ? { id: rollup.sourceFenceId, occurredAt: rollup.sourceFenceOccurredAt }
+  const baseThrough = usableRollup && usableRollup.sourceFenceId && usableRollup.sourceFenceOccurredAt
+    ? { id: usableRollup.sourceFenceId, occurredAt: usableRollup.sourceFenceOccurredAt }
     : null;
   const effectiveThrough = baseThrough && scan.fence.through
     ? (Date.parse(scan.fence.through.occurredAt) > Date.parse(baseThrough.occurredAt)
       || (scan.fence.through.occurredAt === baseThrough.occurredAt && scan.fence.through.id > baseThrough.id) ? scan.fence.through : baseThrough)
     : baseThrough ?? scan.fence.through;
-  const effectiveFence = rollup && effectiveThrough
+  const effectiveFence = usableRollup && effectiveThrough
     ? { ...scan.fence, through: effectiveThrough }
     : scan.fence;
-  const effectiveScan = { ...scan, fence: effectiveFence, scanned: (rollup?.sourceEventCount ?? 0) + tailScanned };
-  return { summary, scan: effectiveScan, accumulatorHighWaterBytes: acc.highWaterMarkBytes, accumulatorSnapshot: acc.serialize(), baseRollupContentHash: rollup?.contentHash ?? null };
+  const effectiveScan = { ...scan, fence: effectiveFence, scanned: (usableRollup?.sourceEventCount ?? 0) + tailScanned };
+  return {
+    summary,
+    scan: effectiveScan,
+    accumulatorHighWaterBytes: acc.highWaterMarkBytes,
+    accumulatorSnapshot: acc.serialize(),
+    baseRollupContentHash: usableRollup?.contentHash ?? null,
+    durableCursor,
+    durableCostScanComplete,
+  };
 }
 
 export function toDurableReportInput(input: {

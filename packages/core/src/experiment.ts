@@ -127,7 +127,10 @@ export interface ExperimentSummary {
   notDispatchedFailureCount: number;
   providerCostCompleteness: "COMPLETE" | "PARTIAL" | "NONE";
   estimatedInfrastructureCostUsd: number;
+  /** COMPLETE only when the report has an authoritative ledger/cost projection. */
+  economicCostCompleteness: "COMPLETE" | "UNKNOWN";
   economicPnlUsd: number;
+  astraDecisionAudit: AstraDecisionAuditSummary;
   maximumDrawdownUsd: number;
   maximumDirectionalExposureUsd: number;
   averageUnhedgedDurationMs: number;
@@ -179,6 +182,77 @@ export interface ExperimentSummary {
   failedHedgeCount: number;
 }
 
+export type AstraDecisionAuditSource =
+  | "PROVIDER"
+  | "FAIL_CLOSED"
+  | "DETERMINISTIC_HEDGE"
+  | "GATE_REJECT"
+  | "PRE_PROVIDER_REJECT";
+
+export type AstraDecisionAuditOutcome =
+  | "MODEL_NO_TRADE"
+  | "DIRECTIONAL_DECISION"
+  | "SYNTHETIC_FAIL_CLOSED"
+  | "DETERMINISTIC_HEDGE_BYPASS"
+  | "GATE_REJECTED"
+  | "PRE_PROVIDER_REJECTED"
+  | "RISK_ACCEPTED"
+  | "RISK_VETO"
+  | "NO_EXECUTABLE_CANDIDATE"
+  | "EXECUTION_GATE_REJECTED"
+  | "BOOK_REVALIDATION_REJECT"
+  | "ORDER_CREATED"
+  | "FILLED"
+  | "EXECUTION_ERROR"
+  | "CANCELLED";
+
+export interface AstraDecisionAuditDigest {
+  id: string;
+  traceId: string;
+  triggerId: string | null;
+  marketId: string | null;
+  asset: string | null;
+  source: AstraDecisionAuditSource;
+  action: "BUY_UP" | "BUY_DOWN" | "NO_TRADE" | null;
+  direction: "UP" | "DOWN" | "FLAT" | null;
+  stages: string[];
+  /** Model-supplied rationale only; execution and gate metadata is separate. */
+  reasonCodes: string[];
+  /** Bounded execution/gate/audit evidence, never counted as model rationale. */
+  auditReasonCodes: string[];
+  reasonEvidenceOverflowCount: number;
+  outcome: AstraDecisionAuditOutcome;
+  riskOutcome: "NOT_EVALUATED" | "ACCEPT" | "VETO";
+  orderCreated: boolean;
+  fillCount: number;
+}
+
+export interface AstraDecisionAuditSummary {
+  decisionCount: number;
+  providerDecisionCount: number;
+  buyUpCount: number;
+  buyDownCount: number;
+  noTradeCount: number;
+  directionUpCount: number;
+  directionDownCount: number;
+  directionFlatCount: number;
+  fastOnlyCount: number;
+  deepDecisionCount: number;
+  failClosedCount: number;
+  deterministicHedgeBypassCount: number;
+  gateRejectedCount: number;
+  preProviderRejectedCount: number;
+  overflow: boolean;
+  overflowCount: number;
+  reasonEvidenceOverflowCount: number;
+  preProviderRejectReasons: Record<string, number>;
+  preProviderRejectReasonOverflow: boolean;
+  maxDigestCount: number;
+  maxBytes: number;
+  coverage: "COMPLETE" | "PARTIAL" | "UNKNOWN";
+  digests: AstraDecisionAuditDigest[];
+}
+
 export interface MarketAssetAttribution {
   realizedPnlUsd: number;
   feesUsd: number;
@@ -211,6 +285,7 @@ Report kind: ${summary.reportKind}
 - AI cost (durable ledger): $${summary.aiCostUsd.toFixed(2)}
 - Provider cost completeness: ${summary.providerCostCompleteness} (authorized ${summary.providerDispatchAuthorizedCount}, dispatches ${summary.providerDispatchStartedCount}, unresolved authorization ${summary.providerDispatchUnresolvedAuthorizationCount}, successful ${summary.successfulModelInvocationCount}, known-usage failures ${summary.knownUsageFailureCount}, unknown ${summary.dispatchedUnknownFailureCount}, tracking overflow ${summary.providerDispatchTrackingOverflow}, tracking incomplete ${summary.providerDispatchTrackingIncomplete})
 - Estimated infrastructure cost: $${summary.estimatedInfrastructureCostUsd.toFixed(2)}
+- Economic cost completeness: ${summary.economicCostCompleteness}
 - Economic PnL: $${summary.economicPnlUsd.toFixed(2)}
 - Maximum drawdown: $${summary.maximumDrawdownUsd.toFixed(2)}
 - Hedge failure rate: ${(summary.hedgeFailureRate * 100).toFixed(2)}%
@@ -239,6 +314,7 @@ Report kind: ${summary.reportKind}
 - Opportunities / vetoes by market: ${JSON.stringify(summary.opportunitiesByMarket)} / ${JSON.stringify(summary.vetoesByMarket)}
 - Event counts (activity, not PnL) by market / asset: ${JSON.stringify(summary.eventCountByMarket)} / ${JSON.stringify(summary.eventCountByAsset)}
 - Astra/OpenAI model cost: $${(summary.modelCostByAgentUsd.ASTRA_BRAIN_V1 ?? 0).toFixed(2)}
+- Astra decision audit: ${summary.astraDecisionAudit.coverage} (provider ${summary.astraDecisionAudit.providerDecisionCount}, BUY_UP ${summary.astraDecisionAudit.buyUpCount}, BUY_DOWN ${summary.astraDecisionAudit.buyDownCount}, NO_TRADE ${summary.astraDecisionAudit.noTradeCount}, fail-closed ${summary.astraDecisionAudit.failClosedCount}, hedge bypass ${summary.astraDecisionAudit.deterministicHedgeBypassCount}, gate reject ${summary.astraDecisionAudit.gateRejectedCount}, pre-provider reject ${summary.astraDecisionAudit.preProviderRejectedCount}, overflow ${summary.astraDecisionAudit.overflow})
 - Failures: ${JSON.stringify(summary.failureStatistics)}
 
 This report is computed from the append-only decision/accounting journal. Raw high-frequency telemetry is sampled.

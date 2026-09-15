@@ -1,6 +1,17 @@
 import { z } from "zod";
 
 export const ASTRA_FAST_MAX_DISPATCHES_PER_HOUR = 12;
+/** Maximum legal lifetime of one experiment. Used for bounded runtime authority. */
+export const ASTRA_EXPERIMENT_MAX_HOURS = 48;
+/** A DEEP review is only reachable after a FAST decision, at most once per FAST. */
+export const ASTRA_DEEP_MAX_DISPATCHES_PER_EXPERIMENT = ASTRA_FAST_MAX_DISPATCHES_PER_HOUR * ASTRA_EXPERIMENT_MAX_HOURS;
+/** Explicit bound for non-economic batch learning dispatches in one experiment. */
+export const ASTRA_BATCH_MAX_DISPATCHES_PER_EXPERIMENT = 256;
+/** Maximum active one-shot provider reservations retained by the runtime. */
+export const ASTRA_PROVIDER_DISPATCH_AUTHORITY_MAX =
+  (ASTRA_FAST_MAX_DISPATCHES_PER_HOUR * ASTRA_EXPERIMENT_MAX_HOURS)
+  + ASTRA_DEEP_MAX_DISPATCHES_PER_EXPERIMENT
+  + ASTRA_BATCH_MAX_DISPATCHES_PER_EXPERIMENT;
 export const ASTRA_FAST_MAX_DISPATCHES_PER_HOUR_LIMIT = 10_000;
 export const ASTRA_FAST_MAX_MARKETS = 256;
 export const ASTRA_FAST_MIN_DISPATCH_INTERVAL_MS = 5_000;
@@ -103,6 +114,36 @@ export class AstraDispatchGovernor {
       this.dispatches.push(atMs);
       this.lastDispatchAtMs = atMs;
       if (typeof event.marketId === "string" && event.marketId.length > 0) this.marketCooldowns.set(event.marketId, atMs + this.marketCooldownMs());
+    }
+    this.trimMarkets();
+    this.prune(nowMs);
+  }
+
+  /**
+   * Merge a bounded recovery scan without weakening a checkpoint. A partial
+   * journal page can contain fewer FAST identities than the checkpoint that
+   * was already restored; in that case keep the checkpoint allowance state.
+   */
+  mergeEvidence(events: readonly { marketId?: unknown; occurredAt: string }[], nowMs = Date.now()): void {
+    this.prune(nowMs);
+    const observed = [...events]
+      .filter((event) => typeof event.occurredAt === "string")
+      .map((event) => ({ event, atMs: Date.parse(event.occurredAt) }))
+      .filter((item) => Number.isFinite(item.atMs))
+      .sort((a, b) => a.atMs - b.atMs)
+      .slice(-this.maxDispatches());
+    // Recovery evidence may be partial or older than the checkpoint. Never
+    // replace newer checkpoint timestamps with an equally-sized older page;
+    // union both sources and retain only the newest bounded rolling window.
+    this.dispatches = [...this.dispatches, ...observed.map((item) => item.atMs)]
+      .sort((a, b) => a - b)
+      .slice(-this.maxDispatches());
+    for (const { event, atMs } of observed) {
+      this.lastDispatchAtMs = Math.max(this.lastDispatchAtMs ?? atMs, atMs);
+      if (typeof event.marketId === "string" && event.marketId.length > 0) {
+        const untilMs = atMs + this.marketCooldownMs();
+        this.marketCooldowns.set(event.marketId, Math.max(this.marketCooldowns.get(event.marketId) ?? 0, untilMs));
+      }
     }
     this.trimMarkets();
     this.prune(nowMs);

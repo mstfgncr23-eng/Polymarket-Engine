@@ -115,6 +115,58 @@ describe("Astra Brain V1 final correctness regressions", () => {
     expect(engine.astraGovernorSnapshotForTest().dispatches).toHaveLength(1);
   });
 
+  it("does not erase a checkpointed FAST governor when recent evidence is DEEP-only", async () => {
+    const clock = { value: now.getTime() };
+    const journal = new MemoryEventJournal();
+    const engine = new EngineService(qualifiedPaperEnv({ ASTRA_ENABLED: "true" }), journal, { error: () => undefined }, {
+      market: new ScriptedMarketAdapter() as never,
+      referenceRegistry: new ScriptedReferenceRegistry() as never,
+      activation: new NoopGrokActivationBridge(), now: () => new Date(clock.value),
+    });
+    const internal = engine as unknown as {
+      astraGovernor: AstraDispatchGovernor;
+      restoreAstraGovernorFromJournal: () => Promise<void>;
+    };
+    internal.astraGovernor.restore({ dispatches: [{ atMs: clock.value - 1_000 }], lastDispatchAtMs: clock.value - 1_000, marketCooldowns: [] }, clock.value);
+    await journal.append(createJournalEvent({
+      id: "deep-only-recovery-evidence", traceId: "deep-only-recovery", type: "ASTRA_PROVIDER_DISPATCH_AUTHORIZED",
+      aggregateType: "astra_provider_dispatch", aggregateId: "deep-only-recovery:DEEP",
+      occurredAt: new Date(clock.value), payload: { authority: "ASTRA_BRAIN_V1", stage: "DEEP", dispatchId: "deep-only-recovery:DEEP" },
+    }));
+    await internal.restoreAstraGovernorFromJournal();
+    expect(engine.astraGovernorSnapshotForTest().dispatches).toHaveLength(1);
+  });
+
+  it("does not weaken a checkpointed FAST governor when recovery evidence is partial", async () => {
+    const clock = { value: now.getTime() };
+    const journal = new MemoryEventJournal();
+    const engine = new EngineService(qualifiedPaperEnv({ ASTRA_ENABLED: "true" }), journal, { error: () => undefined }, {
+      market: new ScriptedMarketAdapter() as never,
+      referenceRegistry: new ScriptedReferenceRegistry() as never,
+      activation: new NoopGrokActivationBridge(), now: () => new Date(clock.value),
+    });
+    const internal = engine as unknown as {
+      astraGovernor: AstraDispatchGovernor;
+      restoreAstraGovernorFromJournal: () => Promise<void>;
+    };
+    internal.astraGovernor.restore({
+      dispatches: Array.from({ length: 12 }, (_, index) => ({ atMs: clock.value - 12_000 + index * 1_000 })),
+      lastDispatchAtMs: clock.value - 1_000, marketCooldowns: [],
+    }, clock.value);
+    await journal.append(createJournalEvent({
+      id: "partial-fast-recovery", traceId: "partial-fast-recovery", type: "ASTRA_PROVIDER_DISPATCH_AUTHORIZED",
+      aggregateType: "astra_provider_dispatch", aggregateId: "partial-fast-recovery:FAST",
+      occurredAt: new Date(clock.value - 500),
+      payload: { authority: "ASTRA_BRAIN_V1", stage: "FAST", dispatchId: "partial-fast-recovery:FAST" },
+    }));
+    await internal.restoreAstraGovernorFromJournal();
+    expect(engine.astraGovernorSnapshotForTest().dispatches).toHaveLength(12);
+    clock.value += 10_000;
+    expect(internal.astraGovernor.tryAdmit("partial-fresh-market", clock.value)).toMatchObject({
+      allowed: false, reason: "ROLLING_HOUR_CAP",
+    });
+  });
+
   it("serializes concurrent markets so the FAST governor cannot be oversubscribed", async () => {
     const clock = { value: now.getTime() };
     const market = new ScriptedMarketAdapter();
@@ -142,6 +194,83 @@ describe("Astra Brain V1 final correctness regressions", () => {
       expect(outcomes.filter((outcome) => outcome.status === "rejected").map((outcome) => (outcome.reason as { admissionReason?: string }).admissionReason))
         .toEqual(["ROLLING_HOUR_CAP"]);
       expect(engine.astraGovernorSnapshotForTest().dispatches).toHaveLength(12);
+    } finally {
+      await engine.stop();
+    }
+  });
+
+  it("rejects a repeated dispatch identity before a second SDK attempt", async () => {
+    const clock = { value: now.getTime() };
+    const market = new ScriptedMarketAdapter();
+    const marketId = "duplicate-dispatch-market";
+    market.queue(discoveryReport([qualified(marketId, "BTC", "duplicate-up", "duplicate-down", new Date(clock.value + 900_000).toISOString())]));
+    const journal = new MemoryEventJournal();
+    const engine = new EngineService(qualifiedPaperEnv({
+      ASTRA_ENABLED: "true", ASTRA_FAST_MIN_DISPATCH_INTERVAL_MS: "5000", ASTRA_FAST_MARKET_COOLDOWN_MS: "0",
+    }), journal, { error: () => undefined }, {
+      market: market as never,
+      referenceRegistry: new ScriptedReferenceRegistry() as never,
+      activation: new NoopGrokActivationBridge(), now: () => new Date(clock.value),
+    });
+    const authorize = (engine as unknown as {
+      authorizeAndBeginAstraProviderDispatch: (context: AstraProviderDispatchContext, beginDispatch: () => boolean) => Promise<void>;
+    }).authorizeAndBeginAstraProviderDispatch.bind(engine);
+    const recovery = engine as unknown as {
+      astraProviderDispatchAuthority: Map<string, string>;
+      restoreActiveAstraProviderDispatchAuthority: () => Promise<void>;
+    };
+    try {
+      await engine.start();
+      await market.waitForHandlers();
+      expect((await engine.beginExperiment()).ok).toBe(true);
+      const context = {
+        experimentId: engine.experimentManifest()!.id,
+        runGeneration: (engine as unknown as { experimentRunGeneration: number }).experimentRunGeneration,
+        traceId: "duplicate-dispatch", triggerId: "duplicate-dispatch", stage: "FAST" as const,
+        model: "gpt-6-astra", triggerKind: "PAIR_COST_OPPORTUNITY" as const, marketId,
+      };
+      let attempts = 0;
+      await authorize(context, () => { attempts += 1; return true; });
+      recovery.astraProviderDispatchAuthority.clear();
+      await recovery.restoreActiveAstraProviderDispatchAuthority();
+      await expect(authorize(context, () => { attempts += 1; return true; })).rejects.toMatchObject({
+        dispatchState: "NOT_DISPATCHED", admissionReason: "DISPATCH_ALREADY_AUTHORIZED",
+      });
+      expect(attempts).toBe(1);
+      expect(engine.astraGovernorSnapshotForTest().dispatches).toHaveLength(1);
+    } finally {
+      await engine.stop();
+    }
+  });
+
+  it("bounds active BATCH provider authority and emits a pre-provider cap block", async () => {
+    const clock = { value: now.getTime() };
+    const market = new ScriptedMarketAdapter();
+    market.queue(discoveryReport([qualified("batch-authority-market", "BTC", "batch-authority-up", "batch-authority-down", new Date(clock.value + 900_000).toISOString())]));
+    const journal = new MemoryEventJournal();
+    const engine = new EngineService(qualifiedPaperEnv({ ASTRA_ENABLED: "true" }), journal, { error: () => undefined }, {
+      market: market as never,
+      referenceRegistry: new ScriptedReferenceRegistry() as never,
+      activation: new NoopGrokActivationBridge(), now: () => new Date(clock.value),
+    });
+    const authorize = (engine as unknown as {
+      authorizeAndBeginAstraProviderDispatch: (context: AstraProviderDispatchContext, beginDispatch: () => boolean) => Promise<void>;
+    }).authorizeAndBeginAstraProviderDispatch.bind(engine);
+    try {
+      await engine.start();
+      await market.waitForHandlers();
+      expect((await engine.beginExperiment()).ok).toBe(true);
+      const experimentId = engine.experimentManifest()!.id;
+      const runGeneration = (engine as unknown as { experimentRunGeneration: number }).experimentRunGeneration;
+      const context = (index: number): AstraProviderDispatchContext => ({
+        experimentId, runGeneration, traceId: `batch-authority-${index}`, triggerId: `batch-authority-${index}`,
+        stage: "BATCH", model: "gpt-6-astra", triggerKind: "BATCH", marketId: null,
+      });
+      for (let index = 0; index < 256; index += 1) await authorize(context(index), () => true);
+      await expect(authorize(context(256), () => true)).rejects.toMatchObject({
+        dispatchState: "NOT_DISPATCHED", admissionReason: "PROVIDER_AUTHORITY_CAP",
+      });
+      expect((await journal.queryEvents({ types: ["ASTRA_PROVIDER_DISPATCH_AUTHORIZED"], experimentId })).length).toBe(256);
     } finally {
       await engine.stop();
     }
@@ -551,6 +680,10 @@ describe("Astra Brain V1 final correctness regressions", () => {
     const released = new Promise<AstraModelResult>((resolve) => {
       release = () => resolve(modelResult(decisionOutput("NO_TRADE", 0.1), 0, "finalization-race"));
     });
+    let releaseStartAudit!: () => void;
+    const startAuditHeld = new Promise<void>((resolve) => { releaseStartAudit = resolve; });
+    journal.appendInFlightHold = startAuditHeld;
+    journal.appendInFlightHoldTypes = ["ASTRA_PROVIDER_DISPATCH_STARTED"];
     const engine = new EngineService(qualifiedPaperEnv({ ASTRA_ENABLED: "true", ESTIMATED_INFRA_COST_PER_HOUR_USD: "0" }), journal, { error: () => undefined }, {
       market: market as never, referenceRegistry: references as never, activation: new NoopGrokActivationBridge(), now: () => new Date(clock.value),
       astraClient: { decide: async () => { entered(); return released; } },
@@ -568,10 +701,16 @@ describe("Astra Brain V1 final correctness regressions", () => {
       expect(await journal.queryEvents({ types: ["EXPERIMENT_COMPLETED"] })).toHaveLength(0);
       release();
       await pendingDecision;
+      expect(engine.experimentManifest()?.status).toBe("RUNNING");
+      expect(await journal.queryEvents({ types: ["EXPERIMENT_COMPLETED"] })).toHaveLength(0);
+      releaseStartAudit();
       await pendingCompletion;
       expect(engine.experimentManifest()?.status).toBe("COMPLETED");
       expect(await journal.queryEvents({ types: ["EXPERIMENT_COMPLETED"] })).toHaveLength(1);
     } finally {
+      journal.appendInFlightHold = null;
+      journal.appendInFlightHoldTypes = null;
+      releaseStartAudit?.();
       await engine.stop();
     }
   });

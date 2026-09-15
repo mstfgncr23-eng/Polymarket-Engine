@@ -751,6 +751,8 @@ describe("PR18 hot operational storage lifecycle", () => {
     const floors: Array<{ durable: number; canonical: number; checkpoints: number; rollups: number }> = [];
     let cursor = 0;
     for (let cycle = 0; cycle < 3; cycle += 1) {
+      const started = await journal.commitDurableTransition({ operationKey: `cycle:${cycle}:started`, type: "EXPERIMENT_STARTED", aggregateType: "experiment", aggregateId: `exp:${cycle}`, payload: { experiment: { id: `exp:${cycle}` } } }, cursor);
+      cursor = started.sequence;
       for (let i = 0; i < 20; i += 1) {
         const committed = await journal.commitDurableTransition({ operationKey: `cycle:${cycle}:settle:${i}`, type: "POSITION_SETTLED", aggregateType: "position", aggregateId: `p:${cycle}:${i}`, payload: { experimentId: `exp:${cycle}` } }, cursor);
         cursor = committed.sequence;
@@ -758,25 +760,41 @@ describe("PR18 hot operational storage lifecycle", () => {
       }
       await journal.saveCheckpoint({ experimentId: `exp:${cycle}`, sequence: cycle * 2 + 1, payload: { ...checkpointPayload(cursor), experiment: { id: `exp:${cycle}`, status: "COMPLETED", startedAt: "2026-01-01T00:00:00.000Z", completedAt: "2026-01-01T00:01:00.000Z" } } });
       await journal.saveCheckpoint({ experimentId: `exp:${cycle}`, sequence: cycle * 2 + 2, payload: { ...checkpointPayload(cursor), experiment: { id: `exp:${cycle}`, status: "COMPLETED", startedAt: "2026-01-01T00:00:00.000Z", completedAt: "2026-01-01T00:01:00.000Z" } } });
-      const acc = new ExperimentSummaryAccumulator(`exp:${cycle}`, { status: "COMPLETED", complete: true, reportKind: "final", metricsScope: "complete" });
-      await persistVerifiedAnalyticsRollup(journal, { experimentId: `exp:${cycle}`, sourceCursor: cursor, sourceFenceId: null, sourceFenceOccurredAt: "2026-01-01T00:01:00.000Z", accumulator: acc.serialize() as unknown as Record<string, unknown> });
+      const streamed = await streamExperimentSummary(journal, { id: `exp:${cycle}`, startedAt: "2026-01-01T00:00:00.000Z" }, { status: "COMPLETED", complete: true, reportKind: "final", metricsScope: "complete" });
+      await persistVerifiedAnalyticsRollup(journal, {
+        experimentId: `exp:${cycle}`, sourceCursor: streamed.durableCursor,
+        sourceFenceId: streamed.scan.fence.through?.id ?? null,
+        sourceFenceOccurredAt: streamed.scan.fence.through?.occurredAt ?? null,
+        sourceEventCount: streamed.accumulatorSnapshot!.eventCount,
+        sourceCommitSeq: streamed.scan.fence.commitSeqTo,
+        sourceRecordedAt: streamed.scan.fence.recordedAtTo.toISOString(),
+        stableRead: streamed.scan.fence.stable, sourceCoverageComplete: streamed.scan.complete,
+        accumulator: streamed.accumulatorSnapshot! as unknown as Record<string, unknown>,
+      });
       await journal.compactDurableTransitionsThrough(cursor);
-      await journal.deleteCanonicalEventsThrough!({ experimentId: `exp:${cycle}`, sourceCursor: cursor, limit: 1_000 });
+      const rollup = await journal.loadAnalyticsRollup!(`exp:${cycle}`);
+      await journal.deleteCanonicalEventsThrough!({
+        experimentId: `exp:${cycle}`, sourceCursor: rollup!.sourceCursor, limit: 1_000,
+        occurredBefore: new Date(rollup!.sourceFenceOccurredAt!), sourceCommitSeq: rollup!.sourceCommitSeq,
+        sourceRecordedAt: new Date(rollup!.sourceRecordedAt!),
+      });
       const counts = journal.memoryFootprintForTest();
       floors.push({ durable: await durableRows(journal), canonical: (await journal.countByType(CANONICAL_REPORT_INPUT_EVENT_TYPES)).RISK_EVALUATION ?? 0, checkpoints: (await journal.listCheckpoints()).length, rollups: cycle + 1 });
       expect(counts.events).toBeLessThanOrEqual(64);
     }
     expect(floors.map((item) => item.durable)).toEqual([0, 0, 0]);
-    expect(floors.map((item) => item.canonical)).toEqual([0, 0, 0]);
+    // The source-fence event is intentionally retained as the anchor for the
+    // next verified rollup/compaction cycle.
+    expect(floors.map((item) => item.canonical)).toEqual([1, 2, 3]);
     expect(floors.map((item) => item.checkpoints)).toEqual([2, 4, 6]);
     expect(floors.map((item) => item.rollups)).toEqual([1, 2, 3]);
-    expect(await journal.latestDurableSequence()).toBe(60);
+    expect(await journal.latestDurableSequence()).toBe(63);
     const footprint = journal.storageFootprintForTest();
     expect(Object.keys(footprint).sort()).toEqual([
       "durable_replay_keys", "durable_transitions", "engine_checkpoints", "experiment_report_rollups", "experiment_reports", "journal_events", "mcp_idempotency",
     ]);
     expect(footprint.durable_transitions.rows).toBe(0);
-    expect(footprint.journal_events.rows).toBe(0);
+    expect(footprint.journal_events.rows).toBe(3);
     expect(footprint.durable_replay_keys.rows).toBeLessThanOrEqual(64);
   });
 
