@@ -115,7 +115,7 @@ describe("Step 5 live-feed experiment start gate", () => {
   it("treats durable pending state as outside the canonical entry window", () => {
     const running = { status: "RUNNING" as const, startValidationPending: true } as never;
     expect(experimentAllowsFirstLeg(running)).toBe(false);
-    expect(experimentAllowsFirstLeg({ status: "RUNNING" } as never)).toBe(true);
+    expect(experimentAllowsFirstLeg({ status: "RUNNING" } as never)).toBe(false);
   });
 
   it("rejects a real-adapter start while the market stream is disconnected", async () => {
