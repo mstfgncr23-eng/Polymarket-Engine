@@ -1,0 +1,151 @@
+name: PR53 one-shot beginExperiment fix
+
+on:
+  push:
+    branches: [fix/begin-experiment-exposure-gate]
+    paths:
+      - .github/workflows/pr53-one-shot-fix.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch-test-commit:
+    runs-on: ubuntu-latest
+    services:
+      postgres-step4:
+        image: postgres:17
+        env:
+          POSTGRES_USER: step4
+          POSTGRES_PASSWORD: step4
+          POSTGRES_DB: step4_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U step4 -d step4_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      STEP4_TEST_DATABASE_URL: postgres://step4:step4@127.0.0.1:5432/step4_test
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Assert expected clean parent
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "10b3389cfaa1395ebdeb0e33341572258855f41c"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.16.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Apply exact anchored engine patch
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("apps/engine/src/engine.ts")
+          text = path.read_text()
+
+          begin_old = '''      if (!this.state.newPaperEntryAllowed() || this.overload.state === "FAIL_CLOSED") {
+                const preflight = this.preflight(this.experimentMode());
+                return { ...preflight, ok: false, blockers: [...new Set([...preflight.blockers, "OVERLOAD_FAIL_CLOSED"])] };
+              }
+          '''
+          begin_new = '''      const startBlockers = [
+                ...(this.state.journalDegraded || this.overload.hasIntegrityFault ? ["JOURNAL_NOT_HEALTHY"] : []),
+                ...this.experimentEconomicResidueBlockers(),
+              ];
+              const entryBlocked = !this.state.newPaperEntryAllowed() || this.overload.state === "FAIL_CLOSED";
+              if (entryBlocked || startBlockers.length > 0) {
+                const preflight = this.preflight(this.experimentMode());
+                return {
+                  ...preflight,
+                  ok: false,
+                  blockers: [...new Set([
+                    ...preflight.blockers,
+                    ...startBlockers,
+                    ...(entryBlocked ? ["OVERLOAD_FAIL_CLOSED"] : []),
+                  ])],
+                };
+              }
+          '''
+
+          prepare_old = '''      const ledger = this.ledger.snapshot();
+                const openPositions = [...this.ledger.positions.values()].filter((position) => d(position.upQuantity).gt(0) || d(position.downQuantity).gt(0));
+                const restingOrders = [...this.restingOrders.values()].filter((order) => d(order.remaining).gt(0));
+                const makerReservations = [...this.makerReservations.entries()].filter(([, amount]) => d(amount).gt(0));
+                const blockers: string[] = [];
+                if (openPositions.length > 0 || this.ledger.positions.size > 0) blockers.push("OPEN_POSITIONS_REMAIN");
+                if (restingOrders.length > 0 || this.restingOrders.size > 0) blockers.push("RESTING_ORDERS_REMAIN");
+                if (makerReservations.length > 0 || this.makerReservations.size > 0) blockers.push("MAKER_RESERVATIONS_REMAIN");
+                if (!d(ledger.reservedCash).eq(0)) blockers.push("RESERVED_CASH_REMAIN");
+                if (this.obligationMarketIds().size > 0) blockers.push("UNRESOLVED_ECONOMIC_OBLIGATIONS");
+                if (blockers.length > 0) return { ok: false, blockers, experiment: current };
+          '''
+          prepare_new = '''      const blockers = this.experimentEconomicResidueBlockers();
+                if (blockers.length > 0) return { ok: false, blockers, experiment: current };
+          '''
+
+          obligation_old = '''  private obligationMarketIds(): Set<string> {
+              const ids = this.openPositionMarketIds();
+              for (const resting of this.restingOrders.values()) {
+                if (d(resting.remaining).gt(0)) ids.add(resting.order.marketId);
+              }
+              return ids;
+            }
+          '''
+          obligation_new = '''  private obligationMarketIds(): Set<string> {
+              const ids = this.openPositionMarketIds();
+              for (const resting of this.restingOrders.values()) {
+                if (d(resting.remaining).gt(0)) ids.add(resting.order.marketId);
+              }
+              return ids;
+            }
+
+            private experimentEconomicResidueBlockers(): string[] {
+              const ledger = this.ledger.snapshot();
+              const openPositions = [...this.ledger.positions.values()].filter((position) => d(position.upQuantity).gt(0) || d(position.downQuantity).gt(0));
+              const restingOrders = [...this.restingOrders.values()].filter((order) => d(order.remaining).gt(0));
+              const makerReservations = [...this.makerReservations.entries()].filter(([, amount]) => d(amount).gt(0));
+              const blockers: string[] = [];
+              if (openPositions.length > 0 || this.ledger.positions.size > 0) blockers.push("OPEN_POSITIONS_REMAIN");
+              if (restingOrders.length > 0 || this.restingOrders.size > 0) blockers.push("RESTING_ORDERS_REMAIN");
+              if (makerReservations.length > 0 || this.makerReservations.size > 0) blockers.push("MAKER_RESERVATIONS_REMAIN");
+              if (!d(ledger.reservedCash).eq(0)) blockers.push("RESERVED_CASH_REMAIN");
+              if (this.obligationMarketIds().size > 0) blockers.push("UNRESOLVED_ECONOMIC_OBLIGATIONS");
+              return blockers;
+            }
+          '''
+
+          for label, old, new in [
+              ("beginExperiment gate", begin_old, begin_new),
+              ("prepareNext residue block", prepare_old, prepare_new),
+              ("residue helper insertion", obligation_old, obligation_new),
+          ]:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected exactly 1 anchor, found {count}")
+              text = text.replace(old, new, 1)
+
+          path.write_text(text)
+          PY
+          git diff --check
+          git diff --stat
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm build
+      - run: pnpm smoke
+      - name: Commit validated patch and remove one-shot workflow
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/pr53-one-shot-fix.yml
+          git add apps/engine/src/engine.ts
+          git diff --cached --check
+          git commit -m "fix(engine): gate experiment start on economic residue"
+          git push origin HEAD:fix/begin-experiment-exposure-gate
