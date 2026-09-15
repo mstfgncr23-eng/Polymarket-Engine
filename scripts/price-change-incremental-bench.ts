@@ -101,10 +101,15 @@ function cpuMs(usage: NodeJS.CpuUsage): number {
   return (usage.user + usage.system) / 1000;
 }
 
-function runWorkload(adapter: PolymarketMarketDataAdapter, eventCount: number): { events: number; snapshots: number } {
+function runWorkload(
+  adapter: PolymarketMarketDataAdapter,
+  eventCount: number,
+  startIndex = 0,
+): { events: number; snapshots: number } {
   let snapshots = 0;
   for (let index = 0; index < eventCount; index += 1) {
-    snapshots += adapter.normalizeSourceEvent(priceChangeEvent(2_000 + index, index)).length;
+    const eventIndex = startIndex + index;
+    snapshots += adapter.normalizeSourceEvent(priceChangeEvent(2_000 + eventIndex, eventIndex)).length;
   }
   return { events: eventCount, snapshots };
 }
@@ -113,13 +118,13 @@ function measure() {
   const adapter = createAdapter();
   adapter.normalizeSourceEvent(bookEvent("tok-up", 1_000));
   adapter.normalizeSourceEvent(bookEvent("tok-down", 1_000));
-  runWorkload(adapter, WARMUP_EVENTS);
+  runWorkload(adapter, WARMUP_EVENTS, 0);
   if (typeof globalThis.gc === "function") globalThis.gc();
 
   const heapBefore = process.memoryUsage().heapUsed;
   const cpuBefore = process.cpuUsage();
   const started = process.hrtime.bigint();
-  const result = runWorkload(adapter, EVENTS);
+  const result = runWorkload(adapter, EVENTS, WARMUP_EVENTS);
   const elapsedNs = process.hrtime.bigint() - started;
   const cpu = process.cpuUsage(cpuBefore);
   const heapAfter = process.memoryUsage().heapUsed;
