@@ -84,48 +84,53 @@ function cpuMs(start: NodeJS.CpuUsage): number {
 /**
  * Valid main-thread stall measurement.
  *
- * A timer is scheduled BEFORE work. After work we yield once so the timers
- * phase and monitorEventLoopDelay can observe the stall. A synchronous loop
- * that never yields cannot be measured by an interval that is armed and
- * cleared around the same blocking call — that probe always reports 0ms.
+ * Arm monitorEventLoopDelay until it has sampled, then schedule a 5ms timer
+ * immediately before work. After work, yield once so both the timer and the
+ * delay histogram can observe a synchronous stall. Do not put this setup on
+ * the wall/cpu clock — that would pollute ops/s.
+ *
+ * A setInterval wrapped around a blocking loop and cleared in the same turn
+ * never fires and must not be reported as 0ms responsiveness.
  */
-async function withResponsivenessProbe<T>(work: () => Promise<T>): Promise<{
-  result: T;
-  mainThreadTimerDelayMs: number;
-  eventLoopDelayMaxMs: number;
+async function armResponsivenessProbe(): Promise<{
+  histogram: ReturnType<typeof monitorEventLoopDelay>;
+  timer: NodeJS.Timeout;
+  scheduledAt: number;
+  expectedDelayMs: number;
+  firedAt: { current: number | null };
 }> {
   const histogram = monitorEventLoopDelay({ resolution: 1 });
   histogram.enable();
-  await new Promise<void>((resolve) => setImmediate(resolve));
-
+  const armedAt = Date.now();
+  while (histogram.count === 0 && Date.now() - armedAt < 50) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 1));
+  }
   const expectedDelayMs = 5;
+  const firedAt = { current: null as number | null };
   const scheduledAt = performance.now();
-  let firedAt: number | null = null;
   const timer = setTimeout(() => {
-    firedAt = performance.now();
+    firedAt.current = performance.now();
   }, expectedDelayMs);
   timer.unref();
+  return { histogram, timer, scheduledAt, expectedDelayMs, firedAt };
+}
 
-  try {
-    const result = await work();
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    if (firedAt == null) {
-      await new Promise<void>((resolve) => setTimeout(resolve, expectedDelayMs + 1));
-    }
-    histogram.disable();
-    const fired = firedAt;
-    if (fired == null) {
-      throw new Error("MAIN_THREAD_TIMER_PROBE_DID_NOT_FIRE");
-    }
-    return {
-      result,
-      mainThreadTimerDelayMs: Number(Math.max(0, fired - scheduledAt - expectedDelayMs).toFixed(3)),
-      eventLoopDelayMaxMs: Number((histogram.max / 1e6).toFixed(3)),
-    };
-  } finally {
-    histogram.disable();
-    clearTimeout(timer);
+async function finishResponsivenessProbe(probe: Awaited<ReturnType<typeof armResponsivenessProbe>>): Promise<{
+  mainThreadTimerDelayMs: number;
+  eventLoopDelayMaxMs: number;
+}> {
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  if (probe.firedAt.current == null) {
+    await new Promise<void>((resolve) => setTimeout(resolve, probe.expectedDelayMs + 1));
   }
+  probe.histogram.disable();
+  clearTimeout(probe.timer);
+  const fired = probe.firedAt.current;
+  if (fired == null) throw new Error("MAIN_THREAD_TIMER_PROBE_DID_NOT_FIRE");
+  return {
+    mainThreadTimerDelayMs: Number(Math.max(0, fired - probe.scheduledAt - probe.expectedDelayMs).toFixed(3)),
+    eventLoopDelayMaxMs: Number((probe.histogram.max / 1e6).toFixed(3)),
+  };
 }
 
 function triggerConfig() {
@@ -151,58 +156,56 @@ for (const item of warmup) {
   workerEngine.ingestMarketWithDerived(item, derived);
 }
 
+const syncProbeArm = await armResponsivenessProbe();
 const syncEluStart = performance.eventLoopUtilization();
 const syncCpu = process.cpuUsage();
 const syncWallStart = performance.now();
-const syncProbe = await withResponsivenessProbe(async () => {
-  const derived: BookDerived[] = [];
-  let triggers = 0;
-  for (const item of measured) {
-    const next = deriveBook(item);
-    derived.push(next);
-    triggers += syncEngine.ingestMarketWithDerived(item, next).length;
-  }
-  return { derived, triggers };
-});
+const syncDerived: BookDerived[] = [];
+let syncTriggers = 0;
+for (const item of measured) {
+  const next = deriveBook(item);
+  syncDerived.push(next);
+  syncTriggers += syncEngine.ingestMarketWithDerived(item, next).length;
+}
 const syncWallMs = performance.now() - syncWallStart;
 const syncCpuMs = cpuMs(syncCpu);
 const syncElu = performance.eventLoopUtilization(syncEluStart).utilization;
+const syncProbe = await finishResponsivenessProbe(syncProbeArm);
 
+const workerProbeArm = await armResponsivenessProbe();
 const workerEluStart = performance.eventLoopUtilization();
 const workerCpu = process.cpuUsage();
 const workerWallStart = performance.now();
+const workerDerived: BookDerived[] = [];
+let workerTriggers = 0;
+let workerSuccess = 0;
 let roundTripSum = 0;
 let roundTripMax = 0;
-const workerProbe = await withResponsivenessProbe(async () => {
-  const derived: BookDerived[] = [];
-  let triggers = 0;
-  let success = 0;
-  for (const item of measured) {
-    const started = performance.now();
-    const result = await service.deriveSnapshot(item);
-    const rtt = performance.now() - started;
-    roundTripSum += rtt;
-    roundTripMax = Math.max(roundTripMax, rtt);
-    if (result.status === "success") success += 1;
-    derived.push(result.derived);
-    triggers += workerEngine.ingestMarketWithDerived(item, result.derived).length;
-  }
-  return { derived, triggers, success };
-});
+for (const item of measured) {
+  const started = performance.now();
+  const result = await service.deriveSnapshot(item);
+  const rtt = performance.now() - started;
+  roundTripSum += rtt;
+  roundTripMax = Math.max(roundTripMax, rtt);
+  if (result.status === "success") workerSuccess += 1;
+  workerDerived.push(result.derived);
+  workerTriggers += workerEngine.ingestMarketWithDerived(item, result.derived).length;
+}
 const workerWallMs = performance.now() - workerWallStart;
 const workerCpuMs = cpuMs(workerCpu);
 const workerElu = performance.eventLoopUtilization(workerEluStart).utilization;
+const workerProbe = await finishResponsivenessProbe(workerProbeArm);
 
 await service.stop();
 
-const syncChecksum = checksum(syncProbe.result.derived);
-const workerChecksum = checksum(workerProbe.result.derived);
+const syncChecksum = checksum(syncDerived);
+const workerChecksum = checksum(workerDerived);
 const compactChecksum = checksum(measured.map((item) => deriveBookFromSides(compactBookSidesForDerivation(item))));
 if (syncChecksum !== workerChecksum || syncChecksum !== compactChecksum) {
   throw new Error(`CHECKSUM_MISMATCH sync=${syncChecksum} worker=${workerChecksum} compact=${compactChecksum}`);
 }
-if (syncProbe.result.triggers !== workerProbe.result.triggers) {
-  throw new Error(`TRIGGER_COUNT_MISMATCH sync=${syncProbe.result.triggers} worker=${workerProbe.result.triggers}`);
+if (syncTriggers !== workerTriggers) {
+  throw new Error(`TRIGGER_COUNT_MISMATCH sync=${syncTriggers} worker=${workerTriggers}`);
 }
 
 const iterations = measured.length;
@@ -212,7 +215,7 @@ const report = {
   levelsPerSide: LEVELS,
   cpus: cpus().length,
   checksum: syncChecksum,
-  triggerCount: syncProbe.result.triggers,
+  triggerCount: syncTriggers,
   equivalent: true,
   sync: {
     wallMs: Number(syncWallMs.toFixed(3)),
@@ -229,7 +232,7 @@ const report = {
     eventLoopUtilization: Number(workerElu.toFixed(4)),
     mainThreadTimerDelayMs: workerProbe.mainThreadTimerDelayMs,
     eventLoopDelayMaxMs: workerProbe.eventLoopDelayMaxMs,
-    success: workerProbe.result.success,
+    success: workerSuccess,
     roundTripAvgMs: Number((roundTripSum / iterations).toFixed(3)),
     roundTripMaxMs: Number(roundTripMax.toFixed(3)),
   },
