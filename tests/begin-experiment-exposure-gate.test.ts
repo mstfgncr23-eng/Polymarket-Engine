@@ -21,6 +21,20 @@ describe("beginExperiment economic residue gate", () => {
     }
   });
 
+  it("refuses to start when the journal is degraded", async () => {
+    const { engine } = await startQualifiedEngine();
+    try {
+      engine.state.journalDegraded = true;
+
+      const result = await engine.beginExperiment();
+      expect(result.ok).toBe(false);
+      expect(result.blockers).toEqual(expect.arrayContaining(["JOURNAL_NOT_HEALTHY"]));
+      expect(engine.experimentManifest()?.status).not.toBe("RUNNING");
+    } finally {
+      await engine.stop();
+    }
+  });
+
   it("still starts a clean IDLE engine with no leftover exposure", async () => {
     const { engine } = await startQualifiedEngine();
     try {
