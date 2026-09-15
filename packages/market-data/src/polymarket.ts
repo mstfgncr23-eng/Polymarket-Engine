@@ -148,6 +148,9 @@ interface BookState {
   publishedAsks: readonly BookLevel[] | null;
   bidsDirty: boolean;
   asksDirty: boolean;
+  /** Working maps/arrays are unique to this object and safe to mutate. */
+  bidsOwned: boolean;
+  asksOwned: boolean;
   levelsValid: boolean;
   lastTradePrice: string | null;
   timestamp: string;
@@ -612,6 +615,8 @@ export class PolymarketMarketDataAdapter {
       publishedAsks: null,
       bidsDirty: true,
       asksDirty: true,
+      bidsOwned: true,
+      asksOwned: true,
       levelsValid: false,
       lastTradePrice: nullableString(payload.lastTradePrice),
       timestamp: new Date(sourceMs).toISOString(),
@@ -642,9 +647,14 @@ export class PolymarketMarketDataAdapter {
   }
 
   /**
-   * Validate every price_change entry, then commit a staged copy.
-   * One malformed entry leaves ZERO trusted mutation and forces a resync.
-   * Stale/out-of-order timestamps remain a safe-drop of that payload.
+   * Parse and validate every relevant price_change entry, then atomically
+   * publish staged copies. One malformed entry leaves ZERO trusted mutation
+   * and forces a resync. Stale/out-of-order timestamps remain a safe-drop.
+   *
+   * Each accepted token is staged once per source payload. Later entries for
+   * the same token mutate that working book in place after copy-on-write of
+   * the written side. Independent frozen arrays are captured per accepted
+   * entry so snapshot count and source order stay unchanged.
    */
   private commitPriceChange(
     payload: Record<string, unknown>,
@@ -706,10 +716,16 @@ export class PolymarketMarketDataAdapter {
       return [];
     }
 
-    const staged = new Map<string, BookState>();
+    const working = new Map<string, BookState>();
     const commits: Array<{ tokenId: string; state: BookState; changedLevel: BookLevel | null }> = [];
     for (const item of accepted) {
-      const copy = cloneBookState(staged.get(item.tokenId) ?? item.state);
+      let copy = working.get(item.tokenId);
+      if (!copy) {
+        copy = cloneBookState(item.state, item.side);
+        working.set(item.tokenId, copy);
+      } else {
+        ownBookSide(copy, item.side);
+      }
       if (item.side === "BUY") applyLevelChange(copy.bids, copy.bidLevels, item.price, item.size, "desc");
       else applyLevelChange(copy.asks, copy.askLevels, item.price, item.size, "asc");
       copy.timestamp = new Date(sourceMs).toISOString();
@@ -725,11 +741,13 @@ export class PolymarketMarketDataAdapter {
         this.failIncrementalTrust([...new Set(accepted.map((entry) => entry.tokenId))], handlers);
         throw new MarketIngressMalformedError([...new Set(accepted.map((entry) => entry.tokenId))]);
       }
-      staged.set(item.tokenId, copy);
-      commits.push({ tokenId: item.tokenId, state: copy, changedLevel });
+      copy.levelsValid = true;
+      commits.push({ tokenId: item.tokenId, state: captureStagedSnapshot(copy), changedLevel });
     }
 
-    for (const [tokenId, state] of staged) {
+    for (const [tokenId, state] of working) {
+      publishSide(state, "bids");
+      publishSide(state, "asks");
       this.books.set(tokenId, state);
       this.lastTimestampByToken.set(tokenId, sourceMs);
     }
@@ -831,7 +849,11 @@ export class PolymarketMarketDataAdapter {
     const minOrderSize = nullableString(raw.minOrderSize);
     let feeSchedule: MarketSnapshot["feeSchedule"] = null;
     try {
-      this.assertSnapshotPublishable(tokenId, state, raw, changedLevel);
+      // Publication safety is proven before trusted mutation. Repeating
+      // full-book validation here would redo O(n) level walks already done
+      // by commitFullBook / commitPriceChange. Event-level fields and the
+      // changed level stay checked on those commit paths.
+      if (!state.levelsValid) this.assertSnapshotPublishable(tokenId, state, raw, changedLevel);
       feeSchedule = market.feeSchedule == null ? null : feeScheduleSchema.parse(market.feeSchedule);
       state.levelsValid = true;
     } catch (error) {
@@ -858,8 +880,8 @@ export class PolymarketMarketDataAdapter {
     };
     this.normalizeObserver?.onNormalizedSnapshot({
       durationSeconds: (performance.now() - started) / 1000,
-      bidLevels: state.bids.size,
-      askLevels: state.asks.size,
+      bidLevels: state.bidLevels.length,
+      askLevels: state.askLevels.length,
     });
     return snapshot;
   }
@@ -1119,21 +1141,92 @@ function insertIndex(levels: readonly BookLevel[], price: string, order: "asc" |
   return lo;
 }
 
-function cloneBookState(state: BookState): BookState {
+/**
+ * Stage a price_change onto a trusted BookState without exposing partial
+ * mutation. Copy-on-write clones only the side that will be mutated.
+ *
+ * Invariants that make sharing the unchanged side safe:
+ * - Trusted books in `this.books` are only installed after validation.
+ * - applyLevelChange mutates only the maps/arrays passed to it (the cloned
+ *   side). The opposite side is never written.
+ * - Published snapshot arrays are frozen slices, not the working arrays.
+ * - A later mutation always forks the side it writes before splicing, so an
+ *   already-published snapshot and a previous staged state cannot change.
+ * - levelsValid is preserved: previously validated unchanged levels stay
+ *   trusted; only the inserted/replaced level is rechecked.
+ */
+function cloneBookState(state: BookState, side: "BUY" | "SELL"): BookState {
+  if (side === "BUY") {
+    return {
+      ...state,
+      bids: new Map(state.bids),
+      bidLevels: state.bidLevels.slice(),
+      publishedBids: null,
+      bidsDirty: true,
+      bidsOwned: true,
+      asksOwned: false,
+    };
+  }
   return {
-    marketId: state.marketId,
-    bids: new Map(state.bids),
+    ...state,
     asks: new Map(state.asks),
-    bidLevels: state.bidLevels.slice(),
     askLevels: state.askLevels.slice(),
-    publishedBids: null,
     publishedAsks: null,
-    bidsDirty: true,
     asksDirty: true,
-    levelsValid: false,
-    lastTradePrice: state.lastTradePrice,
-    timestamp: state.timestamp,
-    hash: state.hash,
+    bidsOwned: false,
+    asksOwned: true,
+  };
+}
+
+function ownBookSide(state: BookState, side: "BUY" | "SELL"): void {
+  if (side === "BUY") {
+    if (state.bidsOwned) {
+      state.publishedBids = null;
+      state.bidsDirty = true;
+      return;
+    }
+    state.bids = new Map(state.bids);
+    state.bidLevels = state.bidLevels.slice();
+    state.publishedBids = null;
+    state.bidsDirty = true;
+    state.bidsOwned = true;
+    return;
+  }
+  if (state.asksOwned) {
+    state.publishedAsks = null;
+    state.asksDirty = true;
+    return;
+  }
+  state.asks = new Map(state.asks);
+  state.askLevels = state.askLevels.slice();
+  state.publishedAsks = null;
+  state.asksDirty = true;
+  state.asksOwned = true;
+}
+
+/**
+ * Freeze independent published arrays for one accepted entry while the
+ * per-token working state continues to accept later entries in the same
+ * payload. Maps may still be shared with the working state; toSnapshot
+ * and observers read the captured arrays, not those maps.
+ */
+function captureStagedSnapshot(state: BookState): BookState {
+  const bids = !state.bidsDirty && state.publishedBids
+    ? state.publishedBids
+    : Object.freeze(state.bidLevels.slice()) as BookLevel[];
+  const asks = !state.asksDirty && state.publishedAsks
+    ? state.publishedAsks
+    : Object.freeze(state.askLevels.slice()) as BookLevel[];
+  return {
+    ...state,
+    bidLevels: bids as BookLevel[],
+    askLevels: asks as BookLevel[],
+    publishedBids: bids,
+    publishedAsks: asks,
+    bidsDirty: false,
+    asksDirty: false,
+    bidsOwned: false,
+    asksOwned: false,
   };
 }
 
@@ -1189,6 +1282,25 @@ function assertDecimalString(value: string | null): void {
   decimalStringSchema.parse(value);
 }
 
+/**
+ * Full books always walk every level (`levelsValid === false`).
+ *
+ * Incremental updates may keep `levelsValid` from a previously trusted
+ * BookState. That is safe because:
+ * 1. commitFullBook / a prior successful incremental commit only install
+ *    books after every level passed assertBookLevel.
+ * 2. cloneBookState copies the mutated side and shares the other; apply
+ *    cannot rewrite a previously validated unchanged level object (levels
+ *    are frozen; replacements assign a new frozen object).
+ * 3. Insert/replace still validate `changedLevel` (price/size decimals and
+ *    non-negative size). Deletion (`changedLevel == null`) only removes a
+ *    previously validated level, so the remainder stays valid.
+ * 4. Event-level fields (timestamp, tickSize, minOrderSize, lastTradePrice,
+ *    fee schedule, side) are still checked on the commit path.
+ *
+ * Malformed incremental data therefore cannot skip the checks that would
+ * have rejected it before; it only skips re-walking unchanged levels.
+ */
 function validateNormalizedBook(state: BookState, changedLevel?: BookLevel | null): void {
   if (!state.levelsValid) {
     for (const level of state.bidLevels) assertBookLevel(level);

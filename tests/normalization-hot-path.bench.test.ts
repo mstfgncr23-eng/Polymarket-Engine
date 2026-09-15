@@ -116,7 +116,7 @@ function measure(
 describe("normalization hot-path benchmark vs main reference", () => {
   it("records wall/CPU improvement for 20/100/500 level books", () => {
     const rows: BenchRow[] = [];
-    const sizes = [20, 100, 500] as const;
+    const sizes = [20, 45, 100, 500] as const;
     const bursts = [100, 500, 1_000] as const;
     for (const levelsPerSide of sizes) {
       for (const priceChanges of bursts) {
