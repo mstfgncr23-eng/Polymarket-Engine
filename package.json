@@ -22,6 +22,7 @@
     "report": "pnpm --filter @pm/engine report",
     "archive:export": "pnpm --filter @pm/engine archive:export",
     "bench:stability": "tsx scripts/stability-hot-path-bench.ts",
+    "bench:price-change": "tsx scripts/price-change-incremental-bench.ts",
     "bench:sustained": "tsx scripts/sustained-capacity-harness.ts",
     "bench:retention": "tsx scripts/report-retention-bench.ts",
     "galaxy:runtime-proof": "node apps/dashboard/scripts/galaxy-runtime-proof.cjs"
