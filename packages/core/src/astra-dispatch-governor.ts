@@ -1,6 +1,17 @@
 import { z } from "zod";
 
 export const ASTRA_FAST_MAX_DISPATCHES_PER_HOUR = 12;
+/** Maximum legal lifetime of one experiment. Used for bounded runtime authority. */
+export const ASTRA_EXPERIMENT_MAX_HOURS = 48;
+/** A DEEP review is only reachable after a FAST decision, at most once per FAST. */
+export const ASTRA_DEEP_MAX_DISPATCHES_PER_EXPERIMENT = ASTRA_FAST_MAX_DISPATCHES_PER_HOUR * ASTRA_EXPERIMENT_MAX_HOURS;
+/** Explicit bound for non-economic batch learning dispatches in one experiment. */
+export const ASTRA_BATCH_MAX_DISPATCHES_PER_EXPERIMENT = 256;
+/** Maximum active one-shot provider reservations retained by the runtime. */
+export const ASTRA_PROVIDER_DISPATCH_AUTHORITY_MAX =
+  (ASTRA_FAST_MAX_DISPATCHES_PER_HOUR * ASTRA_EXPERIMENT_MAX_HOURS)
+  + ASTRA_DEEP_MAX_DISPATCHES_PER_EXPERIMENT
+  + ASTRA_BATCH_MAX_DISPATCHES_PER_EXPERIMENT;
 export const ASTRA_FAST_MAX_DISPATCHES_PER_HOUR_LIMIT = 10_000;
 export const ASTRA_FAST_MAX_MARKETS = 256;
 export const ASTRA_FAST_MIN_DISPATCH_INTERVAL_MS = 5_000;
@@ -121,9 +132,12 @@ export class AstraDispatchGovernor {
       .filter((item) => Number.isFinite(item.atMs))
       .sort((a, b) => a.atMs - b.atMs)
       .slice(-this.maxDispatches());
-    if (observed.length >= this.dispatches.length) {
-      this.dispatches = observed.map((item) => item.atMs);
-    }
+    // Recovery evidence may be partial or older than the checkpoint. Never
+    // replace newer checkpoint timestamps with an equally-sized older page;
+    // union both sources and retain only the newest bounded rolling window.
+    this.dispatches = [...this.dispatches, ...observed.map((item) => item.atMs)]
+      .sort((a, b) => a - b)
+      .slice(-this.maxDispatches());
     for (const { event, atMs } of observed) {
       this.lastDispatchAtMs = Math.max(this.lastDispatchAtMs ?? atMs, atMs);
       if (typeof event.marketId === "string" && event.marketId.length > 0) {

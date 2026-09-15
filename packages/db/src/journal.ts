@@ -235,7 +235,8 @@ export interface EventJournal {
   listVerifiedCheckpoints?(): Promise<EngineCheckpoint[]>;
   persistAnalyticsRollup?(rollup: AnalyticsRollup): Promise<AnalyticsRollup>;
   loadAnalyticsRollup?(experimentId: string, rollupKind?: string): Promise<AnalyticsRollup | null>;
-  deleteCanonicalEventsThrough?(input: { experimentId: string; occurredBefore?: Date; limit: number; sourceCursor: number; sourceCommitSeq?: number; sourceRecordedAt?: Date }): Promise<{ deleted: number }>;
+  /** Provider authorization/start rows are retained unless explicit verified-completion cleanup opts out. */
+  deleteCanonicalEventsThrough?(input: { experimentId: string; occurredBefore?: Date; limit: number; sourceCursor: number; sourceCommitSeq?: number; sourceRecordedAt?: Date; retainProviderDispatchAuthority?: boolean }): Promise<{ deleted: number }>;
   countEligible(types: readonly string[], occurredBefore: Date): Promise<{ count: number; oldestOccurredAt: string | null }>;
   withReadSnapshot<T>(work: (journal: EventJournalKeyset) => Promise<T>): Promise<{ value: T; stable: boolean }>;
   latestCommitSeq(): Promise<number>;
@@ -709,12 +710,17 @@ export class MemoryEventJournal implements EventJournal {
     const row = this.rollups.get(`${experimentId}:${rollupKind}`);
     return row ? structuredClone(row) : null;
   }
-  async deleteCanonicalEventsThrough(input: { experimentId: string; occurredBefore?: Date; limit: number; sourceCursor: number; sourceCommitSeq?: number; sourceRecordedAt?: Date }): Promise<{ deleted: number }> {
+  async deleteCanonicalEventsThrough(input: { experimentId: string; occurredBefore?: Date; limit: number; sourceCursor: number; sourceCommitSeq?: number; sourceRecordedAt?: Date; retainProviderDispatchAuthority?: boolean }): Promise<{ deleted: number }> {
     assertJournalCapability(this.access, "maintenance", "deleteCanonicalEventsThrough");
     if (!rollupAuthorizesCanonicalDelete(this.rollups.get(`${input.experimentId}:canonical`) ?? null, input)) return { deleted: 0 };
     const cap = Math.max(0, Math.floor(input.limit));
     const before = input.occurredBefore?.getTime() ?? Number.POSITIVE_INFINITY;
     const victims = this.events.filter((event) => CANONICAL_REPORT_INPUT_EVENT_TYPES.includes(event.type as (typeof CANONICAL_REPORT_INPUT_EVENT_TYPES)[number]))
+      // Active experiments retain the exact one-shot provider reservation.
+      // The analytics rollup is not runtime dispatch authority; a restart must
+      // still be able to reread the authorization row before the SDK boundary.
+      .filter((event) => input.retainProviderDispatchAuthority === false
+        || (event.type !== "ASTRA_PROVIDER_DISPATCH_AUTHORIZED" && event.type !== "ASTRA_PROVIDER_DISPATCH_STARTED"))
       // Keep the immutable source-fence event itself. The fence proves the
       // rollup boundary for the next compaction and must survive deletion.
       .filter((event) => (event.payload as { experimentId?: unknown }).experimentId === input.experimentId && Date.parse(event.occurredAt) < before)
@@ -1397,7 +1403,7 @@ export class PostgresEventJournal implements EventJournal {
     const row = rows[0];
     return row ? { experimentId: row.experimentId, rollupKind: row.rollupKind, schemaVersion: row.schemaVersion, sourceCursor: Number(row.sourceCursor), sourceFenceId: row.sourceFenceId, sourceFenceOccurredAt: row.sourceFenceOccurredAt?.toISOString() ?? null, sourceEventCount: Number(row.sourceEventCount ?? 0), sourceCommitSeq: Number(row.sourceCommitSeq ?? 0), sourceRecordedAt: row.sourceRecordedAt?.toISOString() ?? null, stableRead: row.stableRead, previousContentHash: row.previousContentHash, ...(row.coverageHash ? { coverageHash: row.coverageHash } : {}), accumulator: row.accumulator as Record<string, unknown>, contentHash: row.contentHash, verified: row.verified, createdAt: row.createdAt.toISOString() } : null;
   }
-  async deleteCanonicalEventsThrough(input: { experimentId: string; occurredBefore?: Date; limit: number; sourceCursor: number; sourceCommitSeq?: number; sourceRecordedAt?: Date }): Promise<{ deleted: number }> {
+  async deleteCanonicalEventsThrough(input: { experimentId: string; occurredBefore?: Date; limit: number; sourceCursor: number; sourceCommitSeq?: number; sourceRecordedAt?: Date; retainProviderDispatchAuthority?: boolean }): Promise<{ deleted: number }> {
     assertJournalCapability(this.access, "maintenance", "deleteCanonicalEventsThrough");
     const cap = Math.max(0, Math.min(500, Math.floor(input.limit)));
     if (cap <= 0) return { deleted: 0 };
@@ -1410,12 +1416,16 @@ export class PostgresEventJournal implements EventJournal {
     const sourceRecordedAt = rollup.sourceRecordedAt ? new Date(rollup.sourceRecordedAt) : undefined;
     const before = input.occurredBefore ?? new Date();
     const types = [...CANONICAL_REPORT_INPUT_EVENT_TYPES] as string[];
+    const protectedProviderTypes = input.retainProviderDispatchAuthority === false
+      ? []
+      : ["ASTRA_PROVIDER_DISPATCH_AUTHORIZED", "ASTRA_PROVIDER_DISPATCH_STARTED"];
     const result = await this.client`
       DELETE FROM journal_events
       WHERE id IN (
         SELECT id FROM journal_events
         WHERE type = ANY(${types}) AND (payload->>'experimentId') = ${input.experimentId}
           AND occurred_at < ${before.toISOString()}
+          AND type <> ALL(${protectedProviderTypes})
           AND commit_seq <= ${sourceCommitSeq}
           AND (${sourceRecordedAt == null} OR recorded_at <= ${(sourceRecordedAt ?? new Date()).toISOString()})
         ORDER BY occurred_at ASC, id ASC LIMIT ${cap}

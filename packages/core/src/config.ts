@@ -67,7 +67,7 @@ export const engineEnvSchema = z.object({
   PAPER_START_BALANCE: z.coerce.number().positive().default(1000),
   PAPER_EXECUTION_LATENCY_MS: z.coerce.number().int().nonnegative().default(150),
   PAPER_EXECUTION_STYLE: z.enum(["TAKER", "MAKER"]).default("TAKER"),
-  EXPERIMENT_DURATION_HOURS: z.coerce.number().positive().default(48),
+  EXPERIMENT_DURATION_HOURS: z.coerce.number().positive().max(48).default(48),
   EXPERIMENT_CLOSE_POLICY: z.enum(["observe_until_settlement", "mark_to_market"]).default("observe_until_settlement"),
   ENGINE_REGION: z.string().default("fra"),
   POLYMARKET_MARKET_SLUGS: z.string().default(""),

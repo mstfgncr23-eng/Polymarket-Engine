@@ -1,14 +1,17 @@
 import { describe, expect, it } from "vitest";
 import { createJournalEvent, MemoryEventJournal } from "@pm/db";
-import { type JournalEvent } from "@pm/core";
+import { AstraDispatchGovernor, type JournalEvent } from "@pm/core";
 import {
   analyticsRollupHasDestructiveCoverage,
   hashAnalyticsRollup,
   loadVerifiedAnalyticsRollup,
+  persistCanonicalFinalReport,
   persistVerifiedAnalyticsRollup,
   streamExperimentSummary,
 } from "../apps/engine/src/final-report.js";
 import { ExperimentSummaryAccumulator, type DurableAccountingTransition } from "../apps/engine/src/report.js";
+import { RetentionManager, completedProviderDispatchAuthoritySafeToDelete, defaultRetentionConfig } from "../apps/engine/src/retention-manager.js";
+import { createSourceSealEvent } from "../apps/engine/src/source-seal.js";
 
 const EXPERIMENT = "pr49-audit";
 const STARTED_AT = "2026-01-01T00:00:00.000Z";
@@ -41,7 +44,210 @@ function providerDecision(id: string, action: "BUY_UP" | "BUY_DOWN" | "NO_TRADE"
   }, { stages });
 }
 
+function providerAuthorization(dispatchId: string, occurredAt: string, stage: "FAST" | "DEEP" | "BATCH" = "FAST", marketId: string | null = null): JournalEvent {
+  return canonical("ASTRA_PROVIDER_DISPATCH_AUTHORIZED", `authorized-${dispatchId}`, occurredAt, {
+    traceId: dispatchId.split(":")[0], authority: "ASTRA_BRAIN_V1", dispatchId, stage, marketId,
+  });
+}
+
+async function persistCompleteRollup(journal: MemoryEventJournal, experimentId = EXPERIMENT, status?: "RUNNING" | "ENTRY_CLOSED") {
+  const streamed = await streamExperimentSummary(journal, { id: experimentId, startedAt: STARTED_AT }, { reportKind: "interim", metricsScope: "rolling", complete: false, ...(status ? { status } : {}) });
+  return persistVerifiedAnalyticsRollup(journal, {
+    experimentId, sourceCursor: streamed.durableCursor,
+    sourceFenceId: streamed.scan.fence.through?.id ?? null,
+    sourceFenceOccurredAt: streamed.scan.fence.through?.occurredAt ?? null,
+    sourceEventCount: streamed.accumulatorSnapshot!.eventCount,
+    sourceCommitSeq: streamed.scan.fence.commitSeqTo,
+    sourceRecordedAt: streamed.scan.fence.recordedAtTo.toISOString(),
+    stableRead: streamed.scan.fence.stable,
+    sourceCoverageComplete: streamed.durableCostScanComplete && streamed.scan.complete,
+    accumulator: streamed.accumulatorSnapshot! as unknown as Record<string, unknown>,
+  });
+}
+
 describe("PR49 report cost and auditability", () => {
+  it("pins active provider authorization/start authority through verified canonical compaction", async () => {
+    const journal = new MemoryEventJournal();
+    const authorization = providerAuthorization("active-retry:FAST", "2026-01-01T00:00:01.000Z", "FAST", "market-active");
+    const started = canonical("ASTRA_PROVIDER_DISPATCH_STARTED", "started-active-retry", "2026-01-01T00:00:01.100Z", {
+      traceId: "active-retry", authority: "ASTRA_BRAIN_V1", dispatchId: "active-retry:FAST", stage: "FAST", marketId: "market-active",
+    });
+    const decision = providerDecision("active-prefix-decision", "NO_TRADE", "FLAT");
+    const fence = canonical("ASTRA_COUNTERFACTUAL", "active-fence", "2026-01-01T00:00:03.000Z", { available: false, reason: "NO_EXECUTABLE_CANDIDATE" });
+    await journal.appendMany([authorization, started, decision, fence]);
+    const rollup = await persistCompleteRollup(journal, EXPERIMENT, "RUNNING");
+    expect(rollup && analyticsRollupHasDestructiveCoverage(rollup)).toBe(true);
+
+    const retention = new RetentionManager(journal, defaultRetentionConfig({
+      enabled: true, analyticsRollupEnabled: true, cycleBudgetMs: 5_000, maxRowsPerCycle: 1_000,
+    }));
+    const cycle = await retention.runCycle({
+      experiment: { id: EXPERIMENT, status: "RUNNING", startedAt: STARTED_AT },
+      now: new Date("2026-01-01T00:05:00.000Z"), degraded: false, failClosed: false, databaseUp: true,
+    });
+    expect(cycle.deletedByClass.canonical_report_input).toBeGreaterThan(0);
+    expect(await journal.readJournalEventById(authorization.id)).not.toBeNull();
+    expect(await journal.readJournalEventById(started.id)).not.toBeNull();
+    expect(await journal.readJournalEventById(decision.id)).toBeNull();
+
+    const closedCycle = await retention.runCycle({
+      experiment: { id: EXPERIMENT, status: "ENTRY_CLOSED", startedAt: STARTED_AT },
+      now: new Date("2026-01-01T00:06:00.000Z"), degraded: false, failClosed: false, databaseUp: true,
+    });
+    expect(closedCycle.skipReason).not.toBe("ANALYTICS_ROLLUP_CONFLICT");
+    expect(await journal.readJournalEventById(authorization.id)).not.toBeNull();
+
+    let beginDispatchAttempts = 0;
+    const retryBlocked = (await journal.readJournalEventById(authorization.id)) !== null;
+    if (!retryBlocked) beginDispatchAttempts += 1;
+    expect(retryBlocked).toBe(true);
+    expect(beginDispatchAttempts).toBe(0);
+  });
+
+  it("survives checkpoint-gap active compaction and restart without reopening the FAST cap", async () => {
+    const journal = new MemoryEventJournal();
+    const baseMs = Date.parse(STARTED_AT);
+    const checkpointGovernor = new AstraDispatchGovernor({ minDispatchIntervalMs: 0, marketCooldownMs: 0 });
+    for (let index = 0; index < 11; index += 1) checkpointGovernor.consume(`checkpoint-market-${index}`, baseMs + index * 1_000);
+    const authEvents = Array.from({ length: 12 }, (_, index) => providerAuthorization(
+      `gap-${index}:FAST`, new Date(baseMs + index * 1_000).toISOString(), "FAST", `gap-market-${index}`,
+    ));
+    const decision = providerDecision("gap-prefix-decision", "NO_TRADE", "FLAT");
+    const fence = canonical("ASTRA_COUNTERFACTUAL", "gap-fence", new Date(baseMs + 20_000).toISOString(), { available: false, reason: "NO_EXECUTABLE_CANDIDATE" });
+    await journal.appendMany([...authEvents, decision, fence]);
+    const rollup = await persistCompleteRollup(journal, EXPERIMENT, "ENTRY_CLOSED");
+    expect(rollup && analyticsRollupHasDestructiveCoverage(rollup)).toBe(true);
+    const retention = new RetentionManager(journal, defaultRetentionConfig({
+      enabled: true, analyticsRollupEnabled: true, cycleBudgetMs: 5_000, maxRowsPerCycle: 1_000,
+    }));
+    await retention.runCycle({
+      experiment: { id: EXPERIMENT, status: "ENTRY_CLOSED", startedAt: STARTED_AT },
+      now: new Date(baseMs + 30_000), degraded: false, failClosed: false, databaseUp: true,
+    });
+    expect((await journal.queryEvents({ types: ["ASTRA_PROVIDER_DISPATCH_AUTHORIZED"], experimentId: EXPERIMENT })).length).toBe(12);
+
+    const recovered = new AstraDispatchGovernor({ minDispatchIntervalMs: 0, marketCooldownMs: 0 });
+    recovered.restore(checkpointGovernor.snapshot(baseMs + 11_000), baseMs + 30_000);
+    const retained = await journal.queryEvents({ types: ["ASTRA_PROVIDER_DISPATCH_AUTHORIZED"], experimentId: EXPERIMENT, order: "asc" });
+    recovered.mergeEvidence(retained.map((event) => ({ occurredAt: event.occurredAt, marketId: String(event.payload.marketId) })), baseMs + 30_000);
+    expect(recovered.tryAdmit("after-restart", baseMs + 30_000)).toMatchObject({ allowed: false, reason: "ROLLING_HOUR_CAP" });
+  });
+
+  it("never replaces newer checkpoint governor timestamps with an older equal-sized recovery page", () => {
+    const baseMs = Date.parse(STARTED_AT);
+    const governor = new AstraDispatchGovernor({ minDispatchIntervalMs: 0, marketCooldownMs: 0 });
+    for (let index = 0; index < 12; index += 1) governor.consume(`checkpoint-new-${index}`, baseMs + 90_000 + index * 1_000);
+    const checkpoint = governor.snapshot(baseMs + 102_000);
+    const recovered = new AstraDispatchGovernor({ minDispatchIntervalMs: 0, marketCooldownMs: 0 });
+    recovered.restore(checkpoint, baseMs + 102_000);
+    recovered.mergeEvidence(Array.from({ length: 12 }, (_, index) => ({
+      occurredAt: new Date(baseMs + index * 1_000).toISOString(), marketId: `journal-old-${index}`,
+    })), baseMs + 102_000);
+    expect(recovered.tryAdmit("after-recovery", baseMs + 3_600_200)).toMatchObject({ allowed: false, reason: "ROLLING_HOUR_CAP" });
+  });
+
+  it("keeps an authorized-only crash unresolved while active retention and restart preserve the reservation", async () => {
+    const journal = new MemoryEventJournal();
+    const authorization = providerAuthorization("authorized-only:FAST", "2026-01-01T00:00:01.000Z", "FAST", "market-authorized-only");
+    const fence = canonical("ASTRA_COUNTERFACTUAL", "authorized-only-fence", "2026-01-01T00:00:02.000Z", { available: false, reason: "NO_EXECUTABLE_CANDIDATE" });
+    await journal.appendMany([authorization, fence]);
+    const rollup = await persistCompleteRollup(journal);
+    expect(rollup && analyticsRollupHasDestructiveCoverage(rollup)).toBe(true);
+    const deleted = await journal.deleteCanonicalEventsThrough!({
+      experimentId: EXPERIMENT, limit: 100, sourceCursor: rollup!.sourceCursor,
+      sourceCommitSeq: rollup!.sourceCommitSeq, occurredBefore: new Date(rollup!.sourceFenceOccurredAt!),
+      sourceRecordedAt: new Date(rollup!.sourceRecordedAt!), retainProviderDispatchAuthority: true,
+    });
+    expect(deleted.deleted).toBe(0);
+    expect(await journal.readJournalEventById(authorization.id)).not.toBeNull();
+    const rebuilt = await streamExperimentSummary(journal, { id: EXPERIMENT, startedAt: STARTED_AT }, { reportKind: "interim", metricsScope: "rolling", complete: false });
+    expect(rebuilt.summary.providerDispatchAuthorizedCount).toBe(1);
+    expect(rebuilt.summary.providerDispatchStartedCount).toBe(0);
+    expect(rebuilt.summary.providerCostCompleteness).toBe("NONE");
+    expect(rebuilt.summary.economicCostCompleteness).toBe("UNKNOWN");
+    expect(await journal.queryEvents({ types: ["ASTRA_FAILURE"] })).toHaveLength(0);
+  });
+
+  it("deletes completed provider rows only after a verified governor checkpoint, preserving prepare-next recovery authority", async () => {
+    const journal = new MemoryEventJournal();
+    const authorization = providerAuthorization("completed:FAST", "2026-01-01T00:00:01.000Z", "FAST", "market-completed");
+    const started = canonical("ASTRA_PROVIDER_DISPATCH_STARTED", "started-completed", "2026-01-01T00:00:01.100Z", {
+      traceId: "completed", authority: "ASTRA_BRAIN_V1", dispatchId: "completed:FAST", stage: "FAST", marketId: "market-completed",
+    });
+    const invocation = canonical("ASTRA_MODEL_INVOCATION", "invocation-completed", "2026-01-01T00:00:01.200Z", {
+      traceId: "completed", authority: "ASTRA_BRAIN_V1", dispatchId: "completed:FAST", stage: "FAST", usage: { costUsd: 0 },
+    });
+    const decision = providerDecision("completed-prefix-decision", "NO_TRADE", "FLAT");
+    const fence = canonical("ASTRA_COUNTERFACTUAL", "completed-fence", "2026-01-01T00:00:03.000Z", { available: false, reason: "NO_EXECUTABLE_CANDIDATE" });
+    await journal.appendMany([authorization, started, invocation, decision, fence]);
+    const rollup = await persistCompleteRollup(journal);
+    expect(rollup && analyticsRollupHasDestructiveCoverage(rollup)).toBe(true);
+    const retention = new RetentionManager(journal, defaultRetentionConfig({
+      enabled: true, analyticsRollupEnabled: true, cycleBudgetMs: 5_000, maxRowsPerCycle: 1_000,
+    }));
+    const completed = { id: EXPERIMENT, status: "COMPLETED", startedAt: STARTED_AT, completedAt: "2026-01-01T00:01:00.000Z" };
+    await retention.runCycle({ experiment: completed, now: new Date("2026-01-02T00:00:00.000Z"), degraded: false, failClosed: false, databaseUp: true });
+    expect(await journal.readJournalEventById(authorization.id)).not.toBeNull();
+    expect(await completedProviderDispatchAuthoritySafeToDelete(journal, completed)).toBe(false);
+
+    const governor = new AstraDispatchGovernor({ minDispatchIntervalMs: 0, marketCooldownMs: 0 });
+    governor.consume("market-completed", Date.parse("2026-01-01T00:00:01.100Z"));
+    await journal.saveCheckpoint({
+      experimentId: EXPERIMENT, sequence: 1,
+      payload: {
+        experiment: { id: EXPERIMENT, status: "COMPLETED", startedAt: STARTED_AT, completedAt: completed.completedAt },
+        astraDispatchGovernor: governor.snapshot(Date.parse("2026-01-01T00:02:00.000Z")), durableCursor: 0,
+      },
+    });
+    await journal.append(createSourceSealEvent({ experimentId: EXPERIMENT, startedAt: STARTED_AT, completedAt: completed.completedAt }));
+    const finalStream = await streamExperimentSummary(journal, {
+      id: EXPERIMENT, startedAt: STARTED_AT, completedAt: completed.completedAt,
+    }, { status: "COMPLETED", reportKind: "final", metricsScope: "complete", complete: true });
+    await persistCanonicalFinalReport(journal, {
+      summary: finalStream.summary, scan: finalStream.scan, experimentStatus: "COMPLETED",
+    });
+    expect(await completedProviderDispatchAuthoritySafeToDelete(journal, completed)).toBe(true);
+    await retention.runCycle({ experiment: completed, now: new Date("2026-01-03T00:00:00.000Z"), degraded: false, failClosed: false, databaseUp: true });
+    expect(await journal.readJournalEventById(authorization.id)).toBeNull();
+    expect(await journal.readJournalEventById(started.id)).toBeNull();
+    expect(await journal.readJournalEventById(fence.id)).not.toBeNull();
+    const recovered = new AstraDispatchGovernor({ minDispatchIntervalMs: 0, marketCooldownMs: 0 });
+    recovered.restore(governor.snapshot(Date.parse("2026-01-01T00:02:00.000Z")), Date.parse("2026-01-01T00:02:00.000Z"));
+    expect(recovered.tryAdmit("prepared-next-market", Date.parse("2026-01-01T00:02:00.000Z"))).toMatchObject({ allowed: true });
+    expect(recovered.snapshot(Date.parse("2026-01-01T00:02:00.000Z")).dispatches).toHaveLength(1);
+  });
+
+  it("does not delete completed provider authority when the final report is cost-incomplete", async () => {
+    const journal = new MemoryEventJournal();
+    const authorization = providerAuthorization("completed-unknown:FAST", "2026-01-01T00:00:01.000Z", "FAST", "market-completed-unknown");
+    const fence = canonical("ASTRA_COUNTERFACTUAL", "completed-unknown-fence", "2026-01-01T00:00:02.000Z", { available: false, reason: "NO_EXECUTABLE_CANDIDATE" });
+    await journal.appendMany([authorization, fence]);
+    const rollup = await persistCompleteRollup(journal);
+    expect(rollup && analyticsRollupHasDestructiveCoverage(rollup)).toBe(true);
+    await journal.append(createSourceSealEvent({ experimentId: EXPERIMENT, startedAt: STARTED_AT, completedAt: "2026-01-01T00:01:00.000Z" }));
+    const finalStream = await streamExperimentSummary(journal, {
+      id: EXPERIMENT, startedAt: STARTED_AT, completedAt: "2026-01-01T00:01:00.000Z",
+    }, { status: "COMPLETED", reportKind: "final", metricsScope: "complete", complete: true });
+    await persistCanonicalFinalReport(journal, {
+      summary: finalStream.summary, scan: finalStream.scan, experimentStatus: "COMPLETED",
+    });
+    await journal.saveCheckpoint({
+      experimentId: EXPERIMENT, sequence: 1,
+      payload: {
+        experiment: { id: EXPERIMENT, status: "COMPLETED", startedAt: STARTED_AT, completedAt: "2026-01-01T00:01:00.000Z" },
+        astraDispatchGovernor: new AstraDispatchGovernor({ minDispatchIntervalMs: 0, marketCooldownMs: 0 }).snapshot(0), durableCursor: 0,
+      },
+    });
+    const completed = { id: EXPERIMENT, status: "COMPLETED", startedAt: STARTED_AT, completedAt: "2026-01-01T00:01:00.000Z" };
+    expect(finalStream.summary.providerCostCompleteness).toBe("NONE");
+    expect(await completedProviderDispatchAuthoritySafeToDelete(journal, completed)).toBe(false);
+    const retention = new RetentionManager(journal, defaultRetentionConfig({
+      enabled: true, analyticsRollupEnabled: true, cycleBudgetMs: 5_000, maxRowsPerCycle: 1_000,
+    }));
+    await retention.runCycle({ experiment: completed, now: new Date("2026-01-03T00:00:00.000Z"), degraded: false, failClosed: false, databaseUp: true });
+    expect(await journal.readJournalEventById(authorization.id)).not.toBeNull();
+  });
+
   it("A: reconstructs a cost-only experiment without orders, fills, or PNL snapshot", async () => {
     const direct = new ExperimentSummaryAccumulator(EXPERIMENT, { reportKind: "final", metricsScope: "complete", complete: true, generatedAt: "2026-01-02T00:00:00.000Z" });
     direct.foldDurableTransition(cost(1, "astra-cost:1", "0.02752", "0"));

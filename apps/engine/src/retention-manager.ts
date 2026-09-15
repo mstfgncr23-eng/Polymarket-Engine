@@ -2,6 +2,7 @@ import {
   AUDIT_CRITICAL_EVENT_TYPES,
   MONITOR_CONTROL_EVENT_TYPES,
   RETENTION_DEFAULTS,
+  astraDispatchGovernorStateSchema,
   TELEMETRY_EVENT_TYPES,
   assertMcpIdempotencyTtlSafe,
   clampRetentionBatchSize,
@@ -28,7 +29,7 @@ export interface RetentionConfig {
   compactionReplayKeyLimit: number;
 }
 
-export type RetentionExperiment = { id: string; status: string; startedAt?: string | null } | null;
+export type RetentionExperiment = { id: string; status: string; startedAt?: string | null; completedAt?: string | null } | null;
 
 export interface RetentionContext {
   experiment: RetentionExperiment;
@@ -136,6 +137,40 @@ export async function completedReportUnlocksTransient(
   return now.getTime() - Date.parse(report.persistedAt) >= graceMs;
 }
 
+/**
+ * Completion checkpoint is the compact cross-experiment FAST authority. Raw
+ * provider authorization/start rows may be deleted only after this checkpoint
+ * proves that completion drained provider work and persisted the governor.
+ */
+export async function completedProviderDispatchAuthoritySafeToDelete(
+  journal: EventJournal,
+  experiment: RetentionExperiment,
+): Promise<boolean> {
+  if (!experiment || experiment.status !== "COMPLETED" || !journal.listVerifiedCheckpoints) return false;
+  const report = await journal.loadExperimentReport(experiment.id, "final");
+  if (!report || !isCanonicalFinalReport(report)) return false;
+  const summary = report.canonicalSummary;
+  if (!summary || typeof summary !== "object" || Array.isArray(summary)) return false;
+  const providerDispatchUnresolved = summary.providerDispatchUnresolvedAuthorizationCount;
+  if (summary.providerCostCompleteness !== "COMPLETE"
+    || summary.economicCostCompleteness !== "COMPLETE"
+    || summary.providerDispatchTrackingOverflow !== false
+    || summary.providerDispatchTrackingIncomplete !== false
+    || summary.dispatchedUnknownFailureCount !== 0
+    || providerDispatchUnresolved !== 0) return false;
+  const checkpoint = (await journal.listVerifiedCheckpoints())[0];
+  if (!checkpoint || checkpoint.experimentId !== experiment.id) return false;
+  const payload = checkpoint.payload;
+  const rawExperiment = payload.experiment;
+  if (!rawExperiment || typeof rawExperiment !== "object" || Array.isArray(rawExperiment)) return false;
+  const manifest = rawExperiment as { id?: unknown; status?: unknown; completedAt?: unknown };
+  if (manifest.id !== experiment.id || manifest.status !== "COMPLETED") return false;
+  const completedAt = typeof manifest.completedAt === "string" ? Date.parse(manifest.completedAt) : Number.NaN;
+  const checkpointCreatedAt = Date.parse(checkpoint.createdAt);
+  if (!Number.isFinite(completedAt) || !Number.isFinite(checkpointCreatedAt) || checkpointCreatedAt < completedAt) return false;
+  return astraDispatchGovernorStateSchema.safeParse(payload.astraDispatchGovernor).success;
+}
+
 export function monitorCutoff(input: {
   now: Date;
   monitorTtlMs: number;
@@ -227,7 +262,7 @@ export class RetentionManager {
         return result.deleted;
       };
 
-      const drainCanonical = async (input: { experimentId: string; occurredBefore: Date; sourceCursor: number; sourceCommitSeq?: number; sourceRecordedAt?: Date }): Promise<number> => {
+      const drainCanonical = async (input: { experimentId: string; occurredBefore: Date; sourceCursor: number; sourceCommitSeq?: number; sourceRecordedAt?: Date; retainProviderDispatchAuthority?: boolean }): Promise<number> => {
         let deletedTotal = 0;
         for (;;) {
           if (Date.now() >= budgetEnd || batchCount >= this.config.maxBatchesPerCycle || totalDeleted >= this.config.maxRowsPerCycle) break;
@@ -344,6 +379,7 @@ export class RetentionManager {
               sourceCursor: rollup.sourceCursor,
               sourceCommitSeq: rollup.sourceCommitSeq,
               sourceRecordedAt: rollup.sourceRecordedAt ? new Date(rollup.sourceRecordedAt) : undefined,
+              retainProviderDispatchAuthority: true,
             });
           }
         }
@@ -357,12 +393,14 @@ export class RetentionManager {
       ) {
         const rollup = await loadVerifiedAnalyticsRollup(this.journal, context.experiment.id, "canonical");
         if (rollup && analyticsRollupHasDestructiveCoverage(rollup) && rollup.sourceFenceOccurredAt && rollup.sourceCursor >= 0) {
+          const retainProviderDispatchAuthority = !(await completedProviderDispatchAuthoritySafeToDelete(this.journal, context.experiment));
           await drainCanonical({
             experimentId: context.experiment!.id,
             occurredBefore: new Date(rollup.sourceFenceOccurredAt!),
             sourceCursor: rollup.sourceCursor,
             sourceCommitSeq: rollup.sourceCommitSeq,
             sourceRecordedAt: rollup.sourceRecordedAt ? new Date(rollup.sourceRecordedAt) : undefined,
+            retainProviderDispatchAuthority,
           });
         }
       }

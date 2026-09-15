@@ -67,6 +67,16 @@ export function hashAnalyticsRollup(accumulator: Record<string, unknown>): strin
 }
 
 /**
+ * Rollup extras describe the consumer view (RUNNING vs ENTRY_CLOSED vs final),
+ * not the covered source prefix. They must not make an unchanged prefix look
+ * like conflicting source data when the lifecycle status advances.
+ */
+function hashRollupSourceAccumulator(accumulator: Record<string, unknown>): string {
+  const { extras: _extras, ...source } = accumulator;
+  return hashAnalyticsRollup(source);
+}
+
+/**
  * Compatibility for schema-v1 rollups written before json-storage hashing.
  * The old accumulator serializer emitted `lastLedger: undefined` when no PNL
  * snapshot had been observed. canonicalJson hashed that key as the literal
@@ -231,6 +241,19 @@ export async function persistVerifiedAnalyticsRollup(
   const existing = journal.loadAnalyticsRollup ? await journal.loadAnalyticsRollup(input.experimentId, input.rollupKind ?? "canonical") : null;
   const storageAccumulator = jsonStorageRoundTrip(input.accumulator);
   const contentHash = hashAnalyticsRollup(storageAccumulator);
+  const sameSourceBoundary = existing
+    && existing.sourceCursor === input.sourceCursor
+    && (existing.sourceEventCount ?? 0) === coveredCount
+    && (existing.sourceCommitSeq ?? 0) === sourceCommitSeq
+    && existing.sourceFenceId === (input.sourceFenceId ?? null)
+    && existing.sourceFenceOccurredAt === (input.sourceFenceOccurredAt ?? null)
+    && (existing.stableRead ?? false) === (input.stableRead ?? true);
+  if (sameSourceBoundary && existing && hashRollupSourceAccumulator(existing.accumulator) === hashRollupSourceAccumulator(storageAccumulator)) {
+    // Lifecycle-only metadata (most notably status) is not source evidence.
+    // Keep the already durable row so a status transition cannot turn a safe
+    // active compaction into ANALYTICS_ROLLUP_CONFLICT.
+    return existing;
+  }
   const rollup = {
     experimentId: input.experimentId, rollupKind: input.rollupKind ?? "canonical", schemaVersion: ANALYTICS_ROLLUP_SCHEMA_VERSION,
     sourceCursor: input.sourceCursor, sourceFenceId: input.sourceFenceId ?? null, sourceFenceOccurredAt: input.sourceFenceOccurredAt ?? null,

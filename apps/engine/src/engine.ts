@@ -3,6 +3,11 @@ import {
   TemporalPairHedgeStrategy,
   TriggerEngine,
   createId,
+  ASTRA_EXPERIMENT_MAX_HOURS,
+  ASTRA_DEEP_MAX_DISPATCHES_PER_EXPERIMENT,
+  ASTRA_BATCH_MAX_DISPATCHES_PER_EXPERIMENT,
+  ASTRA_PROVIDER_DISPATCH_AUTHORITY_MAX,
+  ASTRA_FAST_MAX_DISPATCHES_PER_HOUR,
   ASTRA_FAST_MAX_DISPATCHES_PER_HOUR_LIMIT,
   decidePaperOrder,
   defaultNativeDecisionConfig,
@@ -80,6 +85,7 @@ import {
   type AstraDecision,
   type AstraFeaturePacket,
   type AstraProviderDispatchContext,
+  type AstraStage,
   type JournalKeysetCursor,
   rolesForTriggerKind,
 } from "@pm/core";
@@ -194,15 +200,21 @@ const SCOUT_REFRESH_STATE_TTL_MS = 60_000;
 const SCOUT_REFRESH_CONTEXT_MAX = 128;
 const SCOUT_REFRESH_RETRY_GAP_MS = 1_000;
 const ASTRA_GOVERNOR_RECOVERY_SCAN_CEILING = ASTRA_FAST_MAX_DISPATCHES_PER_HOUR_LIMIT;
+const ASTRA_PROVIDER_AUTHORITY_LIMITS: Record<AstraStage, number> = {
+  FAST: ASTRA_FAST_MAX_DISPATCHES_PER_HOUR * ASTRA_EXPERIMENT_MAX_HOURS,
+  DEEP: ASTRA_DEEP_MAX_DISPATCHES_PER_EXPERIMENT,
+  BATCH: ASTRA_BATCH_MAX_DISPATCHES_PER_EXPERIMENT,
+};
 const ASTRA_BOUNDED_FAILURE_REASONS = new Set([
   "TIMEOUT", "CONCURRENCY_SATURATED", "REQUEST_FAILED", "REQUEST_ABORTED",
   "STRUCTURED_OUTPUT_MISSING", "STRUCTURED_OUTPUT_INVALID", "STAGE_ADMISSION_CLOSED",
   "ACCOUNTING_FAILED", "PERSISTENCE_FAILED", "GLOBAL_MIN_INTERVAL", "MARKET_COOLDOWN",
   "ROLLING_HOUR_CAP", "STALE_RUN", "ENTRY_CLOSED", "FINALIZATION_PENDING", "EVIDENCE_PERSISTENCE_FAILED", "DISPATCH_NOT_STARTED",
-  "CLIENT_UNAVAILABLE", "FEATURE_EXTRACTION_FAILED", "DEEP_TIMEOUT", "DEEP_INVALID_RESPONSE",
+  "CLIENT_UNAVAILABLE", "FEATURE_EXTRACTION_FAILED", "PROVIDER_AUTHORITY_CAP", "DEEP_TIMEOUT", "DEEP_INVALID_RESPONSE",
   "DEEP_FAILED",
 ]);
 const IN_FLIGHT_ASTRA_REPORT_TYPES = new Set([
+  "ASTRA_PROVIDER_DISPATCH_AUTHORIZED", "ASTRA_PROVIDER_DISPATCH_STARTED",
   "ASTRA_MODEL_INVOCATION", "ASTRA_DECISION", "ASTRA_DEEP_REVIEW", "ASTRA_FAILURE", "ASTRA_COUNTERFACTUAL",
   "CONSENSUS_DECISION", "RISK_EVALUATION", "BOOK_REVALIDATION_REJECTED", "PAPER_ORDER_CREATED", "PAPER_FILL", "PAPER_EXECUTION_ERROR",
   "PAPER_ORDER_CANCELLED",
@@ -253,6 +265,10 @@ export class EngineService {
   private readonly astraClient: AstraClient | null;
   private readonly astraMemory: AstraMemoryStore;
   private readonly astraGovernor: AstraDispatchGovernor;
+  /** Exact active-run one-shot reservations; never replaced by analytics data. */
+  private readonly astraProviderDispatchAuthority = new Map<string, AstraStage>();
+  /** Post-start audit appends that completion must drain before sealing. */
+  private readonly astraProviderDispatchStartAudits = new Map<string, Promise<boolean>>();
   private readonly astraLearner: AstraBatchLearner;
   private readonly astraService: EngineAstraDecisionService | null;
   private readonly marketAdapter: PolymarketMarketDataAdapter;
@@ -1777,6 +1793,7 @@ export class EngineService {
         if (!report.ok) throw new RecoveryFailClosedError("invariant", report.reasons.join(","));
         this.syncRecoveredProjection();
       }
+      await this.restoreActiveAstraProviderDispatchAuthority();
       this.assertRecoveredEconomicAuthorityAvailable();
       this.syncExperimentWindow();
       if (this.experiment?.status === "RUNNING" && this.experiment.startValidationPending) {
@@ -2360,6 +2377,51 @@ export class EngineService {
   }
 
   /**
+   * Active retention deliberately leaves the exact authorization rows hot.
+   * Rehydrate only the bounded reservation index used to reject a duplicate
+   * before the SDK; analytics rollups never substitute for this authority.
+   */
+  private async restoreActiveAstraProviderDispatchAuthority(): Promise<void> {
+    this.astraProviderDispatchAuthority.clear();
+    const experiment = this.experiment;
+    if (!experiment || (experiment.status !== "RUNNING" && experiment.status !== "ENTRY_CLOSED")) return;
+    const events = await this.journal.queryEvents({
+      types: ["ASTRA_PROVIDER_DISPATCH_AUTHORIZED"],
+      experimentId: experiment.id,
+      order: "asc",
+      limit: ASTRA_PROVIDER_DISPATCH_AUTHORITY_MAX + 1,
+    });
+    if (events.length > ASTRA_PROVIDER_DISPATCH_AUTHORITY_MAX) {
+      throw new RecoveryFailClosedError("malformed", "active Astra provider authorization authority exceeded its bounded ceiling");
+    }
+    for (const event of events) {
+      const payload = event.payload as { authority?: unknown; experimentId?: unknown; dispatchId?: unknown; stage?: unknown };
+      if (event.aggregateType !== "astra_provider_dispatch"
+        || payload.authority !== ASTRA_BRAIN_AUTHORITY
+        || payload.experimentId !== experiment.id) {
+        throw new RecoveryFailClosedError("malformed", "active Astra provider authorization authority is not bound to the recovered experiment");
+      }
+      const dispatchId = typeof payload.dispatchId === "string" && payload.dispatchId.length > 0
+        ? payload.dispatchId
+        : event.aggregateId;
+      const stage = payload.stage;
+      if (!dispatchId || event.aggregateId !== dispatchId || (stage !== "FAST" && stage !== "DEEP" && stage !== "BATCH")) {
+        throw new RecoveryFailClosedError("malformed", "active Astra provider authorization authority contains an unidentifiable row");
+      }
+      const existing = this.astraProviderDispatchAuthority.get(dispatchId);
+      if (existing) {
+        if (existing !== stage) throw new RecoveryFailClosedError("malformed", `Astra dispatch identity changed stage: ${dispatchId}`);
+        continue;
+      }
+      const stageCount = [...this.astraProviderDispatchAuthority.values()].filter((item) => item === stage).length;
+      if (stageCount >= ASTRA_PROVIDER_AUTHORITY_LIMITS[stage]) {
+        throw new RecoveryFailClosedError("malformed", `Astra ${stage} provider authorization authority exceeded its bounded ceiling`);
+      }
+      this.astraProviderDispatchAuthority.set(dispatchId, stage);
+    }
+  }
+
+  /**
    * True provider-dispatch fence.  The lifecycle gate covers only this small
    * admission/evidence/begin critical section; the SDK promise is awaited by
    * the caller after the gate has been released.
@@ -2385,6 +2447,12 @@ export class EngineService {
         this.metrics.astraProviderDispatchBlocked.inc({ reason: "ENTRY_CLOSED" });
         throw new AstraClientError("ASTRA_PROVIDER_DISPATCH_BLOCKED", context.stage, "NOT_DISPATCHED", { admissionReason: "ENTRY_CLOSED" });
       }
+      const dispatchId = context.traceId + ":" + context.stage;
+      const existingAuthority = this.astraProviderDispatchAuthority.get(dispatchId);
+      if (existingAuthority) {
+        this.metrics.astraProviderDispatchBlocked.inc({ reason: "DISPATCH_ALREADY_AUTHORIZED" });
+        throw new AstraClientError("ASTRA_PROVIDER_DISPATCH_BLOCKED", context.stage, "NOT_DISPATCHED", { admissionReason: "DISPATCH_ALREADY_AUTHORIZED" });
+      }
       if (context.stage === "FAST") {
         const governor = this.astraGovernor.tryAdmit(context.marketId ?? "unknown", this.nowFn().getTime());
         if (!governor.allowed) {
@@ -2392,8 +2460,13 @@ export class EngineService {
           throw new AstraClientError("ASTRA_PROVIDER_DISPATCH_BLOCKED", context.stage, "NOT_DISPATCHED", { admissionReason: governor.reason });
         }
       }
+      const stageAuthorityCount = [...this.astraProviderDispatchAuthority.values()].filter((stage) => stage === context.stage).length;
+      if (stageAuthorityCount >= ASTRA_PROVIDER_AUTHORITY_LIMITS[context.stage]
+        || this.astraProviderDispatchAuthority.size >= ASTRA_PROVIDER_DISPATCH_AUTHORITY_MAX) {
+        this.metrics.astraProviderDispatchBlocked.inc({ reason: "PROVIDER_AUTHORITY_CAP" });
+        throw new AstraClientError("ASTRA_PROVIDER_DISPATCH_BLOCKED", context.stage, "NOT_DISPATCHED", { admissionReason: "PROVIDER_AUTHORITY_CAP" });
+      }
       const occurredAt = this.nowFn();
-      const dispatchId = context.traceId + ":" + context.stage;
       const admissionClass = context.stage === "BATCH" ? "BATCH_LEARNING" : "PAID_FIRST_LEG_CANDIDATE";
       const evidencePayload = {
         authority: ASTRA_BRAIN_AUTHORITY,
@@ -2434,6 +2507,7 @@ export class EngineService {
           this.metrics.astraProviderDispatchBlocked.inc({ reason: "EVIDENCE_PERSISTENCE_FAILED" });
           throw new AstraClientError("ASTRA_PROVIDER_DISPATCH_EVIDENCE_FAILED", context.stage, "NOT_DISPATCHED", { admissionReason: "EVIDENCE_PERSISTENCE_FAILED" });
         }
+        this.astraProviderDispatchAuthority.set(dispatchId, context.stage);
       } catch (error) {
         if (error instanceof AstraClientError && error.admissionReason === "DISPATCH_ALREADY_AUTHORIZED") throw error;
         this.metrics.astraProviderDispatchBlocked.inc({ reason: "EVIDENCE_PERSISTENCE_FAILED" });
@@ -2463,7 +2537,7 @@ export class EngineService {
       // The authorization row above is the durable prerequisite. This
       // post-begin row is best effort so an audit outage cannot release the
       // client semaphore while the already-started SDK request is in flight.
-      void this.persistAstraCanonicalBatch([createJournalEvent({
+      const startAudit = this.persistAstraCanonicalBatch([createJournalEvent({
         id: derivedAuditEventId("ASTRA_PROVIDER_DISPATCH_STARTED", dispatchId),
         traceId: context.traceId,
         type: "ASTRA_PROVIDER_DISPATCH_STARTED",
@@ -2471,7 +2545,14 @@ export class EngineService {
         aggregateId: dispatchId,
         occurredAt: this.nowFn(),
         payload: { ...evidencePayload, dispatchStarted: true },
-      })]).catch((error) => this.logger.error({ err: error, traceId: context.traceId }, "Astra dispatch-start audit append failed"));
+      })]).then((persisted) => {
+        if (!persisted) this.logger.error({ traceId: context.traceId }, "Astra dispatch-start audit append was not admitted");
+        return persisted;
+      }, (error) => {
+        this.logger.error({ err: error, traceId: context.traceId }, "Astra dispatch-start audit append failed");
+        return false;
+      });
+      this.astraProviderDispatchStartAudits.set(dispatchId, startAudit);
       this.record("ASTRA_PROVIDER_DISPATCH_STARTED", context.traceId, context.marketId, {
         stage: context.stage, model: context.model, triggerKind: context.triggerKind, admissionClass,
       });
@@ -2565,6 +2646,8 @@ export class EngineService {
     this.scoutRefreshInFlight.clear();
     this.scoutRefreshSubmissionKeys.clear();
     this.lastAdmittedMarketEpochFence = null;
+    this.astraProviderDispatchAuthority.clear();
+    this.astraProviderDispatchStartAudits.clear();
     this.reportGenerated = false;
     this.abortSourceSealPersist();
     this.sourceSealing = false;
@@ -5008,6 +5091,7 @@ export class EngineService {
         if (Date.now() >= deadline) return false;
         await new Promise((resolve) => setTimeout(resolve, 5));
       }
+      if (!(await this.waitForAstraProviderDispatchStartAudits(deadline))) return false;
       if (this.experiment?.id !== next.id || (this.experiment?.status as string | undefined) === "COMPLETED") {
         return (this.experiment?.status as string | undefined) === "COMPLETED";
       }
@@ -5026,6 +5110,20 @@ export class EngineService {
     } finally {
       this.astraFinalizationPending = false;
     }
+  }
+
+  private async waitForAstraProviderDispatchStartAudits(deadlineAt: number): Promise<boolean> {
+    const audits = [...this.astraProviderDispatchStartAudits.values()];
+    if (audits.length === 0) return true;
+    const remaining = Math.max(0, deadlineAt - Date.now());
+    if (remaining <= 0) return false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const finished = await Promise.race([
+      Promise.all(audits).then(() => true, () => true),
+      new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), remaining); }),
+    ]);
+    if (timer) clearTimeout(timer);
+    return finished;
   }
 
   private sourceSealBlocksAdmission(): boolean {
