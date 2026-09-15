@@ -107,6 +107,7 @@ export class MarketDerivationWorkerService {
   private ignoredLateResponses = 0;
   private readyResolve: (() => void) | null = null;
   private readyReject: ((error: Error) => void) | null = null;
+  private killFlight: Promise<void> = Promise.resolve();
 
   constructor(options: MarketDerivationWorkerServiceOptions = {}) {
     this.options = options;
@@ -187,10 +188,8 @@ export class MarketDerivationWorkerService {
         snapshot,
         started,
         timer: setTimeout(() => {
-          this.disabled = true;
-          this.available = false;
-          if (this.pending?.id === id) this.finish(pending, "timeout", this.fallback(pending));
-          void this.killQuiet();
+          if (this.pending?.id !== id) return;
+          this.disableBroken("timeout");
         }, this.timeoutMs),
       };
       pending.timer.unref();
@@ -203,9 +202,7 @@ export class MarketDerivationWorkerService {
           asks: sides.asks,
         });
       } catch {
-        this.disabled = true;
-        this.available = false;
-        this.finish(pending, "error", this.fallback(pending));
+        this.disableBroken("error");
       }
     });
   }
@@ -273,16 +270,19 @@ export class MarketDerivationWorkerService {
       this.finish(pending, "error", this.fallback(pending));
       return;
     }
-    this.disabled = true;
-    this.available = false;
-    this.finish(pending, "error", this.fallback(pending));
+    this.disableBroken("error");
   }
 
   private onWorkerBroken(status: "error" | "fallback"): void {
-    this.available = false;
+    this.disableBroken(status);
+  }
+
+  private disableBroken(status: MarketDerivationWorkerStatus): void {
     this.disabled = true;
+    this.available = false;
     const pending = this.pending;
     if (pending) this.finish(pending, status, this.fallback(pending));
+    void this.killQuiet();
   }
 
   private finish(pending: PendingRequest, status: MarketDerivationWorkerStatus, derived: BookDerived): void {
@@ -309,12 +309,12 @@ export class MarketDerivationWorkerService {
   private async killQuiet(): Promise<void> {
     const worker = this.worker;
     this.worker = null;
-    if (!worker) return;
-    worker.removeAllListeners();
-    try {
-      await worker.terminate();
-    } catch {
-      /* already gone */
-    }
+    if (!worker) return this.killFlight;
+    const terminating = worker.terminate().then(
+      () => { worker.removeAllListeners(); },
+      () => { worker.removeAllListeners(); },
+    );
+    this.killFlight = this.killFlight.then(() => terminating, () => terminating);
+    return this.killFlight;
   }
 }

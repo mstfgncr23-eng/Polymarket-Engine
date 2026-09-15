@@ -81,30 +81,50 @@ function cpuMs(start: NodeJS.CpuUsage): number {
   return (used.user + used.system) / 1000;
 }
 
-async function withTimerProbe<T>(work: () => Promise<T>): Promise<{ result: T; maxTimerDelayMs: number; eventLoopDelayMaxMs: number }> {
-  const intervalMs = 5;
-  let expected = Date.now() + intervalMs;
-  let maxTimerDelayMs = 0;
-  let callbacks = 0;
-  const timer = setInterval(() => {
-    callbacks += 1;
-    const now = Date.now();
-    maxTimerDelayMs = Math.max(maxTimerDelayMs, now - expected);
-    expected = now + intervalMs;
-  }, intervalMs);
-  timer.unref();
+/**
+ * Valid main-thread stall measurement.
+ *
+ * A timer is scheduled BEFORE work. After work we yield once so the timers
+ * phase and monitorEventLoopDelay can observe the stall. A synchronous loop
+ * that never yields cannot be measured by an interval that is armed and
+ * cleared around the same blocking call — that probe always reports 0ms.
+ */
+async function withResponsivenessProbe<T>(work: () => Promise<T>): Promise<{
+  result: T;
+  mainThreadTimerDelayMs: number;
+  eventLoopDelayMaxMs: number;
+}> {
   const histogram = monitorEventLoopDelay({ resolution: 1 });
   histogram.enable();
   await new Promise<void>((resolve) => setImmediate(resolve));
-  const workStarted = Date.now();
+
+  const expectedDelayMs = 5;
+  const scheduledAt = performance.now();
+  let firedAt: number | null = null;
+  const timer = setTimeout(() => {
+    firedAt = performance.now();
+  }, expectedDelayMs);
+  timer.unref();
+
   try {
     const result = await work();
-    if (callbacks === 0) maxTimerDelayMs = Math.max(0, Date.now() - workStarted - intervalMs);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    if (firedAt == null) {
+      await new Promise<void>((resolve) => setTimeout(resolve, expectedDelayMs + 1));
+    }
     histogram.disable();
-    return { result, maxTimerDelayMs, eventLoopDelayMaxMs: Number((histogram.max / 1e6).toFixed(3)) };
+    const fired = firedAt;
+    if (fired == null) {
+      throw new Error("MAIN_THREAD_TIMER_PROBE_DID_NOT_FIRE");
+    }
+    return {
+      result,
+      mainThreadTimerDelayMs: Number(Math.max(0, fired - scheduledAt - expectedDelayMs).toFixed(3)),
+      eventLoopDelayMaxMs: Number((histogram.max / 1e6).toFixed(3)),
+    };
   } finally {
     histogram.disable();
-    clearInterval(timer);
+    clearTimeout(timer);
   }
 }
 
@@ -134,7 +154,7 @@ for (const item of warmup) {
 const syncEluStart = performance.eventLoopUtilization();
 const syncCpu = process.cpuUsage();
 const syncWallStart = performance.now();
-const syncProbe = await withTimerProbe(async () => {
+const syncProbe = await withResponsivenessProbe(async () => {
   const derived: BookDerived[] = [];
   let triggers = 0;
   for (const item of measured) {
@@ -153,7 +173,7 @@ const workerCpu = process.cpuUsage();
 const workerWallStart = performance.now();
 let roundTripSum = 0;
 let roundTripMax = 0;
-const workerProbe = await withTimerProbe(async () => {
+const workerProbe = await withResponsivenessProbe(async () => {
   const derived: BookDerived[] = [];
   let triggers = 0;
   let success = 0;
@@ -199,7 +219,7 @@ const report = {
     cpuMs: Number(syncCpuMs.toFixed(3)),
     opsPerSec: Number((iterations / (syncWallMs / 1000)).toFixed(1)),
     eventLoopUtilization: Number(syncElu.toFixed(4)),
-    maxTimerDelayMs: syncProbe.maxTimerDelayMs,
+    mainThreadTimerDelayMs: syncProbe.mainThreadTimerDelayMs,
     eventLoopDelayMaxMs: syncProbe.eventLoopDelayMaxMs,
   },
   worker: {
@@ -207,7 +227,7 @@ const report = {
     cpuMs: Number(workerCpuMs.toFixed(3)),
     opsPerSec: Number((iterations / (workerWallMs / 1000)).toFixed(1)),
     eventLoopUtilization: Number(workerElu.toFixed(4)),
-    maxTimerDelayMs: workerProbe.maxTimerDelayMs,
+    mainThreadTimerDelayMs: workerProbe.mainThreadTimerDelayMs,
     eventLoopDelayMaxMs: workerProbe.eventLoopDelayMaxMs,
     success: workerProbe.result.success,
     roundTripAvgMs: Number((roundTripSum / iterations).toFixed(3)),

@@ -223,6 +223,14 @@ const IN_FLIGHT_ASTRA_REPORT_TYPES = new Set([
 function boundedAstraFailureReason(value: string | null | undefined, fallback: string): string {
   return value && ASTRA_BOUNDED_FAILURE_REASONS.has(value) ? value : fallback;
 }
+type MarketSnapshotFence = {
+  feedGeneration: number;
+  runGeneration: number;
+  experimentId: string | null;
+  startPending: boolean;
+  preparePending: boolean;
+};
+
 type IdleGrokSubmission = { observedAt: number; pending: boolean };
 type RetainedBookkeepingCounts = {
   activeTriggers: number;
@@ -2105,26 +2113,27 @@ export class EngineService {
 
   private async ingestMarketSnapshot(snapshot: MarketSnapshot): Promise<TriggerEvent[]> {
     if (!this.derivationWorker) return this.triggerEngine.ingestMarket(snapshot);
-    const fence = {
-      runGeneration: this.experimentRunGeneration,
-      experimentId: this.experiment?.id ?? null,
-      startPending: this.experimentStartPending,
-      preparePending: this.experimentPreparePending,
-    };
+    const fence = this.captureMarketSnapshotFence();
     const { derived } = await this.derivationWorker.deriveSnapshot(snapshot);
     if (this.marketSnapshotFenceStale(fence)) return [];
     return this.triggerEngine.ingestMarketWithDerived(snapshot, derived);
   }
 
-  private marketSnapshotFenceStale(fence: {
-    runGeneration: number;
-    experimentId: string | null;
-    startPending: boolean;
-    preparePending: boolean;
-  }): boolean {
+  private captureMarketSnapshotFence(): MarketSnapshotFence {
+    return {
+      feedGeneration: this.experimentFeedGeneration,
+      runGeneration: this.experimentRunGeneration,
+      experimentId: this.experiment?.id ?? null,
+      startPending: this.experimentStartPending,
+      preparePending: this.experimentPreparePending,
+    };
+  }
+
+  private marketSnapshotFenceStale(fence: MarketSnapshotFence): boolean {
+    if (fence.feedGeneration !== this.experimentFeedGeneration) return true;
     if (fence.runGeneration !== this.experimentRunGeneration) return true;
     if (fence.experimentId !== (this.experiment?.id ?? null)) return true;
-    if (this.experimentPreparePending) return true;
+    if (fence.preparePending !== this.experimentPreparePending) return true;
     return fence.startPending !== this.experimentStartPending;
   }
 

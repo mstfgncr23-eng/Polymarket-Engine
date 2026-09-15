@@ -264,7 +264,13 @@ export class EngineMetrics {
   });
   readonly triggerMarketIngestDuration = new Histogram({
     name: "trigger_market_ingest_duration_seconds",
-    help: "TriggerEngine.ingestMarket duration (one histogram for CPU attribution)",
+    help: "TriggerEngine.ingestMarket duration including deriveBook (one histogram for CPU attribution)",
+    buckets: DURATION_BUCKETS,
+    registers: [this.registry],
+  });
+  readonly triggerMarketIngestMutableDuration = new Histogram({
+    name: "trigger_market_ingest_mutable_duration_seconds",
+    help: "TriggerEngine.ingestMarketWithDerived duration after BookDerived is available (excludes derivation)",
     buckets: DURATION_BUCKETS,
     registers: [this.registry],
   });
@@ -751,6 +757,7 @@ export class EngineMetrics {
       onSuppressed: (kind, severity) => this.triggersSuppressed.inc({ kind, severity: String(severity) }),
       onReferenceWindow: (length) => this.referenceWindowLength.observe(length),
       onMarketIngest: (durationSeconds) => this.triggerMarketIngestDuration.observe(durationSeconds),
+      onMarketIngestMutable: (durationSeconds) => this.triggerMarketIngestMutableDuration.observe(durationSeconds),
       onReferenceIngest: (durationSeconds) => this.triggerReferenceIngestDuration.observe(durationSeconds),
       onReferenceWindowOverflow: () => this.referenceWindowOverflow.inc({ reason: "reference_window_limit" }),
     };
