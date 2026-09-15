@@ -47,91 +47,104 @@ jobs:
         run: |
           python3 - <<'PY'
           from pathlib import Path
+          import re
 
           path = Path("apps/engine/src/engine.ts")
           text = path.read_text()
 
-          begin_old = '''      if (!this.state.newPaperEntryAllowed() || this.overload.state === "FAIL_CLOSED") {
-            const preflight = this.preflight(this.experimentMode());
-            return { ...preflight, ok: false, blockers: [...new Set([...preflight.blockers, "OVERLOAD_FAIL_CLOSED"])] };
-          }
-          '''
-          begin_new = '''      const startBlockers = [
-            ...(this.state.journalDegraded || this.overload.hasIntegrityFault ? ["JOURNAL_NOT_HEALTHY"] : []),
-            ...this.experimentEconomicResidueBlockers(),
-          ];
-          const entryBlocked = !this.state.newPaperEntryAllowed() || this.overload.state === "FAIL_CLOSED";
-          if (entryBlocked || startBlockers.length > 0) {
-            const preflight = this.preflight(this.experimentMode());
-            return {
-              ...preflight,
-              ok: false,
-              blockers: [...new Set([
-                ...preflight.blockers,
-                ...startBlockers,
-                ...(entryBlocked ? ["OVERLOAD_FAIL_CLOSED"] : []),
-              ])],
-            };
-          }
-          '''
+          begin_pattern = re.compile(
+              r'^(?P<i>[ \t]*)if \(!this\.state\.newPaperEntryAllowed\(\) \|\| this\.overload\.state === "FAIL_CLOSED"\) \{\n'
+              r'(?P=i)  const preflight = this\.preflight\(this\.experimentMode\(\)\);\n'
+              r'(?P=i)  return \{ \.\.\.preflight, ok: false, blockers: \[\.\.\.new Set\(\[\.\.\.preflight\.blockers, "OVERLOAD_FAIL_CLOSED"\]\)\] \};\n'
+              r'(?P=i)\}',
+              re.MULTILINE,
+          )
 
-          prepare_old = '''      const ledger = this.ledger.snapshot();
-          const openPositions = [...this.ledger.positions.values()].filter((position) => d(position.upQuantity).gt(0) || d(position.downQuantity).gt(0));
-          const restingOrders = [...this.restingOrders.values()].filter((order) => d(order.remaining).gt(0));
-          const makerReservations = [...this.makerReservations.entries()].filter(([, amount]) => d(amount).gt(0));
-          const blockers: string[] = [];
-          if (openPositions.length > 0 || this.ledger.positions.size > 0) blockers.push("OPEN_POSITIONS_REMAIN");
-          if (restingOrders.length > 0 || this.restingOrders.size > 0) blockers.push("RESTING_ORDERS_REMAIN");
-          if (makerReservations.length > 0 || this.makerReservations.size > 0) blockers.push("MAKER_RESERVATIONS_REMAIN");
-          if (!d(ledger.reservedCash).eq(0)) blockers.push("RESERVED_CASH_REMAIN");
-          if (this.obligationMarketIds().size > 0) blockers.push("UNRESOLVED_ECONOMIC_OBLIGATIONS");
-          if (blockers.length > 0) return { ok: false, blockers, experiment: current };
-          '''
-          prepare_new = '''      const blockers = this.experimentEconomicResidueBlockers();
-          if (blockers.length > 0) return { ok: false, blockers, experiment: current };
-          '''
+          prepare_pattern = re.compile(
+              r'^(?P<i>[ \t]*)const ledger = this\.ledger\.snapshot\(\);\n'
+              r'(?P=i)const openPositions = \[\.\.\.this\.ledger\.positions\.values\(\)\]\.filter\(\(position\) => d\(position\.upQuantity\)\.gt\(0\) \|\| d\(position\.downQuantity\)\.gt\(0\)\);\n'
+              r'(?P=i)const restingOrders = \[\.\.\.this\.restingOrders\.values\(\)\]\.filter\(\(order\) => d\(order\.remaining\)\.gt\(0\)\);\n'
+              r'(?P=i)const makerReservations = \[\.\.\.this\.makerReservations\.entries\(\)\]\.filter\(\(\[, amount\]\) => d\(amount\)\.gt\(0\)\);\n'
+              r'(?P=i)const blockers: string\[\] = \[\];\n'
+              r'(?P=i)if \(openPositions\.length > 0 \|\| this\.ledger\.positions\.size > 0\) blockers\.push\("OPEN_POSITIONS_REMAIN"\);\n'
+              r'(?P=i)if \(restingOrders\.length > 0 \|\| this\.restingOrders\.size > 0\) blockers\.push\("RESTING_ORDERS_REMAIN"\);\n'
+              r'(?P=i)if \(makerReservations\.length > 0 \|\| this\.makerReservations\.size > 0\) blockers\.push\("MAKER_RESERVATIONS_REMAIN"\);\n'
+              r'(?P=i)if \(!d\(ledger\.reservedCash\)\.eq\(0\)\) blockers\.push\("RESERVED_CASH_REMAIN"\);\n'
+              r'(?P=i)if \(this\.obligationMarketIds\(\)\.size > 0\) blockers\.push\("UNRESOLVED_ECONOMIC_OBLIGATIONS"\);\n'
+              r'(?P=i)if \(blockers\.length > 0\) return \{ ok: false, blockers, experiment: current \};',
+              re.MULTILINE,
+          )
 
-          obligation_old = '''  private obligationMarketIds(): Set<string> {
-            const ids = this.openPositionMarketIds();
-            for (const resting of this.restingOrders.values()) {
-              if (d(resting.remaining).gt(0)) ids.add(resting.order.marketId);
-            }
-            return ids;
-          }
-          '''
-          obligation_new = '''  private obligationMarketIds(): Set<string> {
-            const ids = this.openPositionMarketIds();
-            for (const resting of this.restingOrders.values()) {
-              if (d(resting.remaining).gt(0)) ids.add(resting.order.marketId);
-            }
-            return ids;
-          }
+          obligation_pattern = re.compile(
+              r'^(?P<i>[ \t]*)private obligationMarketIds\(\): Set<string> \{\n'
+              r'(?P=i)  const ids = this\.openPositionMarketIds\(\);\n'
+              r'(?P=i)  for \(const resting of this\.restingOrders\.values\(\)\) \{\n'
+              r'(?P=i)    if \(d\(resting\.remaining\)\.gt\(0\)\) ids\.add\(resting\.order\.marketId\);\n'
+              r'(?P=i)  \}\n'
+              r'(?P=i)  return ids;\n'
+              r'(?P=i)\}',
+              re.MULTILINE,
+          )
 
-          private experimentEconomicResidueBlockers(): string[] {
-            const ledger = this.ledger.snapshot();
-            const openPositions = [...this.ledger.positions.values()].filter((position) => d(position.upQuantity).gt(0) || d(position.downQuantity).gt(0));
-            const restingOrders = [...this.restingOrders.values()].filter((order) => d(order.remaining).gt(0));
-            const makerReservations = [...this.makerReservations.entries()].filter(([, amount]) => d(amount).gt(0));
-            const blockers: string[] = [];
-            if (openPositions.length > 0 || this.ledger.positions.size > 0) blockers.push("OPEN_POSITIONS_REMAIN");
-            if (restingOrders.length > 0 || this.restingOrders.size > 0) blockers.push("RESTING_ORDERS_REMAIN");
-            if (makerReservations.length > 0 || this.makerReservations.size > 0) blockers.push("MAKER_RESERVATIONS_REMAIN");
-            if (!d(ledger.reservedCash).eq(0)) blockers.push("RESERVED_CASH_REMAIN");
-            if (this.obligationMarketIds().size > 0) blockers.push("UNRESOLVED_ECONOMIC_OBLIGATIONS");
-            return blockers;
-          }
-          '''
-
-          for label, old, new in [
-              ("beginExperiment gate", begin_old, begin_new),
-              ("prepareNext residue block", prepare_old, prepare_new),
-              ("residue helper insertion", obligation_old, obligation_new),
+          for label, pattern in [
+              ("beginExperiment gate", begin_pattern),
+              ("prepareNext residue block", prepare_pattern),
+              ("obligation helper insertion", obligation_pattern),
           ]:
-              count = text.count(old)
-              if count != 1:
-                  raise SystemExit(f"{label}: expected exactly 1 anchor, found {count}")
-              text = text.replace(old, new, 1)
+              matches = list(pattern.finditer(text))
+              if len(matches) != 1:
+                  raise SystemExit(f"{label}: expected exactly 1 semantic anchor, found {len(matches)}")
 
+          def begin_repl(match: re.Match[str]) -> str:
+              i = match.group("i")
+              return (
+                  f'{i}const startBlockers = [\n'
+                  f'{i}  ...(this.state.journalDegraded || this.overload.hasIntegrityFault ? ["JOURNAL_NOT_HEALTHY"] : []),\n'
+                  f'{i}  ...this.experimentEconomicResidueBlockers(),\n'
+                  f'{i}];\n'
+                  f'{i}const entryBlocked = !this.state.newPaperEntryAllowed() || this.overload.state === "FAIL_CLOSED";\n'
+                  f'{i}if (entryBlocked || startBlockers.length > 0) {{\n'
+                  f'{i}  const preflight = this.preflight(this.experimentMode());\n'
+                  f'{i}  return {{\n'
+                  f'{i}    ...preflight,\n'
+                  f'{i}    ok: false,\n'
+                  f'{i}    blockers: [...new Set([\n'
+                  f'{i}      ...preflight.blockers,\n'
+                  f'{i}      ...startBlockers,\n'
+                  f'{i}      ...(entryBlocked ? ["OVERLOAD_FAIL_CLOSED"] : []),\n'
+                  f'{i}    ])],\n'
+                  f'{i}  }};\n'
+                  f'{i}}}'
+              )
+
+          def prepare_repl(match: re.Match[str]) -> str:
+              i = match.group("i")
+              return (
+                  f'{i}const blockers = this.experimentEconomicResidueBlockers();\n'
+                  f'{i}if (blockers.length > 0) return {{ ok: false, blockers, experiment: current }};'
+              )
+
+          def obligation_repl(match: re.Match[str]) -> str:
+              i = match.group("i")
+              return match.group(0) + (
+                  f'\n\n{i}private experimentEconomicResidueBlockers(): string[] {{\n'
+                  f'{i}  const ledger = this.ledger.snapshot();\n'
+                  f'{i}  const openPositions = [...this.ledger.positions.values()].filter((position) => d(position.upQuantity).gt(0) || d(position.downQuantity).gt(0));\n'
+                  f'{i}  const restingOrders = [...this.restingOrders.values()].filter((order) => d(order.remaining).gt(0));\n'
+                  f'{i}  const makerReservations = [...this.makerReservations.entries()].filter(([, amount]) => d(amount).gt(0));\n'
+                  f'{i}  const blockers: string[] = [];\n'
+                  f'{i}  if (openPositions.length > 0 || this.ledger.positions.size > 0) blockers.push("OPEN_POSITIONS_REMAIN");\n'
+                  f'{i}  if (restingOrders.length > 0 || this.restingOrders.size > 0) blockers.push("RESTING_ORDERS_REMAIN");\n'
+                  f'{i}  if (makerReservations.length > 0 || this.makerReservations.size > 0) blockers.push("MAKER_RESERVATIONS_REMAIN");\n'
+                  f'{i}  if (!d(ledger.reservedCash).eq(0)) blockers.push("RESERVED_CASH_REMAIN");\n'
+                  f'{i}  if (this.obligationMarketIds().size > 0) blockers.push("UNRESOLVED_ECONOMIC_OBLIGATIONS");\n'
+                  f'{i}  return blockers;\n'
+                  f'{i}}}'
+              )
+
+          text = begin_pattern.sub(begin_repl, text, count=1)
+          text = prepare_pattern.sub(prepare_repl, text, count=1)
+          text = obligation_pattern.sub(obligation_repl, text, count=1)
           path.write_text(text)
           PY
           git diff --check
