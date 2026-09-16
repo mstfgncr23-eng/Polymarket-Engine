@@ -68,6 +68,9 @@ import {
   type NativeDecisionConfig,
   NativeV2ShadowFeatureExtractor,
   evaluateNativeV2ShadowFairProbability,
+  NativeV2ShadowOpportunityRanker,
+  evaluateNativeV2ShadowMarketOpportunity,
+  DEFAULT_FIRST_LEG_RISK_CAP_USD,
   rolesForTriggerKind,
 } from "@pm/core";
 import {
@@ -201,6 +204,7 @@ export class EngineService {
   private readonly triggerConfig;
   private readonly nativeDecisionConfig: NativeDecisionConfig;
   private readonly nativeV2Shadow = new NativeV2ShadowFeatureExtractor();
+  private readonly nativeV2OpportunityRanker = new NativeV2ShadowOpportunityRanker();
   private readonly strategy = new TemporalPairHedgeStrategy();
   private readonly marketAdapter: PolymarketMarketDataAdapter;
   private readonly legacyBtcAdapter: BtcWebSocketAdapter | null;
@@ -1094,6 +1098,7 @@ export class EngineService {
       this.snapshots.delete(marketId);
       this.triggerEngine.dropMarket(marketId);
       this.nativeV2Shadow.dropMarket(marketId);
+      this.nativeV2OpportunityRanker.dropMarket(marketId);
       this.assetIndex.removeMarket(marketId);
       for (const [tokenId, snapshot] of [...this.state.marketSnapshots.entries()]) {
         if (snapshot.marketId === marketId) {
@@ -2027,6 +2032,24 @@ export class EngineService {
     const shadowV2FairProbability = shadowV2FeatureVector
       ? evaluateNativeV2ShadowFairProbability(shadowV2FeatureVector)
       : null;
+    const shadowNow = this.nowFn();
+    const shadowV2MarketOpportunity = shadowV2FairProbability
+      ? evaluateNativeV2ShadowMarketOpportunity({
+        fair: shadowV2FairProbability,
+        snapshots: { UP: pair.UP ?? null, DOWN: pair.DOWN ?? null },
+        now: shadowNow,
+        targetNotionalUsd: Math.min(this.riskLimits.maxOrderSizeUsd, DEFAULT_FIRST_LEG_RISK_CAP_USD),
+        minimumNetEvUsdPerShare: this.riskLimits.minExpectedEdge,
+      })
+      : null;
+    const shadowV2OpportunityRanking = shadowV2MarketOpportunity
+      ? this.nativeV2OpportunityRanker.upsertAndRank(
+        shadowV2MarketOpportunity,
+        shadowNow,
+        this.riskLimits.staleFeedTimeoutMs,
+      )
+      : null;
+    if (!shadowV2MarketOpportunity) this.nativeV2OpportunityRanker.dropMarket(trigger.marketId);
 
     const consensus = this.nativeCompatibilityDecision(trigger, native);
     this.state.latestConsensus = consensus;
@@ -2034,7 +2057,7 @@ export class EngineService {
       authority: NATIVE_DETERMINISTIC_AUTHORITY,
       direction: native.direction, confidence: native.confidence,
       fairProbability: native.fairProbability, marketProbability: native.marketProbability,
-      featureVector: native.featureVector, shadowV2FeatureVector, shadowV2FairProbability, triggerId: trigger.id,
+      featureVector: native.featureVector, shadowV2FeatureVector, shadowV2FairProbability, shadowV2OpportunityRanking, triggerId: trigger.id,
     }, asset);
     await this.persistReportInput(createJournalEvent({
       traceId: trigger.traceId, type: "CONSENSUS_DECISION", aggregateType: "consensus", aggregateId: consensus.id,
@@ -2043,7 +2066,7 @@ export class EngineService {
         authority: NATIVE_DETERMINISTIC_AUTHORITY,
         marketId: trigger.marketId, asset,
         fairProbability: native.fairProbability, marketProbability: native.marketProbability,
-        expiresAt: native.expiresAt, featureVector: native.featureVector, shadowV2FeatureVector, shadowV2FairProbability,
+        expiresAt: native.expiresAt, featureVector: native.featureVector, shadowV2FeatureVector, shadowV2FairProbability, shadowV2OpportunityRanking,
         reference: reference ? {
           asset: reference.asset, venue: reference.venue, freshness: reference.freshness,
           freshnessMs: reference.freshnessMs, recentMoveBps: reference.recentMoveBps,
@@ -4539,6 +4562,7 @@ export class EngineService {
   private clearMarketPairProjections(marketId: string): void {
     this.triggerEngine.forgetMarketBooks(marketId);
     this.nativeV2Shadow.dropMarket(marketId);
+    this.nativeV2OpportunityRanker.dropMarket(marketId);
     this.snapshots.delete(marketId);
     for (const [tokenId, snapshot] of [...this.state.marketSnapshots.entries()]) {
       if (snapshot.marketId !== marketId) continue;

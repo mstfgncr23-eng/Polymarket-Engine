@@ -15,6 +15,7 @@ export * from "./journal-types.js";
 export * from "./native-decision.js";
 export * from "./native-v2-shadow-fair-probability.js";
 export * from "./native-v2-shadow-features.js";
+export * from "./native-v2-shadow-opportunity-ranking.js";
 export * from "./qualification.js";
 export * from "./reference-window.js";
 export * from "./retention.js";
