@@ -633,8 +633,20 @@ export class EngineService {
       if (this.experiment?.status === "RUNNING" || this.experiment?.status === "ENTRY_CLOSED") {
         return { ok: false, blockers: ["EXPERIMENT_ALREADY_ACTIVE"], experiment: this.experiment };
       }
-      if (this.experiment?.status === "COMPLETED" || this.experiment?.status === "FAILED") {
+      if (this.experiment?.status === "FAILED") {
         return { ok: false, blockers: ["EXPERIMENT_ALREADY_COMPLETED"], experiment: this.experiment };
+      }
+      if (this.experiment?.status === "COMPLETED") {
+        const previousReport = await this.journal
+          .loadExperimentReport(this.experiment.id, "final")
+          .catch(() => null);
+        if (!previousReport || !isCanonicalFinalReport(previousReport)) {
+          return {
+            ok: false,
+            blockers: ["PREVIOUS_EXPERIMENT_REPORT_NOT_FINALIZED"],
+            experiment: this.experiment,
+          };
+        }
       }
       const startBlockers = [
         ...(this.state.journalDegraded || this.overload.hasIntegrityFault ? ["JOURNAL_NOT_HEALTHY"] : []),
