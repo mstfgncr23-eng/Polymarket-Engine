@@ -66,6 +66,21 @@ export class NativeV2ShadowStore {
     this.slots = new Array<NativeV2ShadowExecutionRecord | undefined>(capacity);
   }
 
+  reset(): void {
+    this.slots.fill(undefined);
+    this.cursor = 0;
+    this.sizeValue = 0;
+    this.sequence = 0;
+    this.observed = 0;
+    this.evaluated = 0;
+    this.wouldSubmit = 0;
+    this.vetoed = 0;
+    this.preflightBlocked = 0;
+    this.droppedBusy = 0;
+    this.riskVetoes.clear();
+    this.preflightBlockers.clear();
+  }
+
   noteObserved(): void {
     this.observed += 1;
   }

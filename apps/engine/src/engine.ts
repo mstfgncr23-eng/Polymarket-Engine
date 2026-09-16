@@ -804,6 +804,7 @@ export class EngineService {
         // START_VALIDATED is durable, later feed loss is ordinary runtime
         // feed-loss semantics; there is no compensating transition to race
         // with recovery.
+        this.nativeV2ShadowStore.reset();
         this.crashInjector.maybeCrash("AFTER_START_VALIDATED_BEFORE_RUNTIME_ADMISSION", `experiment:${next.id}:start_validated`);
         this.syncExperimentWindow();
         try {
@@ -2149,13 +2150,16 @@ export class EngineService {
     const selectedAtDecision = input.opportunity.best;
     if (input.ranking.marketRank !== 1 || !selectedAtDecision?.actionable) return null;
 
+    const now = this.nowFn();
+    // Phase-4 data is scoped to a real entry-capable experiment. Do not fill
+    // the bounded RAM export with idle or post-entry-close observations.
+    if (!experimentAllowsFirstLeg(this.experiment, now)) return null;
     this.nativeV2ShadowStore.noteObserved();
     if (this.nativeV2ShadowExecutionBusy) {
       this.nativeV2ShadowStore.noteDroppedBusy();
       return null;
     }
 
-    const now = this.nowFn();
     const marketId = input.opportunity.marketId;
     const currentPair = this.snapshots.get(marketId);
     const currentSnapshot = currentPair?.[selectedAtDecision.outcome] ?? null;
