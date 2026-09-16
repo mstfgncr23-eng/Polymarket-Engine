@@ -1894,28 +1894,44 @@ export class EngineService {
       return;
     }
     this.state.addTrigger(trigger);
-    const nativeBookkeepingStarted = performance.now();
-    this.activation.ensureLatency(trigger);
-    this.state.setActivationLatency(this.activation.snapshot());
-    await this.persistReportInput(createJournalEvent({
-      traceId: trigger.traceId, type: "GROK_ACTIVATION_DECISION", aggregateType: "activation", aggregateId: trigger.id,
-      payload: {
-        triggerId: trigger.id, marketId: trigger.marketId, asset: trigger.asset ?? null,
-        reason: "NATIVE_DETERMINISTIC_ONLY", activate: false, authority: NATIVE_DETERMINISTIC_AUTHORITY,
-      },
-    }));
-    this.state.addActivation({
-      triggerId: trigger.id, reason: "NATIVE_DETERMINISTIC_ONLY", at: this.nowFn().toISOString(),
-      provider: "native_deterministic", grokWakeObserved: false,
+    await this.experimentBoundaryGate.run(async () => {
+      const nativeBookkeepingStarted = performance.now();
+      this.activation.ensureLatency(trigger);
+      this.state.setActivationLatency(this.activation.snapshot());
+      await this.persistReportInput(createJournalEvent({
+        traceId: trigger.traceId, type: "GROK_ACTIVATION_DECISION", aggregateType: "activation", aggregateId: trigger.id,
+        payload: {
+          triggerId: trigger.id, marketId: trigger.marketId, asset: trigger.asset ?? null,
+          reason: "NATIVE_DETERMINISTIC_ONLY", activate: false, authority: NATIVE_DETERMINISTIC_AUTHORITY,
+        },
+      }));
+      this.state.addActivation({
+        triggerId: trigger.id, reason: "NATIVE_DETERMINISTIC_ONLY", at: this.nowFn().toISOString(),
+        provider: "native_deterministic", grokWakeObserved: false,
+      });
+      this.metrics.idleActivationBookkeepingDuration.observe((performance.now() - nativeBookkeepingStarted) / 1000);
+      this.record("NATIVE_DECISION_EVALUATION", trigger.traceId, trigger.marketId, {
+        authority: NATIVE_DETERMINISTIC_AUTHORITY, triggerId: trigger.id, expiresAt: trigger.expiresAt,
+      }, trigger.asset ?? null);
+      await this.evaluateNativeDecisionForTrigger(trigger, provenance);
     });
-    this.metrics.idleActivationBookkeepingDuration.observe((performance.now() - nativeBookkeepingStarted) / 1000);
-    this.record("NATIVE_DECISION_EVALUATION", trigger.traceId, trigger.marketId, {
-      authority: NATIVE_DETERMINISTIC_AUTHORITY, triggerId: trigger.id, expiresAt: trigger.expiresAt,
-    }, trigger.asset ?? null);
-    await this.evaluateNativeDecisionForTrigger(trigger, provenance);
     } finally {
       this.metrics.noteProcessTriggerEnd(started);
     }
+  }
+
+  /**
+   * The entry deadline is an economic admission fence, not merely a
+   * maintenance hint. Callers use this while holding experimentBoundaryGate.
+   */
+  private async ensureFirstLegEntryOpen(): Promise<boolean> {
+    if (experimentAllowsFirstLeg(this.experiment, this.nowFn())) return true;
+    const current = this.experiment;
+    const now = this.nowFn();
+    if (current?.status === "RUNNING" && current.entryClosesAt && now.getTime() >= new Date(current.entryClosesAt).getTime()) {
+      await this.commitExperimentStatus({ ...current, status: "ENTRY_CLOSED", completedAt: null, markToMarketAt: null });
+    }
+    return false;
   }
 
   /**
@@ -2594,6 +2610,10 @@ export class EngineService {
 
   private async submitPaperOrder(order: PaperOrder, decisionSnapshot: MarketSnapshot, duplicateKey: string, intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" = "OPEN_FIRST_LEG"): Promise<void> {
     if (intent === "OPEN_FIRST_LEG" && this.experimentStartPending) return;
+    // Last economic admission fence immediately before PAPER_ORDER_CREATED.
+    // close-entries and the native decision path are serialized by the same
+    // experimentBoundaryGate, while deadline expiry closes durably here.
+    if (intent === "OPEN_FIRST_LEG" && !(await this.ensureFirstLegEntryOpen())) return;
     this.metrics.paperOrders.inc({ type: order.orderType });
     this.record("PAPER_ORDER_CREATED", order.traceId, order.marketId, { orderId: order.id, type: order.orderType, intent }, decisionSnapshot.asset ?? null);
     await this.persistReportInput(createJournalEvent({
@@ -3275,12 +3295,18 @@ export class EngineService {
       const closed: ExperimentManifest = {
         ...next, status: "ENTRY_CLOSED", completedAt: null, markToMarketAt: null,
       };
-      if (this.experiment.status !== "ENTRY_CLOSED") await this.commitExperimentStatus(closed);
+      await this.experimentBoundaryGate.run(async () => {
+        if (this.experiment?.status === "RUNNING") await this.commitExperimentStatus(closed);
+      });
     }
     if (next.status === "COMPLETED" && this.experiment?.status !== "COMPLETED") {
-      await this.commitExperimentStatus(next);
+      await this.experimentBoundaryGate.run(async () => {
+        if (this.experiment?.status !== "COMPLETED") await this.commitExperimentStatus(next);
+      });
     } else if (next.status === "ENTRY_CLOSED" && this.experiment?.status !== "ENTRY_CLOSED" && this.experiment?.status !== "COMPLETED") {
-      await this.commitExperimentStatus(next);
+      await this.experimentBoundaryGate.run(async () => {
+        if (this.experiment?.status !== "ENTRY_CLOSED" && this.experiment?.status !== "COMPLETED") await this.commitExperimentStatus(next);
+      });
     }
     this.syncExperimentWindow();
     const stillOpen = openPositionsRemain(this.ledger.positions.values());
@@ -4162,11 +4188,13 @@ export class EngineService {
   idleGrokSubmissionCountForTest(): number { return this.idleGrokSubmissions.size; }
   sourceSealStateForTest() { return { sealing: this.sourceSealing, sealed: this.sourceSealed, generation: this.sourceSealGeneration }; }
   async completeExperimentForTest(): Promise<void> {
-    if (!this.experiment) throw new Error("NO_EXPERIMENT");
-    await this.commitExperimentStatus({
-      ...this.experiment,
-      status: "COMPLETED",
-      completedAt: this.nowFn().toISOString(),
+    await this.experimentBoundaryGate.run(async () => {
+      if (!this.experiment) throw new Error("NO_EXPERIMENT");
+      await this.commitExperimentStatus({
+        ...this.experiment,
+        status: "COMPLETED",
+        completedAt: this.nowFn().toISOString(),
+      });
     });
   }
   async ensureSourceSealForTest() {
