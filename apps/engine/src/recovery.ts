@@ -264,7 +264,27 @@ export function applyDurableTransition(state: RecoverableEngineState, transition
         state.experiment = experimentManifestSchema.parse(transition.payload.experiment ?? transition.payload);
         if (transition.type === "EXPERIMENT_STARTED") {
           const at = state.experiment.startedAt ? new Date(state.experiment.startedAt) : new Date(transition.occurredAt);
-          state.ledger.resetOperatingCostBaseline(at);
+          const ledger = state.ledger.snapshot();
+          const openPosition = [...state.ledger.positions.values()].some(
+            (position) => d(position.upQuantity).gt(0) || d(position.downQuantity).gt(0),
+          );
+          const restingOrder = [...state.restingOrders.values()].some(
+            (order) => d(order.remaining).gt(0),
+          );
+          const makerReservation = [...state.makerReservations.values()].some(
+            (amount) => d(amount).gt(0),
+          );
+          if (openPosition || restingOrder || makerReservation || d(ledger.reservedCash).gt(0)) {
+            throw new RecoveryFailClosedError(
+              "invariant",
+              "experiment start attempted with economic residue",
+            );
+          }
+
+          const fresh = new PaperLedger(state.experiment.startingBalance, at);
+          state.ledger.restore(fresh.snapshot(), []);
+          state.restingOrders.clear();
+          state.makerReservations.clear();
           state.lastInfrastructureAccrualAt = at.getTime();
         }
         return;
