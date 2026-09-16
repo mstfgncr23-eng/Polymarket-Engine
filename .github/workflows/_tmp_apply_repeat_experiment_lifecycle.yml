@@ -23,89 +23,95 @@ jobs:
           set -euo pipefail
           python3 <<'PY'
           from pathlib import Path
+          from textwrap import dedent
 
           root = Path('.')
 
           engine_path = root / 'apps/engine/src/engine.ts'
           engine = engine_path.read_text()
-          old_engine = '''      if (this.experiment?.status === "COMPLETED" || this.experiment?.status === "FAILED") {
-                return { ok: false, blockers: ["EXPERIMENT_ALREADY_COMPLETED"], experiment: this.experiment };
-              }
-          '''
-          new_engine = '''      if (this.experiment?.status === "FAILED") {
-                return { ok: false, blockers: ["EXPERIMENT_ALREADY_COMPLETED"], experiment: this.experiment };
-              }
-              if (this.experiment?.status === "COMPLETED") {
-                const previousReport = await this.journal
-                  .loadExperimentReport(this.experiment.id, "final")
-                  .catch(() => null);
-                if (!previousReport || !isCanonicalFinalReport(previousReport)) {
-                  return {
-                    ok: false,
-                    blockers: ["PREVIOUS_EXPERIMENT_REPORT_NOT_FINALIZED"],
-                    experiment: this.experiment,
-                  };
-                }
-              }
-          '''
+          old_engine = (
+              '      if (this.experiment?.status === "COMPLETED" || this.experiment?.status === "FAILED") {\n'
+              '        return { ok: false, blockers: ["EXPERIMENT_ALREADY_COMPLETED"], experiment: this.experiment };\n'
+              '      }\n'
+          )
+          new_engine = (
+              '      if (this.experiment?.status === "FAILED") {\n'
+              '        return { ok: false, blockers: ["EXPERIMENT_ALREADY_COMPLETED"], experiment: this.experiment };\n'
+              '      }\n'
+              '      if (this.experiment?.status === "COMPLETED") {\n'
+              '        const previousReport = await this.journal\n'
+              '          .loadExperimentReport(this.experiment.id, "final")\n'
+              '          .catch(() => null);\n'
+              '        if (!previousReport || !isCanonicalFinalReport(previousReport)) {\n'
+              '          return {\n'
+              '            ok: false,\n'
+              '            blockers: ["PREVIOUS_EXPERIMENT_REPORT_NOT_FINALIZED"],\n'
+              '            experiment: this.experiment,\n'
+              '          };\n'
+              '        }\n'
+              '      }\n'
+          )
           if engine.count(old_engine) != 1:
               raise SystemExit(f'ENGINE_PATCH_ABORT: expected 1 lifecycle block, found {engine.count(old_engine)}')
           engine_path.write_text(engine.replace(old_engine, new_engine))
 
           recovery_path = root / 'apps/engine/src/recovery.ts'
           recovery = recovery_path.read_text()
-          old_recovery = '''    case "EXPERIMENT_STARTED":
-              case "EXPERIMENT_START_VALIDATED":
-              case "EXPERIMENT_START_ABORTED":
-              case "EXPERIMENT_ENTRY_CLOSED":
-              case "EXPERIMENT_COMPLETED":
-                  state.experiment = experimentManifestSchema.parse(transition.payload.experiment ?? transition.payload);
-                  if (transition.type === "EXPERIMENT_STARTED") {
-                    const at = state.experiment.startedAt ? new Date(state.experiment.startedAt) : new Date(transition.occurredAt);
-                    state.ledger.resetOperatingCostBaseline(at);
-                    state.lastInfrastructureAccrualAt = at.getTime();
-                  }
-                  return;
-          '''
-          new_recovery = '''    case "EXPERIMENT_STARTED":
-              case "EXPERIMENT_START_VALIDATED":
-              case "EXPERIMENT_START_ABORTED":
-              case "EXPERIMENT_ENTRY_CLOSED":
-              case "EXPERIMENT_COMPLETED":
-                  state.experiment = experimentManifestSchema.parse(transition.payload.experiment ?? transition.payload);
-                  if (transition.type === "EXPERIMENT_STARTED") {
-                    const at = state.experiment.startedAt ? new Date(state.experiment.startedAt) : new Date(transition.occurredAt);
-                    const ledger = state.ledger.snapshot();
-                    const openPosition = [...state.ledger.positions.values()].some(
-                      (position) => d(position.upQuantity).gt(0) || d(position.downQuantity).gt(0),
-                    );
-                    const restingOrder = [...state.restingOrders.values()].some(
-                      (order) => d(order.remaining).gt(0),
-                    );
-                    const makerReservation = [...state.makerReservations.values()].some(
-                      (amount) => d(amount).gt(0),
-                    );
-                    if (openPosition || restingOrder || makerReservation || d(ledger.reservedCash).gt(0)) {
-                      throw new RecoveryFailClosedError(
-                        "invariant",
-                        "experiment start attempted with economic residue",
-                      );
-                    }
-
-                    const fresh = new PaperLedger(state.experiment.startingBalance, at);
-                    state.ledger.restore(fresh.snapshot(), []);
-                    state.restingOrders.clear();
-                    state.makerReservations.clear();
-                    state.lastInfrastructureAccrualAt = at.getTime();
-                  }
-                  return;
-          '''
+          old_recovery = (
+              '    case "EXPERIMENT_STARTED":\n'
+              '    case "EXPERIMENT_START_VALIDATED":\n'
+              '    case "EXPERIMENT_START_ABORTED":\n'
+              '    case "EXPERIMENT_ENTRY_CLOSED":\n'
+              '    case "EXPERIMENT_COMPLETED":\n'
+              '        state.experiment = experimentManifestSchema.parse(transition.payload.experiment ?? transition.payload);\n'
+              '        if (transition.type === "EXPERIMENT_STARTED") {\n'
+              '          const at = state.experiment.startedAt ? new Date(state.experiment.startedAt) : new Date(transition.occurredAt);\n'
+              '          state.ledger.resetOperatingCostBaseline(at);\n'
+              '          state.lastInfrastructureAccrualAt = at.getTime();\n'
+              '        }\n'
+              '        return;\n'
+          )
+          new_recovery = (
+              '    case "EXPERIMENT_STARTED":\n'
+              '    case "EXPERIMENT_START_VALIDATED":\n'
+              '    case "EXPERIMENT_START_ABORTED":\n'
+              '    case "EXPERIMENT_ENTRY_CLOSED":\n'
+              '    case "EXPERIMENT_COMPLETED":\n'
+              '        state.experiment = experimentManifestSchema.parse(transition.payload.experiment ?? transition.payload);\n'
+              '        if (transition.type === "EXPERIMENT_STARTED") {\n'
+              '          const at = state.experiment.startedAt ? new Date(state.experiment.startedAt) : new Date(transition.occurredAt);\n'
+              '          const ledger = state.ledger.snapshot();\n'
+              '          const openPosition = [...state.ledger.positions.values()].some(\n'
+              '            (position) => d(position.upQuantity).gt(0) || d(position.downQuantity).gt(0),\n'
+              '          );\n'
+              '          const restingOrder = [...state.restingOrders.values()].some(\n'
+              '            (order) => d(order.remaining).gt(0),\n'
+              '          );\n'
+              '          const makerReservation = [...state.makerReservations.values()].some(\n'
+              '            (amount) => d(amount).gt(0),\n'
+              '          );\n'
+              '          if (openPosition || restingOrder || makerReservation || d(ledger.reservedCash).gt(0)) {\n'
+              '            throw new RecoveryFailClosedError(\n'
+              '              "invariant",\n'
+              '              "experiment start attempted with economic residue",\n'
+              '            );\n'
+              '          }\n'
+              '\n'
+              '          const fresh = new PaperLedger(state.experiment.startingBalance, at);\n'
+              '          state.ledger.restore(fresh.snapshot(), []);\n'
+              '          state.restingOrders.clear();\n'
+              '          state.makerReservations.clear();\n'
+              '          state.lastInfrastructureAccrualAt = at.getTime();\n'
+              '        }\n'
+              '        return;\n'
+          )
           if recovery.count(old_recovery) != 1:
               raise SystemExit(f'RECOVERY_PATCH_ABORT: expected 1 start block, found {recovery.count(old_recovery)}')
           recovery_path.write_text(recovery.replace(old_recovery, new_recovery))
 
           test_path = root / 'tests/repeat-experiment-lifecycle.test.ts'
-          test_path.write_text(r'''import { describe, expect, it } from "vitest";
+          test_path.write_text(dedent(r'''
+          import { describe, expect, it } from "vitest";
           import { paperFill, startQualifiedEngine } from "./paper-engine-testkit.js";
 
           function installCompletedExperiment(engine: Awaited<ReturnType<typeof startQualifiedEngine>>["engine"], id: string) {
@@ -201,12 +207,7 @@ jobs:
               }
             });
           });
-          ''')
-
-          for path in (engine_path, recovery_path, test_path):
-              text = path.read_text()
-              lines = [line[10:] if line.startswith('          ') else line for line in text.splitlines()]
-              path.write_text('\n'.join(lines) + '\n')
+          ''').lstrip())
 
           print('PATCH_OK')
           PY
