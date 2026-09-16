@@ -1,6 +1,10 @@
 name: apply-learning-pr1-staging
 on:
   workflow_dispatch:
+  push:
+    branches: [feat/native-v2-learning-foundation]
+    paths:
+      - "scripts/learning-pr1-staging/TRIGGER_ASSEMBLE"
 permissions:
   contents: write
 jobs:
@@ -29,7 +33,7 @@ jobs:
             exit 0
           fi
           git commit -m "$(cat <<'MSG'
-feat(learning): LearningSampleStore, LEARNING_* config, engine hook, tests
+feat(learning): LearningSampleStore, engine hook, foundation tests
 
 Assemble PR1 durable learning foundation. Fail-soft observe after V2 fair
 probability (before opportunity/ranking); non-economic pollLearningSettlements;
