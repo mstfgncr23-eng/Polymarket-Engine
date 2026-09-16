@@ -61,7 +61,7 @@ export interface NativeV2ShadowOpportunityRanking {
   marketRank: number | null;
   rankedMarketCount: number;
   actionableMarketCount: number;
-  current: NativeV2ShadowMarketOpportunity;
+  current: NativeV2ShadowOpportunitySummary | null;
   top: NativeV2ShadowOpportunitySummary | null;
 }
 
@@ -144,7 +144,7 @@ export class NativeV2ShadowOpportunityRanker {
       marketRank: index >= 0 ? index + 1 : null,
       rankedMarketCount: ranked.length,
       actionableMarketCount: ranked.reduce((count, item) => count + (item.best.actionable ? 1 : 0), 0),
-      current: opportunity,
+      current: opportunity.best ? summarize(opportunity.best) : null,
       top: top ? summarize(top) : null,
     };
   }
