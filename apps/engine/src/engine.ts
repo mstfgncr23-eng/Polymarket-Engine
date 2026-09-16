@@ -67,6 +67,7 @@ import {
   type NativeReferenceFeatures,
   type NativeDecisionConfig,
   NativeV2ShadowFeatureExtractor,
+  evaluateNativeV2ShadowFairProbability,
   rolesForTriggerKind,
 } from "@pm/core";
 import {
@@ -2023,6 +2024,9 @@ export class EngineService {
       referenceFreshness: referenceContext?.freshness ?? "unknown",
       referenceFreshnessMs: referenceContext?.freshnessMs ?? null,
     });
+    const shadowV2FairProbability = shadowV2FeatureVector
+      ? evaluateNativeV2ShadowFairProbability(shadowV2FeatureVector)
+      : null;
 
     const consensus = this.nativeCompatibilityDecision(trigger, native);
     this.state.latestConsensus = consensus;
@@ -2030,7 +2034,7 @@ export class EngineService {
       authority: NATIVE_DETERMINISTIC_AUTHORITY,
       direction: native.direction, confidence: native.confidence,
       fairProbability: native.fairProbability, marketProbability: native.marketProbability,
-      featureVector: native.featureVector, shadowV2FeatureVector, triggerId: trigger.id,
+      featureVector: native.featureVector, shadowV2FeatureVector, shadowV2FairProbability, triggerId: trigger.id,
     }, asset);
     await this.persistReportInput(createJournalEvent({
       traceId: trigger.traceId, type: "CONSENSUS_DECISION", aggregateType: "consensus", aggregateId: consensus.id,
@@ -2039,7 +2043,7 @@ export class EngineService {
         authority: NATIVE_DETERMINISTIC_AUTHORITY,
         marketId: trigger.marketId, asset,
         fairProbability: native.fairProbability, marketProbability: native.marketProbability,
-        expiresAt: native.expiresAt, featureVector: native.featureVector, shadowV2FeatureVector,
+        expiresAt: native.expiresAt, featureVector: native.featureVector, shadowV2FeatureVector, shadowV2FairProbability,
         reference: reference ? {
           asset: reference.asset, venue: reference.venue, freshness: reference.freshness,
           freshnessMs: reference.freshnessMs, recentMoveBps: reference.recentMoveBps,
