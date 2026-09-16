@@ -1,0 +1,37 @@
+{
+  "files": {
+    "learning-store.ts": {
+      "dest": "packages/core/src/learning-store.ts",
+      "parts": [
+        "learning-store.ts.b64.00",
+        "learning-store.ts.b64.01",
+        "learning-store.ts.b64.02",
+        "learning-store.ts.b64.03"
+      ],
+      "sha256": "7d3787d187221994eb77f0d7c57e88ba06cdedfc5427581a7c8a50c14681d61b",
+      "bytes": 17698
+    },
+    "config.ts": {
+      "dest": "packages/core/src/config.ts",
+      "parts": [
+        "config.ts.b64.00",
+        "config.ts.b64.01",
+        "config.ts.b64.02"
+      ],
+      "sha256": "ae4102128292014bb31cad9f61f5bc47a0917d36ad60f85477fd96cdc72c5ab5",
+      "bytes": 11593
+    },
+    "learning-sample-foundation.test.ts": {
+      "dest": "tests/learning-sample-foundation.test.ts",
+      "parts": [
+        "learning-sample-foundation.test.ts.b64.00",
+        "learning-sample-foundation.test.ts.b64.01",
+        "learning-sample-foundation.test.ts.b64.02"
+      ],
+      "sha256": "3a2badd989617414d755bfdf1c379eb3bcc1e04614cb2d69c63bc3b1ac8a8037",
+      "bytes": 11791
+    }
+  },
+  "enginePatch": "engine-learning.patch",
+  "engineShaExpected": "f770c759a536c9ff902941dc0b2136bcee912fae"
+}
