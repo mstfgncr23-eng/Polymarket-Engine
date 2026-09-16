@@ -783,8 +783,14 @@ export class PostgresEventJournal implements EventJournal {
     this.access = options.access ?? "boot-migrate";
     this.client = postgres(databaseUrl, {
       max: 10,
-      idle_timeout: 20,
-      connect_timeout: 10,
+      // This engine is a single long-lived VPS process. Recycling every idle
+      // connection after 20s forces repeated TCP/TLS/auth handshakes through
+      // the shared Supavisor session pooler and turns transient connect latency
+      // into journal degradation. Keep the application pool warm instead.
+      idle_timeout: 0,
+      // Keep startup bounded, but use postgres.js' normal 30s connect budget
+      // rather than the previous aggressive 10s cutoff.
+      connect_timeout: 30,
       onclose: () => undefined,
       onnotice: () => undefined,
     });
