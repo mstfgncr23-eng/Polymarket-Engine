@@ -41,6 +41,8 @@ export interface TriggerEmitObserver {
   onSuppressed(kind: TriggerKind, severity: 0 | 1 | 2 | 3): void;
   onReferenceWindow?(length: number): void;
   onMarketIngest?(durationSeconds: number): void;
+  /** Post-derivation mutable work only. Does not include deriveBook. */
+  onMarketIngestMutable?(durationSeconds: number): void;
   onReferenceIngest?(durationSeconds: number): void;
   onReferenceWindowOverflow?(): void;
 }
@@ -103,9 +105,17 @@ export class TriggerEngine {
   ingestMarket(snapshot: MarketSnapshot): TriggerEvent[] {
     const started = performance.now();
     try {
+      return this.ingestMarketWithDerived(snapshot, deriveBook(snapshot));
+    } finally {
+      this.observer?.onMarketIngest?.((performance.now() - started) / 1000);
+    }
+  }
+
+  ingestMarketWithDerived(snapshot: MarketSnapshot, derived: BookDerived): TriggerEvent[] {
+    const started = performance.now();
+    try {
       const key = bookKey(snapshot.marketId, snapshot.outcome);
       const previous = this.books.get(key);
-      const derived = deriveBook(snapshot);
       const candidates: Candidate[] = [];
       let newsScore = -1;
       const imbalance = derived.imbalanceAbs;
@@ -174,7 +184,7 @@ export class TriggerEngine {
       if (snapshot.asset) this.assetIndex.add(snapshot.asset, snapshot.marketId);
       return this.emit(snapshot.traceId, snapshot.marketId, snapshot.asset ?? window?.asset ?? null, snapshot.eventId, candidates, this.marketEmitted(snapshot.marketId));
     } finally {
-      this.observer?.onMarketIngest?.((performance.now() - started) / 1000);
+      this.observer?.onMarketIngestMutable?.((performance.now() - started) / 1000);
     }
   }
 
