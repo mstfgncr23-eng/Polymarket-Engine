@@ -1,6 +1,14 @@
 import { d, decimal } from "./calculations.js";
 import type { ConsensusDecision, MarketSnapshot, Outcome, Position } from "./domain.js";
 
+/**
+ * Safety cap for the initially unhedged leg. This is deliberately smaller than
+ * maxOrderSizeUsd so a single failed hedge cannot consume the full per-order
+ * risk budget. It applies only while opening a fresh directional leg; the
+ * second-leg hedge may still use the full maxOrderSizeUsd to neutralize risk.
+ */
+export const DEFAULT_FIRST_LEG_RISK_CAP_USD = 5;
+
 export interface StrategyCandidate {
   strategyId: string;
   strategyVersion: string;
@@ -23,6 +31,8 @@ export interface StrategyContext {
   snapshots: Record<Outcome, MarketSnapshot | null>;
   position: Position | null;
   maxOrderSizeUsd: number;
+  /** Optional override used by tests/future explicit config. */
+  firstLegRiskCapUsd?: number;
   /** Minimum locked pair value in USD/share for a $1 binary payout. */
   minimumLockedPairEdge: number;
 }
@@ -35,7 +45,7 @@ export interface Strategy {
 
 export class TemporalPairHedgeStrategy implements Strategy {
   readonly id = "temporal-pair-hedge";
-  constructor(readonly version = "temporal-pair-hedge-v1") {}
+  constructor(readonly version = "temporal-pair-hedge-v1.1") {}
 
   evaluate(context: StrategyContext): StrategyCandidate | null {
     const position = context.position;
@@ -63,12 +73,15 @@ export class TemporalPairHedgeStrategy implements Strategy {
     const snapshot = context.snapshots[outcome];
     const ask = snapshot?.asks[0];
     if (!snapshot || !ask) return null;
-    const quantity = decimal(context.maxOrderSizeUsd / Number(ask.price));
+    const askPrice = Number(ask.price);
+    const firstLegRiskCapUsd = Math.min(context.maxOrderSizeUsd, context.firstLegRiskCapUsd ?? DEFAULT_FIRST_LEG_RISK_CAP_USD);
+    if (!Number.isFinite(askPrice) || askPrice <= 0 || !Number.isFinite(firstLegRiskCapUsd) || firstLegRiskCapUsd <= 0) return null;
+    const quantity = decimal(firstLegRiskCapUsd / askPrice);
     return {
       strategyId: this.id, strategyVersion: this.version, marketId: snapshot.marketId,
       tokenId: snapshot.tokenId, outcome, side: "BUY", quantity, limitPrice: ask.price,
       intent: "OPEN_FIRST_LEG", rawEdgeUsdPerShare: context.consensus.estimatedEdge, rawExpectedEdge: context.consensus.estimatedEdge,
-      reasonCodes: ["CONSENSUS_DIRECTION", "TEMPORAL_FIRST_LEG"],
+      reasonCodes: ["CONSENSUS_DIRECTION", "TEMPORAL_FIRST_LEG", "FIRST_LEG_RISK_CAPPED"],
     };
   }
 }
