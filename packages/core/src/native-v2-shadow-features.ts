@@ -372,12 +372,13 @@ function deriveBookFeatures(snapshot: MarketSnapshot, previous: StoredBook | nul
     ? (bidDepthSlope - askDepthSlope) / 2
     : null;
   const sourceMs = Date.parse(snapshot.sourceTimestamp);
+  const previousFeatures = previous?.features ?? null;
   const deltaSeconds = previous && sourceMs > previous.sourceMs ? (sourceMs - previous.sourceMs) / 1_000 : null;
-  const spreadVelocityBpsPerSecond = deltaSeconds && deltaSeconds > 0
-    ? (spreadBps - previous.features.spreadBps) / deltaSeconds
+  const spreadVelocityBpsPerSecond = deltaSeconds && deltaSeconds > 0 && previousFeatures
+    ? (spreadBps - previousFeatures.spreadBps) / deltaSeconds
     : null;
-  const midVelocityBpsPerSecond = deltaSeconds && deltaSeconds > 0 && previous.features.mid > 0
-    ? (((mid / previous.features.mid) - 1) * 10_000) / deltaSeconds
+  const midVelocityBpsPerSecond = deltaSeconds && deltaSeconds > 0 && previousFeatures && previousFeatures.mid > 0
+    ? (((mid / previousFeatures.mid) - 1) * 10_000) / deltaSeconds
     : null;
 
   return {
