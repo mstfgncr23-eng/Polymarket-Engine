@@ -34,7 +34,7 @@ export interface NativeV2ShadowExecutionRecord {
   execution: Record<string, unknown>;
 }
 
-interface NativeV2ShadowSummary {
+export interface NativeV2ShadowSummary {
   observed: number;
   evaluated: number;
   wouldSubmit: number;
