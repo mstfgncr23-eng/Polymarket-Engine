@@ -1,0 +1,58 @@
+name: temporary repeat lifecycle expectation update
+
+on:
+  push:
+    branches:
+      - fix/repeat-experiment-lifecycle
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/repeat-experiment-lifecycle
+          fetch-depth: 0
+
+      - name: Update stale one-shot lifecycle expectation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path('tests/hardening-engine.test.ts')
+          text = path.read_text()
+          old = '''      const restart = await engine.beginExperiment();
+                expect(restart.ok).toBe(false);
+                expect(restart.blockers).toEqual(expect.arrayContaining(["EXPERIMENT_ALREADY_COMPLETED"]));
+                expect(engine.experimentManifest()?.id).toBe(engine.experimentManifest()?.id);
+          '''
+          new = '''      const completedExperimentId = engine.experimentManifest()?.id;
+                const restart = await engine.beginExperiment();
+                expect(restart.ok).toBe(true);
+                expect(engine.experimentManifest()?.status).toBe("RUNNING");
+                expect(engine.experimentManifest()?.id).not.toBe(completedExperimentId);
+          '''
+          if text.count(old) != 1:
+              raise SystemExit(f'EXPECTATION_PATCH_ABORT: expected 1 stale block, found {text.count(old)}')
+          path.write_text(text.replace(old, new))
+          PY
+
+          git diff --check
+          git diff -- tests/hardening-engine.test.ts
+
+      - name: Commit test update and remove temporary workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          rm .github/workflows/_tmp_update_repeat_lifecycle_expectation.yml
+          git add tests/hardening-engine.test.ts .github/workflows/_tmp_update_repeat_lifecycle_expectation.yml
+          git diff --cached --check
+          git commit -m "test(engine): expect repeat paper lifecycle"
+          git push origin HEAD:refs/heads/fix/repeat-experiment-lifecycle
