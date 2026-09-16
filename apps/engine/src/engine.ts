@@ -418,7 +418,7 @@ export class EngineService {
       onTelemetryDegraded: (degraded) => { this.state.telemetryDegraded = degraded; },
     }, this.metrics);
     this.shutdownJoinDeadlineMs = adapters?.shutdownJoinDeadlineMs ?? RUNTIME_BOUNDS.shutdownJoinDeadlineMs;
-    this.supervisor = new RuntimeSupervisor(this.metrics.runtimeWorkMetrics(), () => this.syncRuntimeState());
+    this.supervisor = new RuntimeSupervisor(this.metrics.runtimeWorkMetrics(), () => this.syncRuntimeState(), () => this.nowFn().getTime());
     this.journalAdmission = new DirectJournalAdmission(this.metrics.journalAdmissionMetrics(), () => this.syncRuntimeState());
     this.heavyRead = new FiniteSemaphore(RUNTIME_BOUNDS.heavyRead.concurrency, RUNTIME_BOUNDS.heavyRead.waiting);
     this.discoveryFlight = new SingleFlight({
@@ -1913,6 +1913,7 @@ export class EngineService {
       key: triggerWorkKey(trigger),
       estimatedBytes: RUNTIME_BOUNDS.triggerByteEstimate,
       critical: lane === "p0",
+      expiresAtMs: Date.parse(trigger.expiresAt),
       marketEpochFence,
       provenance: { kind: resolved.kind },
       run: async (signal) => {

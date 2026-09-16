@@ -88,6 +88,8 @@ export interface RuntimeWork {
   key: string;
   estimatedBytes: number;
   critical: boolean;
+  /** Economic deadline copied from TriggerEvent.expiresAt. Expired queued work is obsolete and must not consume a worker. */
+  expiresAtMs?: number;
   run: (signal: AbortSignal) => Promise<void>;
   /** Trusted token epochs at admission; stale if the live market epoch advanced. */
   marketEpochFence?: MarketEpochFence | null;
@@ -143,6 +145,7 @@ export interface RuntimeWorkMetrics {
   setOldestAge(lane: WorkLane, seconds: number): void;
   incRejected(lane: WorkLane, reason: RejectionReason): void;
   incFailed(lane: WorkLane): void;
+  incExpired(lane: WorkLane): void;
 }
 
 interface QueuedWork {
@@ -283,6 +286,7 @@ export class RuntimeSupervisor {
   constructor(
     private readonly metrics?: RuntimeWorkMetrics,
     private readonly onChange?: () => void,
+    private readonly nowMs: () => number = () => Date.now(),
   ) {}
 
   get admissionClosed(): boolean { return this.closed; }
@@ -315,6 +319,8 @@ export class RuntimeSupervisor {
       this.publish();
       return { admitted: false, reason: "admission_closed", done: Promise.resolve() };
     }
+    // Obsolete trading decisions cannot occupy capacity ahead of a fresh trigger.
+    if (this.pruneExpiredQueued(this.nowMs())) this.publish();
     const limit = RUNTIME_BOUNDS.trigger[work.lane].queueLimit;
     if (this.queuedCount[work.lane] >= limit) {
       if (work.lane === "p0") this.lastP0HardCap = true;
@@ -384,6 +390,34 @@ export class RuntimeSupervisor {
     return out;
   }
 
+  private pruneExpiredQueued(nowMs: number): boolean {
+    let p0Changed = false;
+    let p3Changed = false;
+    for (const [key, queues] of this.queuedByKey) {
+      for (const lane of WORK_LANES) {
+        const queue = queues[lane];
+        // Same key/lane is FIFO and trigger deadlines are created in admission
+        // order. Work without a deadline keeps the legacy supervisor contract.
+        while (queue.length > 0) {
+          const item = queue[0]!;
+          const expiresAtMs = item.work.expiresAtMs;
+          if (expiresAtMs == null || !Number.isFinite(expiresAtMs) || expiresAtMs > nowMs) break;
+          queue.shift();
+          this.queuedCount[lane] -= 1;
+          this.queueBytes[lane] -= item.work.estimatedBytes;
+          this.metrics?.incExpired(lane);
+          item.resolve();
+          if (lane === "p0") p0Changed = true;
+          else p3Changed = true;
+        }
+      }
+      if (queues.p0.length === 0 && queues.p3.length === 0) this.queuedByKey.delete(key);
+    }
+    if (p0Changed) this.refreshOldest("p0");
+    if (p3Changed) this.refreshOldest("p3");
+    return p0Changed || p3Changed;
+  }
+
   private unresolved(): number {
     return this.queuedCount.p0 + this.queuedCount.p3 + this.inFlightCount.p0 + this.inFlightCount.p3;
   }
@@ -405,6 +439,7 @@ export class RuntimeSupervisor {
   }
 
   private pump(): void {
+    if (this.pruneExpiredQueued(this.nowMs())) this.publish();
     for (;;) {
       const next = this.pickNext();
       if (!next) return;
