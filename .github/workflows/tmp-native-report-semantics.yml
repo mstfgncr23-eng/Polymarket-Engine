@@ -1,0 +1,194 @@
+name: tmp-native-report-semantics
+
+on:
+  push:
+    branches:
+      - fix/native-report-semantics
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/native-report-semantics
+          fetch-depth: 0
+
+      - name: Apply exact report semantics patch
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path('apps/engine/src/report.ts')
+          text = path.read_text()
+
+          def replace_once(old: str, new: str) -> None:
+              global text
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'expected exactly one match, got {count}: {old[:120]!r}')
+              text = text.replace(old, new, 1)
+
+          replace_once(
+              '  maxDrawdown: number;\n  riskCount: number;',
+              '  maxDrawdown: number;\n  maxDirectionalExposureUsd?: number;\n  riskCount: number;',
+          )
+          replace_once(
+              '  private maxDrawdown = 0;\n  private riskCount = 0;',
+              '  private maxDrawdown = 0;\n  private maxDirectionalExposureUsd = 0;\n  private riskCount = 0;',
+          )
+          replace_once(
+              '      maxDrawdown: this.maxDrawdown, riskCount: this.riskCount, accepted: this.accepted, paperOrders: this.paperOrders,',
+              '      maxDrawdown: this.maxDrawdown, maxDirectionalExposureUsd: this.maxDirectionalExposureUsd,\n      riskCount: this.riskCount, accepted: this.accepted, paperOrders: this.paperOrders,',
+          )
+          replace_once(
+              '    this.settlementCount = assign("settlementCount", 0); this.settlementPnlUsd = assign("settlementPnlUsd", 0); this.settlementBothQty = assign("settlementBothQty", 0); this.lastLedger = snapshot.lastLedger ? structuredClone(snapshot.lastLedger) : undefined;\n    for (const key of ["maxDrawdown","riskCount","accepted","paperOrders","makerOrders","takerOrders","fillCount","makerFills","takerFills","firstLegCount","hedgeCompleteCount","hedgeDurationSum","hedgeDurationN","pairRealizedNetSum","pairRealizedNetN","pairRealizedGrossSum","pairRealizedGrossN","failedHedgeCount","positionWins","positionLosses","positionBreakeven","grossWins","grossLosses","grossBreakeven","rejectedWouldHaveWon","acceptedLost","worstUnhedgedUsd"] as const) (this as unknown as Record<string, unknown>)[key] = snapshot[key];',
+              '    this.settlementCount = assign("settlementCount", 0); this.settlementPnlUsd = assign("settlementPnlUsd", 0); this.settlementBothQty = assign("settlementBothQty", 0); this.lastLedger = snapshot.lastLedger ? structuredClone(snapshot.lastLedger) : undefined;\n    this.maxDirectionalExposureUsd = assign("maxDirectionalExposureUsd", 0);\n    for (const key of ["maxDrawdown","riskCount","accepted","paperOrders","makerOrders","takerOrders","fillCount","makerFills","takerFills","firstLegCount","hedgeCompleteCount","hedgeDurationSum","hedgeDurationN","pairRealizedNetSum","pairRealizedNetN","pairRealizedGrossSum","pairRealizedGrossN","failedHedgeCount","positionWins","positionLosses","positionBreakeven","grossWins","grossLosses","grossBreakeven","rejectedWouldHaveWon","acceptedLost","worstUnhedgedUsd"] as const) (this as unknown as Record<string, unknown>)[key] = snapshot[key];',
+          )
+          replace_once(
+              '    } else if (type === "POSITION_UPDATED") {\n      this.latestPositions.set(event.aggregateId, event.payload as unknown as Position);\n    } else if (type === "PNL_SNAPSHOT") {',
+              '    } else if (type === "POSITION_UPDATED") {\n      const position = event.payload as unknown as Position;\n      const previous = this.latestPositions.get(event.aggregateId);\n      // FIRST_LEG_FILLED counts the initial cycle. A later fully-paired -> unpaired\n      // transition is a fresh opening cycle even though the Position object persists.\n      if (previous && Number(previous.unpairedQuantity) <= 0 && Number(position.unpairedQuantity) > 0) {\n        this.firstLegCount += 1;\n      }\n      this.maxDirectionalExposureUsd = Math.max(this.maxDirectionalExposureUsd, directionalExposureUsd(position));\n      this.latestPositions.set(event.aggregateId, position);\n    } else if (type === "PNL_SNAPSHOT") {',
+          )
+          replace_once(
+              '      maximumDirectionalExposureUsd: Math.max(0, ...positions.map((position) => Number(position.unpairedQuantity) * Number(position.unpairedOutcome === "UP" ? position.averageUpCost : position.averageDownCost))),',
+              '      maximumDirectionalExposureUsd: Math.max(0, this.maxDirectionalExposureUsd),',
+          )
+          replace_once(
+              '      acceptedTradesThatLost: this.acceptedLost, failureStatistics: this.failureStatistics,',
+              '      acceptedTradesThatLost: this.positionLosses, failureStatistics: this.failureStatistics,',
+          )
+          replace_once(
+              'function average(values: readonly number[]): number { return values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0; }',
+              '''function directionalExposureUsd(position: Position): number {
+  const quantity = Number(position.unpairedQuantity);
+  if (!Number.isFinite(quantity) || quantity <= 0 || !position.unpairedOutcome) return 0;
+  // Keep the existing blended-side cost convention here. Residual-lot cost basis
+  // is a separate risk/accounting correctness concern and is intentionally out of scope.
+  const averageCost = Number(position.unpairedOutcome === "UP" ? position.averageUpCost : position.averageDownCost);
+  if (!Number.isFinite(averageCost) || averageCost <= 0) return 0;
+  return quantity * averageCost;
+}
+function average(values: readonly number[]): number { return values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0; }''',
+          )
+
+          path.write_text(text)
+
+          test = r'''import { describe, expect, it } from "vitest";
+import { createJournalEvent } from "@pm/db";
+import type { Position } from "@pm/core";
+import { buildExperimentSummary } from "../apps/engine/src/report.js";
+
+const baseAt = new Date("2026-09-16T15:00:00.000Z");
+
+function pos(overrides: Partial<Position> = {}): Position {
+  return {
+    id: "pos:m1",
+    marketId: "m1",
+    upQuantity: "10",
+    downQuantity: "0",
+    averageUpCost: "0.5",
+    averageDownCost: "0",
+    pairedQuantity: "0",
+    unpairedOutcome: "UP",
+    unpairedQuantity: "10",
+    combinedPairCost: "0.5",
+    totalFees: "0",
+    totalSlippage: "0",
+    openedAt: baseAt.toISOString(),
+    updatedAt: baseAt.toISOString(),
+    ...overrides,
+  };
+}
+
+function event(type: string, aggregateType: string, aggregateId: string, payload: Record<string, unknown>, seconds: number) {
+  return createJournalEvent({
+    traceId: `trace-${seconds}`,
+    type,
+    aggregateType,
+    aggregateId,
+    payload,
+    occurredAt: new Date(baseAt.getTime() + seconds * 1000),
+  });
+}
+
+describe("native final report semantics", () => {
+  it("preserves historical directional exposure after the position settles", () => {
+    const position = pos();
+    const summary = buildExperimentSummary([
+      event("POSITION_UPDATED", "position", position.id, position as unknown as Record<string, unknown>, 1),
+      event("POSITION_SETTLED", "position", position.id, {
+        marketId: position.marketId,
+        upQuantity: position.upQuantity,
+        downQuantity: position.downQuantity,
+        realizedDelta: "-5",
+        grossOutcome: "POSITION_LOSS",
+      }, 2),
+    ], "exp-report");
+
+    expect(summary.maximumDirectionalExposureUsd).toBe(5);
+    expect(summary.incompleteUnhedgedPositions).toBe(0);
+  });
+
+  it("attributes canonical settled position losses to acceptedTradesThatLost", () => {
+    const summary = buildExperimentSummary([
+      event("RISK_EVALUATION", "risk", "risk-1", { accepted: true, marketId: "m1", asset: "BTC" }, 1),
+      event("POSITION_LOSS", "position", "pos:m1", { marketId: "m1", realizedDelta: "-4" }, 2),
+    ], "exp-loss");
+
+    expect(summary.acceptedTradesThatLost).toBe(1);
+    expect(summary.winLossDistribution.losses).toBe(1);
+  });
+
+  it("counts fresh first-leg cycles after a fully paired position reopens", () => {
+    const initial = pos();
+    const paired = pos({
+      downQuantity: "10",
+      averageDownCost: "0.4",
+      pairedQuantity: "10",
+      unpairedOutcome: null,
+      unpairedQuantity: "0",
+      combinedPairCost: "0.9",
+    });
+    const reopened = pos({
+      downQuantity: "20",
+      averageDownCost: "0.45",
+      pairedQuantity: "10",
+      unpairedOutcome: "DOWN",
+      unpairedQuantity: "10",
+      combinedPairCost: "0.95",
+    });
+
+    const summary = buildExperimentSummary([
+      event("FIRST_LEG_FILLED", "position", initial.id, { marketId: "m1", unpairedQuantity: "10" }, 1),
+      event("POSITION_UPDATED", "position", initial.id, initial as unknown as Record<string, unknown>, 2),
+      event("HEDGE_COMPLETE", "position", initial.id, { marketId: "m1", pairedQuantity: "10", unhedgedDurationMs: 1000 }, 3),
+      event("POSITION_UPDATED", "position", paired.id, paired as unknown as Record<string, unknown>, 4),
+      event("POSITION_UPDATED", "position", reopened.id, reopened as unknown as Record<string, unknown>, 5),
+      event("TRIGGER_EVENT", "trigger", "failed-1", { marketId: "m1", kind: "FAILED_HEDGE" }, 6),
+      event("TRIGGER_EVENT", "trigger", "failed-2", { marketId: "m1", kind: "FAILED_HEDGE" }, 7),
+      event("POSITION_SETTLED", "position", reopened.id, { marketId: "m1", realizedDelta: "0" }, 8),
+    ], "exp-cycles");
+
+    expect(summary.firstLegCount).toBe(2);
+    expect(summary.failedHedgeCount).toBe(1);
+    expect(summary.hedgeFailureRate).toBe(0.5);
+  });
+});
+'''
+          Path('tests/report-semantics.test.ts').write_text(test)
+          PY
+
+      - name: Commit patch
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add apps/engine/src/report.ts tests/report-semantics.test.ts
+          git diff --cached --check
+          git commit -m "fix(report): correct native experiment semantics"
+          git push origin HEAD:fix/native-report-semantics
