@@ -13,6 +13,7 @@ export * from "./experiment.js";
 export * from "./fair-edge.js";
 export * from "./journal-types.js";
 export * from "./native-decision.js";
+export * from "./native-v2-shadow-features.js";
 export * from "./qualification.js";
 export * from "./reference-window.js";
 export * from "./retention.js";
