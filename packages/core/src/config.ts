@@ -152,6 +152,26 @@ export const engineEnvSchema = z.object({
     (value) => value === undefined ? undefined : value === true || value === "true" || value === "1",
     z.boolean().optional(),
   ).default(false),
+  /**
+   * Durable Native V2 learning memory. Default false so production OVH/Fly is
+   * unchanged until an operator opts in. Fail-soft when enabled.
+   */
+  LEARNING_ENABLED: z.preprocess(
+    (value) => value === undefined ? undefined : value === true || value === "true" || value === "1",
+    z.boolean().optional(),
+  ).default(false),
+  /** Host-mounted durable directory inside the engine container. */
+  LEARNING_DATA_DIR: z.string().min(1).default("/data/learning"),
+  /**
+   * Operational DEFAULT max durable learning bytes (not a measured capacity
+   * requirement). Prefer append segments; writer stops accepting new samples
+   * once exceeded and marks learning degraded.
+   */
+  LEARNING_MAX_BYTES: z.coerce.number().int().positive().default(256_000_000),
+  /** Comma-separated checkpoint seconds before expiry. Default: 240,180,120,60,30,15,5 */
+  LEARNING_CHECKPOINT_SECONDS: z.string().default("240,180,120,60,30,15,5"),
+  /** Optional dedicated poll interval for non-economic learning settlement labels. */
+  LEARNING_SETTLEMENT_POLL_MS: z.coerce.number().int().positive().optional(),
 });
 export type EngineEnv = z.infer<typeof engineEnvSchema>;
 
