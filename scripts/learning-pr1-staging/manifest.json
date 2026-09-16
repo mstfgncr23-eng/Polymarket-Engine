@@ -4,7 +4,8 @@
       "dest": "packages/core/src/learning-store.ts",
       "parts": [
         "learning-store.part.a",
-        "learning-store.part.b"
+        "learning-store.part.b",
+        "learning-store.part.c"
       ],
       "sha256": "7d3787d187221994eb77f0d7c57e88ba06cdedfc5427581a7c8a50c14681d61b"
     },
