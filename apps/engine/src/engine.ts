@@ -66,6 +66,7 @@ import {
   type NativeDecision,
   type NativeReferenceFeatures,
   type NativeDecisionConfig,
+  NativeV2ShadowFeatureExtractor,
   rolesForTriggerKind,
 } from "@pm/core";
 import {
@@ -198,6 +199,7 @@ export class EngineService {
   private readonly riskLimits;
   private readonly triggerConfig;
   private readonly nativeDecisionConfig: NativeDecisionConfig;
+  private readonly nativeV2Shadow = new NativeV2ShadowFeatureExtractor();
   private readonly strategy = new TemporalPairHedgeStrategy();
   private readonly marketAdapter: PolymarketMarketDataAdapter;
   private readonly legacyBtcAdapter: BtcWebSocketAdapter | null;
@@ -1090,6 +1092,7 @@ export class EngineService {
       this.settlementBackoff.delete(marketId);
       this.snapshots.delete(marketId);
       this.triggerEngine.dropMarket(marketId);
+      this.nativeV2Shadow.dropMarket(marketId);
       this.assetIndex.removeMarket(marketId);
       for (const [tokenId, snapshot] of [...this.state.marketSnapshots.entries()]) {
         if (snapshot.marketId === marketId) {
@@ -1100,6 +1103,7 @@ export class EngineService {
     }
     for (const asset of removedAssets) {
       this.triggerEngine.dropAsset(asset);
+      this.nativeV2Shadow.dropAsset(asset);
       this.assetIndex.dropAsset(asset);
       this.referenceUnreliable.delete(asset);
       this.referenceEpoch.delete(asset);
@@ -1744,6 +1748,7 @@ export class EngineService {
     const previous = pair[snapshot.outcome];
     pair[snapshot.outcome] = snapshot;
     this.snapshots.set(snapshot.marketId, pair);
+    this.nativeV2Shadow.ingestMarket(snapshot);
     if (snapshot.asset) {
       this.assetByMarket.set(snapshot.marketId, snapshot.asset);
       this.assetIndex.add(snapshot.asset, snapshot.marketId);
@@ -1794,6 +1799,7 @@ export class EngineService {
     const started = performance.now();
     const admission = this.triggerEngine.admitReferenceTick(tick);
     if (admission.overflow) {
+      this.nativeV2Shadow.resetReference(tick.asset);
       this.noteReferenceLogicalLoss(tick.asset);
       this.state.invalidateReferenceContext(tick.asset);
       this.requestReferenceResync(tick.asset);
@@ -1809,6 +1815,7 @@ export class EngineService {
       return;
     }
     const wasUnreliable = this.referenceUnreliable.has(tick.asset);
+    this.nativeV2Shadow.ingestReference(tick);
     this.state.noteReferenceTick(tick.asset, tick.receivedAt, {
       symbol: tick.symbol, venue: tick.venue, price: tick.price,
     });
@@ -2007,13 +2014,23 @@ export class EngineService {
     });
     if (!native) return;
 
+    const shadowV2FeatureVector = this.nativeV2Shadow.extract({
+      marketId: trigger.marketId,
+      asset,
+      now: this.nowFn(),
+      endDate: this.marketsById.get(trigger.marketId)?.endDate ?? null,
+      marketSynchronized: true,
+      referenceFreshness: referenceContext?.freshness ?? "unknown",
+      referenceFreshnessMs: referenceContext?.freshnessMs ?? null,
+    });
+
     const consensus = this.nativeCompatibilityDecision(trigger, native);
     this.state.latestConsensus = consensus;
     this.record("NATIVE_DECISION_COMPLETE", trigger.traceId, trigger.marketId, {
       authority: NATIVE_DETERMINISTIC_AUTHORITY,
       direction: native.direction, confidence: native.confidence,
       fairProbability: native.fairProbability, marketProbability: native.marketProbability,
-      featureVector: native.featureVector, triggerId: trigger.id,
+      featureVector: native.featureVector, shadowV2FeatureVector, triggerId: trigger.id,
     }, asset);
     await this.persistReportInput(createJournalEvent({
       traceId: trigger.traceId, type: "CONSENSUS_DECISION", aggregateType: "consensus", aggregateId: consensus.id,
@@ -2022,7 +2039,7 @@ export class EngineService {
         authority: NATIVE_DETERMINISTIC_AUTHORITY,
         marketId: trigger.marketId, asset,
         fairProbability: native.fairProbability, marketProbability: native.marketProbability,
-        expiresAt: native.expiresAt, featureVector: native.featureVector,
+        expiresAt: native.expiresAt, featureVector: native.featureVector, shadowV2FeatureVector,
         reference: reference ? {
           asset: reference.asset, venue: reference.venue, freshness: reference.freshness,
           freshnessMs: reference.freshnessMs, recentMoveBps: reference.recentMoveBps,
@@ -2917,6 +2934,7 @@ export class EngineService {
         this.noteReferenceLogicalLoss(asset);
         this.state.invalidateReferenceContext(asset);
         this.triggerEngine.resetReferenceAfterReconnect(asset);
+        this.nativeV2Shadow.resetReference(asset);
         if (event.message?.includes("REFERENCE_INGRESS_OVERFLOW")) this.requestReferenceResync(asset);
       } else if (event.state === "DISCONNECTED") {
         this.noteExperimentFeedInvalidation();
@@ -2926,10 +2944,12 @@ export class EngineService {
         this.noteReferenceLogicalLoss(asset);
         this.state.invalidateReferenceContext(asset);
         this.triggerEngine.resetReferenceAfterReconnect(asset);
+        this.nativeV2Shadow.resetReference(asset);
       } else if (event.state === "CONNECTED") {
         this.referenceLogicalGapped.delete(asset);
         if (this.referenceUnreliable.has(asset) || this.triggerEngine.referenceWindowOverflowed(asset)) {
           this.triggerEngine.resetReferenceAfterReconnect(asset);
+        this.nativeV2Shadow.resetReference(asset);
         }
       }
     }
@@ -4514,6 +4534,7 @@ export class EngineService {
 
   private clearMarketPairProjections(marketId: string): void {
     this.triggerEngine.forgetMarketBooks(marketId);
+    this.nativeV2Shadow.dropMarket(marketId);
     this.snapshots.delete(marketId);
     for (const [tokenId, snapshot] of [...this.state.marketSnapshots.entries()]) {
       if (snapshot.marketId !== marketId) continue;
