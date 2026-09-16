@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { EngineMetrics } from "../apps/engine/src/metrics.js";
-import { RuntimeSupervisor } from "../apps/engine/src/runtime-supervisor.js";
+import { RUNTIME_BOUNDS, RuntimeSupervisor } from "../apps/engine/src/runtime-supervisor.js";
 
 async function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<void> {
   const started = Date.now();
@@ -81,20 +81,27 @@ describe("RuntimeSupervisor economic expiry", () => {
     expect(supervisor.snapshot().totalQueued).toBe(0);
   });
 
-  it("prunes stale queued capacity before admitting fresh work", async () => {
+  it("prunes an expired full P3 queue before hard-cap checking fresh work", async () => {
     let nowMs = 1_000;
     let release!: () => void;
     const hold = new Promise<void>((resolve) => { release = resolve; });
-    const supervisor = new RuntimeSupervisor(undefined, undefined, () => nowMs);
+    const metrics = new EngineMetrics();
+    const supervisor = new RuntimeSupervisor(metrics.runtimeWorkMetrics(), undefined, () => nowMs);
 
     const blocker = supervisor.admit({
       id: "blocker", lane: "p3", key: "market:blocked", estimatedBytes: 1, critical: false,
       expiresAtMs: 10_000, run: () => hold,
     });
-    const stale = supervisor.admit({
-      id: "stale", lane: "p3", key: "market:blocked", estimatedBytes: 1, critical: false,
-      expiresAtMs: 2_000, run: async () => { throw new Error("stale work must not run"); },
-    });
+    const staleDones: Array<Promise<void>> = [];
+    for (let i = 0; i < RUNTIME_BOUNDS.trigger.p3.queueLimit; i += 1) {
+      const stale = supervisor.admit({
+        id: `stale-${i}`, lane: "p3", key: "market:blocked", estimatedBytes: 1, critical: false,
+        expiresAtMs: 2_000, run: async () => { throw new Error("stale work must not run"); },
+      });
+      expect(stale.admitted).toBe(true);
+      staleDones.push(stale.done);
+    }
+    expect(supervisor.snapshot().lanes.p3.queued).toBe(RUNTIME_BOUNDS.trigger.p3.queueLimit);
 
     nowMs = 3_000;
     const fresh = supervisor.admit({
@@ -103,7 +110,8 @@ describe("RuntimeSupervisor economic expiry", () => {
     });
 
     expect(fresh.admitted).toBe(true);
-    await Promise.all([fresh.done, stale.done]);
+    await Promise.all([...staleDones, fresh.done]);
+    expect(await metricValue(metrics, "p3")).toBe(RUNTIME_BOUNDS.trigger.p3.queueLimit);
     release();
     await blocker.done;
     expect(supervisor.snapshot().totalQueued).toBe(0);
