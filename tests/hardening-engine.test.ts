@@ -435,10 +435,11 @@ describe("B/D/R/T settlement, close policy, recovery, accelerated lifecycle", ()
       expect(reports.some((event) => event.type === "EXPERIMENT_COMPLETED")).toBe(true);
       expect(reports.some((event) => event.type === "EXPERIMENT_REPORT_GENERATED")).toBe(true);
       expect(engine.activationFootprint().latency).toBeLessThanOrEqual(20);
+      const completedExperimentId = engine.experimentManifest()?.id;
       const restart = await engine.beginExperiment();
-      expect(restart.ok).toBe(false);
-      expect(restart.blockers).toEqual(expect.arrayContaining(["EXPERIMENT_ALREADY_COMPLETED"]));
-      expect(engine.experimentManifest()?.id).toBe(engine.experimentManifest()?.id);
+      expect(restart.ok).toBe(true);
+      expect(engine.experimentManifest()?.status).toBe("RUNNING");
+      expect(engine.experimentManifest()?.id).not.toBe(completedExperimentId);
     } finally {
       await engine.stop();
     }
