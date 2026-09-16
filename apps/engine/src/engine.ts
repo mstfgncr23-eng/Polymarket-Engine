@@ -2949,7 +2949,7 @@ export class EngineService {
         this.referenceLogicalGapped.delete(asset);
         if (this.referenceUnreliable.has(asset) || this.triggerEngine.referenceWindowOverflowed(asset)) {
           this.triggerEngine.resetReferenceAfterReconnect(asset);
-        this.nativeV2Shadow.resetReference(asset);
+          this.nativeV2Shadow.resetReference(asset);
         }
       }
     }
