@@ -2,10 +2,12 @@
   "files": [
     {
       "dest": "packages/core/src/learning-store.ts",
+      "encoding": "base64",
       "parts": [
-        "learning-store.part.a",
-        "learning-store.part.b",
-        "learning-store.part.c"
+        "learning-store.ts.b64.00",
+        "learning-store.ts.b64.01",
+        "learning-store.ts.b64.02",
+        "learning-store.ts.b64.03"
       ],
       "sha256": "7d3787d187221994eb77f0d7c57e88ba06cdedfc5427581a7c8a50c14681d61b"
     },
