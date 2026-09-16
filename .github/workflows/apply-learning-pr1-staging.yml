@@ -1,12 +1,6 @@
 name: apply-learning-pr1-staging
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - "scripts/learning-pr1-staging/**"
-      - ".github/workflows/apply-learning-pr1-staging.yml"
-    branches:
-      - feat/native-v2-learning-foundation
 permissions:
   contents: write
 jobs:
