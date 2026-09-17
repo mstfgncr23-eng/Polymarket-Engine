@@ -28,3 +28,4 @@ export * from "./strategy.js";
 export * from "./trigger.js";
 export * from "./learning-sample.js";
 export * from "./learning-store.js";
+export * from "./native-v2-counterfactual-state.js";

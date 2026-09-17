@@ -599,3 +599,114 @@ describe("PR64 review blocker regressions", () => {
   });
 });
 
+describe("learning settlement lookup lifecycle", () => {
+  it("A) authoritative lookup on sample row survives restart; market absent still labels via inverted mapping", () => {
+    const dataDir = tempDir();
+    const store = new LearningSampleStore({
+      enabled: true,
+      dataDir,
+      maxBytes: 1_000_000,
+      checkpointSeconds: [60],
+    });
+    store.init();
+    const lookup = {
+      marketId: "m-learn",
+      slug: "btc-updown-15m",
+      endDate: "2026-09-17T09:00:00.000Z",
+      yesMapsTo: "DOWN" as const,
+      noMapsTo: "UP" as const,
+    };
+    const features = vector({
+      marketId: "m-learn",
+      timeToExpiryMs: 55_000,
+    });
+    const fair = evaluateNativeV2ShadowFairProbability(features);
+    expect(fair).not.toBeNull();
+    const accepted = store.observe({
+      marketId: "m-learn",
+      asset: "BTC",
+      now: new Date("2026-09-17T08:00:00.000Z"),
+      featureVector: features,
+      v2FairProbability: fair!,
+      settlementLookup: lookup,
+    });
+    expect(accepted.length).toBeGreaterThanOrEqual(1);
+    expect(store.settlementLookupFor("m-learn")).toEqual(lookup);
+    expect(store.unresolvedLearningMarketIds()).toContain("m-learn");
+
+    // Atomic representation: lookup lives ON the sample JSONL row (same append boundary).
+    const rows = store.readSegmentRowsForTest();
+    const sampleRows = rows.filter((row) => row.kind === "sample");
+    expect(sampleRows.length).toBeGreaterThanOrEqual(1);
+    for (const row of sampleRows) {
+      if (row.kind !== "sample") continue;
+      expect(row.settlementLookup).toEqual(lookup);
+    }
+    expect(rows.some((row) => row.kind === "settlement_lookup")).toBe(false);
+
+    const recovered = new LearningSampleStore({
+      enabled: true,
+      dataDir,
+      maxBytes: 1_000_000,
+      checkpointSeconds: [60],
+    });
+    recovered.init();
+    expect(recovered.settlementLookupFor("m-learn")).toEqual(lookup);
+    expect(recovered.unresolvedLearningMarketIds()).toContain("m-learn");
+    // Official Yes winner + inverted yesMapsTo=DOWN => DOWN labeled (no default UP/DOWN guess).
+    const labeled = recovered.labelMarket("m-learn", resolvedGamma("UP"), lookup.yesMapsTo, lookup.noMapsTo);
+    expect(labeled).toBeGreaterThanOrEqual(1);
+    expect(recovered.unresolvedLearningMarketIds()).not.toContain("m-learn");
+    const samples = recovered.readSamplesForTest();
+    expect(samples.every((sample) => sample.settlement.outcome === "DOWN")).toBe(true);
+  });
+
+  it("B) capacity reject of sample+embedded-lookup row accepts neither (split-state impossible)", () => {
+    const dataDir = tempDir();
+    // Tiny budget: sampleWriteCeiling leaves label reserve; one sample+lookup row exceeds it.
+    const store = new LearningSampleStore({
+      enabled: true,
+      dataDir,
+      maxBytes: 4_200,
+      checkpointSeconds: [60],
+    });
+    store.init();
+    const lookup = {
+      marketId: "m-cap",
+      slug: "x".repeat(200),
+      endDate: "2026-09-17T09:00:00.000Z",
+      yesMapsTo: "DOWN" as const,
+      noMapsTo: "UP" as const,
+    };
+    const features = vector({
+      marketId: "m-cap",
+      timeToExpiryMs: 55_000,
+    });
+    const fair = evaluateNativeV2ShadowFairProbability(features);
+    expect(fair).not.toBeNull();
+    const accepted = store.observe({
+      marketId: "m-cap",
+      asset: "BTC",
+      now: new Date("2026-09-17T08:00:00.000Z"),
+      featureVector: features,
+      v2FairProbability: fair!,
+      settlementLookup: lookup,
+    });
+    // Either 0 accepted (row too large for ceiling) — never a durable sample without lookup.
+    if (accepted.length === 0) {
+      expect(store.summary().sampleCount).toBe(0);
+      expect(store.settlementLookupFor("m-cap")).toBeNull();
+      expect(store.readSegmentRowsForTest()).toEqual([]);
+      expect(store.summary().degraded).toBe(true);
+    } else {
+      // If capacity allowed the combined row, lookup MUST be on the same durable sample row.
+      const rows = store.readSegmentRowsForTest();
+      for (const row of rows.filter((r) => r.kind === "sample")) {
+        if (row.kind !== "sample") continue;
+        expect(row.settlementLookup).toEqual(lookup);
+      }
+      expect(store.settlementLookupFor("m-cap")).toEqual(lookup);
+    }
+  });
+
+});

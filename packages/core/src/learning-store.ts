@@ -15,7 +15,7 @@ import {
   type NativeV2ShadowFeatureVector,
 } from "./native-v2-shadow-features.js";
 import type { Outcome } from "./domain.js";
-import { parsePublicBinaryResolution } from "./settlement.js";
+import { isAuthoritativeBinaryMapping, parsePublicBinaryResolution, type BinarySettlementLookup } from "./settlement.js";
 import {
   LEARNING_SAMPLE_SCHEMA_VERSION,
   buildLearningSampleV1,
@@ -93,11 +93,17 @@ export interface LearningObserveInput {
   gitSha?: string | null;
   /** Optional full market horizon (end - start). Invalid checkpoints above it are skipped. */
   horizonMs?: number | null;
+  /**
+   * Authoritative settlement lookup captured when the learning sample is accepted.
+   * Required so unresolved labels remain labelable after restart when discovery drops the market.
+   */
+  settlementLookup?: BinarySettlementLookup;
 }
 
 type SegmentRow =
-  | { kind: "sample"; sample: LearningSampleV1 }
-  | { kind: "label"; marketId: string; sampleId: string; settlement: LearningSettlementLabel; at: string };
+  | { kind: "sample"; sample: LearningSampleV1; settlementLookup?: BinarySettlementLookup }
+  | { kind: "label"; marketId: string; sampleId: string; settlement: LearningSettlementLabel; at: string }
+  | { kind: "settlement_lookup"; lookup: BinarySettlementLookup; at: string };
 
 /**
  * Append-friendly segmented JSONL learning memory.
@@ -115,6 +121,7 @@ export class LearningSampleStore {
   private readonly unresolvedMarkets = new Set<string>();
   private readonly labeledSampleIds = new Set<string>();
   private readonly samplesByMarket = new Map<string, Set<string>>();
+  private readonly settlementLookups = new Map<string, BinarySettlementLookup>();
 
   private manifest: LearningDatasetManifest;
   private currentSegmentPath: string | null = null;
@@ -218,6 +225,15 @@ export class LearningSampleStore {
     });
     if (crossed.length === 0) return [];
 
+    // Authoritative accept-time lookup is serialized ON the sample row (same append
+    // boundary). Split state — durable sample without required lookup — is impossible.
+    const authoritativeLookup =
+      input.settlementLookup
+      && input.settlementLookup.marketId === input.marketId
+      && isAuthoritativeBinaryMapping(input.settlementLookup.yesMapsTo, input.settlementLookup.noMapsTo)
+        ? structuredClone(input.settlementLookup)
+        : undefined;
+
     const accepted: LearningSampleV1[] = [];
     for (const checkpoint of crossed) {
       const sampleId = learningSampleId(input.marketId, checkpoint.checkpointId);
@@ -237,7 +253,10 @@ export class LearningSampleStore {
         gitSha: input.gitSha ?? this.gitSha,
       });
 
-      const line = `${JSON.stringify({ kind: "sample", sample } satisfies SegmentRow)}\n`;
+      const row: SegmentRow = authoritativeLookup
+        ? { kind: "sample", sample, settlementLookup: structuredClone(authoritativeLookup) }
+        : { kind: "sample", sample };
+      const line = `${JSON.stringify(row)}\n`;
       const lineBytes = Buffer.byteLength(line, "utf8");
       if (this.manifest.bytes + lineBytes > this.sampleWriteCeiling()) {
         this.noteFailure(new Error("LEARNING_CAPACITY_EXCEEDED"));
@@ -246,6 +265,9 @@ export class LearningSampleStore {
 
       this.appendLine(line, lineBytes);
       this.indexSample(sample);
+      if (authoritativeLookup) {
+        this.settlementLookups.set(authoritativeLookup.marketId, structuredClone(authoritativeLookup));
+      }
       accepted.push(sample);
     }
     if (accepted.length > 0) this.persistManifest();
@@ -330,6 +352,15 @@ export class LearningSampleStore {
     return [...this.unresolvedMarkets].sort();
   }
 
+  /**
+   * Restart-safe settlement lookup for unresolved learning markets.
+   * Returns null when no authoritative mapping was durably captured — do not invent mappings.
+   */
+  settlementLookupFor(marketId: string): BinarySettlementLookup | null {
+    this.init();
+    return this.settlementLookups.get(marketId) ?? null;
+  }
+
   summary(): LearningStoreSummary {
     return {
       enabled: this.enabled,
@@ -374,6 +405,20 @@ export class LearningSampleStore {
     return [...byId.values()].sort((a, b) => a.sampleId.localeCompare(b.sampleId));
   }
 
+  /** Test helper: raw segment rows for atomic accept-boundary assertions. */
+  readSegmentRowsForTest(): SegmentRow[] {
+    this.init();
+    const rows: SegmentRow[] = [];
+    for (const segmentPath of this.listSegmentPaths()) {
+      const text = readFileSync(segmentPath, "utf8");
+      for (const line of text.split("\n")) {
+        if (!line.trim()) continue;
+        rows.push(JSON.parse(line) as SegmentRow);
+      }
+    }
+    return rows;
+  }
+
   private rebuildFromDisk(): void {
     mkdirSync(this.segmentsDir(), { recursive: true });
     this.sampleIds.clear();
@@ -381,6 +426,7 @@ export class LearningSampleStore {
     this.unresolvedMarkets.clear();
     this.labeledSampleIds.clear();
     this.samplesByMarket.clear();
+    this.settlementLookups.clear();
 
     const manifestPath = this.manifestPath();
     if (existsSync(manifestPath)) {
@@ -409,10 +455,18 @@ export class LearningSampleStore {
           const row = JSON.parse(line) as SegmentRow;
           if (row.kind === "sample") {
             this.indexSample(row.sample, false);
+            if (row.settlementLookup?.marketId) {
+              this.settlementLookups.set(row.settlementLookup.marketId, structuredClone(row.settlementLookup));
+            }
           }
           else if (row.kind === "label") {
             this.labeledSampleIds.add(row.sampleId);
             this.unresolvedMarkets.delete(row.marketId);
+          }
+          else if (row.kind === "settlement_lookup") {
+            if (row.lookup?.marketId) {
+              this.settlementLookups.set(row.lookup.marketId, structuredClone(row.lookup));
+            }
           }
         } catch {
           this.noteFailure(new Error(`LEARNING_SEGMENT_CORRUPT:${path.basename(segmentPath)}`));
@@ -523,6 +577,8 @@ export class LearningSampleStore {
   private sampleWriteCeiling(): number {
     return Math.max(0, this.maxBytes - this.labelReserveBytes());
   }
+
+
 
   private noteFailure(error: unknown): void {
     this.degraded = true;

@@ -30,6 +30,8 @@ import {
   makerReserveNotional,
   executableFairEdge,
   parsePublicBinaryResolution,
+  isAuthoritativeBinaryMapping,
+  type BinarySettlementLookup,
   conservativeRealizableMark,
   classifySettledOutcome,
   settlementCashDelta,
@@ -71,6 +73,10 @@ import {
   evaluateNativeV2ShadowFairProbability,
   LearningSampleStore,
   tryObserveLearningSample,
+  NativeV2CounterfactualStore,
+  counterfactualDataDir,
+  nativeV2CounterfactualActionKey,
+  NATIVE_V2_COUNTERFACTUAL_STATE_BASIS,
   NativeV2ShadowOpportunityRanker,
   evaluateNativeV2ShadowMarketOpportunity,
   buildNativeV2ShadowExecutionIntent,
@@ -235,6 +241,11 @@ type NativeV2ShadowExecutionCapture = {
   experimentEntryOpen: boolean;
   executionErrorsLastHour: number;
   shuttingDown: boolean;
+  /**
+   * Authoritative YES/NO mapping captured at decision-time reserve.
+   * evaluateNativeV2ShadowExecution must not re-resolve from live marketsById.
+   */
+  settlementLookup: BinarySettlementLookup | null;
 };
 
 export class EngineService {
@@ -252,6 +263,8 @@ export class EngineService {
   private readonly nativeV2OpportunityRanker = new NativeV2ShadowOpportunityRanker();
   private readonly nativeV2ShadowStore = new NativeV2ShadowStore();
   private readonly learningStore: LearningSampleStore | null;
+  /** Isolated V2 shadow portfolio — never mutates V1 ledger/cash/positions. */
+  private readonly counterfactualStore: NativeV2CounterfactualStore;
   private nativeV2ShadowExecutionBusy = false;
   private lastLearningSettlementPollAt = 0;
   private readonly strategy = new TemporalPairHedgeStrategy();
@@ -333,6 +346,7 @@ export class EngineService {
   private lastShutdownCheckpointed = false;
   private maintenanceHold: Promise<void> | null = null;
   private processTriggerHold: Promise<void> | null = null;
+  private nativeV2ShadowEvalHoldForTest: Promise<void> | null = null;
   private triggerEventPersistHold: Promise<void> | null = null;
   private sourceSealing = false;
   private sourceSealed = false;
@@ -417,6 +431,22 @@ export class EngineService {
       this.learningStore?.init();
     } catch {
       // Learning storage must never block engine startup (V1/V2/risk/execution).
+    }
+    // V2 counterfactual portfolio: durable under LEARNING_DATA_DIR/counterfactual.
+    // Always constructed for Phase-4 shadow statefulness; isolated from V1.
+    this.counterfactualStore = new NativeV2CounterfactualStore({
+      enabled: true,
+      durable: true,
+      dataDir: counterfactualDataDir(env.LEARNING_DATA_DIR),
+      startingBalance: env.PAPER_START_BALANCE,
+      // CF has its own bounded log under LEARNING_DATA_DIR/counterfactual (always durable).
+      // Cap matches the learning volume contract; CF failures never affect V1 authority.
+      maxBytes: env.LEARNING_MAX_BYTES,
+    });
+    try {
+      this.counterfactualStore.init();
+    } catch {
+      // Counterfactual storage must never block engine startup (V1/V2/risk/execution).
     }
     this.hotResearchCache = new HotResearchCache({
       now: this.nowFn,
@@ -2101,16 +2131,20 @@ export class EngineService {
     // opportunity/ranking. Fail-soft — never throw into the trading path.
     if (this.learningStore && shadowV2FeatureVector && shadowV2FairProbability) {
       try {
-        tryObserveLearningSample(this.learningStore, {
-          marketId: trigger.marketId,
-          asset,
-          now: this.nowFn(),
-          featureVector: shadowV2FeatureVector,
-          v2FairProbability: shadowV2FairProbability,
-          native,
-          experimentId: this.experiment?.id ?? null,
-          gitSha: process.env.GIT_SHA ?? process.env.FLY_IMAGE_REF ?? null,
-        });
+        {
+          const discovered = this.marketsById.get(trigger.marketId);
+          tryObserveLearningSample(this.learningStore, {
+            marketId: trigger.marketId,
+            asset,
+            now: this.nowFn(),
+            featureVector: shadowV2FeatureVector,
+            v2FairProbability: shadowV2FairProbability,
+            native,
+            experimentId: this.experiment?.id ?? null,
+            gitSha: process.env.GIT_SHA ?? process.env.FLY_IMAGE_REF ?? null,
+            settlementLookup: discovered ? (this.settlementLookupFromMarket(discovered) ?? undefined) : undefined,
+          });
+        }
       } catch {
         // Learning must never affect V1/V2/risk/execution authority.
       }
@@ -2223,7 +2257,9 @@ export class EngineService {
     if (!this.entryQualified.has(marketId)) blockers.push("MARKET_NOT_ENTRY_QUALIFIED");
     if (!this.isMarketSynchronized(marketId)) blockers.push("MARKET_UNSYNCHRONIZED");
     if (assetNeedsReliableReference(this.referenceRequired.get(marketId), this.referenceUnreliable, asset)) blockers.push("REFERENCE_PROVIDER_BLOCKED");
-    if (this.ledger.positions.get(marketId)?.unpairedOutcome) blockers.push("EXISTING_UNPAIRED_POSITION");
+    if (!this.counterfactualStore.isRecoveryReady()) blockers.push("CF_RECOVERY_UNAVAILABLE");
+    if (this.counterfactualStore.hasSettledMarket(marketId)) blockers.push("CF_MARKET_SETTLED");
+    if (this.counterfactualStore.hasUnpairedPosition(marketId)) blockers.push("EXISTING_UNPAIRED_POSITION");
     if (!currentSnapshot || !selected) blockers.push("CURRENT_BOOK_NOT_EXECUTABLE");
     if (currentSnapshot && !this.adapterTokenSynchronized(currentSnapshot.tokenId)) blockers.push("TOKEN_UNSYNCHRONIZED");
 
@@ -2233,9 +2269,14 @@ export class EngineService {
     const marketFeedAt = currentSnapshot
       ? collectMarketFeedAt(currentPair, selectedAtDecision.outcome, "OPEN_FIRST_LEG", currentSnapshot.receivedAt)
       : null;
-    const duplicateKey = `${marketId}:${selectedAtDecision.outcome}:OPEN_FIRST_LEG`;
-    const ledger = structuredClone(this.ledger.snapshot());
+    const duplicateKey = nativeV2CounterfactualActionKey(marketId, selectedAtDecision.outcome, "OPEN_FIRST_LEG");
+    const cfState = this.counterfactualStore.decisionState();
     const blocked = asset ? this.referenceBlocked.get(asset) : undefined;
+
+    const discoveredAtDecision = this.marketsById.get(marketId);
+    const settlementLookupAtDecision = discoveredAtDecision
+      ? this.settlementLookupFromMarket(discoveredAtDecision)
+      : null;
 
     const capture: NativeV2ShadowExecutionCapture = {
       trigger: structuredClone(input.trigger),
@@ -2251,6 +2292,7 @@ export class EngineService {
       asset,
       currentSnapshot: currentSnapshot ? structuredClone(currentSnapshot) : null,
       selected: selected ? structuredClone(selected) : null,
+      settlementLookup: settlementLookupAtDecision ? structuredClone(settlementLookupAtDecision) : null,
       evidenceIds: [...new Set([
         ...input.trigger.sourceEventIds,
         ...(input.trigger.evidenceIds ?? []),
@@ -2258,10 +2300,11 @@ export class EngineService {
         currentPair?.DOWN?.eventId ?? "",
       ].filter(Boolean))],
       preflightBlockers: [...new Set(blockers)],
-      positions: structuredClone([...this.ledger.positions.values()]),
+      // V2-only counterfactual portfolio — never the authoritative V1 paper ledger.
+      positions: cfState.positions,
       assetByMarketEntries: [...this.assetByMarket.entries()],
-      ledger,
-      availableCashUsd: this.ledger.availableCash().toFixed(),
+      ledger: cfState.ledger,
+      availableCashUsd: cfState.availableCashUsd,
       marketFeedAt: marketFeedAt?.toISOString() ?? null,
       referenceFeedAt: referenceFeedAt?.toISOString() ?? null,
       btcFeedAt: btcFeedAt?.toISOString() ?? null,
@@ -2270,8 +2313,8 @@ export class EngineService {
       timestampDisorder: this.timestampDisorder,
       referenceProviderBlocked: Boolean(blocked),
       marketEntryQualified: this.entryQualified.has(marketId),
-      lastStrategyTradeAt: this.lastTradeAt?.toISOString() ?? null,
-      duplicateTrade: (this.recentTrades.get(duplicateKey) ?? 0) > now.getTime() - this.riskLimits.strategyCooldownMs,
+      lastStrategyTradeAt: cfState.lastStrategyTradeAt,
+      duplicateTrade: this.counterfactualStore.hasAction(duplicateKey),
       experimentEntryOpen: experimentAllowsFirstLeg(this.experiment, now),
       executionErrorsLastHour: this.executionErrors.filter((at) => now.getTime() - at < 3_600_000).length,
       shuttingDown: this.state.draining,
@@ -2282,6 +2325,14 @@ export class EngineService {
 
   private dispatchNativeV2ShadowExecution(capture: NativeV2ShadowExecutionCapture): void {
     const handle = setImmediate(() => {
+      void this.runNativeV2ShadowExecution(capture);
+    });
+    handle.unref?.();
+  }
+
+  private async runNativeV2ShadowExecution(capture: NativeV2ShadowExecutionCapture): Promise<void> {
+    try {
+      if (this.nativeV2ShadowEvalHoldForTest) await this.nativeV2ShadowEvalHoldForTest;
       try {
         const execution = this.evaluateNativeV2ShadowExecution(capture);
         const selectedAtDecision = capture.opportunity.best;
@@ -2341,8 +2392,10 @@ export class EngineService {
       } finally {
         this.nativeV2ShadowExecutionBusy = false;
       }
-    });
-    handle.unref?.();
+    } catch (error) {
+      this.nativeV2ShadowExecutionBusy = false;
+      this.logger.error({ err: error, marketId: capture.opportunity.marketId }, "native v2 shadow execution dispatch failed");
+    }
   }
 
   private evaluateNativeV2ShadowExecution(input: NativeV2ShadowExecutionCapture): Record<string, unknown> {
@@ -2352,7 +2405,7 @@ export class EngineService {
     const selected = input.selected;
     const compactBase = {
       version: "native-v2-shadow-execution-v1",
-      stateBasis: "DECISION_TIME_V1_PAPER_STATE",
+      stateBasis: NATIVE_V2_COUNTERFACTUAL_STATE_BASIS,
       evaluatedAt: input.capturedAt,
       marketId,
       outcome: selectedAtDecision.outcome,
@@ -2444,13 +2497,51 @@ export class EngineService {
       },
     });
 
+    const wouldSubmitOrder = decision.accepted && decision.order !== null;
+    let counterfactual: Record<string, unknown> | null = null;
+    if (wouldSubmitOrder && decision.order && this.counterfactualStore.isRecoveryReady()) {
+      const actionKey = nativeV2CounterfactualActionKey(marketId, selectedAtDecision.outcome, "OPEN_FIRST_LEG");
+      // Decision-time capture only — discovery refresh after reserve must not change historical settlement semantics.
+      const capturedLookup = input.settlementLookup;
+      if (
+        !capturedLookup
+        || capturedLookup.marketId !== marketId
+        || !isAuthoritativeBinaryMapping(capturedLookup.yesMapsTo, capturedLookup.noMapsTo)
+      ) {
+        // Production-shaped qualified actionable CF fill without restart-safe lookup must not durable-accept.
+        counterfactual = {
+          actionKey,
+          applied: false,
+          reason: "MISSING_SETTLEMENT_LOOKUP",
+          fillId: null,
+          summary: this.counterfactualStore.summary(),
+        };
+      } else {
+        const commit = this.counterfactualStore.tryCommitWouldSubmit({
+          actionKey,
+          order: decision.order,
+          snapshot: input.currentSnapshot,
+          measuredLatencyMs: 0,
+          at: now,
+          settlementLookup: structuredClone(capturedLookup),
+        });
+        counterfactual = {
+          actionKey,
+          applied: commit.applied,
+          reason: commit.applied ? null : commit.reason,
+          fillId: commit.applied ? commit.fill.id : null,
+          summary: this.counterfactualStore.summary(),
+        };
+      }
+    }
+
     return {
       ...compactBase,
       executionConfidence: intent.confidence,
       evidenceCoverage: intent.evidenceCoverage,
       riskAccepted: decision.risk.accepted,
       riskVetoes: decision.risk.vetoes,
-      wouldSubmitOrder: decision.accepted && decision.order !== null,
+      wouldSubmitOrder,
       order: decision.order ? {
         orderType: decision.order.orderType, requestedPrice: decision.order.requestedPrice, quantity: decision.order.quantity,
       } : null,
@@ -2461,6 +2552,7 @@ export class EngineService {
         netEvUsdTotal: decision.netEvUsdTotal, executableNotionalUsd: decision.executableNotionalUsd,
         expectedROI: decision.expectedROI, bookVwap: decision.bookVwap,
       },
+      counterfactual,
     };
   }
 
@@ -2470,6 +2562,10 @@ export class EngineService {
 
   learningSummary() {
     return this.learningStore?.summary() ?? { enabled: false };
+  }
+
+  counterfactualSummary() {
+    return this.counterfactualStore.summary();
   }
 
   nativeV2ShadowExport() {
@@ -3752,6 +3848,9 @@ export class EngineService {
   }
 
   private async maintainExperiment(): Promise<void> {
+    // CF + learning settlement obligations are restart-durable and must poll even when
+    // no experiment is active (expired markets may be absent from discovery).
+    await this.pollLearningSettlements();
     if (!this.experiment) return;
     if (this.experiment.status === "RUNNING" || this.experiment.status === "ENTRY_CLOSED") {
       await this.accrueInfrastructureCost(this.nowFn().getTime());
@@ -3760,7 +3859,6 @@ export class EngineService {
     await this.pollFailedHedges();
     await this.maybeScheduledReview();
     await this.pollSettlements();
-    await this.pollLearningSettlements();
     const previous = this.experiment.status;
     const open = openPositionsRemain(this.ledger.positions.values());
     const unresolved = [...this.ledger.positions.values()].filter((position) => Number(position.upQuantity) > 0 || Number(position.downQuantity) > 0).length;
@@ -3842,30 +3940,89 @@ export class EngineService {
    * the same public resolution fetch used by economic settlement, without
    * calling settleMarket / commitAuthoritative POSITION_SETTLED / ledger mutation.
    */
+
+  private settlementLookupFromMarket(market: DiscoveredMarket): BinarySettlementLookup | null {
+    if (!market.endDate) return null;
+    const yes = market.qualification.binary.yesOutcome;
+    const no = market.qualification.binary.noOutcome;
+    if (!isAuthoritativeBinaryMapping(yes, no)) return null;
+    return {
+      marketId: market.id,
+      slug: market.slug ?? null,
+      endDate: market.endDate,
+      yesMapsTo: yes as "UP" | "DOWN",
+      noMapsTo: no as "UP" | "DOWN",
+    };
+  }
+
+  private resolveSettlementLookup(marketId: string): BinarySettlementLookup | null {
+    // Prefer decision/accept-time durable captures over live discovery so a later
+    // re-discovery cannot rewrite historical YES/NO settlement semantics.
+    const fromCf = this.counterfactualStore.settlementLookupFor(marketId);
+    if (fromCf) return fromCf;
+    const fromLearning = this.learningStore?.settlementLookupFor(marketId) ?? null;
+    if (fromLearning) return fromLearning;
+    const live = this.marketsById.get(marketId);
+    if (live) {
+      const fromLive = this.settlementLookupFromMarket(live);
+      if (fromLive) return fromLive;
+    }
+    return null;
+  }
+
   private async pollLearningSettlements(): Promise<void> {
-    if (!this.learningStore) return;
     const now = this.nowFn();
     const intervalMs = this.env.LEARNING_SETTLEMENT_POLL_MS ?? this.env.SETTLEMENT_POLL_MS;
     if (now.getTime() - this.lastLearningSettlementPollAt < intervalMs) return;
     this.lastLearningSettlementPollAt = now.getTime();
 
-    for (const marketId of this.learningStore.unresolvedLearningMarketIds()) {
-      const market = this.marketsById.get(marketId);
-      if (!market?.endDate || new Date(market.endDate).getTime() > now.getTime()) continue;
+    if (this.learningStore) {
+      for (const marketId of this.learningStore.unresolvedLearningMarketIds()) {
+        const lookup = this.resolveSettlementLookup(marketId);
+        // Without authoritative endDate + YES/NO mapping, do not guess after discovery drops the market.
+        if (!lookup?.endDate || new Date(lookup.endDate).getTime() > now.getTime()) continue;
+        if (!isAuthoritativeBinaryMapping(lookup.yesMapsTo, lookup.noMapsTo)) continue;
+        try {
+          const raw = await this.resolutionFetcher(lookup.marketId)
+            ?? (lookup.slug ? await this.resolutionFetcher(lookup.slug) : null);
+          if (!raw) continue;
+          this.learningStore.labelMarket(marketId, raw, lookup.yesMapsTo, lookup.noMapsTo, now);
+          // CF settlement uses the same authoritative public resolution parse — never invents winners.
+          const parsed = parsePublicBinaryResolution(raw, lookup.yesMapsTo, lookup.noMapsTo);
+          if (parsed.status === "resolved" && parsed.upPayoff && parsed.downPayoff
+            && this.counterfactualStore.isRecoveryReady()) {
+            this.counterfactualStore.trySettleMarket(marketId, parsed.upPayoff, parsed.downPayoff, {
+              at: now,
+              source: parsed.source,
+              reason: parsed.reason,
+            });
+          }
+        } catch {
+          // Learning labeling failures must not affect economic settlement.
+        }
+      }
+    }
+
+    // Settle open CF positions even when no learning samples exist for the market.
+    if (!this.counterfactualStore.isRecoveryReady()) return;
+    for (const marketId of this.counterfactualStore.openPositionMarketIds()) {
+      const lookup = this.resolveSettlementLookup(marketId);
+      if (!lookup?.endDate || new Date(lookup.endDate).getTime() > now.getTime()) continue;
+      if (!isAuthoritativeBinaryMapping(lookup.yesMapsTo, lookup.noMapsTo)) continue;
       try {
-        const raw = await this.resolutionFetcher(market.id)
-          ?? (market.slug ? await this.resolutionFetcher(market.slug) : null);
+        const raw = await this.resolutionFetcher(lookup.marketId)
+          ?? (lookup.slug ? await this.resolutionFetcher(lookup.slug) : null);
         if (!raw) continue;
-        const binary = market.qualification.binary;
-        this.learningStore.labelMarket(
-          marketId,
-          raw,
-          binary.yesOutcome === "DOWN" || binary.yesOutcome === "UP" ? binary.yesOutcome : "UP",
-          binary.noOutcome === "DOWN" || binary.noOutcome === "UP" ? binary.noOutcome : "DOWN",
-          now,
-        );
+        const parsed = parsePublicBinaryResolution(raw, lookup.yesMapsTo, lookup.noMapsTo);
+        if (parsed.status === "resolved" && parsed.upPayoff && parsed.downPayoff) {
+          this.counterfactualStore.trySettleMarket(marketId, parsed.upPayoff, parsed.downPayoff, {
+            at: now,
+            source: parsed.source,
+            reason: parsed.reason,
+          });
+        }
       } catch {
-        // Learning labeling failures must not affect economic settlement.
+        // CF settlement failures must not affect V1 economic settlement.
       }
     }
   }
@@ -4698,6 +4855,14 @@ export class EngineService {
   }
   setMaintenanceHoldForTest(hold: Promise<void> | null): void { this.maintenanceHold = hold; }
   setProcessTriggerHoldForTest(hold: Promise<void> | null): void { this.processTriggerHold = hold; }
+  setNativeV2ShadowEvalHoldForTest(hold: Promise<void> | null): void { this.nativeV2ShadowEvalHoldForTest = hold; }
+  /** Test helper: simulate discovery removing a market from live maps after decision-time capture. */
+  dropLiveMarketForTest(marketId: string): void {
+    this.marketsById.delete(marketId);
+    this.entryQualified.delete(marketId);
+    this.managedMarketIds.delete(marketId);
+    this.assetByMarket.delete(marketId);
+  }
   setTriggerEventPersistHoldForTest(hold: Promise<void> | null): void { this.triggerEventPersistHold = hold; }
   setSourceSealTimeoutForTest(ms: number): void { this.sourceSealTimeoutMs = Math.max(1, ms); }
   setSourceSealPersistHoldForTest(hold: Promise<void> | null): void { this.sourceSealPersistHold = hold; }
