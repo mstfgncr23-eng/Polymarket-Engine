@@ -1,0 +1,77 @@
+name: PR68 apply canonical engine hook
+
+on:
+  push:
+    branches:
+      - feat/native-v2-learned-runtime
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/native-v2-learned-runtime
+          fetch-depth: 0
+      - name: Apply exact PR5 advisory hook
+        shell: python
+        run: |
+          from pathlib import Path
+
+          p = Path('apps/engine/src/engine.ts')
+          s = p.read_text()
+
+          replacements = [
+            (
+              '  tryObserveLearningSample,\n  NativeV2CounterfactualStore,',
+              '  tryObserveLearningSample,\n  LearningRuntime,\n  type LearnedV2ShadowEvaluation,\n  NativeV2CounterfactualStore,',
+            ),
+            (
+              '  private readonly learningStore: LearningSampleStore | null;\n  /** Isolated V2 shadow portfolio — never mutates V1 ledger/cash/positions. */',
+              '  private readonly learningStore: LearningSampleStore | null;\n  /** PR5 learned V2 shadow runtime — advisory only; never V1 authority. */\n  private readonly learningRuntime: LearningRuntime;\n  /** Isolated V2 shadow portfolio — never mutates V1 ledger/cash/positions. */',
+            ),
+            (
+              '    try {\n      this.learningStore?.init();\n    } catch {\n      // Learning storage must never block engine startup (V1/V2/risk/execution).\n    }\n    // V2 counterfactual portfolio: durable under LEARNING_DATA_DIR/counterfactual.',
+              '    try {\n      this.learningStore?.init();\n    } catch {\n      // Learning storage must never block engine startup (V1/V2/risk/execution).\n    }\n    this.learningRuntime = new LearningRuntime({\n      shadowEnabled: env.LEARNING_SHADOW_ENABLED,\n      learningDataDir: env.LEARNING_DATA_DIR,\n      modelArtifactPath: env.LEARNING_SHADOW_MODEL_PATH ?? null,\n      modelId: env.LEARNING_SHADOW_MODEL_ID ?? null,\n      paperAuthority: {\n        paperAuthorityEnabled: env.LEARNING_PAPER_AUTHORITY_ENABLED,\n        approvedModelId: env.LEARNING_PAPER_AUTHORITY_MODEL_ID ?? null,\n      },\n    });\n    // Defense in depth: LearningRuntime.init() is fail-soft, and the engine\n    // boundary also refuses to let optional learned state block V1 startup.\n    try {\n      this.learningRuntime.init();\n    } catch {\n      // Learned shadow remains unavailable; V1/V2/risk/execution continue.\n    }\n    // V2 counterfactual portfolio: durable under LEARNING_DATA_DIR/counterfactual.',
+            ),
+            (
+              '      } catch {\n        // Learning must never affect V1/V2/risk/execution authority.\n      }\n    }\n    const shadowNow = this.nowFn();',
+              '      } catch {\n        // Learning must never affect V1/V2/risk/execution authority.\n      }\n    }\n    // PR5 learned V2 shadow — advisory only. Fail-soft; never mutates V1.\n    let learnedV2Shadow: LearnedV2ShadowEvaluation | null = null;\n    try {\n      learnedV2Shadow = this.learningRuntime.evaluateShadow({\n        featureVector: shadowV2FeatureVector,\n        deterministicV2: shadowV2FairProbability,\n        marketId: trigger.marketId,\n        asset,\n        experimentId: this.experiment?.id ?? null,\n        triggerId: trigger.id,\n        traceId: trigger.traceId,\n        now: this.nowFn(),\n      });\n    } catch {\n      learnedV2Shadow = null;\n    }\n    const shadowNow = this.nowFn();',
+            ),
+            (
+              '      featureVector: native.featureVector, shadowV2FeatureVector, shadowV2FairProbability, shadowV2OpportunityRanking, triggerId: trigger.id,',
+              '      featureVector: native.featureVector, shadowV2FeatureVector, shadowV2FairProbability, shadowV2OpportunityRanking, learnedV2Shadow, triggerId: trigger.id,',
+            ),
+            (
+              '        expiresAt: native.expiresAt, featureVector: native.featureVector, shadowV2FeatureVector, shadowV2FairProbability, shadowV2OpportunityRanking,',
+              '        expiresAt: native.expiresAt, featureVector: native.featureVector, shadowV2FeatureVector, shadowV2FairProbability, shadowV2OpportunityRanking, learnedV2Shadow,',
+            ),
+            (
+              '  learningSummary() {\n    return this.learningStore?.summary() ?? { enabled: false };\n  }\n\n  counterfactualSummary() {',
+              '  learningSummary() {\n    return this.learningStore?.summary() ?? { enabled: false };\n  }\n\n  learningRuntimeSummary() {\n    return this.learningRuntime.summary();\n  }\n\n  counterfactualSummary() {',
+            ),
+          ]
+
+          for old, new in replacements:
+            count = s.count(old)
+            if count != 1:
+              raise SystemExit(f'expected exactly one match, got {count}: {old[:100]!r}')
+            s = s.replace(old, new, 1)
+
+          p.write_text(s)
+      - name: Verify scope
+        run: |
+          git diff --check
+          git diff -- apps/engine/src/engine.ts
+      - name: Commit patch and remove helper
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git rm .github/workflows/pr68-apply-engine-hook.yml
+          git add apps/engine/src/engine.ts
+          git commit -m "fix(learning): wire fail-soft learned shadow on canonical engine"
+          git push origin HEAD:feat/native-v2-learned-runtime
