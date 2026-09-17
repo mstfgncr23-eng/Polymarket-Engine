@@ -10,7 +10,10 @@ import {
 import path from "node:path";
 import type { NativeDecision } from "./native-decision.js";
 import type { NativeV2ShadowFairProbability } from "./native-v2-shadow-fair-probability.js";
-import type { NativeV2ShadowFeatureVector } from "./native-v2-shadow-features.js";
+import {
+  NATIVE_V2_SHADOW_FEATURE_VERSION,
+  type NativeV2ShadowFeatureVector,
+} from "./native-v2-shadow-features.js";
 import type { Outcome } from "./domain.js";
 import { parsePublicBinaryResolution } from "./settlement.js";
 import {
@@ -141,7 +144,7 @@ export class LearningSampleStore {
     this.manifest = {
       manifestVersion: LEARNING_MANIFEST_VERSION,
       schemaVersion: LEARNING_SAMPLE_SCHEMA_VERSION,
-      featureSchemaVersion: "native-v2-shadow-features-v1",
+      featureSchemaVersion: NATIVE_V2_SHADOW_FEATURE_VERSION,
       createdAt: now,
       updatedAt: now,
       gitSha: this.gitSha,

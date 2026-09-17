@@ -103,3 +103,67 @@ Native V2 counterfactual portfolio**, not the authoritative V1 paper ledger.
 On process start, `NativeV2CounterfactualStore.init()` replays durable
 counterfactual events into a fresh isolated `PaperLedger`. Failures degrade
 counterfactual durability only (`summary().degraded`); V1 trading continues.
+
+
+## Learnable feature schema (PR3)
+
+Feature schema version: `native-v2-shadow-features-v2` (was `native-v2-shadow-features-v1`).
+
+PR3 enriches Native V2 **learnable information only**. Learned models still have
+**no authority** over V1 decisions, deterministic risk, or execution.
+
+### Part A — event-flow / OFI: BLOCKED
+
+CLOB transport evidence:
+
+- Wire `event_type`s normalized by `normalizeRawClobMarketEvent` in
+  `packages/market-data/src/bounded-clob-market.ts`: `book`, `price_change`,
+  `last_trade_price`
+- `price_change` applies absolute post-state size via `applyLevelChange` in
+  `packages/market-data/src/polymarket.ts` (not typed add/cancel deltas)
+- `last_trade_price` only updates in-memory `state.lastTradePrice` and returns
+  **no** `MarketSnapshot`s to the engine feature path
+- `NativeV2ShadowFeatureExtractor.ingestMarket` accepts snapshots only — never
+  raw CLOB events
+
+Therefore add/cancel/trade cannot be discriminated reliably. PR3 does **not**
+fabricate OFI from snapshot diffs. `featureVector.eventFlow` is always:
+
+- `available: false`
+- `reason: "CLOB_TRANSPORT_LACKS_ADD_CANCEL_TRADE_DISCRIMINATION"`
+- all numeric OFI fields explicitly `null`
+
+Follow-up: wire a bounded event-flow buffer at the CLOB normalize boundary if
+Polymarket ever exposes typed add/cancel/trade deltas.
+
+### Part B — resolution-aligned features: LANDED
+
+From already-supported market + Binance reference inputs:
+
+- `resolutionAligned.timeToExpiryMs` + `invSqrtTimeToExpiryMinutes`
+- TTE interactions: book pressure / short momentum / vol-normalized movement × invSqrt(TTE)
+- Mid vs market-prior distances + binary complement basis
+- Reference venue/symbol/age + market↔reference source skew
+- Synchronization / freshness passthrough
+
+Explicitly unavailable (no invented strike):
+
+- `referenceStrikeDistanceAvailable: false`
+- `referenceStrikeDistanceBps: null`
+
+(`DiscoveredMarket` has `endDate` but no price-to-beat / strike field.)
+
+### Part C — cross-venue / oracle: partial
+
+| Source | Status |
+| --- | --- |
+| Binance reference (existing `ReferenceTick` / reference feed) | Exposed under `crossVenueOracle.binance` when ticks present |
+| Chainlink | `available: false`, `reason: "NO_EXISTING_INTEGRATION"` |
+| Coinbase | `available: false`, `reason: "NO_EXISTING_INTEGRATION"` |
+
+No new network/feed architecture was added.
+
+### Authority
+
+Unchanged: V1 Native Math → Strategy → Risk → Execution. PR3 only widens the
+shadow/learning feature vector.

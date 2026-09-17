@@ -7,7 +7,7 @@ import type {
 } from "@pm/core";
 
 const featureVector: NativeV2ShadowFeatureVector = {
-  version: "native-v2-shadow-features-v1",
+  version: "native-v2-shadow-features-v2",
   marketId: "m1",
   asset: "BTC",
   observedAt: "2026-09-16T18:00:00.000Z",
@@ -41,6 +41,62 @@ const featureVector: NativeV2ShadowFeatureVector = {
   },
   timing: { timeToExpiryMs: 60_000, upSourceAgeMs: 0, downSourceAgeMs: 0, pairSourceSkewMs: 0 },
   synchronization: { marketSynchronized: true, referenceFreshness: "fresh", referenceFreshnessMs: 0 },
+  eventFlow: {
+      available: false,
+      reason: "CLOB_TRANSPORT_LACKS_ADD_CANCEL_TRADE_DISCRIMINATION",
+      windowMs: null,
+      orderFlowImbalance: null,
+      bidAddImbalance: null,
+      askAddImbalance: null,
+      bidCancelImbalance: null,
+      askCancelImbalance: null,
+      touchDepletion: null,
+      touchReplenishment: null,
+      aggressiveBuyVolume: null,
+      aggressiveSellVolume: null,
+      eventArrivalRatePerSecond: null,
+      ofiSlope: null,
+      ofiVelocity: null,
+    },
+  resolutionAligned: {
+      timeToExpiryMs: 60_000,
+      invSqrtTimeToExpiryMinutes: 1,
+      bookPressureL5xInvSqrtTte: 0,
+      shortMomentumBpsxInvSqrtTte: 0,
+      volNormMovementxInvSqrtTte: 0,
+      upMidMinusMarketPrior: 0,
+      downMidMinusMarketPriorComplement: 0,
+      binaryComplementBasis: 0,
+      referenceStrikeDistanceBps: null,
+      referenceStrikeDistanceAvailable: false,
+      referenceVenue: "binance",
+      referenceSymbol: "BTCUSDT",
+      referenceSourceAgeMs: 1_000,
+      marketReferenceSourceSkewMs: 0,
+      referenceFreshness: "fresh",
+      marketSynchronized: true,
+    },
+  crossVenueOracle: {
+      binance: {
+        available: true,
+        price: 100,
+        sourceAgeMs: 1_000,
+        symbol: "BTCUSDT",
+        venue: "binance",
+      },
+      chainlink: {
+        available: false,
+        price: null,
+        sourceAgeMs: null,
+        reason: "NO_EXISTING_INTEGRATION",
+      },
+      coinbase: {
+        available: false,
+        price: null,
+        sourceAgeMs: null,
+        reason: "NO_EXISTING_INTEGRATION",
+      },
+    },
 };
 
 const fairProbability: NativeV2ShadowFairProbability = {

@@ -1,6 +1,6 @@
 import type { MarketSnapshot, Outcome, ReferenceTick } from "./domain.js";
 
-export const NATIVE_V2_SHADOW_FEATURE_VERSION = "native-v2-shadow-features-v1" as const;
+export const NATIVE_V2_SHADOW_FEATURE_VERSION = "native-v2-shadow-features-v2" as const;
 
 const BOOK_LEVELS = 5;
 const REFERENCE_WINDOW_MS = 60_000;
@@ -73,6 +73,75 @@ export interface NativeV2ShadowFeatureVector {
     referenceFreshness: "fresh" | "stale" | "unknown";
     referenceFreshnessMs: number | null;
   };
+  /**
+   * Part A — event-flow / OFI.
+   * KNOWN BLOCKED: CLOB `price_change` carries absolute post-state size only;
+   * `last_trade_price` never emits MarketSnapshot into the feature path.
+   * Do not invent add/cancel/trade labels from snapshot diffs.
+   */
+  eventFlow: {
+    available: false;
+    reason: "CLOB_TRANSPORT_LACKS_ADD_CANCEL_TRADE_DISCRIMINATION";
+    windowMs: null;
+    orderFlowImbalance: null;
+    bidAddImbalance: null;
+    askAddImbalance: null;
+    bidCancelImbalance: null;
+    askCancelImbalance: null;
+    touchDepletion: null;
+    touchReplenishment: null;
+    aggressiveBuyVolume: null;
+    aggressiveSellVolume: null;
+    eventArrivalRatePerSecond: null;
+    ofiSlope: null;
+    ofiVelocity: null;
+  };
+  /** Part B — resolution-aligned features from already-supported inputs. */
+  resolutionAligned: {
+    timeToExpiryMs: number | null;
+    invSqrtTimeToExpiryMinutes: number | null;
+    bookPressureL5xInvSqrtTte: number | null;
+    shortMomentumBpsxInvSqrtTte: number | null;
+    volNormMovementxInvSqrtTte: number | null;
+    upMidMinusMarketPrior: number;
+    downMidMinusMarketPriorComplement: number;
+    binaryComplementBasis: number;
+    /** Strike/threshold distance is UNKNOWN — DiscoveredMarket has no price-to-beat. */
+    referenceStrikeDistanceBps: null;
+    referenceStrikeDistanceAvailable: false;
+    referenceVenue: string | null;
+    referenceSymbol: string | null;
+    referenceSourceAgeMs: number | null;
+    marketReferenceSourceSkewMs: number | null;
+    referenceFreshness: "fresh" | "stale" | "unknown";
+    marketSynchronized: boolean;
+  };
+  /**
+   * Part C — cross-venue / oracle.
+   * Only the existing Binance reference integration may be marked available.
+   * Chainlink/Coinbase require new feed architecture → explicit unavailable.
+   */
+  crossVenueOracle: {
+    binance: {
+      available: boolean;
+      price: number | null;
+      sourceAgeMs: number | null;
+      symbol: string | null;
+      venue: string | null;
+    };
+    chainlink: {
+      available: false;
+      price: null;
+      sourceAgeMs: null;
+      reason: "NO_EXISTING_INTEGRATION";
+    };
+    coinbase: {
+      available: false;
+      price: null;
+      sourceAgeMs: null;
+      reason: "NO_EXISTING_INTEGRATION";
+    };
+  };
 }
 
 interface StoredBook {
@@ -96,6 +165,8 @@ interface ReferenceBucket {
   sourceMs: number;
   price: number;
   sourceTimestamp: string;
+  venue: string;
+  symbol: string;
 }
 
 class BoundedReferenceBuckets {
@@ -110,10 +181,12 @@ class BoundedReferenceBuckets {
     if (last && sourceMs < last.sourceMs) return false;
 
     const bucket = Math.floor(sourceMs / REFERENCE_BUCKET_MS);
+    const venue = tick.venue;
+    const symbol = tick.symbol;
     if (last?.bucket === bucket) {
-      this.items[this.items.length - 1] = { bucket, sourceMs, price, sourceTimestamp: tick.sourceTimestamp };
+      this.items[this.items.length - 1] = { bucket, sourceMs, price, sourceTimestamp: tick.sourceTimestamp, venue, symbol };
     } else {
-      this.items.push({ bucket, sourceMs, price, sourceTimestamp: tick.sourceTimestamp });
+      this.items.push({ bucket, sourceMs, price, sourceTimestamp: tick.sourceTimestamp, venue, symbol });
     }
     this.evict(sourceMs - REFERENCE_WINDOW_MS);
     this.enforceBound();
@@ -253,6 +326,23 @@ export class NativeV2ShadowFeatureExtractor {
       : null;
     const referenceSourceAgeMs = referenceLatest ? Math.max(0, nowMs - referenceLatest.sourceMs) : null;
     const endMs = input.endDate ? Date.parse(input.endDate) : Number.NaN;
+    const timeToExpiryMs = Number.isFinite(endMs) ? endMs - nowMs : null;
+    const invSqrtTimeToExpiryMinutes = timeToExpiryMs !== null && timeToExpiryMs > 0
+      ? 1 / Math.sqrt(Math.max(timeToExpiryMs, 1_000) / 60_000)
+      : null;
+    const bookPressureL5xInvSqrtTte = invSqrtTimeToExpiryMinutes !== null
+      ? bookPressureL5 * invSqrtTimeToExpiryMinutes
+      : null;
+    const shortMomentumBpsxInvSqrtTte = shortMomentumBps !== null && invSqrtTimeToExpiryMinutes !== null
+      ? shortMomentumBps * invSqrtTimeToExpiryMinutes
+      : null;
+    const volNormMovementxInvSqrtTte = volatilityNormalizedMovement !== null && invSqrtTimeToExpiryMinutes !== null
+      ? volatilityNormalizedMovement * invSqrtTimeToExpiryMinutes
+      : null;
+    const binaryComplementBasis = up.features.mid + down.features.mid - 1;
+    const referenceVenue = referenceLatest?.venue ?? null;
+    const referenceSymbol = referenceLatest?.symbol ?? null;
+    const binanceAvailable = referenceLatest !== null && (referenceVenue === null || referenceVenue === "binance");
 
     return {
       version: NATIVE_V2_SHADOW_FEATURE_VERSION,
@@ -284,7 +374,7 @@ export class NativeV2ShadowFeatureExtractor {
         marketReferenceSourceSkewMs: referenceLatest ? pairObservedMs - referenceLatest.sourceMs : null,
       },
       timing: {
-        timeToExpiryMs: Number.isFinite(endMs) ? endMs - nowMs : null,
+        timeToExpiryMs,
         upSourceAgeMs: Math.max(0, nowMs - up.sourceMs),
         downSourceAgeMs: Math.max(0, nowMs - down.sourceMs),
         pairSourceSkewMs: Math.abs(up.sourceMs - down.sourceMs),
@@ -293,6 +383,46 @@ export class NativeV2ShadowFeatureExtractor {
         marketSynchronized: input.marketSynchronized,
         referenceFreshness: input.referenceFreshness,
         referenceFreshnessMs: input.referenceFreshnessMs,
+      },
+      eventFlow: unavailableEventFlowFeatures(),
+      resolutionAligned: {
+        timeToExpiryMs,
+        invSqrtTimeToExpiryMinutes: finiteOrNull(invSqrtTimeToExpiryMinutes),
+        bookPressureL5xInvSqrtTte: finiteOrNull(bookPressureL5xInvSqrtTte),
+        shortMomentumBpsxInvSqrtTte: finiteOrNull(shortMomentumBpsxInvSqrtTte),
+        volNormMovementxInvSqrtTte: finiteOrNull(volNormMovementxInvSqrtTte),
+        upMidMinusMarketPrior: up.features.mid - marketPriorUp,
+        downMidMinusMarketPriorComplement: down.features.mid - (1 - marketPriorUp),
+        binaryComplementBasis,
+        referenceStrikeDistanceBps: null,
+        referenceStrikeDistanceAvailable: false,
+        referenceVenue,
+        referenceSymbol,
+        referenceSourceAgeMs,
+        marketReferenceSourceSkewMs: referenceLatest ? pairObservedMs - referenceLatest.sourceMs : null,
+        referenceFreshness: input.referenceFreshness,
+        marketSynchronized: input.marketSynchronized,
+      },
+      crossVenueOracle: {
+        binance: {
+          available: binanceAvailable,
+          price: binanceAvailable ? (referenceLatest?.price ?? null) : null,
+          sourceAgeMs: binanceAvailable ? referenceSourceAgeMs : null,
+          symbol: binanceAvailable ? referenceSymbol : null,
+          venue: binanceAvailable ? (referenceVenue ?? "binance") : null,
+        },
+        chainlink: {
+          available: false,
+          price: null,
+          sourceAgeMs: null,
+          reason: "NO_EXISTING_INTEGRATION",
+        },
+        coinbase: {
+          available: false,
+          price: null,
+          sourceAgeMs: null,
+          reason: "NO_EXISTING_INTEGRATION",
+        },
       },
     };
   }
@@ -443,6 +573,27 @@ function normalizedQuantitySlope(levels: readonly { quantity: string }[], limit:
     denominator += (i - xMean) ** 2;
   }
   return denominator > 0 ? (numerator / denominator) / yMean : 0;
+}
+
+
+function unavailableEventFlowFeatures(): NativeV2ShadowFeatureVector["eventFlow"] {
+  return {
+    available: false,
+    reason: "CLOB_TRANSPORT_LACKS_ADD_CANCEL_TRADE_DISCRIMINATION",
+    windowMs: null,
+    orderFlowImbalance: null,
+    bidAddImbalance: null,
+    askAddImbalance: null,
+    bidCancelImbalance: null,
+    askCancelImbalance: null,
+    touchDepletion: null,
+    touchReplenishment: null,
+    aggressiveBuyVolume: null,
+    aggressiveSellVolume: null,
+    eventArrivalRatePerSecond: null,
+    ofiSlope: null,
+    ofiVelocity: null,
+  };
 }
 
 function directionOf(value: number): -1 | 0 | 1 { return value > 0 ? 1 : value < 0 ? -1 : 0; }
