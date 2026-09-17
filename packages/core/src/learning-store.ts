@@ -115,8 +115,6 @@ export class LearningSampleStore {
   private readonly unresolvedMarkets = new Set<string>();
   private readonly labeledSampleIds = new Set<string>();
   private readonly samplesByMarket = new Map<string, Set<string>>();
-  /** Last observed time-to-expiry per market — seeds true checkpoint crossing. */
-  private readonly lastTimeToExpiryMsByMarket = new Map<string, number>();
 
   private manifest: LearningDatasetManifest;
   private currentSegmentPath: string | null = null;
@@ -212,18 +210,12 @@ export class LearningSampleStore {
     if (timeToExpiryMs === null || !Number.isFinite(timeToExpiryMs)) return [];
 
     const already = this.checkpointIdsByMarket.get(input.marketId) ?? new Set<string>();
-    const previousTimeToExpiryMs = this.lastTimeToExpiryMsByMarket.has(input.marketId)
-      ? this.lastTimeToExpiryMsByMarket.get(input.marketId)!
-      : null;
     const crossed = selectCrossedCheckpoints({
       timeToExpiryMs,
       checkpointSeconds: this.checkpointSeconds,
       alreadySampledCheckpointIds: already,
-      previousTimeToExpiryMs,
       ...(input.horizonMs !== undefined ? { horizonMs: input.horizonMs } : {}),
     });
-    // Always advance crossing cursor (including first-ever late observations).
-    this.lastTimeToExpiryMsByMarket.set(input.marketId, timeToExpiryMs);
     if (crossed.length === 0) return [];
 
     const accepted: LearningSampleV1[] = [];
@@ -389,7 +381,6 @@ export class LearningSampleStore {
     this.unresolvedMarkets.clear();
     this.labeledSampleIds.clear();
     this.samplesByMarket.clear();
-    this.lastTimeToExpiryMsByMarket.clear();
 
     const manifestPath = this.manifestPath();
     if (existsSync(manifestPath)) {
@@ -418,11 +409,6 @@ export class LearningSampleStore {
           const row = JSON.parse(line) as SegmentRow;
           if (row.kind === "sample") {
             this.indexSample(row.sample, false);
-            const prev = this.lastTimeToExpiryMsByMarket.get(row.sample.marketId);
-            // Min TTE ≈ latest observation in the market lifecycle (TTE decreases).
-            if (prev === undefined || row.sample.timeToExpiryMs < prev) {
-              this.lastTimeToExpiryMsByMarket.set(row.sample.marketId, row.sample.timeToExpiryMs);
-            }
           }
           else if (row.kind === "label") {
             this.labeledSampleIds.add(row.sampleId);

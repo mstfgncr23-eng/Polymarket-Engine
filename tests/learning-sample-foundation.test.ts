@@ -119,67 +119,65 @@ describe("learning checkpoint crossing + identity", () => {
     expect(learningSampleId("m1", "T-60")).toBe("m1::T-60");
   });
 
-  it("selects true first crossings only; late first obs does not backfill", () => {
+  it("selects nearest eligible checkpoint band; never fans out historical samples", () => {
     const schedule = [240, 180, 120, 60, 30, 15, 5];
-    // Late first observation: no previous TTE → no historical backfill.
+
     expect(selectCrossedCheckpoints({
-      timeToExpiryMs: 50_000,
+      timeToExpiryMs: 62_400,
       checkpointSeconds: schedule,
       alreadySampledCheckpointIds: new Set(),
     })).toEqual([]);
     expect(selectCrossedCheckpoints({
-      timeToExpiryMs: 50_000,
+      timeToExpiryMs: 59_700,
       checkpointSeconds: schedule,
       alreadySampledCheckpointIds: new Set(),
-      previousTimeToExpiryMs: null,
-    })).toEqual([]);
+    }).map((item) => item.checkpointId)).toEqual(["T-60"]);
 
-    // Normal crossing: previous above T-60, now at/below → emit T-60 only.
-    const crossed = selectCrossedCheckpoints({
-      timeToExpiryMs: 55_000,
+    expect(selectCrossedCheckpoints({
+      timeToExpiryMs: 25_000,
       checkpointSeconds: schedule,
       alreadySampledCheckpointIds: new Set(),
-      previousTimeToExpiryMs: 65_000,
-    });
-    expect(crossed.map((item) => item.checkpointId)).toEqual(["T-60"]);
+    }).map((item) => item.checkpointId)).toEqual(["T-30"]);
 
-    // Gap crossing between observations emits each newly crossed checkpoint once.
-    const gap = selectCrossedCheckpoints({
-      timeToExpiryMs: 50_000,
-      checkpointSeconds: schedule,
-      alreadySampledCheckpointIds: new Set(),
-      previousTimeToExpiryMs: 250_000,
-    });
-    expect(gap.map((item) => item.checkpointId)).toEqual(["T-240", "T-180", "T-120", "T-60"]);
-
-    const already = new Set(gap.map((item) => item.checkpointId));
     expect(selectCrossedCheckpoints({
       timeToExpiryMs: 50_000,
       checkpointSeconds: schedule,
-      alreadySampledCheckpointIds: already,
-      previousTimeToExpiryMs: 50_000,
+      alreadySampledCheckpointIds: new Set(),
+    }).map((item) => item.checkpointId)).toEqual(["T-60"]);
+
+    expect(selectCrossedCheckpoints({
+      timeToExpiryMs: 250_000,
+      checkpointSeconds: schedule,
+      alreadySampledCheckpointIds: new Set(),
+    })).toEqual([]);
+    expect(selectCrossedCheckpoints({
+      timeToExpiryMs: 35_000,
+      checkpointSeconds: schedule,
+      alreadySampledCheckpointIds: new Set(),
     })).toEqual([]);
 
-    const later = selectCrossedCheckpoints({
+    expect(selectCrossedCheckpoints({
+      timeToExpiryMs: 50_000,
+      checkpointSeconds: schedule,
+      alreadySampledCheckpointIds: new Set(["T-60"]),
+    })).toEqual([]);
+
+    expect(selectCrossedCheckpoints({
       timeToExpiryMs: 4_000,
       checkpointSeconds: schedule,
-      alreadySampledCheckpointIds: already,
-      previousTimeToExpiryMs: 50_000,
-    });
-    expect(later.map((item) => item.checkpointId)).toEqual(["T-30", "T-15", "T-5"]);
+      alreadySampledCheckpointIds: new Set(["T-60"]),
+    }).map((item) => item.checkpointId)).toEqual(["T-5"]);
 
     expect(selectCrossedCheckpoints({
       timeToExpiryMs: null,
       checkpointSeconds: schedule,
       alreadySampledCheckpointIds: new Set(),
-      previousTimeToExpiryMs: 100_000,
     })).toEqual([]);
 
     expect(selectCrossedCheckpoints({
       timeToExpiryMs: 50_000,
       checkpointSeconds: schedule,
       alreadySampledCheckpointIds: new Set(),
-      previousTimeToExpiryMs: 100_000,
       horizonMs: 90_000,
     }).map((item) => item.checkpointId)).toEqual(["T-60"]);
   });
@@ -228,18 +226,7 @@ describe("LearningSampleStore durability + labeling", () => {
     });
     store.init();
 
-    // Seed above all checkpoints so the next observe is a true multi-crossing.
-    const seedFeatures = vector({ timeToExpiryMs: 250_000 });
-    expect(store.observe({
-      marketId: "m1",
-      asset: "BTC",
-      now: new Date("2026-09-16T16:59:00.000Z"),
-      featureVector: seedFeatures,
-      v2FairProbability: fair,
-      experimentId: "exp-1",
-      gitSha: "deadbeef",
-    })).toEqual([]);
-
+    // One observation in the T-60 band → exactly one sample (no historical fan-out).
     const first = store.observe({
       marketId: "m1",
       asset: "BTC",
@@ -249,7 +236,7 @@ describe("LearningSampleStore durability + labeling", () => {
       experimentId: "exp-1",
       gitSha: "deadbeef",
     });
-    expect(first.map((s) => s.checkpointId).sort()).toEqual(["T-120", "T-180", "T-240", "T-60"]);
+    expect(first.map((s) => s.checkpointId)).toEqual(["T-60"]);
 
     const again = store.observe({
       marketId: "m1",
@@ -261,20 +248,19 @@ describe("LearningSampleStore durability + labeling", () => {
     expect(again).toEqual([]);
 
     const before = store.summary();
-    expect(before.sampleCount).toBe(4);
+    expect(before.sampleCount).toBe(1);
     expect(before.unresolvedMarketCount).toBe(1);
     expect(store.getManifest().schemaVersion).toBe(LEARNING_SAMPLE_SCHEMA_VERSION);
     expect(store.getManifest().featureSchemaVersion).toBe(NATIVE_V2_SHADOW_FEATURE_VERSION);
     expect(store.getManifest().gitSha).toBe("deadbeef");
 
-    
     const reopened = new LearningSampleStore({
       dataDir,
       checkpointSeconds: "240,180,120,60,30,15,5",
       gitSha: "deadbeef",
     });
     reopened.init();
-    expect(reopened.summary().sampleCount).toBe(4);
+    expect(reopened.summary().sampleCount).toBe(1);
     expect(reopened.unresolvedLearningMarketIds()).toEqual(["m1"]);
     const third = reopened.observe({
       marketId: "m1",
@@ -288,16 +274,16 @@ describe("LearningSampleStore durability + labeling", () => {
 
   it("keeps unresolved unlabeled until authoritative resolution; labels without economic settlement", () => {
     const dataDir = tempDir();
-    const features = vector({ marketId: "orphan-mkt", timeToExpiryMs: 20_000 });
+    const features = vector({ marketId: "orphan-mkt", timeToExpiryMs: 12_000 });
     const fair = evaluateNativeV2ShadowFairProbability(features)!;
     const store = new LearningSampleStore({ dataDir, checkpointSeconds: "30,15,5" });
     store.init();
-    // Seed above checkpoints, then cross so samples exist for labeling.
+    // Observe inside checkpoint bands so samples exist for labeling.
     store.observe({
       marketId: "orphan-mkt",
       asset: "ETH",
       now: new Date(),
-      featureVector: vector({ marketId: "orphan-mkt", timeToExpiryMs: 40_000 }),
+      featureVector: vector({ marketId: "orphan-mkt", timeToExpiryMs: 25_000 }),
       v2FairProbability: fair,
     });
     store.observe({
@@ -349,14 +335,7 @@ describe("LearningSampleStore durability + labeling", () => {
       v2FairProbability: fair,
     })).not.toThrow();
 
-    // Capacity: seed crossing cursor, then observe into a tiny budget.
-    expect(() => store.tryObserve({
-      marketId: "m1",
-      asset: "BTC",
-      now: new Date(),
-      featureVector: vector({ timeToExpiryMs: 250_000 }),
-      v2FairProbability: fair,
-    })).not.toThrow();
+    // Capacity: observe inside an eligible band into a tiny budget.
     expect(() => store.tryObserve({
       marketId: "m1",
       asset: "BTC",
@@ -374,13 +353,6 @@ describe("LearningSampleStore durability + labeling", () => {
       // Fill until capacity via fresh markets that cross into sampleable territory.
       for (let i = 0; i < 50; i += 1) {
         const id = `m-${i}`;
-        store.tryObserve({
-          marketId: id,
-          asset: "BTC",
-          now: new Date(),
-          featureVector: vector({ marketId: id, timeToExpiryMs: 250_000 }),
-          v2FairProbability: fair,
-        });
         store.tryObserve({
           marketId: id,
           asset: "BTC",
@@ -446,25 +418,16 @@ describe("PR64 review blocker regressions", () => {
     });
     store.init();
 
-    // First-ever late observation must not invent T-240/T-180/T-120/T-60.
-    expect(store.observe({
+    const late = store.observe({
       marketId: "m-late",
       asset: "BTC",
       now: new Date("2026-09-16T17:00:00.000Z"),
       featureVector: lateFeatures,
       v2FairProbability: fair,
-    })).toEqual([]);
-    expect(store.summary().sampleCount).toBe(0);
+    });
+    expect(late.map((s) => s.checkpointId)).toEqual(["T-60"]);
+    expect(store.summary().sampleCount).toBe(1);
 
-    // Normal crossing after seed above T-30.
-    const above = vector({ timeToExpiryMs: 35_000 });
-    expect(store.observe({
-      marketId: "m-cross",
-      asset: "BTC",
-      now: new Date("2026-09-16T17:00:01.000Z"),
-      featureVector: above,
-      v2FairProbability: fair,
-    })).toEqual([]);
     const crossed = store.observe({
       marketId: "m-cross",
       asset: "BTC",
@@ -474,13 +437,12 @@ describe("PR64 review blocker regressions", () => {
     });
     expect(crossed.map((s) => s.checkpointId)).toEqual(["T-30"]);
 
-    // Restart: already-sampled checkpoint is not re-emitted; cursor restored from disk.
     const reopened = new LearningSampleStore({
       dataDir,
       checkpointSeconds: "240,180,120,60,30,15,5",
     });
     reopened.init();
-    expect(reopened.summary().sampleCount).toBe(1);
+    expect(reopened.summary().sampleCount).toBe(2);
     expect(reopened.observe({
       marketId: "m-cross",
       asset: "BTC",
@@ -488,12 +450,11 @@ describe("PR64 review blocker regressions", () => {
       featureVector: vector({ timeToExpiryMs: 25_000 }),
       v2FairProbability: fair,
     })).toEqual([]);
-    // Further true crossing after restart still works.
     const afterRestart = reopened.observe({
       marketId: "m-cross",
       asset: "BTC",
       now: new Date("2026-09-16T17:00:04.000Z"),
-      featureVector: vector({ timeToExpiryMs: 10_000 }),
+      featureVector: vector({ timeToExpiryMs: 12_000 }),
       v2FairProbability: fair,
     });
     expect(afterRestart.map((s) => s.checkpointId)).toEqual(["T-15"]);
@@ -509,21 +470,30 @@ describe("PR64 review blocker regressions", () => {
     });
     store.init();
 
-    store.observe({
-      marketId: "m-partial",
-      asset: "BTC",
-      now: new Date("2026-09-16T17:00:00.000Z"),
-      featureVector: vector({ timeToExpiryMs: 70_000 }),
-      v2FairProbability: fair,
-    });
-    const accepted = store.observe({
-      marketId: "m-partial",
-      asset: "BTC",
-      now: new Date("2026-09-16T17:00:01.000Z"),
-      featureVector: vector({ timeToExpiryMs: 10_000 }),
-      v2FairProbability: fair,
-    });
-    expect(accepted.length).toBe(3); // T-60, T-30, T-15
+    const accepted = [
+      ...store.observe({
+        marketId: "m-partial",
+        asset: "BTC",
+        now: new Date("2026-09-16T17:00:00.000Z"),
+        featureVector: vector({ timeToExpiryMs: 55_000 }),
+        v2FairProbability: fair,
+      }),
+      ...store.observe({
+        marketId: "m-partial",
+        asset: "BTC",
+        now: new Date("2026-09-16T17:00:01.000Z"),
+        featureVector: vector({ timeToExpiryMs: 25_000 }),
+        v2FairProbability: fair,
+      }),
+      ...store.observe({
+        marketId: "m-partial",
+        asset: "BTC",
+        now: new Date("2026-09-16T17:00:02.000Z"),
+        featureVector: vector({ timeToExpiryMs: 12_000 }),
+        v2FairProbability: fair,
+      }),
+    ];
+    expect(accepted.map((s) => s.checkpointId)).toEqual(["T-60", "T-30", "T-15"]);
     expect(store.unresolvedLearningMarketIds()).toEqual(["m-partial"]);
 
     // Reopen with maxBytes that fits existing bytes + ~1 label, not all 3.
@@ -555,6 +525,69 @@ describe("PR64 review blocker regressions", () => {
     expect(roomier.readSamplesForTest()
       .filter((s) => s.marketId === "m-partial")
       .every((s) => s.settlement.status === "resolved" && s.settlement.outcome === "UP")).toBe(true);
+  });
+
+  it("E) restart before any checkpoint sample still allows currently eligible band", () => {
+    const dataDir = tempDir();
+    const fair = evaluateNativeV2ShadowFairProbability(vector({ timeToExpiryMs: 25_000 }))!;
+
+    const store = new LearningSampleStore({
+      dataDir,
+      checkpointSeconds: "240,180,120,60,30,15,5",
+    });
+    store.init();
+    expect(store.observe({
+      marketId: "m-restart",
+      asset: "BTC",
+      now: new Date("2026-09-16T17:00:00.000Z"),
+      featureVector: vector({ timeToExpiryMs: 35_000 }),
+      v2FairProbability: fair,
+    })).toEqual([]);
+    expect(store.summary().sampleCount).toBe(0);
+
+    const reopened = new LearningSampleStore({
+      dataDir,
+      checkpointSeconds: "240,180,120,60,30,15,5",
+    });
+    reopened.init();
+    const after = reopened.observe({
+      marketId: "m-restart",
+      asset: "BTC",
+      now: new Date("2026-09-16T17:00:01.000Z"),
+      featureVector: vector({ timeToExpiryMs: 25_000 }),
+      v2FairProbability: fair,
+    });
+    expect(after.map((s) => s.checkpointId)).toEqual(["T-30"]);
+    expect(reopened.summary().sampleCount).toBe(1);
+  });
+
+  it("F) large observation gap produces at most one sample from current features", () => {
+    const dataDir = tempDir();
+    const fair = evaluateNativeV2ShadowFairProbability(vector({ timeToExpiryMs: 50_000 }))!;
+    const store = new LearningSampleStore({
+      dataDir,
+      checkpointSeconds: "240,180,120,60,30,15,5",
+    });
+    store.init();
+
+    expect(store.observe({
+      marketId: "m-gap",
+      asset: "BTC",
+      now: new Date("2026-09-16T16:59:00.000Z"),
+      featureVector: vector({ timeToExpiryMs: 250_000 }),
+      v2FairProbability: fair,
+    })).toEqual([]);
+
+    const gap = store.observe({
+      marketId: "m-gap",
+      asset: "BTC",
+      now: new Date("2026-09-16T17:00:00.000Z"),
+      featureVector: vector({ timeToExpiryMs: 50_000 }),
+      v2FairProbability: fair,
+    });
+    expect(gap.map((s) => s.checkpointId)).toEqual(["T-60"]);
+    expect(gap).toHaveLength(1);
+    expect(store.summary().sampleCount).toBe(1);
   });
 
   it("D) manifest featureSchemaVersion uses NATIVE_V2_SHADOW_FEATURE_VERSION SoT", () => {

@@ -80,18 +80,21 @@ export function parseLearningCheckpointSeconds(raw: string | undefined | null): 
 }
 
 /**
- * Crossing semantics: emit a checkpoint only when it is truly crossed between
- * consecutive observations:
- *   previousTimeToExpiryMs > checkpointMs && timeToExpiryMs <= checkpointMs
+ * Deterministic nearest-eligible checkpoint selection (at most one per observation).
  *
- * A late first observation (no previous TTE) must NOT backfill earlier
- * checkpoints — e.g. first obs at T-50s emits nothing for T-240/T-180/T-120.
- * Already-recorded checkpoints are skipped. Null timeToExpiryMs yields none.
+ * Reconstructible from durable alreadySampledCheckpointIds + current TTE + schedule.
+ * Does NOT use previous-TTE / volatile cursors — restart-safe without hot-path cursor writes.
  *
- * Invalid schedule entries relative to a known positive horizonMs (optional)
- * are skipped rather than invented — checkpoints whose ms exceed horizonMs
- * can never be crossed before the market ends from t=0, so they are omitted
- * when horizonMs is supplied.
+ * Each checkpoint C with next-smaller neighbor S (or 0) owns the half-open band
+ *   (midpoint(S, C), C]  in milliseconds of time-to-expiry.
+ * An observation emits that band's checkpoint when present and not yet sampled.
+ * Large gaps and first/after-restart observations therefore produce at most one
+ * currently eligible sample (never a fan-out of synthetic historical rows).
+ *
+ * Examples (default schedule):
+ * - T-62.4s → none; T-59.7s → T-60
+ * - T-25s (incl. after restart) → at most T-30
+ * - T-50s after T-250s → at most T-60 (not T-240/T-180/T-120)
  */
 export function selectCrossedCheckpoints(input: {
   timeToExpiryMs: number | null;
@@ -99,22 +102,11 @@ export function selectCrossedCheckpoints(input: {
   alreadySampledCheckpointIds: ReadonlySet<string>;
   /** Optional market horizon from birth→end; invalid checkpoints above it are skipped. */
   horizonMs?: number | null;
-  /**
-   * Previous observation time-to-expiry for this market.
-   * null/undefined = first observation → no historical backfill.
-   */
-  previousTimeToExpiryMs?: number | null;
 }): Array<{ checkpointId: string; checkpointSeconds: number }> {
   const tte = input.timeToExpiryMs;
   if (tte === null || !Number.isFinite(tte)) return [];
 
-  const previous = input.previousTimeToExpiryMs;
-  // First observation: emit nothing; caller should seed previous TTE.
-  if (previous === null || previous === undefined || !Number.isFinite(previous)) {
-    return [];
-  }
-
-  const selected: Array<{ checkpointId: string; checkpointSeconds: number }> = [];
+  const valid: number[] = [];
   for (const seconds of input.checkpointSeconds) {
     if (!Number.isFinite(seconds) || !Number.isInteger(seconds) || seconds <= 0) continue;
     const checkpointMs = seconds * 1_000;
@@ -127,13 +119,22 @@ export function selectCrossedCheckpoints(input: {
     ) {
       continue;
     }
-    // True first crossing only: was strictly above, now at/below.
-    if (!(previous > checkpointMs && tte <= checkpointMs)) continue;
+    valid.push(seconds);
+  }
+  valid.sort((a, b) => a - b);
+
+  for (let i = 0; i < valid.length; i += 1) {
+    const seconds = valid[i]!;
+    const checkpointMs = seconds * 1_000;
+    const prevSeconds = i > 0 ? valid[i - 1]! : 0;
+    const lowerMs = ((prevSeconds + seconds) / 2) * 1_000;
+    // Band (lowerMs, checkpointMs]: at most one schedule entry owns any TTE.
+    if (!(tte <= checkpointMs && tte > lowerMs)) continue;
     const checkpointId = checkpointIdFromSeconds(seconds);
     if (input.alreadySampledCheckpointIds.has(checkpointId)) continue;
-    selected.push({ checkpointId, checkpointSeconds: seconds });
+    return [{ checkpointId, checkpointSeconds: seconds }];
   }
-  return selected;
+  return [];
 }
 
 export function buildLearningSampleV1(input: {
