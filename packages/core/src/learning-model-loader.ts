@@ -27,7 +27,8 @@ export type LearningModelLoadFailureReason =
   | "UNSUPPORTED_MODEL_VERSION"
   | "UNSUPPORTED_MODEL_TYPE"
   | "STALE_OR_INCOMPLETE_METADATA"
-  | "REGISTRY_STATUS_BLOCKED";
+  | "REGISTRY_STATUS_BLOCKED"
+  | "RUNTIME_INIT_ERROR";
 
 export interface LoadedLearningModelV1 {
   loadedVersion: typeof LEARNING_LOADED_MODEL_VERSION;
@@ -152,10 +153,9 @@ function validateAndWrapCandidate(
     };
   }
 
-  if (!verifyLearningCandidateChecksum(candidate)) {
-    return { ok: false, reason: "CHECKSUM_MISMATCH", detail: "artifact checksum verification failed" };
-  }
-
+  // Check explicit schema/version contracts before integrity verification so an
+  // artifact produced for an older runtime reports the actionable compatibility
+  // reason. It is still rejected unless the semantic checksum also verifies.
   const expectedFeature =
     options.expectedFeatureSchemaVersion ?? NATIVE_V2_SHADOW_FEATURE_VERSION;
   if (candidate.featureSchemaVersion !== expectedFeature) {
@@ -173,6 +173,11 @@ function validateAndWrapCandidate(
       reason: "UNSUPPORTED_MODEL_VERSION",
       detail: `expected ${expectedModel}, got ${candidate.modelVersion}`,
     };
+  }
+
+  // PR4 semantic checksum intentionally excludes generation-only timestamps.
+  if (!verifyLearningCandidateChecksum(candidate)) {
+    return { ok: false, reason: "CHECKSUM_MISMATCH", detail: "artifact checksum verification failed" };
   }
 
   try {
