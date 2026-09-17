@@ -2245,6 +2245,8 @@ export class EngineService {
     if (!this.entryQualified.has(marketId)) blockers.push("MARKET_NOT_ENTRY_QUALIFIED");
     if (!this.isMarketSynchronized(marketId)) blockers.push("MARKET_UNSYNCHRONIZED");
     if (assetNeedsReliableReference(this.referenceRequired.get(marketId), this.referenceUnreliable, asset)) blockers.push("REFERENCE_PROVIDER_BLOCKED");
+    if (!this.counterfactualStore.isRecoveryReady()) blockers.push("CF_RECOVERY_UNAVAILABLE");
+    if (this.counterfactualStore.hasSettledMarket(marketId)) blockers.push("CF_MARKET_SETTLED");
     if (this.counterfactualStore.hasUnpairedPosition(marketId)) blockers.push("EXISTING_UNPAIRED_POSITION");
     if (!currentSnapshot || !selected) blockers.push("CURRENT_BOOK_NOT_EXECUTABLE");
     if (currentSnapshot && !this.adapterTokenSynchronized(currentSnapshot.tokenId)) blockers.push("TOKEN_UNSYNCHRONIZED");
@@ -2469,7 +2471,7 @@ export class EngineService {
 
     const wouldSubmitOrder = decision.accepted && decision.order !== null;
     let counterfactual: Record<string, unknown> | null = null;
-    if (wouldSubmitOrder && decision.order) {
+    if (wouldSubmitOrder && decision.order && this.counterfactualStore.isRecoveryReady()) {
       const actionKey = nativeV2CounterfactualActionKey(marketId, selectedAtDecision.outcome, "OPEN_FIRST_LEG");
       const commit = this.counterfactualStore.tryCommitWouldSubmit({
         actionKey,
@@ -3910,7 +3912,8 @@ export class EngineService {
           this.learningStore.labelMarket(marketId, raw, yes, no, now);
           // CF settlement uses the same authoritative public resolution parse — never invents winners.
           const parsed = parsePublicBinaryResolution(raw, yes, no);
-          if (parsed.status === "resolved" && parsed.upPayoff && parsed.downPayoff) {
+          if (parsed.status === "resolved" && parsed.upPayoff && parsed.downPayoff
+            && this.counterfactualStore.isRecoveryReady()) {
             this.counterfactualStore.trySettleMarket(marketId, parsed.upPayoff, parsed.downPayoff, {
               at: now,
               source: parsed.source,
@@ -3924,6 +3927,7 @@ export class EngineService {
     }
 
     // Settle open CF positions even when no learning samples exist for the market.
+    if (!this.counterfactualStore.isRecoveryReady()) return;
     for (const marketId of this.counterfactualStore.openPositionMarketIds()) {
       const market = this.marketsById.get(marketId);
       if (!market?.endDate || new Date(market.endDate).getTime() > now.getTime()) continue;

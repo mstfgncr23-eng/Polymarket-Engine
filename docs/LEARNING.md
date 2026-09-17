@@ -109,7 +109,7 @@ V1 PAPER portfolio is **continuous across experiment windows**, not reset per ex
 - `experimentEconomicResidueBlockers()` refuses a new experiment when open positions / resting orders / reservations remain — it does **not** wipe the ledger (`docs/native-restore-pr53-audit.md`).
 - On `START_VALIDATED`, only `nativeV2ShadowStore.reset()` runs (shadow feature cache), **not** a CF/V1 ledger reset.
 
-CF therefore keeps process-lifetime + durable continuous portfolio semantics (same `PAPER_START_BALANCE`, no experimentId wipe). Action keys stay `${marketId}:${outcome}:${intent}` and clear on settlement. Learning samples may stamp `experimentId` for attribution, but the learning store is also continuous.
+CF therefore keeps process-lifetime + durable continuous portfolio semantics (durable `startingBalance` authoritative, no experimentId wipe). Action keys stay `${marketId}:${outcome}:${intent}` and clear on settlement, but settled market IDs remain terminal tombstones (never reopen). Learning samples may stamp `experimentId` for attribution, but the learning store is also continuous.
 
 ### Bounded CF storage
 
@@ -118,14 +118,33 @@ CF therefore keeps process-lifetime + durable continuous portfolio semantics (sa
 | `maxBytes` (store) / `LEARNING_MAX_BYTES` (engine wiring) | `256000000` | Total CF event-log byte cap under `.../counterfactual/` |
 | `segmentMaxBytes` | `8000000` | Per-segment rotation only (insufficient alone) |
 
-Fill admission is obligation-aware: a fill is accepted only when `currentBytes + fillRowBytes + outstandingSettlementReserve + newSettlementReserve <= maxBytes`, where each open CF position reserves `MAX_COUNTERFACTUAL_SETTLEMENT_ROW_BYTES` (1024) for its future settlement row. Settlement `marketId` is preserved exactly (legal max 160 per `idSchema`; never truncated) so restart replay matches the fill identity; only non-identity metadata (`source` / `reason` / deltas) is clamped/shrunk so a serialized settlement row cannot exceed that bound — making the reservation a real guarantee, not a global percentage guess. A fixed ~5%/4KiB global reserve alone is **not** sufficient (it can accept more opens than it can later settle). When the cap is hit, the write is rejected (`CAPACITY_EXCEEDED`), in-memory state is **not** advanced, and `summary().degraded` is set — V1 authority unchanged. On restart, open positions are reconstructed from the durable log and the outstanding settlement reserve is recomputed from them; rejected writes cannot diverge memory vs disk.
+Fill admission is obligation-aware: a fill is accepted only when `currentBytes + fillRowBytes + sum(exactSettlementObligation(openMarketId)) <= maxBytes`. Each open market's obligation is the **exact serialized JSON identity byte cost** of that `marketId` (including JSON escapes) plus bounded non-identity overhead (clamped `source` / `reason` / deltas + fixed `at`). Settlement `marketId` is preserved exactly (legal max 160 per `idSchema`; never truncated) so restart replay matches the fill identity — even when JSON escaping expands beyond 1 byte/char. A fixed 1024-byte-per-open constant is **not** sufficient for worst-case legal ids. When the cap is hit, the write is rejected (`CAPACITY_EXCEEDED`), in-memory state is **not** advanced, and `summary().degraded` is set — V1 authority unchanged. On restart, open positions are reconstructed from the durable log and obligations are recomputed from those exact market IDs.
 
 ### Durable commit atomicity
 
 Fill and settlement transitions stage on a temporary `PaperLedger`, append the durable segment row first, then apply the live in-memory transition. A manifest write failure **after** a successful segment append does **not** roll back the economic event.
 
-### Recovery
+### Recovery / fail-closed CF
 
 On process start, `NativeV2CounterfactualStore.init()` replays durable
-counterfactual events into a fresh isolated `PaperLedger`. Failures degrade
-counterfactual durability only (`summary().degraded`); V1 trading continues.
+counterfactual events into a fresh isolated `PaperLedger`.
+
+- **V1** remains fail-soft elsewhere.
+- **CF is fail-closed** when durable recovery is untrustworthy (corrupt/unreadable
+  economic rows, startingBalance mismatch, unsafe maxBytes decrease).
+- Exposes `recoveryStatus` / `recoveryReady`; Phase-4 must not use CF as
+  stateful shadow authority while unavailable (`RECOVERY_UNAVAILABLE`).
+- Torn/truncated last-segment tail (no trailing newline) is skipped deterministically;
+  any other corrupt economic row fails CF closed (never silently skipped).
+- Persisted `startingBalance` is authoritative; constructor mismatch → CF unavailable.
+- `maxBytes`: safe increase allowed; unsafe decrease that cannot cover committed
+  bytes + settlement obligations → CF unavailable.
+- After official settlement, the market identity is a **terminal tombstone**
+  (reconstructed from durable settlement rows) — same market never reopens.
+
+### Ops notes (non-blocking)
+
+- OVH `/data/learning` mount is an ops prerequisite for durable CF/learning recovery.
+- Combined PR1 learning + CF disk usage shares `LEARNING_MAX_BYTES` defaults per store
+  layout under `LEARNING_DATA_DIR` (document capacity jointly in ops).
+- Compaction of CF segments is **not** a PR2 merge blocker.
