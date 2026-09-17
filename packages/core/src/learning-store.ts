@@ -10,7 +10,10 @@ import {
 import path from "node:path";
 import type { NativeDecision } from "./native-decision.js";
 import type { NativeV2ShadowFairProbability } from "./native-v2-shadow-fair-probability.js";
-import type { NativeV2ShadowFeatureVector } from "./native-v2-shadow-features.js";
+import {
+  NATIVE_V2_SHADOW_FEATURE_VERSION,
+  type NativeV2ShadowFeatureVector,
+} from "./native-v2-shadow-features.js";
 import type { Outcome } from "./domain.js";
 import { parsePublicBinaryResolution } from "./settlement.js";
 import {
@@ -28,6 +31,10 @@ export const LEARNING_MANIFEST_VERSION = 1 as const;
 export const DEFAULT_LEARNING_MAX_BYTES = 256_000_000;
 export const DEFAULT_LEARNING_DATA_DIR = "/data/learning";
 export const DEFAULT_LEARNING_SEGMENT_MAX_BYTES = 8_000_000;
+/** Fraction of maxBytes reserved so settlement labels remain writable near capacity. */
+export const DEFAULT_LEARNING_LABEL_RESERVE_RATIO = 0.05;
+/** Floor reserve so tiny test caps still leave room for labels. */
+export const DEFAULT_LEARNING_LABEL_RESERVE_FLOOR_BYTES = 4_096;
 
 export interface LearningDatasetManifest {
   manifestVersion: typeof LEARNING_MANIFEST_VERSION;
@@ -141,7 +148,7 @@ export class LearningSampleStore {
     this.manifest = {
       manifestVersion: LEARNING_MANIFEST_VERSION,
       schemaVersion: LEARNING_SAMPLE_SCHEMA_VERSION,
-      featureSchemaVersion: "native-v2-shadow-features-v1",
+      featureSchemaVersion: NATIVE_V2_SHADOW_FEATURE_VERSION,
       createdAt: now,
       updatedAt: now,
       gitSha: this.gitSha,
@@ -158,10 +165,19 @@ export class LearningSampleStore {
     };
   }
 
-  /** Rebuild dedupe index from durable segments (safe to call on every construction). */
+  /**
+   * Rebuild dedupe index from durable segments.
+   * Fail-soft: filesystem / segment failures degrade learning only — never throw.
+   */
   init(): void {
     if (!this.enabled || this.initialized) return;
-    this.rebuildFromDisk();
+    try {
+      this.rebuildFromDisk();
+    } catch (error) {
+      this.noteFailure(error);
+      // Mark initialized so callers do not re-enter a throwing rebuild loop.
+      this.initialized = true;
+    }
   }
 
   /**
@@ -223,7 +239,7 @@ export class LearningSampleStore {
 
       const line = `${JSON.stringify({ kind: "sample", sample } satisfies SegmentRow)}\n`;
       const lineBytes = Buffer.byteLength(line, "utf8");
-      if (this.manifest.bytes + lineBytes > this.maxBytes) {
+      if (this.manifest.bytes + lineBytes > this.sampleWriteCeiling()) {
         this.noteFailure(new Error("LEARNING_CAPACITY_EXCEEDED"));
         break;
       }
@@ -279,18 +295,33 @@ export class LearningSampleStore {
         at: settlement.labeledAt!,
       } satisfies SegmentRow)}\n`;
       const lineBytes = Buffer.byteLength(line, "utf8");
+      // Labels may consume the reserved label headroom past the sample ceiling.
       if (this.manifest.bytes + lineBytes > this.maxBytes) {
         this.noteFailure(new Error("LEARNING_CAPACITY_EXCEEDED"));
         break;
       }
-      this.appendLine(line, lineBytes);
+      try {
+        this.appendLine(line, lineBytes);
+      } catch (error) {
+        this.noteFailure(error);
+        break;
+      }
       this.labeledSampleIds.add(sampleId);
       applied += 1;
       this.labelsApplied += 1;
     }
-    this.unresolvedMarkets.delete(marketId);
+    // Keep market unresolved until every related sample has an authoritative label.
+    const allLabeled = [...sampleIds].every((id) => this.labeledSampleIds.has(id));
+    if (allLabeled) this.unresolvedMarkets.delete(marketId);
+    else this.unresolvedMarkets.add(marketId);
     this.syncManifestCounts();
-    this.persistManifest();
+    try {
+      this.persistManifest();
+    } catch (error) {
+      this.noteFailure(error);
+      // Partial durable labels still leave the market retryable.
+      this.unresolvedMarkets.add(marketId);
+    }
     return applied;
   }
 
@@ -360,6 +391,7 @@ export class LearningSampleStore {
           ...parsed,
           maxBytes: this.maxBytes,
           checkpointSeconds: [...this.checkpointSeconds],
+          featureSchemaVersion: NATIVE_V2_SHADOW_FEATURE_VERSION,
         };
       } catch {
         // rebuild from segments only
@@ -375,7 +407,9 @@ export class LearningSampleStore {
         if (!line.trim()) continue;
         try {
           const row = JSON.parse(line) as SegmentRow;
-          if (row.kind === "sample") this.indexSample(row.sample, false);
+          if (row.kind === "sample") {
+            this.indexSample(row.sample, false);
+          }
           else if (row.kind === "label") {
             this.labeledSampleIds.add(row.sampleId);
             this.unresolvedMarkets.delete(row.marketId);
@@ -476,6 +510,18 @@ export class LearningSampleStore {
       .filter((name) => /^segment-\d+\.jsonl$/.test(name))
       .sort()
       .map((name) => path.join(dir, name));
+  }
+
+  /** Bytes reserved for settlement labels near the sample capacity ceiling. */
+  private labelReserveBytes(): number {
+    const ratioReserve = Math.floor(this.maxBytes * DEFAULT_LEARNING_LABEL_RESERVE_RATIO);
+    const reserve = Math.max(ratioReserve, DEFAULT_LEARNING_LABEL_RESERVE_FLOOR_BYTES);
+    return Math.min(reserve, Math.floor(this.maxBytes / 2));
+  }
+
+  /** Sample writes stop before this ceiling so labels retain bounded headroom. */
+  private sampleWriteCeiling(): number {
+    return Math.max(0, this.maxBytes - this.labelReserveBytes());
   }
 
   private noteFailure(error: unknown): void {

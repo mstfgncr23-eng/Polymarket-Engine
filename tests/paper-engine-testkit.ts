@@ -1,3 +1,6 @@
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { mkdtempSync } from "node:fs";
 import {
   createId,
   engineEnvSchema,
@@ -211,11 +214,15 @@ export function paperFill(marketId: string, outcome: "UP" | "DOWN", price = "0.4
   return { ...fill(outcome, price, "10"), marketId, tokenId: `${marketId}-${outcome.toLowerCase()}`, ...extra };
 }
 
+/** Writable per-process learning/CF root for Engine tests (CI cannot mkdir /data). */
+const TEST_LEARNING_DATA_DIR = mkdtempSync(join(tmpdir(), "pm-learning-test-"));
+
 export function qualifiedPaperEnv(overrides: Record<string, string | undefined> = {}): EngineEnv {
   return engineEnvSchema.parse({
     NODE_ENV: "test", JOURNAL_MODE: "memory", TRADING_MODE: "paper",
     ...grokPaperEnv(),
     DISCOVERY_INTERVAL_MS: "3600000",
+    LEARNING_DATA_DIR: TEST_LEARNING_DATA_DIR,
     ...overrides,
   });
 }

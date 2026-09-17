@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -119,28 +119,54 @@ describe("learning checkpoint crossing + identity", () => {
     expect(learningSampleId("m1", "T-60")).toBe("m1::T-60");
   });
 
-  it("selects first crossing observation and skips already sampled + invalid horizon checkpoints", () => {
+  it("selects nearest eligible checkpoint band; never fans out historical samples", () => {
     const schedule = [240, 180, 120, 60, 30, 15, 5];
-    const first = selectCrossedCheckpoints({
+
+    expect(selectCrossedCheckpoints({
+      timeToExpiryMs: 62_400,
+      checkpointSeconds: schedule,
+      alreadySampledCheckpointIds: new Set(),
+    })).toEqual([]);
+    expect(selectCrossedCheckpoints({
+      timeToExpiryMs: 59_700,
+      checkpointSeconds: schedule,
+      alreadySampledCheckpointIds: new Set(),
+    }).map((item) => item.checkpointId)).toEqual(["T-60"]);
+
+    expect(selectCrossedCheckpoints({
+      timeToExpiryMs: 25_000,
+      checkpointSeconds: schedule,
+      alreadySampledCheckpointIds: new Set(),
+    }).map((item) => item.checkpointId)).toEqual(["T-30"]);
+
+    expect(selectCrossedCheckpoints({
       timeToExpiryMs: 50_000,
       checkpointSeconds: schedule,
       alreadySampledCheckpointIds: new Set(),
-    });
-    expect(first.map((item) => item.checkpointId)).toEqual(["T-240", "T-180", "T-120", "T-60"]);
+    }).map((item) => item.checkpointId)).toEqual(["T-60"]);
 
-    const second = selectCrossedCheckpoints({
+    expect(selectCrossedCheckpoints({
+      timeToExpiryMs: 250_000,
+      checkpointSeconds: schedule,
+      alreadySampledCheckpointIds: new Set(),
+    })).toEqual([]);
+    expect(selectCrossedCheckpoints({
+      timeToExpiryMs: 35_000,
+      checkpointSeconds: schedule,
+      alreadySampledCheckpointIds: new Set(),
+    })).toEqual([]);
+
+    expect(selectCrossedCheckpoints({
       timeToExpiryMs: 50_000,
       checkpointSeconds: schedule,
-      alreadySampledCheckpointIds: new Set(first.map((item) => item.checkpointId)),
-    });
-    expect(second).toEqual([]);
+      alreadySampledCheckpointIds: new Set(["T-60"]),
+    })).toEqual([]);
 
-    const later = selectCrossedCheckpoints({
+    expect(selectCrossedCheckpoints({
       timeToExpiryMs: 4_000,
       checkpointSeconds: schedule,
-      alreadySampledCheckpointIds: new Set(first.map((item) => item.checkpointId)),
-    });
-    expect(later.map((item) => item.checkpointId)).toEqual(["T-30", "T-15", "T-5"]);
+      alreadySampledCheckpointIds: new Set(["T-60"]),
+    }).map((item) => item.checkpointId)).toEqual(["T-5"]);
 
     expect(selectCrossedCheckpoints({
       timeToExpiryMs: null,
@@ -200,6 +226,7 @@ describe("LearningSampleStore durability + labeling", () => {
     });
     store.init();
 
+    // One observation in the T-60 band → exactly one sample (no historical fan-out).
     const first = store.observe({
       marketId: "m1",
       asset: "BTC",
@@ -209,7 +236,7 @@ describe("LearningSampleStore durability + labeling", () => {
       experimentId: "exp-1",
       gitSha: "deadbeef",
     });
-    expect(first.map((s) => s.checkpointId).sort()).toEqual(["T-120", "T-180", "T-240", "T-60"]);
+    expect(first.map((s) => s.checkpointId)).toEqual(["T-60"]);
 
     const again = store.observe({
       marketId: "m1",
@@ -221,19 +248,19 @@ describe("LearningSampleStore durability + labeling", () => {
     expect(again).toEqual([]);
 
     const before = store.summary();
-    expect(before.sampleCount).toBe(4);
+    expect(before.sampleCount).toBe(1);
     expect(before.unresolvedMarketCount).toBe(1);
     expect(store.getManifest().schemaVersion).toBe(LEARNING_SAMPLE_SCHEMA_VERSION);
+    expect(store.getManifest().featureSchemaVersion).toBe(NATIVE_V2_SHADOW_FEATURE_VERSION);
     expect(store.getManifest().gitSha).toBe("deadbeef");
 
-    
     const reopened = new LearningSampleStore({
       dataDir,
       checkpointSeconds: "240,180,120,60,30,15,5",
       gitSha: "deadbeef",
     });
     reopened.init();
-    expect(reopened.summary().sampleCount).toBe(4);
+    expect(reopened.summary().sampleCount).toBe(1);
     expect(reopened.unresolvedLearningMarketIds()).toEqual(["m1"]);
     const third = reopened.observe({
       marketId: "m1",
@@ -247,10 +274,18 @@ describe("LearningSampleStore durability + labeling", () => {
 
   it("keeps unresolved unlabeled until authoritative resolution; labels without economic settlement", () => {
     const dataDir = tempDir();
-    const features = vector({ marketId: "orphan-mkt", timeToExpiryMs: 20_000 });
+    const features = vector({ marketId: "orphan-mkt", timeToExpiryMs: 12_000 });
     const fair = evaluateNativeV2ShadowFairProbability(features)!;
     const store = new LearningSampleStore({ dataDir, checkpointSeconds: "30,15,5" });
     store.init();
+    // Observe inside checkpoint bands so samples exist for labeling.
+    store.observe({
+      marketId: "orphan-mkt",
+      asset: "ETH",
+      now: new Date(),
+      featureVector: vector({ marketId: "orphan-mkt", timeToExpiryMs: 25_000 }),
+      v2FairProbability: fair,
+    });
     store.observe({
       marketId: "orphan-mkt",
       asset: "ETH",
@@ -300,7 +335,7 @@ describe("LearningSampleStore durability + labeling", () => {
       v2FairProbability: fair,
     })).not.toThrow();
 
-    // Capacity: tiny maxBytes marks degraded and does not throw.
+    // Capacity: observe inside an eligible band into a tiny budget.
     expect(() => store.tryObserve({
       marketId: "m1",
       asset: "BTC",
@@ -315,13 +350,14 @@ describe("LearningSampleStore durability + labeling", () => {
       expect(summary.degraded).toBe(true);
       expect(summary.lastError).toBeTruthy();
     } else {
-      // Fill until capacity
+      // Fill until capacity via fresh markets that cross into sampleable territory.
       for (let i = 0; i < 50; i += 1) {
+        const id = `m-${i}`;
         store.tryObserve({
-          marketId: `m-${i}`,
+          marketId: id,
           asset: "BTC",
           now: new Date(),
-          featureVector: vector({ marketId: `m-${i}`, timeToExpiryMs: 55_000 }),
+          featureVector: vector({ marketId: id, timeToExpiryMs: 55_000 }),
           v2FairProbability: fair,
         });
       }
@@ -346,3 +382,220 @@ describe("LearningSampleStore durability + labeling", () => {
     })).toEqual([]);
   });
 });
+
+describe("PR64 review blocker regressions", () => {
+  it("A) learning store init fails soft on unwritable filesystem", () => {
+    const parent = tempDir();
+    const blocker = join(parent, "not-a-dir");
+    writeFileSync(blocker, "x"); // path exists as a file → mkdir of segments fails
+    const features = vector({ timeToExpiryMs: 55_000 });
+    const fair = evaluateNativeV2ShadowFairProbability(features)!;
+    const store = new LearningSampleStore({
+      dataDir: blocker,
+      enabled: true,
+      checkpointSeconds: "60,30",
+    });
+    expect(() => store.init()).not.toThrow();
+    expect(store.summary().degraded).toBe(true);
+    expect(store.summary().lastError).toBeTruthy();
+    // Observe path remains fail-soft; trading callers must not see throws.
+    expect(() => store.tryObserve({
+      marketId: "m1",
+      asset: "BTC",
+      now: new Date(),
+      featureVector: features,
+      v2FairProbability: fair,
+    })).not.toThrow();
+  });
+
+  it("B) late first observation does not backfill; restart dedupe stays deterministic", () => {
+    const dataDir = tempDir();
+    const lateFeatures = vector({ timeToExpiryMs: 50_000 });
+    const fair = evaluateNativeV2ShadowFairProbability(lateFeatures)!;
+    const store = new LearningSampleStore({
+      dataDir,
+      checkpointSeconds: "240,180,120,60,30,15,5",
+    });
+    store.init();
+
+    const late = store.observe({
+      marketId: "m-late",
+      asset: "BTC",
+      now: new Date("2026-09-16T17:00:00.000Z"),
+      featureVector: lateFeatures,
+      v2FairProbability: fair,
+    });
+    expect(late.map((s) => s.checkpointId)).toEqual(["T-60"]);
+    expect(store.summary().sampleCount).toBe(1);
+
+    const crossed = store.observe({
+      marketId: "m-cross",
+      asset: "BTC",
+      now: new Date("2026-09-16T17:00:02.000Z"),
+      featureVector: vector({ timeToExpiryMs: 25_000 }),
+      v2FairProbability: fair,
+    });
+    expect(crossed.map((s) => s.checkpointId)).toEqual(["T-30"]);
+
+    const reopened = new LearningSampleStore({
+      dataDir,
+      checkpointSeconds: "240,180,120,60,30,15,5",
+    });
+    reopened.init();
+    expect(reopened.summary().sampleCount).toBe(2);
+    expect(reopened.observe({
+      marketId: "m-cross",
+      asset: "BTC",
+      now: new Date("2026-09-16T17:00:03.000Z"),
+      featureVector: vector({ timeToExpiryMs: 25_000 }),
+      v2FairProbability: fair,
+    })).toEqual([]);
+    const afterRestart = reopened.observe({
+      marketId: "m-cross",
+      asset: "BTC",
+      now: new Date("2026-09-16T17:00:04.000Z"),
+      featureVector: vector({ timeToExpiryMs: 12_000 }),
+      v2FairProbability: fair,
+    });
+    expect(afterRestart.map((s) => s.checkpointId)).toEqual(["T-15"]);
+  });
+
+  it("C) partial label write keeps market unresolved until all samples labeled", () => {
+    const dataDir = tempDir();
+    const fair = evaluateNativeV2ShadowFairProbability(vector({ timeToExpiryMs: 55_000 }))!;
+    const store = new LearningSampleStore({
+      dataDir,
+      checkpointSeconds: "60,30,15",
+      maxBytes: 5_000_000,
+    });
+    store.init();
+
+    const accepted = [
+      ...store.observe({
+        marketId: "m-partial",
+        asset: "BTC",
+        now: new Date("2026-09-16T17:00:00.000Z"),
+        featureVector: vector({ timeToExpiryMs: 55_000 }),
+        v2FairProbability: fair,
+      }),
+      ...store.observe({
+        marketId: "m-partial",
+        asset: "BTC",
+        now: new Date("2026-09-16T17:00:01.000Z"),
+        featureVector: vector({ timeToExpiryMs: 25_000 }),
+        v2FairProbability: fair,
+      }),
+      ...store.observe({
+        marketId: "m-partial",
+        asset: "BTC",
+        now: new Date("2026-09-16T17:00:02.000Z"),
+        featureVector: vector({ timeToExpiryMs: 12_000 }),
+        v2FairProbability: fair,
+      }),
+    ];
+    expect(accepted.map((s) => s.checkpointId)).toEqual(["T-60", "T-30", "T-15"]);
+    expect(store.unresolvedLearningMarketIds()).toEqual(["m-partial"]);
+
+    // Reopen with maxBytes that fits existing bytes + ~1 label, not all 3.
+    const bytesNow = store.summary().bytes;
+    const tight = new LearningSampleStore({
+      dataDir,
+      checkpointSeconds: "60,30,15",
+      // Empirically one label row is a few hundred bytes; 600 fits one, not three.
+      maxBytes: bytesNow + 600,
+    });
+    tight.init();
+    const partial = tight.labelMarket("m-partial", resolvedGamma("UP"));
+    expect(partial).toBeGreaterThan(0);
+    expect(partial).toBeLessThan(3);
+    expect(tight.unresolvedLearningMarketIds()).toContain("m-partial");
+    expect(tight.summary().degraded).toBe(true);
+
+    // Retry with room must finish authoritative labels and clear unresolved.
+    const roomier = new LearningSampleStore({
+      dataDir,
+      checkpointSeconds: "60,30,15",
+      maxBytes: 5_000_000,
+    });
+    roomier.init();
+    expect(roomier.unresolvedLearningMarketIds()).toContain("m-partial");
+    const retry = roomier.labelMarket("m-partial", resolvedGamma("UP"));
+    expect(retry).toBe(3 - partial);
+    expect(roomier.unresolvedLearningMarketIds()).not.toContain("m-partial");
+    expect(roomier.readSamplesForTest()
+      .filter((s) => s.marketId === "m-partial")
+      .every((s) => s.settlement.status === "resolved" && s.settlement.outcome === "UP")).toBe(true);
+  });
+
+  it("E) restart before any checkpoint sample still allows currently eligible band", () => {
+    const dataDir = tempDir();
+    const fair = evaluateNativeV2ShadowFairProbability(vector({ timeToExpiryMs: 25_000 }))!;
+
+    const store = new LearningSampleStore({
+      dataDir,
+      checkpointSeconds: "240,180,120,60,30,15,5",
+    });
+    store.init();
+    expect(store.observe({
+      marketId: "m-restart",
+      asset: "BTC",
+      now: new Date("2026-09-16T17:00:00.000Z"),
+      featureVector: vector({ timeToExpiryMs: 35_000 }),
+      v2FairProbability: fair,
+    })).toEqual([]);
+    expect(store.summary().sampleCount).toBe(0);
+
+    const reopened = new LearningSampleStore({
+      dataDir,
+      checkpointSeconds: "240,180,120,60,30,15,5",
+    });
+    reopened.init();
+    const after = reopened.observe({
+      marketId: "m-restart",
+      asset: "BTC",
+      now: new Date("2026-09-16T17:00:01.000Z"),
+      featureVector: vector({ timeToExpiryMs: 25_000 }),
+      v2FairProbability: fair,
+    });
+    expect(after.map((s) => s.checkpointId)).toEqual(["T-30"]);
+    expect(reopened.summary().sampleCount).toBe(1);
+  });
+
+  it("F) large observation gap produces at most one sample from current features", () => {
+    const dataDir = tempDir();
+    const fair = evaluateNativeV2ShadowFairProbability(vector({ timeToExpiryMs: 50_000 }))!;
+    const store = new LearningSampleStore({
+      dataDir,
+      checkpointSeconds: "240,180,120,60,30,15,5",
+    });
+    store.init();
+
+    expect(store.observe({
+      marketId: "m-gap",
+      asset: "BTC",
+      now: new Date("2026-09-16T16:59:00.000Z"),
+      featureVector: vector({ timeToExpiryMs: 250_000 }),
+      v2FairProbability: fair,
+    })).toEqual([]);
+
+    const gap = store.observe({
+      marketId: "m-gap",
+      asset: "BTC",
+      now: new Date("2026-09-16T17:00:00.000Z"),
+      featureVector: vector({ timeToExpiryMs: 50_000 }),
+      v2FairProbability: fair,
+    });
+    expect(gap.map((s) => s.checkpointId)).toEqual(["T-60"]);
+    expect(gap).toHaveLength(1);
+    expect(store.summary().sampleCount).toBe(1);
+  });
+
+  it("D) manifest featureSchemaVersion uses NATIVE_V2_SHADOW_FEATURE_VERSION SoT", () => {
+    const dataDir = tempDir();
+    const store = new LearningSampleStore({ dataDir, checkpointSeconds: "60" });
+    store.init();
+    expect(store.getManifest().featureSchemaVersion).toBe(NATIVE_V2_SHADOW_FEATURE_VERSION);
+    expect(store.getManifest().featureSchemaVersion).not.toBe("HARDCODED_SHOULD_NOT_APPEAR");
+  });
+});
+

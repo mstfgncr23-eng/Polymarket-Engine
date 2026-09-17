@@ -58,7 +58,9 @@ is ephemeral.
 ## Sample identity + checkpoints
 
 - Identity: `${marketId}::${checkpointId}` (e.g. `mkt-1::T-60`)
-- Crossing: first observation where `feature.timing.timeToExpiryMs <= checkpointMs`
+- Checkpoint selection: deterministic nearest-eligible band from durable sample IDs + current TTE
+  (each checkpoint C owns `(midpoint(S, C), C]` vs next-smaller neighbor S; at most one sample per observation)
+- Restart-safe: does not depend on volatile previous-TTE cursors or hot-path cursor writes
 - Exactly one logical sample per market+checkpoint
 - `timeToExpiryMs === null` → skip sampling (no invented timing)
 - Invalid checkpoint seconds (non-positive / non-integer) are skipped

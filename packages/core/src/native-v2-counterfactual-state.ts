@@ -155,10 +155,20 @@ export class NativeV2CounterfactualStore {
     this.ledger = new PaperLedger(this.startingBalance, new Date(this.createdAt));
   }
 
+  /**
+   * Rebuild / open durable segments.
+   * Fail-soft: filesystem failures degrade counterfactual persistence only - never throw.
+   */
   init(): void {
     if (!this.enabled || this.initialized) return;
-    if (this.durable) this.rebuildFromDisk();
-    this.initialized = true;
+    try {
+      if (this.durable) this.rebuildFromDisk();
+      this.initialized = true;
+    } catch (error) {
+      this.noteFailure(error);
+      // Mark initialized so callers do not re-enter a throwing rebuild loop.
+      this.initialized = true;
+    }
   }
 
   /** Decision-time portfolio view for Phase-4 shadow risk/execution (V2-only). */

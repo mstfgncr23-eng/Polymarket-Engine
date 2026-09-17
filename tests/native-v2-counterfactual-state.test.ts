@@ -78,7 +78,8 @@ function order(marketId = "m1"): PaperOrder {
 
 describe("Native V2 counterfactual state", () => {
   it("places durable files under LEARNING_DATA_DIR/counterfactual", () => {
-    expect(counterfactualDataDir("/data/learning")).toBe("/data/learning/counterfactual");
+    // path.join is platform-specific; assert the CF subdir contract, not POSIX separators.
+    expect(counterfactualDataDir("/data/learning")).toBe(join("/data/learning", "counterfactual"));
   });
 
   it("first hypothetical would-submit changes V2-only state; V1 ledger unchanged", () => {
