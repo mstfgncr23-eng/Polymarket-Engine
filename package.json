@@ -23,7 +23,8 @@
     "storage:watchdog": "tsx packages/db/scripts/storage-watchdog.ts",
     "bench:stability": "tsx scripts/stability-hot-path-bench.ts",
     "bench:sustained": "tsx scripts/sustained-capacity-harness.ts",
-    "bench:retention": "tsx scripts/report-retention-bench.ts"
+    "bench:retention": "tsx scripts/report-retention-bench.ts",
+    "learning:train-validate": "tsx scripts/learning-train-validate.ts"
   },
   "devDependencies": {
     "@types/node": "26.4.0",
