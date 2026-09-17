@@ -241,6 +241,11 @@ type NativeV2ShadowExecutionCapture = {
   experimentEntryOpen: boolean;
   executionErrorsLastHour: number;
   shuttingDown: boolean;
+  /**
+   * Authoritative YES/NO mapping captured at decision-time reserve.
+   * evaluateNativeV2ShadowExecution must not re-resolve from live marketsById.
+   */
+  settlementLookup: BinarySettlementLookup | null;
 };
 
 export class EngineService {
@@ -341,6 +346,7 @@ export class EngineService {
   private lastShutdownCheckpointed = false;
   private maintenanceHold: Promise<void> | null = null;
   private processTriggerHold: Promise<void> | null = null;
+  private nativeV2ShadowEvalHoldForTest: Promise<void> | null = null;
   private triggerEventPersistHold: Promise<void> | null = null;
   private sourceSealing = false;
   private sourceSealed = false;
@@ -2267,6 +2273,11 @@ export class EngineService {
     const cfState = this.counterfactualStore.decisionState();
     const blocked = asset ? this.referenceBlocked.get(asset) : undefined;
 
+    const discoveredAtDecision = this.marketsById.get(marketId);
+    const settlementLookupAtDecision = discoveredAtDecision
+      ? this.settlementLookupFromMarket(discoveredAtDecision)
+      : null;
+
     const capture: NativeV2ShadowExecutionCapture = {
       trigger: structuredClone(input.trigger),
       featureVector: structuredClone(input.featureVector),
@@ -2281,6 +2292,7 @@ export class EngineService {
       asset,
       currentSnapshot: currentSnapshot ? structuredClone(currentSnapshot) : null,
       selected: selected ? structuredClone(selected) : null,
+      settlementLookup: settlementLookupAtDecision ? structuredClone(settlementLookupAtDecision) : null,
       evidenceIds: [...new Set([
         ...input.trigger.sourceEventIds,
         ...(input.trigger.evidenceIds ?? []),
@@ -2313,6 +2325,14 @@ export class EngineService {
 
   private dispatchNativeV2ShadowExecution(capture: NativeV2ShadowExecutionCapture): void {
     const handle = setImmediate(() => {
+      void this.runNativeV2ShadowExecution(capture);
+    });
+    handle.unref?.();
+  }
+
+  private async runNativeV2ShadowExecution(capture: NativeV2ShadowExecutionCapture): Promise<void> {
+    try {
+      if (this.nativeV2ShadowEvalHoldForTest) await this.nativeV2ShadowEvalHoldForTest;
       try {
         const execution = this.evaluateNativeV2ShadowExecution(capture);
         const selectedAtDecision = capture.opportunity.best;
@@ -2372,8 +2392,10 @@ export class EngineService {
       } finally {
         this.nativeV2ShadowExecutionBusy = false;
       }
-    });
-    handle.unref?.();
+    } catch (error) {
+      this.nativeV2ShadowExecutionBusy = false;
+      this.logger.error({ err: error, marketId: capture.opportunity.marketId }, "native v2 shadow execution dispatch failed");
+    }
   }
 
   private evaluateNativeV2ShadowExecution(input: NativeV2ShadowExecutionCapture): Record<string, unknown> {
@@ -2479,22 +2501,38 @@ export class EngineService {
     let counterfactual: Record<string, unknown> | null = null;
     if (wouldSubmitOrder && decision.order && this.counterfactualStore.isRecoveryReady()) {
       const actionKey = nativeV2CounterfactualActionKey(marketId, selectedAtDecision.outcome, "OPEN_FIRST_LEG");
-      const discovered = this.marketsById.get(marketId);
-      const commit = this.counterfactualStore.tryCommitWouldSubmit({
-        actionKey,
-        order: decision.order,
-        snapshot: input.currentSnapshot,
-        measuredLatencyMs: 0,
-        at: now,
-        settlementLookup: discovered ? (this.settlementLookupFromMarket(discovered) ?? undefined) : undefined,
-      });
-      counterfactual = {
-        actionKey,
-        applied: commit.applied,
-        reason: commit.applied ? null : commit.reason,
-        fillId: commit.applied ? commit.fill.id : null,
-        summary: this.counterfactualStore.summary(),
-      };
+      // Decision-time capture only — discovery refresh after reserve must not change historical settlement semantics.
+      const capturedLookup = input.settlementLookup;
+      if (
+        !capturedLookup
+        || capturedLookup.marketId !== marketId
+        || !isAuthoritativeBinaryMapping(capturedLookup.yesMapsTo, capturedLookup.noMapsTo)
+      ) {
+        // Production-shaped qualified actionable CF fill without restart-safe lookup must not durable-accept.
+        counterfactual = {
+          actionKey,
+          applied: false,
+          reason: "MISSING_SETTLEMENT_LOOKUP",
+          fillId: null,
+          summary: this.counterfactualStore.summary(),
+        };
+      } else {
+        const commit = this.counterfactualStore.tryCommitWouldSubmit({
+          actionKey,
+          order: decision.order,
+          snapshot: input.currentSnapshot,
+          measuredLatencyMs: 0,
+          at: now,
+          settlementLookup: structuredClone(capturedLookup),
+        });
+        counterfactual = {
+          actionKey,
+          applied: commit.applied,
+          reason: commit.applied ? null : commit.reason,
+          fillId: commit.applied ? commit.fill.id : null,
+          summary: this.counterfactualStore.summary(),
+        };
+      }
     }
 
     return {
@@ -4813,6 +4851,14 @@ export class EngineService {
   }
   setMaintenanceHoldForTest(hold: Promise<void> | null): void { this.maintenanceHold = hold; }
   setProcessTriggerHoldForTest(hold: Promise<void> | null): void { this.processTriggerHold = hold; }
+  setNativeV2ShadowEvalHoldForTest(hold: Promise<void> | null): void { this.nativeV2ShadowEvalHoldForTest = hold; }
+  /** Test helper: simulate discovery removing a market from live maps after decision-time capture. */
+  dropLiveMarketForTest(marketId: string): void {
+    this.marketsById.delete(marketId);
+    this.entryQualified.delete(marketId);
+    this.managedMarketIds.delete(marketId);
+    this.assetByMarket.delete(marketId);
+  }
   setTriggerEventPersistHoldForTest(hold: Promise<void> | null): void { this.triggerEventPersistHold = hold; }
   setSourceSealTimeoutForTest(ms: number): void { this.sourceSealTimeoutMs = Math.max(1, ms); }
   setSourceSealPersistHoldForTest(hold: Promise<void> | null): void { this.sourceSealPersistHold = hold; }

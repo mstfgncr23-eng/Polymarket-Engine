@@ -15,7 +15,7 @@ import {
   type NativeV2ShadowFeatureVector,
 } from "./native-v2-shadow-features.js";
 import type { Outcome } from "./domain.js";
-import { parsePublicBinaryResolution, type BinarySettlementLookup } from "./settlement.js";
+import { isAuthoritativeBinaryMapping, parsePublicBinaryResolution, type BinarySettlementLookup } from "./settlement.js";
 import {
   LEARNING_SAMPLE_SCHEMA_VERSION,
   buildLearningSampleV1,
@@ -225,6 +225,15 @@ export class LearningSampleStore {
     });
     if (crossed.length === 0) return [];
 
+    // Authoritative accept-time lookup is serialized ON the sample row (same append
+    // boundary). Split state — durable sample without required lookup — is impossible.
+    const authoritativeLookup =
+      input.settlementLookup
+      && input.settlementLookup.marketId === input.marketId
+      && isAuthoritativeBinaryMapping(input.settlementLookup.yesMapsTo, input.settlementLookup.noMapsTo)
+        ? structuredClone(input.settlementLookup)
+        : undefined;
+
     const accepted: LearningSampleV1[] = [];
     for (const checkpoint of crossed) {
       const sampleId = learningSampleId(input.marketId, checkpoint.checkpointId);
@@ -244,7 +253,10 @@ export class LearningSampleStore {
         gitSha: input.gitSha ?? this.gitSha,
       });
 
-      const line = `${JSON.stringify({ kind: "sample", sample } satisfies SegmentRow)}\n`;
+      const row: SegmentRow = authoritativeLookup
+        ? { kind: "sample", sample, settlementLookup: structuredClone(authoritativeLookup) }
+        : { kind: "sample", sample };
+      const line = `${JSON.stringify(row)}\n`;
       const lineBytes = Buffer.byteLength(line, "utf8");
       if (this.manifest.bytes + lineBytes > this.sampleWriteCeiling()) {
         this.noteFailure(new Error("LEARNING_CAPACITY_EXCEEDED"));
@@ -253,10 +265,10 @@ export class LearningSampleStore {
 
       this.appendLine(line, lineBytes);
       this.indexSample(sample);
-      accepted.push(sample);
-      if (input.settlementLookup && input.settlementLookup.marketId === input.marketId) {
-        this.persistSettlementLookup(input.settlementLookup, input.now);
+      if (authoritativeLookup) {
+        this.settlementLookups.set(authoritativeLookup.marketId, structuredClone(authoritativeLookup));
       }
+      accepted.push(sample);
     }
     if (accepted.length > 0) this.persistManifest();
     return accepted;
@@ -391,6 +403,20 @@ export class LearningSampleStore {
       }
     }
     return [...byId.values()].sort((a, b) => a.sampleId.localeCompare(b.sampleId));
+  }
+
+  /** Test helper: raw segment rows for atomic accept-boundary assertions. */
+  readSegmentRowsForTest(): SegmentRow[] {
+    this.init();
+    const rows: SegmentRow[] = [];
+    for (const segmentPath of this.listSegmentPaths()) {
+      const text = readFileSync(segmentPath, "utf8");
+      for (const line of text.split("\n")) {
+        if (!line.trim()) continue;
+        rows.push(JSON.parse(line) as SegmentRow);
+      }
+    }
+    return rows;
   }
 
   private rebuildFromDisk(): void {
@@ -553,34 +579,6 @@ export class LearningSampleStore {
   }
 
 
-  private persistSettlementLookup(lookup: BinarySettlementLookup, at: Date): void {
-    const existing = this.settlementLookups.get(lookup.marketId);
-    if (
-      existing
-      && existing.slug === lookup.slug
-      && existing.endDate === lookup.endDate
-      && existing.yesMapsTo === lookup.yesMapsTo
-      && existing.noMapsTo === lookup.noMapsTo
-    ) {
-      return;
-    }
-    const line = `${JSON.stringify({
-      kind: "settlement_lookup",
-      lookup: structuredClone(lookup),
-      at: at.toISOString(),
-    } satisfies SegmentRow)}\n`;
-    const lineBytes = Buffer.byteLength(line, "utf8");
-    if (this.manifest.bytes + lineBytes > this.maxBytes) {
-      this.noteFailure(new Error("LEARNING_CAPACITY_EXCEEDED"));
-      return;
-    }
-    try {
-      this.appendLine(line, lineBytes);
-      this.settlementLookups.set(lookup.marketId, structuredClone(lookup));
-    } catch (error) {
-      this.noteFailure(error);
-    }
-  }
 
   private noteFailure(error: unknown): void {
     this.degraded = true;

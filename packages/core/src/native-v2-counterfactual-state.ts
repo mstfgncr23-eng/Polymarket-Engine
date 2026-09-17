@@ -13,7 +13,7 @@ import { PaperLedger } from "./accounting.js";
 import type { LedgerState, MarketSnapshot, Outcome, PaperFill, PaperOrder, Position } from "./domain.js";
 import { executePaperTaker } from "./execution.js";
 import type { LearningSettlementLabel } from "./learning-sample.js";
-import type { BinarySettlementLookup } from "./settlement.js";
+import { isAuthoritativeBinaryMapping, type BinarySettlementLookup } from "./settlement.js";
 import { DEFAULT_LEARNING_DATA_DIR, DEFAULT_LEARNING_MAX_BYTES } from "./learning-store.js";
 
 export const NATIVE_V2_COUNTERFACTUAL_MANIFEST_VERSION = 1 as const;
@@ -172,7 +172,8 @@ export type CounterfactualCommitResult =
       | "CAPACITY_EXCEEDED"
       | "DISABLED"
       | "RECOVERY_UNAVAILABLE"
-      | "MARKET_SETTLED";
+      | "MARKET_SETTLED"
+      | "MISSING_SETTLEMENT_LOOKUP";
     detail?: string;
   };
 
@@ -488,6 +489,23 @@ export class NativeV2CounterfactualStore {
       return { applied: false, reason: "DUPLICATE_ACTION", detail: "EXISTING_UNPAIRED_POSITION" };
     }
     if (!input.order) return { applied: false, reason: "NO_ORDER" };
+
+    // Durable CF fills require restart-safe authoritative settlement lookup at accept time.
+    // Do not invent YES→UP / NO→DOWN after discovery drops the market.
+    if (this.durable) {
+      const lookup = input.settlementLookup;
+      if (
+        !lookup
+        || lookup.marketId !== input.order.marketId
+        || !isAuthoritativeBinaryMapping(lookup.yesMapsTo, lookup.noMapsTo)
+      ) {
+        return {
+          applied: false,
+          reason: "MISSING_SETTLEMENT_LOOKUP",
+          detail: "CF durable would-submit requires authoritative settlementLookup at accept time",
+        };
+      }
+    }
 
     try {
       const fill = executePaperTaker({

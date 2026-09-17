@@ -63,6 +63,16 @@ function snapshot(marketId = "m1"): MarketSnapshot {
   };
 }
 
+function settlementLookup(marketId = "m1") {
+  return {
+    marketId,
+    slug: `${marketId}-slug`,
+    endDate: "2026-09-17T09:00:00.000Z",
+    yesMapsTo: "UP" as const,
+    noMapsTo: "DOWN" as const,
+  };
+}
+
 function order(marketId = "m1"): PaperOrder {
   return {
     id: createId("order"),
@@ -100,6 +110,7 @@ describe("Native V2 counterfactual state", () => {
       order: order(),
       snapshot: snapshot(),
       at: NOW,
+      settlementLookup: settlementLookup("m1"),
     });
     expect(first.applied).toBe(true);
     if (!first.applied) throw new Error("expected apply");
@@ -127,6 +138,7 @@ describe("Native V2 counterfactual state", () => {
       order: order(),
       snapshot: snapshot(),
       at: NOW,
+      settlementLookup: settlementLookup("m1"),
     }).applied).toBe(true);
 
     const state = store.decisionState();
@@ -140,12 +152,13 @@ describe("Native V2 counterfactual state", () => {
     const store = new NativeV2CounterfactualStore({ dataDir: tempDir(), startingBalance: 1000 });
     store.init();
     const actionKey = nativeV2CounterfactualActionKey("m1", "UP");
-    const input = { actionKey, order: order(), snapshot: snapshot(), at: NOW };
+    const input = { actionKey, order: order(), snapshot: snapshot(), at: NOW, settlementLookup: settlementLookup("m1") };
     expect(store.tryCommitWouldSubmit(input).applied).toBe(true);
     const mid = store.summary();
     const dup = store.tryCommitWouldSubmit({
       ...input,
-      order: order(), // new order id, same action key
+      order: order(), // new order id, same action key,
+      settlementLookup: settlementLookup("m1"),
     });
     expect(dup.applied).toBe(false);
     if (dup.applied) throw new Error("expected duplicate");
@@ -162,6 +175,7 @@ describe("Native V2 counterfactual state", () => {
       order: order(),
       snapshot: snapshot(),
       at: NOW,
+      settlementLookup: settlementLookup("m1"),
     }).applied).toBe(true);
 
     const beforeSettle = store.summary();
@@ -186,6 +200,7 @@ describe("Native V2 counterfactual state", () => {
       order: order(),
       snapshot: snapshot(),
       at: NOW,
+      settlementLookup: settlementLookup("m1"),
     });
     expect(reopen.applied).toBe(false);
     if (reopen.applied) throw new Error("expected reject");
@@ -201,6 +216,7 @@ describe("Native V2 counterfactual state", () => {
       order: order(),
       snapshot: snapshot(),
       at: NOW,
+      settlementLookup: settlementLookup("m1"),
     }).applied).toBe(true);
     expect(first.trySettleMarket("m1", "1", "0", {
       at: new Date("2026-09-17T09:00:00.000Z"),
@@ -229,6 +245,7 @@ describe("Native V2 counterfactual state", () => {
       order: order(),
       snapshot: snapshot(),
       at: NOW,
+      settlementLookup: settlementLookup("m1"),
     }).applied).toBe(true);
     const rejected = store.trySettleFromLearningLabel("m1", {
       status: "unresolved",
@@ -254,6 +271,7 @@ describe("Native V2 counterfactual state", () => {
       order: order(),
       snapshot: snapshot(),
       at: NOW,
+      settlementLookup: settlementLookup("m1"),
     });
     expect(result.applied).toBe(false);
     if (result.applied) throw new Error("expected failure");
@@ -270,6 +288,7 @@ describe("Native V2 counterfactual state", () => {
       order: order("m2"),
       snapshot: snapshot("m2"),
       at: NOW,
+      settlementLookup: settlementLookup("m2"),
     });
     expect(again.applied).toBe(false);
     if (again.applied) throw new Error("expected reject");
@@ -293,6 +312,7 @@ describe("Native V2 counterfactual state", () => {
       order: order(),
       snapshot: snapshot(),
       at: NOW,
+      settlementLookup: settlementLookup("m1"),
     }).applied).toBe(true);
     const before = store.summary();
     expect(store.openPositionMarketIds()).toEqual(["m1"]);
@@ -331,6 +351,7 @@ describe("Native V2 counterfactual state", () => {
       order: order("m1"),
       snapshot: snapshot("m1"),
       at: NOW,
+      settlementLookup: settlementLookup("m1"),
     }).applied).toBe(true);
     expect(store.trySettleMarket("m1", "1", "0", { at: NOW }).applied).toBe(true);
     const afterExperimentA = store.summary();
@@ -343,6 +364,7 @@ describe("Native V2 counterfactual state", () => {
       order: order("m2"),
       snapshot: snapshot("m2"),
       at: NOW,
+      settlementLookup: settlementLookup("m2"),
     }).applied).toBe(true);
     const afterExperimentB = store.summary();
     expect(afterExperimentB.fillCount).toBe(2);
@@ -375,7 +397,8 @@ describe("Native V2 counterfactual state", () => {
         order: order(marketId),
         snapshot: snapshot(marketId),
         at: NOW,
-      });
+      settlementLookup: settlementLookup(marketId),
+    });
       if (!result.applied) {
         rejected = result;
         break;
@@ -420,7 +443,8 @@ describe("Native V2 counterfactual state", () => {
         order: order(marketId),
         snapshot: snapshot(marketId),
         at: NOW,
-      });
+      settlementLookup: settlementLookup(marketId),
+    });
       expect(store.summary().bytes).toBeLessThanOrEqual(maxBytes);
       if (!result.applied) {
         expect(result.reason).toBe("CAPACITY_EXCEEDED");
@@ -479,6 +503,7 @@ describe("Native V2 counterfactual state", () => {
       order: order(marketId),
       snapshot: snapshot(marketId),
       at: NOW,
+      settlementLookup: settlementLookup(marketId),
     });
     expect(filled.applied).toBe(true);
     expect(store.openPositionMarketIds()).toEqual([marketId]);
@@ -566,6 +591,7 @@ describe("Native V2 counterfactual state", () => {
       order: order(),
       snapshot: snapshot(),
       at: NOW,
+      settlementLookup: settlementLookup("m1"),
     });
     expect(rejected.applied).toBe(false);
     if (rejected.applied) throw new Error("expected reject");
@@ -579,6 +605,7 @@ describe("Native V2 counterfactual state", () => {
       order: order(),
       snapshot: snapshot(),
       at: NOW,
+      settlementLookup: settlementLookup("m1"),
     }).applied).toBe(false);
   });
 
@@ -591,6 +618,7 @@ describe("Native V2 counterfactual state", () => {
       order: order(),
       snapshot: snapshot(),
       at: NOW,
+      settlementLookup: settlementLookup("m1"),
     }).applied).toBe(true);
     const segment = join(dataDir, "segments", "segment-00001.jsonl");
     const beforeTorn = readFileSync(segment, "utf8");
@@ -613,6 +641,7 @@ describe("Native V2 counterfactual state", () => {
       order: order("m2"),
       snapshot: snapshot("m2"),
       at: NOW,
+      settlementLookup: settlementLookup("m2"),
     }).applied).toBe(true);
 
     const again = new NativeV2CounterfactualStore({ dataDir, startingBalance: 1000 });
@@ -636,6 +665,7 @@ describe("Native V2 counterfactual state", () => {
       order: order(),
       snapshot: snapshot(),
       at: NOW,
+      settlementLookup: settlementLookup("m1"),
     }).applied).toBe(true);
     const cashA = a.summary().availableCashUsd;
 
@@ -648,6 +678,7 @@ describe("Native V2 counterfactual state", () => {
       order: order("m2"),
       snapshot: snapshot("m2"),
       at: NOW,
+      settlementLookup: settlementLookup("m2"),
     }).applied).toBe(false);
 
     const ok = new NativeV2CounterfactualStore({ dataDir, startingBalance: 1000 });
@@ -673,7 +704,8 @@ describe("Native V2 counterfactual state", () => {
         order: order(marketId),
         snapshot: snapshot(marketId),
         at: NOW,
-      }).applied).toBe(true);
+      settlementLookup: settlementLookup(marketId),
+    }).applied).toBe(true);
     }
     const need = a.summary().bytes + a.openPositionMarketIds()
       .reduce((sum, id) => sum + counterfactualSettlementObligationBytes(id), 0);
@@ -708,6 +740,7 @@ describe("Native V2 counterfactual state", () => {
       order: order(),
       snapshot: snapshot(),
       at: NOW,
+      settlementLookup: settlementLookup("m1"),
     }).applied).toBe(true);
     expect(store.trySettleMarket("m1", "1", "0", {
       at: new Date("2026-09-17T09:00:00.000Z"),
@@ -720,6 +753,7 @@ describe("Native V2 counterfactual state", () => {
       order: { ...order(), outcome: "DOWN", tokenId: "token-down" },
       snapshot: { ...snapshot(), outcome: "DOWN", tokenId: "token-down" },
       at: NOW,
+      settlementLookup: settlementLookup("m1"),
     });
     expect(again.applied).toBe(false);
     if (again.applied) throw new Error("expected reject");
@@ -733,6 +767,7 @@ describe("Native V2 counterfactual state", () => {
       order: order(),
       snapshot: snapshot(),
       at: NOW,
+      settlementLookup: settlementLookup("m1"),
     });
     expect(afterRestart.applied).toBe(false);
     if (afterRestart.applied) throw new Error("expected reject");
@@ -759,6 +794,7 @@ describe("Native V2 counterfactual state", () => {
       order: order(marketId),
       snapshot: snapshot(marketId),
       at: NOW,
+      settlementLookup: settlementLookup(marketId),
     });
     expect(filled.applied).toBe(true);
     expect(store.summary().bytes + obligation).toBeLessThanOrEqual(maxBytes);
@@ -802,7 +838,8 @@ describe("Native V2 counterfactual state", () => {
         order: order(marketId),
         snapshot: snapshot(marketId),
         at: NOW,
-      });
+      settlementLookup: settlementLookup(marketId),
+    });
       if (!result.applied) {
         rejected = result;
         break;
@@ -817,6 +854,7 @@ describe("Native V2 counterfactual state", () => {
       order: order("follow"),
       snapshot: snapshot("follow"),
       at: NOW,
+      settlementLookup: settlementLookup("follow"),
     });
     expect(followUp.applied).toBe(false);
     if (followUp.applied) throw new Error("expected reject");
@@ -886,5 +924,22 @@ describe("Native V2 counterfactual state", () => {
     expect(recovered.settlementLookupFor("m1")).toEqual(lookup);
     expect(recovered.openSettlementLookups()).toEqual([lookup]);
   });
+
+  it("rejects durable would-submit without authoritative settlementLookup", () => {
+    const store = new NativeV2CounterfactualStore({ dataDir: tempDir(), startingBalance: 1000 });
+    store.init();
+    const result = store.tryCommitWouldSubmit({
+      actionKey: nativeV2CounterfactualActionKey("m1", "UP"),
+      order: order(),
+      snapshot: snapshot(),
+      at: NOW,
+    });
+    expect(result.applied).toBe(false);
+    if (result.applied) throw new Error("expected reject");
+    expect(result.reason).toBe("MISSING_SETTLEMENT_LOOKUP");
+    expect(store.summary().fillCount).toBe(0);
+    expect(store.settlementLookupFor("m1")).toBeNull();
+  });
+
 
 });
