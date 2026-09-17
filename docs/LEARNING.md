@@ -118,7 +118,7 @@ CF therefore keeps process-lifetime + durable continuous portfolio semantics (sa
 | `maxBytes` (store) / `LEARNING_MAX_BYTES` (engine wiring) | `256000000` | Total CF event-log byte cap under `.../counterfactual/` |
 | `segmentMaxBytes` | `8000000` | Per-segment rotation only (insufficient alone) |
 
-Fill writes stop before a settlement reserve (~5% / 4KiB floor) so open CF positions can still settle near capacity. When the cap is hit, the write is rejected (`CAPACITY_EXCEEDED`), in-memory state is **not** advanced, and `summary().degraded` is set — V1 authority unchanged. Restart replays durable events only, so rejected writes cannot diverge memory vs disk.
+Fill admission is obligation-aware: a fill is accepted only when `currentBytes + fillRowBytes + outstandingSettlementReserve + newSettlementReserve <= maxBytes`, where each open CF position reserves `MAX_COUNTERFACTUAL_SETTLEMENT_ROW_BYTES` (768) for its future settlement row. Settlement metadata (`marketId` / `source` / `reason` / deltas) is clamped so a serialized settlement row cannot exceed that bound — making the reservation a real guarantee, not a global percentage guess. A fixed ~5%/4KiB global reserve alone is **not** sufficient (it can accept more opens than it can later settle). When the cap is hit, the write is rejected (`CAPACITY_EXCEEDED`), in-memory state is **not** advanced, and `summary().degraded` is set — V1 authority unchanged. On restart, open positions are reconstructed from the durable log and the outstanding settlement reserve is recomputed from them; rejected writes cannot diverge memory vs disk.
 
 ### Durable commit atomicity
 

@@ -19,10 +19,21 @@ export const NATIVE_V2_COUNTERFACTUAL_STATE_BASIS = "DECISION_TIME_V2_COUNTERFAC
 export const DEFAULT_COUNTERFACTUAL_SEGMENT_MAX_BYTES = 8_000_000;
 /** Total CF event-log byte cap — same operational default as learning volume contract. */
 export const DEFAULT_COUNTERFACTUAL_MAX_BYTES = DEFAULT_LEARNING_MAX_BYTES;
-/** Fraction of maxBytes reserved so settlements remain writable near fill capacity. */
-export const DEFAULT_COUNTERFACTUAL_SETTLEMENT_RESERVE_RATIO = 0.05;
-/** Floor reserve so tiny test caps still leave room for settlement events. */
-export const DEFAULT_COUNTERFACTUAL_SETTLEMENT_RESERVE_FLOOR_BYTES = 4_096;
+/**
+ * Hard upper bound for one durable settlement JSONL row (including trailing newline).
+ * Fill admission reserves this many bytes per accepted open CF position so every
+ * open position can still append its settlement without exceeding maxBytes.
+ * Settlement metadata is clamped so serialized rows cannot exceed this bound.
+ */
+export const MAX_COUNTERFACTUAL_SETTLEMENT_ROW_BYTES = 768;
+/** Max UTF-16 code units retained for settlement marketId in the durable row. */
+export const MAX_COUNTERFACTUAL_SETTLEMENT_MARKET_ID_CHARS = 128;
+/** Max UTF-16 code units retained for settlement source metadata. */
+export const MAX_COUNTERFACTUAL_SETTLEMENT_SOURCE_CHARS = 64;
+/** Max UTF-16 code units retained for settlement reason metadata. */
+export const MAX_COUNTERFACTUAL_SETTLEMENT_REASON_CHARS = 64;
+/** Max UTF-16 code units retained for settlement decimal delta strings. */
+export const MAX_COUNTERFACTUAL_SETTLEMENT_DECIMAL_CHARS = 64;
 
 export type NativeV2CounterfactualIntent = "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG";
 
@@ -113,6 +124,64 @@ type SegmentRow =
     source: string;
     reason: string | null;
   };
+
+function clampSettlementChars(value: string, maxChars: number): string {
+  return value.length <= maxChars ? value : value.slice(0, maxChars);
+}
+
+/** Build a settlement row whose serialized size is guaranteed <= MAX_COUNTERFACTUAL_SETTLEMENT_ROW_BYTES. */
+export function buildBoundedCounterfactualSettlementRow(input: {
+  marketId: string;
+  upPayoff: "0" | "1";
+  downPayoff: "0" | "1";
+  cashDelta: string;
+  realizedDelta: string;
+  at: string;
+  source: string;
+  reason: string | null;
+}): Extract<SegmentRow, { kind: "settlement" }> {
+  let source = clampSettlementChars(input.source, MAX_COUNTERFACTUAL_SETTLEMENT_SOURCE_CHARS);
+  let reason =
+    input.reason === null
+      ? null
+      : clampSettlementChars(input.reason, MAX_COUNTERFACTUAL_SETTLEMENT_REASON_CHARS);
+  let marketId = clampSettlementChars(input.marketId, MAX_COUNTERFACTUAL_SETTLEMENT_MARKET_ID_CHARS);
+  let cashDelta = clampSettlementChars(input.cashDelta, MAX_COUNTERFACTUAL_SETTLEMENT_DECIMAL_CHARS);
+  let realizedDelta = clampSettlementChars(input.realizedDelta, MAX_COUNTERFACTUAL_SETTLEMENT_DECIMAL_CHARS);
+
+  const build = (): Extract<SegmentRow, { kind: "settlement" }> => ({
+    kind: "settlement",
+    marketId,
+    upPayoff: input.upPayoff,
+    downPayoff: input.downPayoff,
+    cashDelta,
+    realizedDelta,
+    at: input.at,
+    source,
+    reason,
+  });
+
+  let row = build();
+  let line = `${JSON.stringify(row)}\n`;
+  // Shrink optional metadata first if a pathological payload still exceeds the hard bound.
+  while (Buffer.byteLength(line, "utf8") > MAX_COUNTERFACTUAL_SETTLEMENT_ROW_BYTES) {
+    if (reason && reason.length > 0) {
+      reason = reason.slice(0, Math.max(0, reason.length - 16));
+      if (reason.length === 0) reason = null;
+    } else if (source.length > 8) {
+      source = source.slice(0, Math.max(8, source.length - 16));
+    } else if (marketId.length > 16) {
+      marketId = marketId.slice(0, Math.max(16, marketId.length - 16));
+    } else {
+      throw new Error(
+        `CAPACITY_EXCEEDED: settlement row exceeds MAX_COUNTERFACTUAL_SETTLEMENT_ROW_BYTES=${MAX_COUNTERFACTUAL_SETTLEMENT_ROW_BYTES}`,
+      );
+    }
+    row = build();
+    line = `${JSON.stringify(row)}\n`;
+  }
+  return row;
+}
 
 export interface NativeV2CounterfactualStoreOptions {
   dataDir?: string;
@@ -255,7 +324,7 @@ export class NativeV2CounterfactualStore {
           at: at.toISOString(),
         };
         try {
-          this.appendRow(row, "fill");
+          this.appendRow(row, "fill", { openPositionsAfter: staged.positions.size });
         } catch (error) {
           this.noteFailure(error);
           const message = error instanceof Error ? error.message : String(error);
@@ -304,8 +373,7 @@ export class NativeV2CounterfactualStore {
     if (!settled) return { applied: false, reason: "NO_POSITION" };
 
     if (this.durable) {
-      const row: SegmentRow = {
-        kind: "settlement",
+      const row = buildBoundedCounterfactualSettlementRow({
         marketId,
         upPayoff,
         downPayoff,
@@ -314,7 +382,7 @@ export class NativeV2CounterfactualStore {
         at: at.toISOString(),
         source: meta.source ?? "counterfactual_settlement",
         reason: meta.reason ?? null,
-      };
+      });
       try {
         this.appendRow(row, "settlement");
       } catch (error) {
@@ -530,17 +598,20 @@ export class NativeV2CounterfactualStore {
     return clone;
   }
 
-  private settlementReserveBytes(): number {
-    const ratioReserve = Math.floor(this.maxBytes * DEFAULT_COUNTERFACTUAL_SETTLEMENT_RESERVE_RATIO);
-    const reserve = Math.max(ratioReserve, DEFAULT_COUNTERFACTUAL_SETTLEMENT_RESERVE_FLOOR_BYTES);
-    return Math.min(reserve, Math.floor(this.maxBytes / 2));
+  private outstandingSettlementReserveBytes(openPositionCount = this.ledger.positions.size): number {
+    return Math.max(0, openPositionCount) * MAX_COUNTERFACTUAL_SETTLEMENT_ROW_BYTES;
   }
 
-  /** Fill writes stop before this ceiling so settlements retain bounded headroom. */
-  private fillWriteCeilingBytes(): number {
-    return Math.max(0, this.maxBytes - this.settlementReserveBytes());
-  }
-  private appendRow(row: SegmentRow, klass: "fill" | "settlement" = row.kind === "settlement" ? "settlement" : "fill"): void {
+  /**
+   * Append a durable CF event.
+   * Fills are admitted only when bytes + fillRow + outstandingSettlementReserve(after) <= maxBytes.
+   * Settlements may consume reserved headroom up to maxBytes; row size is hard-bounded.
+   */
+  private appendRow(
+    row: SegmentRow,
+    klass: "fill" | "settlement" = row.kind === "settlement" ? "settlement" : "fill",
+    opts: { openPositionsAfter?: number } = {},
+  ): void {
     if (this.appendFaultForTest) {
       const err = this.appendFaultForTest;
       this.appendFaultForTest = null;
@@ -548,9 +619,18 @@ export class NativeV2CounterfactualStore {
     }
     const line = `${JSON.stringify(row)}\n`;
     const lineBytes = Buffer.byteLength(line, "utf8");
-    const ceiling = klass === "fill" ? this.fillWriteCeilingBytes() : this.maxBytes;
+    if (klass === "settlement" && lineBytes > MAX_COUNTERFACTUAL_SETTLEMENT_ROW_BYTES) {
+      throw new Error(
+        `CAPACITY_EXCEEDED: settlement row ${lineBytes} bytes exceeds MAX_COUNTERFACTUAL_SETTLEMENT_ROW_BYTES=${MAX_COUNTERFACTUAL_SETTLEMENT_ROW_BYTES}`,
+      );
+    }
+    const openAfter = opts.openPositionsAfter ?? this.ledger.positions.size;
+    const reservedAfter = klass === "fill" ? this.outstandingSettlementReserveBytes(openAfter) : 0;
+    const ceiling = this.maxBytes - reservedAfter;
     if (this.bytes + lineBytes > ceiling) {
-      throw new Error(`CAPACITY_EXCEEDED: counterfactual store at ${this.bytes}+${lineBytes} bytes exceeds ${ceiling} (${klass})`);
+      throw new Error(
+        `CAPACITY_EXCEEDED: counterfactual store at ${this.bytes}+${lineBytes}+reserve${reservedAfter} bytes exceeds maxBytes=${this.maxBytes} (${klass})`,
+      );
     }
     mkdirSync(this.segmentsDir(), { recursive: true });
     if (!this.currentSegmentPath || this.currentSegmentBytes + lineBytes > this.segmentMaxBytes) {

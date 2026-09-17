@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   NATIVE_V2_COUNTERFACTUAL_STATE_BASIS,
+  MAX_COUNTERFACTUAL_SETTLEMENT_ROW_BYTES,
   NativeV2CounterfactualStore,
   PaperLedger,
   counterfactualDataDir,
@@ -332,13 +333,14 @@ describe("Native V2 counterfactual state", () => {
     const store = new NativeV2CounterfactualStore({
       dataDir,
       startingBalance: 1000,
-      maxBytes: 400,
-      segmentMaxBytes: 200,
+      // Must fit one fill + one settlement reservation; settle-as-you-go keeps open count <= 1.
+      maxBytes: 20_000,
+      segmentMaxBytes: 8_000,
     });
     store.init();
     // First fill may succeed; keep committing until capacity rejects.
     let rejected = null;
-    for (let i = 0; i < 30; i += 1) {
+    for (let i = 0; i < 200; i += 1) {
       const marketId = `m${i}`;
       const result = store.tryCommitWouldSubmit({
         actionKey: nativeV2CounterfactualActionKey(marketId, "UP"),
@@ -362,11 +364,81 @@ describe("Native V2 counterfactual state", () => {
     const recovered = new NativeV2CounterfactualStore({
       dataDir,
       startingBalance: 1000,
-      maxBytes: 400,
-      segmentMaxBytes: 200,
+      maxBytes: 20_000,
+      segmentMaxBytes: 8_000,
     });
     recovered.init();
     expect(recovered.summary().fillCount).toBe(fillsBefore);
     expect(recovered.summary().bytes).toBe(store.summary().bytes);
+  });
+
+  it("accepted open CF positions retain guaranteed settlement capacity (incl. restart)", () => {
+    const dataDir = tempDir();
+    const maxBytes = 25_000;
+    const store = new NativeV2CounterfactualStore({
+      dataDir,
+      startingBalance: 10_000,
+      maxBytes,
+      segmentMaxBytes: 8_000,
+    });
+    store.init();
+
+    const acceptedMarketIds = [];
+    for (let i = 0; i < 80; i += 1) {
+      const marketId = `open-${i}`;
+      const result = store.tryCommitWouldSubmit({
+        actionKey: nativeV2CounterfactualActionKey(marketId, "UP"),
+        order: order(marketId),
+        snapshot: snapshot(marketId),
+        at: NOW,
+      });
+      expect(store.summary().bytes).toBeLessThanOrEqual(maxBytes);
+      if (!result.applied) {
+        expect(result.reason).toBe("CAPACITY_EXCEEDED");
+        break;
+      }
+      acceptedMarketIds.push(marketId);
+    }
+
+    expect(acceptedMarketIds.length).toBeGreaterThan(3);
+    expect(store.openPositionMarketIds().sort()).toEqual([...acceptedMarketIds].sort());
+    const reserved = store.openPositionMarketIds().length * MAX_COUNTERFACTUAL_SETTLEMENT_ROW_BYTES;
+    expect(store.summary().bytes + reserved).toBeLessThanOrEqual(maxBytes);
+
+    // Restart midway with opens still outstanding; reservations must reconstruct.
+    const mid = new NativeV2CounterfactualStore({
+      dataDir,
+      startingBalance: 10_000,
+      maxBytes,
+      segmentMaxBytes: 8_000,
+    });
+    mid.init();
+    expect(mid.openPositionMarketIds().sort()).toEqual([...acceptedMarketIds].sort());
+    const midReserved = mid.openPositionMarketIds().length * MAX_COUNTERFACTUAL_SETTLEMENT_ROW_BYTES;
+    expect(mid.summary().bytes + midReserved).toBeLessThanOrEqual(maxBytes);
+    expect(mid.summary().bytes).toBeLessThanOrEqual(maxBytes);
+
+    for (const marketId of acceptedMarketIds) {
+      const settled = mid.trySettleMarket(marketId, "1", "0", {
+        at: NOW,
+        source: "x".repeat(200),
+        reason: "y".repeat(200),
+      });
+      expect(settled.applied).toBe(true);
+      expect(mid.summary().bytes).toBeLessThanOrEqual(maxBytes);
+    }
+    expect(mid.openPositionMarketIds()).toEqual([]);
+    expect(mid.summary().settlementCount).toBe(acceptedMarketIds.length);
+
+    const finalStore = new NativeV2CounterfactualStore({
+      dataDir,
+      startingBalance: 10_000,
+      maxBytes,
+      segmentMaxBytes: 8_000,
+    });
+    finalStore.init();
+    expect(finalStore.openPositionMarketIds()).toEqual([]);
+    expect(finalStore.summary().settlementCount).toBe(acceptedMarketIds.length);
+    expect(finalStore.summary().bytes).toBeLessThanOrEqual(maxBytes);
   });
 });
