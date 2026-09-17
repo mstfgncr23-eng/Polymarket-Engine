@@ -512,4 +512,103 @@ describe("EngineService PR2 counterfactual integration", () => {
     }
   });
 
+  it("durable CF lookup outranks later live discovery remapping", async () => {
+    const learningDataDir = learningDir();
+    const START_MS = Date.parse("2026-09-17T08:00:00.000Z");
+    const END_MS = Date.parse("2026-09-17T08:15:00.000Z");
+    const clock: Clock = { nowMs: START_MS };
+    const resolutions = new Map<string, Record<string, unknown>>();
+    const marketId = "btc-mkt-remap";
+    const marketDef = qualified(
+      marketId,
+      "BTC",
+      `${marketId}-up`,
+      `${marketId}-down`,
+      new Date(END_MS).toISOString(),
+    );
+    marketDef.qualification.binary.yesOutcome = "DOWN";
+    marketDef.qualification.binary.noOutcome = "UP";
+
+    const market = new ScriptedMarketAdapter();
+    market.queue(discoveryReport([marketDef]));
+    const engine = new EngineService(
+      qualifiedPaperEnv({
+        LEARNING_DATA_DIR: learningDataDir,
+        LEARNING_ENABLED: "true",
+        PAPER_START_BALANCE: "1000",
+        PAPER_EXECUTION_STYLE: "TAKER",
+        PAPER_EXECUTION_LATENCY_MS: "0",
+        EXPERIMENT_DURATION_HOURS: "1",
+        ESTIMATED_INFRA_COST_PER_HOUR_USD: "0",
+        SETTLEMENT_POLL_MS: "1",
+        LEARNING_SETTLEMENT_POLL_MS: "1",
+        LEARNING_CHECKPOINT_SECONDS: "900,600,300",
+      }),
+      new MemoryEventJournal(),
+      { error: () => undefined },
+      {
+        market: market as never,
+        referenceRegistry: new ScriptedReferenceRegistry() as never,
+        activation: new NoopGrokActivationBridge(),
+        now: () => new Date(clock.nowMs),
+        resolutionFetcher: async (id) => resolutions.get(id) ?? null,
+      },
+    );
+
+    try {
+      await engine.start();
+      await market.waitForHandlers();
+      expect((await engine.beginExperiment()).ok).toBe(true);
+      await engine.ingestReferenceTickForTest(referenceTick(clock, "100000"));
+      clock.nowMs += 1_000;
+      await engine.ingestReferenceTickForTest(referenceTick(clock, "100500"));
+      await market.emitSnapshot(book(clock, marketId, "UP", 1));
+      await market.emitSnapshot(book(clock, marketId, "DOWN", 1));
+      await drainRuntime(engine);
+      await waitFor(() => engine.counterfactualSummary().fillCount >= 1, 10_000);
+
+      const cf = (engine as unknown as { counterfactualStore: {
+        settlementLookupFor: (id: string) => { yesMapsTo: string; noMapsTo: string } | null;
+      } }).counterfactualStore;
+      expect(cf.settlementLookupFor(marketId)?.yesMapsTo).toBe("DOWN");
+
+      // Re-discover same market with inverted-back-to-default mapping — durable capture must win.
+      const remapped = qualified(
+        marketId,
+        "BTC",
+        `${marketId}-up`,
+        `${marketId}-down`,
+        new Date(END_MS).toISOString(),
+      );
+      remapped.qualification.binary.yesOutcome = "UP";
+      remapped.qualification.binary.noOutcome = "DOWN";
+      market.queue(discoveryReport([remapped]));
+      await engine.reconcileDiscovery();
+
+      clock.nowMs = END_MS + 60_000;
+      resolutions.set(marketId, {
+        closed: true,
+        umaResolutionStatus: "resolved",
+        outcomes: ["Yes", "No"],
+        outcomePrices: ["1", "0"],
+      });
+      for (let i = 0; i < 5; i += 1) {
+        await engine.tickMaintenance();
+        if (engine.counterfactualSummary().settlementCount >= 1) break;
+        clock.nowMs += 1_000;
+      }
+      expect(engine.counterfactualSummary().settlementCount).toBeGreaterThanOrEqual(1);
+      // Original inverted capture: Yes→DOWN, Yes wins ⇒ DOWN wins ⇒ UP position loses (not default Yes→UP win).
+      const settled = (engine as unknown as { counterfactualStore: {
+        hasSettledMarket: (id: string) => boolean;
+        summary: () => { realizedPnl: string; availableCashUsd: string };
+      } }).counterfactualStore;
+      expect(settled.hasSettledMarket(marketId)).toBe(true);
+      expect(Number(settled.summary().realizedPnl)).toBeLessThan(0);
+      expect(Number(settled.summary().availableCashUsd)).toBeLessThan(1000);
+    } finally {
+      await engine.stop();
+    }
+  });
+
 });

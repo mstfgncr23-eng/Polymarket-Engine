@@ -3956,14 +3956,18 @@ export class EngineService {
   }
 
   private resolveSettlementLookup(marketId: string): BinarySettlementLookup | null {
+    // Prefer decision/accept-time durable captures over live discovery so a later
+    // re-discovery cannot rewrite historical YES/NO settlement semantics.
+    const fromCf = this.counterfactualStore.settlementLookupFor(marketId);
+    if (fromCf) return fromCf;
+    const fromLearning = this.learningStore?.settlementLookupFor(marketId) ?? null;
+    if (fromLearning) return fromLearning;
     const live = this.marketsById.get(marketId);
     if (live) {
       const fromLive = this.settlementLookupFromMarket(live);
       if (fromLive) return fromLive;
     }
-    const fromCf = this.counterfactualStore.settlementLookupFor(marketId);
-    if (fromCf) return fromCf;
-    return this.learningStore?.settlementLookupFor(marketId) ?? null;
+    return null;
   }
 
   private async pollLearningSettlements(): Promise<void> {
