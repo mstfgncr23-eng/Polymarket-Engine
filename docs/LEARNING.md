@@ -70,3 +70,36 @@ is ephemeral.
 and calls `LearningSampleStore.labelMarket` only. It does **not** call
 `settleMarket`, `commitAuthoritative(POSITION_SETTLED)`, or mutate the ledger.
 Unresolved samples stay explicitly unresolved until authoritative resolution.
+
+## Counterfactual V2 portfolio state (PR2)
+
+Phase-4 shadow execution evaluates risk/cash/positions against an **isolated
+Native V2 counterfactual portfolio**, not the authoritative V1 paper ledger.
+
+| Concern | Behavior |
+| --- | --- |
+| State basis | `DECISION_TIME_V2_COUNTERFACTUAL_STATE` |
+| Storage | `${LEARNING_DATA_DIR}/counterfactual/` (manifest + segmented JSONL) |
+| Accounting | Reuses `PaperLedger.applyFill`, `executePaperTaker`, settlement helpers |
+| Advance rule | State advances **only** when shadow eval `wouldSubmitOrder === true` |
+| Idempotency | Action key `${marketId}:${outcome}:${intent}` — reevaluations do not stack fills |
+| Settlement | Uses authoritative public/learning resolution labels only — never invents winners |
+| Isolation | Never mutates V1 ledger, real PAPER cash, V1 positions, V1 reserved cash, execution authority, or deterministic risk authority |
+
+### Layout
+
+```text
+/data/learning/
+  manifest.json              # PR1 learning samples
+  segments/...
+  counterfactual/
+    manifest.json            # CF fill/settlement counts
+    segments/
+      segment-00001.jsonl    # append-only fill | settlement events
+```
+
+### Recovery
+
+On process start, `NativeV2CounterfactualStore.init()` replays durable
+counterfactual events into a fresh isolated `PaperLedger`. Failures degrade
+counterfactual durability only (`summary().degraded`); V1 trading continues.
