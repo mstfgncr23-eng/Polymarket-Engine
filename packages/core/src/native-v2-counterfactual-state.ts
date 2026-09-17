@@ -23,16 +23,16 @@ export const DEFAULT_COUNTERFACTUAL_MAX_BYTES = DEFAULT_LEARNING_MAX_BYTES;
  * Hard upper bound for one durable settlement JSONL row (including trailing newline).
  * Fill admission reserves this many bytes per accepted open CF position so every
  * open position can still append its settlement without exceeding maxBytes.
- * Settlement metadata is clamped so serialized rows cannot exceed this bound.
+ * Sized to fit an exact legal idSchema marketId (max 160 chars, incl. multi-byte UTF-8)
+ * plus clamped non-identity metadata — marketId is never truncated.
+ * Non-identity settlement metadata is clamped/shrunk so serialized rows cannot exceed this bound.
  */
-export const MAX_COUNTERFACTUAL_SETTLEMENT_ROW_BYTES = 768;
-/** Max UTF-16 code units retained for settlement marketId in the durable row. */
-export const MAX_COUNTERFACTUAL_SETTLEMENT_MARKET_ID_CHARS = 128;
-/** Max UTF-16 code units retained for settlement source metadata. */
+export const MAX_COUNTERFACTUAL_SETTLEMENT_ROW_BYTES = 1024;
+/** Max UTF-16 code units retained for settlement source metadata (non-identity). */
 export const MAX_COUNTERFACTUAL_SETTLEMENT_SOURCE_CHARS = 64;
-/** Max UTF-16 code units retained for settlement reason metadata. */
+/** Max UTF-16 code units retained for settlement reason metadata (non-identity). */
 export const MAX_COUNTERFACTUAL_SETTLEMENT_REASON_CHARS = 64;
-/** Max UTF-16 code units retained for settlement decimal delta strings. */
+/** Max UTF-16 code units retained for settlement decimal delta strings (non-identity). */
 export const MAX_COUNTERFACTUAL_SETTLEMENT_DECIMAL_CHARS = 64;
 
 export type NativeV2CounterfactualIntent = "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG";
@@ -129,7 +129,11 @@ function clampSettlementChars(value: string, maxChars: number): string {
   return value.length <= maxChars ? value : value.slice(0, maxChars);
 }
 
-/** Build a settlement row whose serialized size is guaranteed <= MAX_COUNTERFACTUAL_SETTLEMENT_ROW_BYTES. */
+/**
+ * Build a settlement row whose serialized size is guaranteed <= MAX_COUNTERFACTUAL_SETTLEMENT_ROW_BYTES.
+ * Durable identity: marketId is preserved exactly (never truncated) so restart replay matches the fill.
+ * Size bounding applies only to non-identity metadata (source / reason / decimal deltas).
+ */
 export function buildBoundedCounterfactualSettlementRow(input: {
   marketId: string;
   upPayoff: "0" | "1";
@@ -140,12 +144,13 @@ export function buildBoundedCounterfactualSettlementRow(input: {
   source: string;
   reason: string | null;
 }): Extract<SegmentRow, { kind: "settlement" }> {
+  // Identity: keep exact marketId (legal max 160 per idSchema). Never clamp or shrink it.
+  const marketId = input.marketId;
   let source = clampSettlementChars(input.source, MAX_COUNTERFACTUAL_SETTLEMENT_SOURCE_CHARS);
   let reason =
     input.reason === null
       ? null
       : clampSettlementChars(input.reason, MAX_COUNTERFACTUAL_SETTLEMENT_REASON_CHARS);
-  let marketId = clampSettlementChars(input.marketId, MAX_COUNTERFACTUAL_SETTLEMENT_MARKET_ID_CHARS);
   let cashDelta = clampSettlementChars(input.cashDelta, MAX_COUNTERFACTUAL_SETTLEMENT_DECIMAL_CHARS);
   let realizedDelta = clampSettlementChars(input.realizedDelta, MAX_COUNTERFACTUAL_SETTLEMENT_DECIMAL_CHARS);
 
@@ -163,15 +168,13 @@ export function buildBoundedCounterfactualSettlementRow(input: {
 
   let row = build();
   let line = `${JSON.stringify(row)}\n`;
-  // Shrink optional metadata first if a pathological payload still exceeds the hard bound.
+  // Shrink non-identity metadata only if a pathological payload still exceeds the hard bound.
   while (Buffer.byteLength(line, "utf8") > MAX_COUNTERFACTUAL_SETTLEMENT_ROW_BYTES) {
     if (reason && reason.length > 0) {
       reason = reason.slice(0, Math.max(0, reason.length - 16));
       if (reason.length === 0) reason = null;
     } else if (source.length > 8) {
       source = source.slice(0, Math.max(8, source.length - 16));
-    } else if (marketId.length > 16) {
-      marketId = marketId.slice(0, Math.max(16, marketId.length - 16));
     } else {
       throw new Error(
         `CAPACITY_EXCEEDED: settlement row exceeds MAX_COUNTERFACTUAL_SETTLEMENT_ROW_BYTES=${MAX_COUNTERFACTUAL_SETTLEMENT_ROW_BYTES}`,

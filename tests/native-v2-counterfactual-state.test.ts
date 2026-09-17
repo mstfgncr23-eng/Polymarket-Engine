@@ -1,10 +1,11 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   NATIVE_V2_COUNTERFACTUAL_STATE_BASIS,
   MAX_COUNTERFACTUAL_SETTLEMENT_ROW_BYTES,
+  buildBoundedCounterfactualSettlementRow,
   NativeV2CounterfactualStore,
   PaperLedger,
   counterfactualDataDir,
@@ -440,5 +441,70 @@ describe("Native V2 counterfactual state", () => {
     expect(finalStore.openPositionMarketIds()).toEqual([]);
     expect(finalStore.summary().settlementCount).toBe(acceptedMarketIds.length);
     expect(finalStore.summary().bytes).toBeLessThanOrEqual(maxBytes);
+  });
+  it("settlement preserves exact legal 160-char marketId across restart (no resurrection)", () => {
+    const dataDir = tempDir();
+    const marketId = "m".repeat(160);
+    expect(marketId.length).toBe(160);
+    const store = new NativeV2CounterfactualStore({ dataDir, startingBalance: 1000 });
+    store.init();
+
+    const filled = store.tryCommitWouldSubmit({
+      actionKey: nativeV2CounterfactualActionKey(marketId, "UP"),
+      order: order(marketId),
+      snapshot: snapshot(marketId),
+      at: NOW,
+    });
+    expect(filled.applied).toBe(true);
+    expect(store.openPositionMarketIds()).toEqual([marketId]);
+
+    const settled = store.trySettleMarket(marketId, "1", "0", {
+      at: new Date("2026-09-17T09:00:00.000Z"),
+      source: "x".repeat(200),
+      reason: "y".repeat(200),
+    });
+    expect(settled.applied).toBe(true);
+    if (!settled.applied) throw new Error("expected settle");
+    expect(settled.marketId).toBe(marketId);
+    expect(store.openPositionMarketIds()).toEqual([]);
+    const after = store.summary();
+    expect(after.settlementCount).toBe(1);
+    expect(after.bytes).toBeLessThanOrEqual(after.maxBytes);
+
+    // Durable row must carry the exact identity (not a truncated prefix).
+    const segmentsDir = join(dataDir, "segments");
+    const segmentFiles = readdirSync(segmentsDir).filter((n) => n.endsWith(".jsonl"));
+    expect(segmentFiles.length).toBeGreaterThan(0);
+    const text = segmentFiles.map((n) => readFileSync(join(segmentsDir, n), "utf8")).join("");
+    const settlementLines = text.split("\n").filter((line) => line.includes('"kind":"settlement"'));
+    expect(settlementLines.length).toBe(1);
+    const row = JSON.parse(settlementLines[0]!);
+    expect(row.marketId).toBe(marketId);
+    expect(row.marketId.length).toBe(160);
+    expect(Buffer.byteLength(settlementLines[0]! + "\n", "utf8")).toBeLessThanOrEqual(MAX_COUNTERFACTUAL_SETTLEMENT_ROW_BYTES);
+
+    // Unit: builder never truncates a legal 160-char id even with huge metadata.
+    const bounded = buildBoundedCounterfactualSettlementRow({
+      marketId,
+      upPayoff: "1",
+      downPayoff: "0",
+      cashDelta: "1.25",
+      realizedDelta: "0.5",
+      at: NOW.toISOString(),
+      source: "z".repeat(500),
+      reason: "w".repeat(500),
+    });
+    expect(bounded.marketId).toBe(marketId);
+    expect(Buffer.byteLength(JSON.stringify(bounded) + "\n", "utf8")).toBeLessThanOrEqual(MAX_COUNTERFACTUAL_SETTLEMENT_ROW_BYTES);
+
+    const recovered = new NativeV2CounterfactualStore({ dataDir, startingBalance: 1000 });
+    recovered.init();
+    expect(recovered.openPositionMarketIds()).toEqual([]);
+    expect(recovered.summary().settlementCount).toBe(1);
+    expect(recovered.summary().fillCount).toBe(1);
+    expect(recovered.summary().availableCashUsd).toBe(after.availableCashUsd);
+    expect(recovered.summary().realizedPnl).toBe(after.realizedPnl);
+    expect(recovered.summary().fees).toBe(after.fees);
+    expect(recovered.summary().bytes).toBeLessThanOrEqual(recovered.summary().maxBytes);
   });
 });
