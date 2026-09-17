@@ -413,7 +413,11 @@ export class EngineService {
         gitSha: process.env.GIT_SHA ?? process.env.FLY_IMAGE_REF ?? null,
       })
       : null;
-    this.learningStore?.init();
+    try {
+      this.learningStore?.init();
+    } catch {
+      // Learning storage must never block engine startup (V1/V2/risk/execution).
+    }
     this.hotResearchCache = new HotResearchCache({
       now: this.nowFn,
       maxEntries: env.XAI_SCOUT_CACHE_MAX_ENTRIES,

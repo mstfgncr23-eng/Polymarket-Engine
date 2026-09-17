@@ -80,9 +80,13 @@ export function parseLearningCheckpointSeconds(raw: string | undefined | null): 
 }
 
 /**
- * Crossing semantics: emit a checkpoint on the first observation where
- * timeToExpiryMs <= checkpointMs. Already-recorded checkpoints are skipped.
- * Null timeToExpiryMs yields no checkpoints (caller should skip sampling).
+ * Crossing semantics: emit a checkpoint only when it is truly crossed between
+ * consecutive observations:
+ *   previousTimeToExpiryMs > checkpointMs && timeToExpiryMs <= checkpointMs
+ *
+ * A late first observation (no previous TTE) must NOT backfill earlier
+ * checkpoints — e.g. first obs at T-50s emits nothing for T-240/T-180/T-120.
+ * Already-recorded checkpoints are skipped. Null timeToExpiryMs yields none.
  *
  * Invalid schedule entries relative to a known positive horizonMs (optional)
  * are skipped rather than invented — checkpoints whose ms exceed horizonMs
@@ -95,9 +99,20 @@ export function selectCrossedCheckpoints(input: {
   alreadySampledCheckpointIds: ReadonlySet<string>;
   /** Optional market horizon from birth→end; invalid checkpoints above it are skipped. */
   horizonMs?: number | null;
+  /**
+   * Previous observation time-to-expiry for this market.
+   * null/undefined = first observation → no historical backfill.
+   */
+  previousTimeToExpiryMs?: number | null;
 }): Array<{ checkpointId: string; checkpointSeconds: number }> {
   const tte = input.timeToExpiryMs;
   if (tte === null || !Number.isFinite(tte)) return [];
+
+  const previous = input.previousTimeToExpiryMs;
+  // First observation: emit nothing; caller should seed previous TTE.
+  if (previous === null || previous === undefined || !Number.isFinite(previous)) {
+    return [];
+  }
 
   const selected: Array<{ checkpointId: string; checkpointSeconds: number }> = [];
   for (const seconds of input.checkpointSeconds) {
@@ -112,7 +127,8 @@ export function selectCrossedCheckpoints(input: {
     ) {
       continue;
     }
-    if (!(tte <= checkpointMs)) continue;
+    // True first crossing only: was strictly above, now at/below.
+    if (!(previous > checkpointMs && tte <= checkpointMs)) continue;
     const checkpointId = checkpointIdFromSeconds(seconds);
     if (input.alreadySampledCheckpointIds.has(checkpointId)) continue;
     selected.push({ checkpointId, checkpointSeconds: seconds });
