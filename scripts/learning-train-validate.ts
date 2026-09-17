@@ -12,6 +12,8 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import {
   loadLearningSamplesFromStoreDir,
+  learningModelsDir,
+  registerLearningCandidate,
   runLearningOfflinePipeline,
 } from "@pm/core";
 
@@ -36,6 +38,8 @@ Options:
   --val-fraction <n>  Validation market fraction (default 0.3)
   --max-rows-per-market <n>  Optional dominance cap
   --assumed-fee <n>   Optional assumed fee/share for net-edge reporting
+  --register-candidate  Register output as CANDIDATE in LEARNING_DATA_DIR/models
+                        (never auto-promotes to SHADOW/PAPER_APPROVED)
 `);
     return;
   }
@@ -83,9 +87,29 @@ Options:
     },
   });
 
+  let registered: { modelId: string; status: string } | null = null;
+  if (hasFlag("--register-candidate")) {
+    if (!result.output?.candidatePath) {
+      console.error("ERROR: no candidate path to register");
+      process.exitCode = 1;
+      return;
+    }
+    const entry = registerLearningCandidate(learningModelsDir(dataDir), {
+      artifactPath: result.output.candidatePath,
+      candidate: result.candidate,
+    });
+    registered = { modelId: entry.modelId, status: entry.status };
+    if (entry.status !== "CANDIDATE") {
+      console.error("ERROR: register must produce CANDIDATE only");
+      process.exitCode = 1;
+      return;
+    }
+  }
+
   console.log(JSON.stringify({
     paperOnly: true,
     runtimeAuthority: false,
+    autoPromotion: false,
     datasetRows: result.dataset.rows.length,
     trainMarkets: result.split.trainMarketIds.length,
     validationMarkets: result.split.validationMarketIds.length,
@@ -102,6 +126,7 @@ Options:
       unavailable: result.candidate.economicEvaluation.unavailable,
     },
     output: result.output,
+    registered,
   }, null, 2));
 }
 

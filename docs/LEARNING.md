@@ -241,3 +241,73 @@ training cutoff/window, metrics, economic eval, git SHA, checksumSha256.
 Unchanged: V1 Native Math → Strategy → Risk → Execution. PR4 is offline tooling
 only.
 
+## Learned runtime (PR5)
+
+Paper-only runtime loading of a **validated** candidate for a third advisory view:
+
+1. **V1** — authoritative PAPER decision path (unchanged)
+2. **Deterministic V2** — existing deterministic shadow (unchanged)
+3. **Learned V2** — new learned shadow (this PR)
+
+### Model registry / states
+
+`CANDIDATE | SHADOW | PAPER_APPROVED | REJECTED | RETIRED`
+
+- Offline retrain (`pnpm learning:train-validate -- --register-candidate`) → **CANDIDATE only**
+- **No auto-promotion** to `PAPER_APPROVED` from metrics
+- Human/operator review required for `PAPER_APPROVED` (`operatorConfirmed: true`)
+
+Layout:
+
+```text
+/data/learning/
+  models/
+    registry.json
+  scorecards/
+    segments/segment-*.jsonl
+```
+
+### Runtime safety
+
+Before shadow use the loader verifies: artifact checksum, feature schema
+compatibility (`native-v2-shadow-features-v2`), dataset/model metadata, supported
+model version (`learning-residual-logistic-v1`).
+
+On failure: learned shadow **fail-safe**; V1 + deterministic V2 continue; risk
+never bypassed.
+
+### Enablement (shadow)
+
+| Env | Default | Meaning |
+| --- | --- | --- |
+| `LEARNING_SHADOW_ENABLED` | `false` | Opt-in learned shadow |
+| `LEARNING_SHADOW_MODEL_PATH` | (none) | Path to `candidate.json` |
+| `LEARNING_SHADOW_MODEL_ID` | (none) | Registry model id |
+| `LEARNING_PAPER_AUTHORITY_ENABLED` | `false` | Future gate only — **no engine hook** |
+| `LEARNING_PAPER_AUTHORITY_MODEL_ID` | (none) | Explicit operator model id |
+
+### Controlled PAPER authority — DEFERRED
+
+**Blocker (KNOWN):** V1 authority is `evaluateNativeDecision` → `evaluateTrade`
+with hardcoded native fair/market probabilities and deterministic risk. There is
+**no** pluggable probability provider or learned-authority fork. Wiring a learned
+model into order submission would invent architecture.
+
+PR5 ships:
+
+- Registry status `PAPER_APPROVED` + gate helper `evaluateControlledPaperAuthorityGate`
+- Gate always sets `maySubmitOrders: false` and `engineHookImplemented: false`
+- Tests proving CANDIDATE cannot obtain PAPER authority
+
+PR5 does **not** submit orders from learned models under any config.
+
+### Retraining loop
+
+Offline/batch only: finalized dataset → train → validate → **CANDIDATE** artifact
+(+ optional `--register-candidate`). Must NOT: train → auto-promote → trade.
+No uncontrolled per-settlement online weight updates.
+
+### Authority
+
+Unchanged: V1 Native Math → Strategy → Risk → Execution. Learned shadow is
+advisory telemetry / scorecards only.

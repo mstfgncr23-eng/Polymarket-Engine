@@ -71,6 +71,8 @@ import {
   evaluateNativeV2ShadowFairProbability,
   LearningSampleStore,
   tryObserveLearningSample,
+  LearningRuntime,
+  type LearnedV2ShadowEvaluation,
   NativeV2CounterfactualStore,
   counterfactualDataDir,
   nativeV2CounterfactualActionKey,
@@ -256,6 +258,8 @@ export class EngineService {
   private readonly nativeV2OpportunityRanker = new NativeV2ShadowOpportunityRanker();
   private readonly nativeV2ShadowStore = new NativeV2ShadowStore();
   private readonly learningStore: LearningSampleStore | null;
+  /** PR5 learned V2 shadow runtime — advisory only; never V1 authority. */
+  private readonly learningRuntime: LearningRuntime;
   /** Isolated V2 shadow portfolio — never mutates V1 ledger/cash/positions. */
   private readonly counterfactualStore: NativeV2CounterfactualStore;
   private nativeV2ShadowExecutionBusy = false;
@@ -420,6 +424,17 @@ export class EngineService {
       })
       : null;
     this.learningStore?.init();
+    this.learningRuntime = new LearningRuntime({
+      shadowEnabled: env.LEARNING_SHADOW_ENABLED,
+      learningDataDir: env.LEARNING_DATA_DIR,
+      modelArtifactPath: env.LEARNING_SHADOW_MODEL_PATH ?? null,
+      modelId: env.LEARNING_SHADOW_MODEL_ID ?? null,
+      paperAuthority: {
+        paperAuthorityEnabled: env.LEARNING_PAPER_AUTHORITY_ENABLED,
+        approvedModelId: env.LEARNING_PAPER_AUTHORITY_MODEL_ID ?? null,
+      },
+    });
+    this.learningRuntime.init();
     // V2 counterfactual portfolio: durable under LEARNING_DATA_DIR/counterfactual.
     // Always constructed for Phase-4 shadow statefulness; isolated from V1.
     this.counterfactualStore = new NativeV2CounterfactualStore({
@@ -2126,6 +2141,22 @@ export class EngineService {
         // Learning must never affect V1/V2/risk/execution authority.
       }
     }
+    // PR5 learned V2 shadow — advisory only. Fail-soft; never mutates V1.
+    let learnedV2Shadow: LearnedV2ShadowEvaluation | null = null;
+    try {
+      learnedV2Shadow = this.learningRuntime.evaluateShadow({
+        featureVector: shadowV2FeatureVector,
+        deterministicV2: shadowV2FairProbability,
+        marketId: trigger.marketId,
+        asset,
+        experimentId: this.experiment?.id ?? null,
+        triggerId: trigger.id,
+        traceId: trigger.traceId,
+        now: this.nowFn(),
+      });
+    } catch {
+      learnedV2Shadow = null;
+    }
     const shadowNow = this.nowFn();
     const shadowV2MarketOpportunity = shadowV2FairProbability
       ? evaluateNativeV2ShadowMarketOpportunity({
@@ -2151,7 +2182,7 @@ export class EngineService {
       authority: NATIVE_DETERMINISTIC_AUTHORITY,
       direction: native.direction, confidence: native.confidence,
       fairProbability: native.fairProbability, marketProbability: native.marketProbability,
-      featureVector: native.featureVector, shadowV2FeatureVector, shadowV2FairProbability, shadowV2OpportunityRanking, triggerId: trigger.id,
+      featureVector: native.featureVector, shadowV2FeatureVector, shadowV2FairProbability, shadowV2OpportunityRanking, learnedV2Shadow, triggerId: trigger.id,
     }, asset);
     await this.persistReportInput(createJournalEvent({
       traceId: trigger.traceId, type: "CONSENSUS_DECISION", aggregateType: "consensus", aggregateId: consensus.id,
@@ -2160,7 +2191,7 @@ export class EngineService {
         authority: NATIVE_DETERMINISTIC_AUTHORITY,
         marketId: trigger.marketId, asset,
         fairProbability: native.fairProbability, marketProbability: native.marketProbability,
-        expiresAt: native.expiresAt, featureVector: native.featureVector, shadowV2FeatureVector, shadowV2FairProbability, shadowV2OpportunityRanking,
+        expiresAt: native.expiresAt, featureVector: native.featureVector, shadowV2FeatureVector, shadowV2FairProbability, shadowV2OpportunityRanking, learnedV2Shadow,
         reference: reference ? {
           asset: reference.asset, venue: reference.venue, freshness: reference.freshness,
           freshnessMs: reference.freshnessMs, recentMoveBps: reference.recentMoveBps,
@@ -2503,6 +2534,10 @@ export class EngineService {
 
   learningSummary() {
     return this.learningStore?.summary() ?? { enabled: false };
+  }
+
+  learningRuntimeSummary() {
+    return this.learningRuntime.summary();
   }
 
   counterfactualSummary() {
