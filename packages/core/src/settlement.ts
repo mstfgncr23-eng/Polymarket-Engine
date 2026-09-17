@@ -4,6 +4,23 @@ import { directionalOutcomeFromLabel } from "./qualification.js";
 
 export type PublicResolutionStatus = "unresolved" | "resolved";
 
+export interface BinarySettlementLookup {
+  marketId: string;
+  slug: string | null;
+  endDate: string;
+  yesMapsTo: Outcome;
+  noMapsTo: Outcome;
+}
+
+export function isAuthoritativeBinaryMapping(
+  yesMapsTo: unknown,
+  noMapsTo: unknown,
+): boolean {
+  return (yesMapsTo === "UP" || yesMapsTo === "DOWN")
+    && (noMapsTo === "UP" || noMapsTo === "DOWN")
+    && yesMapsTo !== noMapsTo;
+}
+
 export interface PublicBinaryResolution {
   status: PublicResolutionStatus;
   winner: Outcome | null;
