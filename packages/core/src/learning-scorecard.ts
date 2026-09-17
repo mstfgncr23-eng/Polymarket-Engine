@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import type { LearnedV2ShadowEvaluation } from "./learning-shadow-runtime.js";
 import type { Outcome } from "./domain.js";
@@ -143,25 +143,51 @@ export class LearningScorecardStore {
 
   init(): void {
     mkdirSync(this.options.dataDir, { recursive: true });
-    mkdirSync(path.join(this.options.dataDir, "segments"), { recursive: true });
+    const segmentsDir = path.join(this.options.dataDir, "segments");
+    mkdirSync(segmentsDir, { recursive: true });
+
+    const segments = readdirSync(segmentsDir)
+      .filter((name) => /^segment-\d+\.jsonl$/.test(name))
+      .sort();
+    this.bytes = segments.reduce((sum, name) => {
+      try {
+        return sum + statSync(path.join(segmentsDir, name)).size;
+      } catch {
+        return sum;
+      }
+    }, 0);
+    const last = segments.at(-1);
+    if (last) {
+      const match = /^segment-(\d+)\.jsonl$/.exec(last);
+      if (match) this.segmentIndex = Number(match[1]);
+    }
+
+    const maxBytes = this.options.maxBytes ?? 64_000_000;
+    if (this.bytes >= maxBytes) {
+      this.degraded = true;
+      this.lastError = "SCORECARD_MAX_BYTES";
+    }
   }
 
   append(record: LearningScorecardRecordV1): void {
     try {
       const line = `${JSON.stringify(record)}\n`;
+      const lineBytes = Buffer.byteLength(line, "utf8");
+      const maxBytes = this.options.maxBytes ?? 64_000_000;
+      if (this.bytes + lineBytes > maxBytes) {
+        this.degraded = true;
+        this.lastError = "SCORECARD_MAX_BYTES";
+        throw new Error("SCORECARD_MAX_BYTES");
+      }
+
       const segmentPath = path.join(
         this.options.dataDir,
         "segments",
         `segment-${String(this.segmentIndex).padStart(5, "0")}.jsonl`,
       );
       appendFileSync(segmentPath, line, "utf8");
-      this.bytes += Buffer.byteLength(line, "utf8");
+      this.bytes += lineBytes;
       this.records += 1;
-      const maxBytes = this.options.maxBytes ?? 64_000_000;
-      if (this.bytes > maxBytes) {
-        this.degraded = true;
-        this.lastError = "SCORECARD_MAX_BYTES";
-      }
     } catch (error) {
       this.degraded = true;
       this.lastError = error instanceof Error ? error.message : String(error);
