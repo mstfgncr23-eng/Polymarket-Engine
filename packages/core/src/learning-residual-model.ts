@@ -139,21 +139,51 @@ export function fitResidualLogisticModel(
   };
 }
 
+export interface ResidualPredictInput {
+  marketPriorUp: number;
+  featureVector: LearningTrainingRowV1["featureVector"];
+}
+
 export function predictResidualProbabilityUp(
   row: LearningTrainingRowV1,
   model: LearningResidualModelV1,
 ): number {
-  const x = extractResidualFeatures(row);
-  const marketLogit = logit(clampProb(row.marketPriorUp, model.probabilityFloor, model.probabilityCeiling));
-  let residual = model.bias;
+  return predictResidualProbabilityFromFeatures(
+    { marketPriorUp: row.marketPriorUp, featureVector: row.featureVector },
+    model,
+  ).probabilityUp;
+}
+
+/**
+ * Runtime/shadow prediction from a live feature vector + market prior.
+ * Returns probability and residual logit contribution (w·x + b).
+ */
+export function predictResidualProbabilityFromFeatures(
+  input: ResidualPredictInput,
+  model: LearningResidualModelV1,
+): { probabilityUp: number; residualLogit: number; marketLogit: number } {
+  const x = extractResidualFeaturesFromVector(input.featureVector);
+  const marketLogit = logit(clampProb(input.marketPriorUp, model.probabilityFloor, model.probabilityCeiling));
+  let residualLogit = model.bias;
   for (let j = 0; j < model.featureNames.length; j += 1) {
-    residual += model.weights[j]! * x[j]!;
+    residualLogit += model.weights[j]! * x[j]!;
   }
-  return clampProb(sigmoid(marketLogit + residual), model.probabilityFloor, model.probabilityCeiling);
+  const probabilityUp = clampProb(
+    sigmoid(marketLogit + residualLogit),
+    model.probabilityFloor,
+    model.probabilityCeiling,
+  );
+  return { probabilityUp, residualLogit, marketLogit };
 }
 
 export function extractResidualFeatures(row: LearningTrainingRowV1): number[] {
-  const f = row.featureVector;
+  return extractResidualFeaturesFromVector(row.featureVector);
+}
+
+export function extractResidualFeaturesFromVector(
+  featureVector: LearningTrainingRowV1["featureVector"],
+): number[] {
+  const f = featureVector;
   return [
     finiteOrZero(f.pair.bookPressureL5),
     finiteOrZero(f.pair.orderPressureVelocityPerSecond),

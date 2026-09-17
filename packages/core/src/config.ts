@@ -172,6 +172,29 @@ export const engineEnvSchema = z.object({
   LEARNING_CHECKPOINT_SECONDS: z.string().default("240,180,120,60,30,15,5"),
   /** Optional dedicated poll interval for non-economic learning settlement labels. */
   LEARNING_SETTLEMENT_POLL_MS: z.coerce.number().int().positive().optional(),
+  /**
+   * Learned V2 shadow runtime (PR5). Default false. When enabled, loads a
+   * verified candidate for advisory prediction only — never V1 authority.
+   */
+  LEARNING_SHADOW_ENABLED: z.preprocess(
+    (value) => value === undefined ? undefined : value === true || value === "true" || value === "1",
+    z.boolean().optional(),
+  ).default(false),
+  /** Absolute path to candidate.json for shadow load (alternative to model id). */
+  LEARNING_SHADOW_MODEL_PATH: z.string().min(1).optional(),
+  /** Registry model id under LEARNING_DATA_DIR/models (alternative to path). */
+  LEARNING_SHADOW_MODEL_ID: z.string().min(1).optional(),
+  /**
+   * Future controlled PAPER authority for PAPER_APPROVED models.
+   * Default false. PR5 has NO engine execution hook — enabling this alone
+   * cannot submit orders.
+   */
+  LEARNING_PAPER_AUTHORITY_ENABLED: z.preprocess(
+    (value) => value === undefined ? undefined : value === true || value === "true" || value === "1",
+    z.boolean().optional(),
+  ).default(false),
+  /** Explicit operator-approved model id for a future controlled PAPER path. */
+  LEARNING_PAPER_AUTHORITY_MODEL_ID: z.string().min(1).optional(),
 });
 export type EngineEnv = z.infer<typeof engineEnvSchema>;
 
