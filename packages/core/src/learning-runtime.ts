@@ -82,23 +82,29 @@ export class LearningRuntime {
         dataDir: learningScorecardDir(this.config.learningDataDir),
       });
       this.scorecardStore.init();
-    } catch (error) {
-      this.loadFailureReason = "MISSING_ARTIFACT";
-      this.loadFailureDetail =
-        `scorecard init failed: ${error instanceof Error ? error.message : String(error)}`;
-      // Continue — scorecard is best-effort; model load may still work.
+    } catch {
+      // Scorecard is advisory/best-effort. Model load may still work.
       this.scorecardStore = null;
     }
 
-    const result = this.resolveAndLoad();
-    if (result.ok) {
-      this.loaded = result.loaded;
-      this.loadFailureReason = null;
-      this.loadFailureDetail = null;
-    } else {
+    try {
+      const result = this.resolveAndLoad();
+      if (result.ok) {
+        this.loaded = result.loaded;
+        this.loadFailureReason = null;
+        this.loadFailureDetail = null;
+      } else {
+        this.loaded = null;
+        this.loadFailureReason = result.reason;
+        this.loadFailureDetail = result.detail;
+      }
+    } catch (error) {
+      // Registry corruption, permission errors, or unexpected IO must never
+      // escape into engine startup. Learned shadow simply fails safe.
       this.loaded = null;
-      this.loadFailureReason = result.reason;
-      this.loadFailureDetail = result.detail;
+      this.registryEntry = null;
+      this.loadFailureReason = "RUNTIME_INIT_ERROR";
+      this.loadFailureDetail = error instanceof Error ? error.message : String(error);
     }
   }
 
