@@ -58,7 +58,9 @@ is ephemeral.
 ## Sample identity + checkpoints
 
 - Identity: `${marketId}::${checkpointId}` (e.g. `mkt-1::T-60`)
-- Crossing: first observation where `feature.timing.timeToExpiryMs <= checkpointMs`
+- Checkpoint selection: deterministic nearest-eligible band from durable sample IDs + current TTE
+  (each checkpoint C owns `(midpoint(S, C), C]` vs next-smaller neighbor S; at most one sample per observation)
+- Restart-safe: does not depend on volatile previous-TTE cursors or hot-path cursor writes
 - Exactly one logical sample per market+checkpoint
 - `timeToExpiryMs === null` → skip sampling (no invented timing)
 - Invalid checkpoint seconds (non-positive / non-integer) are skipped
@@ -98,216 +100,51 @@ Native V2 counterfactual portfolio**, not the authoritative V1 paper ledger.
       segment-00001.jsonl    # append-only fill | settlement events
 ```
 
-### Recovery
+### Experiment lifetime / scoping (KNOWN)
+
+V1 PAPER portfolio is **continuous across experiment windows**, not reset per experiment:
+
+- `PaperLedger` is constructed once from `PAPER_START_BALANCE` (`apps/engine/src/engine.ts`).
+- `beginExperiment` stamps `startingBalance: this.ledger.snapshot().startingBalance` (carries cash/PnL forward).
+- `experimentEconomicResidueBlockers()` refuses a new experiment when open positions / resting orders / reservations remain — it does **not** wipe the ledger (`docs/native-restore-pr53-audit.md`).
+- On `START_VALIDATED`, only `nativeV2ShadowStore.reset()` runs (shadow feature cache), **not** a CF/V1 ledger reset.
+
+CF therefore keeps process-lifetime + durable continuous portfolio semantics (durable `startingBalance` authoritative, no experimentId wipe). Action keys stay `${marketId}:${outcome}:${intent}` and clear on settlement, but settled market IDs remain terminal tombstones (never reopen). Learning samples may stamp `experimentId` for attribution, but the learning store is also continuous.
+
+### Bounded CF storage
+
+| Env / option | Default | Meaning |
+| --- | --- | --- |
+| `maxBytes` (store) / `LEARNING_MAX_BYTES` (engine wiring) | `256000000` | Total CF event-log byte cap under `.../counterfactual/` |
+| `segmentMaxBytes` | `8000000` | Per-segment rotation only (insufficient alone) |
+
+Fill admission is obligation-aware: a fill is accepted only when `currentBytes + fillRowBytes + sum(exactSettlementObligation(openMarketId)) <= maxBytes`. Each open market's obligation is the **exact serialized JSON identity byte cost** of that `marketId` (including JSON escapes) plus bounded non-identity overhead (clamped `source` / `reason` / deltas + fixed `at`). Settlement `marketId` is preserved exactly (legal max 160 per `idSchema`; never truncated) so restart replay matches the fill identity — even when JSON escaping expands beyond 1 byte/char. A fixed 1024-byte-per-open constant is **not** sufficient for worst-case legal ids. When the cap is hit, the write is rejected (`CAPACITY_EXCEEDED`), in-memory state is **not** advanced, and `summary().degraded` is set — V1 authority unchanged. On restart, open positions are reconstructed from the durable log and obligations are recomputed from those exact market IDs.
+
+### Durable commit atomicity
+
+Fill and settlement transitions stage on a temporary `PaperLedger`, append the durable segment row first, then apply the live in-memory transition. A manifest write failure **after** a successful segment append does **not** roll back the economic event.
+
+### Recovery / fail-closed CF
 
 On process start, `NativeV2CounterfactualStore.init()` replays durable
-counterfactual events into a fresh isolated `PaperLedger`. Failures degrade
-counterfactual durability only (`summary().degraded`); V1 trading continues.
-
-
-## Learnable feature schema (PR3)
-
-Feature schema version: `native-v2-shadow-features-v2` (was `native-v2-shadow-features-v1`).
-
-PR3 enriches Native V2 **learnable information only**. Learned models still have
-**no authority** over V1 decisions, deterministic risk, or execution.
-
-### Part A — event-flow / OFI: BLOCKED
-
-CLOB transport evidence:
-
-- Wire `event_type`s normalized by `normalizeRawClobMarketEvent` in
-  `packages/market-data/src/bounded-clob-market.ts`: `book`, `price_change`,
-  `last_trade_price`
-- `price_change` applies absolute post-state size via `applyLevelChange` in
-  `packages/market-data/src/polymarket.ts` (not typed add/cancel deltas)
-- `last_trade_price` only updates in-memory `state.lastTradePrice` and returns
-  **no** `MarketSnapshot`s to the engine feature path
-- `NativeV2ShadowFeatureExtractor.ingestMarket` accepts snapshots only — never
-  raw CLOB events
-
-Therefore add/cancel/trade cannot be discriminated reliably. PR3 does **not**
-fabricate OFI from snapshot diffs. `featureVector.eventFlow` is always:
-
-- `available: false`
-- `reason: "CLOB_TRANSPORT_LACKS_ADD_CANCEL_TRADE_DISCRIMINATION"`
-- all numeric OFI fields explicitly `null`
-
-Follow-up: wire a bounded event-flow buffer at the CLOB normalize boundary if
-Polymarket ever exposes typed add/cancel/trade deltas.
-
-### Part B — resolution-aligned features: LANDED
-
-From already-supported market + Binance reference inputs:
-
-- `resolutionAligned.timeToExpiryMs` + `invSqrtTimeToExpiryMinutes`
-- TTE interactions: book pressure / short momentum / vol-normalized movement × invSqrt(TTE)
-- Mid vs market-prior distances + binary complement basis
-- Reference venue/symbol/age + market↔reference source skew
-- Synchronization / freshness passthrough
-
-Explicitly unavailable (no invented strike):
-
-- `referenceStrikeDistanceAvailable: false`
-- `referenceStrikeDistanceBps: null`
-
-(`DiscoveredMarket` has `endDate` but no price-to-beat / strike field.)
-
-### Part C — cross-venue / oracle: partial
-
-| Source | Status |
-| --- | --- |
-| Binance reference (existing `ReferenceTick` / reference feed) | Exposed under `crossVenueOracle.binance` when ticks present |
-| Chainlink | `available: false`, `reason: "NO_EXISTING_INTEGRATION"` |
-| Coinbase | `available: false`, `reason: "NO_EXISTING_INTEGRATION"` |
-
-No new network/feed architecture was added.
-
-### Authority
-
-Unchanged: V1 Native Math → Strategy → Risk → Execution. PR3 only widens the
-shadow/learning feature vector.
-
-## Offline training / validation (PR4)
-
-Paper-only offline forecasting pipeline. **No runtime trading authority**, no auto
-promotion, no live order submission.
-
-### Goal
-
-Turn finalized (resolved) learning observations into a reproducible offline
-candidate: dataset → market-grouped walk-forward → residual logistic → baselines
-+ calibration + economic eval → versioned artifact.
-
-### Format choice: JSONL (not Parquet)
-
-**Chosen:** compact JSONL (`dataset.jsonl` + `dataset.manifest.json`).
-
-**Rationale:** the stack already persists learning samples as segmented JSONL
-under `LearningSampleStore`. Adding Parquet would introduce an Arrow/Parquet
-dependency solely for aesthetics. JSONL stays dependency-free, diff-friendly,
-and checksum-stable.
-
-### Model choice: inspectable residual logistic
-
-```
-logit(p_learned) = logit(p_market) + w·x + b
-```
-
-L2-regularized logistic residual around the market prior. Pure TypeScript — no
-GBDT/ML stack. This is **not** a BUY/SELL classifier.
-
-### Always-scored baselines
-
-1. Market prior (`pair.marketPriorUp`)
-2. Deterministic V2 shadow fair probability
-3. Learned residual model
-
-### Leakage prevention
-
-- Rows are grouped by `marketId`
-- Walk-forward assigns whole markets to train or validation (never both)
-- Optional `trainCutoffObservedAt` for explicit time cutoffs
-- Same-market random splits are rejected
-
-### Calibration
-
-Brier, log loss, and calibration buckets. If an isotonic calibrator is fit, it
-uses a held-out slice of validation only — never the same rows that are scored.
-
-### Economic evaluation (available vs unavailable)
-
-| Available from sample fields | Unavailable without new joins |
-| --- | --- |
-| Approximate executable ask/bid via mid±spread/2 | True VWAP depth-walk (asks not stored) |
-| Expected gross edge (p − ask) | Fee schedule on sample |
-| Optional assumed fee → net edge | Counterfactual ledger realized PnL join |
-| Binary settlement PnL for hypothetical BUY UP | Live fill prices |
-| Drawdown / trade count / asset / checkpoint breakdown | |
-
-### CLI
-
-```bash
-pnpm learning:train-validate -- --data-dir /data/learning --out ./artifacts/learning-pr4
-```
-
-### Candidate artifact
-
-`candidate.json` includes: model type/version, feature schema, dataset version,
-training cutoff/window, metrics, economic eval, git SHA, checksumSha256.
-
-### Authority
-
-Unchanged: V1 Native Math → Strategy → Risk → Execution. PR4 is offline tooling
-only.
-
-## Learned runtime (PR5)
-
-Paper-only runtime loading of a **validated** candidate for a third advisory view:
-
-1. **V1** — authoritative PAPER decision path (unchanged)
-2. **Deterministic V2** — existing deterministic shadow (unchanged)
-3. **Learned V2** — new learned shadow (this PR)
-
-### Model registry / states
-
-`CANDIDATE | SHADOW | PAPER_APPROVED | REJECTED | RETIRED`
-
-- Offline retrain (`pnpm learning:train-validate -- --register-candidate`) → **CANDIDATE only**
-- **No auto-promotion** to `PAPER_APPROVED` from metrics
-- Human/operator review required for `PAPER_APPROVED` (`operatorConfirmed: true`)
-
-Layout:
-
-```text
-/data/learning/
-  models/
-    registry.json
-  scorecards/
-    segments/segment-*.jsonl
-```
-
-### Runtime safety
-
-Before shadow use the loader verifies: artifact checksum, feature schema
-compatibility (`native-v2-shadow-features-v2`), dataset/model metadata, supported
-model version (`learning-residual-logistic-v1`).
-
-On failure: learned shadow **fail-safe**; V1 + deterministic V2 continue; risk
-never bypassed.
-
-### Enablement (shadow)
-
-| Env | Default | Meaning |
-| --- | --- | --- |
-| `LEARNING_SHADOW_ENABLED` | `false` | Opt-in learned shadow |
-| `LEARNING_SHADOW_MODEL_PATH` | (none) | Path to `candidate.json` |
-| `LEARNING_SHADOW_MODEL_ID` | (none) | Registry model id |
-| `LEARNING_PAPER_AUTHORITY_ENABLED` | `false` | Future gate only — **no engine hook** |
-| `LEARNING_PAPER_AUTHORITY_MODEL_ID` | (none) | Explicit operator model id |
-
-### Controlled PAPER authority — DEFERRED
-
-**Blocker (KNOWN):** V1 authority is `evaluateNativeDecision` → `evaluateTrade`
-with hardcoded native fair/market probabilities and deterministic risk. There is
-**no** pluggable probability provider or learned-authority fork. Wiring a learned
-model into order submission would invent architecture.
-
-PR5 ships:
-
-- Registry status `PAPER_APPROVED` + gate helper `evaluateControlledPaperAuthorityGate`
-- Gate always sets `maySubmitOrders: false` and `engineHookImplemented: false`
-- Tests proving CANDIDATE cannot obtain PAPER authority
-
-PR5 does **not** submit orders from learned models under any config.
-
-### Retraining loop
-
-Offline/batch only: finalized dataset → train → validate → **CANDIDATE** artifact
-(+ optional `--register-candidate`). Must NOT: train → auto-promote → trade.
-No uncontrolled per-settlement online weight updates.
-
-### Authority
-
-Unchanged: V1 Native Math → Strategy → Risk → Execution. Learned shadow is
-advisory telemetry / scorecards only.
+counterfactual events into a fresh isolated `PaperLedger`.
+
+- **V1** remains fail-soft elsewhere.
+- **CF is fail-closed** when durable recovery is untrustworthy (corrupt/unreadable
+  economic rows, startingBalance mismatch, unsafe maxBytes decrease).
+- Exposes `recoveryStatus` / `recoveryReady`; Phase-4 must not use CF as
+  stateful shadow authority while unavailable (`RECOVERY_UNAVAILABLE`).
+- Torn/truncated last-segment tail (no trailing newline) is skipped deterministically;
+  any other corrupt economic row fails CF closed (never silently skipped).
+- Persisted `startingBalance` is authoritative; constructor mismatch → CF unavailable.
+- `maxBytes`: safe increase allowed; unsafe decrease that cannot cover committed
+  bytes + settlement obligations → CF unavailable.
+- After official settlement, the market identity is a **terminal tombstone**
+  (reconstructed from durable settlement rows) — same market never reopens.
+
+### Ops notes (non-blocking)
+
+- OVH `/data/learning` mount is an ops prerequisite for durable CF/learning recovery.
+- Combined PR1 learning + CF disk usage shares `LEARNING_MAX_BYTES` defaults per store
+  layout under `LEARNING_DATA_DIR` (document capacity jointly in ops).
+- Compaction of CF segments is **not** a PR2 merge blocker.

@@ -13,7 +13,7 @@ export interface LearningCandidateMetricsBundle {
   marketPrior: LearningProbabilityMetrics;
   deterministicV2: LearningProbabilityMetrics;
   residualLearned: LearningProbabilityMetrics;
-  /** Calibration fitted only on a held-out slice of validation — never the scored rows. */
+  /** Present only when a leakage-safe calibration-market → evaluation-market boundary exists. */
   residualCalibrated?: LearningProbabilityMetrics;
 }
 
@@ -23,6 +23,7 @@ export interface LearningCandidateArtifactV1 {
   modelVersion: LearningResidualModelV1["modelVersion"];
   featureSchemaVersion: string;
   datasetVersion: string;
+  /** Historical model-freeze/data-availability boundary for this fold. */
   trainingCutoffAt: string;
   trainingWindow: {
     startAt: string;
@@ -41,8 +42,13 @@ export interface LearningCandidateArtifactV1 {
   model: LearningResidualModelV1;
   datasetManifest: LearningDatasetManifestV1;
   gitSha: string | null;
+  /** Generation provenance only; intentionally excluded from semantic checksum. */
   createdAt: string;
-  /** SHA-256 of canonical JSON payload excluding this checksum field. */
+  /**
+   * SHA-256 of deterministic candidate semantics. Generation timestamps
+   * (`createdAt` and datasetManifest.createdAt) are intentionally excluded so
+   * identical data/config/model content yields the same identity across runs.
+   */
   checksumSha256: string;
 }
 
@@ -51,6 +57,7 @@ export interface BuildLearningCandidateInput {
   datasetManifest: LearningDatasetManifestV1;
   split: Pick<
     LearningWalkForwardSplit,
+    | "trainingCutoffAt"
     | "trainWindowStartAt"
     | "trainWindowEndAt"
     | "validationWindowStartAt"
@@ -76,7 +83,7 @@ export function buildLearningCandidateArtifact(
     modelVersion: input.model.modelVersion,
     featureSchemaVersion: input.datasetManifest.featureSchemaVersion,
     datasetVersion: input.datasetManifest.datasetVersion,
-    trainingCutoffAt: input.split.trainWindowEndAt,
+    trainingCutoffAt: input.split.trainingCutoffAt,
     trainingWindow: {
       startAt: input.split.trainWindowStartAt,
       endAt: input.split.trainWindowEndAt,
@@ -111,13 +118,19 @@ export function writeLearningCandidateArtifact(
   return { candidatePath };
 }
 
-export function checksumCandidatePayload(
-  payload: Omit<LearningCandidateArtifactV1, "checksumSha256">,
-): string {
-  return createHash("sha256").update(JSON.stringify(payload)).digest("hex");
+type CandidatePayload = Omit<LearningCandidateArtifactV1, "checksumSha256">;
+
+export function checksumCandidatePayload(payload: CandidatePayload): string {
+  const { createdAt: _candidateCreatedAt, datasetManifest, ...rest } = payload;
+  const { createdAt: _datasetCreatedAt, ...stableDatasetManifest } = datasetManifest;
+  const stablePayload = {
+    ...rest,
+    datasetManifest: stableDatasetManifest,
+  };
+  return createHash("sha256").update(JSON.stringify(stablePayload)).digest("hex");
 }
 
-/** Recompute checksum and verify integrity. */
+/** Recompute deterministic semantic checksum and verify integrity. */
 export function verifyLearningCandidateChecksum(candidate: LearningCandidateArtifactV1): boolean {
   const { checksumSha256, ...rest } = candidate;
   return checksumCandidatePayload(rest) === checksumSha256;

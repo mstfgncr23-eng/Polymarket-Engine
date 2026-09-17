@@ -6,6 +6,7 @@ import {
   type BuildLearningDatasetResult,
 } from "./learning-dataset.js";
 import {
+  splitCalibrationEvaluationByMarket,
   splitWalkForwardByMarket,
   type LearningWalkForwardOptions,
   type LearningWalkForwardSplit,
@@ -37,7 +38,7 @@ export interface RunLearningOfflinePipelineOptions {
   walkForward?: LearningWalkForwardOptions;
   residual?: FitResidualLogisticOptions;
   economics?: EvaluateLearningEconomicsOptions;
-  /** Fraction of validation rows used only to fit calibration (not scored). Default 0.3. */
+  /** Fraction of validation MARKETS reserved for calibration. Default 0.3. */
   calibrationHoldoutFraction?: number;
   gitSha?: string | null;
   now?: Date;
@@ -58,8 +59,8 @@ export interface LearningOfflinePipelineResult {
 
 /**
  * Paper-only offline forecasting pipeline:
- * finalized dataset → market-grouped walk-forward → residual logistic →
- * baselines + metrics + economic eval → versioned candidate artifact.
+ * finalized dataset → label-safe market walk-forward → residual logistic →
+ * baselines + optional market-isolated calibration + economic eval → candidate.
  * Does NOT touch runtime trading authority.
  */
 export function runLearningOfflinePipeline(
@@ -81,25 +82,34 @@ export function runLearningOfflinePipeline(
 
   const model = fitResidualLogisticModel(split.trainRows, options.residual);
 
+  // Always score the uncalibrated baselines on the complete untouched validation set.
   const validationScores = scoreBaselines(split.validationRows, model);
   const marketPriorMetrics = scoreProbabilityMetrics(validationScores.marketPrior);
   const deterministicV2Metrics = scoreProbabilityMetrics(validationScores.deterministicV2);
   const residualMetrics = scoreProbabilityMetrics(validationScores.residualLearned);
 
-  // Calibration: fit only on a held-out slice of validation; score the remainder.
-  const holdoutFraction = options.calibrationHoldoutFraction ?? 0.3;
-  const holdoutCount = Math.max(
-    1,
-    Math.min(split.validationRows.length - 1, Math.floor(split.validationRows.length * holdoutFraction)),
+  // Calibration is optional and must preserve both market isolation and historical
+  // label availability. If a safe second boundary cannot be formed, omit the
+  // calibrated metric rather than leaking labels or manufacturing a score.
+  const calibrationFraction = options.calibrationHoldoutFraction ?? 0.3;
+  const calibrationSplit = splitCalibrationEvaluationByMarket(
+    split.validationRows,
+    calibrationFraction,
   );
-  const calibrationRows = validationScores.residualLearned.slice(0, holdoutCount);
-  const scoredRows = validationScores.residualLearned.slice(holdoutCount);
-  const calibrator = fitIsotonicCalibrator(calibrationRows);
-  const calibratedScores = scoredRows.map((row) => ({
-    probabilityUp: applyIsotonicCalibrator(row.probabilityUp, calibrator),
-    labelUp: row.labelUp,
-  }));
-  const residualCalibratedMetrics = scoreProbabilityMetrics(calibratedScores);
+
+  let residualCalibratedMetrics: ReturnType<typeof scoreProbabilityMetrics> | undefined;
+  if (calibrationSplit) {
+    const calibrationScores = calibrationSplit.calibrationRows.map((row) => ({
+      probabilityUp: predictResidualProbabilityUp(row, model),
+      labelUp: row.labelUp,
+    }));
+    const calibrator = fitIsotonicCalibrator(calibrationScores);
+    const calibratedScores = calibrationSplit.evaluationRows.map((row) => ({
+      probabilityUp: applyIsotonicCalibrator(predictResidualProbabilityUp(row, model), calibrator),
+      labelUp: row.labelUp,
+    }));
+    residualCalibratedMetrics = scoreProbabilityMetrics(calibratedScores);
+  }
 
   const residualProbs = split.validationRows.map((row) => predictResidualProbabilityUp(row, model));
   const economicEvaluation = evaluateLearningEconomics(
@@ -116,7 +126,7 @@ export function runLearningOfflinePipeline(
       marketPrior: marketPriorMetrics,
       deterministicV2: deterministicV2Metrics,
       residualLearned: residualMetrics,
-      residualCalibrated: residualCalibratedMetrics,
+      ...(residualCalibratedMetrics ? { residualCalibrated: residualCalibratedMetrics } : {}),
     },
     economicEvaluation,
     gitSha: options.gitSha ?? null,
