@@ -168,4 +168,143 @@ describe("NativeV2ShadowFeatureExtractor", () => {
     extractor.dropMarket("m1");
     expect(extractor.footprint().markets).toBe(0);
   });
+
+  it("marks event-flow/OFI unavailable without inventing snapshot-derived flow (Part A BLOCKED)", () => {
+    const extractor = new NativeV2ShadowFeatureExtractor();
+    extractor.ingestMarket(snapshot({
+      outcome: "UP", sequence: 1, seconds: 1, bid: 0.4, ask: 0.6,
+      bidQuantities: [30, 20, 10, 5, 5], askQuantities: [10, 10, 10, 10, 10],
+    }));
+    extractor.ingestMarket(snapshot({
+      outcome: "DOWN", sequence: 1, seconds: 1, bid: 0.3, ask: 0.5,
+      bidQuantities: [10, 10, 10, 10, 10], askQuantities: [30, 20, 10, 5, 5],
+    }));
+    const vector = extractor.extract({
+      marketId: "m1",
+      asset: "BTC",
+      now: new Date(baseMs + 2_000),
+      endDate: new Date(baseMs + 60_000).toISOString(),
+      marketSynchronized: true,
+      referenceFreshness: "unknown",
+      referenceFreshnessMs: null,
+    });
+    expect(vector).not.toBeNull();
+    expect(vector!.version).toBe(NATIVE_V2_SHADOW_FEATURE_VERSION);
+    expect(vector!.version).toBe("native-v2-shadow-features-v2");
+    expect(vector!.eventFlow.available).toBe(false);
+    expect(vector!.eventFlow.reason).toBe("CLOB_TRANSPORT_LACKS_ADD_CANCEL_TRADE_DISCRIMINATION");
+    expect(vector!.eventFlow.windowMs).toBeNull();
+    expect(vector!.eventFlow.orderFlowImbalance).toBeNull();
+    expect(vector!.eventFlow.bidAddImbalance).toBeNull();
+    expect(vector!.eventFlow.askCancelImbalance).toBeNull();
+    expect(vector!.eventFlow.touchDepletion).toBeNull();
+    expect(vector!.eventFlow.aggressiveBuyVolume).toBeNull();
+    expect(vector!.eventFlow.ofiSlope).toBeNull();
+    expect(vector!.eventFlow.ofiVelocity).toBeNull();
+  });
+
+  it("exposes resolution-aligned TTE interactions and keeps strike distance unavailable (Part B)", () => {
+    const extractor = new NativeV2ShadowFeatureExtractor();
+    extractor.ingestMarket(snapshot({
+      outcome: "UP", sequence: 1, seconds: 1, bid: 0.4, ask: 0.6,
+      bidQuantities: [30, 20, 10, 5, 5], askQuantities: [10, 10, 10, 10, 10],
+    }));
+    extractor.ingestMarket(snapshot({
+      outcome: "DOWN", sequence: 1, seconds: 1, bid: 0.3, ask: 0.5,
+      bidQuantities: [10, 10, 10, 10, 10], askQuantities: [30, 20, 10, 5, 5],
+    }));
+    for (let second = 0; second <= 30; second += 1) {
+      extractor.ingestReference(reference(second, 100 + second * 0.2));
+    }
+    const vector = extractor.extract({
+      marketId: "m1",
+      asset: "BTC",
+      now: new Date(baseMs + 31_000),
+      endDate: new Date(baseMs + 91_000).toISOString(),
+      marketSynchronized: true,
+      referenceFreshness: "fresh",
+      referenceFreshnessMs: 500,
+    });
+    expect(vector).not.toBeNull();
+    expect(vector!.resolutionAligned.timeToExpiryMs).toBe(60_000);
+    expect(vector!.resolutionAligned.invSqrtTimeToExpiryMinutes).toBeCloseTo(1, 8);
+    expect(vector!.resolutionAligned.bookPressureL5xInvSqrtTte).not.toBeNull();
+    expect(vector!.resolutionAligned.shortMomentumBpsxInvSqrtTte).not.toBeNull();
+    expect(vector!.resolutionAligned.volNormMovementxInvSqrtTte).not.toBeNull();
+    expect(vector!.resolutionAligned.upMidMinusMarketPrior).toBeCloseTo(
+      vector!.up.mid - vector!.pair.marketPriorUp, 10,
+    );
+    expect(vector!.resolutionAligned.binaryComplementBasis).toBeCloseTo(
+      vector!.pair.binaryComplementBasis, 10,
+    );
+    expect(vector!.resolutionAligned.referenceStrikeDistanceAvailable).toBe(false);
+    expect(vector!.resolutionAligned.referenceStrikeDistanceBps).toBeNull();
+    expect(vector!.resolutionAligned.referenceVenue).toBe("binance");
+    expect(vector!.resolutionAligned.referenceSymbol).toBe("BTCUSDT");
+    expect(vector!.resolutionAligned.referenceFreshness).toBe("fresh");
+    expect(vector!.resolutionAligned.marketSynchronized).toBe(true);
+  });
+
+  it("exposes existing Binance reference as cross-venue oracle and keeps Chainlink/Coinbase unavailable (Part C)", () => {
+    const extractor = new NativeV2ShadowFeatureExtractor();
+    extractor.ingestMarket(snapshot({
+      outcome: "UP", sequence: 1, seconds: 1, bid: 0.45, ask: 0.55,
+      bidQuantities: [10, 10, 10, 10, 10], askQuantities: [10, 10, 10, 10, 10],
+    }));
+    extractor.ingestMarket(snapshot({
+      outcome: "DOWN", sequence: 1, seconds: 1, bid: 0.45, ask: 0.55,
+      bidQuantities: [10, 10, 10, 10, 10], askQuantities: [10, 10, 10, 10, 10],
+    }));
+    extractor.ingestReference(reference(1, 42_000));
+    const vector = extractor.extract({
+      marketId: "m1",
+      asset: "BTC",
+      now: new Date(baseMs + 2_000),
+      endDate: null,
+      marketSynchronized: true,
+      referenceFreshness: "fresh",
+      referenceFreshnessMs: 1_000,
+    });
+    expect(vector).not.toBeNull();
+    expect(vector!.crossVenueOracle.binance.available).toBe(true);
+    expect(vector!.crossVenueOracle.binance.price).toBe(42_000);
+    expect(vector!.crossVenueOracle.binance.venue).toBe("binance");
+    expect(vector!.crossVenueOracle.binance.symbol).toBe("BTCUSDT");
+    expect(vector!.crossVenueOracle.chainlink.available).toBe(false);
+    expect(vector!.crossVenueOracle.chainlink.price).toBeNull();
+    expect(vector!.crossVenueOracle.chainlink.reason).toBe("NO_EXISTING_INTEGRATION");
+    expect(vector!.crossVenueOracle.coinbase.available).toBe(false);
+    expect(vector!.crossVenueOracle.coinbase.price).toBeNull();
+    expect(vector!.crossVenueOracle.coinbase.reason).toBe("NO_EXISTING_INTEGRATION");
+  });
+
+  it("keeps reference freshness unknown and oracle unavailable when reference is absent", () => {
+    const extractor = new NativeV2ShadowFeatureExtractor();
+    extractor.ingestMarket(snapshot({
+      outcome: "UP", sequence: 1, seconds: 1, bid: 0.45, ask: 0.55,
+      bidQuantities: [10, 10, 10, 10, 10], askQuantities: [10, 10, 10, 10, 10],
+    }));
+    extractor.ingestMarket(snapshot({
+      outcome: "DOWN", sequence: 1, seconds: 1, bid: 0.45, ask: 0.55,
+      bidQuantities: [10, 10, 10, 10, 10], askQuantities: [10, 10, 10, 10, 10],
+    }));
+    const vector = extractor.extract({
+      marketId: "m1",
+      asset: "BTC",
+      now: new Date(baseMs + 2_000),
+      endDate: null,
+      marketSynchronized: false,
+      referenceFreshness: "unknown",
+      referenceFreshnessMs: null,
+    });
+    expect(vector).not.toBeNull();
+    expect(vector!.crossVenueOracle.binance.available).toBe(false);
+    expect(vector!.crossVenueOracle.binance.price).toBeNull();
+    expect(vector!.resolutionAligned.referenceVenue).toBeNull();
+    expect(vector!.resolutionAligned.shortMomentumBpsxInvSqrtTte).toBeNull();
+    expect(vector!.resolutionAligned.referenceFreshness).toBe("unknown");
+    expect(vector!.resolutionAligned.marketSynchronized).toBe(false);
+    expect(vector!.eventFlow.available).toBe(false);
+  });
+
 });
