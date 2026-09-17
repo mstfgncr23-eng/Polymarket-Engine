@@ -69,13 +69,15 @@ describe("PR5 scorecard durable byte cap", () => {
       marketId: "m-cap",
       recordId: "cap-record",
     });
-    const lineBytes = Buffer.byteLength(`${JSON.stringify(record)}\n`, "utf8");
-    const maxBytes = lineBytes * 2;
+    const row1 = { ...record, recordId: "cap-1" };
+    const row2 = { ...record, recordId: "cap-2" };
+    const maxBytes = Buffer.byteLength(`${JSON.stringify(row1)}\n`, "utf8")
+      + Buffer.byteLength(`${JSON.stringify(row2)}\n`, "utf8");
 
     const first = new LearningScorecardStore({ dataDir: scorecardDir, maxBytes });
     first.init();
-    first.append({ ...record, recordId: "cap-1" });
-    first.append({ ...record, recordId: "cap-2" });
+    first.append(row1);
+    first.append(row2);
     expect(first.summary().bytes).toBe(maxBytes);
     expect(() => first.append({ ...record, recordId: "cap-3" })).toThrow(/SCORECARD_MAX_BYTES/);
 
