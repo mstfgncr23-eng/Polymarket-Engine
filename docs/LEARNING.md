@@ -100,6 +100,30 @@ Native V2 counterfactual portfolio**, not the authoritative V1 paper ledger.
       segment-00001.jsonl    # append-only fill | settlement events
 ```
 
+### Experiment lifetime / scoping (KNOWN)
+
+V1 PAPER portfolio is **continuous across experiment windows**, not reset per experiment:
+
+- `PaperLedger` is constructed once from `PAPER_START_BALANCE` (`apps/engine/src/engine.ts`).
+- `beginExperiment` stamps `startingBalance: this.ledger.snapshot().startingBalance` (carries cash/PnL forward).
+- `experimentEconomicResidueBlockers()` refuses a new experiment when open positions / resting orders / reservations remain — it does **not** wipe the ledger (`docs/native-restore-pr53-audit.md`).
+- On `START_VALIDATED`, only `nativeV2ShadowStore.reset()` runs (shadow feature cache), **not** a CF/V1 ledger reset.
+
+CF therefore keeps process-lifetime + durable continuous portfolio semantics (same `PAPER_START_BALANCE`, no experimentId wipe). Action keys stay `${marketId}:${outcome}:${intent}` and clear on settlement. Learning samples may stamp `experimentId` for attribution, but the learning store is also continuous.
+
+### Bounded CF storage
+
+| Env / option | Default | Meaning |
+| --- | --- | --- |
+| `maxBytes` (store) / `LEARNING_MAX_BYTES` (engine wiring) | `256000000` | Total CF event-log byte cap under `.../counterfactual/` |
+| `segmentMaxBytes` | `8000000` | Per-segment rotation only (insufficient alone) |
+
+Fill writes stop before a settlement reserve (~5% / 4KiB floor) so open CF positions can still settle near capacity. When the cap is hit, the write is rejected (`CAPACITY_EXCEEDED`), in-memory state is **not** advanced, and `summary().degraded` is set — V1 authority unchanged. Restart replays durable events only, so rejected writes cannot diverge memory vs disk.
+
+### Durable commit atomicity
+
+Fill and settlement transitions stage on a temporary `PaperLedger`, append the durable segment row first, then apply the live in-memory transition. A manifest write failure **after** a successful segment append does **not** roll back the economic event.
+
 ### Recovery
 
 On process start, `NativeV2CounterfactualStore.init()` replays durable

@@ -227,4 +227,146 @@ describe("Native V2 counterfactual state", () => {
     expect(rejected.reason).toBe("UNRESOLVED_LABEL");
     expect(store.openPositionMarketIds()).toEqual(["m1"]);
   });
+
+  it("fill durable append failure leaves memory and restart state unchanged", () => {
+    const dataDir = tempDir();
+    const store = new NativeV2CounterfactualStore({ dataDir, startingBalance: 1000 });
+    store.init();
+    const before = store.summary();
+    store.faultNextAppendForTest(new Error("FORCED_FILL_APPEND_FAILURE"));
+    const result = store.tryCommitWouldSubmit({
+      actionKey: nativeV2CounterfactualActionKey("m1", "UP"),
+      order: order(),
+      snapshot: snapshot(),
+      at: NOW,
+    });
+    expect(result.applied).toBe(false);
+    if (result.applied) throw new Error("expected failure");
+    expect(result.reason).toBe("EXECUTION_ERROR");
+    expect(store.summary().fillCount).toBe(before.fillCount);
+    expect(store.summary().availableCashUsd).toBe(before.availableCashUsd);
+    expect(store.openPositionMarketIds()).toEqual([]);
+    expect(store.summary().degraded).toBe(true);
+
+    const recovered = new NativeV2CounterfactualStore({ dataDir, startingBalance: 1000 });
+    recovered.init();
+    expect(recovered.summary().fillCount).toBe(0);
+    expect(recovered.openPositionMarketIds()).toEqual([]);
+    expect(recovered.summary().availableCashUsd).toBe(before.availableCashUsd);
+  });
+
+  it("settlement durable append failure leaves memory and restart state unchanged", () => {
+    const dataDir = tempDir();
+    const store = new NativeV2CounterfactualStore({ dataDir, startingBalance: 1000 });
+    store.init();
+    expect(store.tryCommitWouldSubmit({
+      actionKey: nativeV2CounterfactualActionKey("m1", "UP"),
+      order: order(),
+      snapshot: snapshot(),
+      at: NOW,
+    }).applied).toBe(true);
+    const before = store.summary();
+    expect(store.openPositionMarketIds()).toEqual(["m1"]);
+
+    store.faultNextAppendForTest(new Error("FORCED_SETTLEMENT_APPEND_FAILURE"));
+    const settled = store.trySettleMarket("m1", "1", "0", {
+      at: new Date("2026-09-17T09:00:00.000Z"),
+      source: "public_polymarket",
+      reason: "RESOLVED",
+    });
+    expect(settled.applied).toBe(false);
+    if (settled.applied) throw new Error("expected failure");
+    expect(settled.reason).toBe("EXECUTION_ERROR");
+    expect(store.summary().settlementCount).toBe(before.settlementCount);
+    expect(store.openPositionMarketIds()).toEqual(["m1"]);
+    expect(store.summary().availableCashUsd).toBe(before.availableCashUsd);
+    expect(store.summary().degraded).toBe(true);
+
+    const recovered = new NativeV2CounterfactualStore({ dataDir, startingBalance: 1000 });
+    recovered.init();
+    expect(recovered.openPositionMarketIds()).toEqual(["m1"]);
+    expect(recovered.summary().settlementCount).toBe(0);
+    expect(recovered.summary().fillCount).toBe(1);
+    expect(recovered.summary().availableCashUsd).toBe(before.availableCashUsd);
+  });
+
+  it("CF portfolio is continuous across experiment boundaries (matches V1 PaperLedger lifetime)", () => {
+    // KNOWN: V1 ledger is process-lifetime (PAPER_START_BALANCE once); beginExperiment
+    // carries snapshot().startingBalance and only residue-gates open exposure.
+    // Shadow store resets on START_VALIDATED; CF must NOT invent a per-experiment wipe.
+    const dataDir = tempDir();
+    const store = new NativeV2CounterfactualStore({ dataDir, startingBalance: 1000 });
+    store.init();
+    expect(store.tryCommitWouldSubmit({
+      actionKey: nativeV2CounterfactualActionKey("m1", "UP"),
+      order: order("m1"),
+      snapshot: snapshot("m1"),
+      at: NOW,
+    }).applied).toBe(true);
+    expect(store.trySettleMarket("m1", "1", "0", { at: NOW }).applied).toBe(true);
+    const afterExperimentA = store.summary();
+    expect(afterExperimentA.settlementCount).toBe(1);
+    expect(Number(afterExperimentA.availableCashUsd)).not.toBe(1000);
+
+    // Simulated experiment B boundary: no CF reset; cash/PnL accumulate.
+    expect(store.tryCommitWouldSubmit({
+      actionKey: nativeV2CounterfactualActionKey("m2", "UP"),
+      order: order("m2"),
+      snapshot: snapshot("m2"),
+      at: NOW,
+    }).applied).toBe(true);
+    const afterExperimentB = store.summary();
+    expect(afterExperimentB.fillCount).toBe(2);
+    expect(afterExperimentB.settlementCount).toBe(1);
+    expect(Number(afterExperimentB.availableCashUsd)).toBeLessThan(Number(afterExperimentA.availableCashUsd));
+
+    const recovered = new NativeV2CounterfactualStore({ dataDir, startingBalance: 1000 });
+    recovered.init();
+    expect(recovered.summary().fillCount).toBe(2);
+    expect(recovered.summary().settlementCount).toBe(1);
+    expect(recovered.summary().availableCashUsd).toBe(afterExperimentB.availableCashUsd);
+  });
+
+  it("total maxBytes bound rejects fills without mutating CF or V1-visible authority", () => {
+    const dataDir = tempDir();
+    const store = new NativeV2CounterfactualStore({
+      dataDir,
+      startingBalance: 1000,
+      maxBytes: 400,
+      segmentMaxBytes: 200,
+    });
+    store.init();
+    // First fill may succeed; keep committing until capacity rejects.
+    let rejected = null;
+    for (let i = 0; i < 30; i += 1) {
+      const marketId = `m${i}`;
+      const result = store.tryCommitWouldSubmit({
+        actionKey: nativeV2CounterfactualActionKey(marketId, "UP"),
+        order: order(marketId),
+        snapshot: snapshot(marketId),
+        at: NOW,
+      });
+      if (!result.applied) {
+        rejected = result;
+        break;
+      }
+      // Settle to free action keys / keep writing more fill events.
+      store.trySettleMarket(marketId, "1", "0", { at: NOW });
+    }
+    expect(rejected).not.toBeNull();
+    expect(rejected?.reason).toBe("CAPACITY_EXCEEDED");
+    expect(store.summary().degraded).toBe(true);
+    expect(store.summary().bytes).toBeLessThanOrEqual(store.summary().maxBytes);
+
+    const fillsBefore = store.summary().fillCount;
+    const recovered = new NativeV2CounterfactualStore({
+      dataDir,
+      startingBalance: 1000,
+      maxBytes: 400,
+      segmentMaxBytes: 200,
+    });
+    recovered.init();
+    expect(recovered.summary().fillCount).toBe(fillsBefore);
+    expect(recovered.summary().bytes).toBe(store.summary().bytes);
+  });
 });

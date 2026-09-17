@@ -12,11 +12,17 @@ import { PaperLedger } from "./accounting.js";
 import type { LedgerState, MarketSnapshot, Outcome, PaperFill, PaperOrder, Position } from "./domain.js";
 import { executePaperTaker } from "./execution.js";
 import type { LearningSettlementLabel } from "./learning-sample.js";
-import { DEFAULT_LEARNING_DATA_DIR } from "./learning-store.js";
+import { DEFAULT_LEARNING_DATA_DIR, DEFAULT_LEARNING_MAX_BYTES } from "./learning-store.js";
 
 export const NATIVE_V2_COUNTERFACTUAL_MANIFEST_VERSION = 1 as const;
 export const NATIVE_V2_COUNTERFACTUAL_STATE_BASIS = "DECISION_TIME_V2_COUNTERFACTUAL_STATE" as const;
 export const DEFAULT_COUNTERFACTUAL_SEGMENT_MAX_BYTES = 8_000_000;
+/** Total CF event-log byte cap — same operational default as learning volume contract. */
+export const DEFAULT_COUNTERFACTUAL_MAX_BYTES = DEFAULT_LEARNING_MAX_BYTES;
+/** Fraction of maxBytes reserved so settlements remain writable near fill capacity. */
+export const DEFAULT_COUNTERFACTUAL_SETTLEMENT_RESERVE_RATIO = 0.05;
+/** Floor reserve so tiny test caps still leave room for settlement events. */
+export const DEFAULT_COUNTERFACTUAL_SETTLEMENT_RESERVE_FLOOR_BYTES = 4_096;
 
 export type NativeV2CounterfactualIntent = "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG";
 
@@ -44,6 +50,7 @@ export interface NativeV2CounterfactualManifest {
   fees: string;
   segmentCount: number;
   bytes: number;
+  maxBytes: number;
   degraded: boolean;
   lastError: string | null;
   lastErrorAt: string | null;
@@ -61,6 +68,8 @@ export interface NativeV2CounterfactualSummary {
   fillCount: number;
   settlementCount: number;
   actionKeyCount: number;
+  bytes: number;
+  maxBytes: number;
   degraded: boolean;
   lastError: string | null;
   lastFillAt: string | null;
@@ -85,11 +94,11 @@ export interface CounterfactualWouldSubmitInput {
 
 export type CounterfactualCommitResult =
   | { applied: true; fill: PaperFill; actionKey: string }
-  | { applied: false; reason: "DUPLICATE_ACTION" | "NO_ORDER" | "EXECUTION_ERROR" | "DISABLED"; detail?: string };
+  | { applied: false; reason: "DUPLICATE_ACTION" | "NO_ORDER" | "EXECUTION_ERROR" | "CAPACITY_EXCEEDED" | "DISABLED"; detail?: string };
 
 export type CounterfactualSettlementResult =
   | { applied: true; marketId: string; cashDelta: string; realizedDelta: string }
-  | { applied: false; reason: "NO_POSITION" | "UNRESOLVED_LABEL" | "DISABLED"; detail?: string };
+  | { applied: false; reason: "NO_POSITION" | "UNRESOLVED_LABEL" | "EXECUTION_ERROR" | "CAPACITY_EXCEEDED" | "DISABLED"; detail?: string };
 
 type SegmentRow =
   | { kind: "fill"; actionKey: string; fill: PaperFill; at: string }
@@ -109,6 +118,7 @@ export interface NativeV2CounterfactualStoreOptions {
   dataDir?: string;
   startingBalance?: string | number;
   segmentMaxBytes?: number;
+  maxBytes?: number;
   enabled?: boolean;
   /** When false, keep in-memory state only (still isolated from V1). */
   durable?: boolean;
@@ -126,6 +136,7 @@ export class NativeV2CounterfactualStore {
   readonly enabled: boolean;
   readonly durable: boolean;
   readonly segmentMaxBytes: number;
+  readonly maxBytes: number;
 
   private readonly ledger: PaperLedger;
   private readonly actionKeys = new Set<string>();
@@ -142,6 +153,8 @@ export class NativeV2CounterfactualStore {
   private bytes = 0;
   private segmentCount = 0;
   private createdAt: string;
+  /** Test-only: next durable segment append throws once, then clears. */
+  private appendFaultForTest: Error | null = null;
 
   constructor(options: NativeV2CounterfactualStoreOptions = {}) {
     this.enabled = options.enabled !== false;
@@ -151,6 +164,9 @@ export class NativeV2CounterfactualStore {
     this.segmentMaxBytes = Number.isFinite(options.segmentMaxBytes) && (options.segmentMaxBytes ?? 0) > 0
       ? Math.trunc(options.segmentMaxBytes!)
       : DEFAULT_COUNTERFACTUAL_SEGMENT_MAX_BYTES;
+    this.maxBytes = Number.isFinite(options.maxBytes) && (options.maxBytes ?? 0) > 0
+      ? Math.trunc(options.maxBytes!)
+      : DEFAULT_COUNTERFACTUAL_MAX_BYTES;
     this.createdAt = new Date().toISOString();
     this.ledger = new PaperLedger(this.startingBalance, new Date(this.createdAt));
   }
@@ -227,7 +243,39 @@ export class NativeV2CounterfactualStore {
         measuredLatencyMs: input.measuredLatencyMs ?? 0,
       });
       const at = input.at ?? new Date(fill.timestamp);
-      this.applyFillInternal(input.actionKey, fill, at, true);
+      // Stage on a temporary ledger first so durable failure cannot diverge memory.
+      const staged = this.cloneLedger();
+      staged.applyFill(fill);
+
+      if (this.durable) {
+        const row: SegmentRow = {
+          kind: "fill",
+          actionKey: input.actionKey,
+          fill: structuredClone(fill),
+          at: at.toISOString(),
+        };
+        try {
+          this.appendRow(row, "fill");
+        } catch (error) {
+          this.noteFailure(error);
+          const message = error instanceof Error ? error.message : String(error);
+          return {
+            applied: false,
+            reason: message.includes("CAPACITY_EXCEEDED") ? "CAPACITY_EXCEEDED" : "EXECUTION_ERROR",
+            detail: message,
+          };
+        }
+        // Durable event is authoritative — apply memory, then best-effort manifest.
+        this.applyFillInternal(input.actionKey, fill, at, false);
+        try {
+          this.persistManifest();
+        } catch (error) {
+          // Manifest failure AFTER durable segment append must NOT roll back the economic event.
+          this.noteFailure(error);
+        }
+      } else {
+        this.applyFillInternal(input.actionKey, fill, at, false);
+      }
       return { applied: true, fill, actionKey: input.actionKey };
     } catch (error) {
       this.noteFailure(error);
@@ -238,11 +286,6 @@ export class NativeV2CounterfactualStore {
       };
     }
   }
-
-  /**
-   * Realize CF PnL from authoritative binary payoffs (same math as V1 settlement).
-   * Intended to be driven by learning settlement labels / public resolution — never invents winners.
-   */
   trySettleMarket(
     marketId: string,
     upPayoff: "0" | "1",
@@ -255,39 +298,66 @@ export class NativeV2CounterfactualStore {
       return { applied: false, reason: "NO_POSITION" };
     }
     const at = meta.at ?? new Date();
-    const settled = this.ledger.settlePosition(marketId, upPayoff, downPayoff, at);
+    // Stage settlement on a temporary ledger; only mutate live state after durable append.
+    const staged = this.cloneLedger();
+    const settled = staged.settlePosition(marketId, upPayoff, downPayoff, at);
     if (!settled) return { applied: false, reason: "NO_POSITION" };
 
-    this.settlementCount += 1;
-    this.clearActionKeysForMarket(marketId);
     if (this.durable) {
+      const row: SegmentRow = {
+        kind: "settlement",
+        marketId,
+        upPayoff,
+        downPayoff,
+        cashDelta: settled.cashDelta,
+        realizedDelta: settled.realizedDelta,
+        at: at.toISOString(),
+        source: meta.source ?? "counterfactual_settlement",
+        reason: meta.reason ?? null,
+      };
       try {
-        const row: SegmentRow = {
-          kind: "settlement",
-          marketId,
-          upPayoff,
-          downPayoff,
-          cashDelta: settled.cashDelta,
-          realizedDelta: settled.realizedDelta,
-          at: at.toISOString(),
-          source: meta.source ?? "counterfactual_settlement",
-          reason: meta.reason ?? null,
-        };
-        this.appendRow(row);
-        this.persistManifest();
+        this.appendRow(row, "settlement");
       } catch (error) {
         this.noteFailure(error);
+        const message = error instanceof Error ? error.message : String(error);
+        return {
+          applied: false,
+          reason: message.includes("CAPACITY_EXCEEDED") ? "CAPACITY_EXCEEDED" : "EXECUTION_ERROR",
+          detail: message,
+        };
       }
+      const live = this.ledger.settlePosition(marketId, upPayoff, downPayoff, at);
+      if (!live) {
+        // Durable settlement exists; memory must match — force-apply via restore from staged.
+        this.ledger.restore(staged.snapshot(), [...staged.positions.values()]);
+      }
+      this.settlementCount += 1;
+      this.clearActionKeysForMarket(marketId);
+      try {
+        this.persistManifest();
+      } catch (error) {
+        // Manifest failure AFTER durable segment append must NOT roll back the economic event.
+        this.noteFailure(error);
+      }
+      return {
+        applied: true,
+        marketId,
+        cashDelta: settled.cashDelta,
+        realizedDelta: settled.realizedDelta,
+      };
     }
+
+    const live = this.ledger.settlePosition(marketId, upPayoff, downPayoff, at);
+    if (!live) return { applied: false, reason: "NO_POSITION" };
+    this.settlementCount += 1;
+    this.clearActionKeysForMarket(marketId);
     return {
       applied: true,
       marketId,
-      cashDelta: settled.cashDelta,
-      realizedDelta: settled.realizedDelta,
+      cashDelta: live.cashDelta,
+      realizedDelta: live.realizedDelta,
     };
   }
-
-  /** Settle using a learning settlement label (authoritative outcome only). */
   trySettleFromLearningLabel(
     marketId: string,
     label: LearningSettlementLabel,
@@ -329,6 +399,8 @@ export class NativeV2CounterfactualStore {
       fillCount: this.fillCount,
       settlementCount: this.settlementCount,
       actionKeyCount: this.actionKeys.size,
+      bytes: this.bytes,
+      maxBytes: this.maxBytes,
       degraded: this.degraded,
       lastError: this.lastError,
       lastFillAt: this.lastFillAt,
@@ -349,6 +421,7 @@ export class NativeV2CounterfactualStore {
       fees: ledger.fees,
       segmentCount: this.segmentCount,
       bytes: this.bytes,
+      maxBytes: this.maxBytes,
       degraded: this.degraded,
       lastError: this.lastError,
       lastErrorAt: this.lastErrorAt,
@@ -446,9 +519,39 @@ export class NativeV2CounterfactualStore {
     }
   }
 
-  private appendRow(row: SegmentRow): void {
+  /** Test helper: force the next durable segment append to fail once. */
+  faultNextAppendForTest(error: Error = new Error("FORCED_APPEND_FAILURE")): void {
+    this.appendFaultForTest = error;
+  }
+
+  private cloneLedger(): PaperLedger {
+    const clone = new PaperLedger(this.startingBalance, new Date(this.createdAt));
+    clone.restore(this.ledger.snapshot(), [...this.ledger.positions.values()]);
+    return clone;
+  }
+
+  private settlementReserveBytes(): number {
+    const ratioReserve = Math.floor(this.maxBytes * DEFAULT_COUNTERFACTUAL_SETTLEMENT_RESERVE_RATIO);
+    const reserve = Math.max(ratioReserve, DEFAULT_COUNTERFACTUAL_SETTLEMENT_RESERVE_FLOOR_BYTES);
+    return Math.min(reserve, Math.floor(this.maxBytes / 2));
+  }
+
+  /** Fill writes stop before this ceiling so settlements retain bounded headroom. */
+  private fillWriteCeilingBytes(): number {
+    return Math.max(0, this.maxBytes - this.settlementReserveBytes());
+  }
+  private appendRow(row: SegmentRow, klass: "fill" | "settlement" = row.kind === "settlement" ? "settlement" : "fill"): void {
+    if (this.appendFaultForTest) {
+      const err = this.appendFaultForTest;
+      this.appendFaultForTest = null;
+      throw err;
+    }
     const line = `${JSON.stringify(row)}\n`;
     const lineBytes = Buffer.byteLength(line, "utf8");
+    const ceiling = klass === "fill" ? this.fillWriteCeilingBytes() : this.maxBytes;
+    if (this.bytes + lineBytes > ceiling) {
+      throw new Error(`CAPACITY_EXCEEDED: counterfactual store at ${this.bytes}+${lineBytes} bytes exceeds ${ceiling} (${klass})`);
+    }
     mkdirSync(this.segmentsDir(), { recursive: true });
     if (!this.currentSegmentPath || this.currentSegmentBytes + lineBytes > this.segmentMaxBytes) {
       this.currentSegmentIndex += 1;

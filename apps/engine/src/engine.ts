@@ -431,6 +431,9 @@ export class EngineService {
       durable: true,
       dataDir: counterfactualDataDir(env.LEARNING_DATA_DIR),
       startingBalance: env.PAPER_START_BALANCE,
+      // CF has its own bounded log under LEARNING_DATA_DIR/counterfactual (always durable).
+      // Cap matches the learning volume contract; CF failures never affect V1 authority.
+      maxBytes: env.LEARNING_MAX_BYTES,
     });
     try {
       this.counterfactualStore.init();
