@@ -15,7 +15,7 @@ import {
   type NativeV2ShadowFeatureVector,
 } from "./native-v2-shadow-features.js";
 import type { Outcome } from "./domain.js";
-import { parsePublicBinaryResolution } from "./settlement.js";
+import { parsePublicBinaryResolution, type BinarySettlementLookup } from "./settlement.js";
 import {
   LEARNING_SAMPLE_SCHEMA_VERSION,
   buildLearningSampleV1,
@@ -93,11 +93,17 @@ export interface LearningObserveInput {
   gitSha?: string | null;
   /** Optional full market horizon (end - start). Invalid checkpoints above it are skipped. */
   horizonMs?: number | null;
+  /**
+   * Authoritative settlement lookup captured when the learning sample is accepted.
+   * Required so unresolved labels remain labelable after restart when discovery drops the market.
+   */
+  settlementLookup?: BinarySettlementLookup;
 }
 
 type SegmentRow =
-  | { kind: "sample"; sample: LearningSampleV1 }
-  | { kind: "label"; marketId: string; sampleId: string; settlement: LearningSettlementLabel; at: string };
+  | { kind: "sample"; sample: LearningSampleV1; settlementLookup?: BinarySettlementLookup }
+  | { kind: "label"; marketId: string; sampleId: string; settlement: LearningSettlementLabel; at: string }
+  | { kind: "settlement_lookup"; lookup: BinarySettlementLookup; at: string };
 
 /**
  * Append-friendly segmented JSONL learning memory.
@@ -115,6 +121,7 @@ export class LearningSampleStore {
   private readonly unresolvedMarkets = new Set<string>();
   private readonly labeledSampleIds = new Set<string>();
   private readonly samplesByMarket = new Map<string, Set<string>>();
+  private readonly settlementLookups = new Map<string, BinarySettlementLookup>();
 
   private manifest: LearningDatasetManifest;
   private currentSegmentPath: string | null = null;
@@ -247,6 +254,9 @@ export class LearningSampleStore {
       this.appendLine(line, lineBytes);
       this.indexSample(sample);
       accepted.push(sample);
+      if (input.settlementLookup && input.settlementLookup.marketId === input.marketId) {
+        this.persistSettlementLookup(input.settlementLookup, input.now);
+      }
     }
     if (accepted.length > 0) this.persistManifest();
     return accepted;
@@ -330,6 +340,15 @@ export class LearningSampleStore {
     return [...this.unresolvedMarkets].sort();
   }
 
+  /**
+   * Restart-safe settlement lookup for unresolved learning markets.
+   * Returns null when no authoritative mapping was durably captured — do not invent mappings.
+   */
+  settlementLookupFor(marketId: string): BinarySettlementLookup | null {
+    this.init();
+    return this.settlementLookups.get(marketId) ?? null;
+  }
+
   summary(): LearningStoreSummary {
     return {
       enabled: this.enabled,
@@ -381,6 +400,7 @@ export class LearningSampleStore {
     this.unresolvedMarkets.clear();
     this.labeledSampleIds.clear();
     this.samplesByMarket.clear();
+    this.settlementLookups.clear();
 
     const manifestPath = this.manifestPath();
     if (existsSync(manifestPath)) {
@@ -409,10 +429,18 @@ export class LearningSampleStore {
           const row = JSON.parse(line) as SegmentRow;
           if (row.kind === "sample") {
             this.indexSample(row.sample, false);
+            if (row.settlementLookup?.marketId) {
+              this.settlementLookups.set(row.settlementLookup.marketId, structuredClone(row.settlementLookup));
+            }
           }
           else if (row.kind === "label") {
             this.labeledSampleIds.add(row.sampleId);
             this.unresolvedMarkets.delete(row.marketId);
+          }
+          else if (row.kind === "settlement_lookup") {
+            if (row.lookup?.marketId) {
+              this.settlementLookups.set(row.lookup.marketId, structuredClone(row.lookup));
+            }
           }
         } catch {
           this.noteFailure(new Error(`LEARNING_SEGMENT_CORRUPT:${path.basename(segmentPath)}`));
@@ -522,6 +550,36 @@ export class LearningSampleStore {
   /** Sample writes stop before this ceiling so labels retain bounded headroom. */
   private sampleWriteCeiling(): number {
     return Math.max(0, this.maxBytes - this.labelReserveBytes());
+  }
+
+
+  private persistSettlementLookup(lookup: BinarySettlementLookup, at: Date): void {
+    const existing = this.settlementLookups.get(lookup.marketId);
+    if (
+      existing
+      && existing.slug === lookup.slug
+      && existing.endDate === lookup.endDate
+      && existing.yesMapsTo === lookup.yesMapsTo
+      && existing.noMapsTo === lookup.noMapsTo
+    ) {
+      return;
+    }
+    const line = `${JSON.stringify({
+      kind: "settlement_lookup",
+      lookup: structuredClone(lookup),
+      at: at.toISOString(),
+    } satisfies SegmentRow)}\n`;
+    const lineBytes = Buffer.byteLength(line, "utf8");
+    if (this.manifest.bytes + lineBytes > this.maxBytes) {
+      this.noteFailure(new Error("LEARNING_CAPACITY_EXCEEDED"));
+      return;
+    }
+    try {
+      this.appendLine(line, lineBytes);
+      this.settlementLookups.set(lookup.marketId, structuredClone(lookup));
+    } catch (error) {
+      this.noteFailure(error);
+    }
   }
 
   private noteFailure(error: unknown): void {

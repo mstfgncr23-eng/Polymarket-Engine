@@ -4,14 +4,21 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   NATIVE_V2_COUNTERFACTUAL_STATE_BASIS,
-  NativeV2CounterfactualStore,
-  counterfactualDataDir,
-  nativeV2CounterfactualActionKey,
-  type MarketSnapshot,
-  type PaperOrder,
   createId,
+  type MarketSnapshot,
+  type ReferenceTick,
 } from "@pm/core";
-import { startQualifiedEngine } from "./paper-engine-testkit.js";
+import { MemoryEventJournal } from "@pm/db";
+import { EngineService } from "../apps/engine/src/engine.js";
+import { NoopGrokActivationBridge } from "../apps/engine/src/activation/index.js";
+import {
+  ScriptedMarketAdapter,
+  ScriptedReferenceRegistry,
+  discoveryReport,
+  qualified,
+  qualifiedPaperEnv,
+} from "./paper-engine-testkit.js";
+import { feeSchedule, snapshot as baseSnapshot } from "./fixtures.js";
 
 const dirs: string[] = [];
 
@@ -27,157 +34,292 @@ function learningDir(): string {
   return dir;
 }
 
-const NOW = new Date("2026-09-17T08:00:00.000Z");
+type Clock = { nowMs: number };
 
-function snapshot(marketId = "btc-mkt"): MarketSnapshot {
-  const iso = NOW.toISOString();
-  return {
-    eventId: "event-btc-up",
-    traceId: "trace-1",
+async function waitFor(predicate: () => boolean, timeoutMs = 8_000): Promise<void> {
+  const started = Date.now();
+  while (!predicate()) {
+    if (Date.now() - started > timeoutMs) throw new Error("test wait timeout");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+async function drainRuntime(engine: EngineService): Promise<void> {
+  await waitFor(() => engine.runtimeSupervisorSnapshot().unresolved === 0, 15_000);
+}
+
+function iso(clock: Clock): string {
+  return new Date(clock.nowMs).toISOString();
+}
+
+function zeroFee() {
+  return { ...feeSchedule, rate: "0", rebateRate: "0" };
+}
+
+function book(clock: Clock, marketId: string, outcome: "UP" | "DOWN", sequence: number): MarketSnapshot {
+  const at = iso(clock);
+  // Cheap asks (pair cost << 1) + strong UP bid imbalance for actionable shadow edge / confidence.
+  if (outcome === "UP") {
+    return baseSnapshot({
+      eventId: createId("book"),
+      traceId: createId("trace"),
+      marketId,
+      tokenId: `${marketId}-up`,
+      outcome: "UP",
+      asset: "BTC",
+      bids: [{ price: "0.38", quantity: "5000" }, { price: "0.37", quantity: "5000" }],
+      asks: [{ price: "0.40", quantity: "500" }, { price: "0.41", quantity: "500" }],
+      feeSchedule: zeroFee(),
+      sourceTimestamp: at,
+      receivedAt: at,
+      sequence,
+      hash: null,
+    });
+  }
+  return baseSnapshot({
+    eventId: createId("book"),
+    traceId: createId("trace"),
     marketId,
-    tokenId: "btc-up",
-    outcome: "UP",
+    tokenId: `${marketId}-down`,
+    outcome: "DOWN",
     asset: "BTC",
-    bids: [{ price: "0.53", quantity: "200" }],
-    asks: [{ price: "0.54", quantity: "4" }, { price: "0.56", quantity: "200" }],
-    lastTradePrice: null,
-    tickSize: "0.01",
-    minOrderSize: "1",
-    feeSchedule: {
-      rate: "0",
-      exponent: 1,
-      takerOnly: true,
-      rebateRate: "0",
-      source: "configured_test_fixture",
-      effectiveAt: iso,
-    },
-    sourceTimestamp: iso,
-    receivedAt: iso,
-    sequence: 1,
+    bids: [{ price: "0.38", quantity: "10" }],
+    asks: [{ price: "0.40", quantity: "500" }, { price: "0.41", quantity: "500" }],
+    feeSchedule: zeroFee(),
+    sourceTimestamp: at,
+    receivedAt: at,
+    sequence,
     hash: null,
-  };
+  });
 }
 
-function order(marketId = "btc-mkt"): PaperOrder {
+function referenceTick(clock: Clock, price: string): ReferenceTick {
   return {
-    id: createId("order"),
-    traceId: "trace-1",
-    triggerId: "trigger-1",
-    strategyId: "native-v2-shadow-opportunity",
-    marketId,
-    tokenId: "btc-up",
-    outcome: "UP",
-    side: "BUY",
-    orderType: "TAKER",
-    requestedPrice: "0.56",
-    quantity: "5",
-    status: "PENDING",
-    createdAt: NOW.toISOString(),
+    eventId: createId("reference"),
+    traceId: createId("trace"),
+    asset: "BTC",
+    symbol: "BTCUSDT",
+    venue: "deterministic-test",
+    price,
+    quantity: "1",
+    sourceTimestamp: iso(clock),
+    receivedAt: iso(clock),
+    tradeId: createId("trade"),
   };
 }
-
-type EngineWithCf = {
-  counterfactualStore: NativeV2CounterfactualStore;
-  ledger: { snapshot: () => unknown; positions: Map<string, unknown>; availableCash: () => { toFixed: () => string } };
-  counterfactualSummary: () => {
-    fillCount: number;
-    settlementCount: number;
-    availableCashUsd: string;
-    recoveryReady: boolean;
-    realizedPnl: string;
-    fees: string;
-  };
-  stop: () => Promise<void>;
-};
 
 describe("EngineService PR2 counterfactual integration", () => {
-  it("shadow CF advances, subsequent eval observes CF, V1 unchanged, settle+restart preserve", async () => {
+  it("real V2 shadow path advances CF, observes state, settles after restart without active discovery", async () => {
     const learningDataDir = learningDir();
-    const { engine, env } = await startQualifiedEngine({
+    const START_MS = Date.parse("2026-09-17T08:00:00.000Z");
+    const END_MS = Date.parse("2026-09-17T08:15:00.000Z");
+    const clock: Clock = { nowMs: START_MS };
+    const resolutions = new Map<string, Record<string, unknown>>();
+    const marketId = "btc-mkt";
+    const marketDef = qualified(
+      marketId,
+      "BTC",
+      `${marketId}-up`,
+      `${marketId}-down`,
+      new Date(END_MS).toISOString(),
+    );
+    // Persist inverted mapping so restart cannot silently fall back to UP/DOWN defaults.
+    marketDef.qualification.binary.yesOutcome = "DOWN";
+    marketDef.qualification.binary.noOutcome = "UP";
+
+    const market = new ScriptedMarketAdapter();
+    market.queue(discoveryReport([marketDef]));
+    const journal = new MemoryEventJournal();
+    const env = qualifiedPaperEnv({
       LEARNING_DATA_DIR: learningDataDir,
+      LEARNING_ENABLED: "true",
       PAPER_START_BALANCE: "1000",
+      PAPER_EXECUTION_STYLE: "TAKER",
+      PAPER_EXECUTION_LATENCY_MS: "0",
+      EXPERIMENT_DURATION_HOURS: "1",
+      ESTIMATED_INFRA_COST_PER_HOUR_USD: "0",
+      SETTLEMENT_POLL_MS: "1",
+      LEARNING_SETTLEMENT_POLL_MS: "1",
+      LEARNING_CHECKPOINT_SECONDS: "900,600,300",
     });
-    const typed = engine as unknown as EngineWithCf;
+    const engine = new EngineService(env, journal, { error: () => undefined }, {
+      market: market as never,
+      referenceRegistry: new ScriptedReferenceRegistry() as never,
+      activation: new NoopGrokActivationBridge(),
+      now: () => new Date(clock.nowMs),
+      resolutionFetcher: async (id) => resolutions.get(id) ?? null,
+    });
+
     try {
-      expect(env.LEARNING_DATA_DIR).toBe(learningDataDir);
-      expect(counterfactualDataDir(env.LEARNING_DATA_DIR)).toBe(join(learningDataDir, "counterfactual"));
+      await engine.start();
+      await market.waitForHandlers();
+      expect((await engine.beginExperiment()).ok).toBe(true);
 
-      const cf = typed.counterfactualStore;
-      expect(cf.isRecoveryReady()).toBe(true);
-      const v1Before = typed.ledger.snapshot();
-      const v1CashBefore = typed.ledger.availableCash().toFixed();
+      await engine.ingestReferenceTickForTest(referenceTick(clock, "100000"));
+      clock.nowMs += 1_000;
+      await engine.ingestReferenceTickForTest(referenceTick(clock, "100500"));
 
-      // First V2 shadow would-submit (same store EngineService uses for Phase-4 commits).
-      const actionKey = nativeV2CounterfactualActionKey("btc-mkt", "UP", "OPEN_FIRST_LEG");
-      const first = cf.tryCommitWouldSubmit({
-        actionKey,
-        order: order(),
-        snapshot: snapshot(),
-        measuredLatencyMs: 0,
-        at: NOW,
-      });
-      expect(first.applied).toBe(true);
+      await market.emitSnapshot(book(clock, marketId, "UP", 1));
+      await market.emitSnapshot(book(clock, marketId, "DOWN", 1));
+      await drainRuntime(engine);
+      // Shadow execution is dispatched via setImmediate.
+      await waitFor(() => engine.counterfactualSummary().fillCount >= 1, 10_000);
+      await drainRuntime(engine);
 
       const summaryAfterFirst = engine.counterfactualSummary();
-      expect(summaryAfterFirst.fillCount).toBe(1);
+      expect(summaryAfterFirst.fillCount).toBeGreaterThanOrEqual(1);
       expect(summaryAfterFirst.recoveryReady).toBe(true);
       expect(Number(summaryAfterFirst.availableCashUsd)).toBeLessThan(1000);
 
-      // Subsequent evaluation observes CF cash / exposure / duplicate / cooldown inputs.
+      const cf = (engine as unknown as { counterfactualStore: {
+        decisionState: () => { recoveryReady: boolean; stateBasis: string; positions: unknown[]; availableCashUsd: string };
+        hasUnpairedPosition: (id: string) => boolean;
+        settlementLookupFor: (id: string) => {
+          marketId: string; slug: string | null; endDate: string; yesMapsTo: string; noMapsTo: string;
+        } | null;
+        openPositionMarketIds: () => string[];
+        hasSettledMarket: (id: string) => boolean;
+      } }).counterfactualStore;
+
       const decision = cf.decisionState();
       expect(decision.stateBasis).toBe(NATIVE_V2_COUNTERFACTUAL_STATE_BASIS);
       expect(decision.recoveryReady).toBe(true);
-      expect(decision.positions).toHaveLength(1);
-      expect(Number(decision.availableCashUsd)).toBe(Number(summaryAfterFirst.availableCashUsd));
-      expect(cf.hasUnpairedPosition("btc-mkt")).toBe(true);
-      expect(cf.hasAction(actionKey)).toBe(true);
-      expect(cf.tryCommitWouldSubmit({
-        actionKey,
-        order: order(),
-        snapshot: snapshot(),
-        at: NOW,
-      }).applied).toBe(false);
+      expect(decision.positions.length).toBeGreaterThanOrEqual(1);
+      expect(cf.hasUnpairedPosition(marketId)).toBe(true);
+      const lookup = cf.settlementLookupFor(marketId);
+      expect(lookup).not.toBeNull();
+      expect(lookup?.yesMapsTo).toBe("DOWN");
+      expect(lookup?.noMapsTo).toBe("UP");
+      expect(lookup?.endDate).toBe(new Date(END_MS).toISOString());
 
-      // V1 PaperLedger unchanged.
-      expect(typed.ledger.snapshot()).toEqual(v1Before);
-      expect(typed.ledger.positions.size).toBe(0);
-      expect(typed.ledger.availableCash().toFixed()).toBe(v1CashBefore);
+      // Isolate V1 after CF durable advance: subsequent CF observation must not mutate V1.
+      const v1AfterCf = engine.ledger.snapshot();
+      const v1CashAfterCf = engine.ledger.availableCash().toFixed();
+      const v1PosAfterCf = engine.ledger.positions.size;
 
-      // Authoritative resolution settles CF (same path shape as pollLearningSettlements).
-      const settled = cf.trySettleMarket("btc-mkt", "1", "0", {
-        at: new Date("2026-09-17T09:00:00.000Z"),
-        source: "public_polymarket",
-        reason: "RESOLVED",
-      });
-      expect(settled.applied).toBe(true);
-      expect(engine.counterfactualSummary().settlementCount).toBe(1);
-      expect(cf.hasSettledMarket("btc-mkt")).toBe(true);
-      expect(cf.openPositionMarketIds()).toEqual([]);
-
-      // Still no V1 mutation.
-      expect(typed.ledger.positions.size).toBe(0);
-      expect(typed.ledger.availableCash().toFixed()).toBe(v1CashBefore);
+      // Next evaluation observes CF state (unpaired / duplicate) without a second CF fill.
+      clock.nowMs += 2_000;
+      await market.emitSnapshot(book(clock, marketId, "UP", 2));
+      await market.emitSnapshot(book(clock, marketId, "DOWN", 2));
+      await drainRuntime(engine);
+      await new Promise((r) => setImmediate(r));
+      await new Promise((r) => setImmediate(r));
+      expect(engine.counterfactualSummary().fillCount).toBe(summaryAfterFirst.fillCount);
+      expect(cf.hasUnpairedPosition(marketId)).toBe(true);
+      expect(engine.ledger.snapshot()).toEqual(v1AfterCf);
+      expect(engine.ledger.availableCash().toFixed()).toBe(v1CashAfterCf);
+      expect(engine.ledger.positions.size).toBe(v1PosAfterCf);
     } finally {
       await engine.stop();
     }
 
-    // Restart/recovery preserves CF via EngineService wiring (same LEARNING_DATA_DIR).
-    const restarted = await startQualifiedEngine({
-      LEARNING_DATA_DIR: learningDataDir,
-      PAPER_START_BALANCE: "1000",
+    // Restart with market ABSENT from active discovery — durable lookup must settle CF.
+    clock.nowMs = END_MS + 60_000;
+    resolutions.set(marketId, {
+      closed: true,
+      umaResolutionStatus: "resolved",
+      outcomes: ["Yes", "No"],
+      outcomePrices: ["1", "0"],
     });
+    // yesMapsTo=DOWN, noMapsTo=UP, Yes wins → DOWN wins → upPayoff=0, downPayoff=1
+
+    const restarted = new EngineService(
+      qualifiedPaperEnv({
+        LEARNING_DATA_DIR: learningDataDir,
+        LEARNING_ENABLED: "true",
+        PAPER_START_BALANCE: "1000",
+        PAPER_EXECUTION_STYLE: "TAKER",
+        SETTLEMENT_POLL_MS: "1",
+        LEARNING_SETTLEMENT_POLL_MS: "1",
+      }),
+      new MemoryEventJournal(),
+      { error: () => undefined },
+      {
+        market: (() => {
+          const m = new ScriptedMarketAdapter();
+          // Empty discovery — market not in active set.
+          m.queue(discoveryReport([]));
+          return m as never;
+        })(),
+        referenceRegistry: new ScriptedReferenceRegistry() as never,
+        activation: new NoopGrokActivationBridge(),
+        now: () => new Date(clock.nowMs),
+        resolutionFetcher: async (id) => resolutions.get(id) ?? null,
+      },
+    );
+
     try {
-      const summary = restarted.engine.counterfactualSummary();
-      expect(summary.recoveryReady).toBe(true);
-      expect(summary.fillCount).toBe(1);
-      expect(summary.settlementCount).toBe(1);
-      const cf2 = (restarted.engine as unknown as EngineWithCf).counterfactualStore;
-      expect(cf2.hasSettledMarket("btc-mkt")).toBe(true);
+      await restarted.start();
+      const cfSummary = restarted.counterfactualSummary();
+      expect(cfSummary.recoveryReady).toBe(true);
+      expect(cfSummary.fillCount).toBeGreaterThanOrEqual(1);
+      expect(
+        (restarted as unknown as { counterfactualStore: { openPositionMarketIds: () => string[] } })
+          .counterfactualStore.openPositionMarketIds().length,
+      ).toBeGreaterThanOrEqual(1);
+
+      // Drive official public resolution polling (same path as maintenance).
+      for (let i = 0; i < 5; i += 1) {
+        await restarted.tickMaintenance();
+        if (restarted.counterfactualSummary().settlementCount >= 1) break;
+        clock.nowMs += 1_000;
+      }
+      expect(restarted.counterfactualSummary().settlementCount).toBeGreaterThanOrEqual(1);
+      const cf2 = (restarted as unknown as { counterfactualStore: {
+        hasSettledMarket: (id: string) => boolean;
+        openPositionMarketIds: () => string[];
+        summary: () => { availableCashUsd: string; realizedPnl: string; fees: string; fillCount: number; settlementCount: number };
+      } }).counterfactualStore;
+      expect(cf2.hasSettledMarket(marketId)).toBe(true);
       expect(cf2.openPositionMarketIds()).toEqual([]);
-      expect(restarted.engine.ledger.positions.size).toBe(0);
-      expect(restarted.engine.ledger.availableCash().toFixed()).toBe("1000");
+      expect(restarted.ledger.positions.size).toBe(0);
+      expect(restarted.ledger.availableCash().toFixed()).toBe("1000");
+
+      const settledSnapshot = {
+        availableCashUsd: cf2.summary().availableCashUsd,
+        realizedPnl: cf2.summary().realizedPnl,
+        fees: cf2.summary().fees,
+        fillCount: cf2.summary().fillCount,
+        settlementCount: cf2.summary().settlementCount,
+      };
+
+      await restarted.stop();
+
+      // Second restart: replay equivalent.
+      const replay = new EngineService(
+        qualifiedPaperEnv({
+          LEARNING_DATA_DIR: learningDataDir,
+          PAPER_START_BALANCE: "1000",
+        }),
+        new MemoryEventJournal(),
+        { error: () => undefined },
+        {
+          market: (() => {
+            const m = new ScriptedMarketAdapter();
+            m.queue(discoveryReport([]));
+            return m as never;
+          })(),
+          referenceRegistry: new ScriptedReferenceRegistry() as never,
+          activation: new NoopGrokActivationBridge(),
+          now: () => new Date(clock.nowMs),
+          resolutionFetcher: async () => null,
+        },
+      );
+      try {
+        await replay.start();
+        const summary = replay.counterfactualSummary();
+        expect(summary.recoveryReady).toBe(true);
+        expect(summary.fillCount).toBe(settledSnapshot.fillCount);
+        expect(summary.settlementCount).toBe(settledSnapshot.settlementCount);
+        expect(summary.availableCashUsd).toBe(settledSnapshot.availableCashUsd);
+        expect(summary.realizedPnl).toBe(settledSnapshot.realizedPnl);
+        expect(summary.fees).toBe(settledSnapshot.fees);
+        expect(replay.ledger.availableCash().toFixed()).toBe("1000");
+      } finally {
+        await replay.stop();
+      }
     } finally {
-      await restarted.engine.stop();
+      try { await restarted.stop(); } catch { /* already stopped */ }
     }
   });
 });

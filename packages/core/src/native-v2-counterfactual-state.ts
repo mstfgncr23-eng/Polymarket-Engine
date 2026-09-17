@@ -5,6 +5,7 @@ import {
   readFileSync,
   readdirSync,
   renameSync,
+  truncateSync,
   writeFileSync,
 } from "node:fs";
 import path from "node:path";
@@ -12,6 +13,7 @@ import { PaperLedger } from "./accounting.js";
 import type { LedgerState, MarketSnapshot, Outcome, PaperFill, PaperOrder, Position } from "./domain.js";
 import { executePaperTaker } from "./execution.js";
 import type { LearningSettlementLabel } from "./learning-sample.js";
+import type { BinarySettlementLookup } from "./settlement.js";
 import { DEFAULT_LEARNING_DATA_DIR, DEFAULT_LEARNING_MAX_BYTES } from "./learning-store.js";
 
 export const NATIVE_V2_COUNTERFACTUAL_MANIFEST_VERSION = 1 as const;
@@ -28,13 +30,25 @@ export const DEFAULT_COUNTERFACTUAL_MAX_BYTES = DEFAULT_LEARNING_MAX_BYTES;
  */
 export const MAX_COUNTERFACTUAL_SETTLEMENT_ROW_BYTES = 1024;
 
-/** Max UTF-16 code units retained for settlement source metadata (non-identity). */
+/**
+ * Max UTF-8 bytes of the JSON string literal (including quotes / escapes) retained
+ * for settlement source metadata (non-identity). Char-count clamps are NOT byte-safe.
+ */
+export const MAX_COUNTERFACTUAL_SETTLEMENT_SOURCE_JSON_BYTES = 66;
+/** Max UTF-8 JSON string literal bytes for settlement reason metadata (non-identity). */
+export const MAX_COUNTERFACTUAL_SETTLEMENT_REASON_JSON_BYTES = 66;
+/** Max UTF-8 JSON string literal bytes for settlement decimal delta strings (non-identity). */
+export const MAX_COUNTERFACTUAL_SETTLEMENT_DECIMAL_JSON_BYTES = 66;
+/** Fixed ISO-8601 millisecond timestamp JSON string literal byte budget (incl. quotes). */
+export const COUNTERFACTUAL_SETTLEMENT_AT_JSON_BYTES = 26;
+
+/** @deprecated Use MAX_COUNTERFACTUAL_SETTLEMENT_SOURCE_JSON_BYTES */
 export const MAX_COUNTERFACTUAL_SETTLEMENT_SOURCE_CHARS = 64;
-/** Max UTF-16 code units retained for settlement reason metadata (non-identity). */
+/** @deprecated Use MAX_COUNTERFACTUAL_SETTLEMENT_REASON_JSON_BYTES */
 export const MAX_COUNTERFACTUAL_SETTLEMENT_REASON_CHARS = 64;
-/** Max UTF-16 code units retained for settlement decimal delta strings (non-identity). */
+/** @deprecated Use MAX_COUNTERFACTUAL_SETTLEMENT_DECIMAL_JSON_BYTES */
 export const MAX_COUNTERFACTUAL_SETTLEMENT_DECIMAL_CHARS = 64;
-/** Fixed ISO-8601 millisecond timestamp length used when sizing settlement obligations. */
+/** @deprecated Use COUNTERFACTUAL_SETTLEMENT_AT_JSON_BYTES */
 export const COUNTERFACTUAL_SETTLEMENT_AT_CHARS = 24;
 
 export type NativeV2CounterfactualIntent = "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG";
@@ -67,15 +81,16 @@ export function counterfactualSettlementIdentityJsonBytes(marketId: string): num
  * Summed across actual open market IDs on fill admission and reconstructed on restart.
  */
 export function counterfactualSettlementObligationBytes(marketId: string): number {
+  // Worst-case non-identity payloads that still fit the JSON-byte clamps.
   const row = buildBoundedCounterfactualSettlementRow({
     marketId,
     upPayoff: "1",
     downPayoff: "0",
-    cashDelta: "9".repeat(MAX_COUNTERFACTUAL_SETTLEMENT_DECIMAL_CHARS),
-    realizedDelta: "9".repeat(MAX_COUNTERFACTUAL_SETTLEMENT_DECIMAL_CHARS),
-    at: "2".repeat(COUNTERFACTUAL_SETTLEMENT_AT_CHARS),
-    source: "x".repeat(MAX_COUNTERFACTUAL_SETTLEMENT_SOURCE_CHARS),
-    reason: "y".repeat(MAX_COUNTERFACTUAL_SETTLEMENT_REASON_CHARS),
+    cashDelta: "9".repeat(256),
+    realizedDelta: "9".repeat(256),
+    at: "2".repeat(64),
+    source: "x".repeat(256),
+    reason: "y".repeat(256),
   });
   return Buffer.byteLength(`${JSON.stringify(row)}\n`, "utf8");
 }
@@ -138,6 +153,12 @@ export interface CounterfactualWouldSubmitInput {
   /** Paper taker latency model; Phase-4 shadow uses decision-time book (0 is valid). */
   measuredLatencyMs?: number;
   at?: Date;
+  /**
+   * Authoritative settlement lookup captured at accept time. Required for
+   * restart-safe official resolution when the market leaves active discovery.
+   * Do not invent YES/NO mappings later.
+   */
+  settlementLookup?: BinarySettlementLookup;
 }
 
 export type CounterfactualCommitResult =
@@ -170,7 +191,13 @@ export type CounterfactualSettlementResult =
   };
 
 type SegmentRow =
-  | { kind: "fill"; actionKey: string; fill: PaperFill; at: string }
+  | {
+    kind: "fill";
+    actionKey: string;
+    fill: PaperFill;
+    at: string;
+    settlementLookup?: BinarySettlementLookup;
+  }
   | {
     kind: "settlement";
     marketId: string;
@@ -183,14 +210,27 @@ type SegmentRow =
     reason: string | null;
   };
 
-function clampSettlementChars(value: string, maxChars: number): string {
-  return value.length <= maxChars ? value : value.slice(0, maxChars);
+/**
+ * Truncate a string so JSON.stringify(value) UTF-8 byte length stays within maxJsonBytes
+ * (including the surrounding quotes and any JSON escapes). Escape-aware / UTF-8 safe.
+ */
+export function clampJsonStringUtf8Bytes(value: string, maxJsonBytes: number): string {
+  if (!Number.isFinite(maxJsonBytes) || maxJsonBytes < 2) return "";
+  if (Buffer.byteLength(JSON.stringify(value), "utf8") <= maxJsonBytes) return value;
+  let lo = 0;
+  let hi = value.length;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (Buffer.byteLength(JSON.stringify(value.slice(0, mid)), "utf8") <= maxJsonBytes) lo = mid;
+    else hi = mid - 1;
+  }
+  return value.slice(0, lo);
 }
 
 /**
- * Build a settlement row with exact marketId identity and clamped non-identity metadata.
+ * Build a settlement row with exact marketId identity and byte-bounded non-identity metadata.
  * Row byte size is identity-driven (JSON-escaped marketId) + bounded overhead — never
- * truncate marketId. Non-identity fields are clamped to their char budgets only.
+ * truncate marketId. Non-identity fields are clamped to JSON UTF-8 byte budgets.
  */
 export function buildBoundedCounterfactualSettlementRow(input: {
   marketId: string;
@@ -203,14 +243,14 @@ export function buildBoundedCounterfactualSettlementRow(input: {
   reason: string | null;
 }): Extract<SegmentRow, { kind: "settlement" }> {
   const marketId = input.marketId;
-  const source = clampSettlementChars(input.source, MAX_COUNTERFACTUAL_SETTLEMENT_SOURCE_CHARS);
+  const source = clampJsonStringUtf8Bytes(input.source, MAX_COUNTERFACTUAL_SETTLEMENT_SOURCE_JSON_BYTES);
   const reason =
     input.reason === null
       ? null
-      : clampSettlementChars(input.reason, MAX_COUNTERFACTUAL_SETTLEMENT_REASON_CHARS);
-  const cashDelta = clampSettlementChars(input.cashDelta, MAX_COUNTERFACTUAL_SETTLEMENT_DECIMAL_CHARS);
-  const realizedDelta = clampSettlementChars(input.realizedDelta, MAX_COUNTERFACTUAL_SETTLEMENT_DECIMAL_CHARS);
-  const at = clampSettlementChars(input.at, COUNTERFACTUAL_SETTLEMENT_AT_CHARS);
+      : clampJsonStringUtf8Bytes(input.reason, MAX_COUNTERFACTUAL_SETTLEMENT_REASON_JSON_BYTES);
+  const cashDelta = clampJsonStringUtf8Bytes(input.cashDelta, MAX_COUNTERFACTUAL_SETTLEMENT_DECIMAL_JSON_BYTES);
+  const realizedDelta = clampJsonStringUtf8Bytes(input.realizedDelta, MAX_COUNTERFACTUAL_SETTLEMENT_DECIMAL_JSON_BYTES);
+  const at = clampJsonStringUtf8Bytes(input.at, COUNTERFACTUAL_SETTLEMENT_AT_JSON_BYTES);
 
   return {
     kind: "settlement",
@@ -264,6 +304,8 @@ export class NativeV2CounterfactualStore {
   private readonly actionKeys = new Set<string>();
   /** Terminal settled-market tombstones (reconstructed from durable settlement rows). */
   private readonly settledMarketIds = new Set<string>();
+  /** Authoritative settlement lookup metadata captured at CF fill accept time. */
+  private readonly settlementLookups = new Map<string, BinarySettlementLookup>();
   private fillCount = 0;
   private settlementCount = 0;
   private lastFillAt: string | null = null;
@@ -391,6 +433,26 @@ export class NativeV2CounterfactualStore {
       .sort();
   }
 
+  /**
+   * Restart-safe settlement lookup for an open (or previously accepted) CF market.
+   * Returns null when no authoritative mapping was durably captured — callers must
+   * NOT invent YES/NO → UP/DOWN mappings.
+   */
+  settlementLookupFor(marketId: string): BinarySettlementLookup | null {
+    this.init();
+    if (this.recoveryStatus !== "ready") return null;
+    return this.settlementLookups.get(marketId) ?? null;
+  }
+
+  /** Open CF markets that still have durable settlement lookup metadata. */
+  openSettlementLookups(): BinarySettlementLookup[] {
+    this.init();
+    if (this.recoveryStatus !== "ready") return [];
+    return this.openPositionMarketIds()
+      .map((marketId) => this.settlementLookups.get(marketId))
+      .filter((row): row is BinarySettlementLookup => row != null);
+  }
+
   settledMarketIdsForTest(): string[] {
     this.init();
     return [...this.settledMarketIds].sort();
@@ -444,6 +506,9 @@ export class NativeV2CounterfactualStore {
           actionKey: input.actionKey,
           fill: structuredClone(fill),
           at: at.toISOString(),
+          ...(input.settlementLookup
+            ? { settlementLookup: structuredClone(input.settlementLookup) }
+            : {}),
         };
         try {
           this.appendRow(row, "fill", {
@@ -454,7 +519,9 @@ export class NativeV2CounterfactualStore {
             }),
           });
         } catch (error) {
-          this.noteFailure(error);
+          // Economically required would-submit could not be durably appended — fail CF closed
+          // for subsequent shadow decisions. V1 remains unaffected. Durable log unchanged.
+          this.markRecoveryUnavailable(error);
           const message = error instanceof Error ? error.message : String(error);
           return {
             applied: false,
@@ -464,14 +531,21 @@ export class NativeV2CounterfactualStore {
         }
         // Durable event is authoritative — apply memory, then best-effort manifest.
         this.applyFillInternal(input.actionKey, fill, at, false);
+        if (input.settlementLookup) {
+          this.settlementLookups.set(input.settlementLookup.marketId, structuredClone(input.settlementLookup));
+        }
         try {
           this.persistManifest();
         } catch (error) {
-          // Manifest failure AFTER durable segment append must NOT roll back the economic event.
+          // Manifest failure AFTER durable segment append must NOT roll back the economic event
+          // or unnecessarily invalidate a recoverable economic log.
           this.noteFailure(error);
         }
       } else {
         this.applyFillInternal(input.actionKey, fill, at, false);
+        if (input.settlementLookup) {
+          this.settlementLookups.set(input.settlementLookup.marketId, structuredClone(input.settlementLookup));
+        }
       }
       return { applied: true, fill, actionKey: input.actionKey };
     } catch (error) {
@@ -537,6 +611,7 @@ export class NativeV2CounterfactualStore {
       }
       this.settlementCount += 1;
       this.settledMarketIds.add(marketId);
+      this.settlementLookups.delete(marketId);
       this.clearActionKeysForMarket(marketId);
       try {
         this.persistManifest();
@@ -556,6 +631,7 @@ export class NativeV2CounterfactualStore {
     if (!live) return { applied: false, reason: "NO_POSITION" };
     this.settlementCount += 1;
     this.settledMarketIds.add(marketId);
+    this.settlementLookups.delete(marketId);
     this.clearActionKeysForMarket(marketId);
     return {
       applied: true,
@@ -662,6 +738,7 @@ export class NativeV2CounterfactualStore {
     mkdirSync(this.segmentsDir(), { recursive: true });
     this.actionKeys.clear();
     this.settledMarketIds.clear();
+    this.settlementLookups.clear();
     this.fillCount = 0;
     this.settlementCount = 0;
     this.lastFillAt = null;
@@ -716,13 +793,15 @@ export class NativeV2CounterfactualStore {
           `CF_SEGMENT_UNREADABLE:${path.basename(segmentPath)}:${error instanceof Error ? error.message : String(error)}`,
         );
       }
-      this.bytes += Buffer.byteLength(text, "utf8");
       const endsWithNewline = text.endsWith("\n");
       const rawLines = text.split("\n");
       // split() yields a trailing empty string when file ends with \n — drop it.
       if (rawLines.length > 0 && rawLines[rawLines.length - 1] === "") {
         rawLines.pop();
       }
+
+      const committedLines: string[] = [];
+      let tornTailSkipped = false;
 
       for (let lineIdx = 0; lineIdx < rawLines.length; lineIdx += 1) {
         const line = rawLines[lineIdx]!;
@@ -734,11 +813,21 @@ export class NativeV2CounterfactualStore {
             if (!row.actionKey || !row.fill) {
               throw new Error("CF_FILL_ROW_INVALID");
             }
-            if (this.actionKeys.has(row.actionKey)) continue;
+            if (this.actionKeys.has(row.actionKey)) {
+              committedLines.push(line);
+              continue;
+            }
             fresh.applyFill(row.fill);
             this.actionKeys.add(row.actionKey);
             this.fillCount += 1;
             this.lastFillAt = row.at;
+            if (row.settlementLookup && row.settlementLookup.marketId) {
+              this.settlementLookups.set(
+                row.settlementLookup.marketId,
+                structuredClone(row.settlementLookup),
+              );
+            }
+            committedLines.push(line);
           } else if (row.kind === "settlement") {
             if (typeof row.marketId !== "string" || !row.marketId) {
               throw new Error("CF_SETTLEMENT_ROW_INVALID");
@@ -750,14 +839,15 @@ export class NativeV2CounterfactualStore {
             }
             this.settlementCount += 1;
             this.clearActionKeysForMarket(row.marketId);
+            this.settlementLookups.delete(row.marketId);
+            committedLines.push(line);
           } else {
             throw new Error(`CF_SEGMENT_UNKNOWN_KIND:${String((row as { kind?: unknown }).kind)}`);
           }
         } catch (error) {
           // Torn/truncated tail of the last segment: deterministic skip (incomplete write).
           if (isLastSegment && isLastLine && !endsWithNewline) {
-            // Exclude torn bytes from the durable byte counter (they are not committed rows).
-            this.bytes -= Buffer.byteLength(line, "utf8");
+            tornTailSkipped = true;
             continue;
           }
           // Any other corrupt economic row → fail CF closed (do not skip / continue).
@@ -766,6 +856,16 @@ export class NativeV2CounterfactualStore {
           );
         }
       }
+
+      // Physically repair last segment so the next append cannot concatenate onto a
+      // torn/missing-newline tail. Truncate to last committed newline-terminated content.
+      if (isLastSegment && (tornTailSkipped || !endsWithNewline)) {
+        const repaired = committedLines.length > 0 ? `${committedLines.join("\n")}\n` : "";
+        writeFileSync(segmentPath, repaired, "utf8");
+        text = repaired;
+      }
+
+      this.bytes += Buffer.byteLength(text, "utf8");
     }
 
     this.ledger.restore(fresh.snapshot(), [...fresh.positions.values()]);
@@ -904,6 +1004,7 @@ export class NativeV2CounterfactualStore {
     // Do NOT rewrite durable manifest/segments: preserve evidence so a clean restart can retry.
     this.actionKeys.clear();
     this.settledMarketIds.clear();
+    this.settlementLookups.clear();
     this.fillCount = 0;
     this.settlementCount = 0;
     this.lastFillAt = null;

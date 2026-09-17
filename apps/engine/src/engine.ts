@@ -30,6 +30,8 @@ import {
   makerReserveNotional,
   executableFairEdge,
   parsePublicBinaryResolution,
+  isAuthoritativeBinaryMapping,
+  type BinarySettlementLookup,
   conservativeRealizableMark,
   classifySettledOutcome,
   settlementCashDelta,
@@ -2123,16 +2125,20 @@ export class EngineService {
     // opportunity/ranking. Fail-soft — never throw into the trading path.
     if (this.learningStore && shadowV2FeatureVector && shadowV2FairProbability) {
       try {
-        tryObserveLearningSample(this.learningStore, {
-          marketId: trigger.marketId,
-          asset,
-          now: this.nowFn(),
-          featureVector: shadowV2FeatureVector,
-          v2FairProbability: shadowV2FairProbability,
-          native,
-          experimentId: this.experiment?.id ?? null,
-          gitSha: process.env.GIT_SHA ?? process.env.FLY_IMAGE_REF ?? null,
-        });
+        {
+          const discovered = this.marketsById.get(trigger.marketId);
+          tryObserveLearningSample(this.learningStore, {
+            marketId: trigger.marketId,
+            asset,
+            now: this.nowFn(),
+            featureVector: shadowV2FeatureVector,
+            v2FairProbability: shadowV2FairProbability,
+            native,
+            experimentId: this.experiment?.id ?? null,
+            gitSha: process.env.GIT_SHA ?? process.env.FLY_IMAGE_REF ?? null,
+            settlementLookup: discovered ? (this.settlementLookupFromMarket(discovered) ?? undefined) : undefined,
+          });
+        }
       } catch {
         // Learning must never affect V1/V2/risk/execution authority.
       }
@@ -2473,12 +2479,14 @@ export class EngineService {
     let counterfactual: Record<string, unknown> | null = null;
     if (wouldSubmitOrder && decision.order && this.counterfactualStore.isRecoveryReady()) {
       const actionKey = nativeV2CounterfactualActionKey(marketId, selectedAtDecision.outcome, "OPEN_FIRST_LEG");
+      const discovered = this.marketsById.get(marketId);
       const commit = this.counterfactualStore.tryCommitWouldSubmit({
         actionKey,
         order: decision.order,
         snapshot: input.currentSnapshot,
         measuredLatencyMs: 0,
         at: now,
+        settlementLookup: discovered ? (this.settlementLookupFromMarket(discovered) ?? undefined) : undefined,
       });
       counterfactual = {
         actionKey,
@@ -3802,6 +3810,9 @@ export class EngineService {
   }
 
   private async maintainExperiment(): Promise<void> {
+    // CF + learning settlement obligations are restart-durable and must poll even when
+    // no experiment is active (expired markets may be absent from discovery).
+    await this.pollLearningSettlements();
     if (!this.experiment) return;
     if (this.experiment.status === "RUNNING" || this.experiment.status === "ENTRY_CLOSED") {
       await this.accrueInfrastructureCost(this.nowFn().getTime());
@@ -3810,7 +3821,6 @@ export class EngineService {
     await this.pollFailedHedges();
     await this.maybeScheduledReview();
     await this.pollSettlements();
-    await this.pollLearningSettlements();
     const previous = this.experiment.status;
     const open = openPositionsRemain(this.ledger.positions.values());
     const unresolved = [...this.ledger.positions.values()].filter((position) => Number(position.upQuantity) > 0 || Number(position.downQuantity) > 0).length;
@@ -3892,6 +3902,32 @@ export class EngineService {
    * the same public resolution fetch used by economic settlement, without
    * calling settleMarket / commitAuthoritative POSITION_SETTLED / ledger mutation.
    */
+
+  private settlementLookupFromMarket(market: DiscoveredMarket): BinarySettlementLookup | null {
+    if (!market.endDate) return null;
+    const yes = market.qualification.binary.yesOutcome;
+    const no = market.qualification.binary.noOutcome;
+    if (!isAuthoritativeBinaryMapping(yes, no)) return null;
+    return {
+      marketId: market.id,
+      slug: market.slug ?? null,
+      endDate: market.endDate,
+      yesMapsTo: yes as "UP" | "DOWN",
+      noMapsTo: no as "UP" | "DOWN",
+    };
+  }
+
+  private resolveSettlementLookup(marketId: string): BinarySettlementLookup | null {
+    const live = this.marketsById.get(marketId);
+    if (live) {
+      const fromLive = this.settlementLookupFromMarket(live);
+      if (fromLive) return fromLive;
+    }
+    const fromCf = this.counterfactualStore.settlementLookupFor(marketId);
+    if (fromCf) return fromCf;
+    return this.learningStore?.settlementLookupFor(marketId) ?? null;
+  }
+
   private async pollLearningSettlements(): Promise<void> {
     const now = this.nowFn();
     const intervalMs = this.env.LEARNING_SETTLEMENT_POLL_MS ?? this.env.SETTLEMENT_POLL_MS;
@@ -3900,18 +3936,17 @@ export class EngineService {
 
     if (this.learningStore) {
       for (const marketId of this.learningStore.unresolvedLearningMarketIds()) {
-        const market = this.marketsById.get(marketId);
-        if (!market?.endDate || new Date(market.endDate).getTime() > now.getTime()) continue;
+        const lookup = this.resolveSettlementLookup(marketId);
+        // Without authoritative endDate + YES/NO mapping, do not guess after discovery drops the market.
+        if (!lookup?.endDate || new Date(lookup.endDate).getTime() > now.getTime()) continue;
+        if (!isAuthoritativeBinaryMapping(lookup.yesMapsTo, lookup.noMapsTo)) continue;
         try {
-          const raw = await this.resolutionFetcher(market.id)
-            ?? (market.slug ? await this.resolutionFetcher(market.slug) : null);
+          const raw = await this.resolutionFetcher(lookup.marketId)
+            ?? (lookup.slug ? await this.resolutionFetcher(lookup.slug) : null);
           if (!raw) continue;
-          const binary = market.qualification.binary;
-          const yes = binary.yesOutcome === "DOWN" || binary.yesOutcome === "UP" ? binary.yesOutcome : "UP";
-          const no = binary.noOutcome === "DOWN" || binary.noOutcome === "UP" ? binary.noOutcome : "DOWN";
-          this.learningStore.labelMarket(marketId, raw, yes, no, now);
+          this.learningStore.labelMarket(marketId, raw, lookup.yesMapsTo, lookup.noMapsTo, now);
           // CF settlement uses the same authoritative public resolution parse — never invents winners.
-          const parsed = parsePublicBinaryResolution(raw, yes, no);
+          const parsed = parsePublicBinaryResolution(raw, lookup.yesMapsTo, lookup.noMapsTo);
           if (parsed.status === "resolved" && parsed.upPayoff && parsed.downPayoff
             && this.counterfactualStore.isRecoveryReady()) {
             this.counterfactualStore.trySettleMarket(marketId, parsed.upPayoff, parsed.downPayoff, {
@@ -3929,16 +3964,14 @@ export class EngineService {
     // Settle open CF positions even when no learning samples exist for the market.
     if (!this.counterfactualStore.isRecoveryReady()) return;
     for (const marketId of this.counterfactualStore.openPositionMarketIds()) {
-      const market = this.marketsById.get(marketId);
-      if (!market?.endDate || new Date(market.endDate).getTime() > now.getTime()) continue;
+      const lookup = this.resolveSettlementLookup(marketId);
+      if (!lookup?.endDate || new Date(lookup.endDate).getTime() > now.getTime()) continue;
+      if (!isAuthoritativeBinaryMapping(lookup.yesMapsTo, lookup.noMapsTo)) continue;
       try {
-        const raw = await this.resolutionFetcher(market.id)
-          ?? (market.slug ? await this.resolutionFetcher(market.slug) : null);
+        const raw = await this.resolutionFetcher(lookup.marketId)
+          ?? (lookup.slug ? await this.resolutionFetcher(lookup.slug) : null);
         if (!raw) continue;
-        const binary = market.qualification.binary;
-        const yes = binary.yesOutcome === "DOWN" || binary.yesOutcome === "UP" ? binary.yesOutcome : "UP";
-        const no = binary.noOutcome === "DOWN" || binary.noOutcome === "UP" ? binary.noOutcome : "DOWN";
-        const parsed = parsePublicBinaryResolution(raw, yes, no);
+        const parsed = parsePublicBinaryResolution(raw, lookup.yesMapsTo, lookup.noMapsTo);
         if (parsed.status === "resolved" && parsed.upPayoff && parsed.downPayoff) {
           this.counterfactualStore.trySettleMarket(marketId, parsed.upPayoff, parsed.downPayoff, {
             at: now,

@@ -599,3 +599,53 @@ describe("PR64 review blocker regressions", () => {
   });
 });
 
+describe("learning settlement lookup lifecycle", () => {
+  it("settlement lookup survives restart so unresolved labels remain labelable", () => {
+    const dataDir = tempDir();
+    const store = new LearningSampleStore({
+      enabled: true,
+      dataDir,
+      maxBytes: 1_000_000,
+      checkpointSeconds: [60],
+    });
+    store.init();
+    const lookup = {
+      marketId: "m-learn",
+      slug: "btc-updown-15m",
+      endDate: "2026-09-17T09:00:00.000Z",
+      yesMapsTo: "DOWN" as const,
+      noMapsTo: "UP" as const,
+    };
+    const features = vector({
+      marketId: "m-learn",
+      timeToExpiryMs: 55_000,
+    });
+    const fair = evaluateNativeV2ShadowFairProbability(features);
+    expect(fair).not.toBeNull();
+    const accepted = store.observe({
+      marketId: "m-learn",
+      asset: "BTC",
+      now: new Date("2026-09-17T08:00:00.000Z"),
+      featureVector: features,
+      v2FairProbability: fair!,
+      settlementLookup: lookup,
+    });
+    expect(accepted.length).toBeGreaterThanOrEqual(1);
+    expect(store.settlementLookupFor("m-learn")).toEqual(lookup);
+    expect(store.unresolvedLearningMarketIds()).toContain("m-learn");
+
+    const recovered = new LearningSampleStore({
+      enabled: true,
+      dataDir,
+      maxBytes: 1_000_000,
+      checkpointSeconds: [60],
+    });
+    recovered.init();
+    expect(recovered.settlementLookupFor("m-learn")).toEqual(lookup);
+    expect(recovered.unresolvedLearningMarketIds()).toContain("m-learn");
+    const labeled = recovered.labelMarket("m-learn", resolvedGamma("UP"), lookup.yesMapsTo, lookup.noMapsTo);
+    expect(labeled).toBeGreaterThanOrEqual(1);
+    expect(recovered.unresolvedLearningMarketIds()).not.toContain("m-learn");
+  });
+
+});

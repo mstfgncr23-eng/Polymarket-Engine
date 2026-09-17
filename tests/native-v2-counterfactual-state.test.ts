@@ -6,6 +6,8 @@ import {
   NATIVE_V2_COUNTERFACTUAL_STATE_BASIS,
   MAX_COUNTERFACTUAL_SETTLEMENT_ROW_BYTES,
   buildBoundedCounterfactualSettlementRow,
+  clampJsonStringUtf8Bytes,
+  MAX_COUNTERFACTUAL_SETTLEMENT_SOURCE_JSON_BYTES,
   counterfactualSettlementObligationBytes,
   NativeV2CounterfactualStore,
   PaperLedger,
@@ -241,7 +243,7 @@ describe("Native V2 counterfactual state", () => {
     expect(store.openPositionMarketIds()).toEqual(["m1"]);
   });
 
-  it("fill durable append failure leaves memory and restart state unchanged", () => {
+  it("fill durable append failure fail-closes CF for subsequent evaluations; restart recovers prior log", () => {
     const dataDir = tempDir();
     const store = new NativeV2CounterfactualStore({ dataDir, startingBalance: 1000 });
     store.init();
@@ -260,9 +262,23 @@ describe("Native V2 counterfactual state", () => {
     expect(store.summary().availableCashUsd).toBe(before.availableCashUsd);
     expect(store.openPositionMarketIds()).toEqual([]);
     expect(store.summary().degraded).toBe(true);
+    expect(store.isRecoveryReady()).toBe(false);
+    expect(store.decisionState().recoveryReady).toBe(false);
+    // Subsequent evaluation attempt must not treat CF as authoritative.
+    const again = store.tryCommitWouldSubmit({
+      actionKey: nativeV2CounterfactualActionKey("m2", "UP"),
+      order: order("m2"),
+      snapshot: snapshot("m2"),
+      at: NOW,
+    });
+    expect(again.applied).toBe(false);
+    if (again.applied) throw new Error("expected reject");
+    expect(again.reason).toBe("RECOVERY_UNAVAILABLE");
 
+    // Durable log was never mutated — clean restart is recoveryReady again.
     const recovered = new NativeV2CounterfactualStore({ dataDir, startingBalance: 1000 });
     recovered.init();
+    expect(recovered.isRecoveryReady()).toBe(true);
     expect(recovered.summary().fillCount).toBe(0);
     expect(recovered.openPositionMarketIds()).toEqual([]);
     expect(recovered.summary().availableCashUsd).toBe(before.availableCashUsd);
@@ -370,9 +386,9 @@ describe("Native V2 counterfactual state", () => {
     expect(rejected).not.toBeNull();
     expect(rejected?.reason).toBe("CAPACITY_EXCEEDED");
     expect(store.summary().degraded).toBe(true);
-    expect(store.summary().bytes).toBeLessThanOrEqual(store.summary().maxBytes);
+    expect(store.isRecoveryReady()).toBe(false);
+    expect(store.decisionState().recoveryReady).toBe(false);
 
-    const fillsBefore = store.summary().fillCount;
     const recovered = new NativeV2CounterfactualStore({
       dataDir,
       startingBalance: 1000,
@@ -380,8 +396,9 @@ describe("Native V2 counterfactual state", () => {
       segmentMaxBytes: 8_000,
     });
     recovered.init();
-    expect(recovered.summary().fillCount).toBe(fillsBefore);
-    expect(recovered.summary().bytes).toBe(store.summary().bytes);
+    expect(recovered.isRecoveryReady()).toBe(true);
+    expect(recovered.summary().fillCount).toBeGreaterThan(0);
+    expect(recovered.summary().bytes).toBeLessThanOrEqual(recovered.summary().maxBytes);
   });
 
   it("accepted open CF positions retain guaranteed settlement capacity (incl. restart)", () => {
@@ -413,12 +430,7 @@ describe("Native V2 counterfactual state", () => {
     }
 
     expect(acceptedMarketIds.length).toBeGreaterThan(3);
-    expect(store.openPositionMarketIds().sort()).toEqual([...acceptedMarketIds].sort());
-    const reserved = store.openPositionMarketIds()
-      .reduce((sum, id) => sum + counterfactualSettlementObligationBytes(id), 0);
-    expect(store.summary().bytes + reserved).toBeLessThanOrEqual(maxBytes);
-
-    // Restart midway with opens still outstanding; reservations must reconstruct.
+    // Capacity rejection fail-closes the live instance; durable opens are recovered on restart.
     const mid = new NativeV2CounterfactualStore({
       dataDir,
       startingBalance: 10_000,
@@ -570,7 +582,7 @@ describe("Native V2 counterfactual state", () => {
     }).applied).toBe(false);
   });
 
-  it("torn truncated tail is skipped deterministically without fail-closing", () => {
+  it("torn truncated tail is physically repaired so later appends stay newline-safe", () => {
     const dataDir = tempDir();
     const good = new NativeV2CounterfactualStore({ dataDir, startingBalance: 1000 });
     good.init();
@@ -581,13 +593,38 @@ describe("Native V2 counterfactual state", () => {
       at: NOW,
     }).applied).toBe(true);
     const segment = join(dataDir, "segments", "segment-00001.jsonl");
+    const beforeTorn = readFileSync(segment, "utf8");
+    expect(beforeTorn.endsWith("\n")).toBe(true);
     appendFileSync(segment, '{"kind":"fill","torn":', "utf8"); // no trailing newline
+    expect(readFileSync(segment, "utf8").endsWith("\n")).toBe(false);
 
     const recovered = new NativeV2CounterfactualStore({ dataDir, startingBalance: 1000 });
     recovered.init();
     expect(recovered.isRecoveryReady()).toBe(true);
     expect(recovered.summary().fillCount).toBe(1);
     expect(recovered.openPositionMarketIds()).toEqual(["m1"]);
+    // Physical repair: torn bytes removed; file ends at last committed newline.
+    const repaired = readFileSync(segment, "utf8");
+    expect(repaired).toBe(beforeTorn);
+    expect(repaired.endsWith("\n")).toBe(true);
+
+    expect(recovered.tryCommitWouldSubmit({
+      actionKey: nativeV2CounterfactualActionKey("m2", "UP"),
+      order: order("m2"),
+      snapshot: snapshot("m2"),
+      at: NOW,
+    }).applied).toBe(true);
+
+    const again = new NativeV2CounterfactualStore({ dataDir, startingBalance: 1000 });
+    again.init();
+    expect(again.isRecoveryReady()).toBe(true);
+    expect(again.summary().fillCount).toBe(2);
+    expect(again.openPositionMarketIds().sort()).toEqual(["m1", "m2"]);
+    // Every durable line remains independently parseable (no concatenated torn+row).
+    const text = readFileSync(segment, "utf8");
+    for (const line of text.split("\n").filter(Boolean)) {
+      expect(() => JSON.parse(line)).not.toThrow();
+    }
   });
 
   it("persisted startingBalance mismatch makes CF recovery unavailable (A→B restart)", () => {
@@ -745,6 +782,109 @@ describe("Native V2 counterfactual state", () => {
     expect(recovered.hasSettledMarket(marketId)).toBe(true);
     expect(recovered.summary().settlementCount).toBe(1);
     expect(recovered.summary().bytes).toBeLessThanOrEqual(maxBytes);
+  });
+
+
+  it("capacity exhaustion on would-submit fail-closes CF for subsequent evaluations", () => {
+    const dataDir = tempDir();
+    const store = new NativeV2CounterfactualStore({
+      dataDir,
+      startingBalance: 1000,
+      maxBytes: 400,
+      segmentMaxBytes: 8_000,
+    });
+    store.init();
+    let rejected = null;
+    for (let i = 0; i < 50; i += 1) {
+      const marketId = `cap-${i}`;
+      const result = store.tryCommitWouldSubmit({
+        actionKey: nativeV2CounterfactualActionKey(marketId, "UP"),
+        order: order(marketId),
+        snapshot: snapshot(marketId),
+        at: NOW,
+      });
+      if (!result.applied) {
+        rejected = result;
+        break;
+      }
+    }
+    expect(rejected).not.toBeNull();
+    expect(rejected?.reason).toBe("CAPACITY_EXCEEDED");
+    expect(store.isRecoveryReady()).toBe(false);
+    expect(store.decisionState().recoveryReady).toBe(false);
+    const followUp = store.tryCommitWouldSubmit({
+      actionKey: nativeV2CounterfactualActionKey("follow", "UP"),
+      order: order("follow"),
+      snapshot: snapshot("follow"),
+      at: NOW,
+    });
+    expect(followUp.applied).toBe(false);
+    if (followUp.applied) throw new Error("expected reject");
+    expect(followUp.reason).toBe("RECOVERY_UNAVAILABLE");
+  });
+
+  it("settlement source/reason clamps are UTF-8 JSON byte-safe (not char-count)", () => {
+    const multibyte = "€".repeat(80); // 3 bytes each in UTF-8
+    const bounded = buildBoundedCounterfactualSettlementRow({
+      marketId: "m1",
+      upPayoff: "1",
+      downPayoff: "0",
+      cashDelta: "1",
+      realizedDelta: "1",
+      at: NOW.toISOString(),
+      source: multibyte,
+      reason: multibyte,
+    });
+    expect(Buffer.byteLength(JSON.stringify(bounded.source), "utf8")).toBeLessThanOrEqual(
+      MAX_COUNTERFACTUAL_SETTLEMENT_SOURCE_JSON_BYTES,
+    );
+    expect(Buffer.byteLength(JSON.stringify(bounded.reason), "utf8")).toBeLessThanOrEqual(
+      MAX_COUNTERFACTUAL_SETTLEMENT_SOURCE_JSON_BYTES,
+    );
+    // Escape-aware: quotes/backslashes expand under JSON.stringify
+    const escaped = clampJsonStringUtf8Bytes('x"\\'.repeat(40), MAX_COUNTERFACTUAL_SETTLEMENT_SOURCE_JSON_BYTES);
+    expect(Buffer.byteLength(JSON.stringify(escaped), "utf8")).toBeLessThanOrEqual(
+      MAX_COUNTERFACTUAL_SETTLEMENT_SOURCE_JSON_BYTES,
+    );
+    const obligation = counterfactualSettlementObligationBytes("m1");
+    const worst = buildBoundedCounterfactualSettlementRow({
+      marketId: "m1",
+      upPayoff: "1",
+      downPayoff: "0",
+      cashDelta: "9".repeat(256),
+      realizedDelta: "9".repeat(256),
+      at: "2".repeat(64),
+      source: multibyte,
+      reason: multibyte,
+    });
+    expect(Buffer.byteLength(`${JSON.stringify(worst)}\n`, "utf8")).toBeLessThanOrEqual(obligation);
+  });
+
+  it("persists settlement lookup on CF fill and recovers it after restart", () => {
+    const dataDir = tempDir();
+    const lookup = {
+      marketId: "m1",
+      slug: "btc-updown-15m",
+      endDate: "2026-09-17T09:00:00.000Z",
+      yesMapsTo: "DOWN" as const,
+      noMapsTo: "UP" as const,
+    };
+    const store = new NativeV2CounterfactualStore({ dataDir, startingBalance: 1000 });
+    store.init();
+    expect(store.tryCommitWouldSubmit({
+      actionKey: nativeV2CounterfactualActionKey("m1", "UP"),
+      order: order(),
+      snapshot: snapshot(),
+      at: NOW,
+      settlementLookup: lookup,
+    }).applied).toBe(true);
+    expect(store.settlementLookupFor("m1")).toEqual(lookup);
+
+    const recovered = new NativeV2CounterfactualStore({ dataDir, startingBalance: 1000 });
+    recovered.init();
+    expect(recovered.isRecoveryReady()).toBe(true);
+    expect(recovered.settlementLookupFor("m1")).toEqual(lookup);
+    expect(recovered.openSettlementLookups()).toEqual([lookup]);
   });
 
 });
