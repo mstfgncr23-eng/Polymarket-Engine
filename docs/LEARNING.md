@@ -167,3 +167,77 @@ No new network/feed architecture was added.
 
 Unchanged: V1 Native Math → Strategy → Risk → Execution. PR3 only widens the
 shadow/learning feature vector.
+
+## Offline training / validation (PR4)
+
+Paper-only offline forecasting pipeline. **No runtime trading authority**, no auto
+promotion, no live order submission.
+
+### Goal
+
+Turn finalized (resolved) learning observations into a reproducible offline
+candidate: dataset → market-grouped walk-forward → residual logistic → baselines
++ calibration + economic eval → versioned artifact.
+
+### Format choice: JSONL (not Parquet)
+
+**Chosen:** compact JSONL (`dataset.jsonl` + `dataset.manifest.json`).
+
+**Rationale:** the stack already persists learning samples as segmented JSONL
+under `LearningSampleStore`. Adding Parquet would introduce an Arrow/Parquet
+dependency solely for aesthetics. JSONL stays dependency-free, diff-friendly,
+and checksum-stable.
+
+### Model choice: inspectable residual logistic
+
+```
+logit(p_learned) = logit(p_market) + w·x + b
+```
+
+L2-regularized logistic residual around the market prior. Pure TypeScript — no
+GBDT/ML stack. This is **not** a BUY/SELL classifier.
+
+### Always-scored baselines
+
+1. Market prior (`pair.marketPriorUp`)
+2. Deterministic V2 shadow fair probability
+3. Learned residual model
+
+### Leakage prevention
+
+- Rows are grouped by `marketId`
+- Walk-forward assigns whole markets to train or validation (never both)
+- Optional `trainCutoffObservedAt` for explicit time cutoffs
+- Same-market random splits are rejected
+
+### Calibration
+
+Brier, log loss, and calibration buckets. If an isotonic calibrator is fit, it
+uses a held-out slice of validation only — never the same rows that are scored.
+
+### Economic evaluation (available vs unavailable)
+
+| Available from sample fields | Unavailable without new joins |
+| --- | --- |
+| Approximate executable ask/bid via mid±spread/2 | True VWAP depth-walk (asks not stored) |
+| Expected gross edge (p − ask) | Fee schedule on sample |
+| Optional assumed fee → net edge | Counterfactual ledger realized PnL join |
+| Binary settlement PnL for hypothetical BUY UP | Live fill prices |
+| Drawdown / trade count / asset / checkpoint breakdown | |
+
+### CLI
+
+```bash
+pnpm learning:train-validate -- --data-dir /data/learning --out ./artifacts/learning-pr4
+```
+
+### Candidate artifact
+
+`candidate.json` includes: model type/version, feature schema, dataset version,
+training cutoff/window, metrics, economic eval, git SHA, checksumSha256.
+
+### Authority
+
+Unchanged: V1 Native Math → Strategy → Risk → Execution. PR4 is offline tooling
+only.
+
