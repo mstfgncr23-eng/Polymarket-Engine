@@ -69,6 +69,8 @@ import {
   type NativeDecisionConfig,
   NativeV2ShadowFeatureExtractor,
   evaluateNativeV2ShadowFairProbability,
+  LearningSampleStore,
+  tryObserveLearningSample,
   NativeV2ShadowOpportunityRanker,
   evaluateNativeV2ShadowMarketOpportunity,
   buildNativeV2ShadowExecutionIntent,
@@ -249,7 +251,9 @@ export class EngineService {
   private readonly nativeV2Shadow = new NativeV2ShadowFeatureExtractor();
   private readonly nativeV2OpportunityRanker = new NativeV2ShadowOpportunityRanker();
   private readonly nativeV2ShadowStore = new NativeV2ShadowStore();
+  private readonly learningStore: LearningSampleStore | null;
   private nativeV2ShadowExecutionBusy = false;
+  private lastLearningSettlementPollAt = 0;
   private readonly strategy = new TemporalPairHedgeStrategy();
   private readonly marketAdapter: PolymarketMarketDataAdapter;
   private readonly legacyBtcAdapter: BtcWebSocketAdapter | null;
@@ -400,6 +404,20 @@ export class EngineService {
       createRestProbe(env.REFERENCE_REST_BASE_URL),
     );
     this.resolutionFetcher = adapters?.resolutionFetcher ?? ((id) => this.marketAdapter.fetchPublicMarket(id));
+    this.learningStore = env.LEARNING_ENABLED
+      ? new LearningSampleStore({
+        enabled: true,
+        dataDir: env.LEARNING_DATA_DIR,
+        maxBytes: env.LEARNING_MAX_BYTES,
+        checkpointSeconds: env.LEARNING_CHECKPOINT_SECONDS,
+        gitSha: process.env.GIT_SHA ?? process.env.FLY_IMAGE_REF ?? null,
+      })
+      : null;
+    try {
+      this.learningStore?.init();
+    } catch {
+      // Learning storage must never block engine startup (V1/V2/risk/execution).
+    }
     this.hotResearchCache = new HotResearchCache({
       now: this.nowFn,
       maxEntries: env.XAI_SCOUT_CACHE_MAX_ENTRIES,
@@ -2079,6 +2097,24 @@ export class EngineService {
     const shadowV2FairProbability = shadowV2FeatureVector
       ? evaluateNativeV2ShadowFairProbability(shadowV2FeatureVector)
       : null;
+    // PR1 learning foundation: durable samples after V2 fair succeeds, before
+    // opportunity/ranking. Fail-soft — never throw into the trading path.
+    if (this.learningStore && shadowV2FeatureVector && shadowV2FairProbability) {
+      try {
+        tryObserveLearningSample(this.learningStore, {
+          marketId: trigger.marketId,
+          asset,
+          now: this.nowFn(),
+          featureVector: shadowV2FeatureVector,
+          v2FairProbability: shadowV2FairProbability,
+          native,
+          experimentId: this.experiment?.id ?? null,
+          gitSha: process.env.GIT_SHA ?? process.env.FLY_IMAGE_REF ?? null,
+        });
+      } catch {
+        // Learning must never affect V1/V2/risk/execution authority.
+      }
+    }
     const shadowNow = this.nowFn();
     const shadowV2MarketOpportunity = shadowV2FairProbability
       ? evaluateNativeV2ShadowMarketOpportunity({
@@ -2430,6 +2466,10 @@ export class EngineService {
 
   nativeV2ShadowSnapshot() {
     return this.nativeV2ShadowStore.snapshot();
+  }
+
+  learningSummary() {
+    return this.learningStore?.summary() ?? { enabled: false };
   }
 
   nativeV2ShadowExport() {
@@ -3720,6 +3760,7 @@ export class EngineService {
     await this.pollFailedHedges();
     await this.maybeScheduledReview();
     await this.pollSettlements();
+    await this.pollLearningSettlements();
     const previous = this.experiment.status;
     const open = openPositionsRemain(this.ledger.positions.values());
     const unresolved = [...this.ledger.positions.values()].filter((position) => Number(position.upQuantity) > 0 || Number(position.downQuantity) > 0).length;
@@ -3793,6 +3834,39 @@ export class EngineService {
       const waitUntil = this.settlementBackoff.get(position.marketId) ?? 0;
       if (now.getTime() < waitUntil) continue;
       await this.settleMarket(position.marketId, market);
+    }
+  }
+
+  /**
+   * Non-economic learning settlement poll. Labels durable learning samples via
+   * the same public resolution fetch used by economic settlement, without
+   * calling settleMarket / commitAuthoritative POSITION_SETTLED / ledger mutation.
+   */
+  private async pollLearningSettlements(): Promise<void> {
+    if (!this.learningStore) return;
+    const now = this.nowFn();
+    const intervalMs = this.env.LEARNING_SETTLEMENT_POLL_MS ?? this.env.SETTLEMENT_POLL_MS;
+    if (now.getTime() - this.lastLearningSettlementPollAt < intervalMs) return;
+    this.lastLearningSettlementPollAt = now.getTime();
+
+    for (const marketId of this.learningStore.unresolvedLearningMarketIds()) {
+      const market = this.marketsById.get(marketId);
+      if (!market?.endDate || new Date(market.endDate).getTime() > now.getTime()) continue;
+      try {
+        const raw = await this.resolutionFetcher(market.id)
+          ?? (market.slug ? await this.resolutionFetcher(market.slug) : null);
+        if (!raw) continue;
+        const binary = market.qualification.binary;
+        this.learningStore.labelMarket(
+          marketId,
+          raw,
+          binary.yesOutcome === "DOWN" || binary.yesOutcome === "UP" ? binary.yesOutcome : "UP",
+          binary.noOutcome === "DOWN" || binary.noOutcome === "UP" ? binary.noOutcome : "DOWN",
+          now,
+        );
+      } catch {
+        // Learning labeling failures must not affect economic settlement.
+      }
     }
   }
 
