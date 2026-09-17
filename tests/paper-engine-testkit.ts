@@ -1,3 +1,6 @@
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { mkdtempSync, rmSync } from "node:fs";
 import {
   createId,
   engineEnvSchema,
@@ -211,11 +214,29 @@ export function paperFill(marketId: string, outcome: "UP" | "DOWN", price = "0.4
   return { ...fill(outcome, price, "10"), marketId, tokenId: `${marketId}-${outcome.toLowerCase()}`, ...extra };
 }
 
+/** Fresh writable learning/CF root per env invocation (avoids order-dependent CF state). */
+const learningDirsForCleanup: string[] = [];
+
+export function allocateTestLearningDataDir(): string {
+  const dir = mkdtempSync(join(tmpdir(), "pm-learning-test-"));
+  learningDirsForCleanup.push(dir);
+  return dir;
+}
+
+/** Best-effort cleanup helper for suites that opt in. */
+export function cleanupAllocatedLearningDataDirs(): void {
+  for (const dir of learningDirsForCleanup.splice(0)) {
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+}
+
 export function qualifiedPaperEnv(overrides: Record<string, string | undefined> = {}): EngineEnv {
+  const learningDataDir = overrides.LEARNING_DATA_DIR ?? allocateTestLearningDataDir();
   return engineEnvSchema.parse({
     NODE_ENV: "test", JOURNAL_MODE: "memory", TRADING_MODE: "paper",
     ...grokPaperEnv(),
     DISCOVERY_INTERVAL_MS: "3600000",
+    LEARNING_DATA_DIR: learningDataDir,
     ...overrides,
   });
 }
