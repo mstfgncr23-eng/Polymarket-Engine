@@ -3401,7 +3401,7 @@ export class EngineService {
       positions: projectableLegsFromPositions(this.ledger.positions.values(), this.assetByMarket),
       candidate: {
         marketId: candidate.marketId, outcome: candidate.outcome, quantity: candidate.quantity,
-        price: candidate.limitPrice, intent: candidate.intent, asset,
+        price: candidate.limitPrice, side: candidate.side, intent: candidate.intent, asset,
       },
       nowMs: now.getTime(),
     });
@@ -3497,8 +3497,17 @@ export class EngineService {
     await this.submitPaperOrder(decision.order, snapshot, duplicateKey, candidate.intent);
   }
 
-  private async submitPaperOrder(order: PaperOrder, decisionSnapshot: MarketSnapshot, duplicateKey: string, intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" = "OPEN_FIRST_LEG"): Promise<void> {
+  private async submitPaperOrder(
+    order: PaperOrder,
+    decisionSnapshot: MarketSnapshot,
+    duplicateKey: string,
+    intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK" = "OPEN_FIRST_LEG",
+    deRisk?: ProtectiveDeRiskAudit,
+  ): Promise<void> {
     if (intent === "OPEN_FIRST_LEG" && this.experimentStartPending) return;
+    if (intent === "PROTECTIVE_DE_RISK" && order.orderType !== "TAKER") {
+      throw new Error("PROTECTIVE_DE_RISK_REQUIRES_TAKER");
+    }
     const firstLegReserved = intent === "OPEN_FIRST_LEG"
       ? this.tryReserveFirstLegAdmission(order.marketId)
       : false;
@@ -3513,18 +3522,23 @@ export class EngineService {
         intent === "OPEN_FIRST_LEG"
         && this.firstLegLifecycleBlocked(order.marketId, true)
       ) return;
-      if (intent === "HEDGE_SECOND_LEG") {
-        // Once hedging starts, an older first-leg maker remainder must not be
-        // allowed to refill directional exposure behind the hedge.
-        await this.cancelOutstandingFirstLegMakers(order.marketId, "HEDGE_ADMITTED");
+      if (intent === "HEDGE_SECOND_LEG" || intent === "PROTECTIVE_DE_RISK") {
+        // Once risk reduction starts, an older first-leg maker remainder must
+        // not be allowed to refill directional exposure behind the action.
+        await this.cancelOutstandingFirstLegMakers(
+          order.marketId,
+          intent === "PROTECTIVE_DE_RISK" ? "PROTECTIVE_DE_RISK_ADMITTED" : "HEDGE_ADMITTED",
+        );
       }
 
       this.metrics.paperOrders.inc({ type: order.orderType });
-      this.record("PAPER_ORDER_CREATED", order.traceId, order.marketId, { orderId: order.id, type: order.orderType, intent }, decisionSnapshot.asset ?? null);
+      this.record("PAPER_ORDER_CREATED", order.traceId, order.marketId, {
+        orderId: order.id, type: order.orderType, intent, ...(deRisk ? { deRisk } : {}),
+      }, decisionSnapshot.asset ?? null);
       await this.persistReportInput(createJournalEvent({
         id: derivedAuditEventId("PAPER_ORDER_CREATED", order.id),
         traceId: order.traceId, type: "PAPER_ORDER_CREATED", aggregateType: "paper_order", aggregateId: order.id,
-        payload: { ...order, intent },
+        payload: { ...order, intent, ...(deRisk ? { deRisk } : {}) },
       }));
       this.recentTrades.set(duplicateKey, Date.now());
       try {
@@ -3537,14 +3551,24 @@ export class EngineService {
         if (!current || new Date(current.receivedAt).getTime() < new Date(decisionSnapshot.receivedAt).getTime()) throw new Error("STALE_EXECUTION_SNAPSHOT");
         const applied = await this.applyFill(
           executePaperTaker({ order, snapshotAfterLatency: current, measuredLatencyMs: this.env.PAPER_EXECUTION_LATENCY_MS }),
-          { intent },
+          { intent, deRisk },
         );
         if (applied) this.lastTradeAt = this.nowFn();
       } catch (error) {
         if (this.overload.hasIntegrityFault || error instanceof IdempotencyConflictError || error instanceof CrashInjectedError || (error instanceof JournalAdmissionRejected && error.critical)) throw error;
         this.executionErrors.push(Date.now());
-        this.record("PAPER_EXECUTION_ERROR", order.traceId, order.marketId, { orderId: order.id, message: error instanceof Error ? error.message : String(error) });
-        await this.persistReportInput(createJournalEvent({ traceId: order.traceId, type: "PAPER_EXECUTION_ERROR", aggregateType: "paper_order", aggregateId: order.id, payload: { message: error instanceof Error ? error.message : String(error) } }));
+        const message = error instanceof Error ? error.message : String(error);
+        const failureDeRisk = deRisk ? { ...deRisk, finalState: "EXECUTION_ERROR" as const } : undefined;
+        this.record("PAPER_EXECUTION_ERROR", order.traceId, order.marketId, {
+          orderId: order.id, message, intent, ...(failureDeRisk ? { deRisk: failureDeRisk } : {}),
+        });
+        await this.persistReportInput(createJournalEvent({
+          traceId: order.traceId,
+          type: "PAPER_EXECUTION_ERROR",
+          aggregateType: "paper_order",
+          aggregateId: order.id,
+          payload: { orderId: order.id, marketId: order.marketId, message, intent, ...(failureDeRisk ? { deRisk: failureDeRisk } : {}) },
+        }));
       }
     } finally {
       if (firstLegReserved) this.pendingFirstLegMarkets.delete(order.marketId);
@@ -3650,7 +3674,8 @@ export class EngineService {
     fill: Parameters<PaperLedger["applyFill"]>[0],
     extras: {
       restingAfter?: RestingPaperOrder | null;
-      intent?: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG";
+      intent?: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK";
+      deRisk?: ProtectiveDeRiskAudit;
     } = {},
   ): Promise<boolean> {
     // A settlement is the terminal authority for this market. The live bit
@@ -3720,13 +3745,26 @@ export class EngineService {
           // excluded from the authoritative transition payload. Keeping the
           // replay payload to stable operation facts lets a compacted retry
           // reconstruct the same hash after the live projection has advanced.
-          const auth = { fill, positionId, reservationAfter, restingAfter };
+          const unhedgedStartedAtBefore = previousAtCommit?.unhedgedStartedAt ?? previousAtCommit?.openedAt ?? null;
+          const auth = {
+            fill, positionId, reservationAfter, restingAfter,
+            ...(economicIntent ? { intent: economicIntent } : {}),
+            ...(extras.deRisk ? { deRisk: extras.deRisk } : {}),
+          };
           return {
             ...auth,
             derivedAudit: this.projectDerivedAudit(
               { operationKey: `fill:${fill.id}`, type: "PAPER_FILL", aggregateType: "paper_fill", aggregateId: fill.id, payload: auth },
               occurredAt,
-              (projected) => this.buildFillDerivedAudit(fill, wasEmptyAtCommit, projected, occurredAt),
+              (projected) => this.buildFillDerivedAudit(
+                fill,
+                wasEmptyAtCommit,
+                projected,
+                occurredAt,
+                economicIntent,
+                extras.deRisk,
+                unhedgedStartedAtBefore,
+              ),
             ),
           };
         },
@@ -3756,8 +3794,11 @@ export class EngineService {
       }
       return false;
     }
-    if (economicIntent === "HEDGE_SECOND_LEG") {
-      await this.cancelOutstandingFirstLegMakers(fill.marketId, "HEDGE_FILLED");
+    if (economicIntent === "HEDGE_SECOND_LEG" || economicIntent === "PROTECTIVE_DE_RISK") {
+      await this.cancelOutstandingFirstLegMakers(
+        fill.marketId,
+        economicIntent === "PROTECTIVE_DE_RISK" ? "PROTECTIVE_DE_RISK_FILLED" : "HEDGE_FILLED",
+      );
     }
     return true;
   }
@@ -3767,6 +3808,9 @@ export class EngineService {
     wasEmpty: boolean,
     projected: RecoverableEngineState,
     occurredAt: Date,
+    intent?: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK",
+    deRisk?: ProtectiveDeRiskAudit,
+    unhedgedStartedAtBefore: string | null = null,
   ): DerivedAuditRecord[] {
     const position = projected.ledger.positions.get(fill.marketId);
     const experimentId = projected.experiment?.id ?? this.experiment?.id ?? null;
@@ -3776,7 +3820,14 @@ export class EngineService {
       aggregateType: "paper_fill",
       aggregateId: fill.id,
       traceId: fill.traceId,
-      payload: { ...fill, asset: this.assetByMarket.get(fill.marketId) ?? null },
+      payload: {
+        ...fill,
+        asset: this.assetByMarket.get(fill.marketId) ?? null,
+        ...(intent ? { intent } : {}),
+        ...(deRisk ? {
+          deRisk: this.finalizeProtectiveDeRiskAudit(deRisk, fill, position),
+        } : {}),
+      },
       sourceEventId: fill.sourceMarketEventId,
     }];
     if (wasEmpty && fill.side === "BUY" && position) {
@@ -3790,7 +3841,8 @@ export class EngineService {
       });
     }
     if (position && Number(position.pairedQuantity) > 0 && Number(position.unpairedQuantity) === 0) {
-      const unhedgedDurationMs = Math.max(0, occurredAt.getTime() - new Date(position.openedAt).getTime());
+      const episodeStart = unhedgedStartedAtBefore ?? position.openedAt;
+      const unhedgedDurationMs = Math.max(0, occurredAt.getTime() - new Date(episodeStart).getTime());
       records.push({
         id: derivedAuditEventId("HEDGE_COMPLETE", fill.id),
         type: "HEDGE_COMPLETE",
@@ -3810,7 +3862,10 @@ export class EngineService {
         aggregateType: "position",
         aggregateId: position.id,
         traceId: fill.traceId,
-        payload: structuredClone(position),
+        payload: {
+          ...structuredClone(position),
+          ...(deRisk ? { deRisk: this.finalizeProtectiveDeRiskAudit(deRisk, fill, position) } : {}),
+        },
         sourceEventId: fill.id,
       });
     }
@@ -3823,6 +3878,26 @@ export class EngineService {
       payload: { ...projected.ledger.snapshot(), experimentId, source: "FILL", fillId: fill.id },
     });
     return records;
+  }
+
+  private finalizeProtectiveDeRiskAudit(
+    audit: ProtectiveDeRiskAudit,
+    fill: Parameters<PaperLedger["applyFill"]>[0],
+    position: Position | undefined,
+  ): ProtectiveDeRiskAudit {
+    const residualQuantity = position?.unpairedQuantity ?? "0";
+    const residualExposure = position?.unpairedOutcome
+      ? d(position.unpairedQuantity)
+        .mul(position.unpairedOutcome === "UP" ? position.averageUpCost : position.averageDownCost)
+        .toFixed()
+      : "0";
+    return {
+      ...audit,
+      executionPrice: fill.fillPrice,
+      residualQuantity,
+      residualExposure,
+      finalState: d(residualQuantity).gt(0) ? "RESIDUAL_UNHEDGED" : "RISK_NEUTRALIZED",
+    };
   }
 
   private async onConnection(event: FeedConnectionEvent): Promise<void> {
