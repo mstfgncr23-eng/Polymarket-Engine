@@ -3931,8 +3931,14 @@ export class EngineService {
         aggregateId: position.id,
         traceId: fill.traceId,
         payload: {
-          positionId: position.id, marketId: fill.marketId, pairedQuantity: position.pairedQuantity,
-          unhedgedDurationMs, experimentId,
+          positionId: position.id,
+          marketId: fill.marketId,
+          pairedQuantity: position.pairedQuantity,
+          unhedgedDurationMs,
+          completionMode: intent === "PROTECTIVE_DE_RISK" ? "PROTECTIVE_DE_RISK" : "PAIR_HEDGE",
+          ...(intent ? { intent } : {}),
+          ...(deRisk ? { deRisk: this.finalizeProtectiveDeRiskAudit(deRisk, fill, position) } : {}),
+          experimentId,
         },
       });
     }
