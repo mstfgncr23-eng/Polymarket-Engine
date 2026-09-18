@@ -91,7 +91,8 @@ export function evaluateRisk(input: RiskInput, limits: RiskLimits): RiskEvaluati
   if (input.signalConfidence < limits.minSignalConfidence) vetoes.push("MINIMUM_SIGNAL_CONFIDENCE");
   if (input.signalExpiresAt.getTime() <= input.now.getTime()) vetoes.push("SIGNAL_EXPIRED");
   if (input.externalSignalsLastMinute >= limits.maxExternalSignalsPerMinute) vetoes.push("MAXIMUM_EXTERNAL_SIGNAL_RATE");
-  if (input.lastStrategyTradeAt && input.now.getTime() - input.lastStrategyTradeAt.getTime() < limits.strategyCooldownMs) vetoes.push("STRATEGY_COOLDOWN");
+  // Cooldown throttles fresh directional entries. It must not delay a risk-reducing second leg.
+  if (!hedge && input.lastStrategyTradeAt && input.now.getTime() - input.lastStrategyTradeAt.getTime() < limits.strategyCooldownMs) vetoes.push("STRATEGY_COOLDOWN");
   if (input.duplicateTrade) vetoes.push("DUPLICATE_TRADE");
   if (!input.feeScheduleKnown) vetoes.push("UNKNOWN_FEE_SCHEDULE");
   if (!input.experimentEntryOpen) vetoes.push("EXPERIMENT_ENTRY_CLOSED");
