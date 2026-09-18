@@ -121,7 +121,8 @@ describe("temporal pair hedge first-leg risk cap", () => {
     const strategy = new TemporalPairHedgeStrategy();
     const up = snapshot({ marketId: "missing-fair-market", tokenId: "up-missing", outcome: "UP", asks: [{ price: "0.40", quantity: "100" }] });
     const down = snapshot({ marketId: "missing-fair-market", tokenId: "down-missing", outcome: "DOWN", asks: [{ price: "0.60", quantity: "100" }] });
-    const legacy = { ...consensus("UP"), fairProbability: undefined };
+    const legacy = consensus("UP");
+    delete legacy.fairProbability;
 
     expect(strategy.evaluate({
       consensus: legacy,
