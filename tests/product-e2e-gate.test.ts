@@ -372,7 +372,11 @@ describe("PR20 true product end-to-end gate", () => {
     try {
       expect((await setup.engine.beginExperiment()).ok).toBe(true);
       const upInitial = marketBook(setup.clock, "UP", 1);
-      const downInitial = marketBook(setup.clock, "DOWN", 1);
+      const downInitial = snapshot({
+        ...marketBook(setup.clock, "DOWN", 1),
+        bids: [{ price: "0.69", quantity: "300" }],
+        asks: [{ price: "0.70", quantity: "300" }],
+      });
       await setup.market.emitSnapshot(upInitial);
       await setup.market.emitSnapshot(downInitial);
 
