@@ -42,9 +42,14 @@ export function decidePaperOrder(input: {
   const orderType = input.orderType ?? "TAKER";
   const bestBid = input.snapshotAfterDecisionLatency.bids[0];
   const bestAsk = input.snapshotAfterDecisionLatency.asks[0];
-  const makerPrice = bestBid?.price ?? input.candidate.limitPrice;
+  const makerPrice = input.candidate.side === "BUY"
+    ? (bestBid?.price ?? input.candidate.limitPrice)
+    : (bestAsk?.price ?? input.candidate.limitPrice);
   const requestedPrice = orderType === "MAKER" ? makerPrice : input.candidate.limitPrice;
-  const walk = walkBook(input.snapshotAfterDecisionLatency.asks, input.candidate.quantity, input.candidate.limitPrice);
+  const takerLevels = input.candidate.side === "BUY"
+    ? input.snapshotAfterDecisionLatency.asks
+    : input.snapshotAfterDecisionLatency.bids;
+  const walk = walkBook(takerLevels, input.candidate.quantity, input.candidate.limitPrice, input.candidate.side);
   const schedule = input.snapshotAfterDecisionLatency.feeSchedule;
   const executableNow = orderType === "MAKER" ? bestBid !== undefined : walk.sufficientDepth;
   const executionPrice = orderType === "MAKER" ? makerPrice : walk.vwap;
@@ -70,11 +75,13 @@ export function decidePaperOrder(input: {
   const grossEvUsdTotal = d(rawEdgeUsdPerShare).mul(quantity).toFixed();
   const netEvUsdTotal = Number.isFinite(netEvUsdPerShare) ? d(netEvUsdPerShare).mul(quantity).toFixed() : null;
   const expectedROI = netEvUsdTotal === null ? null : d(netEvUsdTotal).div(notional).toNumber();
-  const requiredCashUsd = d(notional).plus(fee ?? 0).toFixed();
+  const requiredCashUsd = input.candidate.side === "BUY"
+    ? d(notional).plus(fee ?? 0).toFixed()
+    : "0";
   const marketSpread = bestBid && bestAsk ? Number(d(bestAsk.price).minus(bestBid.price)) : Number.POSITIVE_INFINITY;
   const risk = evaluateRisk({
     ...input.baseRisk, traceId: input.consensus.traceId,
-    availableLiquidityUsd: orderBookLiquidityUsd(input.snapshotAfterDecisionLatency, "BUY"),
+    availableLiquidityUsd: orderBookLiquidityUsd(input.snapshotAfterDecisionLatency, input.candidate.side),
     expectedEdge: netEvUsdPerShare,
     expectedROI: expectedROI ?? Number.NEGATIVE_INFINITY,
     spread: marketSpread, signalConfidence: input.consensus.consensusConfidence,
@@ -102,5 +109,124 @@ export function decidePaperOrder(input: {
     rawEdge: rawEdgeUsdPerShare, feeUsd: fee, slippageUsd: slippage,
     netExpectedEdge: netEvUsdPerShare,
     bookVwap: orderType === "TAKER" && walk.sufficientDepth ? walk.vwap : null,
+  };
+}
+
+
+/**
+ * Deterministic risk-only admission for an existing long inventory unwind.
+ * It deliberately does not manufacture an alpha signal: the protective intent
+ * bypasses alpha gates inside evaluateRisk but still obeys hard feed/database/
+ * execution safety and must monotonically reduce unhedged exposure.
+ */
+export function decideProtectivePaperOrder(input: {
+  candidate: StrategyCandidate;
+  snapshotAfterDecisionLatency: MarketSnapshot;
+  baseRisk: Omit<
+    RiskInput,
+    | "traceId"
+    | "availableLiquidityUsd"
+    | "expectedEdge"
+    | "expectedROI"
+    | "spread"
+    | "signalConfidence"
+    | "signalExpiresAt"
+    | "feeScheduleKnown"
+    | "orderSizeUsd"
+    | "requiredCashUsd"
+    | "intent"
+  >;
+  limits: RiskLimits;
+  traceId: string;
+  triggerId: string;
+}): PaperOrderDecision {
+  if (input.candidate.intent !== "PROTECTIVE_DE_RISK" || input.candidate.side !== "SELL") {
+    throw new Error("INVALID_PROTECTIVE_DE_RISK_CANDIDATE");
+  }
+
+  const snapshot = input.snapshotAfterDecisionLatency;
+  const bestBid = snapshot.bids[0];
+  const bestAsk = snapshot.asks[0];
+  const walk = walkBook(snapshot.bids, input.candidate.quantity, input.candidate.limitPrice, "SELL");
+  const schedule = snapshot.feeSchedule;
+  const executableNow = walk.sufficientDepth && d(walk.filledQuantity).eq(input.candidate.quantity);
+  const fee = schedule && executableNow
+    ? calculateFee(input.candidate.quantity, walk.vwap, "TAKER", schedule)
+    : null;
+  const slippage = executableNow
+    ? calculateSlippageUsd(input.candidate.limitPrice, walk.vwap, walk.filledQuantity, "SELL")
+    : null;
+  const notional = executableNow
+    ? d(walk.notional)
+    : d(input.candidate.quantity).mul(input.candidate.limitPrice);
+  const quantity = d(input.candidate.quantity);
+  const feeUsdPerShare = fee ? d(fee).div(quantity).toFixed() : null;
+  const slippageUsdPerShare = slippage ? d(slippage).div(quantity).toFixed() : null;
+  const costUsdPerShare = feeUsdPerShare !== null && slippageUsdPerShare !== null
+    ? d(feeUsdPerShare).plus(slippageUsdPerShare).toFixed()
+    : null;
+  const netEvUsdPerShare = costUsdPerShare === null ? Number.NEGATIVE_INFINITY : d(costUsdPerShare).negated().toNumber();
+  const netEvUsdTotal = Number.isFinite(netEvUsdPerShare)
+    ? d(netEvUsdPerShare).mul(quantity).toFixed()
+    : null;
+  const spread = bestBid && bestAsk ? Number(d(bestAsk.price).minus(bestBid.price)) : Number.POSITIVE_INFINITY;
+
+  const risk = evaluateRisk({
+    ...input.baseRisk,
+    traceId: input.traceId,
+    intent: "PROTECTIVE_DE_RISK",
+    availableLiquidityUsd: orderBookLiquidityUsd(snapshot, "SELL"),
+    expectedEdge: 0,
+    expectedROI: 0,
+    spread,
+    signalConfidence: 1,
+    signalExpiresAt: new Date(input.baseRisk.now.getTime() + 60_000),
+    feeScheduleKnown: schedule !== null,
+    orderSizeUsd: notional.toFixed(),
+    requiredCashUsd: "0",
+  }, input.limits);
+
+  if (!executableNow && !risk.vetoes.includes("INSUFFICIENT_DEPTH")) {
+    risk.vetoes.push("INSUFFICIENT_DEPTH");
+    risk.accepted = false;
+  }
+
+  const order: PaperOrder | null = risk.accepted ? {
+    id: createId("order"),
+    traceId: input.traceId,
+    triggerId: input.triggerId,
+    strategyId: input.candidate.strategyId,
+    marketId: input.candidate.marketId,
+    tokenId: input.candidate.tokenId,
+    outcome: input.candidate.outcome,
+    side: "SELL",
+    orderType: "TAKER",
+    requestedPrice: input.candidate.limitPrice,
+    quantity: input.candidate.quantity,
+    status: "PENDING",
+    createdAt: input.baseRisk.now.toISOString(),
+  } : null;
+
+  return {
+    accepted: risk.accepted,
+    order,
+    risk,
+    rawEdgeUsdPerShare: 0,
+    feeUsdPerShare,
+    slippageUsdPerShare,
+    costUsdPerShare,
+    netEvUsdPerShare,
+    grossEvUsdTotal: "0",
+    netEvUsdTotal,
+    executableNotionalUsd: notional.toFixed(),
+    expectedROI: 0,
+    quantity: quantity.toFixed(),
+    feeUsdTotal: fee,
+    slippageUsdTotal: slippage,
+    rawEdge: 0,
+    feeUsd: fee,
+    slippageUsd: slippage,
+    netExpectedEdge: netEvUsdPerShare,
+    bookVwap: executableNow ? walk.vwap : null,
   };
 }
