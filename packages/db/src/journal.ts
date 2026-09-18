@@ -614,23 +614,6 @@ export class MemoryEventJournal implements EventJournal {
   async latestDurableSequence(): Promise<number> {
     return this.durableHighWater;
   }
-  async countCanonicalEventsThrough(input: { experimentId: string; occurredBefore: Date; sourceCommitSeq: number; sourceRecordedAt: Date }): Promise<{ count: number; oldestOccurredAt: string | null }> {
-    const types = [...CANONICAL_REPORT_INPUT_EVENT_TYPES] as string[];
-    const rows = await this.client`
-      SELECT count(*)::int AS count, min(occurred_at) AS oldest
-      FROM journal_events
-      WHERE type = ANY(${types})
-        AND (payload->>'experimentId') = ${input.experimentId}
-        AND occurred_at < ${input.occurredBefore.toISOString()}
-        AND commit_seq <= ${input.sourceCommitSeq}
-        AND recorded_at <= ${input.sourceRecordedAt.toISOString()}
-    `;
-    const row = rows[0] as { count?: number; oldest?: string | Date | null } | undefined;
-    return {
-      count: Number(row?.count ?? 0),
-      oldestOccurredAt: row?.oldest ? new Date(row.oldest).toISOString() : null,
-    };
-  }
   async saveCheckpoint(checkpoint: Omit<EngineCheckpoint, "id" | "createdAt">): Promise<EngineCheckpoint> {
     assertJournalCapability(this.access, "runtime-write", "saveCheckpoint");
     return this.withDurableLock(() => {
@@ -1495,6 +1478,23 @@ export class PostgresEventJournal implements EventJournal {
         ORDER BY occurred_at ASC, id ASC LIMIT ${cap}
       )`;
     return { deleted: result.count ?? 0 };
+  }
+  async countCanonicalEventsThrough(input: { experimentId: string; occurredBefore: Date; sourceCommitSeq: number; sourceRecordedAt: Date }): Promise<{ count: number; oldestOccurredAt: string | null }> {
+    const types = [...CANONICAL_REPORT_INPUT_EVENT_TYPES] as string[];
+    const rows = await this.client`
+      SELECT count(*)::int AS count, min(occurred_at) AS oldest
+      FROM journal_events
+      WHERE type = ANY(${types})
+        AND (payload->>'experimentId') = ${input.experimentId}
+        AND occurred_at < ${input.occurredBefore.toISOString()}
+        AND commit_seq <= ${input.sourceCommitSeq}
+        AND recorded_at <= ${input.sourceRecordedAt.toISOString()}
+    `;
+    const row = rows[0] as { count?: number; oldest?: string | Date | null } | undefined;
+    return {
+      count: Number(row?.count ?? 0),
+      oldestOccurredAt: row?.oldest ? new Date(row.oldest).toISOString() : null,
+    };
   }
   async saveCheckpoint(checkpoint: Omit<EngineCheckpoint, "id" | "createdAt">): Promise<EngineCheckpoint> {
     assertJournalCapability(this.access, "runtime-write", "saveCheckpoint");
