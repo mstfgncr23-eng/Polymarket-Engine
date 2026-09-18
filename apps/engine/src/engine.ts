@@ -217,6 +217,9 @@ const IDLE_GROK_IDEMPOTENCY_TTL_MS = 5 * 60_000;
 const SCOUT_REFRESH_STATE_TTL_MS = 60_000;
 const SCOUT_REFRESH_CONTEXT_MAX = 128;
 const SCOUT_REFRESH_RETRY_GAP_MS = 1_000;
+const PROTECTIVE_DE_RISK_RETRY_MS = 5_000;
+const PROTECTIVE_DE_RISK_VETO_RETRY_MS = 30_000;
+const PROTECTIVE_DE_RISK_WAIT_SAMPLE_MS = 5_000;
 type IdleGrokSubmission = { observedAt: number; pending: boolean };
 type RetainedBookkeepingCounts = {
   activeTriggers: number;
@@ -321,6 +324,10 @@ export class EngineService {
   /** One risk-reducing unwind flight per market; never block the websocket consumer. */
   private readonly protectiveDeRiskInFlight = new Set<string>();
   private readonly protectiveDeRiskAttempts = new Map<string, number>();
+  /** Earliest next durable de-risk evaluation per market. Ephemeral by design. */
+  private readonly protectiveDeRiskNextAttemptAt = new Map<string, number>();
+  /** Bounds non-durable waiting feed/SSE samples when no sell depth exists. */
+  private readonly protectiveDeRiskLastWaitingAt = new Map<string, number>();
   private readonly activeTriggers = new Map<string, TriggerEvent>();
   private readonly triggerProvenance = new Map<string, TriggerProvenance>();
   private readonly provenanceInvalid = new Set<string>();
@@ -871,6 +878,9 @@ export class EngineService {
           },
           afterApply: async () => {
             this.reportGenerated = false;
+            this.protectiveDeRiskAttempts.clear();
+            this.protectiveDeRiskNextAttemptAt.clear();
+            this.protectiveDeRiskLastWaitingAt.clear();
             this.abortSourceSealPersist();
             this.sourceSealed = false;
             this.sourceSealing = false;
@@ -4460,7 +4470,7 @@ export class EngineService {
     if (this.protectiveDeRiskInFlight.has(marketId)) return;
     const initial = this.ledger.positions.get(marketId);
     if (!initial?.unpairedOutcome || d(initial.unpairedQuantity).lte(0)) {
-      this.protectiveDeRiskAttempts.delete(marketId);
+      this.clearProtectiveDeRiskState(marketId);
       return;
     }
     if (!experimentAllowsHedge(this.experiment) || this.settledMarkets.has(marketId)) return;
@@ -4488,7 +4498,7 @@ export class EngineService {
 
       const position = this.ledger.positions.get(marketId);
       if (!position?.unpairedOutcome || d(position.unpairedQuantity).lte(0)) {
-        this.protectiveDeRiskAttempts.delete(marketId);
+        this.clearProtectiveDeRiskState(marketId);
         return;
       }
       if (!experimentAllowsHedge(this.experiment) || this.settledMarkets.has(marketId) || this.state.draining) return;
@@ -4513,17 +4523,27 @@ export class EngineService {
         maxOrderSizeUsd: this.riskLimits.maxOrderSizeUsd,
       });
       if (!candidate) {
-        this.record("PROTECTIVE_DE_RISK_WAITING", position.id, marketId, {
-          deRiskReason: "MAX_UNHEDGED_DURATION",
-          unhedgedStartedAt,
-          unhedgedDurationMs,
-          attemptedAction: "SELL_UNPAIRED",
-          requestedQty: position.unpairedQuantity,
-          executableQty: "0",
-          finalState: "NO_EXECUTABLE_BID_DEPTH",
-        }, this.assetByMarket.get(marketId) ?? snapshot.asset ?? null);
+        const lastWaitingAt = this.protectiveDeRiskLastWaitingAt.get(marketId) ?? Number.NEGATIVE_INFINITY;
+        if (now.getTime() - lastWaitingAt >= PROTECTIVE_DE_RISK_WAIT_SAMPLE_MS) {
+          this.protectiveDeRiskLastWaitingAt.set(marketId, now.getTime());
+          this.record("PROTECTIVE_DE_RISK_WAITING", position.id, marketId, {
+            deRiskReason: "MAX_UNHEDGED_DURATION",
+            unhedgedStartedAt,
+            unhedgedDurationMs,
+            attemptedAction: "SELL_UNPAIRED",
+            requestedQty: position.unpairedQuantity,
+            executableQty: "0",
+            finalState: "NO_EXECUTABLE_BID_DEPTH",
+          }, this.assetByMarket.get(marketId) ?? snapshot.asset ?? null);
+        }
         return;
       }
+
+      const nextAttemptAt = this.protectiveDeRiskNextAttemptAt.get(marketId) ?? 0;
+      if (now.getTime() < nextAttemptAt) return;
+      // Reserve the retry slot before any journal await so fresh snapshot
+      // bursts cannot generate duplicate durable evaluations behind this flight.
+      this.protectiveDeRiskNextAttemptAt.set(marketId, now.getTime() + PROTECTIVE_DE_RISK_RETRY_MS);
 
       const asset = this.assetByMarket.get(marketId) ?? snapshot.asset ?? null;
       const exposure = computePaperExposures(this.ledger.positions.values(), marketId, this.assetByMarket, now.getTime());
@@ -4614,6 +4634,7 @@ export class EngineService {
         payload: { ...decision.risk, marketId, asset, deRisk: audit },
       }));
       if (!decision.accepted || !decision.order) {
+        this.protectiveDeRiskNextAttemptAt.set(marketId, now.getTime() + PROTECTIVE_DE_RISK_VETO_RETRY_MS);
         for (const reason of decision.risk.vetoes) this.metrics.riskVetoes.inc({ reason });
         this.record("RISK_VETO", traceId, marketId, {
           reasons: decision.risk.vetoes,
@@ -4628,6 +4649,7 @@ export class EngineService {
         intent: "PROTECTIVE_DE_RISK",
         deRisk: audit,
       }, asset);
+      const unpairedBeforeSubmit = d(position.unpairedQuantity);
       await this.submitPaperOrder(
         decision.order,
         snapshot,
@@ -4635,11 +4657,26 @@ export class EngineService {
         "PROTECTIVE_DE_RISK",
         audit,
       );
+      const afterSubmit = this.ledger.positions.get(marketId);
+      const unpairedAfterSubmit = afterSubmit?.unpairedOutcome
+        ? d(afterSubmit.unpairedQuantity)
+        : d(0);
+      if (unpairedAfterSubmit.lt(unpairedBeforeSubmit)) {
+        // A successful reduction earns an immediate residual retry on the next
+        // fresh book instead of waiting out the failure backoff.
+        this.protectiveDeRiskNextAttemptAt.delete(marketId);
+      }
     } finally {
       this.protectiveDeRiskInFlight.delete(marketId);
       const current = this.ledger.positions.get(marketId);
-      if (!current || d(current.unpairedQuantity).lte(0)) this.protectiveDeRiskAttempts.delete(marketId);
+      if (!current || d(current.unpairedQuantity).lte(0)) this.clearProtectiveDeRiskState(marketId);
     }
+  }
+
+  private clearProtectiveDeRiskState(marketId: string): void {
+    this.protectiveDeRiskAttempts.delete(marketId);
+    this.protectiveDeRiskNextAttemptAt.delete(marketId);
+    this.protectiveDeRiskLastWaitingAt.delete(marketId);
   }
 
   private async pollSettlements(): Promise<void> {
@@ -4814,6 +4851,7 @@ export class EngineService {
       afterApply: async () => {
         this.settledMarkets.add(marketId);
         this.settlementBackoff.delete(marketId);
+        this.clearProtectiveDeRiskState(marketId);
         if (!positionBefore) return;
         const realizedDelta = settlementRealizedDelta(positionBefore, upPayoff, downPayoff);
         const outcome = classifySettledOutcome(realizedDelta, positionBefore.totalFees);
