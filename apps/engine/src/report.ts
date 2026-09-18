@@ -253,9 +253,13 @@ export class ExperimentSummaryAccumulator {
       this.lastLedger = event.payload as unknown as LedgerState;
       this.maxDrawdown = Math.max(this.maxDrawdown, Number((event.payload as { drawdown?: unknown }).drawdown ?? 0));
     } else if (type === "RISK_EVALUATION") {
-      this.riskCount += 1;
-      if ((event.payload as { accepted?: boolean }).accepted === true) this.accepted += 1;
-      this.addRiskAttribution(event);
+      const payload = event.payload as { accepted?: boolean; intent?: unknown; deRisk?: unknown };
+      const protective = payload.intent === "PROTECTIVE_DE_RISK" || payload.deRisk != null;
+      if (!protective) {
+        this.riskCount += 1;
+        if (payload.accepted === true) this.accepted += 1;
+        this.addRiskAttribution(event);
+      }
     } else if (type === "PAPER_ORDER_CREATED") {
       this.paperOrders += 1;
       const payload = event.payload as { orderType?: unknown; type?: unknown };
@@ -288,7 +292,9 @@ export class ExperimentSummaryAccumulator {
       const status = String((event.payload as { status?: unknown }).status ?? "MCP");
       if (status !== "HANDLED") this.failureStatistics[`MCP_${status}`] = (this.failureStatistics[`MCP_${status}`] ?? 0) + 1;
     } else if (type === "PAPER_EXECUTION_ERROR") {
-      this.failureStatistics.PAPER_EXECUTION_ERROR = (this.failureStatistics.PAPER_EXECUTION_ERROR ?? 0) + 1;
+      if ((event.payload as { stateChanged?: unknown }).stateChanged !== true) {
+        this.failureStatistics.PAPER_EXECUTION_ERROR = (this.failureStatistics.PAPER_EXECUTION_ERROR ?? 0) + 1;
+      }
     } else if (type === "PAIR_REALIZED") {
       const net = netRealizedEdgeOf(event);
       if (Number.isFinite(net)) { this.pairRealizedNetSum += net; this.pairRealizedNetN += 1; }
