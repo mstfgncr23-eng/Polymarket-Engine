@@ -167,6 +167,51 @@ describe("native v2 full shadow execution evaluation", () => {
     expect(decision.netEvUsdPerShare).toBeGreaterThan(0.015);
   });
 
+  it("rejects a high-price first leg whose net edge passes but expected ROI is below 2%", () => {
+    const shadow = intent();
+    const risk = baseRisk(shadow.confidence);
+    const { _consensusConfidence: _ignored, ...riskInput } = risk;
+    const expensiveSnapshot: MarketSnapshot = {
+      ...snapshot(),
+      bids: [{ price: "0.96", quantity: "200" }],
+      asks: [{ price: "0.97", quantity: "200" }],
+      feeSchedule: {
+        rate: "0.07",
+        exponent: 1,
+        takerOnly: true,
+        rebateRate: "0.2",
+        source: "configured_test_fixture",
+        effectiveAt: NOW.toISOString(),
+      },
+    };
+    const candidate = {
+      ...shadow.candidate,
+      quantity: "5.15463918",
+      limitPrice: "0.97",
+      rawEdgeUsdPerShare: 0.02,
+      rawExpectedEdge: 0.02,
+    };
+
+    const decision = decidePaperOrder({
+      candidate,
+      consensus: shadow.consensus,
+      snapshotAfterDecisionLatency: expensiveSnapshot,
+      baseRisk: riskInput,
+      limits: riskLimitsSchema.parse({}),
+      triggerId: "trigger-1",
+      signalExpiresAt: EXPIRES,
+      orderType: "TAKER",
+    });
+
+    expect(decision.netEvUsdPerShare).toBeGreaterThan(0.015);
+    expect(decision.expectedROI).not.toBeNull();
+    expect(decision.expectedROI!).toBeLessThan(0.02);
+    expect(decision.risk.vetoes).not.toContain("MINIMUM_EXPECTED_EDGE");
+    expect(decision.risk.vetoes).toContain("MINIMUM_EXPECTED_ROI");
+    expect(decision.accepted).toBe(false);
+    expect(decision.order).toBeNull();
+  });
+
   it("uses the unchanged risk gate to veto weak V2 evidence on minimum signal confidence", () => {
     const shadow = intent(1, 0.3);
     const risk = baseRisk(shadow.confidence);
