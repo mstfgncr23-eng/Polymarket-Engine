@@ -205,6 +205,7 @@ const IDLE_GROK_IDEMPOTENCY_TTL_MS = 5 * 60_000;
 const SCOUT_REFRESH_STATE_TTL_MS = 60_000;
 const SCOUT_REFRESH_CONTEXT_MAX = 128;
 const SCOUT_REFRESH_RETRY_GAP_MS = 1_000;
+const NATIVE_ENTRY_REVALIDATION_VERSION = "native-entry-revalidation-v1" as const;
 type IdleGrokSubmission = { observedAt: number; pending: boolean };
 type RetainedBookkeepingCounts = {
   activeTriggers: number;
@@ -361,6 +362,7 @@ export class EngineService {
   private maintenanceHold: Promise<void> | null = null;
   private processTriggerHold: Promise<void> | null = null;
   private nativeV2ShadowEvalHoldForTest: Promise<void> | null = null;
+  private nativeEntryRevalidationHoldForTest: Promise<void> | null = null;
   private triggerEventPersistHold: Promise<void> | null = null;
   private sourceSealing = false;
   private sourceSealed = false;
@@ -813,6 +815,7 @@ export class EngineService {
         modelConfiguration: {
           provider: "native_deterministic", version: NATIVE_DETERMINISTIC_MODEL_VERSION,
           localExecution: true, externalInference: false, authority: NATIVE_DETERMINISTIC_AUTHORITY,
+          entryRevalidationVersion: NATIVE_ENTRY_REVALIDATION_VERSION,
         },
         startingBalance: this.ledger.snapshot().startingBalance, systemVersion: "0.1.0",
         gitSha: process.env.GIT_SHA ?? process.env.FLY_IMAGE_REF ?? "unknown", now,
@@ -1692,6 +1695,7 @@ export class EngineService {
           modelConfiguration: {
             provider: "native_deterministic", version: NATIVE_DETERMINISTIC_MODEL_VERSION,
             localExecution: true, externalInference: false, authority: NATIVE_DETERMINISTIC_AUTHORITY,
+            entryRevalidationVersion: NATIVE_ENTRY_REVALIDATION_VERSION,
           },
           startingBalance: this.ledger.snapshot().startingBalance, systemVersion: "0.1.0",
           gitSha: process.env.GIT_SHA ?? process.env.FLY_IMAGE_REF ?? "unknown",
@@ -1754,6 +1758,7 @@ export class EngineService {
       modelConfiguration: {
         provider: "native_deterministic", version: NATIVE_DETERMINISTIC_MODEL_VERSION,
         localExecution: true, externalInference: false, authority: NATIVE_DETERMINISTIC_AUTHORITY,
+        entryRevalidationVersion: NATIVE_ENTRY_REVALIDATION_VERSION,
       },
       startingBalance: this.ledger.snapshot().startingBalance,
       systemVersion: "0.1.0", gitSha: "unknown",
@@ -2186,19 +2191,19 @@ export class EngineService {
     return false;
   }
 
-  /**
-   * Evaluate one trigger from the current trusted pair. The Engine owns the
-   * synchronization, epoch, provenance, lifecycle, and persistence gates;
-   * the core model only receives the already-admitted inputs.
-   */
-  private async evaluateNativeDecisionForTrigger(trigger: TriggerEvent, provenance: TriggerProvenance): Promise<void> {
-    if (this.researchIngressBlocked() || !trigger.marketId || !this.isTriggerActionable(trigger.id)) return;
-    if (!this.isMarketSynchronized(trigger.marketId)) return;
-    const pair = this.snapshots.get(trigger.marketId);
-    if (!pair?.UP || !pair.DOWN) return;
+  private currentNativeDecisionContext(
+    trigger: TriggerEvent,
+    provenance: TriggerProvenance,
+    now: Date,
+  ) {
+    if (!trigger.marketId || !this.isTriggerActionable(trigger.id)) return null;
+    if (!this.isMarketSynchronized(trigger.marketId)) return null;
+    const currentPair = this.snapshots.get(trigger.marketId);
+    if (!currentPair?.UP || !currentPair.DOWN) return null;
+    const pair = { UP: currentPair.UP, DOWN: currentPair.DOWN };
     const asset = trigger.asset ?? this.assetByMarket.get(trigger.marketId) ?? pair.UP.asset ?? pair.DOWN.asset ?? null;
     const referenceContext = asset
-      ? this.state.getReferenceContext(asset, this.nowFn().getTime(), this.riskLimits.staleFeedTimeoutMs)
+      ? this.state.getReferenceContext(asset, now.getTime(), this.riskLimits.staleFeedTimeoutMs)
       : null;
     const referenceMovement = asset ? this.triggerEngine.referenceMovement(asset) : null;
     const reference: NativeReferenceFeatures | null = referenceContext ? {
@@ -2212,13 +2217,30 @@ export class EngineService {
       referenceSourceTimestamp: referenceMovement?.sourceTimestamp ?? null,
     } : null;
     const native = evaluateNativeDecision({
-      trigger, up: pair.UP, down: pair.DOWN, reference,
+      trigger,
+      up: pair.UP,
+      down: pair.DOWN,
+      reference,
       referenceRequired: this.referenceRequired.get(trigger.marketId) === true,
-      marketSynchronized: this.isMarketSynchronized(trigger.marketId),
+      marketSynchronized: true,
       triggerProvenanceValid: this.isProvenanceCurrentlyValid(trigger.id, provenance),
-      now: this.nowFn(), config: this.nativeDecisionConfig,
+      now,
+      config: this.nativeDecisionConfig,
     });
-    if (!native) return;
+    if (!native) return null;
+    return { native, pair, asset, referenceContext, reference };
+  }
+
+  /**
+   * Evaluate one trigger from the current trusted pair. The Engine owns the
+   * synchronization, epoch, provenance, lifecycle, and persistence gates;
+   * the core model only receives the already-admitted inputs.
+   */
+  private async evaluateNativeDecisionForTrigger(trigger: TriggerEvent, provenance: TriggerProvenance): Promise<void> {
+    if (this.researchIngressBlocked() || !trigger.marketId || !this.isTriggerActionable(trigger.id)) return;
+    const initial = this.currentNativeDecisionContext(trigger, provenance, this.nowFn());
+    if (!initial) return;
+    const { native, pair, asset, referenceContext, reference } = initial;
 
     const shadowV2FeatureVector = this.nativeV2Shadow.extract({
       marketId: trigger.marketId,
@@ -2322,6 +2344,7 @@ export class EngineService {
         opportunity: shadowV2MarketOpportunity, ranking: shadowV2OpportunityRanking,
       })
       : null;
+    if (this.nativeEntryRevalidationHoldForTest) await this.nativeEntryRevalidationHoldForTest;
     try {
       await this.evaluateTrade(trigger, consensus, native);
     } catch (error) {
@@ -2702,13 +2725,17 @@ export class EngineService {
     });
   }
 
-  private nativeCompatibilityDecision(trigger: TriggerEvent, native: NativeDecision): NonNullable<EngineStateStore["latestConsensus"]> {
+  private nativeCompatibilityDecision(
+    trigger: TriggerEvent,
+    native: NativeDecision,
+    calculatedAt = this.nowFn(),
+  ): NonNullable<EngineStateStore["latestConsensus"]> {
     return {
       id: createId("native_decision"), traceId: trigger.traceId, triggerId: trigger.id,
       consensusDirection: native.direction, consensusConfidence: native.confidence,
       agentAgreement: 1, signalFreshness: 1, conflicts: [],
       estimatedEdge: native.fairProbability - native.marketProbability,
-      evidenceIds: native.evidenceIds, calculatedAt: this.nowFn().toISOString(),
+      evidenceIds: native.evidenceIds, calculatedAt: calculatedAt.toISOString(),
       authority: NATIVE_DETERMINISTIC_AUTHORITY,
       fairProbability: native.fairProbability, marketProbability: native.marketProbability,
       featureVector: { ...native.featureVector },
@@ -5064,6 +5091,7 @@ export class EngineService {
   setMaintenanceHoldForTest(hold: Promise<void> | null): void { this.maintenanceHold = hold; }
   setProcessTriggerHoldForTest(hold: Promise<void> | null): void { this.processTriggerHold = hold; }
   setNativeV2ShadowEvalHoldForTest(hold: Promise<void> | null): void { this.nativeV2ShadowEvalHoldForTest = hold; }
+  setNativeEntryRevalidationHoldForTest(hold: Promise<void> | null): void { this.nativeEntryRevalidationHoldForTest = hold; }
   /** Test helper: simulate discovery removing a market from live maps after decision-time capture. */
   dropLiveMarketForTest(marketId: string): void {
     this.marketsById.delete(marketId);
