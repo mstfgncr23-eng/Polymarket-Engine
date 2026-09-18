@@ -57,7 +57,7 @@ export function buildProtectiveDeRiskCandidate(input: {
     worstPrice = level.price;
   }
 
-  if (quantity.lte(0) || !worstPrice || quantity.lt(snapshot.minOrderSize)) return null;
+  if (quantity.lte(0) || !worstPrice || !snapshot.minOrderSize || quantity.lt(snapshot.minOrderSize)) return null;
   return {
     strategyId: "protective-de-risk",
     strategyVersion: "protective-de-risk-v1",
