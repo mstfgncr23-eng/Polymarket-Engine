@@ -255,16 +255,18 @@ export class RetentionManager {
         monitorOnlyEligible,
         transientEligible,
       });
-      const operationalBefore = new Date(context.now.getTime() - this.config.monitorTtlMs);
+      // Operational journal mirrors are human/forensic data, but the same
+      // lifecycle fence as monitor rows applies: never archive/purge an active
+      // experiment window merely because its wall-clock age exceeds the TTL.
+      const operationalBefore = monitorBefore;
 
       const telemetryEligible = await this.journal.countEligible([...TELEMETRY_EVENT_TYPES], telemetryBefore);
       const monitorEligible = monitorBefore
         ? await this.journal.countEligible([...MONITOR_CONTROL_EVENT_TYPES], monitorBefore)
         : { count: 0, oldestOccurredAt: null };
-      const operationalEligible = await this.journal.countEligible(
-        [...LOCAL_ARCHIVE_OPERATIONAL_EVENT_TYPES],
-        operationalBefore,
-      );
+      const operationalEligible = operationalBefore
+        ? await this.journal.countEligible([...LOCAL_ARCHIVE_OPERATIONAL_EVENT_TYPES], operationalBefore)
+        : { count: 0, oldestOccurredAt: null };
 
       type Drain = {
         cls: string;
@@ -278,6 +280,7 @@ export class RetentionManager {
       // local raw archive. Historical experiments are considered, not only the
       // engine's currently attached manifest.
       if (this.archive) {
+        let canonicalDrainPrepared = false;
         const candidates = await this.journal.listArchiveCandidates(32);
         for (const candidate of candidates) {
           if (context.now.getTime() - Date.parse(candidate.report.persistedAt) < this.config.completedGraceMs) continue;
@@ -305,6 +308,7 @@ export class RetentionManager {
               limit,
             }),
           });
+          canonicalDrainPrepared = true;
           break;
         }
 
@@ -347,8 +351,13 @@ export class RetentionManager {
         };
 
         await prepareBucket("raw_telemetry", TELEMETRY_EVENT_TYPES, telemetryEligible, telemetryBefore);
-        await prepareBucket("monitor_control", MONITOR_CONTROL_EVENT_TYPES, monitorEligible, monitorBefore);
-        await prepareBucket("operational_audit", LOCAL_ARCHIVE_OPERATIONAL_EVENT_TYPES, operationalEligible, operationalBefore);
+        // Experiment-scoped trigger/Grok/control rows are already present in the
+        // canonical experiment archive. Prefer draining that source first to
+        // avoid duplicating the largest forensic payloads into time buckets.
+        if (!canonicalDrainPrepared) {
+          await prepareBucket("monitor_control", MONITOR_CONTROL_EVENT_TYPES, monitorEligible, monitorBefore);
+          await prepareBucket("operational_audit", LOCAL_ARCHIVE_OPERATIONAL_EVENT_TYPES, operationalEligible, operationalBefore);
+        }
       }
 
       // Archive work is read/IO work. Start the destructive DML budget only
