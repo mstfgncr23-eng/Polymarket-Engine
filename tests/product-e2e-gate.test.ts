@@ -612,7 +612,10 @@ describe("PR20 true product end-to-end gate", () => {
 
     const recovered = await setupScenario({ journal, clock, resolutions });
     try {
-      expect(recovered.engine.ledger.positions.get("btc-mkt")?.unpairedQuantity).not.toBe("0");
+      const recoveredPosition = recovered.engine.ledger.positions.get("btc-mkt");
+      expect(recoveredPosition?.unpairedQuantity).not.toBe("0");
+      const recoveredFillTimestamp = ((durableFill[0]!.payload.fill as { timestamp?: string }).timestamp);
+      expect(recoveredPosition?.unhedgedStartedAt).toBe(recoveredFillTimestamp);
       expect((await journal.queryEvents({ types: ["PAPER_FILL"] })).length).toBe(1);
       clock.nowMs = START_MS + 20_000;
       resolutions.set("btc-mkt", {
