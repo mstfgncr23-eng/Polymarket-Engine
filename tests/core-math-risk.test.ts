@@ -202,6 +202,16 @@ describe("native decisions and hard risk", () => {
       ...protective,
       feeScheduleKnown: false,
     }, limits).vetoes).toContain("UNKNOWN_FEE_SCHEDULE");
+
+    for (const [change, veto] of [
+      [{ databaseAvailable: false }, "DATABASE_UNAVAILABLE"],
+      [{ timestampDisorder: true }, "EVENT_TIMESTAMP_DISORDER"],
+      [{ riskStateAvailable: false }, "RISK_STATE_UNAVAILABLE"],
+      [{ executionErrorsLastHour: limits.maxExecutionErrorsPerHour }, "ABNORMAL_EXECUTION_ERRORS"],
+      [{ shuttingDown: true }, "SHUTTING_DOWN"],
+    ] as const) {
+      expect(evaluateRisk({ ...protective, ...change }, limits).vetoes).toContain(veto);
+    }
   });
 
   it("rejects malicious model-shaped output before deterministic risk", () => {
