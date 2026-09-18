@@ -83,6 +83,23 @@ describe("native decisions and hard risk", () => {
     expect(decision.vetoes).not.toContain("MINIMUM_EXPECTED_ROI");
   });
 
+  it("applies strategy cooldown to fresh first legs but not risk-reducing hedges", () => {
+    const limits = riskLimitsSchema.parse({ strategyCooldownMs: 60_000 });
+    const recentTradeAt = new Date(now.getTime() - 1_000);
+
+    const firstLeg = evaluateRisk(safeRisk({
+      intent: "OPEN_FIRST_LEG",
+      lastStrategyTradeAt: recentTradeAt,
+    }), limits);
+    expect(firstLeg.vetoes).toContain("STRATEGY_COOLDOWN");
+
+    const hedge = evaluateRisk(safeRisk({
+      intent: "HEDGE_SECOND_LEG",
+      lastStrategyTradeAt: recentTradeAt,
+    }), limits);
+    expect(hedge.vetoes).not.toContain("STRATEGY_COOLDOWN");
+  });
+
   it("rejects malicious model-shaped output before deterministic risk", () => {
     const malicious = { direction: "UP", fairProbability: 3, marketProbability: 0.5, estimatedEdge: 99, confidence: 2, evidenceIds: [], expiresAt: "never", reasonCodes: [], placeLiveOrder: true };
     expect(fairProbabilityOutputSchema.safeParse(malicious).success).toBe(false);
