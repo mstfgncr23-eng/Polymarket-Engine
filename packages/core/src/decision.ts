@@ -51,7 +51,9 @@ export function decidePaperOrder(input: {
     : input.snapshotAfterDecisionLatency.bids;
   const walk = walkBook(takerLevels, input.candidate.quantity, input.candidate.limitPrice, input.candidate.side);
   const schedule = input.snapshotAfterDecisionLatency.feeSchedule;
-  const executableNow = orderType === "MAKER" ? bestBid !== undefined : walk.sufficientDepth;
+  const executableNow = orderType === "MAKER"
+    ? (input.candidate.side === "BUY" ? bestBid !== undefined : bestAsk !== undefined)
+    : walk.sufficientDepth;
   const executionPrice = orderType === "MAKER" ? makerPrice : walk.vwap;
   const fee = schedule ? calculateFee(input.candidate.quantity, executionPrice, orderType, schedule) : null;
   const slippage = executableNow
