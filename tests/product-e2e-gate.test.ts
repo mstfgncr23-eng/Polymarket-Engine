@@ -243,6 +243,21 @@ describe("PR20 true product end-to-end gate", () => {
         "EXPERIMENT_COMPLETED", "EXPERIMENT_SOURCE_SEALED", "EXPERIMENT_REPORT_GENERATED",
       ]));
       expect(types).not.toContain("GROK_SIGNAL_ACCEPTED");
+      const riskRows = await setup.journal.queryEvents({ types: ["RISK_EVALUATION"] });
+      const revalidatedFirstLeg = riskRows.find((row) => {
+        const alpha = row.payload.alpha as { fairProvenance?: { revalidated?: boolean } } | undefined;
+        return alpha?.fairProvenance?.revalidated === true;
+      });
+      expect(revalidatedFirstLeg?.payload.alpha).toMatchObject({
+        fairProvenance: {
+          revalidated: true,
+          originalDirection: "UP",
+          revalidatedDirection: "UP",
+          up: { tokenId: "btc-up", sequence: expect.any(Number) },
+          down: { tokenId: "btc-down", sequence: expect.any(Number) },
+          reference: { venue: "deterministic-test", sourceTimestamp: expect.any(String) },
+        },
+      });
       const consensusRows = await setup.journal.queryEvents({ types: ["CONSENSUS_DECISION"] });
       expect(consensusRows[0]?.payload).toMatchObject({
         authority: "NATIVE_DETERMINISTIC_V1",
@@ -281,6 +296,72 @@ describe("PR20 true product end-to-end gate", () => {
       expect(setup.engine.state.snapshot().decisionFeed.some((item) => item.type === "RISK_VETO")).toBe(true);
       expect((await setup.journal.readDurableTransitionsAfter(0, 256)).filter((row) => row.type === "PAPER_FILL")).toEqual([]);
     } finally {
+      await setup.engine.stop();
+    }
+  });
+
+  it("revalidates first-leg fair against the current book after consensus persistence", async () => {
+    const journal = new MemoryEventJournal();
+    const setup = await setupScenario({ journal, env: { EXPERIMENT_DURATION_HOURS: "1" } });
+    let releaseHold: (() => void) | null = null;
+    try {
+      expect((await setup.engine.beginExperiment()).ok).toBe(true);
+      await setup.market.emitSnapshot(marketBook(setup.clock, "UP", 1));
+      await setup.market.emitSnapshot(marketBook(setup.clock, "DOWN", 1));
+      await setup.engine.ingestReferenceTickForTest(referenceTick(setup.clock, "100"));
+
+      const hold = new Promise<void>((resolve) => { releaseHold = resolve; });
+      journal.setAppendInFlightHoldForTest(hold, ["CONSENSUS_DECISION"]);
+
+      setup.clock.nowMs = START_MS + 1_000;
+      await setup.engine.ingestReferenceTickForTest(referenceTick(setup.clock, "102"));
+      await waitFor(() => journal.inFlightAppends, (count) => count > 0);
+
+      // The original decision is UP. While its consensus row is durably
+      // persisting, move the live pair into a state where fresh V1 evidence is
+      // FLAT. The old UP fair must never be combined with this newer book.
+      setup.clock.nowMs = START_MS + 1_100;
+      await setup.market.emitSnapshot(snapshot({
+        eventId: createId("market-revalidated-up"),
+        traceId: createId("trace"),
+        marketId: "btc-mkt",
+        tokenId: "btc-up",
+        outcome: "UP",
+        asset: "BTC",
+        bids: [{ price: "0.10", quantity: "1" }],
+        asks: [{ price: "0.20", quantity: "2000" }],
+        sourceTimestamp: iso(setup.clock),
+        receivedAt: iso(setup.clock),
+        sequence: 2,
+      }));
+      await setup.market.emitSnapshot(snapshot({
+        eventId: createId("market-revalidated-down"),
+        traceId: createId("trace"),
+        marketId: "btc-mkt",
+        tokenId: "btc-down",
+        outcome: "DOWN",
+        asset: "BTC",
+        bids: [{ price: "0.80", quantity: "2000" }],
+        asks: [{ price: "0.90", quantity: "1" }],
+        sourceTimestamp: iso(setup.clock),
+        receivedAt: iso(setup.clock),
+        sequence: 2,
+      }));
+
+      releaseHold();
+      releaseHold = null;
+      journal.setAppendInFlightHoldForTest(null);
+      await drainRuntime(setup.engine);
+
+      expect(await setup.journal.queryEvents({ types: ["PAPER_ORDER_CREATED", "PAPER_FILL"] })).toEqual([]);
+      expect(setup.engine.ledger.positions.size).toBe(0);
+      expect(setup.engine.state.snapshot().decisionFeed.some(
+        (item) => item.type === "FIRST_LEG_REVALIDATION_REJECTED"
+          && item.payload.reason === "DECISION_STATE_CHANGED",
+      )).toBe(true);
+    } finally {
+      releaseHold?.();
+      journal.setAppendInFlightHoldForTest(null);
       await setup.engine.stop();
     }
   });
