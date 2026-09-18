@@ -1,5 +1,5 @@
 import { createReadStream, createWriteStream } from "node:fs";
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { once } from "node:events";
 import { finished } from "node:stream/promises";
 import { basename, dirname, resolve } from "node:path";
@@ -189,8 +189,22 @@ function assertArchiveCandidate(candidate: JournalArchiveCandidate): void {
   }
 }
 
+export const LOCAL_ARCHIVE_SENTINEL = ".polymarket-local-archive-v1";
+export const LOCAL_ARCHIVE_SENTINEL_CONTENT = "POLYMARKET_LOCAL_ARCHIVE_V1";
+
 export class LocalJournalArchive {
   constructor(readonly rootDir: string) {}
+
+  async verifyDurableRoot(): Promise<void> {
+    const root = resolve(this.rootDir);
+    const info = await stat(root).catch(() => null);
+    if (!info?.isDirectory()) throw new Error("LOCAL_ARCHIVE_ROOT_MISSING");
+    const sentinelPath = resolve(root, LOCAL_ARCHIVE_SENTINEL);
+    const sentinel = await readFile(sentinelPath, "utf8").catch(() => null);
+    if (sentinel?.trim() !== LOCAL_ARCHIVE_SENTINEL_CONTENT) {
+      throw new Error("LOCAL_ARCHIVE_SENTINEL_MISSING");
+    }
+  }
 
   experimentDirectory(experimentId: string): string {
     return resolve(this.rootDir, "experiments", safePathComponent(experimentId));
@@ -200,6 +214,7 @@ export class LocalJournalArchive {
     journal: EventJournal,
     candidate: JournalArchiveCandidate,
   ): Promise<ArchiveVerification<ExperimentRawArchiveManifest>> {
+    await this.verifyDurableRoot();
     assertArchiveCandidate(candidate);
     const { report, rollup } = candidate;
     const directory = this.experimentDirectory(report.experimentId);
@@ -267,6 +282,7 @@ export class LocalJournalArchive {
       recordedAtTo: Date;
     },
   ): Promise<ArchiveVerification<JournalBucketArchiveManifest>> {
+    await this.verifyDurableRoot();
     const classDir = resolve(this.rootDir, "journal", safePathComponent(input.retentionClass));
     const start = input.occurredFrom.toISOString();
     const end = input.occurredBefore.toISOString();
