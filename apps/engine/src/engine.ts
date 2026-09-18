@@ -4603,9 +4603,7 @@ export class EngineService {
           assetExposureUsd: exposure.asset,
           databaseAvailable: this.state.database === "UP",
           timestampDisorder: this.timestampDisorder,
-          riskStateAvailable: !this.state.journalDegraded
-            && !this.overload.hasIntegrityFault
-            && this.overload.state !== "FAIL_CLOSED",
+          riskStateAvailable: this.protectiveRiskStateAvailable(),
           dailyPnlUsd: ledger.netTradingPnl,
           drawdownUsd: ledger.drawdown,
           marketExposureUsd: exposure.market,
@@ -4694,6 +4692,19 @@ export class EngineService {
       const current = this.ledger.positions.get(marketId);
       if (!current || d(current.unpairedQuantity).lte(0)) this.clearProtectiveDeRiskState(marketId);
     }
+  }
+
+  /**
+   * Hard safety gate for a protective exit. The overload latch can trip to
+   * FAIL_CLOSED between the entry guard and this decision (async boundary while
+   * cancelling stale first-leg makers), and integrity faults and journal
+   * degradation are independent sticky signals. This re-reads the live latch
+   * facts in a fresh narrowing context instead of trusting an earlier guard.
+   */
+  private protectiveRiskStateAvailable(): boolean {
+    return !this.state.journalDegraded
+      && !this.overload.hasIntegrityFault
+      && this.overload.state !== "FAIL_CLOSED";
   }
 
   private clearProtectiveDeRiskState(marketId: string): void {
