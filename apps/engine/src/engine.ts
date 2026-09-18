@@ -3180,15 +3180,24 @@ export class EngineService {
   private async evaluateTrade(trigger: TriggerEvent, consensus: NonNullable<EngineStateStore["latestConsensus"]>, native: NativeDecision): Promise<void> {
     if (this.researchIngressBlocked()) return;
     if (!this.isTriggerActionable(trigger.id)) return;
-    const pair = this.snapshots.get(trigger.marketId ?? "");
+    let pair = this.snapshots.get(trigger.marketId ?? "");
     if (!pair) return;
-    const position = this.ledger.positions.get(trigger.marketId ?? "") ?? null;
+    let position = this.ledger.positions.get(trigger.marketId ?? "") ?? null;
     if (this.experiment) {
       const next = refreshExperiment(this.experiment, this.nowFn(), { openPositions: openPositionsRemain(this.ledger.positions.values()) });
       if (next.status !== this.experiment.status) await this.commitExperimentStatus(next);
     }
-    const candidate = this.strategy.evaluate({
-      consensus, snapshots: { UP: pair.UP ?? null, DOWN: pair.DOWN ?? null }, position,
+
+    // Experiment refresh is allowed to await. Re-read the economic state after
+    // that boundary before deriving a candidate.
+    pair = this.snapshots.get(trigger.marketId ?? "");
+    if (!pair) return;
+    position = this.ledger.positions.get(trigger.marketId ?? "") ?? null;
+
+    let decisionConsensus = consensus;
+    let decisionNative = native;
+    let candidate = this.strategy.evaluate({
+      consensus: decisionConsensus, snapshots: { UP: pair.UP ?? null, DOWN: pair.DOWN ?? null }, position,
       maxOrderSizeUsd: this.riskLimits.maxOrderSizeUsd, minimumLockedPairEdge: this.riskLimits.minExpectedEdge,
     });
     if (!candidate) return;
@@ -3206,22 +3215,160 @@ export class EngineService {
     if (candidate.intent === "OPEN_FIRST_LEG" && !this.isMarketSynchronized(candidate.marketId)) return;
     if (candidate.intent === "OPEN_FIRST_LEG" && assetNeedsReliableReference(this.referenceRequired.get(candidate.marketId), this.referenceUnreliable, this.assetByMarket.get(candidate.marketId))) return;
     if (candidate.intent === "HEDGE_SECOND_LEG" && !experimentAllowsHedge(this.experiment)) return;
-    const snapshot = this.state.marketSnapshots.get(candidate.tokenId);
-    if (!snapshot) return;
+
+    // Database health is an async hard-safety prerequisite. Resolve it before
+    // the final first-leg economic capture so a slow health check cannot leave
+    // fair value tied to an older book.
+    const databaseAvailable = await this.journal.healthCheck();
+
+    let fairProvenance: Record<string, unknown> | null = null;
+    if (candidate.intent === "OPEN_FIRST_LEG") {
+      if (this.researchIngressBlocked() || !this.isTriggerActionable(trigger.id)) return;
+      if (this.experimentStartPending || this.overload.state === "FAIL_CLOSED") return;
+      if (!experimentAllowsFirstLeg(this.experiment, this.nowFn())) return;
+      if (!this.entryQualified.has(candidate.marketId) || !this.isMarketSynchronized(candidate.marketId)) return;
+      if (this.firstLegLifecycleBlocked(candidate.marketId)) return;
+
+      const currentPair = this.snapshots.get(candidate.marketId);
+      if (!currentPair?.UP || !currentPair.DOWN) return;
+      const currentAsset = trigger.asset
+        ?? this.assetByMarket.get(candidate.marketId)
+        ?? currentPair.UP.asset
+        ?? currentPair.DOWN.asset
+        ?? null;
+      if (assetNeedsReliableReference(this.referenceRequired.get(candidate.marketId), this.referenceUnreliable, currentAsset)) return;
+
+      const referenceContext = currentAsset
+        ? this.state.getReferenceContext(currentAsset, this.nowFn().getTime(), this.riskLimits.staleFeedTimeoutMs)
+        : null;
+      const referenceMovement = currentAsset ? this.triggerEngine.referenceMovement(currentAsset) : null;
+      const currentReference: NativeReferenceFeatures | null = referenceContext ? {
+        asset: referenceContext.asset,
+        venue: referenceContext.venue,
+        freshness: referenceContext.freshness,
+        freshnessMs: referenceContext.freshnessMs,
+        recentMoveBps: referenceMovement?.moveBps ?? null,
+        recentVolatilityBps: referenceContext.recentVolatilityBps,
+        referenceWindowMs: referenceMovement?.windowMs ?? null,
+        referenceSourceTimestamp: referenceMovement?.sourceTimestamp ?? null,
+      } : null;
+      const currentProvenance = this.triggerProvenance.get(trigger.id);
+      if (!currentProvenance || !this.isProvenanceCurrentlyValid(trigger.id, currentProvenance)) return;
+
+      const revalidatedAt = this.nowFn();
+      const revalidatedNative = evaluateNativeDecision({
+        trigger,
+        up: currentPair.UP,
+        down: currentPair.DOWN,
+        reference: currentReference,
+        referenceRequired: this.referenceRequired.get(candidate.marketId) === true,
+        marketSynchronized: true,
+        triggerProvenanceValid: true,
+        now: revalidatedAt,
+        config: this.nativeDecisionConfig,
+      });
+      if (
+        !revalidatedNative
+        || (revalidatedNative.direction !== "UP" && revalidatedNative.direction !== "DOWN")
+        || revalidatedNative.direction !== native.direction
+      ) {
+        this.record("FIRST_LEG_REVALIDATION_REJECTED", trigger.traceId, candidate.marketId, {
+          triggerId: trigger.id,
+          originalDirection: native.direction,
+          revalidatedDirection: revalidatedNative?.direction ?? null,
+          originalFairProbability: native.fairProbability,
+          revalidatedFairProbability: revalidatedNative?.fairProbability ?? null,
+          reason: "DECISION_STATE_CHANGED",
+        }, currentAsset);
+        return;
+      }
+
+      decisionNative = revalidatedNative;
+      decisionConsensus = {
+        ...consensus,
+        consensusDirection: revalidatedNative.direction,
+        consensusConfidence: revalidatedNative.confidence,
+        estimatedEdge: revalidatedNative.fairProbability - revalidatedNative.marketProbability,
+        fairProbability: revalidatedNative.fairProbability,
+        marketProbability: revalidatedNative.marketProbability,
+        featureVector: { ...revalidatedNative.featureVector },
+        calculatedAt: revalidatedAt.toISOString(),
+      };
+      position = this.ledger.positions.get(candidate.marketId) ?? null;
+      const revalidatedCandidate = this.strategy.evaluate({
+        consensus: decisionConsensus,
+        snapshots: { UP: currentPair.UP, DOWN: currentPair.DOWN },
+        position,
+        maxOrderSizeUsd: this.riskLimits.maxOrderSizeUsd,
+        minimumLockedPairEdge: this.riskLimits.minExpectedEdge,
+      });
+      if (
+        !revalidatedCandidate
+        || revalidatedCandidate.intent !== "OPEN_FIRST_LEG"
+        || revalidatedCandidate.outcome !== revalidatedNative.direction
+      ) {
+        this.record("FIRST_LEG_REVALIDATION_REJECTED", trigger.traceId, candidate.marketId, {
+          triggerId: trigger.id,
+          originalDirection: native.direction,
+          revalidatedDirection: revalidatedNative.direction,
+          reason: "NO_FRESH_FIRST_LEG_CANDIDATE",
+        }, currentAsset);
+        return;
+      }
+      candidate = revalidatedCandidate;
+      pair = currentPair;
+      if (!this.adapterTokenSynchronized(candidate.tokenId)) return;
+
+      const snapshotProvenance = (snapshot: MarketSnapshot) => ({
+        eventId: snapshot.eventId,
+        tokenId: snapshot.tokenId,
+        sequence: snapshot.sequence,
+        hash: snapshot.hash,
+        sourceTimestamp: snapshot.sourceTimestamp,
+        receivedAt: snapshot.receivedAt,
+      });
+      fairProvenance = {
+        revalidated: true,
+        revalidatedAt: revalidatedAt.toISOString(),
+        originalDirection: native.direction,
+        revalidatedDirection: revalidatedNative.direction,
+        up: snapshotProvenance(currentPair.UP),
+        down: snapshotProvenance(currentPair.DOWN),
+        reference: {
+          venue: currentReference?.venue ?? null,
+          sourceTimestamp: currentReference?.referenceSourceTimestamp ?? null,
+          receivedAt: currentAsset ? this.state.referenceLastMessageAt(currentAsset) : null,
+        },
+      };
+    }
+
+    const snapshot = candidate.intent === "OPEN_FIRST_LEG"
+      ? pair[candidate.outcome]
+      : this.state.marketSnapshots.get(candidate.tokenId);
+    if (!snapshot || snapshot.tokenId !== candidate.tokenId) return;
+
     let executableFair: ReturnType<typeof executableFairEdge> = null;
-    if (candidate.intent === "OPEN_FIRST_LEG" && (native.direction === "UP" || native.direction === "DOWN")) {
+    if (candidate.intent === "OPEN_FIRST_LEG" && (decisionNative.direction === "UP" || decisionNative.direction === "DOWN")) {
       executableFair = executableFairEdge({
-        fair: { direction: native.direction, fairProbability: native.fairProbability, marketProbability: native.marketProbability },
-        consensus, snapshot, quantity: candidate.quantity, limitPrice: candidate.limitPrice,
+        fair: {
+          direction: decisionNative.direction,
+          fairProbability: decisionNative.fairProbability,
+          marketProbability: decisionNative.marketProbability,
+        },
+        consensus: decisionConsensus,
+        snapshot,
+        quantity: candidate.quantity,
+        limitPrice: candidate.limitPrice,
       });
       if (!executableFair) return;
       candidate.rawEdgeUsdPerShare = executableFair.rawEdgeUsdPerShare;
       candidate.rawExpectedEdge = executableFair.rawEdgeUsdPerShare;
-      consensus.estimatedEdge = executableFair.rawEdgeUsdPerShare;
+      decisionConsensus.estimatedEdge = executableFair.rawEdgeUsdPerShare;
     }
+
     const duplicateKey = `${candidate.marketId}:${candidate.outcome}:${candidate.intent}`;
     const now = this.nowFn();
-    const signalExpiry = new Date(native.expiresAt);
+    const signalExpiry = new Date(decisionNative.expiresAt);
     const asset = trigger.asset ?? this.assetByMarket.get(candidate.marketId) ?? snapshot.asset ?? null;
     const exposure = computePaperExposures(this.ledger.positions.values(), candidate.marketId, this.assetByMarket, now.getTime());
     const projected = projectPaperExposures({
@@ -3236,15 +3383,20 @@ export class EngineService {
     const referenceRequired = this.referenceRequired.get(candidate.marketId) === true;
     const referenceFeedAt = asset ? dateOrNull(this.state.referenceLastMessageAt(asset)) : null;
     const blocked = asset ? this.referenceBlocked.get(asset) : undefined;
-    const marketFeedAt = collectMarketFeedAt(this.snapshots.get(candidate.marketId), candidate.outcome, candidate.intent, snapshot.receivedAt);
+    const marketFeedAt = collectMarketFeedAt(pair, candidate.outcome, candidate.intent, snapshot.receivedAt);
     const decision = decidePaperOrder({
-      candidate, consensus, snapshotAfterDecisionLatency: snapshot, limits: this.riskLimits, triggerId: trigger.id,
-      signalExpiresAt: signalExpiry, orderType: this.env.PAPER_EXECUTION_STYLE,
+      candidate,
+      consensus: decisionConsensus,
+      snapshotAfterDecisionLatency: snapshot,
+      limits: this.riskLimits,
+      triggerId: trigger.id,
+      signalExpiresAt: signalExpiry,
+      orderType: this.env.PAPER_EXECUTION_STYLE,
       baseRisk: {
         now, marketFeedAt,
         btcFeedAt: asset === "BTC" ? referenceFeedAt ?? dateOrNull(this.state.lastBtcMessageAt) : now,
         referenceFeedAt, referenceRequired, asset, assetExposureUsd: exposure.asset,
-        databaseAvailable: await this.journal.healthCheck(), timestampDisorder: this.timestampDisorder, riskStateAvailable: true,
+        databaseAvailable, timestampDisorder: this.timestampDisorder, riskStateAvailable: true,
         dailyPnlUsd: this.ledger.snapshot().netTradingPnl, drawdownUsd: this.ledger.snapshot().drawdown,
         marketExposureUsd: exposure.market, totalExposureUsd: exposure.total, directionalExposureUsd: exposure.directional,
         unhedgedExposureUsd: exposure.unhedged, unhedgedDurationMs: exposure.unhedgedDurationMs,
@@ -3257,7 +3409,9 @@ export class EngineService {
         externalSignalsLastMinute: 0,
         lastStrategyTradeAt: this.lastTradeAt,
         duplicateTrade: (this.recentTrades.get(duplicateKey) ?? 0) > now.getTime() - this.riskLimits.strategyCooldownMs,
-        experimentEntryOpen: candidate.intent === "HEDGE_SECOND_LEG" ? experimentAllowsHedge(this.experiment) : experimentAllowsFirstLeg(this.experiment, this.nowFn()),
+        experimentEntryOpen: candidate.intent === "HEDGE_SECOND_LEG"
+          ? experimentAllowsHedge(this.experiment)
+          : experimentAllowsFirstLeg(this.experiment, now),
         executionErrorsLastHour: this.executionErrors.filter((at) => now.getTime() - at < 3_600_000).length,
         externalRiskRecommendedVeto: false, shuttingDown: this.state.draining,
       },
@@ -3267,9 +3421,9 @@ export class EngineService {
     const calibration = executableFair ? {
       authority: NATIVE_DETERMINISTIC_AUTHORITY,
       /** Compatibility display fields; executable fields below are authoritative. */
-      fairProbability: native.fairProbability,
-      marketProbability: native.marketProbability,
-      featureVector: native.featureVector,
+      fairProbability: decisionNative.fairProbability,
+      marketProbability: decisionNative.marketProbability,
+      featureVector: decisionNative.featureVector,
       fairProbabilityForTradedOutcome: executableFair.fairProbabilityForTradedOutcome,
       tradedOutcome: executableFair.consensusOutcome,
       usedComplement: executableFair.usedComplement,
@@ -3293,16 +3447,17 @@ export class EngineService {
       executableNotionalUsd: decision.executableNotionalUsd,
       expectedROI: decision.expectedROI,
       quantity: decision.quantity,
-      decisionTimestamp: this.nowFn().toISOString(),
-      evidenceIds: native.evidenceIds,
-      expiresAt: native.expiresAt,
+      decisionTimestamp: now.toISOString(),
+      evidenceIds: decisionNative.evidenceIds,
+      expiresAt: decisionNative.expiresAt,
+      fairProvenance,
     } : {
       authority: NATIVE_DETERMINISTIC_AUTHORITY,
-      fairProbability: native.fairProbability,
-      marketProbability: native.marketProbability,
-      featureVector: native.featureVector,
-      evidenceIds: native.evidenceIds,
-      expiresAt: native.expiresAt,
+      fairProbability: decisionNative.fairProbability,
+      marketProbability: decisionNative.marketProbability,
+      featureVector: decisionNative.featureVector,
+      evidenceIds: decisionNative.evidenceIds,
+      expiresAt: decisionNative.expiresAt,
     };
     await this.persistReportInput(createJournalEvent({ traceId: trigger.traceId, type: "RISK_EVALUATION", aggregateType: "risk", aggregateId: decision.risk.id, payload: {
       ...decision.risk, marketId: trigger.marketId, asset,
