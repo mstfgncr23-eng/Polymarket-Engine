@@ -131,9 +131,12 @@ export function evaluateNativeDecision(input: NativeDecisionInput): NativeDecisi
     config.probabilityFloor,
     config.probabilityCeiling,
   );
-  const direction: Direction = directionalScore > config.directionThreshold
+  // directionalScore describes movement evidence relative to the market prior.
+  // It is not itself a winner label. Winner-direction authority follows the
+  // absolute fair probability after the bounded adjustment.
+  const direction: Direction = fairProbabilityUp > 0.5
     ? "UP"
-    : directionalScore < -config.directionThreshold ? "DOWN" : "FLAT";
+    : fairProbabilityUp < 0.5 ? "DOWN" : "FLAT";
 
   let confidence = 0.5 + 0.25 * Math.abs(bookPressure) + 0.25 * Math.abs(referenceStrength);
   if (

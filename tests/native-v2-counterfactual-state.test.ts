@@ -148,6 +148,31 @@ describe("Native V2 counterfactual state", () => {
     expect(Number(state.positions[0]?.unpairedQuantity)).toBeGreaterThan(0);
   });
 
+  it("blocks a different-side first-leg action while the same market is still open", () => {
+    const store = new NativeV2CounterfactualStore({ dataDir: tempDir(), startingBalance: 1000 });
+    store.init();
+    expect(store.tryCommitWouldSubmit({
+      actionKey: nativeV2CounterfactualActionKey("m1", "UP"),
+      order: order(),
+      snapshot: snapshot(),
+      at: NOW,
+      settlementLookup: settlementLookup("m1"),
+    }).applied).toBe(true);
+
+    const second = store.tryCommitWouldSubmit({
+      actionKey: nativeV2CounterfactualActionKey("m1", "DOWN"),
+      order: { ...order(), outcome: "DOWN", tokenId: "token-down" },
+      snapshot: { ...snapshot(), outcome: "DOWN", tokenId: "token-down" },
+      at: NOW,
+      settlementLookup: settlementLookup("m1"),
+    });
+    expect(second.applied).toBe(false);
+    if (second.applied) throw new Error("expected reject");
+    expect(second.reason).toBe("DUPLICATE_ACTION");
+    expect(second.detail).toBe("EXISTING_OPEN_POSITION");
+    expect(store.summary().fillCount).toBe(1);
+  });
+
   it("duplicate action is idempotent", () => {
     const store = new NativeV2CounterfactualStore({ dataDir: tempDir(), startingBalance: 1000 });
     store.init();

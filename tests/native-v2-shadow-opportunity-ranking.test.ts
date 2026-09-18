@@ -121,7 +121,7 @@ describe("native v2 shadow opportunity ranking", () => {
     expect(up?.actionable).toBe(true);
   });
 
-  it("marks a side non-executable when the current ask book cannot absorb the target notional", () => {
+  it("does not substitute the loser side when the fair-probability winner is not executable", () => {
     const result = evaluateNativeV2ShadowMarketOpportunity({
       fair: fair(0.75),
       snapshots: {
@@ -131,7 +131,17 @@ describe("native v2 shadow opportunity ranking", () => {
       now: new Date(T0),
     });
     expect(result?.candidates.UP).toBeNull();
-    expect(result?.best?.outcome).toBe("DOWN");
+    expect(result?.candidates.DOWN?.actionable).toBe(false);
+    expect(result?.best).toBeNull();
+  });
+
+  it("keeps a cheap longshot diagnostic but never selects it over the absolute winner", () => {
+    const result = opportunity("m-longshot", 0.90, T0, 0.95, 0.05);
+    expect(result.candidates.DOWN?.netEvUsdPerShare).toBeCloseTo(0.05, 8);
+    expect(result.candidates.DOWN?.actionable).toBe(false);
+    expect(result.best?.outcome).toBe("UP");
+    expect(result.best?.fairProbability).toBeCloseTo(0.90, 8);
+    expect(result.best?.actionable).toBe(false);
   });
 
   it("ranks markets deterministically by ROI and evicts stale latest values", () => {

@@ -62,6 +62,22 @@ describe("native deterministic decision model", () => {
     expect(result?.direction).toBe("FLAT");
   });
 
+  it("selects the absolute fair-probability winner even when directional evidence points toward the longshot", () => {
+    const up = book("UP", "10", "100", {
+      bids: [{ price: "0.90", quantity: "10" }],
+      asks: [{ price: "0.92", quantity: "100" }],
+    });
+    const down = book("DOWN", "100", "10", {
+      bids: [{ price: "0.08", quantity: "100" }],
+      asks: [{ price: "0.10", quantity: "10" }],
+    });
+    const result = evaluate(up, down, reference(-30));
+    expect(result?.featureVector.directionalScore).toBeLessThan(-0.15);
+    expect(result?.featureVector.fairProbabilityUp).toBeGreaterThan(0.5);
+    expect(result?.direction).toBe("UP");
+    expect(result?.fairProbability).toBe(result?.featureVector.fairProbabilityUp);
+  });
+
   it("reduces confidence and avoids forcing a direction on disagreement", () => {
     const result = evaluate(book("UP", "100", "1"), book("DOWN", "1", "100"), reference(-30));
     expect(result?.direction).toBe("FLAT");

@@ -54,6 +54,17 @@ export function buildNativeV2ShadowExecutionIntent(input: {
   if (input.snapshot.outcome !== input.selected.outcome) return null;
   if (!Number.isFinite(input.now.getTime()) || input.now.getTime() >= Date.parse(input.expiresAt)) return null;
   if (!Number.isFinite(input.selected.fairProbability) || input.selected.fairProbability < 0 || input.selected.fairProbability > 1) return null;
+  const winnerOutcome = input.fair.fairProbabilityUp > input.fair.fairProbabilityDown
+    ? "UP"
+    : input.fair.fairProbabilityDown > input.fair.fairProbabilityUp ? "DOWN" : null;
+  if (!winnerOutcome || input.selected.outcome !== winnerOutcome || !input.selected.actionable) return null;
+  const winnerProbability = winnerOutcome === "UP"
+    ? input.fair.fairProbabilityUp
+    : input.fair.fairProbabilityDown;
+  if (
+    winnerProbability <= 0.5
+    || Math.abs(input.selected.fairProbability - winnerProbability) > 1e-9
+  ) return null;
   if (!Number.isFinite(input.selected.executableVwap) || input.selected.executableVwap <= 0 || input.selected.executableVwap > 1) return null;
   if (!Number.isFinite(input.selected.worstPrice) || input.selected.worstPrice <= 0 || input.selected.worstPrice > 1) return null;
 

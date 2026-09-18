@@ -216,6 +216,7 @@ const reservePayloadSchema = z.object({
   orderId: z.string().min(1),
   reserved: z.string(),
   resting: restingPaperOrderSchema,
+  intent: z.enum(["OPEN_FIRST_LEG", "HEDGE_SECOND_LEG"]).optional(),
 });
 
 const releasePayloadSchema = z.object({
@@ -292,7 +293,10 @@ export function applyDurableTransition(state: RecoverableEngineState, transition
         const payload = reservePayloadSchema.parse(transition.payload);
         state.ledger.reserve(payload.reserved, new Date(transition.occurredAt));
         state.makerReservations.set(payload.orderId, payload.reserved);
-        state.restingOrders.set(payload.orderId, payload.resting);
+        const resting = payload.intent && !payload.resting.intent
+          ? { ...payload.resting, intent: payload.intent }
+          : payload.resting;
+        state.restingOrders.set(payload.orderId, resting);
         return;
       }
       case "PAPER_MAKER_RELEASED":

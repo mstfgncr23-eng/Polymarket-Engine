@@ -13,6 +13,8 @@ function consensus(direction: "UP" | "DOWN" | "FLAT") {
     signalFreshness: 1,
     conflicts: [],
     estimatedEdge: 0.05,
+    fairProbability: direction === "FLAT" ? 0.5 : 0.65,
+    marketProbability: direction === "FLAT" ? 0.5 : 0.60,
     evidenceIds: ["evidence-first-leg-cap"],
     calculatedAt: now.toISOString(),
     authority: "NATIVE_DETERMINISTIC_V1",
@@ -46,7 +48,7 @@ describe("temporal pair hedge first-leg risk cap", () => {
     });
 
     expect(candidate?.intent).toBe("OPEN_FIRST_LEG");
-    expect(candidate?.strategyVersion).toBe("temporal-pair-hedge-v1.1");
+    expect(candidate?.strategyVersion).toBe("temporal-pair-hedge-v1.2");
     expect(candidate?.reasonCodes).toContain("FIRST_LEG_RISK_CAPPED");
     expect(Number(candidate?.quantity) * 0.5).toBeCloseTo(5, 8);
   });
@@ -83,6 +85,55 @@ describe("temporal pair hedge first-leg risk cap", () => {
     expect(candidate?.intent).toBe("HEDGE_SECOND_LEG");
     expect(candidate?.quantity).toBe("20");
     expect(candidate?.reasonCodes).not.toContain("FIRST_LEG_RISK_CAPPED");
+  });
+
+  it("does not reopen a fully paired unsettled market", () => {
+    const strategy = new TemporalPairHedgeStrategy();
+    const up = snapshot({ marketId: "paired-market", tokenId: "up-paired", outcome: "UP", asks: [{ price: "0.60", quantity: "100" }] });
+    const down = snapshot({ marketId: "paired-market", tokenId: "down-paired", outcome: "DOWN", asks: [{ price: "0.40", quantity: "100" }] });
+    const position = positionSchema.parse({
+      id: "pos-paired-market",
+      marketId: "paired-market",
+      upQuantity: "10",
+      downQuantity: "10",
+      averageUpCost: "0.45",
+      averageDownCost: "0.45",
+      pairedQuantity: "10",
+      unpairedOutcome: null,
+      unpairedQuantity: "0",
+      combinedPairCost: "0.90",
+      totalFees: "0",
+      totalSlippage: "0",
+      openedAt: now.toISOString(),
+      updatedAt: now.toISOString(),
+    });
+
+    expect(strategy.evaluate({
+      consensus: consensus("DOWN"),
+      snapshots: { UP: up, DOWN: down },
+      position,
+      maxOrderSizeUsd: 25,
+      minimumLockedPairEdge: 0.015,
+    })).toBeNull();
+  });
+
+  it("rejects a fresh first leg when the selected side is not the fair-probability winner", () => {
+    const strategy = new TemporalPairHedgeStrategy();
+    const up = snapshot({ marketId: "winner-market", tokenId: "up-winner", outcome: "UP", asks: [{ price: "0.90", quantity: "100" }] });
+    const down = snapshot({ marketId: "winner-market", tokenId: "down-winner", outcome: "DOWN", asks: [{ price: "0.05", quantity: "100" }] });
+    const invalid = {
+      ...consensus("DOWN"),
+      fairProbability: 0.10,
+      marketProbability: 0.05,
+    };
+
+    expect(strategy.evaluate({
+      consensus: invalid,
+      snapshots: { UP: up, DOWN: down },
+      position: null,
+      maxOrderSizeUsd: 25,
+      minimumLockedPairEdge: 0.015,
+    })).toBeNull();
   });
 
   it("allows a smaller explicit cap without changing hedge capacity", () => {

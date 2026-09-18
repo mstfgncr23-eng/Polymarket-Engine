@@ -416,6 +416,16 @@ export class NativeV2CounterfactualStore {
     return Boolean(this.ledger.positions.get(marketId)?.unpairedOutcome);
   }
 
+  hasOpenPosition(marketId: string): boolean {
+    this.init();
+    if (this.recoveryStatus !== "ready") return false;
+    const position = this.ledger.positions.get(marketId);
+    return Boolean(
+      position
+      && (Number(position.upQuantity) !== 0 || Number(position.downQuantity) !== 0)
+    );
+  }
+
   hasSettledMarket(marketId: string): boolean {
     this.init();
     if (this.recoveryStatus !== "ready") return false;
@@ -484,9 +494,11 @@ export class NativeV2CounterfactualStore {
     if (this.actionKeys.has(input.actionKey)) {
       return { applied: false, reason: "DUPLICATE_ACTION" };
     }
-    // Re-evaluations against an already-open unpaired CF book are not new actions.
-    if (this.hasUnpairedPosition(input.order.marketId)) {
-      return { applied: false, reason: "DUPLICATE_ACTION", detail: "EXISTING_UNPAIRED_POSITION" };
+    // A market lifecycle admits one fresh first leg until official settlement.
+    // Fully paired inventory is still an open economic obligation and cannot
+    // be reopened directionally.
+    if (this.hasOpenPosition(input.order.marketId)) {
+      return { applied: false, reason: "DUPLICATE_ACTION", detail: "EXISTING_OPEN_POSITION" };
     }
     if (!input.order) return { applied: false, reason: "NO_ORDER" };
 
