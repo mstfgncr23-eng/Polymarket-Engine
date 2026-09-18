@@ -64,6 +64,28 @@ describe("native final report semantics", () => {
     expect(summary.winLossDistribution.losses).toBe(1);
   });
 
+  it("closes failed-hedge episodes without counting protective neutralization as a pair hedge", () => {
+    const summary = buildExperimentSummary([
+      event("FIRST_LEG_FILLED", "position", "pos:m1", { marketId: "m1", unpairedQuantity: "10" }, 1),
+      event("TRIGGER_EVENT", "trigger", "failed-1", { marketId: "m1", kind: "FAILED_HEDGE" }, 2),
+      event("HEDGE_COMPLETE", "position", "pos:m1", {
+        marketId: "m1",
+        pairedQuantity: "10",
+        unhedgedDurationMs: 301_000,
+        completionMode: "PROTECTIVE_DE_RISK",
+        intent: "PROTECTIVE_DE_RISK",
+      }, 3),
+      // A later episode for the same market must count again, proving the
+      // protective neutralization closed the prior failed-hedge episode.
+      event("TRIGGER_EVENT", "trigger", "failed-2", { marketId: "m1", kind: "FAILED_HEDGE" }, 4),
+    ], "exp-protective-completion");
+
+    expect(summary.firstLegCount).toBe(1);
+    expect(summary.failedHedgeCount).toBe(2);
+    expect(summary.hedgeCompleteCount).toBe(0);
+    expect(summary.averageUnhedgedDurationMs).toBe(0);
+  });
+
   it("counts fresh first-leg cycles after a fully paired position reopens", () => {
     const initial = pos();
     const paired = pos({
