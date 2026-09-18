@@ -18,6 +18,7 @@ import { ExperimentSummaryAccumulator } from "../apps/engine/src/report.js";
 import {
   LOCAL_ARCHIVE_SENTINEL,
   LOCAL_ARCHIVE_SENTINEL_CONTENT,
+  LocalJournalArchive,
   exportExperimentArchive,
 } from "../apps/engine/src/archive.js";
 import {
@@ -480,6 +481,85 @@ describe("PR18 hot operational storage lifecycle", () => {
     expect(manifest.rawEvents.eventCount).toBe(500);
     expect(manifest.rawEvents.sha256).toMatch(/^[a-f0-9]{64}$/);
     expect(manifest.reportContentHash).toBe("archive-final-hash");
+  });
+
+  it("keeps journal rows hot when local archive is disabled", async () => {
+    const journal = new MemoryEventJournal();
+    await journal.append(event("TRIGGER_EVENT", "archive-off-trigger", "2026-01-01T00:00:00.000Z"));
+    await journal.append(event("MARKET_SNAPSHOT", "archive-off-market", "2026-01-01T00:00:01.000Z"));
+    const manager = new RetentionManager(journal, defaultRetentionConfig({
+      enabled: true,
+      telemetryTtlMs: 1,
+      monitorTtlMs: 1,
+      maxRowsPerCycle: 100,
+      cycleBudgetMs: 5_000,
+    }));
+    const result = await manager.runCycle({
+      experiment: null,
+      now: new Date("2026-09-01T00:00:00.000Z"),
+      degraded: false,
+      failClosed: false,
+      databaseUp: true,
+    });
+    expect(result.deletedByClass.raw_telemetry).toBe(0);
+    expect(result.deletedByClass.monitor_control).toBe(0);
+    expect((await journal.queryEvents({ types: ["TRIGGER_EVENT", "MARKET_SNAPSHOT"] }))).toHaveLength(2);
+  });
+
+  it("fails closed when archive is enabled without the durable sentinel", async () => {
+    const journal = new MemoryEventJournal();
+    await journal.append(event("TRIGGER_EVENT", "missing-sentinel", "2026-01-01T00:00:00.000Z"));
+    const directory = await mkdtemp(join(tmpdir(), "pr18-no-sentinel-"));
+    const manager = new RetentionManager(journal, defaultRetentionConfig({
+      enabled: true,
+      localArchiveEnabled: true,
+      localArchiveDir: directory,
+      localArchiveBucketMs: 60_000,
+      monitorTtlMs: 1,
+      cycleBudgetMs: 5_000,
+    }));
+    const result = await manager.runCycle({
+      experiment: null,
+      now: new Date("2026-09-01T00:00:00.000Z"),
+      degraded: false,
+      failClosed: false,
+      databaseUp: true,
+    });
+    expect(result.skipReason).toBe("LOCAL_ARCHIVE_SENTINEL_MISSING");
+    expect(result.deletedByClass.monitor_control).toBe(0);
+    expect(await journal.queryEvents({ types: ["TRIGGER_EVENT"] })).toHaveLength(1);
+  });
+
+  it("never deletes a late old-timestamp row outside the archived commit fence", async () => {
+    const journal = new MemoryEventJournal();
+    const { directory } = await archiveConfig();
+    const archive = new LocalJournalArchive(directory);
+    const from = new Date("2026-01-01T00:00:00.000Z");
+    const before = new Date("2026-01-01T00:01:00.000Z");
+    await journal.append(event("TRIGGER_EVENT", "bucket-first", "2026-01-01T00:00:10.000Z"));
+    const commitSeqTo = await journal.latestCommitSeq();
+    const recordedAtTo = new Date(Date.now() + 1_000);
+    const archived = await archive.ensureJournalBucket(journal, {
+      retentionClass: "monitor_control",
+      eventTypes: ["TRIGGER_EVENT"],
+      occurredFrom: from,
+      occurredBefore: before,
+      commitSeqTo,
+      recordedAtTo,
+    });
+    expect(archived.verified).toBe(true);
+
+    await journal.append(event("TRIGGER_EVENT", "bucket-late", "2026-01-01T00:00:20.000Z"));
+    const deleted = await journal.deleteJournalEventsArchivedRange({
+      types: ["TRIGGER_EVENT"],
+      occurredFrom: from,
+      occurredBefore: before,
+      commitSeqTo,
+      recordedAtTo,
+      limit: 100,
+    });
+    expect(deleted.deleted).toBe(1);
+    expect((await journal.queryEvents({ types: ["TRIGGER_EVENT"] })).map((row) => row.id)).toEqual(["bucket-late"]);
   });
 
   it("falls back from a hash-valid but semantically invalid newest snapshot", async () => {
