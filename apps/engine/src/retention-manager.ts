@@ -262,7 +262,11 @@ export class RetentionManager {
 
       const telemetryEligible = await this.journal.countEligible([...TELEMETRY_EVENT_TYPES], telemetryBefore);
       const monitorEligible = monitorBefore
-        ? await this.journal.countEligible([...MONITOR_CONTROL_EVENT_TYPES], monitorBefore)
+        ? await this.journal.countEligible(
+          [...MONITOR_CONTROL_EVENT_TYPES],
+          monitorBefore,
+          { unattributedOnly: true },
+        )
         : { count: 0, oldestOccurredAt: null };
       const operationalEligible = operationalBefore
         ? await this.journal.countEligible([...LOCAL_ARCHIVE_OPERATIONAL_EVENT_TYPES], operationalBefore)
@@ -317,6 +321,7 @@ export class RetentionManager {
           types: readonly string[],
           eligible: { count: number; oldestOccurredAt: string | null },
           cutoff: Date | null,
+          unattributedOnly = false,
         ): Promise<void> => {
           if (eligible.count <= 0) return;
           const bucket = fullArchiveBucket(eligible.oldestOccurredAt, cutoff, this.config.localArchiveBucketMs);
@@ -333,6 +338,7 @@ export class RetentionManager {
             occurredBefore: bucket.before,
             commitSeqTo,
             recordedAtTo,
+            unattributedOnly,
           });
           if (!archived.verified || !archived.manifest) throw new Error(`LOCAL_ARCHIVE_${cls.toUpperCase()}_VERIFY_FAILED`);
           const manifest = archived.manifest;
@@ -345,6 +351,7 @@ export class RetentionManager {
               occurredBefore: new Date(manifest.occurredBefore),
               commitSeqTo: manifest.commitSeqTo,
               recordedAtTo: new Date(manifest.recordedAtTo),
+              unattributedOnly: manifest.unattributedOnly,
               limit,
             }),
           });
@@ -355,7 +362,7 @@ export class RetentionManager {
         // canonical experiment archive. Prefer draining that source first to
         // avoid duplicating the largest forensic payloads into time buckets.
         if (!canonicalDrainPrepared) {
-          await prepareBucket("monitor_control", MONITOR_CONTROL_EVENT_TYPES, monitorEligible, monitorBefore);
+          await prepareBucket("monitor_control", MONITOR_CONTROL_EVENT_TYPES, monitorEligible, monitorBefore, true);
           await prepareBucket("operational_audit", LOCAL_ARCHIVE_OPERATIONAL_EVENT_TYPES, operationalEligible, operationalBefore);
         }
       }
