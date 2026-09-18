@@ -7,6 +7,7 @@ import {
   engineEnvSchema,
   grokActivationRequestSchema,
   grokSignalSubmissionSchema,
+  NATIVE_DETERMINISTIC_MODEL_VERSION,
   type GrokActivationRequest,
   type TriggerEvent,
   type ReferenceTick,
@@ -433,7 +434,7 @@ describe("EngineService xAI product path", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
       await engine.referenceTickForTest(runtimeReferenceTick(now.getTime()));
       await engine.registerTriggerForResearch(runtimeTriggerAt(now.getTime(), "runtime_product_trigger", { severity: 2 }));
-      expect(engine.experimentManifest()?.modelConfiguration).toMatchObject({ provider: "native_deterministic", version: "native-deterministic-v1", localExecution: true, externalInference: false });
+      expect(engine.experimentManifest()?.modelConfiguration).toMatchObject({ provider: "native_deterministic", version: NATIVE_DETERMINISTIC_MODEL_VERSION, localExecution: true, externalInference: false });
       expect(engine.state.latestConsensus).toMatchObject({ authority: "NATIVE_DETERMINISTIC_V1" });
       expect(engine.hotResearchCacheForTest()).toHaveLength(0);
       expect((await journal.queryEvents({ types: ["PAPER_ORDER_CREATED", "PAPER_FILL"] }))).toHaveLength(0);
