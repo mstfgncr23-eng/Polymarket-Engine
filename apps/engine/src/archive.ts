@@ -65,6 +65,7 @@ export interface JournalBucketArchiveManifest {
   occurredBefore: string;
   commitSeqTo: number;
   recordedAtTo: string;
+  unattributedOnly: boolean;
   eventTypes: string[];
   rawEvents: VerifiedArchiveFile & { eventCount: number };
 }
@@ -280,6 +281,7 @@ export class LocalJournalArchive {
       occurredBefore: Date;
       commitSeqTo: number;
       recordedAtTo: Date;
+      unattributedOnly?: boolean;
     },
   ): Promise<ArchiveVerification<JournalBucketArchiveManifest>> {
     await this.verifyDurableRoot();
@@ -308,6 +310,7 @@ export class LocalJournalArchive {
       include: (event) => (
         event.occurredAt >= start
         && event.occurredAt < end
+        && (!input.unattributedOnly || !((event.payload as { experimentId?: unknown }).experimentId))
       ),
     });
     if (rawEvents.eventCount === 0) {
@@ -323,6 +326,7 @@ export class LocalJournalArchive {
       occurredBefore: end,
       commitSeqTo: input.commitSeqTo,
       recordedAtTo: input.recordedAtTo.toISOString(),
+      unattributedOnly: input.unattributedOnly === true,
       eventTypes: [...input.eventTypes].sort(),
       rawEvents,
     };
@@ -370,6 +374,7 @@ export class LocalJournalArchive {
       occurredBefore: Date;
       commitSeqTo: number;
       recordedAtTo: Date;
+      unattributedOnly?: boolean;
     },
   ): Promise<ArchiveVerification<JournalBucketArchiveManifest>> {
     const directory = dirname(manifestPath);
@@ -383,6 +388,7 @@ export class LocalJournalArchive {
         || manifest.occurredBefore !== input.occurredBefore.toISOString()
         || manifest.commitSeqTo !== input.commitSeqTo
         || manifest.recordedAtTo !== input.recordedAtTo.toISOString()
+        || manifest.unattributedOnly !== (input.unattributedOnly === true)
         || JSON.stringify(manifest.eventTypes) !== JSON.stringify([...input.eventTypes].sort())
       ) return { verified: false, manifest: null, directory };
       const ok = await verifyFile(directory, manifest.rawEvents);
