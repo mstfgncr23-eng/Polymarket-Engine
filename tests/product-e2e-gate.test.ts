@@ -490,6 +490,92 @@ describe("PR20 true product end-to-end gate", () => {
     }
   });
 
+  it("bounds durable protective risk retries under a persistent veto", async () => {
+    const setup = await setupScenario({ env: { EXPERIMENT_DURATION_HOURS: "1", PAPER_EXECUTION_LATENCY_MS: "0" } });
+    try {
+      expect((await setup.engine.beginExperiment()).ok).toBe(true);
+      const upInitial = marketBook(setup.clock, "UP", 1);
+      const downInitial = snapshot({
+        ...marketBook(setup.clock, "DOWN", 1),
+        bids: [{ price: "0.69", quantity: "300" }],
+        asks: [{ price: "0.70", quantity: "300" }],
+      });
+      await setup.market.emitSnapshot(upInitial);
+      await setup.market.emitSnapshot(downInitial);
+
+      await setup.engine.applyObservedFill({
+        id: createId("fill-veto-first"),
+        orderId: createId("order-veto-first"),
+        traceId: createId("trace-veto-first"),
+        marketId: "btc-mkt",
+        tokenId: "btc-up",
+        outcome: "UP",
+        side: "BUY",
+        requestedPrice: "0.40",
+        fillPrice: "0.40",
+        quantity: "10",
+        liquidityRole: "TAKER",
+        latencyMs: 0,
+        slippageUsd: "0",
+        feeUsd: "0",
+        timestamp: iso(setup.clock),
+        sourceMarketEventId: upInitial.eventId,
+        fillConfidence: 1,
+        fillModel: "protective-derisk-test:veto-first-leg",
+        feeSchedule: upInitial.feeSchedule!,
+      });
+
+      setup.clock.nowMs = START_MS + 301_000;
+      for (let sequence = 2; sequence <= 30; sequence += 1) {
+        await setup.market.emitSnapshot(snapshot({
+          ...marketBook(setup.clock, "UP", sequence),
+          bids: [{ price: "0.30", quantity: "20" }],
+          asks: [{ price: "0.31", quantity: "100" }],
+          feeSchedule: null,
+        }));
+        setup.clock.nowMs += 250;
+      }
+
+      await waitFor(
+        () => setup.journal.queryEvents({ types: ["RISK_EVALUATION"] }),
+        (rows) => rows.some((row) => Boolean(row.payload.deRisk)),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      const firstWindow = (await setup.journal.queryEvents({ types: ["RISK_EVALUATION"] }))
+        .filter((row) => Boolean(row.payload.deRisk));
+      expect(firstWindow).toHaveLength(1);
+      expect(firstWindow[0]?.payload).toMatchObject({
+        accepted: false,
+        vetoes: expect.arrayContaining(["UNKNOWN_FEE_SCHEDULE"]),
+        deRisk: { retryCount: 1, finalState: "RISK_VETO" },
+      });
+      expect(setup.engine.ledger.positions.get("btc-mkt")?.unpairedQuantity).toBe("10");
+
+      setup.clock.nowMs = START_MS + 331_001;
+      await setup.market.emitSnapshot(snapshot({
+        ...marketBook(setup.clock, "UP", 31),
+        bids: [{ price: "0.30", quantity: "20" }],
+        asks: [{ price: "0.31", quantity: "100" }],
+        feeSchedule: null,
+      }));
+      await waitFor(
+        () => setup.journal.queryEvents({ types: ["RISK_EVALUATION"] }),
+        (rows) => rows.filter((row) => Boolean(row.payload.deRisk)).length === 2,
+      );
+
+      const secondWindow = (await setup.journal.queryEvents({ types: ["RISK_EVALUATION"] }))
+        .filter((row) => Boolean(row.payload.deRisk));
+      expect(secondWindow).toHaveLength(2);
+      expect(secondWindow[1]?.payload).toMatchObject({
+        accepted: false,
+        deRisk: { retryCount: 2, finalState: "RISK_VETO" },
+      });
+    } finally {
+      await setup.engine.stop();
+    }
+  });
+
   it("Scenario C accepts one valid response but never creates consensus or a trade", async () => {
     const setup = await setupScenario();
     try {
