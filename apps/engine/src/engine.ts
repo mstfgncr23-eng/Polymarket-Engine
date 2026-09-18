@@ -4466,6 +4466,11 @@ export class EngineService {
 
     this.protectiveDeRiskInFlight.add(marketId);
     try {
+      // Once the hard unhedged timeout is breached, no stale entry remainder
+      // may keep increasing directional inventory while an exit is pending or
+      // temporarily unexecutable. Cancelling it is itself risk-reducing.
+      await this.cancelOutstandingFirstLegMakers(marketId, "MAX_UNHEDGED_DURATION");
+
       const position = this.ledger.positions.get(marketId);
       if (!position?.unpairedOutcome || d(position.unpairedQuantity).lte(0)) {
         this.protectiveDeRiskAttempts.delete(marketId);
