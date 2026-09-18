@@ -131,6 +131,11 @@ async function setup() {
   await engine.ingestReferenceTickForTest(referenceTick(clock, "100"));
   clock.nowMs += 1_000;
   await engine.ingestReferenceTickForTest(referenceTick(clock, "100.30"));
+  await waitFor(
+    async () => engine.runtimeSupervisorSnapshot().unresolved,
+    (unresolved) => unresolved === 0,
+    10_000,
+  );
   expect((await engine.beginExperiment()).ok).toBe(true);
 
   return { clock, journal, market, engine };
