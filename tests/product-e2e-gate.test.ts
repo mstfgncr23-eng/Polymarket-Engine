@@ -6,6 +6,7 @@ import {
   triggerEventSchema,
   type Direction,
   type MarketSnapshot,
+  type PaperFill,
   type ReferenceTick,
   type TriggerEvent,
 } from "@pm/core";
@@ -362,6 +363,125 @@ describe("PR20 true product end-to-end gate", () => {
     } finally {
       releaseHold?.();
       journal.setAppendInFlightHoldForTest(null);
+      await setup.engine.stop();
+    }
+  });
+
+  it("forces a bounded protective SELL after max unhedged duration and retries residual depth", async () => {
+    const setup = await setupScenario({ env: { EXPERIMENT_DURATION_HOURS: "1", PAPER_EXECUTION_LATENCY_MS: "0" } });
+    try {
+      expect((await setup.engine.beginExperiment()).ok).toBe(true);
+      const upInitial = marketBook(setup.clock, "UP", 1);
+      const downInitial = marketBook(setup.clock, "DOWN", 1);
+      await setup.market.emitSnapshot(upInitial);
+      await setup.market.emitSnapshot(downInitial);
+
+      const firstLeg: PaperFill = {
+        id: createId("fill-first"),
+        orderId: createId("order-first"),
+        traceId: createId("trace-first"),
+        marketId: "btc-mkt",
+        tokenId: "btc-up",
+        outcome: "UP",
+        side: "BUY",
+        requestedPrice: "0.40",
+        fillPrice: "0.40",
+        quantity: "10",
+        liquidityRole: "TAKER",
+        latencyMs: 0,
+        slippageUsd: "0",
+        feeUsd: "0",
+        timestamp: iso(setup.clock),
+        sourceMarketEventId: upInitial.eventId,
+        fillConfidence: 1,
+        fillModel: "protective-derisk-test:first-leg",
+        feeSchedule: upInitial.feeSchedule!,
+      };
+      await setup.engine.applyObservedFill(firstLeg);
+      const opened = setup.engine.ledger.positions.get("btc-mkt");
+      expect(opened?.unpairedQuantity).toBe("10");
+      expect(opened?.unhedgedStartedAt).toBe(firstLeg.timestamp);
+
+      // The hard timeout is five minutes. A fresh book one second before it
+      // must not cause a protective order.
+      setup.clock.nowMs = START_MS + 299_000;
+      await setup.market.emitSnapshot(snapshot({
+        ...marketBook(setup.clock, "UP", 2),
+        bids: [{ price: "0.30", quantity: "4" }],
+        asks: [{ price: "0.31", quantity: "100" }],
+      }));
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      expect((await setup.journal.queryEvents({ types: ["PAPER_ORDER_CREATED"] })).filter(
+        (row) => row.payload.intent === "PROTECTIVE_DE_RISK",
+      )).toHaveLength(0);
+
+      // After the timeout, only four shares are executable. The first de-risk
+      // attempt must sell exactly those four and preserve the original episode
+      // start for the six-share residual.
+      setup.clock.nowMs = START_MS + 301_000;
+      await setup.market.emitSnapshot(snapshot({
+        ...marketBook(setup.clock, "UP", 3),
+        bids: [{ price: "0.30", quantity: "4" }],
+        asks: [{ price: "0.31", quantity: "100" }],
+      }));
+      await waitFor(
+        () => setup.journal.queryEvents({ types: ["PAPER_FILL"] }),
+        (rows) => rows.some((row) => row.payload.intent === "PROTECTIVE_DE_RISK"),
+      );
+
+      const residual = setup.engine.ledger.positions.get("btc-mkt");
+      expect(residual?.unpairedOutcome).toBe("UP");
+      expect(residual?.unpairedQuantity).toBe("6");
+      expect(residual?.unhedgedStartedAt).toBe(firstLeg.timestamp);
+
+      const firstProtectiveFill = (await setup.journal.queryEvents({ types: ["PAPER_FILL"] }))
+        .find((row) => row.payload.intent === "PROTECTIVE_DE_RISK");
+      expect(firstProtectiveFill?.payload).toMatchObject({
+        side: "SELL",
+        quantity: "4",
+        intent: "PROTECTIVE_DE_RISK",
+        deRisk: {
+          deRiskReason: "MAX_UNHEDGED_DURATION",
+          attemptedAction: "SELL_UNPAIRED",
+          requestedQty: "10",
+          executableQty: "4",
+          residualQuantity: "6",
+          finalState: "RESIDUAL_UNHEDGED",
+        },
+      });
+
+      // New bid depth closes the residual on the next fresh book. A complete
+      // directional unwind removes the zero-inventory position so the market
+      // cannot remain stuck behind an empty Position object.
+      setup.clock.nowMs = START_MS + 302_000;
+      await setup.market.emitSnapshot(snapshot({
+        ...marketBook(setup.clock, "UP", 4),
+        bids: [{ price: "0.29", quantity: "6" }],
+        asks: [{ price: "0.30", quantity: "100" }],
+      }));
+      await waitFor(
+        () => setup.journal.queryEvents({ types: ["PAPER_FILL"] }),
+        (rows) => rows.filter((row) => row.payload.intent === "PROTECTIVE_DE_RISK").length === 2,
+      );
+      expect(setup.engine.ledger.positions.has("btc-mkt")).toBe(false);
+
+      const protectiveRisk = (await setup.journal.queryEvents({ types: ["RISK_EVALUATION"] }))
+        .filter((row) => Boolean(row.payload.deRisk));
+      expect(protectiveRisk).toHaveLength(2);
+      expect(protectiveRisk.every((row) => row.payload.accepted === true)).toBe(true);
+      const protectiveFills = (await setup.journal.queryEvents({ types: ["PAPER_FILL"] }))
+        .filter((row) => row.payload.intent === "PROTECTIVE_DE_RISK");
+      expect(protectiveFills[1]?.payload).toMatchObject({
+        side: "SELL",
+        quantity: "6",
+        deRisk: {
+          retryCount: 2,
+          residualQuantity: "0",
+          residualExposure: "0",
+          finalState: "RISK_NEUTRALIZED",
+        },
+      });
+    } finally {
       await setup.engine.stop();
     }
   });
