@@ -474,7 +474,7 @@ describe("B/D/R/T settlement, close policy, recovery, accelerated lifecycle", ()
     }
   });
 
-  it("restores open position, resting maker, ENTRY_CLOSED experiment, and activation latency", async () => {
+  it("restores open position and ENTRY_CLOSED experiment after timed-out entry maker cancellation", async () => {
     const journal = new MemoryEventJournal();
     let nowMs = Date.parse("2026-09-01T00:00:00.000Z");
     const market = new ScriptedMarketAdapter();
@@ -501,7 +501,8 @@ describe("B/D/R/T settlement, close policy, recovery, accelerated lifecycle", ()
     nowMs += 48 * 3_600_000 + 1;
     await first.tickMaintenance();
     expect(first.experimentManifest()?.status).toBe("ENTRY_CLOSED");
-    const reserved = first.reservedCash();
+    expect(first.restingOrderCount()).toBe(0);
+    expect(first.reservedCash()).toBe("0");
     const experimentId = first.experimentManifest()?.id;
     await first.stop();
 
@@ -514,8 +515,8 @@ describe("B/D/R/T settlement, close policy, recovery, accelerated lifecycle", ()
       expect(second.experimentManifest()?.id).toBe(experimentId);
       expect(second.experimentManifest()?.status).toBe("ENTRY_CLOSED");
       expect(second.ledger.positions.get("btc-15m")?.upQuantity).toBe("10");
-      expect(second.restingOrderCount()).toBeGreaterThan(0);
-      expect(second.reservedCash()).toBe(reserved);
+      expect(second.restingOrderCount()).toBe(0);
+      expect(second.reservedCash()).toBe("0");
       expect(second.state.activationLatency.length).toBeGreaterThan(0);
     } finally {
       await second.stop();
