@@ -2,6 +2,39 @@
 
 Operator reference for Step-4. This document does **not** start the 48h experiment, enable live trading, resize Fly machines, change secrets, or mutate production Supabase.
 
+## Storage contract: hot DB vs local forensic archive
+
+PostgreSQL is **hot product storage**, not the long-term human forensic store.
+
+- Recovery authority stays in verified checkpoints + `durable_transitions` / bounded replay identities.
+- Canonical final reports and verified compact rollups stay in PostgreSQL because product/report APIs use them.
+- Raw historical decision, risk, trigger, monitoring and audit detail is exported to durable local storage before it may leave `journal_events`.
+- The engine never reads local archive files as trading or recovery authority.
+- A journal delete is fail-closed unless the exact archived source range is checksum-verified first.
+
+Automatic journal cleanup therefore requires all of:
+
+1. `RETENTION_ENABLED=true`
+2. `LOCAL_ARCHIVE_ENABLED=true`
+3. a durable host mount at `LOCAL_ARCHIVE_DIR` (default `/data/archive`)
+4. sentinel file `.polymarket-local-archive-v1` containing exactly `POLYMARKET_LOCAL_ARCHIVE_V1`
+
+The sentinel intentionally is **not** created in the image. If the durable mount is missing, archive verification fails and journal rows are retained.
+
+Completed experiment canonical detail follows:
+
+```text
+canonical final report + stable verified rollup
+→ completed grace elapsed
+→ raw canonical JSONL local export
+→ SHA-256 / byte-count verification
+→ bounded DB purge behind the same commit_seq + recorded_at + source fence
+```
+
+Active `RUNNING` / `ENTRY_CLOSED` canonical detail remains hot. Rolling analytics rollups may be generated, but they no longer authorize deletion of an active experiment source window.
+
+Monitor/telemetry/operational rows use immutable time buckets. A bucket manifest records its event types, time range, commit-sequence fence, recorded-at fence, byte count and SHA-256. A late row with an old `occurred_at` but a newer commit sequence is outside the old purge fence and is archived by a later bucket rather than silently lost.
+
 ## Rollout (opt-in)
 
 `RETENTION_ENABLED` defaults **false**. Missing env does not start automatic journal deletion.
@@ -9,8 +42,9 @@ Operator reference for Step-4. This document does **not** start the 48h experime
 1. Deploy schema + code (engine boot migrate). Do **not** enable retention yet.
 2. Run `journal-cleanup` dry-run (zero mutation; see access modes).
 3. Inspect eligible candidates / protection / grace.
-4. Set `RETENTION_ENABLED=true` only after operator review.
-5. Optional one-time APPLY for pre-experiment monitor/telemetry after explicit confirmation.
+4. Provision the durable local archive mount + sentinel and set `LOCAL_ARCHIVE_ENABLED=true`.
+5. Set `RETENTION_ENABLED=true` only after operator review.
+6. Optional one-time APPLY remains an explicit destructive/break-glass operator path; normal automatic retention uses archive-before-purge.
 
 This PR does not change production Fly secrets.
 
@@ -122,9 +156,9 @@ Do not reintroduce a transactional `CREATE INDEX` on live `journal_events` insid
 | Recovery-authoritative | verified checkpoints + `durable_transitions` tail | **BOUNDED** | Compact rows only at a fenced verified snapshot cursor; retain indexed minimal replay identities (open obligations pinned, closed identities bounded by TTL/pressure) |
 | Checkpoints | `engine_checkpoints` | keep latest 8 | Only after a newer checkpoint is committed; never the latest usable row |
 | MCP idempotency | `mcp_idempotency_keys` | 24h TTL | Only after TTL > signal timestamp skew (5m) + trigger TTL (30s) + 1h margin |
-| Raw telemetry | `MARKET_SNAPSHOT`, `REFERENCE_TICK`, `MARKET_EVENT` | 6h (legacy rows only; the engine does not insert raw observations) | Yes. Paper fills/settlements are self-contained and are not in this class |
-| Monitor / control-plane | `TRIGGER_*`, `GROK_*`, `MCP_INTERACTION`, `SYSTEM_HEALTH_*`, `DISCOVERY_RECONCILED`, reference lifecycle | 24h | Canonical research is admitted only during an experiment window; see monitor lifecycle below |
-| Long-lived audit | Experiment lifecycle, `PAPER_*`, `POSITION_*`, `PAIR_REALIZED`, `PNL_SNAPSHOT`, risk/consensus/hedge/settlement, strategy change | rollup/report or bounded tail | RUNNING and ENTRY_CLOSED canonical detail rolls periodically into a verified monotonic accumulator. Delete only rows covered by the same stable snapshot's keyset and recorded-at/commit fence; uncertainty retains. Terminal fill/settlement replay identities are closed and bounded by TTL/pressure; only live obligations remain pinned. |
+| Raw telemetry | `MARKET_SNAPSHOT`, `REFERENCE_TICK`, `MARKET_EVENT` | 6h (legacy rows only; the engine does not insert raw observations) | Only after checksum-verified local bucket archive |
+| Monitor / control-plane | `TRIGGER_*`, `GROK_*`, `MCP_INTERACTION`, `SYSTEM_HEALTH_*`, `DISCOVERY_RECONCILED`, reference lifecycle | 24h | Only after lifecycle-safe cutoff + checksum-verified local archive; experiment-scoped canonical rows prefer the experiment archive |
+| Long-lived audit | Experiment lifecycle, `PAPER_*`, `POSITION_*`, `PAIR_REALIZED`, `PNL_SNAPSHOT`, risk/consensus/hedge/settlement, strategy change | final report + verified rollup + local archive | RUNNING and ENTRY_CLOSED raw canonical detail stays hot. Completed detail may purge only after grace and checksum-verified experiment archive behind the exact report/rollup fence. Recovery authority remains in durable state, not these journal mirrors. |
 
 ### Monitor lifecycle
 
@@ -199,8 +233,8 @@ APPLY is **globally** bounded for the whole invocation: telemetry and monitor sh
 
 ## When transient cleanup is eligible
 
-1. Telemetry: older than telemetry TTL (independent of experiment), unless the manager is disabled.
-2. Monitor-only / no experiment: older than monitor TTL.
-3. Active experiment: only pre-start monitor older than `min(ttl, startedAt)`.
-4. Completed experiment transient report-input: canonical final exists, `complete=true`, `truncated=false`, and `persisted_at` older than the completed-report grace (default 7 days).
+1. Telemetry: older than telemetry TTL **and successfully archived locally**.
+2. Monitor-only / no experiment: older than monitor TTL **and successfully archived locally**.
+3. Active experiment: only pre-start monitor older than `min(ttl, startedAt)`; active canonical source detail is not deleted.
+4. Completed experiment canonical detail: canonical final exists, `complete=true`, `truncated=false`, stable verified rollup exists, completed grace elapsed, and the exact raw source has a verified local archive.
 5. Never delete recovery state without verified snapshot authority. Durable transitions may be compacted only behind that cursor; bounded replay keys remain for their configured horizon.

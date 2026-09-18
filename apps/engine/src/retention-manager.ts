@@ -1,5 +1,6 @@
 import {
   AUDIT_CRITICAL_EVENT_TYPES,
+  LOCAL_ARCHIVE_OPERATIONAL_EVENT_TYPES,
   MONITOR_CONTROL_EVENT_TYPES,
   RETENTION_DEFAULTS,
   TELEMETRY_EVENT_TYPES,
@@ -9,7 +10,8 @@ import {
   type EngineEnv,
 } from "@pm/core";
 import { isCanonicalFinalReport, type EventJournal } from "@pm/db";
-import { loadVerifiedAnalyticsRollup, persistVerifiedAnalyticsRollup, streamExperimentSummary } from "./final-report.js";
+import { LocalJournalArchive } from "./archive.js";
+import { persistVerifiedAnalyticsRollup, streamExperimentSummary } from "./final-report.js";
 
 export interface RetentionConfig {
   enabled: boolean;
@@ -24,6 +26,9 @@ export interface RetentionConfig {
   maxRowsPerCycle: number;
   compactionEnabled: boolean;
   analyticsRollupEnabled: boolean;
+  localArchiveEnabled: boolean;
+  localArchiveDir: string;
+  localArchiveBucketMs: number;
   compactionReplayKeyTtlMs: number;
   compactionReplayKeyLimit: number;
 }
@@ -67,6 +72,9 @@ type RetentionEnv = Pick<EngineEnv,
   | "RETENTION_MAX_ROWS_PER_CYCLE"
   | "RETENTION_COMPACTION_ENABLED"
   | "RETENTION_ANALYTICS_ROLLUP_ENABLED"
+  | "LOCAL_ARCHIVE_ENABLED"
+  | "LOCAL_ARCHIVE_DIR"
+  | "LOCAL_ARCHIVE_BUCKET_MS"
 >;
 
 export function retentionConfigFromEngineEnv(env: RetentionEnv): RetentionConfig {
@@ -83,6 +91,9 @@ export function retentionConfigFromEngineEnv(env: RetentionEnv): RetentionConfig
     maxRowsPerCycle: env.RETENTION_MAX_ROWS_PER_CYCLE,
     compactionEnabled: env.RETENTION_COMPACTION_ENABLED,
     analyticsRollupEnabled: env.RETENTION_ANALYTICS_ROLLUP_ENABLED,
+    localArchiveEnabled: env.LOCAL_ARCHIVE_ENABLED,
+    localArchiveDir: env.LOCAL_ARCHIVE_DIR,
+    localArchiveBucketMs: env.LOCAL_ARCHIVE_BUCKET_MS,
   });
 }
 
@@ -104,6 +115,9 @@ export function defaultRetentionConfig(overrides: Partial<RetentionConfig> = {})
     maxRowsPerCycle: overrides.maxRowsPerCycle ?? RETENTION_DEFAULTS.maxRowsPerCycle,
     compactionEnabled: overrides.compactionEnabled ?? false,
     analyticsRollupEnabled: overrides.analyticsRollupEnabled ?? false,
+    localArchiveEnabled: overrides.localArchiveEnabled ?? RETENTION_DEFAULTS.localArchiveEnabled,
+    localArchiveDir: overrides.localArchiveDir ?? RETENTION_DEFAULTS.localArchiveDir,
+    localArchiveBucketMs: overrides.localArchiveBucketMs ?? RETENTION_DEFAULTS.localArchiveBucketMs,
     compactionReplayKeyTtlMs: overrides.compactionReplayKeyTtlMs ?? 7 * 24 * 60 * 60_000,
     compactionReplayKeyLimit: overrides.compactionReplayKeyLimit ?? 4_096,
   };
@@ -153,9 +167,24 @@ export function monitorCutoff(input: {
   return null;
 }
 
+function fullArchiveBucket(
+  oldestOccurredAt: string | null,
+  cutoff: Date | null,
+  bucketMs: number,
+): { from: Date; before: Date } | null {
+  if (!oldestOccurredAt || !cutoff) return null;
+  const oldest = Date.parse(oldestOccurredAt);
+  if (!Number.isFinite(oldest)) return null;
+  const fromMs = Math.floor(oldest / bucketMs) * bucketMs;
+  const beforeMs = fromMs + bucketMs;
+  if (beforeMs > cutoff.getTime()) return null;
+  return { from: new Date(fromMs), before: new Date(beforeMs) };
+}
+
 export class RetentionManager {
   private running = false;
   private readonly lastSuccessAt = { value: null as string | null };
+  private readonly archive: LocalJournalArchive | null;
   runs = 0;
   failures = 0;
 
@@ -169,8 +198,14 @@ export class RetentionManager {
       noteLastSuccess?(iso: string): void;
       noteBatch?(size: number, durationMs: number): void;
     },
+    archiveOverride?: LocalJournalArchive | null,
   ) {
     assertMcpIdempotencyTtlSafe(config.mcpIdempotencyTtlMs);
+    this.archive = archiveOverride !== undefined
+      ? archiveOverride
+      : config.localArchiveEnabled
+        ? new LocalJournalArchive(config.localArchiveDir)
+        : null;
   }
 
   get inFlight(): boolean { return this.running; }
@@ -178,7 +213,13 @@ export class RetentionManager {
   async runCycle(context: RetentionContext): Promise<RetentionCycleResult> {
     const started = Date.now();
     const deletedByClass: Record<string, number> = {
-      raw_telemetry: 0, monitor_control: 0, mcp_idempotency: 0, checkpoint: 0, canonical_report_input: 0, durable_transition: 0,
+      raw_telemetry: 0,
+      monitor_control: 0,
+      operational_audit: 0,
+      mcp_idempotency: 0,
+      checkpoint: 0,
+      canonical_report_input: 0,
+      durable_transition: 0,
     };
     const empty: RetentionCycleResult = {
       skipped: true, skipReason: null, deletedByClass, failures: 0, durationMs: 0,
@@ -190,6 +231,7 @@ export class RetentionManager {
     if (context.failClosed) return { ...empty, skipReason: "fail_closed" };
     if (context.degraded) return { ...empty, skipReason: "degraded" };
     if (this.running) return { ...empty, skipReason: "single_flight" };
+
     this.running = true;
     this.runs += 1;
     this.metrics?.noteRun?.(false);
@@ -198,12 +240,137 @@ export class RetentionManager {
     let lastBatchSize = 0;
     let lastBatchDurationMs = 0;
     let totalDeleted = 0;
+    let canonicalBacklog = 0;
+
     try {
       const transientEligible = await completedReportUnlocksTransient(
         this.journal, context.experiment, context.now, this.config.completedGraceMs,
       );
       const monitorOnlyEligible = experimentIsMonitorOnly(context.experiment);
-      const budgetEnd = started + this.config.cycleBudgetMs;
+      const telemetryBefore = new Date(context.now.getTime() - this.config.telemetryTtlMs);
+      const monitorBefore = monitorCutoff({
+        now: context.now,
+        monitorTtlMs: this.config.monitorTtlMs,
+        experiment: context.experiment,
+        monitorOnlyEligible,
+        transientEligible,
+      });
+      // Operational journal mirrors are human/forensic data, but the same
+      // lifecycle fence as monitor rows applies: never archive/purge an active
+      // experiment window merely because its wall-clock age exceeds the TTL.
+      const operationalBefore = monitorBefore;
+
+      const telemetryEligible = await this.journal.countEligible([...TELEMETRY_EVENT_TYPES], telemetryBefore);
+      const monitorEligible = monitorBefore
+        ? await this.journal.countEligible(
+          [...MONITOR_CONTROL_EVENT_TYPES],
+          monitorBefore,
+          { unattributedOnly: true },
+        )
+        : { count: 0, oldestOccurredAt: null };
+      const operationalEligible = operationalBefore
+        ? await this.journal.countEligible([...LOCAL_ARCHIVE_OPERATIONAL_EVENT_TYPES], operationalBefore)
+        : { count: 0, oldestOccurredAt: null };
+
+      type Drain = {
+        cls: string;
+        exhausted: boolean;
+        work: (limit: number) => Promise<{ deleted: number }>;
+      };
+      const journalDrains: Drain[] = [];
+
+      // Canonical experiment detail is allowed to leave hot Postgres only after:
+      // canonical final report + stable verified rollup + grace + checksum-verified
+      // local raw archive. Historical experiments are considered, not only the
+      // engine's currently attached manifest.
+      if (this.archive) {
+        let canonicalDrainPrepared = false;
+        const candidates = await this.journal.listArchiveCandidates(32);
+        for (const candidate of candidates) {
+          if (context.now.getTime() - Date.parse(candidate.report.persistedAt) < this.config.completedGraceMs) continue;
+          if (!candidate.rollup.sourceFenceOccurredAt || !candidate.rollup.sourceCommitSeq || !candidate.rollup.sourceRecordedAt) continue;
+          const backlog = await this.journal.countCanonicalEventsThrough({
+            experimentId: candidate.report.experimentId,
+            occurredBefore: new Date(candidate.rollup.sourceFenceOccurredAt),
+            sourceCommitSeq: candidate.rollup.sourceCommitSeq,
+            sourceRecordedAt: new Date(candidate.rollup.sourceRecordedAt),
+          });
+          if (backlog.count <= 0) continue;
+          canonicalBacklog = backlog.count;
+          const archived = await this.archive.ensureExperimentCanonical(this.journal, candidate);
+          if (!archived.verified || !archived.manifest) throw new Error("LOCAL_ARCHIVE_CANONICAL_VERIFY_FAILED");
+          const manifest = archived.manifest;
+          journalDrains.push({
+            cls: "canonical_report_input",
+            exhausted: false,
+            work: (limit) => this.journal.deleteCanonicalEventsThrough!({
+              experimentId: candidate.report.experimentId,
+              occurredBefore: new Date(manifest.sourceFenceOccurredAt),
+              sourceCursor: candidate.rollup.sourceCursor,
+              sourceCommitSeq: manifest.sourceCommitSeq,
+              sourceRecordedAt: new Date(manifest.sourceRecordedAt),
+              limit,
+            }),
+          });
+          canonicalDrainPrepared = true;
+          break;
+        }
+
+        const prepareBucket = async (
+          cls: string,
+          types: readonly string[],
+          eligible: { count: number; oldestOccurredAt: string | null },
+          cutoff: Date | null,
+          unattributedOnly = false,
+        ): Promise<void> => {
+          if (eligible.count <= 0) return;
+          const bucket = fullArchiveBucket(eligible.oldestOccurredAt, cutoff, this.config.localArchiveBucketMs);
+          if (!bucket) return;
+          const commitSeqTo = await this.journal.latestCommitSeq();
+          // commitSeq is the authority fence. recorded_at is an additional bound
+          // and must use wall clock so deterministic/test nowFn values cannot
+          // exclude rows that are already committed.
+          const recordedAtTo = new Date(Math.max(Date.now(), context.now.getTime()));
+          const archived = await this.archive!.ensureJournalBucket(this.journal, {
+            retentionClass: cls,
+            eventTypes: types,
+            occurredFrom: bucket.from,
+            occurredBefore: bucket.before,
+            commitSeqTo,
+            recordedAtTo,
+            unattributedOnly,
+          });
+          if (!archived.verified || !archived.manifest) throw new Error(`LOCAL_ARCHIVE_${cls.toUpperCase()}_VERIFY_FAILED`);
+          const manifest = archived.manifest;
+          journalDrains.push({
+            cls,
+            exhausted: false,
+            work: (limit) => this.journal.deleteJournalEventsArchivedRange({
+              types,
+              occurredFrom: new Date(manifest.occurredFrom),
+              occurredBefore: new Date(manifest.occurredBefore),
+              commitSeqTo: manifest.commitSeqTo,
+              recordedAtTo: new Date(manifest.recordedAtTo),
+              unattributedOnly: manifest.unattributedOnly,
+              limit,
+            }),
+          });
+        };
+
+        await prepareBucket("raw_telemetry", TELEMETRY_EVENT_TYPES, telemetryEligible, telemetryBefore);
+        // Experiment-scoped trigger/Grok/control rows are already present in the
+        // canonical experiment archive. Prefer draining that source first to
+        // avoid duplicating the largest forensic payloads into time buckets.
+        if (!canonicalDrainPrepared) {
+          await prepareBucket("monitor_control", MONITOR_CONTROL_EVENT_TYPES, monitorEligible, monitorBefore, true);
+          await prepareBucket("operational_audit", LOCAL_ARCHIVE_OPERATIONAL_EVENT_TYPES, operationalEligible, operationalBefore);
+        }
+      }
+
+      // Archive work is read/IO work. Start the destructive DML budget only
+      // after archive verification so a large export cannot consume the purge
+      // budget and leave a half-completed contract.
+      const budgetEnd = Date.now() + this.config.cycleBudgetMs;
       const remainingRows = (): number => this.config.maxRowsPerCycle - totalDeleted;
       const runBatch = async (cls: string, work: (limit: number) => Promise<{ deleted: number }>): Promise<number> => {
         const remaining = remainingRows();
@@ -215,8 +382,6 @@ export class RetentionManager {
         const result = await work(limit);
         lastBatchSize = result.deleted;
         lastBatchDurationMs = Date.now() - t0;
-        // Zero-delete probes exhaust that class; they must not consume the
-        // useful batch/row budget or an empty class starves a real backlog.
         if (result.deleted > 0) {
           batchCount += 1;
           totalDeleted += result.deleted;
@@ -227,91 +392,50 @@ export class RetentionManager {
         return result.deleted;
       };
 
-      const drainCanonical = async (input: { experimentId: string; occurredBefore: Date; sourceCursor: number; sourceCommitSeq?: number; sourceRecordedAt?: Date }): Promise<number> => {
-        let deletedTotal = 0;
-        for (;;) {
-          if (Date.now() >= budgetEnd || batchCount >= this.config.maxBatchesPerCycle || totalDeleted >= this.config.maxRowsPerCycle) break;
-          const requested = Math.min(this.config.batchSize, Math.max(0, remainingRows()));
-          if (requested <= 0) break;
-          const deleted = await runBatch("canonical_report_input", (limit) => this.journal.deleteCanonicalEventsThrough!({ ...input, limit }));
-          deletedTotal += deleted;
-          if (deleted < requested) break;
-        }
-        return deletedTotal;
-      };
-
-      const telemetryBefore = new Date(context.now.getTime() - this.config.telemetryTtlMs);
-      const monitorBefore = monitorCutoff({
-        now: context.now,
-        monitorTtlMs: this.config.monitorTtlMs,
-        experiment: context.experiment,
-        monitorOnlyEligible,
-        transientEligible,
-      });
-      const telemetryEligible = await this.journal.countEligible([...TELEMETRY_EVENT_TYPES], telemetryBefore);
-      const monitorEligibleCount = monitorBefore
-        ? await this.journal.countEligible([...MONITOR_CONTROL_EVENT_TYPES], monitorBefore)
-        : { count: 0, oldestOccurredAt: null };
-
-      const drains: Array<{ cls: string; exhausted: boolean; work: (limit: number) => Promise<{ deleted: number }> }> = [
+      const drains: Drain[] = [
+        ...journalDrains,
         {
-          cls: "raw_telemetry",
+          cls: "mcp_idempotency",
           exhausted: false,
-          work: (limit) => this.journal.deleteJournalEventsBounded({
-            types: TELEMETRY_EVENT_TYPES,
-            occurredBefore: telemetryBefore,
+          work: (limit) => this.journal.pruneIdempotencyKeys(
+            new Date(context.now.getTime() - this.config.mcpIdempotencyTtlMs),
             limit,
-          }),
+          ),
+        },
+        {
+          cls: "checkpoint",
+          exhausted: false,
+          work: (limit) => this.journal.pruneOldCheckpoints(this.config.checkpointKeep, limit),
         },
       ];
-      if (monitorBefore) {
-        drains.push({
-          cls: "monitor_control",
-          exhausted: false,
-          work: (limit) => this.journal.deleteJournalEventsBounded({
-            types: MONITOR_CONTROL_EVENT_TYPES,
-            occurredBefore: monitorBefore,
-            limit,
-          }),
-        });
-      }
-      drains.push({
-        cls: "mcp_idempotency",
-        exhausted: false,
-        work: (limit) => this.journal.pruneIdempotencyKeys(
-          new Date(context.now.getTime() - this.config.mcpIdempotencyTtlMs),
-          limit,
-        ),
-      });
-      drains.push({
-        cls: "checkpoint",
-        exhausted: false,
-        work: (limit) => this.journal.pruneOldCheckpoints(this.config.checkpointKeep, limit),
-      });
 
       let progressed = true;
-      while (progressed && Date.now() < budgetEnd && batchCount < this.config.maxBatchesPerCycle && totalDeleted < this.config.maxRowsPerCycle) {
+      while (
+        progressed
+        && Date.now() < budgetEnd
+        && batchCount < this.config.maxBatchesPerCycle
+        && totalDeleted < this.config.maxRowsPerCycle
+      ) {
         progressed = false;
         for (const drain of drains) {
           if (drain.exhausted) continue;
           if (Date.now() >= budgetEnd || batchCount >= this.config.maxBatchesPerCycle || totalDeleted >= this.config.maxRowsPerCycle) break;
-          const remaining = this.config.maxRowsPerCycle - totalDeleted;
-          const requested = Math.min(this.config.batchSize, Math.max(0, remaining));
+          const requested = Math.min(this.config.batchSize, Math.max(0, remainingRows()));
+          if (requested <= 0) break;
           const deleted = await runBatch(drain.cls, drain.work);
-          if (requested <= 0 || deleted < requested) drain.exhausted = true;
+          if (deleted < requested) drain.exhausted = true;
           if (deleted > 0) progressed = true;
         }
         if (drains.every((item) => item.exhausted)) break;
       }
 
-      // A completed experiment's canonical detail is eligible only after a
-      // verified accumulator rollup covers a source fence. Leave the fence
-      // event and all newer tail rows hot for report reconstruction.
+      // Rolling analytics can still be built for active experiments, but raw
+      // canonical detail is not deleted from an active window. Only a sealed
+      // final archive is authoritative for hot-DB purge.
       if (
         this.config.analyticsRollupEnabled
         && (context.experiment?.status === "RUNNING" || context.experiment?.status === "ENTRY_CLOSED")
         && this.journal.persistAnalyticsRollup
-        && this.journal.deleteCanonicalEventsThrough
         && context.experiment.startedAt
         && Date.now() < budgetEnd
       ) {
@@ -319,12 +443,22 @@ export class RetentionManager {
         const scanTimer = setTimeout(() => scanAbort.abort(), Math.max(0, budgetEnd - Date.now()));
         let streamed: Awaited<ReturnType<typeof streamExperimentSummary>>;
         try {
-          streamed = await streamExperimentSummary(this.journal, { id: context.experiment.id, startedAt: context.experiment.startedAt }, { status: context.experiment.status === "RUNNING" ? "RUNNING" : "ENTRY_CLOSED", reportKind: "interim", metricsScope: "rolling", complete: false }, { signal: scanAbort.signal });
+          streamed = await streamExperimentSummary(
+            this.journal,
+            { id: context.experiment.id, startedAt: context.experiment.startedAt },
+            {
+              status: context.experiment.status === "RUNNING" ? "RUNNING" : "ENTRY_CLOSED",
+              reportKind: "interim",
+              metricsScope: "rolling",
+              complete: false,
+            },
+            { signal: scanAbort.signal },
+          );
         } finally {
           clearTimeout(scanTimer);
         }
         if (streamed.scan.fence.stable && streamed.scan.complete && !streamed.scan.truncated && !streamed.scan.interrupted && streamed.accumulatorSnapshot) {
-          const rollup = await persistVerifiedAnalyticsRollup(this.journal, {
+          await persistVerifiedAnalyticsRollup(this.journal, {
             experimentId: context.experiment.id,
             sourceCursor: await this.journal.latestDurableSequence(),
             sourceFenceId: streamed.scan.fence.through?.id ?? null,
@@ -337,39 +471,9 @@ export class RetentionManager {
             baseContentHash: streamed.baseRollupContentHash,
             accumulator: streamed.accumulatorSnapshot as unknown as Record<string, unknown>,
           });
-          if (rollup?.verified && rollup.sourceFenceOccurredAt) {
-            await drainCanonical({
-              experimentId: context.experiment!.id,
-              occurredBefore: new Date(rollup.sourceFenceOccurredAt!),
-              sourceCursor: rollup.sourceCursor,
-              sourceCommitSeq: rollup.sourceCommitSeq,
-              sourceRecordedAt: rollup.sourceRecordedAt ? new Date(rollup.sourceRecordedAt) : undefined,
-            });
-          }
         }
       }
 
-      if (
-        this.config.analyticsRollupEnabled
-        && context.experiment?.status === "COMPLETED"
-        && this.journal.loadAnalyticsRollup
-        && this.journal.deleteCanonicalEventsThrough
-      ) {
-        const rollup = await loadVerifiedAnalyticsRollup(this.journal, context.experiment.id, "canonical");
-        if (rollup?.verified && rollup.sourceFenceOccurredAt && rollup.sourceCursor >= 0) {
-          await drainCanonical({
-            experimentId: context.experiment!.id,
-            occurredBefore: new Date(rollup.sourceFenceOccurredAt!),
-            sourceCursor: rollup.sourceCursor,
-            sourceCommitSeq: rollup.sourceCommitSeq,
-            sourceRecordedAt: rollup.sourceRecordedAt ? new Date(rollup.sourceRecordedAt) : undefined,
-          });
-        }
-      }
-
-      // Durable transitions may be compacted only behind a verified recovery
-      // snapshot. Keep the newest two verified snapshots so recovery always
-      // has a rollback point while allowing the durable hot tail to drain.
       let durableCompaction: RetentionCycleResult["durableCompaction"];
       if (
         this.config.compactionEnabled
@@ -405,21 +509,37 @@ export class RetentionManager {
       this.lastSuccessAt.value = context.now.toISOString();
       this.metrics?.noteLastSuccess?.(this.lastSuccessAt.value);
       return {
-        skipped: false, skipReason: null, deletedByClass, failures, durationMs: Date.now() - started,
-        batchCount, lastBatchSize, lastBatchDurationMs, transientEligible, monitorOnlyEligible,
+        skipped: false,
+        skipReason: null,
+        deletedByClass,
+        failures,
+        durationMs: Date.now() - started,
+        batchCount,
+        lastBatchSize,
+        lastBatchDurationMs,
+        transientEligible,
+        monitorOnlyEligible,
         durableTransitionsPruned: Boolean(durableCompaction?.deleted),
         durableCompaction,
-        eligibleBacklog: telemetryEligible.count + monitorEligibleCount.count,
+        eligibleBacklog: telemetryEligible.count + monitorEligible.count + operationalEligible.count + canonicalBacklog,
       };
     } catch (error) {
       failures += 1;
       this.failures += 1;
       this.metrics?.noteFailure?.();
       return {
-        skipped: false, skipReason: error instanceof Error ? error.message : String(error),
-        deletedByClass, failures, durationMs: Date.now() - started,
-        batchCount, lastBatchSize, lastBatchDurationMs, transientEligible: false,
-        monitorOnlyEligible: false, durableTransitionsPruned: false, eligibleBacklog: 0,
+        skipped: false,
+        skipReason: error instanceof Error ? error.message : String(error),
+        deletedByClass,
+        failures,
+        durationMs: Date.now() - started,
+        batchCount,
+        lastBatchSize,
+        lastBatchDurationMs,
+        transientEligible: false,
+        monitorOnlyEligible: false,
+        durableTransitionsPruned: false,
+        eligibleBacklog: 0,
       };
     } finally {
       this.running = false;
