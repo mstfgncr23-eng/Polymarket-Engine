@@ -11,7 +11,7 @@ import {
 } from "@pm/core";
 import { isCanonicalFinalReport, type EventJournal } from "@pm/db";
 import { LocalJournalArchive } from "./archive.js";
-import { loadVerifiedAnalyticsRollup, persistVerifiedAnalyticsRollup, streamExperimentSummary } from "./final-report.js";
+import { persistVerifiedAnalyticsRollup, streamExperimentSummary } from "./final-report.js";
 
 export interface RetentionConfig {
   enabled: boolean;
