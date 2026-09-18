@@ -508,7 +508,7 @@ describe("PR18 hot operational storage lifecycle", () => {
 
   it("fails closed when archive is enabled without the durable sentinel", async () => {
     const journal = new MemoryEventJournal();
-    await journal.append(event("TRIGGER_EVENT", "missing-sentinel", "2026-01-01T00:00:00.000Z"));
+    await journal.append(event("TRIGGER_EVENT", "missing-sentinel", "2026-01-01T00:00:00.000Z", { experimentId: null }));
     const directory = await mkdtemp(join(tmpdir(), "pr18-no-sentinel-"));
     const manager = new RetentionManager(journal, defaultRetentionConfig({
       enabled: true,
