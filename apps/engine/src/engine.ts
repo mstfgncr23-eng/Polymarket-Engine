@@ -3543,6 +3543,7 @@ export class EngineService {
       this.recentTrades.set(duplicateKey, Date.now());
       try {
         if (order.orderType === "MAKER") {
+          if (intent === "PROTECTIVE_DE_RISK") throw new Error("PROTECTIVE_DE_RISK_REQUIRES_TAKER");
           await this.reserveMaker(order, decisionSnapshot, intent);
           return;
         }
@@ -5993,7 +5994,7 @@ function assetNeedsReliableReference(
 export function collectMarketFeedAt(
   pair: Partial<Record<Outcome, MarketSnapshot>> | undefined,
   outcome: Outcome,
-  intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG",
+  intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK",
   fallbackReceivedAt?: string | Date | null,
 ): Date | null {
   const required = pair?.[outcome];
