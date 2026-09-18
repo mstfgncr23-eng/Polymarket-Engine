@@ -322,6 +322,7 @@ export const riskReasonCodeSchema = z.enum([
   "INSUFFICIENT_CASH",
   "MARKET_NOT_ENTRY_QUALIFIED",
   "REFERENCE_PROVIDER_BLOCKED",
+  "PROTECTIVE_DE_RISK_NOT_REDUCING",
 ]);
 export type RiskReasonCode = z.infer<typeof riskReasonCodeSchema>;
 
@@ -385,6 +386,8 @@ export const positionSchema = z.object({
   pairedQuantity: decimalStringSchema,
   unpairedOutcome: outcomeSchema.nullable(),
   unpairedQuantity: decimalStringSchema,
+  /** Start of the current unpaired episode. Optional for legacy checkpoints. */
+  unhedgedStartedAt: timestampSchema.nullable().optional(),
   combinedPairCost: decimalStringSchema,
   totalFees: decimalStringSchema,
   totalSlippage: decimalStringSchema,
