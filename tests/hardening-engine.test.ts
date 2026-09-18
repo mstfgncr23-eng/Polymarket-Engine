@@ -523,6 +523,80 @@ describe("B/D/R/T settlement, close policy, recovery, accelerated lifecycle", ()
   });
 });
 
+describe("risk-reducing fill lifecycle fences", () => {
+  it("rejects stale hedge/de-risk fills that would cross the current unpaired residual", async () => {
+    const journal = new MemoryEventJournal();
+    const env = engineEnvSchema.parse({
+      NODE_ENV: "test",
+      JOURNAL_MODE: "memory",
+      TRADING_MODE: "paper",
+      POLYMARKET_TOKEN_IDS: "up,down",
+    });
+    const engine = new EngineService(env, journal, logger, { market: pendingFeed() as never });
+    await engine.start();
+    try {
+      await engine.applyObservedFill(paperFill("race-mkt", "UP", "0.40"));
+      expect(engine.ledger.positions.get("race-mkt")?.unpairedQuantity).toBe("10");
+
+      await engine.applyObservedFill({
+        ...paperFill("race-mkt", "UP", "0.35"),
+        id: "derisk-partial-fill",
+        orderId: "derisk-partial-order",
+        side: "SELL",
+        quantity: "4",
+      }, "PROTECTIVE_DE_RISK");
+      expect(engine.ledger.positions.get("race-mkt")).toMatchObject({
+        upQuantity: "6",
+        downQuantity: "0",
+        unpairedOutcome: "UP",
+        unpairedQuantity: "6",
+      });
+
+      await expect(engine.applyObservedFill({
+        ...paperFill("race-mkt", "DOWN", "0.50"),
+        id: "stale-hedge-fill",
+        orderId: "stale-hedge-order",
+        quantity: "10",
+      }, "HEDGE_SECOND_LEG")).rejects.toThrow("QUANTITY_EXCEEDS_RESIDUAL");
+      expect(engine.ledger.positions.get("race-mkt")).toMatchObject({
+        upQuantity: "6",
+        downQuantity: "0",
+        unpairedOutcome: "UP",
+        unpairedQuantity: "6",
+      });
+
+      await engine.applyObservedFill({
+        ...paperFill("race-mkt", "DOWN", "0.50"),
+        id: "fresh-hedge-fill",
+        orderId: "fresh-hedge-order",
+        quantity: "6",
+      }, "HEDGE_SECOND_LEG");
+      expect(engine.ledger.positions.get("race-mkt")).toMatchObject({
+        upQuantity: "6",
+        downQuantity: "6",
+        unpairedOutcome: null,
+        unpairedQuantity: "0",
+      });
+
+      await expect(engine.applyObservedFill({
+        ...paperFill("race-mkt", "UP", "0.34"),
+        id: "stale-derisk-fill",
+        orderId: "stale-derisk-order",
+        side: "SELL",
+        quantity: "6",
+      }, "PROTECTIVE_DE_RISK")).rejects.toThrow("NO_UNPAIRED_RESIDUAL");
+      expect(engine.ledger.positions.get("race-mkt")).toMatchObject({
+        upQuantity: "6",
+        downQuantity: "6",
+        unpairedOutcome: null,
+        unpairedQuantity: "0",
+      });
+    } finally {
+      await engine.stop();
+    }
+  });
+});
+
 describe("J maker reservation through the engine", () => {
   it("reserves cash for a maker and does not double-reserve after recovery", async () => {
     const journal = new MemoryEventJournal();
