@@ -588,6 +588,7 @@ describe("PR20 true product end-to-end gate", () => {
     const clock = { nowMs: START_MS };
     const resolutions = new Map<string, Record<string, unknown>>();
     const setup = await setupScenario({ journal, clock, resolutions, env: { PAPER_EXECUTION_LATENCY_MS: "200" } });
+    let durableFill: Awaited<ReturnType<EventJournal["readDurableTransitionsAfter"]>> = [];
     try {
       expect((await setup.engine.beginExperiment()).ok).toBe(true);
       await setup.market.emitSnapshot(marketBook(clock, "UP", 1));
@@ -601,7 +602,7 @@ describe("PR20 true product end-to-end gate", () => {
       await drainRuntime(setup.engine);
       const trigger = setup.engine.state.recentTriggers.find((item) => item.kind === "BTC_RAPID_MOVE");
       expect(trigger).toBeTruthy();
-      const durableFill = (await journal.readDurableTransitionsAfter(0, 256)).filter((row) => row.type === "PAPER_FILL");
+      durableFill = (await journal.readDurableTransitionsAfter(0, 256)).filter((row) => row.type === "PAPER_FILL");
       expect(durableFill).toHaveLength(1);
       expect(setup.engine.ledger.positions.size).toBe(0);
       await setup.engine.stop();
