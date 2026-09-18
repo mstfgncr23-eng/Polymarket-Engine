@@ -3902,7 +3902,13 @@ export class EngineService {
         aggregateType: "position",
         aggregateId: position.id,
         traceId: fill.traceId,
-        payload: { positionId: position.id, marketId: fill.marketId, unpairedQuantity: position.unpairedQuantity, experimentId },
+        payload: {
+          positionId: position.id,
+          marketId: fill.marketId,
+          unpairedQuantity: position.unpairedQuantity,
+          unhedgedStartedAt: position.unhedgedStartedAt ?? position.openedAt,
+          experimentId,
+        },
       });
     }
     if (position && Number(position.pairedQuantity) > 0 && Number(position.unpairedQuantity) === 0) {
