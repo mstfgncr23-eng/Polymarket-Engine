@@ -326,6 +326,8 @@ export class EngineService {
   private readonly protectiveDeRiskAttempts = new Map<string, number>();
   /** Earliest next durable de-risk evaluation per market. Ephemeral by design. */
   private readonly protectiveDeRiskNextAttemptAt = new Map<string, number>();
+  /** Identifies whether a hard veto is materially unchanged during backoff. */
+  private readonly protectiveDeRiskVetoFingerprint = new Map<string, string>();
   /** Bounds non-durable waiting feed/SSE samples when no sell depth exists. */
   private readonly protectiveDeRiskLastWaitingAt = new Map<string, number>();
   private readonly activeTriggers = new Map<string, TriggerEvent>();
@@ -880,6 +882,7 @@ export class EngineService {
             this.reportGenerated = false;
             this.protectiveDeRiskAttempts.clear();
             this.protectiveDeRiskNextAttemptAt.clear();
+            this.protectiveDeRiskVetoFingerprint.clear();
             this.protectiveDeRiskLastWaitingAt.clear();
             this.abortSourceSealPersist();
             this.sourceSealed = false;
@@ -4545,8 +4548,20 @@ export class EngineService {
         return;
       }
 
+      const executionErrorsLastHour = this.executionErrors.filter((at) => now.getTime() - at < 3_600_000).length;
+      const hardStateFingerprint = [
+        snapshot.feeSchedule ? "fee:known" : "fee:unknown",
+        this.timestampDisorder ? "timestamp:disordered" : "timestamp:ordered",
+        executionErrorsLastHour >= this.riskLimits.maxExecutionErrorsPerHour ? "execution:blocked" : "execution:healthy",
+      ].join("|");
       const nextAttemptAt = this.protectiveDeRiskNextAttemptAt.get(marketId) ?? 0;
-      if (now.getTime() < nextAttemptAt) return;
+      if (now.getTime() < nextAttemptAt) {
+        const vetoFingerprint = this.protectiveDeRiskVetoFingerprint.get(marketId);
+        // A normal execution retry keeps its short cooldown. A hard-veto
+        // backoff may be bypassed only when the blocker state materially changed.
+        if (vetoFingerprint == null || vetoFingerprint === hardStateFingerprint) return;
+        this.protectiveDeRiskVetoFingerprint.delete(marketId);
+      }
       // Reserve the retry slot before any journal await so fresh snapshot
       // bursts cannot generate duplicate durable evaluations behind this flight.
       this.protectiveDeRiskNextAttemptAt.set(marketId, now.getTime() + PROTECTIVE_DE_RISK_RETRY_MS);
@@ -4610,7 +4625,7 @@ export class EngineService {
           lastStrategyTradeAt: this.lastTradeAt,
           duplicateTrade: false,
           experimentEntryOpen: experimentAllowsHedge(this.experiment),
-          executionErrorsLastHour: this.executionErrors.filter((at) => now.getTime() - at < 3_600_000).length,
+          executionErrorsLastHour,
           externalRiskRecommendedVeto: false,
           shuttingDown: this.state.draining,
         },
@@ -4640,6 +4655,7 @@ export class EngineService {
         payload: { ...decision.risk, marketId, asset, intent: "PROTECTIVE_DE_RISK", deRisk: audit },
       }));
       if (!decision.accepted || !decision.order) {
+        this.protectiveDeRiskVetoFingerprint.set(marketId, hardStateFingerprint);
         this.protectiveDeRiskNextAttemptAt.set(marketId, now.getTime() + PROTECTIVE_DE_RISK_VETO_RETRY_MS);
         for (const reason of decision.risk.vetoes) this.metrics.riskVetoes.inc({ reason });
         this.record("RISK_VETO", traceId, marketId, {
@@ -4650,6 +4666,7 @@ export class EngineService {
         return;
       }
 
+      this.protectiveDeRiskVetoFingerprint.delete(marketId);
       this.record("RISK_ACCEPT", traceId, marketId, {
         orderId: decision.order.id,
         intent: "PROTECTIVE_DE_RISK",
@@ -4682,6 +4699,7 @@ export class EngineService {
   private clearProtectiveDeRiskState(marketId: string): void {
     this.protectiveDeRiskAttempts.delete(marketId);
     this.protectiveDeRiskNextAttemptAt.delete(marketId);
+    this.protectiveDeRiskVetoFingerprint.delete(marketId);
     this.protectiveDeRiskLastWaitingAt.delete(marketId);
   }
 
