@@ -338,7 +338,7 @@ describe("Step-4 retention classes and gates", () => {
     expect((await journal.queryEvents({ types: ["PAPER_FILL"] })).length).toBe(1);
   });
 
-  it("complete+grace unlocks monitor/telemetry; telemetry delete never removes execution evidence; batches ≤ cap", async () => {
+  it("complete+grace archives telemetry but keeps experiment-attributed monitor detail without a verified rollup", async () => {
     const journal = new MemoryEventJournal();
     const persistedAt = new Date("2026-09-01T00:00:00.000Z");
     await journal.append(ev("TRIGGER_EVENT", "2026-09-01T00:00:00.000Z", { kind: "BOOK_IMBALANCE" }, "trig-old"));
@@ -362,7 +362,7 @@ describe("Step-4 retention classes and gates", () => {
     expect(result.transientEligible).toBe(true);
     expect(result.lastBatchSize).toBeLessThanOrEqual(200);
     expect((await journal.queryEvents({ types: ["MARKET_SNAPSHOT"] })).length).toBe(0);
-    expect((await journal.queryEvents({ types: ["TRIGGER_EVENT"] })).length).toBe(0);
+    expect((await journal.queryEvents({ types: ["TRIGGER_EVENT"] })).length).toBe(1);
     expect((await journal.queryEvents({ types: ["PAPER_FILL"] })).length).toBe(1);
     expect(result.durableTransitionsPruned).toBe(false);
   });
@@ -665,14 +665,14 @@ describe("Step-4 acceptance: monitor-only and drain", () => {
   it("monitor-only / no experiment allows monitor TTL; active protects in-window; completed needs final+grace", async () => {
     const journal = new MemoryEventJournal();
     const now = new Date("2026-09-08T00:00:00.000Z");
-    await journal.append(ev("TRIGGER_EVENT", "2026-09-01T00:00:00.000Z", {}, "pre"));
+    await journal.append(ev("TRIGGER_EVENT", "2026-09-01T00:00:00.000Z", { experimentId: null }, "pre"));
     const manager = new RetentionManager(journal, await localArchiveRetentionConfig({ enabled: true, monitorTtlMs: 1, telemetryTtlMs: 1, completedGraceMs: 1, batchSize: 50, maxBatchesPerCycle: 8, maxRowsPerCycle: 400 }));
     expect(experimentIsMonitorOnly(null)).toBe(true);
     expect(experimentIsMonitorOnly({ id: "aborted", status: "ABORTED_START" })).toBe(true);
     const idle = await manager.runCycle({ experiment: null, now, degraded: false, failClosed: false, databaseUp: true });
     expect(idle.monitorOnlyEligible).toBe(true);
     expect((await journal.queryEvents({ types: ["TRIGGER_EVENT"] })).length).toBe(0);
-    await journal.append(ev("TRIGGER_EVENT", "2026-09-01T00:00:00.000Z", {}, "aborted-old"));
+    await journal.append(ev("TRIGGER_EVENT", "2026-09-01T00:00:00.000Z", { experimentId: null }, "aborted-old"));
     const aborted = await manager.runCycle({
       experiment: { id: "aborted", status: "ABORTED_START" },
       now, degraded: false, failClosed: false, databaseUp: true,
@@ -686,7 +686,7 @@ describe("Step-4 acceptance: monitor-only and drain", () => {
     await manager.runCycle({ experiment: { id: "aborted", status: "ABORTED_START" }, now, degraded: false, failClosed: false, databaseUp: true });
     expect(await journal.queryDurableTransitions({ types: ["EXPERIMENT_START_ABORTED"], limit: 8 })).toHaveLength(1);
     await journal.append(ev("TRIGGER_EVENT", "2026-09-07T00:00:00.000Z", {}, "in-window"));
-    await journal.append(ev("TRIGGER_EVENT", "2026-09-01T00:00:00.000Z", {}, "pre2"));
+    await journal.append(ev("TRIGGER_EVENT", "2026-09-01T00:00:00.000Z", { experimentId: null }, "pre2"));
     const active = await manager.runCycle({
       experiment: { id: "exp-1", status: "RUNNING", startedAt: "2026-09-06T00:00:00.000Z" },
       now, degraded: false, failClosed: false, databaseUp: true,
@@ -1017,7 +1017,7 @@ describe("Step-4 acceptance: hard maxRowsPerCycle and effective retention config
     const journal = new MemoryEventJournal();
     const now = new Date("2026-09-08T00:00:00.000Z");
     await journal.append(ev("MARKET_SNAPSHOT", "2026-09-07T21:00:00.000Z", {}, "tel-2h"));
-    await journal.append(ev("TRIGGER_EVENT", "2026-09-07T10:00:00.000Z", {}, "mon-12h"));
+    await journal.append(ev("TRIGGER_EVENT", "2026-09-07T10:00:00.000Z", { experimentId: null }, "mon-12h"));
     const config = defaultRetentionConfig({
       enabled: true,
       telemetryTtlMs: 2 * 60 * 60_000,
@@ -1041,7 +1041,7 @@ describe("Step-4 acceptance: hard maxRowsPerCycle and effective retention config
     expect(cycle.eligibleBacklog).toBe(dry.telemetry.eligible + dry.monitor.eligible);
     const applyJournal = new MemoryEventJournal();
     await applyJournal.append(ev("MARKET_SNAPSHOT", "2026-09-07T21:00:00.000Z", {}, "tel-2h"));
-    await applyJournal.append(ev("TRIGGER_EVENT", "2026-09-07T10:00:00.000Z", {}, "mon-12h"));
+    await applyJournal.append(ev("TRIGGER_EVENT", "2026-09-07T10:00:00.000Z", { experimentId: null }, "mon-12h"));
     const apply = await applyJournalCleanup(applyJournal, {
       now, experiment: null, confirm: "I_UNDERSTAND_DESTRUCTIVE_CLEANUP", config,
     });
