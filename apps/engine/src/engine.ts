@@ -4402,10 +4402,6 @@ export class EngineService {
 
     this.protectiveDeRiskInFlight.add(marketId);
     try {
-      // A stale first-leg maker can recreate directional inventory behind an
-      // unwind. Close that lifecycle before capturing final de-risk economics.
-      await this.cancelOutstandingFirstLegMakers(marketId, "PROTECTIVE_DE_RISK");
-
       const position = this.ledger.positions.get(marketId);
       if (!position?.unpairedOutcome || d(position.unpairedQuantity).lte(0)) {
         this.protectiveDeRiskAttempts.delete(marketId);
