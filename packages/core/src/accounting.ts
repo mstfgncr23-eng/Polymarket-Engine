@@ -61,7 +61,7 @@ export class PaperLedger {
     const previous = this.positions.get(fill.marketId) ?? {
       id: options?.positionId ?? createId("pos"), marketId: fill.marketId, upQuantity: "0", downQuantity: "0",
       averageUpCost: "0", averageDownCost: "0", pairedQuantity: "0", unpairedOutcome: null,
-      unpairedQuantity: "0", combinedPairCost: "0", totalFees: "0", totalSlippage: "0",
+      unpairedQuantity: "0", unhedgedStartedAt: null, combinedPairCost: "0", totalFees: "0", totalSlippage: "0",
       openedAt: now, updatedAt: now,
     } satisfies Position;
 
@@ -97,6 +97,16 @@ export class PaperLedger {
     next.pairedQuantity = decimal(paired);
     next.unpairedOutcome = difference.gt(0) ? "UP" : difference.lt(0) ? "DOWN" : null;
     next.unpairedQuantity = decimal(difference.abs());
+    if (next.unpairedOutcome === null) {
+      next.unhedgedStartedAt = null;
+    } else if (
+      d(previous.unpairedQuantity).gt(0)
+      && previous.unpairedOutcome === next.unpairedOutcome
+    ) {
+      next.unhedgedStartedAt = previous.unhedgedStartedAt ?? previous.openedAt;
+    } else {
+      next.unhedgedStartedAt = now;
+    }
     next.combinedPairCost = decimal(d(next.averageUpCost).plus(next.averageDownCost));
     this.positions.set(fill.marketId, next);
 
@@ -192,7 +202,13 @@ export function computePaperExposures(
     const value = Number(position.upQuantity) * Number(position.averageUpCost) + Number(position.downQuantity) * Number(position.averageDownCost);
     const unhedged = Number(position.unpairedQuantity) * Number(position.unpairedOutcome === "UP" ? position.averageUpCost : position.averageDownCost);
     total += value; directional += unhedged;
-    if (position.marketId === marketId) { market = value; if (unhedged > 0) duration = nowMs - new Date(position.openedAt).getTime(); }
+    if (position.marketId === marketId) {
+      market = value;
+      if (unhedged > 0) {
+        const episodeStart = position.unhedgedStartedAt ?? position.openedAt;
+        duration = nowMs - new Date(episodeStart).getTime();
+      }
+    }
     if (assetKey && assetByMarket.get(position.marketId) === assetKey) asset += value;
   }
   const selected = list.find((position) => position.marketId === marketId);
@@ -219,7 +235,8 @@ export interface PaperExposureProjectionInput {
     outcome: Outcome;
     quantity: Decimal.Value;
     price: Decimal.Value;
-    intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG";
+    side?: "BUY" | "SELL";
+    intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK";
     asset?: string | null;
   };
   nowMs?: number;
@@ -240,27 +257,41 @@ export function projectPaperExposures(input: PaperExposureProjectionInput): Retu
     books.set(marketId, created);
     return created;
   };
-  const add = (marketId: string, outcome: Outcome, quantity: Decimal.Value, price: Decimal.Value, asset?: string | null) => {
+  const apply = (
+    marketId: string,
+    outcome: Outcome,
+    quantity: Decimal.Value,
+    price: Decimal.Value,
+    side: "BUY" | "SELL",
+    asset?: string | null,
+  ) => {
     const book = ensure(marketId);
     const leg = book[outcome];
     const qty = d(quantity);
     if (qty.lte(0)) return;
-    const next = leg.qty.plus(qty);
-    leg.cost = next.gt(0) ? leg.qty.mul(leg.cost).plus(qty.mul(price)).div(next) : d(0);
-    leg.qty = next;
+    if (side === "BUY") {
+      const next = leg.qty.plus(qty);
+      leg.cost = next.gt(0) ? leg.qty.mul(leg.cost).plus(qty.mul(price)).div(next) : d(0);
+      leg.qty = next;
+    } else {
+      if (qty.gt(leg.qty)) throw new Error("PROJECTED_SHORT_POSITION");
+      leg.qty = leg.qty.minus(qty);
+      if (leg.qty.eq(0)) leg.cost = d(0);
+    }
     if (asset) {
       book.UP.asset = asset;
       book.DOWN.asset = asset;
     }
   };
   for (const position of input.positions) {
-    add(position.marketId, position.outcome, position.quantity, position.avgCost, position.asset);
+    apply(position.marketId, position.outcome, position.quantity, position.avgCost, "BUY", position.asset);
   }
-  add(
+  apply(
     input.candidate.marketId,
     input.candidate.outcome,
     input.candidate.quantity,
     input.candidate.price,
+    input.candidate.side ?? "BUY",
     input.candidate.asset,
   );
   const nowIso = new Date(input.nowMs ?? Date.now()).toISOString();
@@ -278,6 +309,7 @@ export function projectPaperExposures(input: PaperExposureProjectionInput): Retu
       pairedQuantity: decimal(paired),
       unpairedOutcome: difference.gt(0) ? "UP" : difference.lt(0) ? "DOWN" : null,
       unpairedQuantity: decimal(difference.abs()),
+      unhedgedStartedAt: null,
       combinedPairCost: decimal(book.UP.cost.plus(book.DOWN.cost)),
       totalFees: "0", totalSlippage: "0", openedAt: nowIso, updatedAt: nowIso,
     });
