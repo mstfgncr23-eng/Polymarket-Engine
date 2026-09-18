@@ -2008,6 +2008,12 @@ export class EngineService {
       this.requestScoutRefresh(snapshot, "market");
       const triggers = this.triggerEngine.ingestMarket(snapshot);
       for (const trigger of triggers) this.admitTrigger(trigger, this.provenanceForGenerated(trigger, "MARKET"));
+      // Risk exits run outside the websocket consumer await-chain. The per-market
+      // flight below prevents duplicate unwind orders while a prior attempt is
+      // persisting or waiting through paper execution latency.
+      void this.maybeProtectiveDeRisk(snapshot.marketId).catch((error) => {
+        this.logger.error({ err: error, marketId: snapshot.marketId }, "protective de-risk attempt failed");
+      });
     }
     const window = this.marketsById.get(snapshot.marketId);
     if (window?.endDate) this.triggerEngine.noteMarketWindow(snapshot.marketId, snapshot.asset ?? window.asset, window.endDate);
@@ -4291,11 +4297,190 @@ export class EngineService {
   }
 
   private async pollFailedHedges(): Promise<void> {
-    for (const position of this.ledger.positions.values()) {
+    for (const position of [...this.ledger.positions.values()]) {
       if (Number(position.unpairedQuantity) <= 0) continue;
-      for (const trigger of this.triggerEngine.ingestPosition(position, position.id, this.assetByMarket.get(position.marketId) ?? null)) {
+      // Maintenance is a low-frequency fallback. Fresh synchronized snapshots
+      // normally trigger the same keyed de-risk flight sooner.
+      await this.maybeProtectiveDeRisk(position.marketId);
+      const current = this.ledger.positions.get(position.marketId);
+      if (!current || Number(current.unpairedQuantity) <= 0) continue;
+      for (const trigger of this.triggerEngine.ingestPosition(current, current.id, this.assetByMarket.get(current.marketId) ?? null)) {
         this.admitTrigger(trigger);
       }
+    }
+  }
+
+  private async maybeProtectiveDeRisk(marketId: string): Promise<void> {
+    if (this.protectiveDeRiskInFlight.has(marketId)) return;
+    const initial = this.ledger.positions.get(marketId);
+    if (!initial?.unpairedOutcome || d(initial.unpairedQuantity).lte(0)) {
+      this.protectiveDeRiskAttempts.delete(marketId);
+      return;
+    }
+    if (!experimentAllowsHedge(this.experiment) || this.settledMarkets.has(marketId)) return;
+
+    const initialNow = this.nowFn();
+    const initialStartedAt = initial.unhedgedStartedAt ?? initial.openedAt;
+    const initialDurationMs = Math.max(0, initialNow.getTime() - Date.parse(initialStartedAt));
+    if (!Number.isFinite(initialDurationMs) || initialDurationMs < this.riskLimits.maxUnhedgedDurationMs) return;
+
+    this.protectiveDeRiskInFlight.add(marketId);
+    try {
+      // A stale first-leg maker can recreate directional inventory behind an
+      // unwind. Close that lifecycle before capturing final de-risk economics.
+      await this.cancelOutstandingFirstLegMakers(marketId, "PROTECTIVE_DE_RISK");
+
+      const position = this.ledger.positions.get(marketId);
+      if (!position?.unpairedOutcome || d(position.unpairedQuantity).lte(0)) {
+        this.protectiveDeRiskAttempts.delete(marketId);
+        return;
+      }
+      if (!experimentAllowsHedge(this.experiment) || this.settledMarkets.has(marketId) || this.state.draining) return;
+
+      const now = this.nowFn();
+      const unhedgedStartedAt = position.unhedgedStartedAt ?? position.openedAt;
+      const unhedgedDurationMs = Math.max(0, now.getTime() - Date.parse(unhedgedStartedAt));
+      if (!Number.isFinite(unhedgedDurationMs) || unhedgedDurationMs < this.riskLimits.maxUnhedgedDurationMs) return;
+
+      const pair = this.snapshots.get(marketId);
+      const snapshot = pair?.[position.unpairedOutcome]
+        ?? [...this.state.marketSnapshots.values()].find((item) => item.marketId === marketId && item.outcome === position.unpairedOutcome)
+        ?? null;
+      if (!snapshot || !this.adapterTokenSynchronized(snapshot.tokenId)) return;
+
+      const receivedAtMs = Date.parse(snapshot.receivedAt);
+      if (!Number.isFinite(receivedAtMs) || now.getTime() - receivedAtMs > this.riskLimits.staleFeedTimeoutMs) return;
+
+      const candidate = buildProtectiveDeRiskCandidate({
+        position,
+        snapshot,
+        maxOrderSizeUsd: this.riskLimits.maxOrderSizeUsd,
+      });
+      if (!candidate) {
+        this.record("PROTECTIVE_DE_RISK_WAITING", position.id, marketId, {
+          deRiskReason: "MAX_UNHEDGED_DURATION",
+          unhedgedStartedAt,
+          unhedgedDurationMs,
+          attemptedAction: "SELL_UNPAIRED",
+          requestedQty: position.unpairedQuantity,
+          executableQty: "0",
+          finalState: "NO_EXECUTABLE_BID_DEPTH",
+        }, this.assetByMarket.get(marketId) ?? snapshot.asset ?? null);
+        return;
+      }
+
+      const asset = this.assetByMarket.get(marketId) ?? snapshot.asset ?? null;
+      const exposure = computePaperExposures(this.ledger.positions.values(), marketId, this.assetByMarket, now.getTime());
+      const projected = projectPaperExposures({
+        current: exposure,
+        positions: projectableLegsFromPositions(this.ledger.positions.values(), this.assetByMarket),
+        candidate: {
+          marketId,
+          outcome: candidate.outcome,
+          quantity: candidate.quantity,
+          price: candidate.limitPrice,
+          side: "SELL",
+          intent: "PROTECTIVE_DE_RISK",
+          asset,
+        },
+        nowMs: now.getTime(),
+      });
+      const retryCount = (this.protectiveDeRiskAttempts.get(marketId) ?? 0) + 1;
+      this.protectiveDeRiskAttempts.set(marketId, retryCount);
+      const traceId = createId("derisk");
+      const triggerId = createId("derisk-trigger");
+      const ledger = this.ledger.snapshot();
+      const decision = decideProtectivePaperOrder({
+        candidate,
+        snapshotAfterDecisionLatency: snapshot,
+        limits: this.riskLimits,
+        traceId,
+        triggerId,
+        baseRisk: {
+          now,
+          marketFeedAt: new Date(snapshot.receivedAt),
+          btcFeedAt: now,
+          referenceFeedAt: null,
+          referenceRequired: false,
+          asset,
+          assetExposureUsd: exposure.asset,
+          databaseAvailable: this.state.database === "UP",
+          timestampDisorder: this.timestampDisorder,
+          riskStateAvailable: true,
+          dailyPnlUsd: ledger.netTradingPnl,
+          drawdownUsd: ledger.drawdown,
+          marketExposureUsd: exposure.market,
+          totalExposureUsd: exposure.total,
+          directionalExposureUsd: exposure.directional,
+          unhedgedExposureUsd: exposure.unhedged,
+          unhedgedDurationMs: exposure.unhedgedDurationMs,
+          projectedMarketExposureUsd: projected.market,
+          projectedTotalExposureUsd: projected.total,
+          projectedDirectionalExposureUsd: projected.directional,
+          projectedUnhedgedExposureUsd: projected.unhedged,
+          projectedAssetExposureUsd: projected.asset,
+          availableCashUsd: this.ledger.availableCash().toFixed(),
+          referenceProviderBlocked: false,
+          marketEntryQualified: this.entryQualified.has(marketId),
+          externalSignalsLastMinute: 0,
+          lastStrategyTradeAt: this.lastTradeAt,
+          duplicateTrade: false,
+          experimentEntryOpen: experimentAllowsHedge(this.experiment),
+          executionErrorsLastHour: this.executionErrors.filter((at) => now.getTime() - at < 3_600_000).length,
+          externalRiskRecommendedVeto: false,
+          shuttingDown: this.state.draining,
+        },
+      });
+      this.state.latestRisk = decision.risk;
+
+      const residualQuantity = d(position.unpairedQuantity).minus(candidate.quantity);
+      const audit: ProtectiveDeRiskAudit = {
+        deRiskReason: "MAX_UNHEDGED_DURATION",
+        unhedgedStartedAt,
+        unhedgedDurationMs,
+        attemptedAction: "SELL_UNPAIRED",
+        requestedQty: position.unpairedQuantity,
+        executableQty: candidate.quantity,
+        executionPrice: decision.bookVwap,
+        residualQuantity: residualQuantity.gt(0) ? residualQuantity.toFixed() : "0",
+        residualExposure: projected.unhedged,
+        retryCount,
+        finalState: decision.accepted ? "ORDER_ADMITTED" : "RISK_VETO",
+      };
+
+      await this.persistReportInput(createJournalEvent({
+        traceId,
+        type: "RISK_EVALUATION",
+        aggregateType: "risk",
+        aggregateId: decision.risk.id,
+        payload: { ...decision.risk, marketId, asset, deRisk: audit },
+      }));
+      if (!decision.accepted || !decision.order) {
+        for (const reason of decision.risk.vetoes) this.metrics.riskVetoes.inc({ reason });
+        this.record("RISK_VETO", traceId, marketId, {
+          reasons: decision.risk.vetoes,
+          intent: "PROTECTIVE_DE_RISK",
+          deRisk: audit,
+        }, asset);
+        return;
+      }
+
+      this.record("RISK_ACCEPT", traceId, marketId, {
+        orderId: decision.order.id,
+        intent: "PROTECTIVE_DE_RISK",
+        deRisk: audit,
+      }, asset);
+      await this.submitPaperOrder(
+        decision.order,
+        snapshot,
+        `${marketId}:${candidate.outcome}:PROTECTIVE_DE_RISK`,
+        "PROTECTIVE_DE_RISK",
+        audit,
+      );
+    } finally {
+      this.protectiveDeRiskInFlight.delete(marketId);
+      const current = this.ledger.positions.get(marketId);
+      if (!current || d(current.unpairedQuantity).lte(0)) this.protectiveDeRiskAttempts.delete(marketId);
     }
   }
 
