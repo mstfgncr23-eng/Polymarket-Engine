@@ -117,6 +117,21 @@ describe("temporal pair hedge first-leg risk cap", () => {
     })).toBeNull();
   });
 
+  it("fails closed for a fresh first leg when winner probability is absent", () => {
+    const strategy = new TemporalPairHedgeStrategy();
+    const up = snapshot({ marketId: "missing-fair-market", tokenId: "up-missing", outcome: "UP", asks: [{ price: "0.40", quantity: "100" }] });
+    const down = snapshot({ marketId: "missing-fair-market", tokenId: "down-missing", outcome: "DOWN", asks: [{ price: "0.60", quantity: "100" }] });
+    const legacy = { ...consensus("UP"), fairProbability: undefined };
+
+    expect(strategy.evaluate({
+      consensus: legacy,
+      snapshots: { UP: up, DOWN: down },
+      position: null,
+      maxOrderSizeUsd: 25,
+      minimumLockedPairEdge: 0.015,
+    })).toBeNull();
+  });
+
   it("rejects a fresh first leg when the selected side is not the fair-probability winner", () => {
     const strategy = new TemporalPairHedgeStrategy();
     const up = snapshot({ marketId: "winner-market", tokenId: "up-winner", outcome: "UP", asks: [{ price: "0.90", quantity: "100" }] });

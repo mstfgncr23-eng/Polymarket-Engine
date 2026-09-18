@@ -74,9 +74,13 @@ export class TemporalPairHedgeStrategy implements Strategy {
 
     if (context.consensus.consensusDirection === "FLAT") return null;
     const winnerProbability = context.consensus.fairProbability;
+    // Fresh entry requires explicit winner-probability semantics. Historical
+    // consensus rows may remain readable without this field, but they are not
+    // executable first-leg authority.
     if (
-      winnerProbability !== undefined
-      && (!Number.isFinite(winnerProbability) || winnerProbability <= 0.5)
+      winnerProbability === undefined
+      || !Number.isFinite(winnerProbability)
+      || winnerProbability <= 0.5
     ) return null;
     const outcome: Outcome = context.consensus.consensusDirection;
     const snapshot = context.snapshots[outcome];
