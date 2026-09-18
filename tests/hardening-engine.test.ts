@@ -503,6 +503,8 @@ describe("B/D/R/T settlement, close policy, recovery, accelerated lifecycle", ()
     expect(first.experimentManifest()?.status).toBe("ENTRY_CLOSED");
     expect(first.restingOrderCount()).toBe(0);
     expect(first.reservedCash()).toBe("0");
+    const timeoutCancels = await journal.queryEvents({ types: ["PAPER_ORDER_CANCELLED"] });
+    expect(timeoutCancels.some((event) => event.payload.reason === "MAX_UNHEDGED_DURATION")).toBe(true);
     const experimentId = first.experimentManifest()?.id;
     await first.stop();
 
