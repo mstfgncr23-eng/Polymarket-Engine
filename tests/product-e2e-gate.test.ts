@@ -303,7 +303,7 @@ describe("PR20 true product end-to-end gate", () => {
   it("revalidates first-leg fair against the current book after consensus persistence", async () => {
     const journal = new MemoryEventJournal();
     const setup = await setupScenario({ journal, env: { EXPERIMENT_DURATION_HOURS: "1" } });
-    let releaseHold: (() => void) | null = null;
+    let releaseHold: (() => void) | undefined;
     try {
       expect((await setup.engine.beginExperiment()).ok).toBe(true);
       await setup.market.emitSnapshot(marketBook(setup.clock, "UP", 1));
@@ -348,8 +348,8 @@ describe("PR20 true product end-to-end gate", () => {
         sequence: 2,
       }));
 
-      releaseHold();
-      releaseHold = null;
+      releaseHold?.();
+      releaseHold = undefined;
       journal.setAppendInFlightHoldForTest(null);
       await drainRuntime(setup.engine);
 
