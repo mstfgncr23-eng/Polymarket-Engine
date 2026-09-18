@@ -112,6 +112,7 @@ describe("native v2 shadow execution intent", () => {
       now: new Date(NOW),
     });
     expect(intent).not.toBeNull();
+    expect(intent?.version).toBe("native-v2-shadow-execution-v2");
     expect(intent?.candidate.marketId).toBe("m1");
     expect(intent?.candidate.outcome).toBe("UP");
     expect(intent?.candidate.quantity).toBe("9.09090909");
@@ -122,6 +123,38 @@ describe("native v2 shadow execution intent", () => {
     expect(intent?.consensus.fairProbability).toBe(0.65);
     expect(intent?.consensus.marketProbability).toBe(0.55);
     expect(intent?.consensus.evidenceIds).toEqual(["e1", "e2"]);
+  });
+
+  it("rejects a directly supplied loser-side longshot even when its economics are positive", () => {
+    const selected = {
+      ...candidate(),
+      outcome: "DOWN" as const,
+      fairProbability: 0.35,
+      bestAsk: 0.20,
+      executableVwap: 0.20,
+      worstPrice: 0.20,
+      grossEdgeUsdPerShare: 0.15,
+      netEvUsdPerShare: 0.14,
+      actionable: true,
+    };
+    const downSnapshot = {
+      ...snapshot(),
+      eventId: "event-m1-down",
+      tokenId: "token-down",
+      outcome: "DOWN" as const,
+      bids: [{ price: "0.19", quantity: "100" }],
+      asks: [{ price: "0.20", quantity: "100" }],
+    };
+    expect(buildNativeV2ShadowExecutionIntent({
+      triggerId: "trigger-1",
+      traceId: "trace-1",
+      expiresAt: "2026-09-16T18:01:00.000Z",
+      evidenceIds: ["e1"],
+      fair: fair(),
+      selected,
+      snapshot: downSnapshot,
+      now: new Date(NOW),
+    })).toBeNull();
   });
 
   it("fails closed for a stale signal expiry or mismatched selected snapshot", () => {

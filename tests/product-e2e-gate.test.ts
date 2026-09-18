@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   createId,
   grokSignalSubmissionSchema,
+  NATIVE_DETERMINISTIC_MODEL_VERSION,
   triggerEventSchema,
   type Direction,
   type MarketSnapshot,
@@ -265,7 +266,7 @@ describe("PR20 true product end-to-end gate", () => {
       });
       expect(setup.engine.activationFootprint().sent).toBe(0);
       expect(setup.engine.experimentManifest()?.modelConfiguration).toMatchObject({
-        provider: "native_deterministic", version: "native-deterministic-v1", localExecution: true, externalInference: false,
+        provider: "native_deterministic", version: NATIVE_DETERMINISTIC_MODEL_VERSION, localExecution: true, externalInference: false,
       });
     } finally {
       await setup.engine.stop();

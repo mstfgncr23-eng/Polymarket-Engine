@@ -69,6 +69,7 @@ import {
   type NativeDecision,
   type NativeReferenceFeatures,
   type NativeDecisionConfig,
+  NATIVE_DETERMINISTIC_MODEL_VERSION,
   NativeV2ShadowFeatureExtractor,
   evaluateNativeV2ShadowFairProbability,
   LearningSampleStore,
@@ -82,6 +83,7 @@ import {
   NativeV2ShadowOpportunityRanker,
   evaluateNativeV2ShadowMarketOpportunity,
   buildNativeV2ShadowExecutionIntent,
+  NATIVE_V2_SHADOW_EXECUTION_VERSION,
   type NativeV2ShadowFairProbability,
   type NativeV2ShadowFeatureVector,
   type NativeV2ShadowMarketOpportunity,
@@ -187,6 +189,12 @@ class ExperimentStartGuardRejectedError extends Error {
   constructor() { super("EXPERIMENT_START_MARKET_TRUTH_CHANGED"); }
 }
 
+class FirstLegLifecycleGuardRejectedError extends Error {
+  constructor(readonly marketId: string, readonly reason: string) {
+    super(`FIRST_LEG_LIFECYCLE_REJECTED:${marketId}:${reason}`);
+  }
+}
+
 function isJournalAdmissionRejectedError(error: unknown): boolean {
   return error instanceof JournalAdmissionRejected
     || (Boolean(error) && typeof error === "object" && (error as { name?: string }).name === "JournalAdmissionRejected");
@@ -282,6 +290,8 @@ export class EngineService {
   private readonly restingOrders = new Map<string, RestingPaperOrder>();
   private readonly makerReservations = new Map<string, string>();
   private readonly recentTrades = new Map<string, number>();
+  /** Ephemeral reservation for a not-yet-durable first-leg submission. */
+  private readonly pendingFirstLegMarkets = new Set<string>();
   private readonly activeTriggers = new Map<string, TriggerEvent>();
   private readonly triggerProvenance = new Map<string, TriggerProvenance>();
   private readonly provenanceInvalid = new Set<string>();
@@ -801,7 +811,7 @@ export class EngineService {
         id: undefined, durationHours: this.env.EXPERIMENT_DURATION_HOURS, strategyVersion: this.strategy.version,
         riskConfiguration: this.riskLimits,
         modelConfiguration: {
-          provider: "native_deterministic", version: "native-deterministic-v1",
+          provider: "native_deterministic", version: NATIVE_DETERMINISTIC_MODEL_VERSION,
           localExecution: true, externalInference: false, authority: NATIVE_DETERMINISTIC_AUTHORITY,
         },
         startingBalance: this.ledger.snapshot().startingBalance, systemVersion: "0.1.0",
@@ -1169,6 +1179,54 @@ export class EngineService {
     return ids;
   }
 
+  private restingOrderIntent(resting: RestingPaperOrder): "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" {
+    if (resting.intent) return resting.intent;
+    // Pre-PR1 checkpoints did not embed intent in RestingPaperOrder. Infer only
+    // enough to fail safe: an opposite-side order against current unpaired
+    // inventory is a hedge; every other unknown order is treated as first-leg.
+    const position = this.ledger.positions.get(resting.order.marketId);
+    if (
+      position?.unpairedOutcome
+      && resting.order.outcome !== position.unpairedOutcome
+    ) return "HEDGE_SECOND_LEG";
+    return "OPEN_FIRST_LEG";
+  }
+
+  private hasOutstandingFirstLegMaker(marketId: string): boolean {
+    for (const resting of this.restingOrders.values()) {
+      if (
+        resting.order.marketId === marketId
+        && d(resting.remaining).gt(0)
+        && this.restingOrderIntent(resting) === "OPEN_FIRST_LEG"
+      ) return true;
+    }
+    return false;
+  }
+
+  private firstLegLifecycleBlocked(marketId: string, ignoreOwnPending = false): boolean {
+    return this.settledMarkets.has(marketId)
+      || this.ledger.positions.has(marketId)
+      || this.hasOutstandingFirstLegMaker(marketId)
+      || (!ignoreOwnPending && this.pendingFirstLegMarkets.has(marketId));
+  }
+
+  private tryReserveFirstLegAdmission(marketId: string): boolean {
+    if (this.firstLegLifecycleBlocked(marketId)) return false;
+    this.pendingFirstLegMarkets.add(marketId);
+    return true;
+  }
+
+  private async cancelOutstandingFirstLegMakers(marketId: string, reason: string): Promise<void> {
+    for (const [orderId, resting] of [...this.restingOrders.entries()]) {
+      if (
+        resting.order.marketId !== marketId
+        || !d(resting.remaining).gt(0)
+        || this.restingOrderIntent(resting) !== "OPEN_FIRST_LEG"
+      ) continue;
+      await this.releaseMaker(orderId, { cancel: true, reason });
+    }
+  }
+
   private experimentEconomicResidueBlockers(): string[] {
     const ledger = this.ledger.snapshot();
     const openPositions = [...this.ledger.positions.values()].filter((position) => d(position.upQuantity).gt(0) || d(position.downQuantity).gt(0));
@@ -1473,6 +1531,7 @@ export class EngineService {
       } catch (error) {
         if (error instanceof CrashInjectedError) throw error;
         if (error instanceof ExperimentStartGuardRejectedError) throw error;
+        if (error instanceof FirstLegLifecycleGuardRejectedError) throw error;
         if (error instanceof DurableCursorBehindError) {
           commit = await this.catchUpOrRejectStalePlan(input.operationKey, input.type, error);
         } else if (error instanceof IdempotencyConflictError) {
@@ -1605,6 +1664,7 @@ export class EngineService {
           this.checkpointSequence = checkpoint.sequence;
         }
         await this.replayDurableTail(this.lastAppliedDurableCursor);
+        await this.restoreRestingMakerIntentsFromDurable();
         await this.repairAllDerivedAudit();
         const latest = await this.journal.latestDurableSequence();
         const report = validatePostReplayInvariants(this.recoverableBag(), this.lastAppliedDurableCursor, latest);
@@ -1630,7 +1690,7 @@ export class EngineService {
           durationHours: this.env.EXPERIMENT_DURATION_HOURS, strategyVersion: this.strategy.version,
           riskConfiguration: this.riskLimits,
           modelConfiguration: {
-            provider: "native_deterministic", version: "native-deterministic-v1",
+            provider: "native_deterministic", version: NATIVE_DETERMINISTIC_MODEL_VERSION,
             localExecution: true, externalInference: false, authority: NATIVE_DETERMINISTIC_AUTHORITY,
           },
           startingBalance: this.ledger.snapshot().startingBalance, systemVersion: "0.1.0",
@@ -1638,6 +1698,7 @@ export class EngineService {
         });
         this.lastAppliedDurableCursor = 0;
         await this.replayDurableTail(0);
+        await this.restoreRestingMakerIntentsFromDurable();
         await this.repairAllDerivedAudit();
         const latest = await this.journal.latestDurableSequence();
         const report = validatePostReplayInvariants(this.recoverableBag(), this.lastAppliedDurableCursor, latest);
@@ -1669,6 +1730,17 @@ export class EngineService {
     }
   }
 
+  private async restoreRestingMakerIntentsFromDurable(): Promise<void> {
+    for (const [orderId, resting] of this.restingOrders) {
+      if (resting.intent) continue;
+      const reserve = await this.journal.readDurableByOperationKey(`maker:${orderId}:reserve`);
+      const intent = reserve?.payload?.intent;
+      if (intent !== "OPEN_FIRST_LEG" && intent !== "HEDGE_SECOND_LEG") continue;
+      this.restingOrders.set(orderId, { ...resting, intent });
+    }
+    this.syncRestingIndexFromOrders();
+  }
+
   private hydrateCheckpointPayload(payload: Record<string, unknown>): {
     positions: number; restingOrders: number; activeTriggers: number; grokSignals: number;
   } {
@@ -1680,7 +1752,7 @@ export class EngineService {
       durationHours: this.env.EXPERIMENT_DURATION_HOURS, strategyVersion: this.strategy.version,
       riskConfiguration: this.riskLimits,
       modelConfiguration: {
-        provider: "native_deterministic", version: "native-deterministic-v1",
+        provider: "native_deterministic", version: NATIVE_DETERMINISTIC_MODEL_VERSION,
         localExecution: true, externalInference: false, authority: NATIVE_DETERMINISTIC_AUTHORITY,
       },
       startingBalance: this.ledger.snapshot().startingBalance,
@@ -1885,6 +1957,18 @@ export class EngineService {
       for (const orderId of this.restingIndex.orderIdsFor(snapshot.tokenId)) {
         const resting = this.restingOrders.get(orderId);
         if (!resting || resting.order.tokenId !== snapshot.tokenId) continue;
+        const currentPosition = this.ledger.positions.get(resting.order.marketId);
+        if (
+          this.restingOrderIntent(resting) === "OPEN_FIRST_LEG"
+          && currentPosition
+          && d(currentPosition.pairedQuantity).gt(0)
+        ) {
+          await this.releaseMaker(orderId, {
+            cancel: true,
+            reason: "FIRST_LEG_LIFECYCLE_CLOSED",
+          });
+          continue;
+        }
         const evolved = evolveMakerOrder(resting, previous, snapshot);
         if (evolved.fill) {
           await this.applyFill(evolved.fill, { restingAfter: evolved.resting });
@@ -2296,7 +2380,7 @@ export class EngineService {
     if (assetNeedsReliableReference(this.referenceRequired.get(marketId), this.referenceUnreliable, asset)) blockers.push("REFERENCE_PROVIDER_BLOCKED");
     if (!this.counterfactualStore.isRecoveryReady()) blockers.push("CF_RECOVERY_UNAVAILABLE");
     if (this.counterfactualStore.hasSettledMarket(marketId)) blockers.push("CF_MARKET_SETTLED");
-    if (this.counterfactualStore.hasUnpairedPosition(marketId)) blockers.push("EXISTING_UNPAIRED_POSITION");
+    if (this.counterfactualStore.hasOpenPosition(marketId)) blockers.push("EXISTING_OPEN_POSITION");
     if (!currentSnapshot || !selected) blockers.push("CURRENT_BOOK_NOT_EXECUTABLE");
     if (currentSnapshot && !this.adapterTokenSynchronized(currentSnapshot.tokenId)) blockers.push("TOKEN_UNSYNCHRONIZED");
 
@@ -2420,7 +2504,7 @@ export class EngineService {
               actionableMarketCount: capture.ranking.actionableMarketCount, selected: selectedAtDecision, globalTop: capture.ranking.top,
             },
             execution: {
-              version: "native-v2-shadow-execution-v1", evaluatedAt: capture.capturedAt,
+              version: NATIVE_V2_SHADOW_EXECUTION_VERSION, evaluatedAt: capture.capturedAt,
               preflightBlockers: ["SHADOW_EVALUATION_ERROR"], riskVetoes: [], wouldSubmitOrder: false,
               error: error instanceof Error ? error.message : String(error),
             },
@@ -2441,7 +2525,7 @@ export class EngineService {
     const marketId = input.opportunity.marketId;
     const selected = input.selected;
     const compactBase = {
-      version: "native-v2-shadow-execution-v1",
+      version: NATIVE_V2_SHADOW_EXECUTION_VERSION,
       stateBasis: NATIVE_V2_COUNTERFACTUAL_STATE_BASIS,
       evaluatedAt: input.capturedAt,
       marketId,
@@ -3108,6 +3192,10 @@ export class EngineService {
       maxOrderSizeUsd: this.riskLimits.maxOrderSizeUsd, minimumLockedPairEdge: this.riskLimits.minExpectedEdge,
     });
     if (!candidate) return;
+    if (
+      candidate.intent === "OPEN_FIRST_LEG"
+      && this.firstLegLifecycleBlocked(candidate.marketId)
+    ) return;
     // EXPERIMENT_STARTED is applied before its post-commit validation. Keep
     // first-leg admission fenced until the validation marker is durable.
     if (candidate.intent === "OPEN_FIRST_LEG" && this.experimentStartPending) return;
@@ -3231,33 +3319,55 @@ export class EngineService {
 
   private async submitPaperOrder(order: PaperOrder, decisionSnapshot: MarketSnapshot, duplicateKey: string, intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" = "OPEN_FIRST_LEG"): Promise<void> {
     if (intent === "OPEN_FIRST_LEG" && this.experimentStartPending) return;
-    // Last economic admission fence immediately before PAPER_ORDER_CREATED.
-    // close-entries and the native decision path are serialized by the same
-    // experimentBoundaryGate, while deadline expiry closes durably here.
-    if (intent === "OPEN_FIRST_LEG" && !(await this.ensureFirstLegEntryOpen())) return;
-    this.metrics.paperOrders.inc({ type: order.orderType });
-    this.record("PAPER_ORDER_CREATED", order.traceId, order.marketId, { orderId: order.id, type: order.orderType, intent }, decisionSnapshot.asset ?? null);
-    await this.persistReportInput(createJournalEvent({
-      id: derivedAuditEventId("PAPER_ORDER_CREATED", order.id),
-      traceId: order.traceId, type: "PAPER_ORDER_CREATED", aggregateType: "paper_order", aggregateId: order.id,
-      payload: { ...order, intent },
-    }));
-    this.recentTrades.set(duplicateKey, Date.now());
+    const firstLegReserved = intent === "OPEN_FIRST_LEG"
+      ? this.tryReserveFirstLegAdmission(order.marketId)
+      : false;
+    if (intent === "OPEN_FIRST_LEG" && !firstLegReserved) return;
+
     try {
-      if (order.orderType === "MAKER") {
-        await this.reserveMaker(order, decisionSnapshot, intent);
-        return;
+      // Last economic admission fence immediately before PAPER_ORDER_CREATED.
+      // close-entries and the native decision path are serialized by the same
+      // experimentBoundaryGate, while deadline expiry closes durably here.
+      if (intent === "OPEN_FIRST_LEG" && !(await this.ensureFirstLegEntryOpen())) return;
+      if (
+        intent === "OPEN_FIRST_LEG"
+        && this.firstLegLifecycleBlocked(order.marketId, true)
+      ) return;
+      if (intent === "HEDGE_SECOND_LEG") {
+        // Once hedging starts, an older first-leg maker remainder must not be
+        // allowed to refill directional exposure behind the hedge.
+        await this.cancelOutstandingFirstLegMakers(order.marketId, "HEDGE_ADMITTED");
       }
-      await delay(this.env.PAPER_EXECUTION_LATENCY_MS);
-      const current = this.state.marketSnapshots.get(order.tokenId);
-      if (!current || new Date(current.receivedAt).getTime() < new Date(decisionSnapshot.receivedAt).getTime()) throw new Error("STALE_EXECUTION_SNAPSHOT");
-      await this.applyFill(executePaperTaker({ order, snapshotAfterLatency: current, measuredLatencyMs: this.env.PAPER_EXECUTION_LATENCY_MS }));
-      this.lastTradeAt = this.nowFn();
-    } catch (error) {
-      if (this.overload.hasIntegrityFault || error instanceof IdempotencyConflictError || error instanceof CrashInjectedError || (error instanceof JournalAdmissionRejected && error.critical)) throw error;
-      this.executionErrors.push(Date.now());
-      this.record("PAPER_EXECUTION_ERROR", order.traceId, order.marketId, { orderId: order.id, message: error instanceof Error ? error.message : String(error) });
-      await this.persistReportInput(createJournalEvent({ traceId: order.traceId, type: "PAPER_EXECUTION_ERROR", aggregateType: "paper_order", aggregateId: order.id, payload: { message: error instanceof Error ? error.message : String(error) } }));
+
+      this.metrics.paperOrders.inc({ type: order.orderType });
+      this.record("PAPER_ORDER_CREATED", order.traceId, order.marketId, { orderId: order.id, type: order.orderType, intent }, decisionSnapshot.asset ?? null);
+      await this.persistReportInput(createJournalEvent({
+        id: derivedAuditEventId("PAPER_ORDER_CREATED", order.id),
+        traceId: order.traceId, type: "PAPER_ORDER_CREATED", aggregateType: "paper_order", aggregateId: order.id,
+        payload: { ...order, intent },
+      }));
+      this.recentTrades.set(duplicateKey, Date.now());
+      try {
+        if (order.orderType === "MAKER") {
+          await this.reserveMaker(order, decisionSnapshot, intent);
+          return;
+        }
+        await delay(this.env.PAPER_EXECUTION_LATENCY_MS);
+        const current = this.state.marketSnapshots.get(order.tokenId);
+        if (!current || new Date(current.receivedAt).getTime() < new Date(decisionSnapshot.receivedAt).getTime()) throw new Error("STALE_EXECUTION_SNAPSHOT");
+        const applied = await this.applyFill(
+          executePaperTaker({ order, snapshotAfterLatency: current, measuredLatencyMs: this.env.PAPER_EXECUTION_LATENCY_MS }),
+          { intent },
+        );
+        if (applied) this.lastTradeAt = this.nowFn();
+      } catch (error) {
+        if (this.overload.hasIntegrityFault || error instanceof IdempotencyConflictError || error instanceof CrashInjectedError || (error instanceof JournalAdmissionRejected && error.critical)) throw error;
+        this.executionErrors.push(Date.now());
+        this.record("PAPER_EXECUTION_ERROR", order.traceId, order.marketId, { orderId: order.id, message: error instanceof Error ? error.message : String(error) });
+        await this.persistReportInput(createJournalEvent({ traceId: order.traceId, type: "PAPER_EXECUTION_ERROR", aggregateType: "paper_order", aggregateId: order.id, payload: { message: error instanceof Error ? error.message : String(error) } }));
+      }
+    } finally {
+      if (firstLegReserved) this.pendingFirstLegMarkets.delete(order.marketId);
     }
   }
 
@@ -3273,9 +3383,13 @@ export class EngineService {
       throw new Error("INSUFFICIENT_CASH");
     }
     const resting = compactedRetry
-      ? (this.restingOrders.get(order.id) ?? createRestingMakerOrder(order, snapshot))
-      : createRestingMakerOrder(order, snapshot);
-    const auth = { orderId: order.id, reserved: notional, resting, intent };
+      ? (this.restingOrders.get(order.id) ?? createRestingMakerOrder(order, snapshot, intent))
+      : createRestingMakerOrder(order, snapshot, intent);
+    // Keep the durable resting identity byte-compatible with pre-PR1 rows.
+    // intent has always been a top-level reserve fact; recovery reattaches it
+    // to the in-memory resting order.
+    const { intent: _runtimeIntent, ...durableResting } = resting;
+    const auth = { orderId: order.id, reserved: notional, resting: durableResting, intent };
     await this.commitAuthoritative({
       operationKey: `maker:${order.id}:reserve`,
       type: "PAPER_MAKER_RESERVED",
@@ -3352,23 +3466,34 @@ export class EngineService {
     return { ...current, remaining: remaining.gt(0) ? remaining.toFixed() : "0" };
   }
 
-  private async applyFill(fill: Parameters<PaperLedger["applyFill"]>[0], extras: { restingAfter?: RestingPaperOrder | null } = {}): Promise<void> {
+  private async applyFill(
+    fill: Parameters<PaperLedger["applyFill"]>[0],
+    extras: {
+      restingAfter?: RestingPaperOrder | null;
+      intent?: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG";
+    } = {},
+  ): Promise<boolean> {
     // A settlement is the terminal authority for this market. The live bit
     // is normally restored from the verified checkpoint; the durable lookup
     // covers a rediscovery/retry after bounded replay-key pressure evicted the
     // settlement identity. Never let an old fill recreate a settled position.
-    if (this.settledMarkets.has(fill.marketId)) return;
+    if (this.settledMarkets.has(fill.marketId)) return false;
     const settlementAuthority = await this.journal.readDurableByOperationKey(`settlement:${fill.marketId}:${this.experiment?.id ?? "paper"}`);
     if (settlementAuthority?.type === "POSITION_SETTLED") {
       this.settledMarkets.add(fill.marketId);
-      return;
+      return false;
     }
+    const restingAtAdmission = fill.liquidityRole === "MAKER"
+      ? (this.restingOrders.get(fill.orderId) ?? null)
+      : null;
+    const economicIntent = extras.intent
+      ?? (restingAtAdmission ? this.restingOrderIntent(restingAtAdmission) : undefined);
     const priorFillAuthority = await this.journal.readDurableByOperationKey(`fill:${fill.id}`);
     const compactedRetry = Boolean(priorFillAuthority && Object.keys(priorFillAuthority.payload).length === 0);
     // A fill with no existing position is a first leg. The post-commit start
     // validation fence must reject it while the experiment identity is still
     // pending; hedges for pre-existing positions remain admissible.
-    if (this.experimentStartPending && !this.ledger.positions.has(fill.marketId)) return;
+    if (this.experimentStartPending && !this.ledger.positions.has(fill.marketId)) return false;
     const reserved = this.makerReservations.get(fill.orderId);
     let reservationAfter: string | null = reserved ?? null;
     if (reserved && fill.liquidityRole === "MAKER" && !compactedRetry) {
@@ -3377,42 +3502,84 @@ export class EngineService {
       reservationAfter = next.gt(0) ? decimal(next) : null;
     }
     const previous = this.ledger.positions.get(fill.marketId);
-    const wasEmpty = !previous || (!d(previous.upQuantity).gt(0) && !d(previous.downQuantity).gt(0));
     const positionId = previous?.id ?? stablePositionId(fill.marketId);
     const restingAfter = compactedRetry
       ? (this.restingOrders.get(fill.orderId) ?? null)
       : this.computeMakerRestingAfter(fill, extras);
-    await this.commitAuthoritative({
-      operationKey: `fill:${fill.id}`,
-      type: "PAPER_FILL",
-      aggregateType: "paper_fill",
-      aggregateId: fill.id,
-      buildPayload: (occurredAt) => {
-        // wasEmpty only drives derived audit classification and is deliberately
-        // excluded from the authoritative transition payload. Keeping the
-        // replay payload to stable operation facts lets a compacted retry
-        // reconstruct the same hash after the live projection has advanced.
-        const auth = { fill, positionId, reservationAfter, restingAfter };
-        return {
-          ...auth,
-          derivedAudit: this.projectDerivedAudit(
-            { operationKey: `fill:${fill.id}`, type: "PAPER_FILL", aggregateType: "paper_fill", aggregateId: fill.id, payload: auth },
-            occurredAt,
-            (projected) => this.buildFillDerivedAudit(fill, wasEmpty, projected, occurredAt),
-          ),
-        };
-      },
-      afterApply: async () => {
-        this.record("PAPER_FILL", fill.traceId, fill.marketId, { fillId: fill.id, orderId: fill.orderId, price: fill.fillPrice, quantity: fill.quantity, role: fill.liquidityRole });
-        this.metrics.paperFills.inc({ role: fill.liquidityRole });
-        const position = this.ledger.positions.get(fill.marketId);
-        if (position) {
-          for (const trigger of this.triggerEngine.ingestPosition(position, fill.traceId, this.assetByMarket.get(fill.marketId) ?? null)) {
-            this.admitTrigger(trigger);
+    try {
+      await this.commitAuthoritative({
+        operationKey: `fill:${fill.id}`,
+        type: "PAPER_FILL",
+        aggregateType: "paper_fill",
+        aggregateId: fill.id,
+        beforeCommit: () => {
+          if (economicIntent !== "OPEN_FIRST_LEG" || priorFillAuthority) return;
+          const currentPosition = this.ledger.positions.get(fill.marketId);
+          if (fill.liquidityRole === "TAKER") {
+            if (currentPosition) {
+              throw new FirstLegLifecycleGuardRejectedError(fill.marketId, "POSITION_ALREADY_EXISTS");
+            }
+            return;
           }
-        }
-      },
-    });
+          const currentResting = this.restingOrders.get(fill.orderId);
+          if (
+            !currentResting
+            || this.restingOrderIntent(currentResting) !== "OPEN_FIRST_LEG"
+          ) {
+            throw new FirstLegLifecycleGuardRejectedError(fill.marketId, "MAKER_NOT_ACTIVE");
+          }
+          if (currentPosition && d(currentPosition.pairedQuantity).gt(0)) {
+            throw new FirstLegLifecycleGuardRejectedError(fill.marketId, "PAIRING_ALREADY_STARTED");
+          }
+        },
+        buildPayload: (occurredAt) => {
+          const previousAtCommit = this.ledger.positions.get(fill.marketId);
+          const wasEmptyAtCommit = !previousAtCommit
+            || (!d(previousAtCommit.upQuantity).gt(0) && !d(previousAtCommit.downQuantity).gt(0));
+          // wasEmpty only drives derived audit classification and is deliberately
+          // excluded from the authoritative transition payload. Keeping the
+          // replay payload to stable operation facts lets a compacted retry
+          // reconstruct the same hash after the live projection has advanced.
+          const auth = { fill, positionId, reservationAfter, restingAfter };
+          return {
+            ...auth,
+            derivedAudit: this.projectDerivedAudit(
+              { operationKey: `fill:${fill.id}`, type: "PAPER_FILL", aggregateType: "paper_fill", aggregateId: fill.id, payload: auth },
+              occurredAt,
+              (projected) => this.buildFillDerivedAudit(fill, wasEmptyAtCommit, projected, occurredAt),
+            ),
+          };
+        },
+        afterApply: async () => {
+          this.record("PAPER_FILL", fill.traceId, fill.marketId, { fillId: fill.id, orderId: fill.orderId, price: fill.fillPrice, quantity: fill.quantity, role: fill.liquidityRole });
+          this.metrics.paperFills.inc({ role: fill.liquidityRole });
+          const position = this.ledger.positions.get(fill.marketId);
+          if (position) {
+            for (const trigger of this.triggerEngine.ingestPosition(position, fill.traceId, this.assetByMarket.get(fill.marketId) ?? null)) {
+              this.admitTrigger(trigger);
+            }
+          }
+        },
+      });
+    } catch (error) {
+      if (!(error instanceof FirstLegLifecycleGuardRejectedError)) throw error;
+      this.record("FIRST_LEG_LIFECYCLE_BLOCKED", fill.traceId, fill.marketId, {
+        fillId: fill.id,
+        orderId: fill.orderId,
+        reason: error.reason,
+      });
+      if (fill.liquidityRole === "MAKER" && this.restingOrders.has(fill.orderId)) {
+        await this.releaseMaker(fill.orderId, {
+          cancel: true,
+          reason: "FIRST_LEG_LIFECYCLE_CLOSED",
+        });
+      }
+      return false;
+    }
+    if (economicIntent === "HEDGE_SECOND_LEG") {
+      await this.cancelOutstandingFirstLegMakers(fill.marketId, "HEDGE_FILLED");
+    }
+    return true;
   }
 
   private buildFillDerivedAudit(

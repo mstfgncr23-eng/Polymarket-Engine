@@ -88,6 +88,14 @@ function opportunity(
 }
 
 describe("native v2 shadow opportunity ranking", () => {
+  it("records winner-only opportunity and ranking semantic versions", () => {
+    const result = opportunity("m-version", 0.70, T0);
+    const ranker = new NativeV2ShadowOpportunityRanker();
+    const ranked = ranker.upsertAndRank(result, new Date(T0), 15_000);
+    expect(result.version).toBe("native-v2-shadow-opportunity-v2");
+    expect(ranked.version).toBe("native-v2-shadow-ranking-v2");
+  });
+
   it("selects the side with the best executable fee-aware capital efficiency", () => {
     const result = opportunity("m1", 0.65, T0, 0.55, 0.45);
     expect(result.best?.outcome).toBe("UP");
@@ -121,7 +129,7 @@ describe("native v2 shadow opportunity ranking", () => {
     expect(up?.actionable).toBe(true);
   });
 
-  it("marks a side non-executable when the current ask book cannot absorb the target notional", () => {
+  it("does not substitute the loser side when the fair-probability winner is not executable", () => {
     const result = evaluateNativeV2ShadowMarketOpportunity({
       fair: fair(0.75),
       snapshots: {
@@ -131,7 +139,17 @@ describe("native v2 shadow opportunity ranking", () => {
       now: new Date(T0),
     });
     expect(result?.candidates.UP).toBeNull();
-    expect(result?.best?.outcome).toBe("DOWN");
+    expect(result?.candidates.DOWN?.actionable).toBe(false);
+    expect(result?.best).toBeNull();
+  });
+
+  it("keeps a cheap longshot diagnostic but never selects it over the absolute winner", () => {
+    const result = opportunity("m-longshot", 0.90, T0, 0.95, 0.05);
+    expect(result.candidates.DOWN?.netEvUsdPerShare).toBeCloseTo(0.05, 8);
+    expect(result.candidates.DOWN?.actionable).toBe(false);
+    expect(result.best?.outcome).toBe("UP");
+    expect(result.best?.fairProbability).toBeCloseTo(0.90, 8);
+    expect(result.best?.actionable).toBe(false);
   });
 
   it("ranks markets deterministically by ROI and evicts stale latest values", () => {
@@ -149,6 +167,24 @@ describe("native v2 shadow opportunity ranking", () => {
     const afterEviction = ranker.upsertAndRank(refreshedHigh, new Date("2026-09-16T17:00:20.001Z"), 15_000);
     expect(afterEviction.rankedMarketCount).toBe(1);
     expect(ranker.size()).toBe(1);
+  });
+
+  it("ranks an actionable winner ahead of a higher-ROI non-actionable diagnostic", () => {
+    const ranker = new NativeV2ShadowOpportunityRanker();
+    // Winner edge is +0.014/share, below the 0.015 admission threshold but
+    // capital-efficient enough to outrank the next market by raw ROI.
+    const blocked = opportunity("m-blocked", 0.50 + 0.014, T0, 0.50, 0.50);
+    // Higher absolute probability and a smaller ROI, but +0.02/share is
+    // actionable and therefore must own the execution rank-1 slot.
+    const actionable = opportunity("m-actionable", 0.97, T0, 0.95, 0.05);
+    expect(blocked.best?.actionable).toBe(false);
+    expect(actionable.best?.actionable).toBe(true);
+
+    ranker.upsertAndRank(blocked, new Date(T0), 15_000);
+    const ranked = ranker.upsertAndRank(actionable, new Date(T0), 15_000);
+    expect(ranked.top?.marketId).toBe("m-actionable");
+    expect(ranked.marketRank).toBe(1);
+    expect(ranked.actionableMarketCount).toBe(1);
   });
 
   it("uses stable identifiers as the final tie break instead of insertion order", () => {

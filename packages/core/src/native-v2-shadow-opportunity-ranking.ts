@@ -3,8 +3,8 @@ import type { MarketSnapshot, Outcome } from "./domain.js";
 import type { NativeV2ShadowFairProbability } from "./native-v2-shadow-fair-probability.js";
 import { DEFAULT_FIRST_LEG_RISK_CAP_USD } from "./strategy.js";
 
-export const NATIVE_V2_SHADOW_OPPORTUNITY_VERSION = "native-v2-shadow-opportunity-v1" as const;
-export const NATIVE_V2_SHADOW_RANKING_VERSION = "native-v2-shadow-ranking-v1" as const;
+export const NATIVE_V2_SHADOW_OPPORTUNITY_VERSION = "native-v2-shadow-opportunity-v2" as const;
+export const NATIVE_V2_SHADOW_RANKING_VERSION = "native-v2-shadow-ranking-v2" as const;
 
 const DEFAULT_MAX_MARKETS = 512;
 
@@ -93,9 +93,20 @@ export function evaluateNativeV2ShadowMarketOpportunity(input: {
     UP: evaluateCandidate(up, input.fair.fairProbabilityUp, targetNotionalUsd, minimumNetEvUsdPerShare),
     DOWN: evaluateCandidate(down, input.fair.fairProbabilityDown, targetNotionalUsd, minimumNetEvUsdPerShare),
   };
-  const best = [candidates.UP, candidates.DOWN]
-    .filter((candidate): candidate is NativeV2ShadowOpportunityCandidate => candidate !== null)
-    .sort(compareCandidates)[0] ?? null;
+  const winnerOutcome: Outcome | null = input.fair.fairProbabilityUp > input.fair.fairProbabilityDown
+    ? "UP"
+    : input.fair.fairProbabilityDown > input.fair.fairProbabilityUp ? "DOWN" : null;
+  // Preserve loser-side economics for diagnostics, but never expose it as an
+  // actionable first-leg opportunity in a winner-direction engine.
+  if (winnerOutcome === "UP" && candidates.DOWN) {
+    candidates.DOWN = { ...candidates.DOWN, actionable: false };
+  } else if (winnerOutcome === "DOWN" && candidates.UP) {
+    candidates.UP = { ...candidates.UP, actionable: false };
+  } else if (winnerOutcome === null) {
+    if (candidates.UP) candidates.UP = { ...candidates.UP, actionable: false };
+    if (candidates.DOWN) candidates.DOWN = { ...candidates.DOWN, actionable: false };
+  }
+  const best = winnerOutcome ? candidates[winnerOutcome] : null;
 
   return {
     version: NATIVE_V2_SHADOW_OPPORTUNITY_VERSION,
@@ -281,6 +292,9 @@ function compareMarketOpportunities(
   a: NativeV2ShadowMarketOpportunity & { best: NativeV2ShadowOpportunityCandidate },
   b: NativeV2ShadowMarketOpportunity & { best: NativeV2ShadowOpportunityCandidate },
 ): number {
+  // Non-actionable winner diagnostics must never starve an actionable market
+  // from the global rank-1 execution slot.
+  if (a.best.actionable !== b.best.actionable) return a.best.actionable ? -1 : 1;
   return compareCandidates(a.best, b.best);
 }
 

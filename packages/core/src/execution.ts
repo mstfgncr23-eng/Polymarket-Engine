@@ -33,6 +33,8 @@ export interface RestingPaperOrder {
   queueAhead: string;
   remaining: string;
   observedAt: string;
+  /** Strategy lifecycle intent. Optional only for pre-PR1 checkpoints. */
+  intent?: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG";
 }
 
 export const restingPaperOrderSchema = z.object({
@@ -40,13 +42,24 @@ export const restingPaperOrderSchema = z.object({
   queueAhead: decimalStringSchema,
   remaining: decimalStringSchema,
   observedAt: timestampSchema,
+  intent: z.enum(["OPEN_FIRST_LEG", "HEDGE_SECOND_LEG"]).optional(),
 });
 
-export function createRestingMakerOrder(order: PaperOrder, snapshot: MarketSnapshot): RestingPaperOrder {
+export function createRestingMakerOrder(
+  order: PaperOrder,
+  snapshot: MarketSnapshot,
+  intent?: RestingPaperOrder["intent"],
+): RestingPaperOrder {
   if (order.orderType !== "MAKER") throw new Error("ORDER_IS_NOT_MAKER");
   const sameSide = order.side === "BUY" ? snapshot.bids : snapshot.asks;
   const atPrice = sameSide.find((level) => d(level.price).eq(order.requestedPrice));
-  return { order: { ...order, status: "RESTING" }, queueAhead: atPrice?.quantity ?? "0", remaining: order.quantity, observedAt: snapshot.receivedAt };
+  return {
+    order: { ...order, status: "RESTING" },
+    queueAhead: atPrice?.quantity ?? "0",
+    remaining: order.quantity,
+    observedAt: snapshot.receivedAt,
+    ...(intent ? { intent } : {}),
+  };
 }
 
 export function evolveMakerOrder(

@@ -2,6 +2,8 @@ import type { Direction, MarketSnapshot, TriggerEvent } from "./domain.js";
 
 /** The single economic decision authority used by the native paper experiment. */
 export const NATIVE_DETERMINISTIC_AUTHORITY = "NATIVE_DETERMINISTIC_V1" as const;
+/** Semantic model version recorded in experiment provenance. Authority remains the V1 family. */
+export const NATIVE_DETERMINISTIC_MODEL_VERSION = "native-deterministic-v1.1" as const;
 
 export interface NativeReferenceFeatures {
   asset: string;
@@ -131,9 +133,19 @@ export function evaluateNativeDecision(input: NativeDecisionInput): NativeDecisi
     config.probabilityFloor,
     config.probabilityCeiling,
   );
-  const direction: Direction = directionalScore > config.directionThreshold
+  // directionalScore remains the existing V1 evidence-admission gate, but its
+  // sign is not allowed to name a less-likely outcome as the winner. A fresh
+  // direction is actionable only when thresholded evidence and the absolute
+  // fair-probability winner agree; otherwise V1 stays FLAT.
+  const evidenceDirection: Direction = directionalScore > config.directionThreshold
     ? "UP"
     : directionalScore < -config.directionThreshold ? "DOWN" : "FLAT";
+  const fairWinner: Direction = fairProbabilityUp > 0.5
+    ? "UP"
+    : fairProbabilityUp < 0.5 ? "DOWN" : "FLAT";
+  const direction: Direction = evidenceDirection !== "FLAT" && evidenceDirection === fairWinner
+    ? fairWinner
+    : "FLAT";
 
   let confidence = 0.5 + 0.25 * Math.abs(bookPressure) + 0.25 * Math.abs(referenceStrength);
   if (

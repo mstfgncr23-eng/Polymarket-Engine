@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   evaluateNativeDecision,
+  NATIVE_DETERMINISTIC_MODEL_VERSION,
   marketSnapshotSchema,
   triggerEventSchema,
   type MarketSnapshot,
@@ -45,6 +46,10 @@ function evaluate(up: MarketSnapshot, down: MarketSnapshot, ref: NativeReference
 }
 
 describe("native deterministic decision model", () => {
+  it("records the winner-corrected V1 semantic model version", () => {
+    expect(NATIVE_DETERMINISTIC_MODEL_VERSION).toBe("native-deterministic-v1.1");
+  });
+
   it("returns UP for strong aligned UP evidence", () => {
     const result = evaluate(book("UP", "100", "1"), book("DOWN", "1", "100"), reference(30));
     expect(result?.direction).toBe("UP");
@@ -62,8 +67,27 @@ describe("native deterministic decision model", () => {
     expect(result?.direction).toBe("FLAT");
   });
 
-  it("reduces confidence and avoids forcing a direction on disagreement", () => {
+  it("stays FLAT when directional evidence points toward the lower-probability longshot", () => {
+    const up = book("UP", "10", "100", {
+      bids: [{ price: "0.90", quantity: "10" }],
+      asks: [{ price: "0.92", quantity: "100" }],
+    });
+    const down = book("DOWN", "100", "10", {
+      bids: [{ price: "0.08", quantity: "100" }],
+      asks: [{ price: "0.10", quantity: "10" }],
+    });
+    const result = evaluate(up, down, reference(-30));
+    expect(result?.featureVector.directionalScore).toBeLessThan(-0.15);
+    expect(result?.featureVector.fairProbabilityUp).toBeGreaterThan(0.5);
+    expect(result?.direction).toBe("FLAT");
+    expect(result?.fairProbability).toBe(result?.featureVector.fairProbabilityUp);
+  });
+
+  it("reduces confidence and keeps weak conflicting evidence FLAT", () => {
     const result = evaluate(book("UP", "100", "1"), book("DOWN", "1", "100"), reference(-30));
+    expect(result?.featureVector.directionalScore).toBeLessThan(0);
+    expect(Math.abs(result?.featureVector.directionalScore ?? 1)).toBeLessThan(0.15);
+    expect(result?.featureVector.fairProbabilityUp).toBeLessThan(0.5);
     expect(result?.direction).toBe("FLAT");
     expect(result?.confidence).toBeLessThan(0.9);
   });

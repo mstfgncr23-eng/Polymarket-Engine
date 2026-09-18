@@ -45,7 +45,7 @@ export interface Strategy {
 
 export class TemporalPairHedgeStrategy implements Strategy {
   readonly id = "temporal-pair-hedge";
-  constructor(readonly version = "temporal-pair-hedge-v1.1") {}
+  constructor(readonly version = "temporal-pair-hedge-v1.2") {}
 
   evaluate(context: StrategyContext): StrategyCandidate | null {
     const position = context.position;
@@ -68,7 +68,20 @@ export class TemporalPairHedgeStrategy implements Strategy {
       };
     }
 
+    // Any unsettled position owns this market lifecycle. An unpaired position
+    // may only hedge above; a fully paired position is absorbing until settlement.
+    if (position) return null;
+
     if (context.consensus.consensusDirection === "FLAT") return null;
+    const winnerProbability = context.consensus.fairProbability;
+    // Fresh entry requires explicit winner-probability semantics. Historical
+    // consensus rows may remain readable without this field, but they are not
+    // executable first-leg authority.
+    if (
+      winnerProbability === undefined
+      || !Number.isFinite(winnerProbability)
+      || winnerProbability <= 0.5
+    ) return null;
     const outcome: Outcome = context.consensus.consensusDirection;
     const snapshot = context.snapshots[outcome];
     const ask = snapshot?.asks[0];
