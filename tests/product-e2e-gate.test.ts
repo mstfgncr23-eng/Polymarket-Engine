@@ -552,12 +552,13 @@ describe("PR20 true product end-to-end gate", () => {
       });
       expect(setup.engine.ledger.positions.get("btc-mkt")?.unpairedQuantity).toBe("10");
 
-      setup.clock.nowMs = START_MS + 331_001;
+      // The 30-second durable backoff is state-aware: when the blocker
+      // materially recovers, the next fresh book may retry immediately.
+      setup.clock.nowMs = START_MS + 310_000;
       await setup.market.emitSnapshot(snapshot({
         ...marketBook(setup.clock, "UP", 31),
         bids: [{ price: "0.30", quantity: "20" }],
         asks: [{ price: "0.31", quantity: "100" }],
-        feeSchedule: null,
       }));
       await waitFor(
         () => setup.journal.queryEvents({ types: ["RISK_EVALUATION"] }),
@@ -568,9 +569,15 @@ describe("PR20 true product end-to-end gate", () => {
         .filter((row) => Boolean(row.payload.deRisk));
       expect(secondWindow).toHaveLength(2);
       expect(secondWindow[1]?.payload).toMatchObject({
-        accepted: false,
-        deRisk: { retryCount: 2, finalState: "RISK_VETO" },
+        accepted: true,
+        intent: "PROTECTIVE_DE_RISK",
+        deRisk: { retryCount: 2, finalState: "ORDER_ADMITTED" },
       });
+      await waitFor(
+        () => setup.journal.queryEvents({ types: ["PAPER_FILL"] }),
+        (rows) => rows.some((row) => row.payload.intent === "PROTECTIVE_DE_RISK"),
+      );
+      expect(setup.engine.ledger.positions.has("btc-mkt")).toBe(false);
     } finally {
       await setup.engine.stop();
     }
