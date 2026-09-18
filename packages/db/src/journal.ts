@@ -185,6 +185,7 @@ export interface EventJournal {
     occurredBefore: Date;
     commitSeqTo: number;
     recordedAtTo: Date;
+    unattributedOnly?: boolean;
     limit: number;
   }): Promise<{ deleted: number }>;
   pruneOldCheckpoints(keepLatest: number, limit?: number): Promise<{ deleted: number; latestSequence: number | null }>;
@@ -204,7 +205,7 @@ export interface EventJournal {
   loadAnalyticsRollup?(experimentId: string, rollupKind?: string): Promise<AnalyticsRollup | null>;
   deleteCanonicalEventsThrough?(input: { experimentId: string; occurredBefore?: Date; limit: number; sourceCursor: number; sourceCommitSeq?: number; sourceRecordedAt?: Date }): Promise<{ deleted: number }>;
   countCanonicalEventsThrough(input: { experimentId: string; occurredBefore: Date; sourceCommitSeq: number; sourceRecordedAt: Date }): Promise<{ count: number; oldestOccurredAt: string | null }>;
-  countEligible(types: readonly string[], occurredBefore: Date): Promise<{ count: number; oldestOccurredAt: string | null }>;
+  countEligible(types: readonly string[], occurredBefore: Date, options?: { unattributedOnly?: boolean }): Promise<{ count: number; oldestOccurredAt: string | null }>;
   withReadSnapshot<T>(work: (journal: EventJournalKeyset) => Promise<T>): Promise<{ value: T; stable: boolean }>;
   latestCommitSeq(): Promise<number>;
   eventCommitSeq?(id: string): Promise<number | null>;
@@ -502,6 +503,7 @@ export class MemoryEventJournal implements EventJournal {
     occurredBefore: Date;
     commitSeqTo: number;
     recordedAtTo: Date;
+    unattributedOnly?: boolean;
     limit: number;
   }): Promise<{ deleted: number }> {
     assertJournalCapability(this.access, "maintenance", "deleteJournalEventsArchivedRange");
@@ -515,6 +517,8 @@ export class MemoryEventJournal implements EventJournal {
     const recordedTo = input.recordedAtTo.getTime();
     const victims = this.events
       .filter((event) => input.types.includes(event.type))
+      .filter((event) => !input.unattributedOnly
+        || !((event.payload as { experimentId?: unknown }).experimentId))
       .filter((event) => {
         const occurred = Date.parse(event.occurredAt);
         const recorded = Date.parse(event.recordedAt);
@@ -534,10 +538,12 @@ export class MemoryEventJournal implements EventJournal {
     this.recordMutation(`deleteJournalEventsArchivedRange:${victims.length}`);
     return { deleted: victims.length };
   }
-  async countEligible(types: readonly string[], occurredBefore: Date): Promise<{ count: number; oldestOccurredAt: string | null }> {
+  async countEligible(types: readonly string[], occurredBefore: Date, options: { unattributedOnly?: boolean } = {}): Promise<{ count: number; oldestOccurredAt: string | null }> {
     const cutoff = occurredBefore.toISOString();
     const rows = this.events
       .filter((event) => types.includes(event.type) && event.occurredAt < cutoff)
+      .filter((event) => !options.unattributedOnly
+        || !((event.payload as { experimentId?: unknown }).experimentId))
       .sort(compareJournalEventOrder);
     return { count: rows.length, oldestOccurredAt: rows[0]?.occurredAt ?? null };
   }
@@ -1198,6 +1204,7 @@ export class PostgresEventJournal implements EventJournal {
     occurredBefore: Date;
     commitSeqTo: number;
     recordedAtTo: Date;
+    unattributedOnly?: boolean;
     limit: number;
   }): Promise<{ deleted: number }> {
     assertJournalCapability(this.access, "maintenance", "deleteJournalEventsArchivedRange");
@@ -1216,6 +1223,7 @@ export class PostgresEventJournal implements EventJournal {
           AND occurred_at < ${input.occurredBefore.toISOString()}
           AND commit_seq <= ${input.commitSeqTo}
           AND recorded_at <= ${input.recordedAtTo.toISOString()}
+          AND (${!input.unattributedOnly} OR COALESCE(payload->>'experimentId', '') = '')
         ORDER BY occurred_at ASC, id ASC
         LIMIT ${cap}
       )
@@ -1568,13 +1576,19 @@ export class PostgresEventJournal implements EventJournal {
       verified: Boolean(contentHash && hashCheckpointPayload(payload) === contentHash),
     };
   }
-  async countEligible(types: readonly string[], occurredBefore: Date): Promise<{ count: number; oldestOccurredAt: string | null }> {
+  async countEligible(types: readonly string[], occurredBefore: Date, options: { unattributedOnly?: boolean } = {}): Promise<{ count: number; oldestOccurredAt: string | null }> {
     if (types.length === 0) return { count: 0, oldestOccurredAt: null };
+    const predicates = [
+      inArray(journalEvents.type, [...types]),
+      lt(journalEvents.occurredAt, occurredBefore),
+    ];
+    if (options.unattributedOnly) {
+      predicates.push(sql`coalesce(${journalEvents.payload}->>'experimentId', '') = ''`);
+    }
     const rows = await this.db.select({
       count: sql<number>`count(*)::int`,
       oldest: sql<Date | null>`min(${journalEvents.occurredAt})`,
-    }).from(journalEvents)
-      .where(and(inArray(journalEvents.type, [...types]), lt(journalEvents.occurredAt, occurredBefore)));
+    }).from(journalEvents).where(and(...predicates));
     const row = rows[0];
     return {
       count: Number(row?.count ?? 0),
