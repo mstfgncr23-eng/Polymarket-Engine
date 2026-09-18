@@ -4,6 +4,8 @@ import {
   TriggerEngine,
   createId,
   decidePaperOrder,
+  decideProtectivePaperOrder,
+  buildProtectiveDeRiskCandidate,
   defaultNativeDecisionConfig,
   evaluateNativeDecision,
   NATIVE_DETERMINISTIC_AUTHORITY,
@@ -218,6 +220,20 @@ type GrokSubmissionResult = {
   signalId?: string;
 };
 
+type ProtectiveDeRiskAudit = {
+  deRiskReason: "MAX_UNHEDGED_DURATION";
+  unhedgedStartedAt: string;
+  unhedgedDurationMs: number;
+  attemptedAction: "SELL_UNPAIRED";
+  requestedQty: string;
+  executableQty: string;
+  executionPrice: string | null;
+  residualQuantity: string;
+  residualExposure: string;
+  retryCount: number;
+  finalState: "ORDER_ADMITTED" | "RISK_VETO" | "RESIDUAL_UNHEDGED" | "RISK_NEUTRALIZED" | "EXECUTION_ERROR";
+};
+
 type NativeV2ShadowExecutionCapture = {
   trigger: TriggerEvent;
   featureVector: NativeV2ShadowFeatureVector;
@@ -292,6 +308,9 @@ export class EngineService {
   private readonly recentTrades = new Map<string, number>();
   /** Ephemeral reservation for a not-yet-durable first-leg submission. */
   private readonly pendingFirstLegMarkets = new Set<string>();
+  /** One risk-reducing unwind flight per market; never block the websocket consumer. */
+  private readonly protectiveDeRiskInFlight = new Set<string>();
+  private readonly protectiveDeRiskAttempts = new Map<string, number>();
   private readonly activeTriggers = new Map<string, TriggerEvent>();
   private readonly triggerProvenance = new Map<string, TriggerProvenance>();
   private readonly provenanceInvalid = new Set<string>();
