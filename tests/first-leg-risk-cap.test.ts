@@ -126,7 +126,7 @@ describe("temporal pair hedge first-leg risk cap", () => {
       intent: "PROTECTIVE_DE_RISK",
       outcome: "UP",
       quantity: "7",
-      limitPrice: "0.4",
+      limitPrice: "0.40",
     });
 
     const order = paperOrderSchema.parse({
