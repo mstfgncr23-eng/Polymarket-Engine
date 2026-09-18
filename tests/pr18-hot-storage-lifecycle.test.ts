@@ -1,4 +1,4 @@
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,7 +15,11 @@ import {
   hashCheckpointPayload,
 } from "@pm/db";
 import { ExperimentSummaryAccumulator } from "../apps/engine/src/report.js";
-import { exportExperimentArchive } from "../apps/engine/src/archive.js";
+import {
+  LOCAL_ARCHIVE_SENTINEL,
+  LOCAL_ARCHIVE_SENTINEL_CONTENT,
+  exportExperimentArchive,
+} from "../apps/engine/src/archive.js";
 import {
   hashAnalyticsRollup,
   loadVerifiedAnalyticsRollup,
@@ -38,6 +42,22 @@ function event(type: string, id: string, occurredAt: string, payload: Record<str
     payload: { experimentId: "exp-pr18", ...payload },
     occurredAt: new Date(occurredAt),
   });
+}
+
+async function archiveConfig(
+  overrides: Parameters<typeof defaultRetentionConfig>[0] = {},
+) {
+  const directory = await mkdtemp(join(tmpdir(), "pr18-retention-archive-"));
+  await writeFile(join(directory, LOCAL_ARCHIVE_SENTINEL), `${LOCAL_ARCHIVE_SENTINEL_CONTENT}\n`, "utf8");
+  return {
+    directory,
+    config: defaultRetentionConfig({
+      ...overrides,
+      localArchiveEnabled: true,
+      localArchiveDir: directory,
+      localArchiveBucketMs: 60_000,
+    }),
+  };
 }
 
 function checkpointPayload(cursor: number): Record<string, unknown> {
@@ -343,30 +363,123 @@ describe("PR18 hot operational storage lifecycle", () => {
     await expect(journal.persistAnalyticsRollup!(rollup)).resolves.toMatchObject({ experimentId: "exp-pr18" });
   });
 
-  it("rolls active canonical input into a bounded hot set before completion", async () => {
+  it("keeps active canonical detail hot while rolling a verified summary", async () => {
     const journal = new MemoryEventJournal();
-    const manager = new RetentionManager(journal, defaultRetentionConfig({ enabled: true, analyticsRollupEnabled: true, maxRowsPerCycle: 500, maxBatchesPerCycle: 20, batchSize: 100 }));
+    const manager = new RetentionManager(journal, defaultRetentionConfig({
+      enabled: true,
+      analyticsRollupEnabled: true,
+      maxRowsPerCycle: 500,
+      maxBatchesPerCycle: 20,
+      batchSize: 100,
+    }));
     for (let cycle = 0; cycle < 4; cycle += 1) {
-      for (let i = 0; i < 20; i += 1) await journal.append(event("RISK_EVALUATION", `active-${cycle}-${i}`, `2026-01-01T00:0${cycle}:${String(i).padStart(2, "0")}.000Z`, { accepted: i % 2 === 0, marketId: `m${i}` }));
-      await manager.runCycle({ experiment: { id: "exp-pr18", status: "RUNNING", startedAt: "2026-01-01T00:00:00.000Z" }, now: new Date("2026-09-06T00:00:00.000Z"), degraded: false, failClosed: false, databaseUp: true });
-      const count = (await journal.countByType(CANONICAL_REPORT_INPUT_EVENT_TYPES)).RISK_EVALUATION ?? 0;
-      expect(count).toBeLessThanOrEqual(1);
+      for (let i = 0; i < 20; i += 1) {
+        await journal.append(event(
+          "RISK_EVALUATION",
+          `active-${cycle}-${i}`,
+          `2026-01-01T00:0${cycle}:${String(i).padStart(2, "0")}.000Z`,
+          { accepted: i % 2 === 0, marketId: `m${i}` },
+        ));
+      }
+      await manager.runCycle({
+        experiment: { id: "exp-pr18", status: "RUNNING", startedAt: "2026-01-01T00:00:00.000Z" },
+        now: new Date("2026-09-06T00:00:00.000Z"),
+        degraded: false,
+        failClosed: false,
+        databaseUp: true,
+      });
+      const count = (await journal.countByType(["RISK_EVALUATION"])).RISK_EVALUATION ?? 0;
+      expect(count).toBe((cycle + 1) * 20);
     }
     expect((await journal.loadAnalyticsRollup!("exp-pr18"))?.verified).toBe(true);
   });
 
-  it("drains a canonical backlog across multiple batches within one cycle", async () => {
+  it("archives then drains a historical completed canonical backlog across bounded batches", async () => {
     const journal = new MemoryEventJournal();
-    const manager = new RetentionManager(journal, defaultRetentionConfig({ enabled: true, analyticsRollupEnabled: true, maxRowsPerCycle: 600, maxBatchesPerCycle: 3, batchSize: 200 }));
-    for (let cycle = 0; cycle < 3; cycle += 1) {
-      for (let i = 0; i < 500; i += 1) {
-        const minute = Math.floor(i / 60);
-        const second = i % 60;
-        await journal.append(event("RISK_EVALUATION", `drain-${cycle}-${i}`, `2026-01-0${cycle + 1}T00:${String(minute).padStart(2, "0")}:${String(second).padStart(2, "0")}.000Z`, { accepted: true, marketId: `drain:${i}` }));
-      }
-      await manager.runCycle({ experiment: { id: "exp-pr18", status: "RUNNING", startedAt: "2026-01-01T00:00:00.000Z" }, now: new Date("2026-09-06T00:00:00.000Z"), degraded: false, failClosed: false, databaseUp: true });
-      expect((await journal.countByType(["RISK_EVALUATION"])).RISK_EVALUATION ?? 0).toBeLessThanOrEqual(1);
+    const experimentId = "exp-pr18";
+    for (let i = 0; i < 500; i += 1) {
+      const minute = Math.floor(i / 60);
+      const second = i % 60;
+      await journal.append(event(
+        "RISK_EVALUATION",
+        `drain-${i}`,
+        `2026-01-01T00:${String(minute).padStart(2, "0")}:${String(second).padStart(2, "0")}.000Z`,
+        { accepted: true, marketId: `drain:${i}` },
+      ));
     }
+    const fenceAt = "2026-01-01T00:10:00.000Z";
+    await journal.append(event("EXPERIMENT_COMPLETED", "completed-fence", fenceAt, { status: "COMPLETED" }));
+    const fence = await journal.readJournalEventById("completed-fence");
+    expect(fence).toBeTruthy();
+    const sourceCommitSeq = await journal.latestCommitSeq();
+
+    const persisted = await journal.persistExperimentReport({
+      experimentId,
+      reportKind: "final",
+      schemaVersion: 1,
+      generatedAt: fenceAt,
+      complete: true,
+      truncated: false,
+      sourceEventCount: 501,
+      sourceWindowStart: "2026-01-01T00:00:00.000Z",
+      sourceWindowEnd: fenceAt,
+      sourceFenceOccurredAt: fenceAt,
+      sourceFenceId: "completed-fence",
+      earliestIncludedAt: "2026-01-01T00:00:00.000Z",
+      latestIncludedAt: fenceAt,
+      canonicalSummary: { status: "COMPLETED" },
+      renderedMarkdown: "completed",
+      contentHash: "archive-final-hash",
+    });
+
+    const acc = new ExperimentSummaryAccumulator(experimentId, {
+      status: "COMPLETED",
+      complete: true,
+      reportKind: "final",
+      metricsScope: "complete",
+    });
+    await persistVerifiedAnalyticsRollup(journal, {
+      experimentId,
+      sourceCursor: 0,
+      sourceFenceId: "completed-fence",
+      sourceFenceOccurredAt: fenceAt,
+      sourceEventCount: 501,
+      sourceCommitSeq,
+      sourceRecordedAt: fence!.recordedAt,
+      stableRead: true,
+      sourceCoverageComplete: true,
+      accumulator: { ...acc.serialize(), eventCount: 501 } as unknown as Record<string, unknown>,
+    });
+
+    const { directory, config } = await archiveConfig({
+      enabled: true,
+      completedGraceMs: 1,
+      maxRowsPerCycle: 600,
+      maxBatchesPerCycle: 3,
+      batchSize: 200,
+      cycleBudgetMs: 10_000,
+    });
+    const manager = new RetentionManager(journal, config);
+    const now = new Date(Date.parse(persisted.report.persistedAt) + 5_000);
+
+    const first = await manager.runCycle({
+      experiment: null,
+      now,
+      degraded: false,
+      failClosed: false,
+      databaseUp: true,
+    });
+    expect(first.deletedByClass.canonical_report_input).toBe(500);
+    expect((await journal.countByType(["RISK_EVALUATION"])).RISK_EVALUATION ?? 0).toBe(0);
+    expect((await journal.queryEvents({ types: ["EXPERIMENT_COMPLETED"] })).some((row) => row.id === "completed-fence")).toBe(true);
+
+    const manifest = JSON.parse(await readFile(join(directory, "experiments", experimentId, "raw-manifest.json"), "utf8")) as {
+      rawEvents: { eventCount: number; sha256: string };
+      reportContentHash: string;
+    };
+    expect(manifest.rawEvents.eventCount).toBe(500);
+    expect(manifest.rawEvents.sha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(manifest.reportContentHash).toBe("archive-final-hash");
   });
 
   it("falls back from a hash-valid but semantically invalid newest snapshot", async () => {
