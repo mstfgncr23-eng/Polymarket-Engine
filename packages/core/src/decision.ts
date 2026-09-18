@@ -33,7 +33,7 @@ export function decidePaperOrder(input: {
   candidate: StrategyCandidate;
   consensus: ConsensusDecision;
   snapshotAfterDecisionLatency: MarketSnapshot;
-  baseRisk: Omit<RiskInput, "traceId" | "availableLiquidityUsd" | "expectedEdge" | "spread" | "signalConfidence" | "signalExpiresAt" | "feeScheduleKnown" | "orderSizeUsd">;
+  baseRisk: Omit<RiskInput, "traceId" | "availableLiquidityUsd" | "expectedEdge" | "expectedROI" | "spread" | "signalConfidence" | "signalExpiresAt" | "feeScheduleKnown" | "orderSizeUsd">;
   limits: RiskLimits;
   triggerId: string;
   signalExpiresAt: Date;
@@ -75,7 +75,9 @@ export function decidePaperOrder(input: {
   const risk = evaluateRisk({
     ...input.baseRisk, traceId: input.consensus.traceId,
     availableLiquidityUsd: orderBookLiquidityUsd(input.snapshotAfterDecisionLatency, "BUY"),
-    expectedEdge: netEvUsdPerShare, spread: marketSpread, signalConfidence: input.consensus.consensusConfidence,
+    expectedEdge: netEvUsdPerShare,
+    expectedROI: expectedROI ?? Number.NEGATIVE_INFINITY,
+    spread: marketSpread, signalConfidence: input.consensus.consensusConfidence,
     signalExpiresAt: input.signalExpiresAt,
     feeScheduleKnown: schedule !== null, orderSizeUsd: notional.toFixed(),
     requiredCashUsd,

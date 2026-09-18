@@ -65,6 +65,24 @@ describe("native decisions and hard risk", () => {
     expect(evaluateRisk(safeRisk({ externalSignalsLastMinute: 2 }), limits).vetoes).toContain("MAXIMUM_EXTERNAL_SIGNAL_RATE");
   });
 
+  it("requires at least 2% expected ROI for a fresh first leg", () => {
+    const limits = riskLimitsSchema.parse({});
+    expect(limits.minExpectedROI).toBe(0.02);
+    const rejected = evaluateRisk(safeRisk({ intent: "OPEN_FIRST_LEG", expectedROI: 0.019 }), limits);
+    expect(rejected.vetoes).toContain("MINIMUM_EXPECTED_ROI");
+    const accepted = evaluateRisk(safeRisk({ intent: "OPEN_FIRST_LEG", expectedROI: 0.02 }), limits);
+    expect(accepted.vetoes).not.toContain("MINIMUM_EXPECTED_ROI");
+  });
+
+  it("does not apply the first-leg ROI floor to a risk-reducing hedge", () => {
+    const decision = evaluateRisk(safeRisk({
+      intent: "HEDGE_SECOND_LEG",
+      expectedROI: 0,
+      expectedEdge: 0.05,
+    }), riskLimitsSchema.parse({}));
+    expect(decision.vetoes).not.toContain("MINIMUM_EXPECTED_ROI");
+  });
+
   it("rejects malicious model-shaped output before deterministic risk", () => {
     const malicious = { direction: "UP", fairProbability: 3, marketProbability: 0.5, estimatedEdge: 99, confidence: 2, evidenceIds: [], expiresAt: "never", reasonCodes: [], placeLiveOrder: true };
     expect(fairProbabilityOutputSchema.safeParse(malicious).success).toBe(false);

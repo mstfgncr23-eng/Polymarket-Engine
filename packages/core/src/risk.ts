@@ -36,6 +36,8 @@ export interface RiskInput {
   availableLiquidityUsd: string;
   /** Net expected value in USD/share for a $1 binary payout. */
   expectedEdge: number;
+  /** Fee/slippage-adjusted expected return divided by executable notional. */
+  expectedROI: number;
   spread: number;
   signalConfidence: number;
   signalExpiresAt: Date;
@@ -82,6 +84,9 @@ export function evaluateRisk(input: RiskInput, limits: RiskLimits): RiskEvaluati
   if (!hedge && input.unhedgedDurationMs > limits.maxUnhedgedDurationMs) vetoes.push("MAX_UNHEDGED_DURATION");
   if (d(input.availableLiquidityUsd).lt(limits.minLiquidityUsd)) vetoes.push("MINIMUM_LIQUIDITY");
   if (input.expectedEdge < limits.minExpectedEdge) vetoes.push("MINIMUM_EXPECTED_EDGE");
+  if (!hedge && (!Number.isFinite(input.expectedROI) || input.expectedROI < limits.minExpectedROI)) {
+    vetoes.push("MINIMUM_EXPECTED_ROI");
+  }
   if (input.spread > limits.maxSpread) vetoes.push("MAXIMUM_SPREAD");
   if (input.signalConfidence < limits.minSignalConfidence) vetoes.push("MINIMUM_SIGNAL_CONFIDENCE");
   if (input.signalExpiresAt.getTime() <= input.now.getTime()) vetoes.push("SIGNAL_EXPIRED");

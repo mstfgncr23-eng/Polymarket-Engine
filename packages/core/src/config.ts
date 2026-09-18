@@ -13,6 +13,12 @@ export const riskLimitsSchema = z.object({
   minLiquidityUsd: z.number().nonnegative().default(100),
   /** Minimum net expected value in USD/share for a $1 binary payout. */
   minExpectedEdge: z.number().min(0).max(1).default(0.015),
+  /**
+   * Minimum fee/slippage-adjusted expected return on executable first-leg
+   * notional. Unlike the absolute edge floor, this stays economically
+   * meaningful near $1 where a few cents of edge can still be tiny ROI.
+   */
+  minExpectedROI: z.number().nonnegative().default(0.02),
   maxSpread: z.number().min(0).max(1).default(0.08),
   minSignalConfidence: z.number().min(0).max(1).default(0.6),
   staleFeedTimeoutMs: z.number().int().positive().default(15_000),
