@@ -4464,6 +4464,15 @@ export class EngineService {
       return;
     }
     if (!experimentAllowsHedge(this.experiment) || this.settledMarkets.has(marketId)) return;
+    // Economic risk reduction still requires healthy durability authority.
+    // Fail-closed/integrity/journal faults must never be bypassed by calling an
+    // exit "protective".
+    if (
+      this.state.database !== "UP"
+      || this.state.journalDegraded
+      || this.overload.hasIntegrityFault
+      || this.overload.state === "FAIL_CLOSED"
+    ) return;
 
     const initialNow = this.nowFn();
     const initialStartedAt = initial.unhedgedStartedAt ?? initial.openedAt;
@@ -4553,7 +4562,9 @@ export class EngineService {
           assetExposureUsd: exposure.asset,
           databaseAvailable: this.state.database === "UP",
           timestampDisorder: this.timestampDisorder,
-          riskStateAvailable: true,
+          riskStateAvailable: !this.state.journalDegraded
+            && !this.overload.hasIntegrityFault
+            && this.overload.state !== "FAIL_CLOSED",
           dailyPnlUsd: ledger.netTradingPnl,
           drawdownUsd: ledger.drawdown,
           marketExposureUsd: exposure.market,
