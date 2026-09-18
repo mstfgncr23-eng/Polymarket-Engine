@@ -22,7 +22,7 @@ export interface RiskInput {
   directionalExposureUsd: string;
   unhedgedExposureUsd: string;
   unhedgedDurationMs: number;
-  intent?: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG";
+  intent?: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK";
   projectedMarketExposureUsd?: string;
   projectedTotalExposureUsd?: string;
   projectedDirectionalExposureUsd?: string;
@@ -55,52 +55,61 @@ export function evaluateRisk(input: RiskInput, limits: RiskLimits): RiskEvaluati
   const vetoes: RiskReasonCode[] = [];
   const age = (value: Date | null) => value ? input.now.getTime() - value.getTime() : Number.POSITIVE_INFINITY;
   const hedge = input.intent === "HEDGE_SECOND_LEG";
-  const marketExposure = input.projectedMarketExposureUsd ?? (hedge ? input.marketExposureUsd : d(input.marketExposureUsd).plus(input.orderSizeUsd).toFixed());
-  const assetExposure = input.projectedAssetExposureUsd ?? (hedge ? (input.assetExposureUsd ?? "0") : d(input.assetExposureUsd ?? "0").plus(input.orderSizeUsd).toFixed());
-  const totalExposure = input.projectedTotalExposureUsd ?? (hedge ? input.totalExposureUsd : d(input.totalExposureUsd).plus(input.orderSizeUsd).toFixed());
-  const directionalExposure = input.projectedDirectionalExposureUsd ?? (hedge ? input.directionalExposureUsd : d(input.directionalExposureUsd).plus(input.orderSizeUsd).toFixed());
-  const unhedgedExposure = input.projectedUnhedgedExposureUsd ?? (hedge ? input.unhedgedExposureUsd : d(input.unhedgedExposureUsd).plus(input.orderSizeUsd).toFixed());
+  const protective = input.intent === "PROTECTIVE_DE_RISK";
+  const riskReducingIntent = hedge || protective;
+  const marketExposure = input.projectedMarketExposureUsd ?? (riskReducingIntent ? input.marketExposureUsd : d(input.marketExposureUsd).plus(input.orderSizeUsd).toFixed());
+  const assetExposure = input.projectedAssetExposureUsd ?? (riskReducingIntent ? (input.assetExposureUsd ?? "0") : d(input.assetExposureUsd ?? "0").plus(input.orderSizeUsd).toFixed());
+  const totalExposure = input.projectedTotalExposureUsd ?? (riskReducingIntent ? input.totalExposureUsd : d(input.totalExposureUsd).plus(input.orderSizeUsd).toFixed());
+  const directionalExposure = input.projectedDirectionalExposureUsd ?? (riskReducingIntent ? input.directionalExposureUsd : d(input.directionalExposureUsd).plus(input.orderSizeUsd).toFixed());
+  const unhedgedExposure = input.projectedUnhedgedExposureUsd ?? (riskReducingIntent ? input.unhedgedExposureUsd : d(input.unhedgedExposureUsd).plus(input.orderSizeUsd).toFixed());
+  const protectiveReducesRisk = protective
+    && d(marketExposure).lte(input.marketExposureUsd)
+    && d(assetExposure).lte(input.assetExposureUsd ?? "0")
+    && d(totalExposure).lte(input.totalExposureUsd)
+    && d(directionalExposure).lte(input.directionalExposureUsd)
+    && d(unhedgedExposure).lt(input.unhedgedExposureUsd);
   if (age(input.marketFeedAt) > limits.staleFeedTimeoutMs) vetoes.push("MARKET_FEED_STALE");
-  if (input.referenceProviderBlocked === true) vetoes.push("REFERENCE_PROVIDER_BLOCKED");
-  if (input.referenceRequired === true) {
+  if (!protective && input.referenceProviderBlocked === true) vetoes.push("REFERENCE_PROVIDER_BLOCKED");
+  if (!protective && input.referenceRequired === true) {
     if (age(input.referenceFeedAt ?? null) > limits.staleFeedTimeoutMs) {
       vetoes.push("REFERENCE_FEED_STALE");
       if ((input.asset ?? "BTC") === "BTC") vetoes.push("BTC_FEED_STALE");
     }
-  } else if (input.referenceRequired !== false && age(input.btcFeedAt) > limits.staleFeedTimeoutMs) {
+  } else if (!protective && input.referenceRequired !== false && age(input.btcFeedAt) > limits.staleFeedTimeoutMs) {
     vetoes.push("BTC_FEED_STALE");
   }
   if (!input.databaseAvailable) vetoes.push("DATABASE_UNAVAILABLE");
   if (input.timestampDisorder) vetoes.push("EVENT_TIMESTAMP_DISORDER");
   if (!input.riskStateAvailable) vetoes.push("RISK_STATE_UNAVAILABLE");
-  if (d(input.dailyPnlUsd).lte(d(limits.maxDailyPaperLossUsd).negated())) vetoes.push("DAILY_LOSS_LIMIT");
-  if (d(input.drawdownUsd).gte(limits.maxDrawdownUsd)) vetoes.push("MAX_DRAWDOWN");
+  if (!protective && d(input.dailyPnlUsd).lte(d(limits.maxDailyPaperLossUsd).negated())) vetoes.push("DAILY_LOSS_LIMIT");
+  if (!protective && d(input.drawdownUsd).gte(limits.maxDrawdownUsd)) vetoes.push("MAX_DRAWDOWN");
   if (d(input.orderSizeUsd).gt(limits.maxOrderSizeUsd)) vetoes.push("MAX_ORDER_SIZE");
-  if (d(marketExposure).gt(limits.maxMarketExposureUsd)) vetoes.push("MAX_MARKET_EXPOSURE");
-  if (d(assetExposure).gt(limits.maxAssetExposureUsd)) vetoes.push("MAX_ASSET_EXPOSURE");
-  if (d(totalExposure).gt(limits.maxTotalExposureUsd)) vetoes.push("MAX_TOTAL_EXPOSURE");
-  if (d(directionalExposure).gt(limits.maxDirectionalExposureUsd)) vetoes.push("MAX_DIRECTIONAL_EXPOSURE");
-  if (d(unhedgedExposure).gt(limits.maxUnhedgedExposureUsd)) vetoes.push("MAX_UNHEDGED_EXPOSURE");
-  if (!hedge && input.unhedgedDurationMs > limits.maxUnhedgedDurationMs) vetoes.push("MAX_UNHEDGED_DURATION");
-  if (d(input.availableLiquidityUsd).lt(limits.minLiquidityUsd)) vetoes.push("MINIMUM_LIQUIDITY");
-  if (input.expectedEdge < limits.minExpectedEdge) vetoes.push("MINIMUM_EXPECTED_EDGE");
-  if (!hedge && (!Number.isFinite(input.expectedROI) || input.expectedROI < limits.minExpectedROI)) {
+  if (!protective && d(marketExposure).gt(limits.maxMarketExposureUsd)) vetoes.push("MAX_MARKET_EXPOSURE");
+  if (!protective && d(assetExposure).gt(limits.maxAssetExposureUsd)) vetoes.push("MAX_ASSET_EXPOSURE");
+  if (!protective && d(totalExposure).gt(limits.maxTotalExposureUsd)) vetoes.push("MAX_TOTAL_EXPOSURE");
+  if (!protective && d(directionalExposure).gt(limits.maxDirectionalExposureUsd)) vetoes.push("MAX_DIRECTIONAL_EXPOSURE");
+  if (!protective && d(unhedgedExposure).gt(limits.maxUnhedgedExposureUsd)) vetoes.push("MAX_UNHEDGED_EXPOSURE");
+  if (protective && !protectiveReducesRisk) vetoes.push("PROTECTIVE_DE_RISK_NOT_REDUCING");
+  if (!riskReducingIntent && input.unhedgedDurationMs > limits.maxUnhedgedDurationMs) vetoes.push("MAX_UNHEDGED_DURATION");
+  if (!protective && d(input.availableLiquidityUsd).lt(limits.minLiquidityUsd)) vetoes.push("MINIMUM_LIQUIDITY");
+  if (!protective && input.expectedEdge < limits.minExpectedEdge) vetoes.push("MINIMUM_EXPECTED_EDGE");
+  if (!riskReducingIntent && (!Number.isFinite(input.expectedROI) || input.expectedROI < limits.minExpectedROI)) {
     vetoes.push("MINIMUM_EXPECTED_ROI");
   }
-  if (input.spread > limits.maxSpread) vetoes.push("MAXIMUM_SPREAD");
-  if (input.signalConfidence < limits.minSignalConfidence) vetoes.push("MINIMUM_SIGNAL_CONFIDENCE");
-  if (input.signalExpiresAt.getTime() <= input.now.getTime()) vetoes.push("SIGNAL_EXPIRED");
-  if (input.externalSignalsLastMinute >= limits.maxExternalSignalsPerMinute) vetoes.push("MAXIMUM_EXTERNAL_SIGNAL_RATE");
-  // Cooldown throttles fresh directional entries. It must not delay a risk-reducing second leg.
-  if (!hedge && input.lastStrategyTradeAt && input.now.getTime() - input.lastStrategyTradeAt.getTime() < limits.strategyCooldownMs) vetoes.push("STRATEGY_COOLDOWN");
-  if (input.duplicateTrade) vetoes.push("DUPLICATE_TRADE");
+  if (!protective && input.spread > limits.maxSpread) vetoes.push("MAXIMUM_SPREAD");
+  if (!protective && input.signalConfidence < limits.minSignalConfidence) vetoes.push("MINIMUM_SIGNAL_CONFIDENCE");
+  if (!protective && input.signalExpiresAt.getTime() <= input.now.getTime()) vetoes.push("SIGNAL_EXPIRED");
+  if (!protective && input.externalSignalsLastMinute >= limits.maxExternalSignalsPerMinute) vetoes.push("MAXIMUM_EXTERNAL_SIGNAL_RATE");
+  // Cooldown throttles fresh directional entries. It must never trap a risk-reducing action.
+  if (!riskReducingIntent && input.lastStrategyTradeAt && input.now.getTime() - input.lastStrategyTradeAt.getTime() < limits.strategyCooldownMs) vetoes.push("STRATEGY_COOLDOWN");
+  if (!protective && input.duplicateTrade) vetoes.push("DUPLICATE_TRADE");
   if (!input.feeScheduleKnown) vetoes.push("UNKNOWN_FEE_SCHEDULE");
-  if (!input.experimentEntryOpen) vetoes.push("EXPERIMENT_ENTRY_CLOSED");
-  if (input.marketEntryQualified === false && !hedge) vetoes.push("MARKET_NOT_ENTRY_QUALIFIED");
+  if (!protective && !input.experimentEntryOpen) vetoes.push("EXPERIMENT_ENTRY_CLOSED");
+  if (input.marketEntryQualified === false && !riskReducingIntent) vetoes.push("MARKET_NOT_ENTRY_QUALIFIED");
   const requiredCash = input.requiredCashUsd ?? input.orderSizeUsd;
   if (input.availableCashUsd !== undefined && d(input.availableCashUsd).lt(requiredCash)) vetoes.push("INSUFFICIENT_CASH");
   if (input.executionErrorsLastHour >= limits.maxExecutionErrorsPerHour) vetoes.push("ABNORMAL_EXECUTION_ERRORS");
-  if (input.externalRiskRecommendedVeto) vetoes.push("EXTERNAL_RISK_RECOMMENDED_VETO");
+  if (!protective && input.externalRiskRecommendedVeto) vetoes.push("EXTERNAL_RISK_RECOMMENDED_VETO");
   if (input.shuttingDown) vetoes.push("SHUTTING_DOWN");
 
   const unique = [...new Set(vetoes)];
