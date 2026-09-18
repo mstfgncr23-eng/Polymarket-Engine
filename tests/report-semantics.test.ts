@@ -64,6 +64,37 @@ describe("native final report semantics", () => {
     expect(summary.winLossDistribution.losses).toBe(1);
   });
 
+  it("keeps protective risk exits out of alpha opportunity and race-failure metrics", () => {
+    const summary = buildExperimentSummary([
+      event("RISK_EVALUATION", "risk", "alpha-risk", {
+        accepted: true,
+        marketId: "m1",
+        asset: "BTC",
+      }, 1),
+      event("RISK_EVALUATION", "risk", "derisk-risk", {
+        accepted: false,
+        marketId: "m1",
+        asset: "BTC",
+        intent: "PROTECTIVE_DE_RISK",
+        deRisk: { retryCount: 1 },
+      }, 2),
+      event("PAPER_EXECUTION_ERROR", "paper_order", "race-order", {
+        marketId: "m1",
+        intent: "PROTECTIVE_DE_RISK",
+        stateChanged: true,
+      }, 3),
+      event("PAPER_EXECUTION_ERROR", "paper_order", "real-error", {
+        marketId: "m1",
+        message: "INSUFFICIENT_DEPTH",
+      }, 4),
+    ], "exp-report-separation");
+
+    expect(summary.totalOpportunities).toBe(1);
+    expect(summary.acceptedOpportunities).toBe(1);
+    expect(summary.rejectedOpportunities).toBe(0);
+    expect(summary.failureStatistics.PAPER_EXECUTION_ERROR).toBe(1);
+  });
+
   it("closes failed-hedge episodes without counting protective neutralization as a pair hedge", () => {
     const summary = buildExperimentSummary([
       event("FIRST_LEG_FILLED", "position", "pos:m1", { marketId: "m1", unpairedQuantity: "10" }, 1),
