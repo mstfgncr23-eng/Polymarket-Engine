@@ -3478,7 +3478,7 @@ export class EngineService {
     // A fill with no existing position is a first leg. The post-commit start
     // validation fence must reject it while the experiment identity is still
     // pending; hedges for pre-existing positions remain admissible.
-    if (this.experimentStartPending && !this.ledger.positions.has(fill.marketId)) return;
+    if (this.experimentStartPending && !this.ledger.positions.has(fill.marketId)) return false;
     const reserved = this.makerReservations.get(fill.orderId);
     let reservationAfter: string | null = reserved ?? null;
     if (reserved && fill.liquidityRole === "MAKER" && !compactedRetry) {

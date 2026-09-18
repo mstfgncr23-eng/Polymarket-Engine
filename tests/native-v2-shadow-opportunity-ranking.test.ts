@@ -161,6 +161,24 @@ describe("native v2 shadow opportunity ranking", () => {
     expect(ranker.size()).toBe(1);
   });
 
+  it("ranks an actionable winner ahead of a higher-ROI non-actionable diagnostic", () => {
+    const ranker = new NativeV2ShadowOpportunityRanker();
+    // Winner edge is +0.014/share, below the 0.015 admission threshold but
+    // capital-efficient enough to outrank the next market by raw ROI.
+    const blocked = opportunity("m-blocked", 0.50 + 0.014, T0, 0.50, 0.50);
+    // Higher absolute probability and a smaller ROI, but +0.02/share is
+    // actionable and therefore must own the execution rank-1 slot.
+    const actionable = opportunity("m-actionable", 0.97, T0, 0.95, 0.05);
+    expect(blocked.best?.actionable).toBe(false);
+    expect(actionable.best?.actionable).toBe(true);
+
+    ranker.upsertAndRank(blocked, new Date(T0), 15_000);
+    const ranked = ranker.upsertAndRank(actionable, new Date(T0), 15_000);
+    expect(ranked.top?.marketId).toBe("m-actionable");
+    expect(ranked.marketRank).toBe(1);
+    expect(ranked.actionableMarketCount).toBe(1);
+  });
+
   it("uses stable identifiers as the final tie break instead of insertion order", () => {
     const ranker = new NativeV2ShadowOpportunityRanker();
     const m2 = opportunity("m2", 0.65, T0);

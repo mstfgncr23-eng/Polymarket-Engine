@@ -292,6 +292,9 @@ function compareMarketOpportunities(
   a: NativeV2ShadowMarketOpportunity & { best: NativeV2ShadowOpportunityCandidate },
   b: NativeV2ShadowMarketOpportunity & { best: NativeV2ShadowOpportunityCandidate },
 ): number {
+  // Non-actionable winner diagnostics must never starve an actionable market
+  // from the global rank-1 execution slot.
+  if (a.best.actionable !== b.best.actionable) return a.best.actionable ? -1 : 1;
   return compareCandidates(a.best, b.best);
 }
 

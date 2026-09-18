@@ -78,9 +78,11 @@ describe("native deterministic decision model", () => {
     expect(result?.fairProbability).toBe(result?.featureVector.fairProbabilityUp);
   });
 
-  it("reduces confidence and avoids forcing a direction on disagreement", () => {
+  it("reduces confidence on disagreement without overriding the absolute winner", () => {
     const result = evaluate(book("UP", "100", "1"), book("DOWN", "1", "100"), reference(-30));
-    expect(result?.direction).toBe("FLAT");
+    expect(result?.featureVector.directionalScore).toBeLessThan(0);
+    expect(result?.featureVector.fairProbabilityUp).toBeLessThan(0.5);
+    expect(result?.direction).toBe("DOWN");
     expect(result?.confidence).toBeLessThan(0.9);
   });
 

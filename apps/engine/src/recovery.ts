@@ -170,9 +170,18 @@ export function durableIdentityConflicts(
   switch (type) {
     case "PAPER_FILL":
       return hashDurablePayload({ fill: existing.fill ?? null }) !== hashDurablePayload({ fill: incoming.fill ?? null });
-    case "PAPER_MAKER_RESERVED":
-      return hashDurablePayload(pick(existing, ["orderId", "reserved", "resting"]))
+    case "PAPER_MAKER_RESERVED": {
+      const baseConflict = hashDurablePayload(pick(existing, ["orderId", "reserved", "resting"]))
         !== hashDurablePayload(pick(incoming, ["orderId", "reserved", "resting"]));
+      if (baseConflict) return true;
+      // intent became replay-authoritative for lifecycle correctness. Existing
+      // pre-intent rows remain readable; rows that already carry intent must
+      // reject a retry that changes its economic meaning.
+      if (Object.prototype.hasOwnProperty.call(existing, "intent")) {
+        return existing.intent !== incoming.intent;
+      }
+      return false;
+    }
     case "PAPER_MAKER_RELEASED":
     case "PAPER_ORDER_CANCELLED":
       return hashDurablePayload(pick(existing, ["orderId", "cancel", "reason"]))

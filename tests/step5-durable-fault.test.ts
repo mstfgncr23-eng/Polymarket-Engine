@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { MemoryEventJournal } from "@pm/db";
 import { paperOrderSchema } from "@pm/core";
 import { EngineService } from "../apps/engine/src/engine.js";
+import { durableIdentityConflicts } from "../apps/engine/src/recovery.js";
 import { NoopGrokActivationBridge } from "../apps/engine/src/activation/index.js";
 import { discoveryReport, qualified, qualifiedPaperEnv, ScriptedMarketAdapter, ScriptedReferenceRegistry, paperFill } from "./paper-engine-testkit.js";
 import { snapshot } from "./fixtures.js";
@@ -104,6 +105,21 @@ describe("Step 5 durable DB fault path", () => {
       await engine.stop();
     }
   }, 15_000);
+
+  it("treats durable maker intent as economic identity while preserving legacy rows", () => {
+    const resting = { order: { id: "o1" }, remaining: "10" };
+    const base = { orderId: "o1", reserved: "5", resting };
+    expect(durableIdentityConflicts(
+      "PAPER_MAKER_RESERVED",
+      { ...base, intent: "OPEN_FIRST_LEG" },
+      { ...base, intent: "HEDGE_SECOND_LEG" },
+    )).toBe(true);
+    expect(durableIdentityConflicts(
+      "PAPER_MAKER_RESERVED",
+      base,
+      { ...base, intent: "OPEN_FIRST_LEG" },
+    )).toBe(false);
+  });
 
   it("persists maker lifecycle intent across restart", async () => {
     const journal = new MemoryEventJournal();
