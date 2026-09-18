@@ -88,6 +88,14 @@ function opportunity(
 }
 
 describe("native v2 shadow opportunity ranking", () => {
+  it("records winner-only opportunity and ranking semantic versions", () => {
+    const result = opportunity("m-version", 0.70, T0);
+    const ranker = new NativeV2ShadowOpportunityRanker();
+    const ranked = ranker.upsertAndRank(result, new Date(T0), 15_000);
+    expect(result.version).toBe("native-v2-shadow-opportunity-v2");
+    expect(ranked.version).toBe("native-v2-shadow-ranking-v2");
+  });
+
   it("selects the side with the best executable fee-aware capital efficiency", () => {
     const result = opportunity("m1", 0.65, T0, 0.55, 0.45);
     expect(result.best?.outcome).toBe("UP");

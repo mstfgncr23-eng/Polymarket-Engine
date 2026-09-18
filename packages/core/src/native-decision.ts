@@ -2,6 +2,8 @@ import type { Direction, MarketSnapshot, TriggerEvent } from "./domain.js";
 
 /** The single economic decision authority used by the native paper experiment. */
 export const NATIVE_DETERMINISTIC_AUTHORITY = "NATIVE_DETERMINISTIC_V1" as const;
+/** Semantic model version recorded in experiment provenance. Authority remains the V1 family. */
+export const NATIVE_DETERMINISTIC_MODEL_VERSION = "native-deterministic-v1.1" as const;
 
 export interface NativeReferenceFeatures {
   asset: string;

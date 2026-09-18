@@ -69,6 +69,7 @@ import {
   type NativeDecision,
   type NativeReferenceFeatures,
   type NativeDecisionConfig,
+  NATIVE_DETERMINISTIC_MODEL_VERSION,
   NativeV2ShadowFeatureExtractor,
   evaluateNativeV2ShadowFairProbability,
   LearningSampleStore,
@@ -82,6 +83,7 @@ import {
   NativeV2ShadowOpportunityRanker,
   evaluateNativeV2ShadowMarketOpportunity,
   buildNativeV2ShadowExecutionIntent,
+  NATIVE_V2_SHADOW_EXECUTION_VERSION,
   type NativeV2ShadowFairProbability,
   type NativeV2ShadowFeatureVector,
   type NativeV2ShadowMarketOpportunity,
@@ -809,7 +811,7 @@ export class EngineService {
         id: undefined, durationHours: this.env.EXPERIMENT_DURATION_HOURS, strategyVersion: this.strategy.version,
         riskConfiguration: this.riskLimits,
         modelConfiguration: {
-          provider: "native_deterministic", version: "native-deterministic-v1",
+          provider: "native_deterministic", version: NATIVE_DETERMINISTIC_MODEL_VERSION,
           localExecution: true, externalInference: false, authority: NATIVE_DETERMINISTIC_AUTHORITY,
         },
         startingBalance: this.ledger.snapshot().startingBalance, systemVersion: "0.1.0",
@@ -1688,7 +1690,7 @@ export class EngineService {
           durationHours: this.env.EXPERIMENT_DURATION_HOURS, strategyVersion: this.strategy.version,
           riskConfiguration: this.riskLimits,
           modelConfiguration: {
-            provider: "native_deterministic", version: "native-deterministic-v1",
+            provider: "native_deterministic", version: NATIVE_DETERMINISTIC_MODEL_VERSION,
             localExecution: true, externalInference: false, authority: NATIVE_DETERMINISTIC_AUTHORITY,
           },
           startingBalance: this.ledger.snapshot().startingBalance, systemVersion: "0.1.0",
@@ -1750,7 +1752,7 @@ export class EngineService {
       durationHours: this.env.EXPERIMENT_DURATION_HOURS, strategyVersion: this.strategy.version,
       riskConfiguration: this.riskLimits,
       modelConfiguration: {
-        provider: "native_deterministic", version: "native-deterministic-v1",
+        provider: "native_deterministic", version: NATIVE_DETERMINISTIC_MODEL_VERSION,
         localExecution: true, externalInference: false, authority: NATIVE_DETERMINISTIC_AUTHORITY,
       },
       startingBalance: this.ledger.snapshot().startingBalance,
@@ -2502,7 +2504,7 @@ export class EngineService {
               actionableMarketCount: capture.ranking.actionableMarketCount, selected: selectedAtDecision, globalTop: capture.ranking.top,
             },
             execution: {
-              version: "native-v2-shadow-execution-v1", evaluatedAt: capture.capturedAt,
+              version: NATIVE_V2_SHADOW_EXECUTION_VERSION, evaluatedAt: capture.capturedAt,
               preflightBlockers: ["SHADOW_EVALUATION_ERROR"], riskVetoes: [], wouldSubmitOrder: false,
               error: error instanceof Error ? error.message : String(error),
             },
@@ -2523,7 +2525,7 @@ export class EngineService {
     const marketId = input.opportunity.marketId;
     const selected = input.selected;
     const compactBase = {
-      version: "native-v2-shadow-execution-v1",
+      version: NATIVE_V2_SHADOW_EXECUTION_VERSION,
       stateBasis: NATIVE_V2_COUNTERFACTUAL_STATE_BASIS,
       evaluatedAt: input.capturedAt,
       marketId,

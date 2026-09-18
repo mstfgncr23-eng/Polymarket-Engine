@@ -112,6 +112,7 @@ describe("native v2 shadow execution intent", () => {
       now: new Date(NOW),
     });
     expect(intent).not.toBeNull();
+    expect(intent?.version).toBe("native-v2-shadow-execution-v2");
     expect(intent?.candidate.marketId).toBe("m1");
     expect(intent?.candidate.outcome).toBe("UP");
     expect(intent?.candidate.quantity).toBe("9.09090909");

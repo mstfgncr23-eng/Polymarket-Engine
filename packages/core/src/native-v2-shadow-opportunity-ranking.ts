@@ -3,8 +3,8 @@ import type { MarketSnapshot, Outcome } from "./domain.js";
 import type { NativeV2ShadowFairProbability } from "./native-v2-shadow-fair-probability.js";
 import { DEFAULT_FIRST_LEG_RISK_CAP_USD } from "./strategy.js";
 
-export const NATIVE_V2_SHADOW_OPPORTUNITY_VERSION = "native-v2-shadow-opportunity-v1" as const;
-export const NATIVE_V2_SHADOW_RANKING_VERSION = "native-v2-shadow-ranking-v1" as const;
+export const NATIVE_V2_SHADOW_OPPORTUNITY_VERSION = "native-v2-shadow-opportunity-v2" as const;
+export const NATIVE_V2_SHADOW_RANKING_VERSION = "native-v2-shadow-ranking-v2" as const;
 
 const DEFAULT_MAX_MARKETS = 512;
 

@@ -4,7 +4,7 @@ import type { NativeV2ShadowFairProbability } from "./native-v2-shadow-fair-prob
 import type { NativeV2ShadowOpportunityCandidate } from "./native-v2-shadow-opportunity-ranking.js";
 import type { StrategyCandidate } from "./strategy.js";
 
-export const NATIVE_V2_SHADOW_EXECUTION_VERSION = "native-v2-shadow-execution-v1" as const;
+export const NATIVE_V2_SHADOW_EXECUTION_VERSION = "native-v2-shadow-execution-v2" as const;
 
 export interface NativeV2ShadowExecutionIntent {
   version: typeof NATIVE_V2_SHADOW_EXECUTION_VERSION;

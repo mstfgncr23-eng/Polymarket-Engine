@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   evaluateNativeDecision,
+  NATIVE_DETERMINISTIC_MODEL_VERSION,
   marketSnapshotSchema,
   triggerEventSchema,
   type MarketSnapshot,
@@ -45,6 +46,10 @@ function evaluate(up: MarketSnapshot, down: MarketSnapshot, ref: NativeReference
 }
 
 describe("native deterministic decision model", () => {
+  it("records the winner-corrected V1 semantic model version", () => {
+    expect(NATIVE_DETERMINISTIC_MODEL_VERSION).toBe("native-deterministic-v1.1");
+  });
+
   it("returns UP for strong aligned UP evidence", () => {
     const result = evaluate(book("UP", "100", "1"), book("DOWN", "1", "100"), reference(30));
     expect(result?.direction).toBe("UP");
