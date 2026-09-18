@@ -461,6 +461,13 @@ export class MemoryEventJournal implements EventJournal {
       if (report.reportKind !== "final" || !report.complete || report.truncated) continue;
       const rollup = this.rollups.get(`${report.experimentId}:canonical`);
       if (!rollup?.verified || !rollup.stableRead || !rollup.sourceFenceOccurredAt || !rollup.sourceCommitSeq || !rollup.sourceRecordedAt) continue;
+      const backlog = await this.countCanonicalEventsThrough({
+        experimentId: report.experimentId,
+        occurredBefore: new Date(rollup.sourceFenceOccurredAt),
+        sourceCommitSeq: rollup.sourceCommitSeq,
+        sourceRecordedAt: new Date(rollup.sourceRecordedAt),
+      });
+      if (backlog.count <= 0) continue;
       candidates.push({ report: structuredClone(report), rollup: structuredClone(rollup) });
     }
     return candidates.sort((a, b) => a.report.persistedAt.localeCompare(b.report.persistedAt)).slice(0, cap);
@@ -1123,21 +1130,44 @@ export class PostgresEventJournal implements EventJournal {
     return rows[0] ? toExperimentReport(rows[0]) : null;
   }
   async listArchiveCandidates(limit: number): Promise<JournalArchiveCandidate[]> {
-    const cap = Math.max(0, Math.min(64, Math.floor(limit)));
+    const cap = Math.max(0, Math.min(256, Math.floor(limit)));
     if (cap <= 0) return [];
-    const rows = await this.db.select().from(experimentReports)
-      .where(and(
-        eq(experimentReports.reportKind, "final"),
-        eq(experimentReports.complete, true),
-        eq(experimentReports.truncated, false),
-      ))
-      .orderBy(asc(experimentReports.persistedAt))
-      .limit(cap);
+    const canonicalTypes = [...CANONICAL_REPORT_INPUT_EVENT_TYPES] as string[];
+    // Filter to reports that still own purgeable raw rows. Without this EXISTS
+    // an old already-drained prefix could permanently hide newer candidates
+    // behind a fixed LIMIT.
+    const ids = await this.client`
+      SELECT r.experiment_id
+      FROM experiment_reports r
+      JOIN experiment_report_rollups a
+        ON a.experiment_id = r.experiment_id
+       AND a.rollup_kind = 'canonical'
+      WHERE r.report_kind = 'final'
+        AND r.complete = true
+        AND r.truncated = false
+        AND a.verified = true
+        AND a.stable_read = true
+        AND a.source_fence_occurred_at IS NOT NULL
+        AND a.source_commit_seq > 0
+        AND a.source_recorded_at IS NOT NULL
+        AND EXISTS (
+          SELECT 1
+          FROM journal_events e
+          WHERE e.type = ANY(${canonicalTypes})
+            AND (e.payload->>'experimentId') = r.experiment_id
+            AND e.occurred_at < a.source_fence_occurred_at
+            AND e.commit_seq <= a.source_commit_seq
+            AND e.recorded_at <= a.source_recorded_at
+        )
+      ORDER BY r.persisted_at ASC
+      LIMIT ${cap}
+    `;
     const candidates: JournalArchiveCandidate[] = [];
-    for (const row of rows) {
-      const rollup = await this.loadAnalyticsRollup(row.experimentId, "canonical");
-      if (!rollup?.verified || !rollup.stableRead || !rollup.sourceFenceOccurredAt || !rollup.sourceCommitSeq || !rollup.sourceRecordedAt) continue;
-      candidates.push({ report: toExperimentReport(row), rollup });
+    for (const item of ids as unknown as Array<{ experiment_id: string }>) {
+      const report = await this.loadExperimentReport(item.experiment_id, "final");
+      const rollup = await this.loadAnalyticsRollup(item.experiment_id, "canonical");
+      if (!report || !rollup) continue;
+      candidates.push({ report, rollup });
     }
     return candidates;
   }
