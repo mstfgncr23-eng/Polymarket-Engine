@@ -62,7 +62,7 @@ describe("native deterministic decision model", () => {
     expect(result?.direction).toBe("FLAT");
   });
 
-  it("selects the absolute fair-probability winner even when directional evidence points toward the longshot", () => {
+  it("stays FLAT when directional evidence points toward the lower-probability longshot", () => {
     const up = book("UP", "10", "100", {
       bids: [{ price: "0.90", quantity: "10" }],
       asks: [{ price: "0.92", quantity: "100" }],
@@ -74,15 +74,16 @@ describe("native deterministic decision model", () => {
     const result = evaluate(up, down, reference(-30));
     expect(result?.featureVector.directionalScore).toBeLessThan(-0.15);
     expect(result?.featureVector.fairProbabilityUp).toBeGreaterThan(0.5);
-    expect(result?.direction).toBe("UP");
+    expect(result?.direction).toBe("FLAT");
     expect(result?.fairProbability).toBe(result?.featureVector.fairProbabilityUp);
   });
 
-  it("reduces confidence on disagreement without overriding the absolute winner", () => {
+  it("reduces confidence and keeps weak conflicting evidence FLAT", () => {
     const result = evaluate(book("UP", "100", "1"), book("DOWN", "1", "100"), reference(-30));
     expect(result?.featureVector.directionalScore).toBeLessThan(0);
+    expect(Math.abs(result?.featureVector.directionalScore ?? 1)).toBeLessThan(0.15);
     expect(result?.featureVector.fairProbabilityUp).toBeLessThan(0.5);
-    expect(result?.direction).toBe("DOWN");
+    expect(result?.direction).toBe("FLAT");
     expect(result?.confidence).toBeLessThan(0.9);
   });
 

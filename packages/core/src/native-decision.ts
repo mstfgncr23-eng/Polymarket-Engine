@@ -131,12 +131,19 @@ export function evaluateNativeDecision(input: NativeDecisionInput): NativeDecisi
     config.probabilityFloor,
     config.probabilityCeiling,
   );
-  // directionalScore describes movement evidence relative to the market prior.
-  // It is not itself a winner label. Winner-direction authority follows the
-  // absolute fair probability after the bounded adjustment.
-  const direction: Direction = fairProbabilityUp > 0.5
+  // directionalScore remains the existing V1 evidence-admission gate, but its
+  // sign is not allowed to name a less-likely outcome as the winner. A fresh
+  // direction is actionable only when thresholded evidence and the absolute
+  // fair-probability winner agree; otherwise V1 stays FLAT.
+  const evidenceDirection: Direction = directionalScore > config.directionThreshold
+    ? "UP"
+    : directionalScore < -config.directionThreshold ? "DOWN" : "FLAT";
+  const fairWinner: Direction = fairProbabilityUp > 0.5
     ? "UP"
     : fairProbabilityUp < 0.5 ? "DOWN" : "FLAT";
+  const direction: Direction = evidenceDirection !== "FLAT" && evidenceDirection === fairWinner
+    ? fairWinner
+    : "FLAT";
 
   let confidence = 0.5 + 0.25 * Math.abs(bookPressure) + 0.25 * Math.abs(referenceStrength);
   if (
