@@ -318,7 +318,10 @@ export class RetentionManager {
           const bucket = fullArchiveBucket(eligible.oldestOccurredAt, cutoff, this.config.localArchiveBucketMs);
           if (!bucket) return;
           const commitSeqTo = await this.journal.latestCommitSeq();
-          const recordedAtTo = context.now;
+          // commitSeq is the authority fence. recorded_at is an additional bound
+          // and must use wall clock so deterministic/test nowFn values cannot
+          // exclude rows that are already committed.
+          const recordedAtTo = new Date(Math.max(Date.now(), context.now.getTime()));
           const archived = await this.archive!.ensureJournalBucket(this.journal, {
             retentionClass: cls,
             eventTypes: types,
