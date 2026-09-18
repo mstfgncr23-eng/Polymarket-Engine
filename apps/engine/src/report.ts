@@ -263,11 +263,14 @@ export class ExperimentSummaryAccumulator {
       if (payload.orderType === "TAKER" || payload.type === "TAKER") this.takerOrders += 1;
     } else if (type === "FIRST_LEG_FILLED") this.firstLegCount += 1;
     else if (type === "HEDGE_COMPLETE") {
-      this.hedgeCompleteCount += 1;
-      const duration = Number((event.payload as { unhedgedDurationMs?: unknown }).unhedgedDurationMs);
-      if (Number.isFinite(duration)) {
-        this.hedgeDurationSum += duration;
-        this.hedgeDurationN += 1;
+      const completionMode = (event.payload as { completionMode?: unknown }).completionMode;
+      if (completionMode !== "PROTECTIVE_DE_RISK") {
+        this.hedgeCompleteCount += 1;
+        const duration = Number((event.payload as { unhedgedDurationMs?: unknown }).unhedgedDurationMs);
+        if (Number.isFinite(duration)) {
+          this.hedgeDurationSum += duration;
+          this.hedgeDurationN += 1;
+        }
       }
     } else if (type === "CONSENSUS_DECISION" && (event.payload as { authority?: unknown }).authority === "NATIVE_DETERMINISTIC_V1") {
       this.modelCounts.NATIVE_DETERMINISTIC_V1 = (this.modelCounts.NATIVE_DETERMINISTIC_V1 ?? 0) + 1;
