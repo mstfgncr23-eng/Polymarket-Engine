@@ -4,6 +4,7 @@ import { migrate } from "drizzle-orm/postgres-js/migrator";
 import postgres from "postgres";
 import {
   CANONICAL_REPORT_INPUT_EVENT_TYPES,
+  LOCAL_ARCHIVE_PURGE_SAFE_EVENT_TYPES,
   compareJournalEventOrder, createId, EVENT_PAGE_SIZE, EVENT_SCAN_CEILING, isProtectedJournalType,
   journalEventSchema, sortJournalEventsChronologically,
   type JournalEvent, type JournalKeysetCursor, type JournalKeysetQuery, type JournalQuery,
@@ -75,6 +76,11 @@ export interface AnalyticsRollup {
   contentHash: string;
   verified: boolean;
   createdAt: string;
+}
+
+export interface JournalArchiveCandidate {
+  report: DurableExperimentReport;
+  rollup: AnalyticsRollup;
 }
 
 export interface JournalAppendOptions {
@@ -167,9 +173,18 @@ export interface EventJournal {
   idempotencyCreatedAt(scope: string, key: string): Promise<string | null>;
   persistExperimentReport(input: DurableExperimentReportInput): Promise<PersistReportResult>;
   loadExperimentReport(experimentId: string, reportKind?: "final"): Promise<DurableExperimentReport | null>;
+  listArchiveCandidates(limit: number): Promise<JournalArchiveCandidate[]>;
   deleteJournalEventsBounded(input: {
     types: readonly string[];
     occurredBefore: Date;
+    limit: number;
+  }): Promise<{ deleted: number }>;
+  deleteJournalEventsArchivedRange(input: {
+    types: readonly string[];
+    occurredFrom: Date;
+    occurredBefore: Date;
+    commitSeqTo: number;
+    recordedAtTo: Date;
     limit: number;
   }): Promise<{ deleted: number }>;
   pruneOldCheckpoints(keepLatest: number, limit?: number): Promise<{ deleted: number; latestSequence: number | null }>;
@@ -437,6 +452,18 @@ export class MemoryEventJournal implements EventJournal {
     const existing = this.reports.get(`${experimentId}:${reportKind}`);
     return existing ? structuredClone(existing) : null;
   }
+  async listArchiveCandidates(limit: number): Promise<JournalArchiveCandidate[]> {
+    const cap = Math.max(0, Math.floor(limit));
+    if (cap <= 0) return [];
+    const candidates: JournalArchiveCandidate[] = [];
+    for (const report of this.reports.values()) {
+      if (report.reportKind !== "final" || !report.complete || report.truncated) continue;
+      const rollup = this.rollups.get(`${report.experimentId}:canonical`);
+      if (!rollup?.verified || !rollup.stableRead || !rollup.sourceFenceOccurredAt || !rollup.sourceCommitSeq || !rollup.sourceRecordedAt) continue;
+      candidates.push({ report: structuredClone(report), rollup: structuredClone(rollup) });
+    }
+    return candidates.sort((a, b) => a.report.persistedAt.localeCompare(b.report.persistedAt)).slice(0, cap);
+  }
   async deleteJournalEventsBounded(input: { types: readonly string[]; occurredBefore: Date; limit: number }): Promise<{ deleted: number }> {
     assertJournalCapability(this.access, "maintenance", "deleteJournalEventsBounded");
     if (input.types.some((type) => isProtectedJournalType(type))) {
@@ -459,6 +486,44 @@ export class MemoryEventJournal implements EventJournal {
       }
     }
     this.recordMutation(`deleteJournalEventsBounded:${victims.length}`);
+    return { deleted: victims.length };
+  }
+  async deleteJournalEventsArchivedRange(input: {
+    types: readonly string[];
+    occurredFrom: Date;
+    occurredBefore: Date;
+    commitSeqTo: number;
+    recordedAtTo: Date;
+    limit: number;
+  }): Promise<{ deleted: number }> {
+    assertJournalCapability(this.access, "maintenance", "deleteJournalEventsArchivedRange");
+    if (input.types.some((type) => !(LOCAL_ARCHIVE_PURGE_SAFE_EVENT_TYPES as readonly string[]).includes(type))) {
+      throw new Error("ARCHIVE_PURGE_REFUSED_UNSAFE_TYPES");
+    }
+    const cap = Math.max(0, Math.floor(input.limit));
+    if (cap <= 0) return { deleted: 0 };
+    const from = input.occurredFrom.getTime();
+    const before = input.occurredBefore.getTime();
+    const recordedTo = input.recordedAtTo.getTime();
+    const victims = this.events
+      .filter((event) => input.types.includes(event.type))
+      .filter((event) => {
+        const occurred = Date.parse(event.occurredAt);
+        const recorded = Date.parse(event.recordedAt);
+        return occurred >= from && occurred < before && recorded <= recordedTo
+          && (this.commitSeqById.get(event.id) ?? Number.POSITIVE_INFINITY) <= input.commitSeqTo;
+      })
+      .sort(compareJournalEventOrder)
+      .slice(0, cap);
+    const ids = new Set(victims.map((event) => event.id));
+    for (let index = this.events.length - 1; index >= 0; index -= 1) {
+      const row = this.events[index]!;
+      if (!ids.has(row.id)) continue;
+      this.eventIds.delete(row.id);
+      this.commitSeqById.delete(row.id);
+      this.events.splice(index, 1);
+    }
+    this.recordMutation(`deleteJournalEventsArchivedRange:${victims.length}`);
     return { deleted: victims.length };
   }
   async countEligible(types: readonly string[], occurredBefore: Date): Promise<{ count: number; oldestOccurredAt: string | null }> {
@@ -1046,6 +1111,25 @@ export class PostgresEventJournal implements EventJournal {
       .limit(1);
     return rows[0] ? toExperimentReport(rows[0]) : null;
   }
+  async listArchiveCandidates(limit: number): Promise<JournalArchiveCandidate[]> {
+    const cap = Math.max(0, Math.min(64, Math.floor(limit)));
+    if (cap <= 0) return [];
+    const rows = await this.db.select().from(experimentReports)
+      .where(and(
+        eq(experimentReports.reportKind, "final"),
+        eq(experimentReports.complete, true),
+        eq(experimentReports.truncated, false),
+      ))
+      .orderBy(asc(experimentReports.persistedAt))
+      .limit(cap);
+    const candidates: JournalArchiveCandidate[] = [];
+    for (const row of rows) {
+      const rollup = await this.loadAnalyticsRollup(row.experimentId, "canonical");
+      if (!rollup?.verified || !rollup.stableRead || !rollup.sourceFenceOccurredAt || !rollup.sourceCommitSeq || !rollup.sourceRecordedAt) continue;
+      candidates.push({ report: toExperimentReport(row), rollup });
+    }
+    return candidates;
+  }
   async deleteJournalEventsBounded(input: { types: readonly string[]; occurredBefore: Date; limit: number }): Promise<{ deleted: number }> {
     assertJournalCapability(this.access, "maintenance", "deleteJournalEventsBounded");
     if (input.types.length === 0) return { deleted: 0 };
@@ -1061,6 +1145,36 @@ export class PostgresEventJournal implements EventJournal {
         SELECT occurred_at, id FROM journal_events
         WHERE type = ANY(${input.types as string[]})
           AND occurred_at < ${input.occurredBefore.toISOString()}
+        ORDER BY occurred_at ASC, id ASC
+        LIMIT ${cap}
+      )
+    `;
+    return { deleted: result.count ?? 0 };
+  }
+  async deleteJournalEventsArchivedRange(input: {
+    types: readonly string[];
+    occurredFrom: Date;
+    occurredBefore: Date;
+    commitSeqTo: number;
+    recordedAtTo: Date;
+    limit: number;
+  }): Promise<{ deleted: number }> {
+    assertJournalCapability(this.access, "maintenance", "deleteJournalEventsArchivedRange");
+    if (input.types.length === 0) return { deleted: 0 };
+    if (input.types.some((type) => !(LOCAL_ARCHIVE_PURGE_SAFE_EVENT_TYPES as readonly string[]).includes(type))) {
+      throw new Error("ARCHIVE_PURGE_REFUSED_UNSAFE_TYPES");
+    }
+    const cap = Math.max(0, Math.min(500, Math.floor(input.limit)));
+    if (cap <= 0) return { deleted: 0 };
+    const result = await this.client`
+      DELETE FROM journal_events
+      WHERE id IN (
+        SELECT id FROM journal_events
+        WHERE type = ANY(${input.types as string[]})
+          AND occurred_at >= ${input.occurredFrom.toISOString()}
+          AND occurred_at < ${input.occurredBefore.toISOString()}
+          AND commit_seq <= ${input.commitSeqTo}
+          AND recorded_at <= ${input.recordedAtTo.toISOString()}
         ORDER BY occurred_at ASC, id ASC
         LIMIT ${cap}
       )
