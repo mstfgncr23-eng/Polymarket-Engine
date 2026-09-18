@@ -108,7 +108,9 @@ export class PaperLedger {
       next.unhedgedStartedAt = now;
     }
     next.combinedPairCost = decimal(d(next.averageUpCost).plus(next.averageDownCost));
-    this.positions.set(fill.marketId, next);
+    const inventoryClosed = d(next.upQuantity).eq(0) && d(next.downQuantity).eq(0);
+    if (inventoryClosed) this.positions.delete(fill.marketId);
+    else this.positions.set(fill.marketId, next);
 
     this.state.cash = decimal(d(this.state.cash).minus(cashDelta));
     this.state.realizedPnl = decimal(d(this.state.realizedPnl).plus(realizedDelta));
