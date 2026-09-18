@@ -159,6 +159,17 @@ export const engineEnvSchema = z.object({
     z.boolean().optional(),
   ).default(false),
   /**
+   * Human/forensic journal archive on durable local storage. Journal rows that
+   * are not runtime/recovery authority must never be purged before an archive
+   * segment is atomically written and checksum-verified.
+   */
+  LOCAL_ARCHIVE_ENABLED: z.preprocess(
+    (value) => value === undefined ? undefined : value === true || value === "true" || value === "1",
+    z.boolean().optional(),
+  ).default(false),
+  LOCAL_ARCHIVE_DIR: z.string().min(1).default("/data/archive"),
+  LOCAL_ARCHIVE_BUCKET_MS: z.coerce.number().int().min(60_000).default(60 * 60_000),
+  /**
    * Durable Native V2 learning memory. Default false so production OVH/Fly is
    * unchanged until an operator opts in. Fail-soft when enabled.
    */
