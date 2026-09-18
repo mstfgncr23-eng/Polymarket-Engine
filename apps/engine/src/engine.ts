@@ -1662,6 +1662,7 @@ export class EngineService {
           this.checkpointSequence = checkpoint.sequence;
         }
         await this.replayDurableTail(this.lastAppliedDurableCursor);
+        await this.restoreRestingMakerIntentsFromDurable();
         await this.repairAllDerivedAudit();
         const latest = await this.journal.latestDurableSequence();
         const report = validatePostReplayInvariants(this.recoverableBag(), this.lastAppliedDurableCursor, latest);
@@ -1695,6 +1696,7 @@ export class EngineService {
         });
         this.lastAppliedDurableCursor = 0;
         await this.replayDurableTail(0);
+        await this.restoreRestingMakerIntentsFromDurable();
         await this.repairAllDerivedAudit();
         const latest = await this.journal.latestDurableSequence();
         const report = validatePostReplayInvariants(this.recoverableBag(), this.lastAppliedDurableCursor, latest);
@@ -1724,6 +1726,17 @@ export class EngineService {
     } finally {
       this.metrics.recoveryDuration.observe((performance.now() - started) / 1000);
     }
+  }
+
+  private async restoreRestingMakerIntentsFromDurable(): Promise<void> {
+    for (const [orderId, resting] of this.restingOrders) {
+      if (resting.intent) continue;
+      const reserve = await this.journal.readDurableByOperationKey(`maker:${orderId}:reserve`);
+      const intent = reserve?.payload?.intent;
+      if (intent !== "OPEN_FIRST_LEG" && intent !== "HEDGE_SECOND_LEG") continue;
+      this.restingOrders.set(orderId, { ...resting, intent });
+    }
+    this.syncRestingIndexFromOrders();
   }
 
   private hydrateCheckpointPayload(payload: Record<string, unknown>): {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { MemoryEventJournal } from "@pm/db";
-import { paperOrderSchema } from "@pm/core";
+import { paperOrderSchema, type RestingPaperOrder } from "@pm/core";
 import { EngineService } from "../apps/engine/src/engine.js";
 import { durableIdentityConflicts } from "../apps/engine/src/recovery.js";
 import { NoopGrokActivationBridge } from "../apps/engine/src/activation/index.js";
@@ -149,6 +149,17 @@ describe("Step 5 durable DB fault path", () => {
     try {
       await engine.restMakerForTest(maker, book, "OPEN_FIRST_LEG");
       expect(engine.restingOrdersForTest().get(maker.id)?.intent).toBe("OPEN_FIRST_LEG");
+
+      // Simulate a pre-PR1 checkpoint that persisted the resting order before
+      // RestingPaperOrder itself carried intent. The durable reserve already
+      // has the authoritative top-level intent and recovery must reattach it.
+      const internals = engine as unknown as { restingOrders: Map<string, RestingPaperOrder> };
+      const current = internals.restingOrders.get(maker.id);
+      if (!current) throw new Error("missing resting maker");
+      const legacyResting = structuredClone(current);
+      delete legacyResting.intent;
+      internals.restingOrders.set(maker.id, legacyResting);
+      expect(engine.restingOrdersForTest().get(maker.id)?.intent).toBeUndefined();
     } finally {
       await engine.stop();
     }
