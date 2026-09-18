@@ -357,7 +357,7 @@ describe("PR20 true product end-to-end gate", () => {
       expect(setup.engine.ledger.positions.size).toBe(0);
       expect(setup.engine.state.snapshot().decisionFeed.some(
         (item) => item.type === "FIRST_LEG_REVALIDATION_REJECTED"
-          && item.payload.reason === "DECISION_STATE_CHANGED",
+          && item.detail.reason === "DECISION_STATE_CHANGED",
       )).toBe(true);
     } finally {
       releaseHold?.();
