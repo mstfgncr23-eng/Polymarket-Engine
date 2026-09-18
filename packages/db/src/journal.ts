@@ -203,6 +203,7 @@ export interface EventJournal {
   persistAnalyticsRollup?(rollup: AnalyticsRollup): Promise<AnalyticsRollup>;
   loadAnalyticsRollup?(experimentId: string, rollupKind?: string): Promise<AnalyticsRollup | null>;
   deleteCanonicalEventsThrough?(input: { experimentId: string; occurredBefore?: Date; limit: number; sourceCursor: number; sourceCommitSeq?: number; sourceRecordedAt?: Date }): Promise<{ deleted: number }>;
+  countCanonicalEventsThrough(input: { experimentId: string; occurredBefore: Date; sourceCommitSeq: number; sourceRecordedAt: Date }): Promise<{ count: number; oldestOccurredAt: string | null }>;
   countEligible(types: readonly string[], occurredBefore: Date): Promise<{ count: number; oldestOccurredAt: string | null }>;
   withReadSnapshot<T>(work: (journal: EventJournalKeyset) => Promise<T>): Promise<{ value: T; stable: boolean }>;
   latestCommitSeq(): Promise<number>;
@@ -613,6 +614,23 @@ export class MemoryEventJournal implements EventJournal {
   async latestDurableSequence(): Promise<number> {
     return this.durableHighWater;
   }
+  async countCanonicalEventsThrough(input: { experimentId: string; occurredBefore: Date; sourceCommitSeq: number; sourceRecordedAt: Date }): Promise<{ count: number; oldestOccurredAt: string | null }> {
+    const types = [...CANONICAL_REPORT_INPUT_EVENT_TYPES] as string[];
+    const rows = await this.client`
+      SELECT count(*)::int AS count, min(occurred_at) AS oldest
+      FROM journal_events
+      WHERE type = ANY(${types})
+        AND (payload->>'experimentId') = ${input.experimentId}
+        AND occurred_at < ${input.occurredBefore.toISOString()}
+        AND commit_seq <= ${input.sourceCommitSeq}
+        AND recorded_at <= ${input.sourceRecordedAt.toISOString()}
+    `;
+    const row = rows[0] as { count?: number; oldest?: string | Date | null } | undefined;
+    return {
+      count: Number(row?.count ?? 0),
+      oldestOccurredAt: row?.oldest ? new Date(row.oldest).toISOString() : null,
+    };
+  }
   async saveCheckpoint(checkpoint: Omit<EngineCheckpoint, "id" | "createdAt">): Promise<EngineCheckpoint> {
     assertJournalCapability(this.access, "runtime-write", "saveCheckpoint");
     return this.withDurableLock(() => {
@@ -732,6 +750,16 @@ export class MemoryEventJournal implements EventJournal {
     }
     this.recordMutation(`deleteCanonicalEventsThrough:${victims.length}`);
     return { deleted: victims.length };
+  }
+  async countCanonicalEventsThrough(input: { experimentId: string; occurredBefore: Date; sourceCommitSeq: number; sourceRecordedAt: Date }): Promise<{ count: number; oldestOccurredAt: string | null }> {
+    const rows = this.events
+      .filter((event) => CANONICAL_REPORT_INPUT_EVENT_TYPES.includes(event.type as (typeof CANONICAL_REPORT_INPUT_EVENT_TYPES)[number]))
+      .filter((event) => (event.payload as { experimentId?: unknown }).experimentId === input.experimentId)
+      .filter((event) => Date.parse(event.occurredAt) < input.occurredBefore.getTime())
+      .filter((event) => (this.commitSeqById.get(event.id) ?? Number.POSITIVE_INFINITY) <= input.sourceCommitSeq)
+      .filter((event) => Date.parse(event.recordedAt) <= input.sourceRecordedAt.getTime())
+      .sort(compareJournalEventOrder);
+    return { count: rows.length, oldestOccurredAt: rows[0]?.occurredAt ?? null };
   }
   async close(): Promise<void> {}
 
