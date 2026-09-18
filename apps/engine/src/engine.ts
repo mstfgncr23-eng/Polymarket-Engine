@@ -4637,7 +4637,7 @@ export class EngineService {
         type: "RISK_EVALUATION",
         aggregateType: "risk",
         aggregateId: decision.risk.id,
-        payload: { ...decision.risk, marketId, asset, deRisk: audit },
+        payload: { ...decision.risk, marketId, asset, intent: "PROTECTIVE_DE_RISK", deRisk: audit },
       }));
       if (!decision.accepted || !decision.order) {
         this.protectiveDeRiskNextAttemptAt.set(marketId, now.getTime() + PROTECTIVE_DE_RISK_VETO_RETRY_MS);
