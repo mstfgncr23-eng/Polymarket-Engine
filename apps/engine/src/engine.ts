@@ -197,6 +197,16 @@ class FirstLegLifecycleGuardRejectedError extends Error {
   }
 }
 
+class RiskReductionLifecycleGuardRejectedError extends Error {
+  constructor(
+    readonly marketId: string,
+    readonly intent: "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK",
+    readonly reason: string,
+  ) {
+    super(`RISK_REDUCTION_LIFECYCLE_REJECTED:${marketId}:${intent}:${reason}`);
+  }
+}
+
 function isJournalAdmissionRejectedError(error: unknown): boolean {
   return error instanceof JournalAdmissionRejected
     || (Boolean(error) && typeof error === "object" && (error as { name?: string }).name === "JournalAdmissionRejected");
@@ -231,7 +241,7 @@ type ProtectiveDeRiskAudit = {
   residualQuantity: string;
   residualExposure: string;
   retryCount: number;
-  finalState: "ORDER_ADMITTED" | "RISK_VETO" | "RESIDUAL_UNHEDGED" | "RISK_NEUTRALIZED" | "EXECUTION_ERROR";
+  finalState: "ORDER_ADMITTED" | "RISK_VETO" | "RESIDUAL_UNHEDGED" | "RISK_NEUTRALIZED" | "EXECUTION_ERROR" | "STATE_CHANGED";
 };
 
 type NativeV2ShadowExecutionCapture = {
@@ -716,7 +726,10 @@ export class EngineService {
   async tickMaintenance(): Promise<void> { await this.runMaintenance(); }
   /** Test-only ingress hook that exercises the real reference precursor path. */
   async referenceTickForTest(tick: ReferenceTick): Promise<void> { await this.onReferenceTick(tick); }
-  async applyObservedFill(fill: Parameters<PaperLedger["applyFill"]>[0]): Promise<void> { await this.applyFill(fill); }
+  async applyObservedFill(
+    fill: Parameters<PaperLedger["applyFill"]>[0],
+    intent?: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK",
+  ): Promise<void> { await this.applyFill(fill, { intent }); }
   async restMakerForTest(
     order: PaperOrder,
     snapshot: MarketSnapshot,
@@ -3557,6 +3570,30 @@ export class EngineService {
         if (applied) this.lastTradeAt = this.nowFn();
       } catch (error) {
         if (this.overload.hasIntegrityFault || error instanceof IdempotencyConflictError || error instanceof CrashInjectedError || (error instanceof JournalAdmissionRejected && error.critical)) throw error;
+        if (error instanceof RiskReductionLifecycleGuardRejectedError) {
+          const stateChangedDeRisk = deRisk ? { ...deRisk, finalState: "STATE_CHANGED" as const } : undefined;
+          this.record("RISK_REDUCTION_LIFECYCLE_BLOCKED", order.traceId, order.marketId, {
+            orderId: order.id,
+            intent: error.intent,
+            reason: error.reason,
+            ...(stateChangedDeRisk ? { deRisk: stateChangedDeRisk } : {}),
+          }, decisionSnapshot.asset ?? null);
+          await this.persistReportInput(createJournalEvent({
+            traceId: order.traceId,
+            type: "PAPER_EXECUTION_ERROR",
+            aggregateType: "paper_order",
+            aggregateId: order.id,
+            payload: {
+              orderId: order.id,
+              marketId: order.marketId,
+              intent: error.intent,
+              message: error.message,
+              stateChanged: true,
+              ...(stateChangedDeRisk ? { deRisk: stateChangedDeRisk } : {}),
+            },
+          }));
+          return;
+        }
         this.executionErrors.push(Date.now());
         const message = error instanceof Error ? error.message : String(error);
         const failureDeRisk = deRisk ? { ...deRisk, finalState: "EXECUTION_ERROR" as const } : undefined;
@@ -3719,8 +3756,35 @@ export class EngineService {
         aggregateType: "paper_fill",
         aggregateId: fill.id,
         beforeCommit: () => {
-          if (economicIntent !== "OPEN_FIRST_LEG" || priorFillAuthority) return;
+          if (priorFillAuthority) return;
           const currentPosition = this.ledger.positions.get(fill.marketId);
+
+          if (economicIntent === "HEDGE_SECOND_LEG" || economicIntent === "PROTECTIVE_DE_RISK") {
+            if (!currentPosition?.unpairedOutcome || !d(currentPosition.unpairedQuantity).gt(0)) {
+              throw new RiskReductionLifecycleGuardRejectedError(fill.marketId, economicIntent, "NO_UNPAIRED_RESIDUAL");
+            }
+            if (d(fill.quantity).gt(currentPosition.unpairedQuantity)) {
+              throw new RiskReductionLifecycleGuardRejectedError(fill.marketId, economicIntent, "QUANTITY_EXCEEDS_RESIDUAL");
+            }
+            if (economicIntent === "HEDGE_SECOND_LEG") {
+              if (fill.side !== "BUY") {
+                throw new RiskReductionLifecycleGuardRejectedError(fill.marketId, economicIntent, "HEDGE_SIDE_CHANGED");
+              }
+              if (fill.outcome === currentPosition.unpairedOutcome) {
+                throw new RiskReductionLifecycleGuardRejectedError(fill.marketId, economicIntent, "HEDGE_OUTCOME_CHANGED");
+              }
+            } else {
+              if (fill.side !== "SELL") {
+                throw new RiskReductionLifecycleGuardRejectedError(fill.marketId, economicIntent, "DE_RISK_SIDE_CHANGED");
+              }
+              if (fill.outcome !== currentPosition.unpairedOutcome) {
+                throw new RiskReductionLifecycleGuardRejectedError(fill.marketId, economicIntent, "DE_RISK_OUTCOME_CHANGED");
+              }
+            }
+            return;
+          }
+
+          if (economicIntent !== "OPEN_FIRST_LEG") return;
           if (fill.liquidityRole === "TAKER") {
             if (currentPosition) {
               throw new FirstLegLifecycleGuardRejectedError(fill.marketId, "POSITION_ALREADY_EXISTS");
