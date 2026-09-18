@@ -22,7 +22,7 @@ describe("deterministic math and accounting", () => {
       vwap: "0.405",
       sufficientDepth: true,
       levelsConsumed: 2,
-      worstPrice: "0.40",
+      worstPrice: "0.4",
     });
     expect(calculateSlippageUsd("0.40", result.vwap, "10", "SELL")).toBe("0");
   });
