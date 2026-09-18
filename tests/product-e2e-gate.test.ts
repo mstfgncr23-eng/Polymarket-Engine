@@ -199,25 +199,10 @@ describe("PR20 true product end-to-end gate", () => {
       await beginAndGenerateTrigger(setup);
       expect(setup.engine.state.latestConsensus?.consensusDirection).toBe("UP");
       expect(setup.engine.state.latestConsensus?.authority).toBe("NATIVE_DETERMINISTIC_V1");
-      expect(setup.engine.ledger.positions.get("btc-mkt")?.unpairedQuantity).not.toBe("0");
       expect(setup.engine.ledger.snapshot().cash).not.toBe(cashBefore);
 
-      // The strategy-wide cooldown is intentionally 60s. Advance the test
-      // clock, refresh both books/reference, and let the real market trigger
-      // path create a fresh hedge opportunity after that cooldown.
-      setup.clock.nowMs = START_MS + 61_000;
-      const hedgeStartedAt = setup.clock.nowMs;
-      await setup.market.emitSnapshot(marketBook(setup.clock, "DOWN", 2));
-      await setup.market.emitSnapshot(marketBook(setup.clock, "UP", 2));
-      await setup.engine.ingestReferenceTickForTest(referenceTick(setup.clock, "100"));
-      setup.clock.nowMs = START_MS + 62_000;
-      await setup.engine.ingestReferenceTickForTest(referenceTick(setup.clock, "102"));
-      await drainRuntime(setup.engine);
-      const hedgeTrigger = await waitFor(
-        () => [...setup.engine.state.recentTriggers].reverse().find((item) => item.marketId === "btc-mkt" && item.kind === "BOOK_IMBALANCE" && Date.parse(item.createdAt) >= hedgeStartedAt),
-        (item): item is TriggerEvent => Boolean(item),
-      );
-      await drainRuntime(setup.engine);
+      // The books are immediately lockable as a profitable pair. A risk-reducing
+      // HEDGE_SECOND_LEG must not wait for the strategy-wide fresh-entry cooldown.
       const paired = setup.engine.ledger.positions.get("btc-mkt");
       expect(paired?.pairedQuantity, JSON.stringify({
         position: paired,
