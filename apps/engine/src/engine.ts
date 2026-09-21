@@ -4494,8 +4494,15 @@ export class EngineService {
     for (const position of [...this.ledger.positions.values()]) {
       if (Number(position.unpairedQuantity) <= 0) continue;
       // Maintenance is a low-frequency fallback. Fresh synchronized snapshots
-      // normally trigger the same keyed de-risk flight sooner.
-      await this.maybeProtectiveDeRisk(position.marketId);
+      // normally trigger the same keyed de-risk flight sooner. A genuine
+      // durable fault here has already latched the fail-closed state; log it
+      // like the snapshot-triggered flight instead of letting an unhandled
+      // rejection escape the maintenance timer loop.
+      try {
+        await this.maybeProtectiveDeRisk(position.marketId);
+      } catch (error) {
+        this.logger.error({ err: error, marketId: position.marketId }, "maintenance protective de-risk attempt failed");
+      }
       const current = this.ledger.positions.get(position.marketId);
       if (!current || Number(current.unpairedQuantity) <= 0) continue;
       for (const trigger of this.triggerEngine.ingestPosition(current, current.id, this.assetByMarket.get(current.marketId) ?? null)) {
@@ -4743,9 +4750,10 @@ export class EngineService {
    * PAPER_EXECUTION_LATENCY_MS, settlement lookups). Alpha gates remain
    * bypassed for PROTECTIVE_DE_RISK, but a transition to DB unavailable,
    * journal degraded, overload integrity fault / FAIL_CLOSED, timestamp
-   * disorder, shutdown, or stale required market execution state must prevent
-   * a new protective economic mutation — rejected as a normal state change,
-   * never as an integrity fault.
+   * disorder, shutdown, a feed gap (no live book), token desynchronization,
+   * or stale/absent/future required market execution state must prevent a new
+   * protective economic mutation — rejected as a normal state change, never
+   * as an integrity fault.
    */
   private protectiveFillHardSafetyReason(fill: Parameters<PaperLedger["applyFill"]>[0]): string | null {
     if (this.state.database !== "UP") return "DATABASE_UNAVAILABLE";
@@ -4754,17 +4762,30 @@ export class EngineService {
     }
     if (this.timestampDisorder) return "EVENT_TIMESTAMP_DISORDER";
     if (this.state.draining) return "SHUTTING_DOWN";
-    // The execution snapshot must still be fresh at the decisive commit. Read
-    // the live book (the exact snapshot executePaperTaker walks), not the
-    // fill's embedded timestamp, so direct stable-fill replays without a market
-    // context are never treated as stale.
+
+    // The protective SELL executes against the live trusted book. If the book
+    // vanished (feed gap/drop or pair-projection clearing during a resync),
+    // its market/outcome/token identity no longer matches the fill, or the
+    // token left the synchronized set, the admission-era execution snapshot is
+    // no longer authoritative and this mutation must not commit.
     const executionBook = this.snapshots.get(fill.marketId)?.[fill.outcome] ?? null;
-    if (executionBook) {
-      const receivedAtMs = Date.parse(executionBook.receivedAt);
-      if (Number.isFinite(receivedAtMs) && this.nowFn().getTime() - receivedAtMs > this.riskLimits.staleFeedTimeoutMs) {
-        return "MARKET_FEED_STALE";
-      }
+    if (!executionBook) return "MARKET_BOOK_UNAVAILABLE";
+    if (
+      executionBook.marketId !== fill.marketId
+      || executionBook.outcome !== fill.outcome
+      || executionBook.tokenId !== fill.tokenId
+    ) {
+      return "MARKET_BOOK_IDENTITY_MISMATCH";
     }
+    if (!this.adapterTokenSynchronized(fill.tokenId)) return "MARKET_TOKEN_UNSYNCHRONIZED";
+
+    // Book time must be valid, not from the future, and within the configured
+    // freshness window at the commit boundary.
+    const receivedAtMs = Date.parse(executionBook.receivedAt);
+    const nowMs = this.nowFn().getTime();
+    if (!Number.isFinite(receivedAtMs) || !Number.isFinite(nowMs)) return "MARKET_FEED_STALE";
+    if (receivedAtMs > nowMs) return "MARKET_FEED_FUTURE";
+    if (nowMs - receivedAtMs > this.riskLimits.staleFeedTimeoutMs) return "MARKET_FEED_STALE";
     return null;
   }
 

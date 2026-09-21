@@ -529,14 +529,23 @@ describe("B/D/R/T settlement, close policy, recovery, accelerated lifecycle", ()
 describe("risk-reducing fill lifecycle fences", () => {
   it("rejects stale hedge/de-risk fills that would cross the current unpaired residual", async () => {
     const journal = new MemoryEventJournal();
+    const market = new ScriptedMarketAdapter();
     const env = engineEnvSchema.parse({
       NODE_ENV: "test",
       JOURNAL_MODE: "memory",
       TRADING_MODE: "paper",
       POLYMARKET_TOKEN_IDS: "up,down",
     });
-    const engine = new EngineService(env, journal, logger, { market: pendingFeed() as never });
+    const engine = new EngineService(env, journal, logger, { market: market as never });
     await engine.start();
+    // A live, fresh, synchronized execution book is required for a protective
+    // SELL; establish the UP book the de-risk fills walk.
+    const receivedAt = new Date().toISOString();
+    await market.emitSnapshot(snapshot({
+      marketId: "race-mkt", tokenId: "up", outcome: "UP", asset: "BTC",
+      bids: [{ price: "0.50", quantity: "1000" }], asks: [{ price: "0.51", quantity: "1000" }],
+      sourceTimestamp: receivedAt, receivedAt, sequence: 1,
+    }));
     try {
       await engine.applyObservedFill(paperFill("race-mkt", "UP", "0.40"));
       expect(engine.ledger.positions.get("race-mkt")?.unpairedQuantity).toBe("10");
@@ -545,6 +554,7 @@ describe("risk-reducing fill lifecycle fences", () => {
         ...paperFill("race-mkt", "UP", "0.35"),
         id: "derisk-partial-fill",
         orderId: "derisk-partial-order",
+        tokenId: "up",
         side: "SELL",
         quantity: "4",
       }, "PROTECTIVE_DE_RISK");
@@ -559,6 +569,7 @@ describe("risk-reducing fill lifecycle fences", () => {
         ...paperFill("race-mkt", "DOWN", "0.50"),
         id: "stale-hedge-fill",
         orderId: "stale-hedge-order",
+        tokenId: "down",
         quantity: "10",
       }, "HEDGE_SECOND_LEG")).rejects.toThrow("QUANTITY_EXCEEDS_RESIDUAL");
       // Scenario B regression: protective won the race, so the stale hedge is
@@ -577,6 +588,7 @@ describe("risk-reducing fill lifecycle fences", () => {
         ...paperFill("race-mkt", "DOWN", "0.50"),
         id: "fresh-hedge-fill",
         orderId: "fresh-hedge-order",
+        tokenId: "down",
         quantity: "6",
       }, "HEDGE_SECOND_LEG");
       expect(engine.ledger.positions.get("race-mkt")).toMatchObject({
@@ -590,6 +602,7 @@ describe("risk-reducing fill lifecycle fences", () => {
         ...paperFill("race-mkt", "UP", "0.34"),
         id: "stale-derisk-fill",
         orderId: "stale-derisk-order",
+        tokenId: "up",
         side: "SELL",
         quantity: "6",
       }, "PROTECTIVE_DE_RISK")).rejects.toThrow("NO_UNPAIRED_RESIDUAL");
@@ -604,6 +617,49 @@ describe("risk-reducing fill lifecycle fences", () => {
       expect(engine.integrityFault()).toBe(false);
       expect(engine.overloadState()).not.toBe("FAIL_CLOSED");
       expect(engine.state.database).toBe("UP");
+    } finally {
+      await engine.stop();
+    }
+  });
+
+  it("Scenario gap regression: rejects a protective SELL when no live execution book exists at the boundary", async () => {
+    const journal = new MemoryEventJournal();
+    const env = engineEnvSchema.parse({
+      NODE_ENV: "test",
+      JOURNAL_MODE: "memory",
+      TRADING_MODE: "paper",
+      POLYMARKET_TOKEN_IDS: "up,down",
+    });
+    const engine = new EngineService(env, journal, logger, { market: pendingFeed() as never });
+    await engine.start();
+    try {
+      await engine.applyObservedFill({
+        ...paperFill("race-mkt", "UP", "0.40"),
+        id: "gap-first-leg",
+        orderId: "gap-first-order",
+      });
+      expect(engine.ledger.positions.get("race-mkt")?.unpairedQuantity).toBe("10");
+
+      // The final authoritative fence requires a live execution book. A feed
+      // gap between protective admission and commit must reject the fill with
+      // a bounded state change, never an integrity fault.
+      await expect(engine.applyObservedFill({
+        ...paperFill("race-mkt", "UP", "0.35"),
+        id: "gap-derisk-fill",
+        orderId: "gap-derisk-order",
+        tokenId: "race-mkt-up",
+        side: "SELL",
+        quantity: "4",
+      }, "PROTECTIVE_DE_RISK")).rejects.toThrow("MARKET_BOOK_UNAVAILABLE");
+      expect(engine.ledger.positions.get("race-mkt")).toMatchObject({
+        upQuantity: "10", downQuantity: "0", unpairedOutcome: "UP", unpairedQuantity: "10",
+      });
+      expect(engine.integrityFault()).toBe(false);
+      expect(engine.overloadState()).not.toBe("FAIL_CLOSED");
+      expect(engine.state.database).toBe("UP");
+      const protectiveFills = (await journal.queryEvents({ types: ["PAPER_FILL"] }))
+        .filter((row) => row.payload.intent === "PROTECTIVE_DE_RISK");
+      expect(protectiveFills).toHaveLength(0);
     } finally {
       await engine.stop();
     }
