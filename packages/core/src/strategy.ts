@@ -15,15 +15,63 @@ export interface StrategyCandidate {
   marketId: string;
   tokenId: string;
   outcome: Outcome;
-  side: "BUY";
+  side: "BUY" | "SELL";
   quantity: string;
   limitPrice: string;
-  intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG";
+  intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK";
   /** Raw expected value in USD/share for a $1 binary payout. */
   rawEdgeUsdPerShare?: number;
   /** @deprecated Compatibility alias for rawEdgeUsdPerShare. */
   rawExpectedEdge: number;
   reasonCodes: string[];
+}
+
+export function buildProtectiveDeRiskCandidate(input: {
+  position: Position;
+  snapshot: MarketSnapshot;
+  maxOrderSizeUsd: number;
+}): StrategyCandidate | null {
+  const { position, snapshot } = input;
+  if (!position.unpairedOutcome || position.unpairedOutcome !== snapshot.outcome) return null;
+  const unpaired = d(position.unpairedQuantity);
+  const maxNotional = d(input.maxOrderSizeUsd);
+  if (unpaired.lte(0) || maxNotional.lte(0) || snapshot.bids.length === 0) return null;
+
+  let quantity = d(0);
+  let notional = d(0);
+  let worstPrice: string | null = null;
+  for (const level of snapshot.bids) {
+    const price = d(level.price);
+    const available = d(level.quantity);
+    if (price.lte(0) || available.lte(0)) continue;
+    const remainingInventory = unpaired.minus(quantity);
+    const remainingNotional = maxNotional.minus(notional);
+    if (remainingInventory.lte(0) || remainingNotional.lte(0)) break;
+    const capQuantity = remainingNotional.div(price);
+    let take = available;
+    if (take.gt(remainingInventory)) take = remainingInventory;
+    if (take.gt(capQuantity)) take = capQuantity;
+    if (take.lte(0)) break;
+    quantity = quantity.plus(take);
+    notional = notional.plus(take.mul(price));
+    worstPrice = level.price;
+  }
+
+  if (quantity.lte(0) || !worstPrice || !snapshot.minOrderSize || quantity.lt(snapshot.minOrderSize)) return null;
+  return {
+    strategyId: "protective-de-risk",
+    strategyVersion: "protective-de-risk-v1",
+    marketId: snapshot.marketId,
+    tokenId: snapshot.tokenId,
+    outcome: snapshot.outcome,
+    side: "SELL",
+    quantity: decimal(quantity),
+    limitPrice: worstPrice,
+    intent: "PROTECTIVE_DE_RISK",
+    rawEdgeUsdPerShare: 0,
+    rawExpectedEdge: 0,
+    reasonCodes: ["MAX_UNHEDGED_DURATION", "REDUCE_UNPAIRED_INVENTORY"],
+  };
 }
 
 export interface StrategyContext {

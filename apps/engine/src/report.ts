@@ -253,9 +253,13 @@ export class ExperimentSummaryAccumulator {
       this.lastLedger = event.payload as unknown as LedgerState;
       this.maxDrawdown = Math.max(this.maxDrawdown, Number((event.payload as { drawdown?: unknown }).drawdown ?? 0));
     } else if (type === "RISK_EVALUATION") {
-      this.riskCount += 1;
-      if ((event.payload as { accepted?: boolean }).accepted === true) this.accepted += 1;
-      this.addRiskAttribution(event);
+      const payload = event.payload as { accepted?: boolean; intent?: unknown; deRisk?: unknown };
+      const protective = payload.intent === "PROTECTIVE_DE_RISK" || payload.deRisk != null;
+      if (!protective) {
+        this.riskCount += 1;
+        if (payload.accepted === true) this.accepted += 1;
+        this.addRiskAttribution(event);
+      }
     } else if (type === "PAPER_ORDER_CREATED") {
       this.paperOrders += 1;
       const payload = event.payload as { orderType?: unknown; type?: unknown };
@@ -263,11 +267,14 @@ export class ExperimentSummaryAccumulator {
       if (payload.orderType === "TAKER" || payload.type === "TAKER") this.takerOrders += 1;
     } else if (type === "FIRST_LEG_FILLED") this.firstLegCount += 1;
     else if (type === "HEDGE_COMPLETE") {
-      this.hedgeCompleteCount += 1;
-      const duration = Number((event.payload as { unhedgedDurationMs?: unknown }).unhedgedDurationMs);
-      if (Number.isFinite(duration)) {
-        this.hedgeDurationSum += duration;
-        this.hedgeDurationN += 1;
+      const completionMode = (event.payload as { completionMode?: unknown }).completionMode;
+      if (completionMode !== "PROTECTIVE_DE_RISK") {
+        this.hedgeCompleteCount += 1;
+        const duration = Number((event.payload as { unhedgedDurationMs?: unknown }).unhedgedDurationMs);
+        if (Number.isFinite(duration)) {
+          this.hedgeDurationSum += duration;
+          this.hedgeDurationN += 1;
+        }
       }
     } else if (type === "CONSENSUS_DECISION" && (event.payload as { authority?: unknown }).authority === "NATIVE_DETERMINISTIC_V1") {
       this.modelCounts.NATIVE_DETERMINISTIC_V1 = (this.modelCounts.NATIVE_DETERMINISTIC_V1 ?? 0) + 1;
@@ -285,7 +292,9 @@ export class ExperimentSummaryAccumulator {
       const status = String((event.payload as { status?: unknown }).status ?? "MCP");
       if (status !== "HANDLED") this.failureStatistics[`MCP_${status}`] = (this.failureStatistics[`MCP_${status}`] ?? 0) + 1;
     } else if (type === "PAPER_EXECUTION_ERROR") {
-      this.failureStatistics.PAPER_EXECUTION_ERROR = (this.failureStatistics.PAPER_EXECUTION_ERROR ?? 0) + 1;
+      if ((event.payload as { stateChanged?: unknown }).stateChanged !== true) {
+        this.failureStatistics.PAPER_EXECUTION_ERROR = (this.failureStatistics.PAPER_EXECUTION_ERROR ?? 0) + 1;
+      }
     } else if (type === "PAIR_REALIZED") {
       const net = netRealizedEdgeOf(event);
       if (Number.isFinite(net)) { this.pairRealizedNetSum += net; this.pairRealizedNetN += 1; }

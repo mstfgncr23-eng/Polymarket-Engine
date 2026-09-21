@@ -249,7 +249,8 @@ export class TriggerEngine {
     const candidates: Candidate[] = [
       { kind: "DIRECTIONAL_EXPOSURE", score: unpaired, severity: unpaired > 20 ? 2 : 1, evidence: { unpairedQuantity: position.unpairedQuantity, unpairedOutcome: position.unpairedOutcome }, source: "risk" },
     ];
-    const age = this.now().getTime() - new Date(position.openedAt).getTime();
+    const episodeStart = position.unhedgedStartedAt ?? position.openedAt;
+    const age = this.now().getTime() - new Date(episodeStart).getTime();
     if (age >= (this.config.failedHedgeDurationMs ?? 300_000)) {
       candidates.push({ kind: "FAILED_HEDGE", score: age, severity: 2, evidence: { unpairedQuantity: position.unpairedQuantity, ageMs: age }, source: "risk" });
     }

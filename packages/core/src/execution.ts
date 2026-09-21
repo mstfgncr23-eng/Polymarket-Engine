@@ -12,7 +12,7 @@ export function executePaperTaker(input: TakerExecutionInput): PaperFill {
   if (input.order.orderType !== "TAKER") throw new Error("ORDER_IS_NOT_TAKER");
   if (!input.snapshotAfterLatency.feeSchedule) throw new Error("UNKNOWN_FEE_SCHEDULE");
   const levels = input.order.side === "BUY" ? input.snapshotAfterLatency.asks : input.snapshotAfterLatency.bids;
-  const walk = walkBook(levels, input.order.quantity, input.order.requestedPrice);
+  const walk = walkBook(levels, input.order.quantity, input.order.requestedPrice, input.order.side);
   if (!walk.sufficientDepth || d(walk.filledQuantity).lt(input.order.quantity)) throw new Error("INSUFFICIENT_DEPTH");
   const fee = calculateFee(walk.filledQuantity, walk.vwap, "TAKER", input.snapshotAfterLatency.feeSchedule);
   return {

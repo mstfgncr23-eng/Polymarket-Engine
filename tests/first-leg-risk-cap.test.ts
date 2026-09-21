@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { TemporalPairHedgeStrategy, consensusDecisionSchema, positionSchema } from "@pm/core";
+import { TemporalPairHedgeStrategy, buildProtectiveDeRiskCandidate, consensusDecisionSchema, executePaperTaker, paperOrderSchema, positionSchema } from "@pm/core";
 import { now, snapshot } from "./fixtures.js";
 
 function consensus(direction: "UP" | "DOWN" | "FLAT") {
@@ -85,6 +85,101 @@ describe("temporal pair hedge first-leg risk cap", () => {
     expect(candidate?.intent).toBe("HEDGE_SECOND_LEG");
     expect(candidate?.quantity).toBe("20");
     expect(candidate?.reasonCodes).not.toContain("FIRST_LEG_RISK_CAPPED");
+  });
+
+  it("builds a bounded taker SELL only from executable unpaired bid depth", () => {
+    const position = positionSchema.parse({
+      id: "pos-derisk-market",
+      marketId: "derisk-market",
+      upQuantity: "20",
+      downQuantity: "0",
+      averageUpCost: "0.45",
+      averageDownCost: "0",
+      pairedQuantity: "0",
+      unpairedOutcome: "UP",
+      unpairedQuantity: "20",
+      unhedgedStartedAt: new Date(now.getTime() - 600_000).toISOString(),
+      combinedPairCost: "0.45",
+      totalFees: "0",
+      totalSlippage: "0",
+      openedAt: new Date(now.getTime() - 600_000).toISOString(),
+      updatedAt: now.toISOString(),
+    });
+    const book = snapshot({
+      marketId: "derisk-market",
+      tokenId: "up-derisk",
+      outcome: "UP",
+      bids: [
+        { price: "0.41", quantity: "4" },
+        { price: "0.40", quantity: "3" },
+      ],
+      asks: [{ price: "0.42", quantity: "100" }],
+    });
+
+    const candidate = buildProtectiveDeRiskCandidate({
+      position,
+      snapshot: book,
+      maxOrderSizeUsd: 25,
+    });
+    expect(candidate).toMatchObject({
+      side: "SELL",
+      intent: "PROTECTIVE_DE_RISK",
+      outcome: "UP",
+      quantity: "7",
+      limitPrice: "0.40",
+    });
+
+    const order = paperOrderSchema.parse({
+      id: "derisk-order",
+      traceId: "derisk-trace",
+      triggerId: "derisk-trigger",
+      strategyId: candidate!.strategyId,
+      marketId: candidate!.marketId,
+      tokenId: candidate!.tokenId,
+      outcome: candidate!.outcome,
+      side: candidate!.side,
+      orderType: "TAKER",
+      requestedPrice: candidate!.limitPrice,
+      quantity: candidate!.quantity,
+      status: "PENDING",
+      createdAt: now.toISOString(),
+    });
+    const fill = executePaperTaker({ order, snapshotAfterLatency: book, measuredLatencyMs: 0 });
+    expect(fill.side).toBe("SELL");
+    expect(fill.quantity).toBe("7");
+    expect(Number(fill.fillPrice)).toBeCloseTo((4 * 0.41 + 3 * 0.40) / 7, 8);
+  });
+
+  it("never builds a protective sell that touches paired inventory", () => {
+    const position = positionSchema.parse({
+      id: "pos-paired-residual",
+      marketId: "paired-residual",
+      upQuantity: "12",
+      downQuantity: "10",
+      averageUpCost: "0.45",
+      averageDownCost: "0.44",
+      pairedQuantity: "10",
+      unpairedOutcome: "UP",
+      unpairedQuantity: "2",
+      unhedgedStartedAt: new Date(now.getTime() - 600_000).toISOString(),
+      combinedPairCost: "0.89",
+      totalFees: "0",
+      totalSlippage: "0",
+      openedAt: new Date(now.getTime() - 600_000).toISOString(),
+      updatedAt: now.toISOString(),
+    });
+    const book = snapshot({
+      marketId: "paired-residual",
+      tokenId: "up-paired-residual",
+      outcome: "UP",
+      bids: [{ price: "0.40", quantity: "1000" }],
+      asks: [{ price: "0.41", quantity: "1000" }],
+    });
+    expect(buildProtectiveDeRiskCandidate({
+      position,
+      snapshot: book,
+      maxOrderSizeUsd: 25,
+    })?.quantity).toBe("2");
   });
 
   it("does not reopen a fully paired unsettled market", () => {

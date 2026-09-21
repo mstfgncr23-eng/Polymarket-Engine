@@ -64,6 +64,59 @@ describe("native final report semantics", () => {
     expect(summary.winLossDistribution.losses).toBe(1);
   });
 
+  it("keeps protective risk exits out of alpha opportunity and race-failure metrics", () => {
+    const summary = buildExperimentSummary([
+      event("RISK_EVALUATION", "risk", "alpha-risk", {
+        accepted: true,
+        marketId: "m1",
+        asset: "BTC",
+      }, 1),
+      event("RISK_EVALUATION", "risk", "derisk-risk", {
+        accepted: false,
+        marketId: "m1",
+        asset: "BTC",
+        intent: "PROTECTIVE_DE_RISK",
+        deRisk: { retryCount: 1 },
+      }, 2),
+      event("PAPER_EXECUTION_ERROR", "paper_order", "race-order", {
+        marketId: "m1",
+        intent: "PROTECTIVE_DE_RISK",
+        stateChanged: true,
+      }, 3),
+      event("PAPER_EXECUTION_ERROR", "paper_order", "real-error", {
+        marketId: "m1",
+        message: "INSUFFICIENT_DEPTH",
+      }, 4),
+    ], "exp-report-separation");
+
+    expect(summary.totalOpportunities).toBe(1);
+    expect(summary.acceptedOpportunities).toBe(1);
+    expect(summary.rejectedOpportunities).toBe(0);
+    expect(summary.failureStatistics.PAPER_EXECUTION_ERROR).toBe(1);
+  });
+
+  it("closes failed-hedge episodes without counting protective neutralization as a pair hedge", () => {
+    const summary = buildExperimentSummary([
+      event("FIRST_LEG_FILLED", "position", "pos:m1", { marketId: "m1", unpairedQuantity: "10" }, 1),
+      event("TRIGGER_EVENT", "trigger", "failed-1", { marketId: "m1", kind: "FAILED_HEDGE" }, 2),
+      event("HEDGE_COMPLETE", "position", "pos:m1", {
+        marketId: "m1",
+        pairedQuantity: "10",
+        unhedgedDurationMs: 301_000,
+        completionMode: "PROTECTIVE_DE_RISK",
+        intent: "PROTECTIVE_DE_RISK",
+      }, 3),
+      // A later episode for the same market must count again, proving the
+      // protective neutralization closed the prior failed-hedge episode.
+      event("TRIGGER_EVENT", "trigger", "failed-2", { marketId: "m1", kind: "FAILED_HEDGE" }, 4),
+    ], "exp-protective-completion");
+
+    expect(summary.firstLegCount).toBe(1);
+    expect(summary.failedHedgeCount).toBe(2);
+    expect(summary.hedgeCompleteCount).toBe(0);
+    expect(summary.averageUnhedgedDurationMs).toBe(0);
+  });
+
   it("counts fresh first-leg cycles after a fully paired position reopens", () => {
     const initial = pos();
     const paired = pos({

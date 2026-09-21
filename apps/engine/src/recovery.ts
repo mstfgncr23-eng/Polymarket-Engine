@@ -168,8 +168,17 @@ export function durableIdentityConflicts(
     Object.fromEntries(keys.map((key) => [key, row[key] ?? null]))
   );
   switch (type) {
-    case "PAPER_FILL":
-      return hashDurablePayload({ fill: existing.fill ?? null }) !== hashDurablePayload({ fill: incoming.fill ?? null });
+    case "PAPER_FILL": {
+      const fillConflict = hashDurablePayload({ fill: existing.fill ?? null })
+        !== hashDurablePayload({ fill: incoming.fill ?? null });
+      if (fillConflict) return true;
+      // Intent was added after legacy fills existed. Once persisted, a retry
+      // cannot reinterpret the same economic fill as another lifecycle action.
+      if (Object.prototype.hasOwnProperty.call(existing, "intent")) {
+        return existing.intent !== incoming.intent;
+      }
+      return false;
+    }
     case "PAPER_MAKER_RESERVED": {
       const baseConflict = hashDurablePayload(pick(existing, ["orderId", "reserved", "resting"]))
         !== hashDurablePayload(pick(incoming, ["orderId", "reserved", "resting"]));
@@ -219,6 +228,8 @@ const fillPayloadSchema = z.object({
   positionId: z.string().min(1),
   reservationAfter: z.string().nullable(),
   restingAfter: restingPaperOrderSchema.nullable().optional(),
+  intent: z.enum(["OPEN_FIRST_LEG", "HEDGE_SECOND_LEG", "PROTECTIVE_DE_RISK"]).optional(),
+  deRisk: z.record(z.string(), z.unknown()).optional(),
 });
 
 const reservePayloadSchema = z.object({

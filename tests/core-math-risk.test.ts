@@ -10,6 +10,57 @@ describe("deterministic math and accounting", () => {
     expect(calculateSlippageUsd("0.50", "0.49", "10", "BUY")).toBe("0");
   });
 
+  it("walks SELL depth from best bid down to the sell limit", () => {
+    const result = walkBook(
+      [{ price: "0.41", quantity: "5" }, { price: "0.40", quantity: "5" }, { price: "0.39", quantity: "50" }],
+      "10",
+      "0.40",
+      "SELL",
+    );
+    expect(result).toMatchObject({
+      filledQuantity: "10",
+      vwap: "0.405",
+      sufficientDepth: true,
+      levelsConsumed: 2,
+      worstPrice: "0.4",
+    });
+    expect(calculateSlippageUsd("0.40", result.vwap, "10", "SELL")).toBe("0");
+  });
+
+  it("tracks each unhedged episode independently and removes a fully unwound position", () => {
+    const ledger = new PaperLedger(1000, now);
+    const first = { ...fill("UP", "0.45", "10"), timestamp: "2026-08-31T12:00:00.000Z" };
+    let position = ledger.applyFill(first);
+    expect(position.unhedgedStartedAt).toBe(first.timestamp);
+
+    const sameEpisode = { ...fill("UP", "0.46", "2"), timestamp: "2026-08-31T12:01:00.000Z" };
+    position = ledger.applyFill(sameEpisode);
+    expect(position.unhedgedStartedAt).toBe(first.timestamp);
+
+    const pair = { ...fill("DOWN", "0.50", "12"), timestamp: "2026-08-31T12:02:00.000Z" };
+    position = ledger.applyFill(pair);
+    expect(position.unpairedQuantity).toBe("0");
+    expect(position.unhedgedStartedAt).toBeNull();
+
+    const reopen = { ...fill("DOWN", "0.49", "2", "SELL"), timestamp: "2026-08-31T12:03:00.000Z" };
+    position = ledger.applyFill(reopen);
+    expect(position.unpairedOutcome).toBe("UP");
+    expect(position.unpairedQuantity).toBe("2");
+    expect(position.unhedgedStartedAt).toBe(reopen.timestamp);
+
+    const closeResidual = { ...fill("UP", "0.44", "2", "SELL"), timestamp: "2026-08-31T12:04:00.000Z" };
+    position = ledger.applyFill(closeResidual);
+    expect(position.unpairedQuantity).toBe("0");
+    expect(position.unhedgedStartedAt).toBeNull();
+    expect(ledger.positions.get("btc-15m")?.pairedQuantity).toBe("10");
+
+    const sellPairedUp = { ...fill("UP", "0.44", "10", "SELL"), timestamp: "2026-08-31T12:05:00.000Z" };
+    ledger.applyFill(sellPairedUp);
+    const sellPairedDown = { ...fill("DOWN", "0.44", "10", "SELL"), timestamp: "2026-08-31T12:06:00.000Z" };
+    ledger.applyFill(sellPairedDown);
+    expect(ledger.positions.has("btc-15m")).toBe(false);
+  });
+
   it("uses the market fee curve and taker-only maker rule", () => {
     expect(calculateFee("10", "0.5", "TAKER", feeSchedule)).toBe("0.17500");
     expect(calculateFee("10", "0.5", "MAKER", feeSchedule)).toBe("0");
@@ -98,6 +149,69 @@ describe("native decisions and hard risk", () => {
       lastStrategyTradeAt: recentTradeAt,
     }), limits);
     expect(hedge.vetoes).not.toContain("STRATEGY_COOLDOWN");
+  });
+
+  it("allows a monotonic protective unwind through alpha gates but keeps hard safety", () => {
+    const limits = riskLimitsSchema.parse({});
+    const protective = safeRisk({
+      intent: "PROTECTIVE_DE_RISK",
+      marketExposureUsd: "50",
+      assetExposureUsd: "50",
+      totalExposureUsd: "80",
+      directionalExposureUsd: "20",
+      unhedgedExposureUsd: "20",
+      projectedMarketExposureUsd: "45",
+      projectedAssetExposureUsd: "45",
+      projectedTotalExposureUsd: "75",
+      projectedDirectionalExposureUsd: "15",
+      projectedUnhedgedExposureUsd: "15",
+      unhedgedDurationMs: limits.maxUnhedgedDurationMs + 1,
+      dailyPnlUsd: "-9999",
+      drawdownUsd: "9999",
+      availableLiquidityUsd: "0.01",
+      expectedEdge: -1,
+      expectedROI: -1,
+      spread: 1,
+      signalConfidence: 0,
+      signalExpiresAt: now,
+      externalSignalsLastMinute: 999,
+      lastStrategyTradeAt: now,
+      duplicateTrade: true,
+      experimentEntryOpen: false,
+      marketEntryQualified: false,
+      externalRiskRecommendedVeto: true,
+      referenceRequired: true,
+      referenceProviderBlocked: true,
+      referenceFeedAt: new Date(now.getTime() - 60_000),
+      availableCashUsd: "0",
+      requiredCashUsd: "0",
+    });
+    expect(evaluateRisk(protective, limits).vetoes).toEqual([]);
+
+    expect(evaluateRisk({
+      ...protective,
+      projectedUnhedgedExposureUsd: protective.unhedgedExposureUsd,
+    }, limits).vetoes).toContain("PROTECTIVE_DE_RISK_NOT_REDUCING");
+
+    expect(evaluateRisk({
+      ...protective,
+      marketFeedAt: new Date(now.getTime() - limits.staleFeedTimeoutMs - 1),
+    }, limits).vetoes).toContain("MARKET_FEED_STALE");
+
+    expect(evaluateRisk({
+      ...protective,
+      feeScheduleKnown: false,
+    }, limits).vetoes).toContain("UNKNOWN_FEE_SCHEDULE");
+
+    for (const [change, veto] of [
+      [{ databaseAvailable: false }, "DATABASE_UNAVAILABLE"],
+      [{ timestampDisorder: true }, "EVENT_TIMESTAMP_DISORDER"],
+      [{ riskStateAvailable: false }, "RISK_STATE_UNAVAILABLE"],
+      [{ executionErrorsLastHour: limits.maxExecutionErrorsPerHour }, "ABNORMAL_EXECUTION_ERRORS"],
+      [{ shuttingDown: true }, "SHUTTING_DOWN"],
+    ] as const) {
+      expect(evaluateRisk({ ...protective, ...change }, limits).vetoes).toContain(veto);
+    }
   });
 
   it("rejects malicious model-shaped output before deterministic risk", () => {

@@ -6,6 +6,7 @@ import {
   triggerEventSchema,
   type Direction,
   type MarketSnapshot,
+  type PaperFill,
   type ReferenceTick,
   type TriggerEvent,
 } from "@pm/core";
@@ -366,6 +367,444 @@ describe("PR20 true product end-to-end gate", () => {
     }
   });
 
+  it("forces a bounded protective SELL after max unhedged duration and retries residual depth", async () => {
+    const setup = await setupScenario({ env: { EXPERIMENT_DURATION_HOURS: "1", PAPER_EXECUTION_LATENCY_MS: "0" } });
+    try {
+      expect((await setup.engine.beginExperiment()).ok).toBe(true);
+      const upInitial = marketBook(setup.clock, "UP", 1);
+      const downInitial = snapshot({
+        ...marketBook(setup.clock, "DOWN", 1),
+        bids: [{ price: "0.69", quantity: "300" }],
+        asks: [{ price: "0.70", quantity: "300" }],
+      });
+      await setup.market.emitSnapshot(upInitial);
+      await setup.market.emitSnapshot(downInitial);
+
+      const firstLeg: PaperFill = {
+        id: createId("fill-first"),
+        orderId: createId("order-first"),
+        traceId: createId("trace-first"),
+        marketId: "btc-mkt",
+        tokenId: "btc-up",
+        outcome: "UP",
+        side: "BUY",
+        requestedPrice: "0.40",
+        fillPrice: "0.40",
+        quantity: "10",
+        liquidityRole: "TAKER",
+        latencyMs: 0,
+        slippageUsd: "0",
+        feeUsd: "0",
+        timestamp: iso(setup.clock),
+        sourceMarketEventId: upInitial.eventId,
+        fillConfidence: 1,
+        fillModel: "protective-derisk-test:first-leg",
+        feeSchedule: upInitial.feeSchedule!,
+      };
+      await setup.engine.applyObservedFill(firstLeg);
+      const opened = setup.engine.ledger.positions.get("btc-mkt");
+      expect(opened?.unpairedQuantity).toBe("10");
+      expect(opened?.unhedgedStartedAt).toBe(firstLeg.timestamp);
+
+      // The hard timeout is five minutes. A fresh book one second before it
+      // must not cause a protective order.
+      setup.clock.nowMs = START_MS + 299_000;
+      await setup.market.emitSnapshot(snapshot({
+        ...marketBook(setup.clock, "UP", 2),
+        bids: [{ price: "0.30", quantity: "4" }],
+        asks: [{ price: "0.31", quantity: "100" }],
+      }));
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      expect((await setup.journal.queryEvents({ types: ["PAPER_ORDER_CREATED"] })).filter(
+        (row) => row.payload.intent === "PROTECTIVE_DE_RISK",
+      )).toHaveLength(0);
+
+      // After the timeout, only four shares are executable. The first de-risk
+      // attempt must sell exactly those four and preserve the original episode
+      // start for the six-share residual.
+      setup.clock.nowMs = START_MS + 301_000;
+      await setup.market.emitSnapshot(snapshot({
+        ...marketBook(setup.clock, "UP", 3),
+        bids: [{ price: "0.30", quantity: "4" }],
+        asks: [{ price: "0.31", quantity: "100" }],
+      }));
+      await waitFor(
+        () => setup.journal.queryEvents({ types: ["PAPER_FILL"] }),
+        (rows) => rows.some((row) => row.payload.intent === "PROTECTIVE_DE_RISK"),
+      );
+
+      const residual = setup.engine.ledger.positions.get("btc-mkt");
+      expect(residual?.unpairedOutcome).toBe("UP");
+      expect(residual?.unpairedQuantity).toBe("6");
+      expect(residual?.unhedgedStartedAt).toBe(firstLeg.timestamp);
+
+      const firstProtectiveFill = (await setup.journal.queryEvents({ types: ["PAPER_FILL"] }))
+        .find((row) => row.payload.intent === "PROTECTIVE_DE_RISK");
+      expect(firstProtectiveFill?.payload).toMatchObject({
+        side: "SELL",
+        quantity: "4",
+        intent: "PROTECTIVE_DE_RISK",
+        deRisk: {
+          deRiskReason: "MAX_UNHEDGED_DURATION",
+          attemptedAction: "SELL_UNPAIRED",
+          requestedQty: "10",
+          executableQty: "4",
+          residualQuantity: "6",
+          finalState: "RESIDUAL_UNHEDGED",
+        },
+      });
+
+      // New bid depth closes the residual on the next fresh book. A complete
+      // directional unwind removes the zero-inventory position so the market
+      // cannot remain stuck behind an empty Position object.
+      setup.clock.nowMs = START_MS + 302_000;
+      await setup.market.emitSnapshot(snapshot({
+        ...marketBook(setup.clock, "UP", 4),
+        bids: [{ price: "0.29", quantity: "6" }],
+        asks: [{ price: "0.30", quantity: "100" }],
+      }));
+      await waitFor(
+        () => setup.journal.queryEvents({ types: ["PAPER_FILL"] }),
+        (rows) => rows.filter((row) => row.payload.intent === "PROTECTIVE_DE_RISK").length === 2,
+      );
+      expect(setup.engine.ledger.positions.has("btc-mkt")).toBe(false);
+
+      const protectiveRisk = (await setup.journal.queryEvents({ types: ["RISK_EVALUATION"] }))
+        .filter((row) => Boolean(row.payload.deRisk));
+      expect(protectiveRisk).toHaveLength(2);
+      expect(protectiveRisk.every((row) => row.payload.accepted === true)).toBe(true);
+      const protectiveFills = (await setup.journal.queryEvents({ types: ["PAPER_FILL"] }))
+        .filter((row) => row.payload.intent === "PROTECTIVE_DE_RISK");
+      expect(protectiveFills[1]?.payload).toMatchObject({
+        side: "SELL",
+        quantity: "6",
+        deRisk: {
+          retryCount: 2,
+          residualQuantity: "0",
+          residualExposure: "0",
+          finalState: "RISK_NEUTRALIZED",
+        },
+      });
+    } finally {
+      await setup.engine.stop();
+    }
+  });
+
+  it("bounds durable protective risk retries under a persistent veto", async () => {
+    const setup = await setupScenario({ env: { EXPERIMENT_DURATION_HOURS: "1", PAPER_EXECUTION_LATENCY_MS: "0" } });
+    try {
+      expect((await setup.engine.beginExperiment()).ok).toBe(true);
+      const upInitial = marketBook(setup.clock, "UP", 1);
+      const downInitial = snapshot({
+        ...marketBook(setup.clock, "DOWN", 1),
+        bids: [{ price: "0.69", quantity: "300" }],
+        asks: [{ price: "0.70", quantity: "300" }],
+      });
+      await setup.market.emitSnapshot(upInitial);
+      await setup.market.emitSnapshot(downInitial);
+
+      await setup.engine.applyObservedFill({
+        id: createId("fill-veto-first"),
+        orderId: createId("order-veto-first"),
+        traceId: createId("trace-veto-first"),
+        marketId: "btc-mkt",
+        tokenId: "btc-up",
+        outcome: "UP",
+        side: "BUY",
+        requestedPrice: "0.40",
+        fillPrice: "0.40",
+        quantity: "10",
+        liquidityRole: "TAKER",
+        latencyMs: 0,
+        slippageUsd: "0",
+        feeUsd: "0",
+        timestamp: iso(setup.clock),
+        sourceMarketEventId: upInitial.eventId,
+        fillConfidence: 1,
+        fillModel: "protective-derisk-test:veto-first-leg",
+        feeSchedule: upInitial.feeSchedule!,
+      });
+
+      setup.clock.nowMs = START_MS + 301_000;
+      for (let sequence = 2; sequence <= 30; sequence += 1) {
+        await setup.market.emitSnapshot(snapshot({
+          ...marketBook(setup.clock, "UP", sequence),
+          bids: [{ price: "0.30", quantity: "20" }],
+          asks: [{ price: "0.31", quantity: "100" }],
+          feeSchedule: null,
+        }));
+        setup.clock.nowMs += 250;
+      }
+
+      await waitFor(
+        () => setup.journal.queryEvents({ types: ["RISK_EVALUATION"] }),
+        (rows) => rows.some((row) => Boolean(row.payload.deRisk)),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      const firstWindow = (await setup.journal.queryEvents({ types: ["RISK_EVALUATION"] }))
+        .filter((row) => Boolean(row.payload.deRisk));
+      expect(firstWindow).toHaveLength(1);
+      expect(firstWindow[0]?.payload).toMatchObject({
+        accepted: false,
+        vetoes: expect.arrayContaining(["UNKNOWN_FEE_SCHEDULE"]),
+        deRisk: { retryCount: 1, finalState: "RISK_VETO" },
+      });
+      expect(setup.engine.ledger.positions.get("btc-mkt")?.unpairedQuantity).toBe("10");
+
+      // The 30-second durable backoff is state-aware: when the blocker
+      // materially recovers, the next fresh book may retry immediately.
+      setup.clock.nowMs = START_MS + 310_000;
+      await setup.market.emitSnapshot(snapshot({
+        ...marketBook(setup.clock, "UP", 31),
+        bids: [{ price: "0.30", quantity: "20" }],
+        asks: [{ price: "0.31", quantity: "100" }],
+      }));
+      await waitFor(
+        () => setup.journal.queryEvents({ types: ["RISK_EVALUATION"] }),
+        (rows) => rows.filter((row) => Boolean(row.payload.deRisk)).length === 2,
+      );
+
+      const secondWindow = (await setup.journal.queryEvents({ types: ["RISK_EVALUATION"] }))
+        .filter((row) => Boolean(row.payload.deRisk));
+      expect(secondWindow).toHaveLength(2);
+      expect(secondWindow[1]?.payload).toMatchObject({
+        accepted: true,
+        intent: "PROTECTIVE_DE_RISK",
+        deRisk: { retryCount: 2, finalState: "ORDER_ADMITTED" },
+      });
+      await waitFor(
+        () => setup.journal.queryEvents({ types: ["PAPER_FILL"] }),
+        (rows) => rows.some((row) => row.payload.intent === "PROTECTIVE_DE_RISK"),
+      );
+      expect(setup.engine.ledger.positions.has("btc-mkt")).toBe(false);
+    } finally {
+      await setup.engine.stop();
+    }
+  });
+
+  it("Scenario F blocks a protective SELL when hard safety flips after order admission", async () => {
+    const setup = await setupScenario({ env: { EXPERIMENT_DURATION_HOURS: "1", PAPER_EXECUTION_LATENCY_MS: "800" } });
+    try {
+      expect((await setup.engine.beginExperiment()).ok).toBe(true);
+      const upInitial = marketBook(setup.clock, "UP", 1);
+      const downInitial = snapshot({
+        ...marketBook(setup.clock, "DOWN", 1),
+        bids: [{ price: "0.69", quantity: "300" }],
+        asks: [{ price: "0.70", quantity: "300" }],
+      });
+      await setup.market.emitSnapshot(upInitial);
+      await setup.market.emitSnapshot(downInitial);
+
+      const firstLeg: PaperFill = {
+        id: createId("fill-first"), orderId: createId("order-first"), traceId: createId("trace-first"),
+        marketId: "btc-mkt", tokenId: "btc-up", outcome: "UP", side: "BUY", requestedPrice: "0.40",
+        fillPrice: "0.40", quantity: "10", liquidityRole: "TAKER", latencyMs: 0, slippageUsd: "0", feeUsd: "0",
+        timestamp: iso(setup.clock), sourceMarketEventId: upInitial.eventId, fillConfidence: 1,
+        fillModel: "protective-derisk-test:first-leg", feeSchedule: upInitial.feeSchedule!,
+      };
+      await setup.engine.applyObservedFill(firstLeg);
+      expect(setup.engine.ledger.positions.get("btc-mkt")?.unpairedQuantity).toBe("10");
+
+      // Timeout breached; a fresh book with 4-share bid depth triggers the
+      // protective SELL. Hold the PAPER_ORDER_CREATED append in flight so the
+      // test can flip hard safety after admission but before execution.
+      setup.clock.nowMs = START_MS + 301_000;
+      const timeoutBook = snapshot({
+        ...marketBook(setup.clock, "UP", 2),
+        bids: [{ price: "0.30", quantity: "4" }],
+        asks: [{ price: "0.31", quantity: "100" }],
+      });
+      let releaseHold: (() => void) | null = null;
+      const hold = new Promise<void>((resolve) => { releaseHold = resolve; });
+      setup.journal.setAppendInFlightHoldForTest(hold, ["PAPER_ORDER_CREATED"]);
+      try {
+        await setup.market.emitSnapshot(timeoutBook);
+        await waitFor(() => setup.journal.inFlightAppends, (value) => value > 0);
+        // Hard safety flips (journal/recovery authority degraded) after risk
+        // evaluation and order admission, while the protective execution
+        // latency is still pending. journalDegraded is a sticky observed
+        // degradation that audit appends do not clear, so the boundary gate
+        // deterministically sees it. (A real DB outage would instead fail the
+        // journal writes themselves — genuine-failure territory, Scenario D.)
+        setup.engine.state.journalDegraded = true;
+      } finally {
+        releaseHold?.();
+        setup.journal.setAppendInFlightHoldForTest(null);
+      }
+
+      // The post-admission execution must complete its audit before asserting.
+      await waitFor(
+        () => setup.journal.queryEvents({ types: ["PAPER_EXECUTION_ERROR"] }),
+        (rows) => rows.some((row) => row.payload.intent === "PROTECTIVE_DE_RISK" && row.payload.stateChanged === true),
+      );
+
+      // No protective economic mutation may exist after the flip.
+      const protectiveFills = (await setup.journal.queryEvents({ types: ["PAPER_FILL"] }))
+        .filter((row) => row.payload.intent === "PROTECTIVE_DE_RISK");
+      expect(protectiveFills).toHaveLength(0);
+      expect(setup.engine.ledger.positions.get("btc-mkt")).toMatchObject({
+        upQuantity: "10", downQuantity: "0", unpairedOutcome: "UP", unpairedQuantity: "10",
+      });
+
+      // State-changed rejection: bounded, auditable, and NOT an integrity fault.
+      expect(setup.engine.integrityFault()).toBe(false);
+      expect(setup.engine.overloadState()).not.toBe("FAIL_CLOSED");
+      expect(setup.engine.state.journalDegraded).toBe(true);
+      const audit = (await setup.journal.queryEvents({ types: ["PAPER_EXECUTION_ERROR"] }))
+        .find((row) => row.payload.intent === "PROTECTIVE_DE_RISK");
+      expect(audit?.payload).toMatchObject({
+        stateChanged: true,
+        message: expect.stringContaining("RISK_STATE_UNAVAILABLE"),
+        deRisk: { finalState: "STATE_CHANGED" },
+      });
+      // The admitted protective evaluation is still recorded exactly once.
+      const deriskRisks = (await setup.journal.queryEvents({ types: ["RISK_EVALUATION"] }))
+        .filter((row) => Boolean(row.payload.deRisk));
+      expect(deriskRisks).toHaveLength(1);
+    } finally {
+      await setup.engine.stop();
+    }
+  });
+
+  it("Scenario G blocks a protective SELL when the token desynchronizes after order admission", async () => {
+    const setup = await setupScenario({ env: { EXPERIMENT_DURATION_HOURS: "1", PAPER_EXECUTION_LATENCY_MS: "800" } });
+    try {
+      expect((await setup.engine.beginExperiment()).ok).toBe(true);
+      const upInitial = marketBook(setup.clock, "UP", 1);
+      const downInitial = snapshot({
+        ...marketBook(setup.clock, "DOWN", 1),
+        bids: [{ price: "0.69", quantity: "300" }],
+        asks: [{ price: "0.70", quantity: "300" }],
+      });
+      await setup.market.emitSnapshot(upInitial);
+      await setup.market.emitSnapshot(downInitial);
+
+      const firstLeg: PaperFill = {
+        id: createId("fill-first"), orderId: createId("order-first"), traceId: createId("trace-first"),
+        marketId: "btc-mkt", tokenId: "btc-up", outcome: "UP", side: "BUY", requestedPrice: "0.40",
+        fillPrice: "0.40", quantity: "10", liquidityRole: "TAKER", latencyMs: 0, slippageUsd: "0", feeUsd: "0",
+        timestamp: iso(setup.clock), sourceMarketEventId: upInitial.eventId, fillConfidence: 1,
+        fillModel: "protective-derisk-test:first-leg", feeSchedule: upInitial.feeSchedule!,
+      };
+      await setup.engine.applyObservedFill(firstLeg);
+      expect(setup.engine.ledger.positions.get("btc-mkt")?.unpairedQuantity).toBe("10");
+
+      // Timeout breached; a fresh book with 4-share bid depth triggers the
+      // protective SELL. Hold the PAPER_ORDER_CREATED append in flight so the
+      // token can be desynchronized (feed gap) after admission but before the
+      // decisive mutation.
+      setup.clock.nowMs = START_MS + 301_000;
+      const timeoutBook = snapshot({
+        ...marketBook(setup.clock, "UP", 2),
+        bids: [{ price: "0.30", quantity: "4" }],
+        asks: [{ price: "0.31", quantity: "100" }],
+      });
+      let releaseHold: (() => void) | null = null;
+      const hold = new Promise<void>((resolve) => { releaseHold = resolve; });
+      setup.journal.setAppendInFlightHoldForTest(hold, ["PAPER_ORDER_CREATED"]);
+      try {
+        await setup.market.emitSnapshot(timeoutBook);
+        await waitFor(() => setup.journal.inFlightAppends, (value) => value > 0);
+        // Feed desync: the execution token leaves the synchronized set while
+        // the protective order is admitted but not yet executed. AWAITING_BOOK
+        // (unlike GAPPED, which also clears the engine's live book) isolates
+        // the adapter-synchronized revalidation with the book still present.
+        setup.market.markTokenSync("btc-up", "AWAITING_BOOK", 2);
+      } finally {
+        releaseHold?.();
+        setup.journal.setAppendInFlightHoldForTest(null);
+      }
+
+      // The post-admission execution must complete its audit before asserting.
+      await waitFor(
+        () => setup.journal.queryEvents({ types: ["PAPER_EXECUTION_ERROR"] }),
+        (rows) => rows.some((row) => row.payload.intent === "PROTECTIVE_DE_RISK" && row.payload.stateChanged === true),
+      );
+
+      // No protective economic mutation may exist after the desynchronization.
+      const protectiveFills = (await setup.journal.queryEvents({ types: ["PAPER_FILL"] }))
+        .filter((row) => row.payload.intent === "PROTECTIVE_DE_RISK");
+      expect(protectiveFills).toHaveLength(0);
+      expect(setup.engine.ledger.positions.get("btc-mkt")).toMatchObject({
+        upQuantity: "10", downQuantity: "0", unpairedOutcome: "UP", unpairedQuantity: "10",
+      });
+
+      // State-changed rejection: bounded, auditable, and NOT an integrity fault.
+      expect(setup.engine.integrityFault()).toBe(false);
+      expect(setup.engine.overloadState()).not.toBe("FAIL_CLOSED");
+      const audit = (await setup.journal.queryEvents({ types: ["PAPER_EXECUTION_ERROR"] }))
+        .find((row) => row.payload.intent === "PROTECTIVE_DE_RISK");
+      expect(audit?.payload).toMatchObject({
+        stateChanged: true,
+        message: expect.stringContaining("MARKET_TOKEN_UNSYNCHRONIZED"),
+        deRisk: { finalState: "STATE_CHANGED" },
+      });
+      // The admitted protective evaluation is still recorded exactly once.
+      const deriskRisks = (await setup.journal.queryEvents({ types: ["RISK_EVALUATION"] }))
+        .filter((row) => Boolean(row.payload.deRisk));
+      expect(deriskRisks).toHaveLength(1);
+    } finally {
+      await setup.engine.stop();
+    }
+  });
+
+  it("Scenario H: a maintenance-triggered protective attempt fails closed without crashing the loop", async () => {
+    const setup = await setupScenario({ env: { EXPERIMENT_DURATION_HOURS: "1" } });
+    try {
+      expect((await setup.engine.beginExperiment()).ok).toBe(true);
+      const upInitial = marketBook(setup.clock, "UP", 1);
+      const downInitial = snapshot({
+        ...marketBook(setup.clock, "DOWN", 1),
+        bids: [{ price: "0.69", quantity: "300" }],
+        asks: [{ price: "0.70", quantity: "300" }],
+      });
+      await setup.market.emitSnapshot(upInitial);
+      await setup.market.emitSnapshot(downInitial);
+
+      const firstLeg: PaperFill = {
+        id: createId("fill-first"), orderId: createId("order-first"), traceId: createId("trace-first"),
+        marketId: "btc-mkt", tokenId: "btc-up", outcome: "UP", side: "BUY", requestedPrice: "0.40",
+        fillPrice: "0.40", quantity: "10", liquidityRole: "TAKER", latencyMs: 0, slippageUsd: "0", feeUsd: "0",
+        timestamp: iso(setup.clock), sourceMarketEventId: upInitial.eventId, fillConfidence: 1,
+        fillModel: "protective-derisk-test:first-leg", feeSchedule: upInitial.feeSchedule!,
+      };
+      await setup.engine.applyObservedFill(firstLeg);
+      expect(setup.engine.ledger.positions.get("btc-mkt")?.unpairedQuantity).toBe("10");
+
+      // Age the unhedged episode past the hard timeout and refresh the book so
+      // a protective attempt reaches admission. The snapshot-triggered flight
+      // first completes a 4-share reduction (bounded, intended).
+      setup.clock.nowMs = START_MS + 301_000;
+      await setup.market.emitSnapshot(snapshot({
+        ...marketBook(setup.clock, "UP", 2),
+        bids: [{ price: "0.30", quantity: "4" }],
+        asks: [{ price: "0.31", quantity: "100" }],
+      }));
+      await waitFor(
+        () => setup.engine.ledger.positions.get("btc-mkt")?.unpairedQuantity,
+        (value) => value === "6",
+      );
+
+      // Now a genuine journal fault hits the MAINTENANCE-triggered protective
+      // attempt. The maintenance path must latch fail-closed and log, not let
+      // an unhandled rejection escape the maintenance timer loop.
+      setup.journal.failAppendTypes.add("RISK_EVALUATION");
+      await expect(setup.engine.tickMaintenance()).resolves.toBeUndefined();
+
+      expect(setup.engine.integrityFault()).toBe(true);
+      expect(setup.engine.overloadState()).toBe("FAIL_CLOSED");
+      // The failed maintenance attempt produced no further economic mutation
+      // beyond the earlier snapshot reduction (6 remains).
+      expect(setup.engine.ledger.positions.get("btc-mkt")?.unpairedQuantity).toBe("6");
+      const protectiveFills = (await setup.journal.queryEvents({ types: ["PAPER_FILL"] }))
+        .filter((row) => row.payload.intent === "PROTECTIVE_DE_RISK");
+      expect(protectiveFills).toHaveLength(1);
+    } finally {
+      await setup.engine.stop();
+    }
+  });
+
   it("Scenario C accepts one valid response but never creates consensus or a trade", async () => {
     const setup = await setupScenario();
     try {
@@ -468,6 +907,7 @@ describe("PR20 true product end-to-end gate", () => {
     const clock = { nowMs: START_MS };
     const resolutions = new Map<string, Record<string, unknown>>();
     const setup = await setupScenario({ journal, clock, resolutions, env: { PAPER_EXECUTION_LATENCY_MS: "200" } });
+    let durableFill: Awaited<ReturnType<EventJournal["readDurableTransitionsAfter"]>> = [];
     try {
       expect((await setup.engine.beginExperiment()).ok).toBe(true);
       await setup.market.emitSnapshot(marketBook(clock, "UP", 1));
@@ -481,7 +921,7 @@ describe("PR20 true product end-to-end gate", () => {
       await drainRuntime(setup.engine);
       const trigger = setup.engine.state.recentTriggers.find((item) => item.kind === "BTC_RAPID_MOVE");
       expect(trigger).toBeTruthy();
-      const durableFill = (await journal.readDurableTransitionsAfter(0, 256)).filter((row) => row.type === "PAPER_FILL");
+      durableFill = (await journal.readDurableTransitionsAfter(0, 256)).filter((row) => row.type === "PAPER_FILL");
       expect(durableFill).toHaveLength(1);
       expect(setup.engine.ledger.positions.size).toBe(0);
       await setup.engine.stop();
@@ -492,7 +932,10 @@ describe("PR20 true product end-to-end gate", () => {
 
     const recovered = await setupScenario({ journal, clock, resolutions });
     try {
-      expect(recovered.engine.ledger.positions.get("btc-mkt")?.unpairedQuantity).not.toBe("0");
+      const recoveredPosition = recovered.engine.ledger.positions.get("btc-mkt");
+      expect(recoveredPosition?.unpairedQuantity).not.toBe("0");
+      const recoveredFillTimestamp = ((durableFill[0]!.payload.fill as { timestamp?: string }).timestamp);
+      expect(recoveredPosition?.unhedgedStartedAt).toBe(recoveredFillTimestamp);
       expect((await journal.queryEvents({ types: ["PAPER_FILL"] })).length).toBe(1);
       clock.nowMs = START_MS + 20_000;
       resolutions.set("btc-mkt", {

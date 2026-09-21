@@ -25,6 +25,7 @@ export function walkBook(
   levels: readonly BookLevel[],
   requestedQuantity: Decimal.Value,
   limitPrice?: Decimal.Value,
+  side: "BUY" | "SELL" = "BUY",
 ): BookWalkResult {
   const requested = d(requestedQuantity);
   if (requested.lte(0)) throw new Error("INVALID_QUANTITY");
@@ -36,7 +37,10 @@ export function walkBook(
   for (const level of levels) {
     const price = d(level.price);
     const available = d(level.quantity);
-    if (limitPrice !== undefined && price.gt(limitPrice)) break;
+    if (
+      limitPrice !== undefined
+      && (side === "BUY" ? price.gt(limitPrice) : price.lt(limitPrice))
+    ) break;
     if (available.lte(0)) continue;
     const take = Decimal.min(remaining, available);
     notional = notional.plus(take.mul(price));
