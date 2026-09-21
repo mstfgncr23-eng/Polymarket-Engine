@@ -1577,6 +1577,11 @@ export class EngineService {
         if (error instanceof CrashInjectedError) throw error;
         if (error instanceof ExperimentStartGuardRejectedError) throw error;
         if (error instanceof FirstLegLifecycleGuardRejectedError) throw error;
+        // A stale/raced hedge-vs-protective fill is an expected lifecycle
+        // rejection, not durability corruption. It must rethrow as a normal
+        // STATE_CHANGED rejection without latching the integrity fault; only
+        // genuine durable/idempotency/cursor faults fail closed below.
+        if (error instanceof RiskReductionLifecycleGuardRejectedError) throw error;
         if (error instanceof DurableCursorBehindError) {
           commit = await this.catchUpOrRejectStalePlan(input.operationKey, input.type, error);
         } else if (error instanceof IdempotencyConflictError) {
@@ -3773,6 +3778,16 @@ export class EngineService {
           const currentPosition = this.ledger.positions.get(fill.marketId);
 
           if (economicIntent === "HEDGE_SECOND_LEG" || economicIntent === "PROTECTIVE_DE_RISK") {
+            if (economicIntent === "PROTECTIVE_DE_RISK") {
+              // Final hard-safety revalidation immediately before the durable
+              // economic mutation. A flip since risk evaluation makes this a
+              // state-changed rejection (bounded, deterministic), never a
+              // durability/integrity fault.
+              const hardSafetyReason = this.protectiveFillHardSafetyReason(fill);
+              if (hardSafetyReason) {
+                throw new RiskReductionLifecycleGuardRejectedError(fill.marketId, economicIntent, hardSafetyReason);
+              }
+            }
             if (!currentPosition?.unpairedOutcome || !d(currentPosition.unpairedQuantity).gt(0)) {
               throw new RiskReductionLifecycleGuardRejectedError(fill.marketId, economicIntent, "NO_UNPAIRED_RESIDUAL");
             }
@@ -3858,6 +3873,20 @@ export class EngineService {
         },
       });
     } catch (error) {
+      if (error instanceof RiskReductionLifecycleGuardRejectedError && fill.liquidityRole === "MAKER") {
+        // A resting hedge maker that raced a protective SELL (or another hedge)
+        // is a normal state change. Cancel the stale remainder so it cannot
+        // refill directional exposure behind the newer authority, audit it, and
+        // reject without an economic mutation. TAKER fills propagate to the
+        // caller's STATE_CHANGED audit instead.
+        this.record("RISK_REDUCTION_LIFECYCLE_BLOCKED", fill.traceId, fill.marketId, {
+          fillId: fill.id, orderId: fill.orderId, intent: error.intent, reason: error.reason,
+        });
+        if (this.restingOrders.has(fill.orderId)) {
+          await this.releaseMaker(fill.orderId, { cancel: true, reason: "RISK_REDUCTION_LIFECYCLE_CLOSED" });
+        }
+        return false;
+      }
       if (!(error instanceof FirstLegLifecycleGuardRejectedError)) throw error;
       this.record("FIRST_LEG_LIFECYCLE_BLOCKED", fill.traceId, fill.marketId, {
         fillId: fill.id,
@@ -4705,6 +4734,38 @@ export class EngineService {
     return !this.state.journalDegraded
       && !this.overload.hasIntegrityFault
       && this.overload.state !== "FAIL_CLOSED";
+  }
+
+  /**
+   * Final mutation-boundary hard-safety check for a protective SELL fill. This
+   * runs inside the PAPER_FILL beforeCommit, after every await between risk
+   * evaluation and the decisive commit (PAPER_ORDER_CREATED persistence,
+   * PAPER_EXECUTION_LATENCY_MS, settlement lookups). Alpha gates remain
+   * bypassed for PROTECTIVE_DE_RISK, but a transition to DB unavailable,
+   * journal degraded, overload integrity fault / FAIL_CLOSED, timestamp
+   * disorder, shutdown, or stale required market execution state must prevent
+   * a new protective economic mutation — rejected as a normal state change,
+   * never as an integrity fault.
+   */
+  private protectiveFillHardSafetyReason(fill: Parameters<PaperLedger["applyFill"]>[0]): string | null {
+    if (this.state.database !== "UP") return "DATABASE_UNAVAILABLE";
+    if (this.state.journalDegraded || this.overload.hasIntegrityFault || this.overload.state === "FAIL_CLOSED") {
+      return "RISK_STATE_UNAVAILABLE";
+    }
+    if (this.timestampDisorder) return "EVENT_TIMESTAMP_DISORDER";
+    if (this.state.draining) return "SHUTTING_DOWN";
+    // The execution snapshot must still be fresh at the decisive commit. Read
+    // the live book (the exact snapshot executePaperTaker walks), not the
+    // fill's embedded timestamp, so direct stable-fill replays without a market
+    // context are never treated as stale.
+    const executionBook = this.snapshots.get(fill.marketId)?.[fill.outcome] ?? null;
+    if (executionBook) {
+      const receivedAtMs = Date.parse(executionBook.receivedAt);
+      if (Number.isFinite(receivedAtMs) && this.nowFn().getTime() - receivedAtMs > this.riskLimits.staleFeedTimeoutMs) {
+        return "MARKET_FEED_STALE";
+      }
+    }
+    return null;
   }
 
   private clearProtectiveDeRiskState(marketId: string): void {

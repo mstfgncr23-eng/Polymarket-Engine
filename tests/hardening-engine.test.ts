@@ -7,7 +7,7 @@ import {
   type PaperFill,
   type TriggerEvent,
 } from "@pm/core";
-import { MemoryEventJournal } from "@pm/db";
+import { IdempotencyConflictError, MemoryEventJournal } from "@pm/db";
 import {
   type DiscoveryReport,
   type DiscoveredMarket,
@@ -561,12 +561,17 @@ describe("risk-reducing fill lifecycle fences", () => {
         orderId: "stale-hedge-order",
         quantity: "10",
       }, "HEDGE_SECOND_LEG")).rejects.toThrow("QUANTITY_EXCEEDS_RESIDUAL");
+      // Scenario B regression: protective won the race, so the stale hedge is
+      // rejected as a normal state change — never as durability corruption.
       expect(engine.ledger.positions.get("race-mkt")).toMatchObject({
         upQuantity: "6",
         downQuantity: "0",
         unpairedOutcome: "UP",
         unpairedQuantity: "6",
       });
+      expect(engine.integrityFault()).toBe(false);
+      expect(engine.overloadState()).not.toBe("FAIL_CLOSED");
+      expect(engine.state.database).toBe("UP");
 
       await engine.applyObservedFill({
         ...paperFill("race-mkt", "DOWN", "0.50"),
@@ -588,12 +593,52 @@ describe("risk-reducing fill lifecycle fences", () => {
         side: "SELL",
         quantity: "6",
       }, "PROTECTIVE_DE_RISK")).rejects.toThrow("NO_UNPAIRED_RESIDUAL");
+      // Scenario A regression: the hedge won the race, so the stale protective
+      // fill is rejected as a normal state change — never as corruption.
       expect(engine.ledger.positions.get("race-mkt")).toMatchObject({
         upQuantity: "6",
         downQuantity: "6",
         unpairedOutcome: null,
         unpairedQuantity: "0",
       });
+      expect(engine.integrityFault()).toBe(false);
+      expect(engine.overloadState()).not.toBe("FAIL_CLOSED");
+      expect(engine.state.database).toBe("UP");
+    } finally {
+      await engine.stop();
+    }
+  });
+
+  it("Scenario D regression: genuine durable/idempotency conflicts still fail closed", async () => {
+    const journal = new MemoryEventJournal();
+    const env = engineEnvSchema.parse({
+      NODE_ENV: "test",
+      JOURNAL_MODE: "memory",
+      TRADING_MODE: "paper",
+      POLYMARKET_TOKEN_IDS: "up,down",
+    });
+    const engine = new EngineService(env, journal, logger, { market: pendingFeed() as never });
+    await engine.start();
+    try {
+      const buy = paperFill("race-mkt", "UP", "0.40", {
+        id: "idem-conflict-fill",
+        orderId: "idem-conflict-order",
+        feeUsd: "0",
+        slippageUsd: "0",
+      });
+      await engine.applyObservedFill(buy);
+      expect(engine.ledger.positions.get("race-mkt")?.upQuantity).toBe("10");
+
+      // A retry of the same durable economic identity with a different payload
+      // is genuine idempotency corruption. The guard-error reclassification
+      // above must never swallow it: the engine must still fail closed.
+      const conflict = { ...buy, quantity: "3" };
+      await expect(engine.applyObservedFill(conflict)).rejects.toBeInstanceOf(IdempotencyConflictError);
+      expect(engine.integrityFault()).toBe(true);
+      expect(engine.overloadState()).toBe("FAIL_CLOSED");
+      // Idempotency conflicts are data-conflict failures, not connection loss:
+      // database stays UP while the engine refuses further authoritative work.
+      expect(engine.state.database).toBe("UP");
     } finally {
       await engine.stop();
     }
