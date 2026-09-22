@@ -50,7 +50,12 @@ export function refreshExperiment(
 ): ExperimentManifest {
   if (manifest.status === "IDLE" || manifest.status === "COMPLETED" || manifest.status === "FAILED" || manifest.status === "ABORTED_START") return manifest;
   if (manifest.status === "RUNNING" && manifest.entryClosesAt && now.getTime() >= new Date(manifest.entryClosesAt).getTime()) {
-    return { ...manifest, status: "ENTRY_CLOSED" };
+    // The durable ENTRY_CLOSED manifest must carry the actual unresolved
+    // position count at the entry-close boundary. options.unresolvedCount is
+    // authoritative when supplied by the engine; otherwise preserve whatever
+    // the manifest already recorded so restart/replay reproduces the same value.
+    const unresolved = options.unresolvedCount ?? manifest.unresolvedPositionCount;
+    return { ...manifest, status: "ENTRY_CLOSED", unresolvedPositionCount: unresolved };
   }
   if (manifest.status === "ENTRY_CLOSED") {
     const policy = manifest.closePolicy ?? "observe_until_settlement";

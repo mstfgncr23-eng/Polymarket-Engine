@@ -150,6 +150,14 @@ interface BookState {
   asksDirty: boolean;
   levelsValid: boolean;
   lastTradePrice: string | null;
+  /**
+   * Authoritative minimum order size for the token, sourced from the CLOB
+   * full-book event's `min_order_size` field. Price-change events do not carry
+   * it, so it is committed with the full book and carried forward in BookState;
+   * without this the latest snapshot would silently report minOrderSize=null
+   * between full books.
+   */
+  minOrderSize: string | null;
   timestamp: string;
   hash: string | null;
 }
@@ -614,6 +622,7 @@ export class PolymarketMarketDataAdapter {
       asksDirty: true,
       levelsValid: false,
       lastTradePrice: nullableString(payload.lastTradePrice),
+      minOrderSize: nullableString(payload.minOrderSize),
       timestamp: new Date(sourceMs).toISOString(),
       hash: nullableString(payload.hash),
     };
@@ -828,7 +837,10 @@ export class PolymarketMarketDataAdapter {
     const bids = publishSide(state, "bids");
     const asks = publishSide(state, "asks");
     const tickSize = nullableString(raw.tickSize);
-    const minOrderSize = nullableString(raw.minOrderSize);
+    // Carry forward the last committed full-book min_order_size so a
+    // price-change-derived snapshot keeps reporting the authoritative minimum
+    // order size instead of silently nulling it.
+    const minOrderSize = state.minOrderSize ?? nullableString(raw.minOrderSize);
     let feeSchedule: MarketSnapshot["feeSchedule"] = null;
     try {
       this.assertSnapshotPublishable(tokenId, state, raw, changedLevel);
@@ -1132,6 +1144,7 @@ function cloneBookState(state: BookState): BookState {
     asksDirty: true,
     levelsValid: false,
     lastTradePrice: state.lastTradePrice,
+    minOrderSize: state.minOrderSize,
     timestamp: state.timestamp,
     hash: state.hash,
   };

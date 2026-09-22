@@ -5,7 +5,7 @@ import {
   createId,
   decidePaperOrder,
   decideProtectivePaperOrder,
-  buildProtectiveDeRiskCandidate,
+  evaluateProtectiveDeRiskCandidate,
   defaultNativeDecisionConfig,
   evaluateNativeDecision,
   NATIVE_DETERMINISTIC_AUTHORITY,
@@ -221,6 +221,21 @@ const SCOUT_REFRESH_RETRY_GAP_MS = 1_000;
 const PROTECTIVE_DE_RISK_RETRY_MS = 5_000;
 const PROTECTIVE_DE_RISK_VETO_RETRY_MS = 30_000;
 const PROTECTIVE_DE_RISK_WAIT_SAMPLE_MS = 5_000;
+/**
+ * Pre-expiry safety window for the protective de-risk deadline, derived from
+ * existing engine timing bounds (not an arbitrary buffer):
+ *   - one maintenance cadence (60s) so at least one eligible tick can land
+ *     inside the window even in the worst-case maintenance schedule;
+ *   - the configured book freshness bound (riskLimits.staleFeedTimeoutMs, 15s
+ *     default) so the last eligible decision can still observe a fresh
+ *     synchronized book before the market ends;
+ *   - one protective retry slot (PROTECTIVE_DE_RISK_RETRY_MS = 5s) for pacing.
+ * Effective protective deadline =
+ *   min(unhedgedStartedAt + maxUnhedgedDurationMs, marketEnd - this window),
+ * with attempts additionally barred at/after marketEnd. This only bounds WHEN
+ * the existing risk-reducing SELL may begin; it never opens or increases risk.
+ */
+const PROTECTIVE_DE_RISK_PRE_EXPIRY_SAFETY_MS = 80_000;
 /**
  * Diagnostic-only bound for PROTECTIVE_DE_RISK_SUPPRESSED observability rows.
  * At most one durable row per market per 60s, aligned to the maintenance
@@ -999,6 +1014,10 @@ export class EngineService {
         entryClosesAt: this.nowFn().toISOString(),
         completedAt: null,
         markToMarketAt: null,
+        // Manual/operator close-entries is another RUNNING → ENTRY_CLOSED
+        // boundary; the durable manifest must carry the actual unresolved
+        // position count, exactly like the deadline and recovery paths.
+        unresolvedPositionCount: this.countUnresolvedPositions(),
       };
       await this.commitExperimentStatus(closed);
       return { ok: true, experiment: this.experiment };
@@ -2239,6 +2258,20 @@ export class EngineService {
   }
 
   /**
+   * Number of ledger positions with positive up or down quantity. This is the
+   * authoritative unresolved-position count used at the RUNNING → ENTRY_CLOSED
+   * boundary so the durable manifest reproduces the same value across restart/
+   * replay.
+   */
+  private countUnresolvedPositions(): number {
+    let count = 0;
+    for (const position of this.ledger.positions.values()) {
+      if (Number(position.upQuantity) > 0 || Number(position.downQuantity) > 0) count += 1;
+    }
+    return count;
+  }
+
+  /**
    * The entry deadline is an economic admission fence, not merely a
    * maintenance hint. Callers use this while holding experimentBoundaryGate.
    */
@@ -2247,7 +2280,13 @@ export class EngineService {
     const current = this.experiment;
     const now = this.nowFn();
     if (current?.status === "RUNNING" && current.entryClosesAt && now.getTime() >= new Date(current.entryClosesAt).getTime()) {
-      await this.commitExperimentStatus({ ...current, status: "ENTRY_CLOSED", completedAt: null, markToMarketAt: null });
+      await this.commitExperimentStatus({
+        ...current, status: "ENTRY_CLOSED", completedAt: null, markToMarketAt: null,
+        // The durable ENTRY_CLOSED manifest must carry the actual unresolved
+        // position count at the boundary, including immediately after restart/
+        // replay when the rehydrated ledger already holds open positions.
+        unresolvedPositionCount: this.countUnresolvedPositions(),
+      });
     }
     return false;
   }
@@ -3250,7 +3289,10 @@ export class EngineService {
     if (!pair) return;
     let position = this.ledger.positions.get(trigger.marketId ?? "") ?? null;
     if (this.experiment) {
-      const next = refreshExperiment(this.experiment, this.nowFn(), { openPositions: openPositionsRemain(this.ledger.positions.values()) });
+      const next = refreshExperiment(this.experiment, this.nowFn(), {
+        openPositions: openPositionsRemain(this.ledger.positions.values()),
+        unresolvedCount: this.countUnresolvedPositions(),
+      });
       if (next.status !== this.experiment.status) await this.commitExperimentStatus(next);
     }
 
@@ -4525,6 +4567,39 @@ export class EngineService {
     }
   }
 
+  /**
+   * Expiry-aware protective de-risk eligibility.
+   *
+   * Effective protective deadline =
+   *   min(unhedgedStartedAt + maxUnhedgedDurationMs, marketEnd - safetyWindow)
+   * Attempts are additionally barred at/after marketEnd: once the market's
+   * usable trading lifetime is over, settlement authority owns the position.
+   * When the authoritative market endDate is unknown (e.g. no discovery
+   * metadata for a recovered obligation), the pure duration deadline governs.
+   */
+  private protectiveDeRiskEligibility(
+    marketId: string,
+    unhedgedStartedAt: string,
+    nowMs: number,
+  ): { eligible: boolean; effectiveDeadlineMs: number | null; marketEndMs: number | null } {
+    const startedMs = Date.parse(unhedgedStartedAt);
+    const durationDeadlineMs = Number.isFinite(startedMs) ? startedMs + this.riskLimits.maxUnhedgedDurationMs : null;
+    const marketEndValue = this.marketsById.get(marketId)?.endDate ?? null;
+    const parsedEnd = marketEndValue ? Date.parse(marketEndValue) : Number.NaN;
+    const marketEndMs = Number.isFinite(parsedEnd) ? parsedEnd : null;
+    if (marketEndMs != null) {
+      const expiryDeadlineMs = marketEndMs - PROTECTIVE_DE_RISK_PRE_EXPIRY_SAFETY_MS;
+      const effectiveDeadlineMs = durationDeadlineMs == null ? expiryDeadlineMs : Math.min(durationDeadlineMs, expiryDeadlineMs);
+      if (nowMs >= marketEndMs) return { eligible: false, effectiveDeadlineMs, marketEndMs };
+      return { eligible: nowMs >= effectiveDeadlineMs, effectiveDeadlineMs, marketEndMs };
+    }
+    return {
+      eligible: durationDeadlineMs != null && nowMs >= durationDeadlineMs,
+      effectiveDeadlineMs: durationDeadlineMs,
+      marketEndMs: null,
+    };
+  }
+
   private async maybeProtectiveDeRisk(marketId: string): Promise<void> {
     if (this.protectiveDeRiskInFlight.has(marketId)) {
       this.recordProtectiveDeRiskSuppressed(marketId, "GATE_IN_FLIGHT", "IN_FLIGHT");
@@ -4562,10 +4637,19 @@ export class EngineService {
     const initialNow = this.nowFn();
     const initialStartedAt = initial.unhedgedStartedAt ?? initial.openedAt;
     const initialDurationMs = Math.max(0, initialNow.getTime() - Date.parse(initialStartedAt));
-    if (!Number.isFinite(initialDurationMs) || initialDurationMs < this.riskLimits.maxUnhedgedDurationMs) {
+    const initialEligibility = this.protectiveDeRiskEligibility(marketId, initialStartedAt, initialNow.getTime());
+    if (!initialEligibility.eligible) {
+      const initialMarketExpired = initialEligibility.marketEndMs != null && initialNow.getTime() >= initialEligibility.marketEndMs;
       this.recordProtectiveDeRiskSuppressed(
-        marketId, "GATE_DURATION", "UNHEDGED_DURATION_NOT_EXCEEDED",
-        { position: initial, unhedgedDurationMs: Number.isFinite(initialDurationMs) ? initialDurationMs : null },
+        marketId, "GATE_DURATION", initialMarketExpired ? "MARKET_EXPIRED" : "UNHEDGED_DURATION_NOT_EXCEEDED",
+        {
+          position: initial,
+          unhedgedDurationMs: Number.isFinite(initialDurationMs) ? initialDurationMs : null,
+          extra: {
+            effectiveProtectiveDeadlineMs: initialEligibility.effectiveDeadlineMs,
+            marketEndMs: initialEligibility.marketEndMs,
+          },
+        },
       );
       return;
     }
@@ -4599,10 +4683,15 @@ export class EngineService {
       const now = this.nowFn();
       const unhedgedStartedAt = position.unhedgedStartedAt ?? position.openedAt;
       const unhedgedDurationMs = Math.max(0, now.getTime() - Date.parse(unhedgedStartedAt));
-      if (!Number.isFinite(unhedgedDurationMs) || unhedgedDurationMs < this.riskLimits.maxUnhedgedDurationMs) {
+      const eligibility = this.protectiveDeRiskEligibility(marketId, unhedgedStartedAt, now.getTime());
+      if (!eligibility.eligible) {
+        const marketExpired = eligibility.marketEndMs != null && now.getTime() >= eligibility.marketEndMs;
         this.recordProtectiveDeRiskSuppressed(
-          marketId, "GATE_DURATION_CHANGED", "UNHEDGED_DURATION_NOT_EXCEEDED",
-          { position, unhedgedDurationMs: Number.isFinite(unhedgedDurationMs) ? unhedgedDurationMs : null },
+          marketId, "GATE_DURATION_CHANGED", marketExpired ? "MARKET_EXPIRED" : "UNHEDGED_DURATION_NOT_EXCEEDED",
+          {
+            position, unhedgedDurationMs: Number.isFinite(unhedgedDurationMs) ? unhedgedDurationMs : null,
+            extra: { effectiveProtectiveDeadlineMs: eligibility.effectiveDeadlineMs, marketEndMs: eligibility.marketEndMs },
+          },
         );
         return;
       }
@@ -4626,12 +4715,13 @@ export class EngineService {
         return;
       }
 
-      const candidate = buildProtectiveDeRiskCandidate({
+      const { candidate, reason: candidateRejection } = evaluateProtectiveDeRiskCandidate({
         position,
         snapshot,
         maxOrderSizeUsd: this.riskLimits.maxOrderSizeUsd,
       });
       if (!candidate) {
+        const rejectionReason = candidateRejection ?? "NO_EXECUTABLE_BID_DEPTH";
         const lastWaitingAt = this.protectiveDeRiskLastWaitingAt.get(marketId) ?? Number.NEGATIVE_INFINITY;
         if (now.getTime() - lastWaitingAt >= PROTECTIVE_DE_RISK_WAIT_SAMPLE_MS) {
           this.protectiveDeRiskLastWaitingAt.set(marketId, now.getTime());
@@ -4642,11 +4732,11 @@ export class EngineService {
             attemptedAction: "SELL_UNPAIRED",
             requestedQty: position.unpairedQuantity,
             executableQty: "0",
-            finalState: "NO_EXECUTABLE_BID_DEPTH",
+            finalState: rejectionReason,
           }, this.assetByMarket.get(marketId) ?? snapshot.asset ?? null);
         }
         this.recordProtectiveDeRiskSuppressed(
-          marketId, "GATE_CANDIDATE_NULL", "NO_EXECUTABLE_BID_DEPTH",
+          marketId, "GATE_CANDIDATE_NULL", rejectionReason,
           { position, snapshot, unhedgedDurationMs },
         );
         return;
@@ -4839,6 +4929,15 @@ export class EngineService {
     }
     if (this.timestampDisorder) return "EVENT_TIMESTAMP_DISORDER";
     if (this.state.draining) return "SHUTTING_DOWN";
+
+    // A protective SELL after the market's usable trading lifetime is over is
+    // illegal: settlement authority owns the position from marketEnd onward.
+    // This is the durable final fence for a candidate prepared before expiry
+    // whose commit lands after it (feed queued / maintenance lag).
+    const filledMarketEnd = this.marketsById.get(fill.marketId)?.endDate ?? null;
+    const filledMarketEndMs = filledMarketEnd ? Date.parse(filledMarketEnd) : Number.NaN;
+    const fenceNowMs = this.nowFn().getTime();
+    if (Number.isFinite(filledMarketEndMs) && Number.isFinite(fenceNowMs) && fenceNowMs >= filledMarketEndMs) return "MARKET_EXPIRED";
 
     // The protective SELL executes against the live trusted book. If the book
     // vanished (feed gap/drop or pair-projection clearing during a resync),

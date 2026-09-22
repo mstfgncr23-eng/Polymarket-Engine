@@ -26,16 +26,43 @@ export interface StrategyCandidate {
   reasonCodes: string[];
 }
 
-export function buildProtectiveDeRiskCandidate(input: {
+/**
+ * Why a protective de-risk candidate could not be built from the current
+ * position and live book. Diagnostic classification only — it never loosens
+ * the protective SELL bounds.
+ *
+ * - NO_EXECUTABLE_BID_DEPTH: the unpaired token book is absent for the position
+ *   outcome, or the walk over executable bid levels produced zero quantity.
+ * - MIN_ORDER_SIZE_UNKNOWN: the authoritative minimum order size is not known
+ *   for this token. The CLOB full-book event carries `min_order_size`; until
+ *   the adapter has committed one such full book (and carried the value
+ *   forward), the protective SELL fails safely rather than inventing a size.
+ * - QUANTITY_BELOW_MIN_ORDER_SIZE: executable bid quantity exists but is below
+ *   the known minimum order size for the token.
+ */
+export type ProtectiveCandidateRejection =
+  | "NO_EXECUTABLE_BID_DEPTH"
+  | "MIN_ORDER_SIZE_UNKNOWN"
+  | "QUANTITY_BELOW_MIN_ORDER_SIZE";
+
+export interface ProtectiveCandidateEvaluation {
+  candidate: StrategyCandidate | null;
+  /** Non-null exactly when candidate is null on the executable-quantity paths. */
+  reason: ProtectiveCandidateRejection | null;
+}
+
+export function evaluateProtectiveDeRiskCandidate(input: {
   position: Position;
   snapshot: MarketSnapshot;
   maxOrderSizeUsd: number;
-}): StrategyCandidate | null {
+}): ProtectiveCandidateEvaluation {
   const { position, snapshot } = input;
-  if (!position.unpairedOutcome || position.unpairedOutcome !== snapshot.outcome) return null;
+  if (!position.unpairedOutcome || position.unpairedOutcome !== snapshot.outcome) return { candidate: null, reason: null };
   const unpaired = d(position.unpairedQuantity);
   const maxNotional = d(input.maxOrderSizeUsd);
-  if (unpaired.lte(0) || maxNotional.lte(0) || snapshot.bids.length === 0) return null;
+  if (unpaired.lte(0) || maxNotional.lte(0) || snapshot.bids.length === 0) {
+    return { candidate: null, reason: "NO_EXECUTABLE_BID_DEPTH" };
+  }
 
   let quantity = d(0);
   let notional = d(0);
@@ -57,21 +84,34 @@ export function buildProtectiveDeRiskCandidate(input: {
     worstPrice = level.price;
   }
 
-  if (quantity.lte(0) || !worstPrice || !snapshot.minOrderSize || quantity.lt(snapshot.minOrderSize)) return null;
+  if (quantity.lte(0) || !worstPrice) return { candidate: null, reason: "NO_EXECUTABLE_BID_DEPTH" };
+  if (!snapshot.minOrderSize) return { candidate: null, reason: "MIN_ORDER_SIZE_UNKNOWN" };
+  if (quantity.lt(snapshot.minOrderSize)) return { candidate: null, reason: "QUANTITY_BELOW_MIN_ORDER_SIZE" };
   return {
-    strategyId: "protective-de-risk",
-    strategyVersion: "protective-de-risk-v1",
-    marketId: snapshot.marketId,
-    tokenId: snapshot.tokenId,
-    outcome: snapshot.outcome,
-    side: "SELL",
-    quantity: decimal(quantity),
-    limitPrice: worstPrice,
-    intent: "PROTECTIVE_DE_RISK",
-    rawEdgeUsdPerShare: 0,
-    rawExpectedEdge: 0,
-    reasonCodes: ["MAX_UNHEDGED_DURATION", "REDUCE_UNPAIRED_INVENTORY"],
+    candidate: {
+      strategyId: "protective-de-risk",
+      strategyVersion: "protective-de-risk-v1",
+      marketId: snapshot.marketId,
+      tokenId: snapshot.tokenId,
+      outcome: snapshot.outcome,
+      side: "SELL",
+      quantity: decimal(quantity),
+      limitPrice: worstPrice,
+      intent: "PROTECTIVE_DE_RISK",
+      rawEdgeUsdPerShare: 0,
+      rawExpectedEdge: 0,
+      reasonCodes: ["MAX_UNHEDGED_DURATION", "REDUCE_UNPAIRED_INVENTORY"],
+    },
+    reason: null,
   };
+}
+
+export function buildProtectiveDeRiskCandidate(input: {
+  position: Position;
+  snapshot: MarketSnapshot;
+  maxOrderSizeUsd: number;
+}): StrategyCandidate | null {
+  return evaluateProtectiveDeRiskCandidate(input).candidate;
 }
 
 export interface StrategyContext {

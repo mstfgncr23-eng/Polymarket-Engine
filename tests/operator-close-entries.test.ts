@@ -230,4 +230,42 @@ describe("operator close-entries lifecycle action", () => {
       else if (first.engine.lastShutdownResult() === null) await first.engine.stop();
     }
   });
+
+  it("closeExperimentEntries persists the actual unresolved position count and restart reproduces it", async () => {
+    const journal = new MemoryEventJournal();
+    const first = await setup({ journal });
+    let recovered: EngineService | null = null;
+    try {
+      expect((await first.engine.beginExperiment()).ok).toBe(true);
+      await first.engine.applyObservedFill(paperFill("btc-mkt", "UP", "close-count-first-leg", first.clock.nowMs));
+      expect(first.engine.ledger.positions.get("btc-mkt")?.unpairedQuantity).toBe("10");
+
+      await first.engine.closeExperimentEntries();
+      const closed = first.engine.experimentManifest();
+      expect(closed?.status).toBe("ENTRY_CLOSED");
+      // The durable boundary manifest must carry the actual unresolved count
+      // (1 open position), not the stale initial 0.
+      expect(closed?.unresolvedPositionCount).toBe(1);
+
+      const entry = await journal.queryDurableTransitions({ types: ["EXPERIMENT_ENTRY_CLOSED"], limit: 8 });
+      expect(entry).toHaveLength(1);
+      expect((entry[0]!.payload.experiment as { unresolvedPositionCount?: number }).unresolvedPositionCount).toBe(1);
+      first.clock.nowMs += 5_000;
+      await first.engine.stop();
+
+      // Restart/replay reconstructs the same authoritative value.
+      recovered = new EngineService(first.env, journal, { error: () => undefined }, {
+        market: first.market as never,
+        referenceRegistry: new ScriptedReferenceRegistry() as never,
+        activation: new NoopGrokActivationBridge(),
+        now: () => new Date(first.clock.nowMs),
+      });
+      await recovered.start();
+      expect(recovered.experimentManifest()?.status).toBe("ENTRY_CLOSED");
+      expect(recovered.experimentManifest()?.unresolvedPositionCount).toBe(1);
+    } finally {
+      if (recovered) await recovered.stop();
+      else if (first.engine.lastShutdownResult() === null) await first.engine.stop();
+    }
+  });
 });

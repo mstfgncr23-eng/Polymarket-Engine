@@ -148,12 +148,19 @@ async function setupScenario(options: {
   clock?: ScenarioClock;
   resolutions?: Map<string, Record<string, unknown>>;
   env?: Record<string, string | undefined>;
+  /**
+   * Market endDate offset from START_MS. Protective de-risk flows age the clock
+   * past the max-unhedged deadline (+301s), so their market must still be alive
+   * at that point; the shared default reproduces the historical short-lived
+   * market used by non-protective scenarios.
+   */
+  endDateOffsetMs?: number;
 } = {}) {
   const clock = options.clock ?? { nowMs: START_MS };
   const journal = options.journal ?? new MemoryEventJournal();
   const resolutions = options.resolutions ?? new Map<string, Record<string, unknown>>();
   const market = new ScriptedMarketAdapter();
-  const endDate = new Date(START_MS + 10_000).toISOString();
+  const endDate = new Date(START_MS + (options.endDateOffsetMs ?? 10_000)).toISOString();
   market.queue(discoveryReport([qualified("btc-mkt", "BTC", "btc-up", "btc-down", endDate)]));
   const env = qualifiedPaperEnv({
     EXPERIMENT_DURATION_HOURS: "0.001",
@@ -368,7 +375,7 @@ describe("PR20 true product end-to-end gate", () => {
   });
 
   it("forces a bounded protective SELL after max unhedged duration and retries residual depth", async () => {
-    const setup = await setupScenario({ env: { EXPERIMENT_DURATION_HOURS: "1", PAPER_EXECUTION_LATENCY_MS: "0" } });
+    const setup = await setupScenario({ env: { EXPERIMENT_DURATION_HOURS: "1", PAPER_EXECUTION_LATENCY_MS: "0" }, endDateOffsetMs: 2_000_000 });
     try {
       expect((await setup.engine.beginExperiment()).ok).toBe(true);
       const upInitial = marketBook(setup.clock, "UP", 1);
@@ -491,7 +498,7 @@ describe("PR20 true product end-to-end gate", () => {
   });
 
   it("bounds durable protective risk retries under a persistent veto", async () => {
-    const setup = await setupScenario({ env: { EXPERIMENT_DURATION_HOURS: "1", PAPER_EXECUTION_LATENCY_MS: "0" } });
+    const setup = await setupScenario({ env: { EXPERIMENT_DURATION_HOURS: "1", PAPER_EXECUTION_LATENCY_MS: "0" }, endDateOffsetMs: 2_000_000 });
     try {
       expect((await setup.engine.beginExperiment()).ok).toBe(true);
       const upInitial = marketBook(setup.clock, "UP", 1);
@@ -584,7 +591,7 @@ describe("PR20 true product end-to-end gate", () => {
   });
 
   it("Scenario F blocks a protective SELL when hard safety flips after order admission", async () => {
-    const setup = await setupScenario({ env: { EXPERIMENT_DURATION_HOURS: "1", PAPER_EXECUTION_LATENCY_MS: "800" } });
+    const setup = await setupScenario({ env: { EXPERIMENT_DURATION_HOURS: "1", PAPER_EXECUTION_LATENCY_MS: "800" }, endDateOffsetMs: 2_000_000 });
     try {
       expect((await setup.engine.beginExperiment()).ok).toBe(true);
       const upInitial = marketBook(setup.clock, "UP", 1);
@@ -668,7 +675,7 @@ describe("PR20 true product end-to-end gate", () => {
   });
 
   it("Scenario G blocks a protective SELL when the token desynchronizes after order admission", async () => {
-    const setup = await setupScenario({ env: { EXPERIMENT_DURATION_HOURS: "1", PAPER_EXECUTION_LATENCY_MS: "800" } });
+    const setup = await setupScenario({ env: { EXPERIMENT_DURATION_HOURS: "1", PAPER_EXECUTION_LATENCY_MS: "800" }, endDateOffsetMs: 2_000_000 });
     try {
       expect((await setup.engine.beginExperiment()).ok).toBe(true);
       const upInitial = marketBook(setup.clock, "UP", 1);
@@ -750,7 +757,7 @@ describe("PR20 true product end-to-end gate", () => {
   });
 
   it("Scenario H: a maintenance-triggered protective attempt fails closed without crashing the loop", async () => {
-    const setup = await setupScenario({ env: { EXPERIMENT_DURATION_HOURS: "1" } });
+    const setup = await setupScenario({ env: { EXPERIMENT_DURATION_HOURS: "1" }, endDateOffsetMs: 2_000_000 });
     try {
       expect((await setup.engine.beginExperiment()).ok).toBe(true);
       const upInitial = marketBook(setup.clock, "UP", 1);
