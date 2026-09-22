@@ -517,6 +517,36 @@ describe("B+C — atomic full book and price_change", () => {
     expect(deltas).toHaveLength(1);
     expect(instance.bookState("tok-up")?.bids.get("0.47")).toBe("9");
   });
+
+  it("carries the committed full-book min_order_size forward across price_change snapshots", () => {
+    const instance = adapter();
+    const first = instance.normalizeSourceEvent({
+      type: "book",
+      payload: {
+        tokenId: "tok-up", market: "mkt", timestamp: 1_000,
+        bids: [{ price: "0.47", size: "10" }], asks: [{ price: "0.48", size: "5" }],
+        lastTradePrice: "0.48", minOrderSize: "5",
+      },
+    });
+    expect(first).toHaveLength(1);
+    expect(first[0]?.minOrderSize).toBe("5");
+    // price_change events do not carry min_order_size; the snapshot must keep
+    // the authoritative value committed with the most recent full book instead
+    // of silently nulling it (the observed protective-de-risk soak defect).
+    const deltas = instance.normalizeSourceEvent(liveDelta("tok-up", 1_001));
+    expect(deltas).toHaveLength(1);
+    expect(deltas[0]?.minOrderSize).toBe("5");
+  });
+
+  it("minOrderSize stays null only when every committed full book omitted it", () => {
+    const instance = adapter();
+    const first = instance.normalizeSourceEvent(liveBook("tok-up", 1_000));
+    expect(first).toHaveLength(1);
+    expect(first[0]?.minOrderSize).toBeNull();
+    const deltas = instance.normalizeSourceEvent(liveDelta("tok-up", 1_001));
+    expect(deltas).toHaveLength(1);
+    expect(deltas[0]?.minOrderSize).toBeNull();
+  });
 });
 
 describe("D+E+F — end-to-end trigger provenance", () => {

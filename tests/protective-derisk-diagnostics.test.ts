@@ -40,7 +40,10 @@ async function setupScenario() {
   const clock: Clock = { nowMs: START_MS };
   const journal = new MemoryEventJournal();
   const market = new ScriptedMarketAdapter();
-  const endDate = new Date(START_MS + 10_000).toISOString();
+  // Market end far enough past START that the diagnostic gates (observed up to
+  // +480s) fire pre-expiry; the expiry-aware protective deadline must not turn
+  // these observations into MARKET_EXPIRED rows.
+  const endDate = new Date(START_MS + 2_000_000).toISOString();
   market.queue(discoveryReport([qualified("btc-mkt", "XRP", "btc-up", "btc-down", endDate)]));
   const env = qualifiedPaperEnv({
     DISCOVERY_INTERVAL_MS: "3600000",
@@ -209,6 +212,65 @@ it("2 records UNHEDGED_DURATION_NOT_EXCEEDED before the policy deadline", async 
       expect(row?.payload.snapshotPresent).toBe(true);
       expect(row?.payload.bidsPresent).toBe(false);
       expect(row?.payload.bidDepth).toBe("0");
+      expect(setup.engine.ledger.positions.get("btc-mkt")?.unpairedQuantity).toBe("10");
+      expect(setup.engine.integrityFault()).toBe(false);
+    } finally {
+      await setup.engine.stop();
+    }
+  });
+
+  it("6b soak shape: fresh synchronized book with deep bids but missing minimum order size fails safely as MIN_ORDER_SIZE_UNKNOWN", async () => {
+    const setup = await setupScenario();
+    try {
+      expect((await setup.engine.beginExperiment()).ok).toBe(true);
+      // Reproduce experiment_d2fe2633-fd06-4d6f-a2fa-587bd4457023 market 4806624:
+      // fresh snapshot, synchronized token, bestBid 0.45, ~89k bid depth, fee
+      // schedule known, but minOrderSize missing on the snapshots the engine sees.
+      const downBook = book(setup.clock, "DOWN", 1, [{ price: "0.40", quantity: "10" }]);
+      await setup.market.emitSnapshot(book(setup.clock, "UP", 1, [{ price: "0.59", quantity: "300" }]));
+      await setup.engine.applyObservedFill({ ...firstLeg(setup.clock, downBook.eventId), feeSchedule: downBook.feeSchedule });
+      setup.clock.nowMs = START_MS + 301_000;
+      await setup.market.emitSnapshot(snapshot({
+        ...book(setup.clock, "DOWN", 2, [{ price: "0.45", quantity: "88961.66" }]),
+        minOrderSize: null,
+      }));
+      await setup.market.emitSnapshot(book(setup.clock, "UP", 2, [{ price: "0.55", quantity: "300" }]));
+      const rows = await waitFor(() => suppressed(setup), (list) => list.some((row) => row.payload.gate === "GATE_CANDIDATE_NULL"));
+      const row = rows.find((item) => item.payload.gate === "GATE_CANDIDATE_NULL");
+      expect(row?.payload.reason).toBe("MIN_ORDER_SIZE_UNKNOWN");
+      expect(row?.payload.snapshotPresent).toBe(true);
+      expect(row?.payload.tokenSynchronized).toBe(true);
+      expect(row?.payload.bidsPresent).toBe(true);
+      expect(row?.payload.bestBid).toBe("0.45");
+      expect(row?.payload.bidDepth).toBe("88961.66");
+      expect(row?.payload.feeScheduleKnown).toBe(true);
+      expect(row?.payload.minOrderSize).toBe(null);
+      expect(row?.payload.candidateQuantity).toBe(null);
+      expect(setup.engine.ledger.positions.get("btc-mkt")?.unpairedQuantity).toBe("10");
+      expect(setup.engine.integrityFault()).toBe(false);
+    } finally {
+      await setup.engine.stop();
+    }
+  });
+
+  it("6c distinguishes executable quantity below the known minimum order size from missing depth", async () => {
+    const setup = await setupScenario();
+    try {
+      expect((await setup.engine.beginExperiment()).ok).toBe(true);
+      const downBook = book(setup.clock, "DOWN", 1, [{ price: "0.40", quantity: "10" }]);
+      await setup.market.emitSnapshot(book(setup.clock, "UP", 1, [{ price: "0.59", quantity: "300" }]));
+      await setup.engine.applyObservedFill({ ...firstLeg(setup.clock, downBook.eventId), feeSchedule: downBook.feeSchedule });
+      setup.clock.nowMs = START_MS + 301_000;
+      // 0.5 executable shares against the fixture's known minimum order size
+      // of 1: quantity exists but is below the minimum.
+      await setup.market.emitSnapshot(book(setup.clock, "DOWN", 2, [{ price: "0.45", quantity: "0.5" }]));
+      await setup.market.emitSnapshot(book(setup.clock, "UP", 2, [{ price: "0.55", quantity: "300" }]));
+      const rows = await waitFor(() => suppressed(setup), (list) => list.some((row) => row.payload.gate === "GATE_CANDIDATE_NULL"));
+      const row = rows.find((item) => item.payload.gate === "GATE_CANDIDATE_NULL");
+      expect(row?.payload.reason).toBe("QUANTITY_BELOW_MIN_ORDER_SIZE");
+      expect(row?.payload.bidsPresent).toBe(true);
+      expect(row?.payload.bidDepth).toBe("0.5");
+      expect(row?.payload.minOrderSize).toBe("1");
       expect(setup.engine.ledger.positions.get("btc-mkt")?.unpairedQuantity).toBe("10");
       expect(setup.engine.integrityFault()).toBe(false);
     } finally {
