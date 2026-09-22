@@ -1014,6 +1014,10 @@ export class EngineService {
         entryClosesAt: this.nowFn().toISOString(),
         completedAt: null,
         markToMarketAt: null,
+        // Manual/operator close-entries is another RUNNING → ENTRY_CLOSED
+        // boundary; the durable manifest must carry the actual unresolved
+        // position count, exactly like the deadline and recovery paths.
+        unresolvedPositionCount: this.countUnresolvedPositions(),
       };
       await this.commitExperimentStatus(closed);
       return { ok: true, experiment: this.experiment };
