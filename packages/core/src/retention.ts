@@ -121,6 +121,10 @@ export const OPERATIONAL_MONITOR_EVENT_TYPES = [
   "REFERENCE_PROBE_TRANSIENT", "REFERENCE_PROVIDER_BLOCKED",
   "SYSTEM_HEALTH_EVENT",
   "EXPERIMENT_REPORT_GENERATED", "EXPERIMENT_SOURCE_SEALED",
+  // Diagnostic-only (short soak): records why a protective de-risk attempt was
+  // suppressed (gate + live snapshot/sync/depth facts). Rate-bounded per market
+  // by the engine; never canonical, never hashed, never source-sealed.
+  "PROTECTIVE_DE_RISK_SUPPRESSED",
 ] as const;
 
 export type ReportInputClass = "canonical" | "operational";

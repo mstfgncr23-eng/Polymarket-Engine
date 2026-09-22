@@ -58,6 +58,7 @@ import {
   type MarketSnapshot,
   type LedgerState,
   type Outcome,
+  type StrategyCandidate,
   type PaperOrder,
   type Position,
   type ReferenceTick,
@@ -220,6 +221,12 @@ const SCOUT_REFRESH_RETRY_GAP_MS = 1_000;
 const PROTECTIVE_DE_RISK_RETRY_MS = 5_000;
 const PROTECTIVE_DE_RISK_VETO_RETRY_MS = 30_000;
 const PROTECTIVE_DE_RISK_WAIT_SAMPLE_MS = 5_000;
+/**
+ * Diagnostic-only bound for PROTECTIVE_DE_RISK_SUPPRESSED observability rows.
+ * At most one durable row per market per 60s, aligned to the maintenance
+ * cadence. Pure observability: never affects trading decisions or timing.
+ */
+const PROTECTIVE_DE_RISK_SUPPRESS_EMIT_MIN_MS = 60_000;
 type IdleGrokSubmission = { observedAt: number; pending: boolean };
 type RetainedBookkeepingCounts = {
   activeTriggers: number;
@@ -330,6 +337,8 @@ export class EngineService {
   private readonly protectiveDeRiskVetoFingerprint = new Map<string, string>();
   /** Bounds non-durable waiting feed/SSE samples when no sell depth exists. */
   private readonly protectiveDeRiskLastWaitingAt = new Map<string, number>();
+  /** Diagnostic-only: last PROTECTIVE_DE_RISK_SUPPRESSED emission per market. */
+  private readonly protectiveDeRiskLastSuppressEmitAt = new Map<string, number>();
   private readonly activeTriggers = new Map<string, TriggerEvent>();
   private readonly triggerProvenance = new Map<string, TriggerProvenance>();
   private readonly provenanceInvalid = new Set<string>();
@@ -884,6 +893,7 @@ export class EngineService {
             this.protectiveDeRiskNextAttemptAt.clear();
             this.protectiveDeRiskVetoFingerprint.clear();
             this.protectiveDeRiskLastWaitingAt.clear();
+            this.protectiveDeRiskLastSuppressEmitAt.clear();
             this.abortSourceSealPersist();
             this.sourceSealed = false;
             this.sourceSealing = false;
@@ -3785,6 +3795,10 @@ export class EngineService {
               // durability/integrity fault.
               const hardSafetyReason = this.protectiveFillHardSafetyReason(fill);
               if (hardSafetyReason) {
+                this.recordProtectiveDeRiskSuppressed(
+                  fill.marketId, "FINAL_FENCE", hardSafetyReason,
+                  { snapshot: this.snapshots.get(fill.marketId)?.[fill.outcome] ?? null },
+                );
                 throw new RiskReductionLifecycleGuardRejectedError(fill.marketId, economicIntent, hardSafetyReason);
               }
             }
@@ -4512,27 +4526,49 @@ export class EngineService {
   }
 
   private async maybeProtectiveDeRisk(marketId: string): Promise<void> {
-    if (this.protectiveDeRiskInFlight.has(marketId)) return;
+    if (this.protectiveDeRiskInFlight.has(marketId)) {
+      this.recordProtectiveDeRiskSuppressed(marketId, "GATE_IN_FLIGHT", "IN_FLIGHT");
+      return;
+    }
     const initial = this.ledger.positions.get(marketId);
     if (!initial?.unpairedOutcome || d(initial.unpairedQuantity).lte(0)) {
       this.clearProtectiveDeRiskState(marketId);
       return;
     }
-    if (!experimentAllowsHedge(this.experiment) || this.settledMarkets.has(marketId)) return;
+    if (!experimentAllowsHedge(this.experiment)) {
+      this.recordProtectiveDeRiskSuppressed(marketId, "GATE_HEDGE_UNAVAILABLE", "HEDGE_UNAVAILABLE", { position: initial });
+      return;
+    }
+    if (this.settledMarkets.has(marketId)) {
+      this.recordProtectiveDeRiskSuppressed(marketId, "GATE_SETTLED_MARKET", "SETTLED_MARKET", { position: initial });
+      return;
+    }
     // Economic risk reduction still requires healthy durability authority.
     // Fail-closed/integrity/journal faults must never be bypassed by calling an
     // exit "protective".
-    if (
-      this.state.database !== "UP"
-      || this.state.journalDegraded
-      || this.overload.hasIntegrityFault
-      || this.overload.state === "FAIL_CLOSED"
-    ) return;
+    if (this.state.database !== "UP") {
+      this.recordProtectiveDeRiskSuppressed(marketId, "GATE_HARD_AUTHORITY", "DATABASE_UNAVAILABLE", { position: initial });
+      return;
+    }
+    if (this.state.journalDegraded) {
+      this.recordProtectiveDeRiskSuppressed(marketId, "GATE_HARD_AUTHORITY", "JOURNAL_DEGRADED", { position: initial });
+      return;
+    }
+    if (this.overload.hasIntegrityFault || this.overload.state === "FAIL_CLOSED") {
+      this.recordProtectiveDeRiskSuppressed(marketId, "GATE_HARD_AUTHORITY", "INTEGRITY_OR_FAIL_CLOSED", { position: initial });
+      return;
+    }
 
     const initialNow = this.nowFn();
     const initialStartedAt = initial.unhedgedStartedAt ?? initial.openedAt;
     const initialDurationMs = Math.max(0, initialNow.getTime() - Date.parse(initialStartedAt));
-    if (!Number.isFinite(initialDurationMs) || initialDurationMs < this.riskLimits.maxUnhedgedDurationMs) return;
+    if (!Number.isFinite(initialDurationMs) || initialDurationMs < this.riskLimits.maxUnhedgedDurationMs) {
+      this.recordProtectiveDeRiskSuppressed(
+        marketId, "GATE_DURATION", "UNHEDGED_DURATION_NOT_EXCEEDED",
+        { position: initial, unhedgedDurationMs: Number.isFinite(initialDurationMs) ? initialDurationMs : null },
+      );
+      return;
+    }
 
     this.protectiveDeRiskInFlight.add(marketId);
     try {
@@ -4544,23 +4580,51 @@ export class EngineService {
       const position = this.ledger.positions.get(marketId);
       if (!position?.unpairedOutcome || d(position.unpairedQuantity).lte(0)) {
         this.clearProtectiveDeRiskState(marketId);
+        this.recordProtectiveDeRiskSuppressed(marketId, "GATE_POSITION_CHANGED", "POSITION_CHANGED");
         return;
       }
-      if (!experimentAllowsHedge(this.experiment) || this.settledMarkets.has(marketId) || this.state.draining) return;
+      if (!experimentAllowsHedge(this.experiment)) {
+        this.recordProtectiveDeRiskSuppressed(marketId, "GATE_HEDGE_UNAVAILABLE_AFTER_CANCEL", "HEDGE_UNAVAILABLE", { position });
+        return;
+      }
+      if (this.settledMarkets.has(marketId)) {
+        this.recordProtectiveDeRiskSuppressed(marketId, "GATE_SETTLED_AFTER_CANCEL", "SETTLED_MARKET", { position });
+        return;
+      }
+      if (this.state.draining) {
+        this.recordProtectiveDeRiskSuppressed(marketId, "GATE_DRAINING", "DRAINING", { position });
+        return;
+      }
 
       const now = this.nowFn();
       const unhedgedStartedAt = position.unhedgedStartedAt ?? position.openedAt;
       const unhedgedDurationMs = Math.max(0, now.getTime() - Date.parse(unhedgedStartedAt));
-      if (!Number.isFinite(unhedgedDurationMs) || unhedgedDurationMs < this.riskLimits.maxUnhedgedDurationMs) return;
+      if (!Number.isFinite(unhedgedDurationMs) || unhedgedDurationMs < this.riskLimits.maxUnhedgedDurationMs) {
+        this.recordProtectiveDeRiskSuppressed(
+          marketId, "GATE_DURATION_CHANGED", "UNHEDGED_DURATION_NOT_EXCEEDED",
+          { position, unhedgedDurationMs: Number.isFinite(unhedgedDurationMs) ? unhedgedDurationMs : null },
+        );
+        return;
+      }
 
       const pair = this.snapshots.get(marketId);
       const snapshot = pair?.[position.unpairedOutcome]
         ?? [...this.state.marketSnapshots.values()].find((item) => item.marketId === marketId && item.outcome === position.unpairedOutcome)
         ?? null;
-      if (!snapshot || !this.adapterTokenSynchronized(snapshot.tokenId)) return;
+      if (!snapshot) {
+        this.recordProtectiveDeRiskSuppressed(marketId, "GATE_SNAPSHOT_MISSING", "SNAPSHOT_MISSING", { position });
+        return;
+      }
+      if (!this.adapterTokenSynchronized(snapshot.tokenId)) {
+        this.recordProtectiveDeRiskSuppressed(marketId, "GATE_TOKEN_UNSYNCHRONIZED", "TOKEN_UNSYNCHRONIZED", { position, snapshot });
+        return;
+      }
 
       const receivedAtMs = Date.parse(snapshot.receivedAt);
-      if (!Number.isFinite(receivedAtMs) || now.getTime() - receivedAtMs > this.riskLimits.staleFeedTimeoutMs) return;
+      if (!Number.isFinite(receivedAtMs) || now.getTime() - receivedAtMs > this.riskLimits.staleFeedTimeoutMs) {
+        this.recordProtectiveDeRiskSuppressed(marketId, "GATE_SNAPSHOT_STALE", "SNAPSHOT_STALE", { position, snapshot, unhedgedDurationMs });
+        return;
+      }
 
       const candidate = buildProtectiveDeRiskCandidate({
         position,
@@ -4581,6 +4645,10 @@ export class EngineService {
             finalState: "NO_EXECUTABLE_BID_DEPTH",
           }, this.assetByMarket.get(marketId) ?? snapshot.asset ?? null);
         }
+        this.recordProtectiveDeRiskSuppressed(
+          marketId, "GATE_CANDIDATE_NULL", "NO_EXECUTABLE_BID_DEPTH",
+          { position, snapshot, unhedgedDurationMs },
+        );
         return;
       }
 
@@ -4595,7 +4663,16 @@ export class EngineService {
         const vetoFingerprint = this.protectiveDeRiskVetoFingerprint.get(marketId);
         // A normal execution retry keeps its short cooldown. A hard-veto
         // backoff may be bypassed only when the blocker state materially changed.
-        if (vetoFingerprint == null || vetoFingerprint === hardStateFingerprint) return;
+        if (vetoFingerprint == null || vetoFingerprint === hardStateFingerprint) {
+          this.recordProtectiveDeRiskSuppressed(
+            marketId, "GATE_RETRY_BACKOFF", "RETRY_BACKOFF",
+            {
+              position, snapshot, candidate, unhedgedDurationMs,
+              extra: { retryNextAttemptAtMs: nextAttemptAt, vetoFingerprint },
+            },
+          );
+          return;
+        }
         this.protectiveDeRiskVetoFingerprint.delete(marketId);
       }
       // Reserve the retry slot before any journal await so fresh snapshot
@@ -4789,11 +4866,113 @@ export class EngineService {
     return null;
   }
 
+  /**
+   * DIAGNOSTIC ONLY (short soak). Records why a protective de-risk attempt was
+   * suppressed, without altering any decision, timing, or paper behavior.
+   * Emitted at most once per market per PROTECTIVE_DE_RISK_SUPPRESS_EMIT_MIN_MS
+   * as: one structured log line, one SSE/decision-feed record, and one durable
+   * journal_events row of type PROTECTIVE_DE_RISK_SUPPRESSED (operational
+   * class: not canonical, not hashed, not source-sealed, no integrity effect).
+   */
+  private recordProtectiveDeRiskSuppressed(
+    marketId: string,
+    gate: string,
+    reason: string,
+    context: {
+      position?: Position | null;
+      snapshot?: MarketSnapshot | null;
+      candidate?: StrategyCandidate | null;
+      unhedgedDurationMs?: number | null;
+      extra?: Record<string, unknown>;
+    } = {},
+  ): void {
+    const now = this.nowFn();
+    const lastAt = this.protectiveDeRiskLastSuppressEmitAt.get(marketId) ?? Number.NEGATIVE_INFINITY;
+    if (now.getTime() - lastAt < PROTECTIVE_DE_RISK_SUPPRESS_EMIT_MIN_MS) return;
+    this.protectiveDeRiskLastSuppressEmitAt.set(marketId, now.getTime());
+
+    const position = context.position;
+    const snapshot = context.snapshot;
+    let bestBid: string | null = null;
+    let bidDepth = "0";
+    if (snapshot) {
+      let depth = d(0);
+      for (const level of snapshot.bids) {
+        const price = d(level.price);
+        const quantity = d(level.quantity);
+        if (price.lte(0) || quantity.lte(0)) continue;
+        if (bestBid == null || price.gt(bestBid)) bestBid = decimal(price);
+        depth = depth.plus(quantity);
+      }
+      bidDepth = decimal(depth);
+    }
+    const unhedgedDurationMs = context.unhedgedDurationMs != null
+      ? context.unhedgedDurationMs
+      : position
+        ? Math.max(0, now.getTime() - Date.parse(position.unhedgedStartedAt ?? position.openedAt))
+        : null;
+    const facts: Record<string, unknown> = {
+      gate,
+      reason,
+      experimentId: this.experiment?.id ?? null,
+      experimentStatus: this.experiment?.status ?? null,
+      marketId,
+      tokenId: snapshot?.tokenId ?? null,
+      outcome: position?.unpairedOutcome ?? null,
+      at: now.toISOString(),
+      unhedgedDurationMs,
+      unpairedQuantity: position?.unpairedQuantity ?? null,
+      snapshotPresent: snapshot != null,
+      snapshotReceivedAt: snapshot?.receivedAt ?? null,
+      snapshotAgeMs: snapshot ? Math.max(0, now.getTime() - Date.parse(snapshot.receivedAt)) : null,
+      tokenSynchronized: snapshot ? this.adapterTokenSynchronized(snapshot.tokenId) : null,
+      tokenEpoch: snapshot ? this.adapterTokenEpoch(snapshot.tokenId) : null,
+      bidsPresent: snapshot ? snapshot.bids.length > 0 : null,
+      bestBid,
+      bidDepth,
+      asksPresent: snapshot ? snapshot.asks.length > 0 : null,
+      minOrderSize: snapshot?.minOrderSize ?? null,
+      feeScheduleKnown: snapshot ? snapshot.feeSchedule != null : null,
+      candidateQuantity: context.candidate?.quantity ?? null,
+      candidateLimitPrice: context.candidate?.limitPrice ?? null,
+      database: this.state.database,
+      journalDegraded: this.state.journalDegraded,
+      overloadState: this.overload.state,
+      integrityFault: this.overload.hasIntegrityFault,
+      timestampDisorder: this.timestampDisorder,
+      draining: this.state.draining,
+      ...(context.extra ?? {}),
+    };
+    const traceId = createId("derisk-obs");
+    this.record("PROTECTIVE_DE_RISK_SUPPRESSED", traceId, marketId, facts, this.assetByMarket.get(marketId) ?? snapshot?.asset ?? null);
+    (this.logger as { warn?: (obj: unknown, msg?: string) => void }).warn?.({ marketId, gate, reason, benign: true }, "protective de-risk suppressed (diagnostic)");
+    void this.persistProtectiveDeRiskSuppressed(traceId, marketId, facts).catch(() => undefined);
+  }
+
+  private async persistProtectiveDeRiskSuppressed(traceId: string, marketId: string, facts: Record<string, unknown>): Promise<void> {
+    try {
+      // Diagnostic-only row. It intentionally bypasses safeAppend: a benign
+      // observation must never mutate live health flags (safeAppend clears
+      // journalDegraded on any non-critical success) or take fail-closed
+      // semantics. Raw append is rate-bounded (one per market per 60s).
+      await this.journal.append(createJournalEvent({
+        traceId,
+        type: "PROTECTIVE_DE_RISK_SUPPRESSED",
+        aggregateType: "market",
+        aggregateId: marketId,
+        payload: { ...facts, experimentId: this.experiment?.id ?? null },
+      }), {});
+    } catch {
+      // Observability must never affect trading decisions, timing, or health.
+    }
+  }
+
   private clearProtectiveDeRiskState(marketId: string): void {
     this.protectiveDeRiskAttempts.delete(marketId);
     this.protectiveDeRiskNextAttemptAt.delete(marketId);
     this.protectiveDeRiskVetoFingerprint.delete(marketId);
     this.protectiveDeRiskLastWaitingAt.delete(marketId);
+    this.protectiveDeRiskLastSuppressEmitAt.delete(marketId);
   }
 
   private async pollSettlements(): Promise<void> {
