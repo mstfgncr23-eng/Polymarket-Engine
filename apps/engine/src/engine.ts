@@ -337,7 +337,7 @@ export class EngineService {
   private readonly protectiveDeRiskVetoFingerprint = new Map<string, string>();
   /** Bounds non-durable waiting feed/SSE samples when no sell depth exists. */
   private readonly protectiveDeRiskLastWaitingAt = new Map<string, number>();
-  /** Diagnostic-only: last PROTECTIVE_DE_RISK_SUPPRESSED emission per market. */
+  /** Diagnostic-only: last PROTECTIVE_DE_RISK_SUPPRESSED emission per market+gate. */
   private readonly protectiveDeRiskLastSuppressEmitAt = new Map<string, number>();
   private readonly activeTriggers = new Map<string, TriggerEvent>();
   private readonly triggerProvenance = new Map<string, TriggerProvenance>();
@@ -4869,10 +4869,14 @@ export class EngineService {
   /**
    * DIAGNOSTIC ONLY (short soak). Records why a protective de-risk attempt was
    * suppressed, without altering any decision, timing, or paper behavior.
-   * Emitted at most once per market per PROTECTIVE_DE_RISK_SUPPRESS_EMIT_MIN_MS
-   * as: one structured log line, one SSE/decision-feed record, and one durable
-   * journal_events row of type PROTECTIVE_DE_RISK_SUPPRESSED (operational
-   * class: not canonical, not hashed, not source-sealed, no integrity effect).
+   * Rate-limited per (market, gate): a repeated identical gate emits at most
+   * once per PROTECTIVE_DE_RISK_SUPPRESS_EMIT_MIN_MS, while a transition to a
+   * different gate for the same market emits immediately, so a pre-timeout or
+   * in-flight observation can never hide the actual post-timeout gate. Each
+   * emission is one structured log line, one SSE/decision-feed record, and one
+   * durable journal_events row of type PROTECTIVE_DE_RISK_SUPPRESSED
+   * (operational report class, monitor_control journal class: not canonical,
+   * not hashed, not source-sealed, no integrity effect).
    */
   private recordProtectiveDeRiskSuppressed(
     marketId: string,
@@ -4887,9 +4891,10 @@ export class EngineService {
     } = {},
   ): void {
     const now = this.nowFn();
-    const lastAt = this.protectiveDeRiskLastSuppressEmitAt.get(marketId) ?? Number.NEGATIVE_INFINITY;
+    const key = `${marketId}\u0000${gate}`;
+    const lastAt = this.protectiveDeRiskLastSuppressEmitAt.get(key) ?? Number.NEGATIVE_INFINITY;
     if (now.getTime() - lastAt < PROTECTIVE_DE_RISK_SUPPRESS_EMIT_MIN_MS) return;
-    this.protectiveDeRiskLastSuppressEmitAt.set(marketId, now.getTime());
+    this.protectiveDeRiskLastSuppressEmitAt.set(key, now.getTime());
 
     const position = context.position;
     const snapshot = context.snapshot;
@@ -4972,7 +4977,10 @@ export class EngineService {
     this.protectiveDeRiskNextAttemptAt.delete(marketId);
     this.protectiveDeRiskVetoFingerprint.delete(marketId);
     this.protectiveDeRiskLastWaitingAt.delete(marketId);
-    this.protectiveDeRiskLastSuppressEmitAt.delete(marketId);
+    // Diagnostic suppression timestamps are keyed per (market, gate).
+    for (const key of [...this.protectiveDeRiskLastSuppressEmitAt.keys()]) {
+      if (key.startsWith(`${marketId}\u0000`)) this.protectiveDeRiskLastSuppressEmitAt.delete(key);
+    }
   }
 
   private async pollSettlements(): Promise<void> {

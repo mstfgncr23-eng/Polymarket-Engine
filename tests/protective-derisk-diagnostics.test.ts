@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createId, type MarketSnapshot, type PaperFill } from "@pm/core";
+import { classifyJournalRetention, classifyReportInput, createId, isProtectedJournalType, type MarketSnapshot, type PaperFill } from "@pm/core";
 import { MemoryEventJournal } from "@pm/db";
 import { EngineService } from "../apps/engine/src/engine.js";
 import { NoopGrokActivationBridge } from "../apps/engine/src/activation/index.js";
@@ -176,8 +176,9 @@ it("2 records UNHEDGED_DURATION_NOT_EXCEEDED before the policy deadline", async 
       await setup.market.emitSnapshot(book(setup.clock, "DOWN", 2, [], [{ price: "0.40", quantity: "10" }]));
       await setup.market.emitSnapshot(book(setup.clock, "UP", 2, [{ price: "0.55", quantity: "300" }]));
       await waitFor(() => suppressed(setup), (list) => list.some((row) => row.payload.gate === "GATE_CANDIDATE_NULL"));
-      // >60s later the DOWN book is 61s old and the rate limiter allows a new row.
-      setup.clock.nowMs = START_MS + 362_000;
+      // A different gate (SNAPSHOT_STALE) transitions within the same 60s
+      // window and must emit immediately (rate limit is per market+gate).
+      setup.clock.nowMs = START_MS + 317_000;
       await setup.engine.tickMaintenance();
       const rows = await waitFor(() => suppressed(setup), (list) => list.some((row) => row.payload.gate === "GATE_SNAPSHOT_STALE"));
       const row = rows.find((item) => item.payload.gate === "GATE_SNAPSHOT_STALE");
@@ -213,5 +214,56 @@ it("2 records UNHEDGED_DURATION_NOT_EXCEEDED before the policy deadline", async 
     } finally {
       await setup.engine.stop();
     }
+  });
+
+  it("7 transition: a different gate is durably recorded within the same 60s window, repeated identical gate stays bounded", async () => {
+    const setup = await setupScenario();
+    try {
+      expect((await setup.engine.beginExperiment()).ok).toBe(true);
+      const downBook = book(setup.clock, "DOWN", 1, [{ price: "0.40", quantity: "10" }]);
+      await setup.market.emitSnapshot(book(setup.clock, "UP", 1, [{ price: "0.59", quantity: "300" }]));
+      await setup.engine.applyObservedFill({ ...firstLeg(setup.clock, downBook.eventId), feeSchedule: downBook.feeSchedule });
+
+      // Pre-timeout diagnostic consumes the GATE_DURATION slot at +299s.
+      setup.clock.nowMs = START_MS + 299_000;
+      await setup.engine.tickMaintenance();
+      await waitFor(() => suppressed(setup), (list) => list.some((row) => row.payload.gate === "GATE_DURATION"));
+
+      // Post-timeout gate (SNAPSHOT_MISSING) arrives 2s later: a different gate
+      // for the same market must emit immediately, despite the 60s per-gate limit.
+      setup.clock.nowMs = START_MS + 301_000;
+      await setup.engine.tickMaintenance();
+      const rows = await waitFor(
+        () => suppressed(setup),
+        (list) => list.some((row) => row.payload.gate === "GATE_DURATION") && list.some((row) => row.payload.gate === "GATE_SNAPSHOT_MISSING"),
+      );
+      const durationRow = rows.find((item) => item.payload.gate === "GATE_DURATION");
+      const missingRow = rows.find((item) => item.payload.gate === "GATE_SNAPSHOT_MISSING");
+      expect(durationRow).toBeTruthy();
+      expect(missingRow).toBeTruthy();
+      expect(missingRow?.payload.reason).toBe("SNAPSHOT_MISSING");
+      expect(Number(missingRow?.payload.unhedgedDurationMs)).toBeGreaterThanOrEqual(301_000);
+      expect(Date.parse(missingRow?.payload.at as string)).toBeGreaterThan(Date.parse(durationRow?.payload.at as string));
+
+      // Repeated identical gate (+303s) stays bounded: no extra SNAPSHOT_MISSING row.
+      setup.clock.nowMs = START_MS + 303_000;
+      await setup.engine.tickMaintenance();
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      const after = await suppressed(setup);
+      expect(after.filter((item) => item.payload.gate === "GATE_SNAPSHOT_MISSING")).toHaveLength(1);
+
+      expect(setup.engine.ledger.positions.get("btc-mkt")?.unpairedQuantity).toBe("10");
+      expect(setup.engine.integrityFault()).toBe(false);
+    } finally {
+      await setup.engine.stop();
+    }
+  });
+
+  it("8 retention/report classification of the suppression event", () => {
+    // Report class: operational (non-canonical, excluded from the report hash).
+    expect(classifyReportInput("PROTECTIVE_DE_RISK_SUPPRESSED")).toBe("operational");
+    // Journal retention: purge-safe monitor_control, never unknown_retain.
+    expect(classifyJournalRetention("PROTECTIVE_DE_RISK_SUPPRESSED")).toBe("monitor_control");
+    expect(isProtectedJournalType("PROTECTIVE_DE_RISK_SUPPRESSED")).toBe(false);
   });
 });

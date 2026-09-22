@@ -59,6 +59,9 @@ export const MONITOR_CONTROL_EVENT_TYPES = [
   "MCP_INTERACTION", "SYSTEM_HEALTH_EVENT", "DISCOVERY_RECONCILED",
   "REFERENCE_FEED_STARTED", "REFERENCE_FEED_STOPPED", "REFERENCE_UNSUPPORTED",
   "REFERENCE_PROBE_TRANSIENT", "REFERENCE_PROVIDER_BLOCKED",
+  // Diagnostic-only observability (short PAPER soak). Purge-safe monitor_control
+  // class; report class stays operational (non-canonical, never protected).
+  "PROTECTIVE_DE_RISK_SUPPRESSED",
 ] as const;
 
 /**
