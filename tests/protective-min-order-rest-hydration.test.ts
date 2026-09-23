@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { evaluateProtectiveDeRiskCandidate, positionSchema } from "@pm/core";
-import { MarketIngressMalformedError, PolymarketMarketDataAdapter, type MinOrderSizeFetcher } from "@pm/market-data";
+import { MemoryEventJournal } from "@pm/db";
+import { MarketIngressMalformedError, PolymarketMarketDataAdapter, ScriptedBoundedMarketTransport, type MinOrderSizeFetcher } from "@pm/market-data";
+import { EngineService } from "../apps/engine/src/engine.js";
+import { NoopGrokActivationBridge } from "../apps/engine/src/activation/index.js";
+import { ScriptedReferenceRegistry, discoveryReport, qualified, qualifiedPaperEnv } from "./paper-engine-testkit.js";
 
 function liveBook(tokenId: string, timestamp: number, minOrderSize?: string, qty = "10") {
   return {
@@ -245,5 +249,104 @@ it("6: real malformed-delta invalidation race: stale P1 cannot apply to the resy
     resolvers[1]!("9");
     await waitFor(() => instance.hydratedMinOrderSizeForTest("tok-up") === "9");
     expect(instance.hydratedMinOrderSizeForTest("tok-down")).toBeNull();
+  });
+it("8: real run consumer path — hydration reaches onSnapshot with no extra WS event, and a new-epoch first omit-book starts P2 after reconnect", async () => {
+    let calls = 0;
+    const resolvers: Array<(value: string | null) => void> = [];
+    const transport = new ScriptedBoundedMarketTransport();
+    const adapter = new PolymarketMarketDataAdapter(undefined, {
+      transport,
+      minOrderSizeFetcher: () => {
+        calls += 1;
+        return new Promise<string | null>((resolve) => { resolvers.push(resolve); });
+      },
+    });
+    adapter.registerManualToken("tok-up", "mkt", "UP", "BTC");
+    adapter.setTokenIds(["tok-up"]);
+    const captured: Array<{ tokenId: string; minOrderSize: string | null; sequence: number; sourceTimestamp: string }> = [];
+    const controller = new AbortController();
+    const running = adapter.run(["tok-up"], {
+      onSnapshot: (snapshot) => {
+        captured.push({ tokenId: snapshot.tokenId, minOrderSize: snapshot.minOrderSize, sequence: snapshot.sequence, sourceTimestamp: snapshot.sourceTimestamp });
+      },
+      onConnection: () => undefined,
+      onError: () => undefined,
+    }, controller.signal);
+    try {
+      await waitFor(() => adapter.activeStreamCount() === 1);
+      // Initial omit-book is emitted to the consumer with minOrderSize=null; P1 starts.
+      transport.push({ type: "book", payload: { tokenId: "tok-up", market: "mkt", timestamp: 1_000, bids: [{ price: "0.40", size: "1" }], asks: [{ price: "0.60", size: "3" }] } });
+      await waitFor(() => captured.length === 1 && resolvers.length === 1);
+      expect(captured[0]!.minOrderSize).toBeNull();
+
+      // Reconnect / generation change while P1 is unresolved: beginStreamEpoch
+      // must invalidate the pending hydration (blocking the quiet-stream hole).
+      adapter.beginStreamEpoch(["tok-up"], "reconnect");
+      expect(adapter.isTokenSynchronized("tok-up")).toBe(false);
+
+      // First omit-book of the new epoch must start P2 IMMEDIATELY.
+      transport.push({ type: "book", payload: { tokenId: "tok-up", market: "mkt", timestamp: 2_000, bids: [{ price: "0.40", size: "1" }], asks: [{ price: "0.60", size: "3" }] } });
+      await waitFor(() => resolvers.length === 2 && calls === 2);
+
+      // Stale P1 resolves first: no apply, no disturbance of P2.
+      resolvers[0]!("99");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(adapter.hydratedMinOrderSizeForTest("tok-up")).toBeNull();
+      expect(calls).toBe(2);
+      // Another omit-book while P2 is pending must NOT start P3.
+      transport.push({ type: "book", payload: { tokenId: "tok-up", market: "mkt", timestamp: 3_000, bids: [{ price: "0.40", size: "1" }], asks: [{ price: "0.60", size: "3" }] } });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(calls).toBe(2);
+
+      // P2 resolves: consumer-visible WITHOUT another WS event, same book identity.
+      const identity = captured[captured.length - 1]!;
+      resolvers[1]!("3");
+      await waitFor(() => captured.some((entry) => entry.minOrderSize === "3"));
+      const hydrated = captured[captured.length - 1]!;
+      expect(hydrated.minOrderSize).toBe("3");
+      expect(hydrated.tokenId).toBe("tok-up");
+      expect(hydrated.sequence).toBe(identity.sequence);
+      expect(hydrated.sourceTimestamp).toBe(identity.sourceTimestamp);
+      expect(calls).toBe(2);
+    } finally {
+      controller.abort();
+      await running.catch(() => undefined);
+    }
+  });
+
+  it("9: engine consumer state observes the hydrated minOrderSize with no additional WS event", async () => {
+    const market = qualified("btc-live", "BTC", "btc-live-up", "btc-live-down");
+    const transport = new ScriptedBoundedMarketTransport();
+    const byToken = new Map<string, (value: string | null) => void>();
+    const adapter = new PolymarketMarketDataAdapter(undefined, {
+      transport,
+      minOrderSizeFetcher: (tokenId) => new Promise<string | null>((resolve) => { byToken.set(tokenId, resolve); }),
+    });
+    adapter.registerManualToken("btc-live-up", market.id, "UP", "BTC");
+    adapter.registerManualToken("btc-live-down", market.id, "DOWN", "BTC");
+    (adapter as PolymarketMarketDataAdapter & { discoverCryptoMarkets: () => Promise<ReturnType<typeof discoveryReport>> }).discoverCryptoMarkets = async () => discoveryReport([market]);
+    const engine = new EngineService(qualifiedPaperEnv(), new MemoryEventJournal(), { error: () => undefined }, {
+      market: adapter,
+      referenceRegistry: new ScriptedReferenceRegistry() as never,
+      activation: new NoopGrokActivationBridge(),
+    });
+    await engine.start();
+    try {
+      await waitFor(() => transport.streams.length >= 1 && engine.state.connections.polymarket.state === "CONNECTED");
+      transport.push({ type: "book", payload: { tokenId: "btc-live-up", market: market.id, timestamp: 1_000, bids: [{ price: "0.47", size: "10" }], asks: [{ price: "0.48", size: "10" }] } });
+      transport.push({ type: "book", payload: { tokenId: "btc-live-down", market: market.id, timestamp: 1_001, bids: [{ price: "0.52", size: "10" }], asks: [{ price: "0.53", size: "10" }] } });
+      await waitFor(() => engine.state.marketSnapshots.has("btc-live-up") && engine.state.marketSnapshots.has("btc-live-down"));
+      expect(engine.state.marketSnapshots.get("btc-live-up")?.minOrderSize).toBeNull();
+      expect(engine.state.marketSnapshots.get("btc-live-down")?.minOrderSize).toBeNull();
+
+      // REST resolves the UP token only; no additional WS event is pushed.
+      byToken.get("btc-live-up")?.("3");
+      await waitFor(() => engine.state.marketSnapshots.get("btc-live-up")?.minOrderSize === "3");
+      const pair = (engine as unknown as { snapshots: Map<string, { UP?: { minOrderSize: string | null } }> }).snapshots.get("btc-live");
+      expect(pair?.UP?.minOrderSize).toBe("3");
+      expect(engine.state.marketSnapshots.get("btc-live-down")?.minOrderSize).toBeNull();
+    } finally {
+      await engine.stop();
+    }
   });
 });

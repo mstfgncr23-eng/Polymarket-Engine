@@ -207,6 +207,15 @@ export class PolymarketMarketDataAdapter {
    */
   private readonly minOrderSizeHydrationGeneration = new Map<string, number>();
   private minOrderSizeFetcherCalls = 0;
+  /**
+   * Last MarketSnapshot emitted per token (bounded by token count). Successful
+   * REST min_order_size hydration replays a metadata-only copy of this snapshot
+   * through the live onSnapshot consumer so the engine observes the
+   * authoritative value immediately, without waiting for another WS event.
+   */
+  private readonly lastEmittedSnapshotByToken = new Map<string, MarketSnapshot>();
+  /** Consumer attached by the current run() loop; cleared when the loop exits. */
+  private streamOnSnapshot: PolymarketFeedHandlers["onSnapshot"] | undefined;
   private sequence = 0;
   private lastTimestampByToken = new Map<string, number>();
   private tokenIds: string[] = [];
@@ -458,6 +467,7 @@ export class PolymarketMarketDataAdapter {
       return;
     }
     signal.addEventListener("abort", onAbort);
+    this.streamOnSnapshot = handlers?.onSnapshot;
     try {
       while (!signal.aborted) {
         if (this.tokenIds.length === 0) {
@@ -575,6 +585,7 @@ export class PolymarketMarketDataAdapter {
       await handlers.onConnection({ feed: "polymarket", state: "STOPPED", at: new Date().toISOString(), reconnectCount });
     } finally {
       signal.removeEventListener("abort", onAbort);
+      this.streamOnSnapshot = undefined;
     }
   }
 
@@ -603,6 +614,9 @@ export class PolymarketMarketDataAdapter {
     for (const tokenId of tokenIds) {
       this.books.delete(tokenId);
       this.lastTimestampByToken.delete(tokenId);
+      // A new stream epoch supersedes any in-flight hydration: stale completions
+      // must neither block nor apply to the new epoch's books.
+      this.invalidateMinOrderSizeHydration(tokenId);
     }
     this.ingress.clear();
     if (options.emitGap !== false && (options.emitGap === true || reason !== "explicit_resubscribe")) {
@@ -984,6 +998,28 @@ export class PolymarketMarketDataAdapter {
     const state = this.books.get(tokenId);
     if (!state || state.minOrderSize != null) return;
     state.minOrderSize = value;
+    this.publishHydratedMinOrderSize(tokenId);
+  }
+
+  /**
+   * Make a successful hydration immediately visible to the live consumer (the
+   * engine) without a further WS event: replay a metadata-only copy of the last
+   * emitted snapshot with the authoritative minOrderSize. Same token/market/
+   * event identity and sequence, unchanged book content — so this can never
+   * create fills, maker transitions, or triggers — and the original receivedAt
+   * is preserved (no fabricated freshness).
+   */
+  private publishHydratedMinOrderSize(tokenId: string): void {
+    const handler = this.streamOnSnapshot;
+    const previous = this.lastEmittedSnapshotByToken.get(tokenId);
+    const state = this.books.get(tokenId);
+    if (!handler || !previous || !state || state.minOrderSize == null) return;
+    const hydrated: MarketSnapshot = {
+      ...previous,
+      minOrderSize: state.minOrderSize,
+    };
+    this.lastEmittedSnapshotByToken.set(tokenId, hydrated);
+    void Promise.resolve(handler(hydrated)).catch(() => undefined);
   }
 
   /**
@@ -1001,6 +1037,7 @@ export class PolymarketMarketDataAdapter {
     this.minOrderSizeHydrationEpoch.delete(tokenId);
     this.minOrderSizeHydrationAttempts.delete(tokenId);
     this.minOrderSizeHydrationNextAt.delete(tokenId);
+    this.lastEmittedSnapshotByToken.delete(tokenId);
   }
 
   /** Test-only: authoritative min order size currently held for a token. */
@@ -1067,6 +1104,7 @@ export class PolymarketMarketDataAdapter {
       bidLevels: state.bids.size,
       askLevels: state.asks.size,
     });
+    this.lastEmittedSnapshotByToken.set(tokenId, snapshot);
     return snapshot;
   }
 }
