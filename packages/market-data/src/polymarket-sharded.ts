@@ -8,6 +8,8 @@ import {
   type FeedConnectionEvent,
   type MarketIngressGapEvent,
   type MarketIngressResyncEvent,
+  type MinOrderSizeHydratedEvent,
+  type MinOrderSizeHydrationObserver,
   type PolymarketFeedHandlers,
   type PolymarketFeedAnomaly,
   type PolymarketTimestampStats,
@@ -123,6 +125,9 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
       if (singleOptions.stableAfterMs !== undefined) childOptions.stableAfterMs = singleOptions.stableAfterMs;
       if (singleOptions.hydrateMinOrderSizeFromRest !== undefined) childOptions.hydrateMinOrderSizeFromRest = singleOptions.hydrateMinOrderSizeFromRest;
       if (singleOptions.minOrderSizeFetcher !== undefined) childOptions.minOrderSizeFetcher = singleOptions.minOrderSizeFetcher;
+      if (singleOptions.minOrderSizeClock !== undefined) childOptions.minOrderSizeClock = singleOptions.minOrderSizeClock;
+      if (singleOptions.minOrderSizeRetryIntervalMs !== undefined) childOptions.minOrderSizeRetryIntervalMs = singleOptions.minOrderSizeRetryIntervalMs;
+      if (singleOptions.minOrderSizeMaxAttempts !== undefined) childOptions.minOrderSizeMaxAttempts = singleOptions.minOrderSizeMaxAttempts;
       return new SinglePolymarketMarketDataAdapter(client, childOptions);
     });
   }
@@ -152,6 +157,12 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
     super.setNormalizeObserver(observer);
     if (!this.sharded) return;
     for (const shard of this.shards) shard.setNormalizeObserver(observer);
+  }
+
+  override setMinOrderSizeHydrationObserver(observer: MinOrderSizeHydrationObserver | null): void {
+    super.setMinOrderSizeHydrationObserver(observer);
+    if (!this.sharded) return;
+    for (const shard of this.shards) shard.setMinOrderSizeHydrationObserver(observer);
   }
 
   override setIngressObserver(observer: IngressQueueObserver | null): void {
@@ -329,6 +340,42 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
     this.publishShardSnapshots();
   }
 
+  override hydratedMinOrderSizeForTest(tokenId: string): string | null {
+    if (!this.sharded || !this.shardedRunStarted) return super.hydratedMinOrderSizeForTest(tokenId);
+    return this.shardForToken(tokenId)?.hydratedMinOrderSizeForTest(tokenId) ?? null;
+  }
+
+  override minOrderSizeFetcherCallCountForTest(): number {
+    if (!this.sharded || !this.shardedRunStarted) return super.minOrderSizeFetcherCallCountForTest();
+    return this.shards.reduce((sum, shard) => sum + shard.minOrderSizeFetcherCallCountForTest(), 0);
+  }
+
+  override minOrderSizeHydrationStateCountForTest(): number {
+    if (!this.sharded || !this.shardedRunStarted) return super.minOrderSizeHydrationStateCountForTest();
+    return this.shards.reduce((sum, shard) => sum + shard.minOrderSizeHydrationStateCountForTest(), 0);
+  }
+
+  override minOrderSizeHydrationInFlightForTest(): number {
+    if (!this.sharded || !this.shardedRunStarted) return super.minOrderSizeHydrationInFlightForTest();
+    return this.shards.reduce((sum, shard) => sum + shard.minOrderSizeHydrationInFlightForTest(), 0);
+  }
+
+  override flushMinOrderSizeHydrationRetriesForTest(): void {
+    if (!this.sharded || !this.shardedRunStarted) {
+      super.flushMinOrderSizeHydrationRetriesForTest();
+      return;
+    }
+    for (const shard of this.shards) shard.flushMinOrderSizeHydrationRetriesForTest();
+  }
+
+  override bumpTokenEpochForTest(tokenId: string, reason: IngressGapReason = "explicit_resubscribe"): void {
+    if (!this.sharded || !this.shardedRunStarted) {
+      super.bumpTokenEpochForTest(tokenId, reason);
+      return;
+    }
+    this.shardForToken(tokenId)?.bumpTokenEpochForTest(tokenId, reason);
+  }
+
   override beginStreamEpoch(
     tokenIds: readonly string[],
     reason: IngressGapReason,
@@ -368,6 +415,11 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
         return handlers.onError(error);
       },
     };
+    // Metadata-only channel: forwarded WITHOUT dispatchSnapshot/globalSequence so
+    // hydration never manufactures a market observation or advances market sequence.
+    if (handlers.onMinOrderSizeHydrated) {
+      result.onMinOrderSizeHydrated = (event) => this.dispatchMinOrderSizeHydrated(event, handlers);
+    }
     if (handlers.onAnomaly) result.onAnomaly = handlers.onAnomaly;
     if (handlers.onGap) result.onGap = (event: MarketIngressGapEvent) => {
       this.notifyShardObserver((observer) => observer.onGap?.({ shard: shardIndex + 1, event }));
@@ -400,6 +452,18 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
         feeSchedule: market ? market.feeSchedule : snapshot.feeSchedule,
       };
       await handlers.onSnapshot(patched);
+    });
+    this.snapshotTail = work.then(() => undefined, () => undefined);
+    return work;
+  }
+
+  /**
+   * Forward a minOrderSize hydration metadata notification without touching
+   * dispatchSnapshot() or globalSequence — it is not a market event.
+   */
+  private dispatchMinOrderSizeHydrated(event: MinOrderSizeHydratedEvent, handlers: PolymarketFeedHandlers): Promise<void> {
+    const work = this.snapshotTail.then(async () => {
+      await handlers.onMinOrderSizeHydrated?.(event);
     });
     this.snapshotTail = work.then(() => undefined, () => undefined);
     return work;

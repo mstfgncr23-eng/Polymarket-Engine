@@ -47,6 +47,38 @@ import { TokenSyncIndex } from "./token-sync.js";
  */
 export type MinOrderSizeFetcher = (tokenId: string) => Promise<string | null> | string | null;
 
+/**
+ * Per-token minOrderSize hydration lifecycle state. The map of these objects
+ * is bounded by currently managed tokens; entries are deleted on token removal
+ * (stale in-flight requests hold only captured scalar identity — lifecycle,
+ * epoch, flight nonce — so a deleted/new state can never be confused). The
+ * lifecycle version is advanced by every gap/malformed/reconnect invalidation;
+ * a fresh epoch request therefore always carries a different identity.
+ */
+interface TokenMinOrderSizeHydrationState {
+  lifecycle: number;
+  /** Global nonce of the currently running physical request (0 when idle). */
+  flightId: number;
+  /** Failed attempts within the current lifecycle. */
+  attempts: number;
+  /** Earliest autonomous retry timestamp (minOrderSizeClock ms). */
+  retryAt: number;
+  /** True while the token is removed but a stale flight still holds identity. */
+  removed: boolean;
+}
+
+/**
+ * Scalar identity captured by a physical hydration request. Stale requests hold
+ * these values (never map entries), so lifecycle/epoch invalidation or token
+ * removal can never be confused with a newer request.
+ */
+interface MinOrderSizeHydrationIdentity {
+  tokenId: string;
+  lifecycle: number;
+  epoch: number;
+  flightId: number;
+}
+
 export interface DiscoveredMarket {
   id: string;
   slug: string;
@@ -122,6 +154,12 @@ export interface MarketIngressResyncEvent {
   epoch: number;
 }
 
+export interface MinOrderSizeHydratedEvent {
+  tokenId: string;
+  minOrderSize: string;
+  tokenEpoch: number;
+}
+
 export interface PolymarketFeedHandlers {
   onSnapshot(snapshot: MarketSnapshot): Promise<void> | void;
   onConnection(event: FeedConnectionEvent): Promise<void> | void;
@@ -129,6 +167,27 @@ export interface PolymarketFeedHandlers {
   onAnomaly?(anomaly: PolymarketFeedAnomaly): void;
   onGap?(event: MarketIngressGapEvent): void;
   onResync?(event: MarketIngressResyncEvent): void;
+  /**
+   * Narrow metadata-only notification when the authoritative min order size for
+   * a token becomes known via REST hydration. NOT a market event: consumers
+   * must not treat it as a new book (no sequence, no triggers, no maker/shadow
+   * ingest). Consumers patch only the cached snapshot's minOrderSize.
+   */
+  onMinOrderSizeHydrated?(event: MinOrderSizeHydratedEvent): Promise<void> | void;
+}
+
+/**
+ * Bounded, label-free observability for REST minOrderSize hydration. Counters
+ * are low-cardinality (no tokenId/marketId labels) so the metrics registry can
+ * prove production hydration occurred without per-book spam.
+ */
+export interface MinOrderSizeHydrationObserver {
+  onHydrationAttempt(): void;
+  onHydrationSuccess(): void;
+  onHydrationFailure(): void;
+  onHydrationStale(): void;
+  onHydrationApplied(): void;
+  onHydrationInFlightChanged(count: number): void;
 }
 
 /** Optional normalize observer. Must not change book/price_change semantics. */
@@ -190,32 +249,24 @@ export class PolymarketMarketDataAdapter {
   private readonly marketsByToken = new Map<string, DiscoveredMarket>();
   private readonly books = new Map<string, BookState>();
   private readonly minOrderSizeFetcher: MinOrderSizeFetcher | null;
-  /** Bounded REST hydration bookkeeping (per token, one in-flight request). */
-  private readonly minOrderSizeHydrationPending = new Map<string, Promise<void>>();
-  private readonly minOrderSizeHydrationEpoch = new Map<string, number>();
-  private readonly minOrderSizeHydrationAttempts = new Map<string, number>();
-  private readonly minOrderSizeHydrationNextAt = new Map<string, number>();
+  private readonly minOrderSizeClock: () => number;
+  private readonly minOrderSizeRetryIntervalMs: number;
+  private readonly minOrderSizeMaxAttempts: number;
   /**
-   * Monotonic per-token hydration generation. Every book/token lifecycle
-   * transition that invalidates an in-flight hydration (gap, malformed-fail,
-   * token removal) increments it; each request captures the current generation
-   * and a stale completion after such a transition can neither apply nor clear/
-   * overwrite newer pending/backoff/attempt state. TokenSyncIndex epoch is NOT
-   * sufficient alone: markGapped paths do not always advance the epoch.
-   * The entry is preserved across removal/re-add so a re-added token cannot be
-   * matched by a stale pre-removal request.
+   * Bounded per-current-token hydration lifecycle state (one physical in-flight
+   * request per token at any instant). Deleted on token removal; stale request
+   * identities hold scalars, never map entries.
    */
-  private readonly minOrderSizeHydrationGeneration = new Map<string, number>();
+  private readonly minOrderSizeHydrationState = new Map<string, TokenMinOrderSizeHydrationState>();
+  /** Global monotonic request identity nonce; never reused. */
+  private minOrderSizeHydrationFlightSeq = 0;
+  private minOrderSizeHydrationRetryTimer: ReturnType<typeof setInterval> | null = null;
+  private minOrderSizeHydrationShutdown = false;
   private minOrderSizeFetcherCalls = 0;
-  /**
-   * Last MarketSnapshot emitted per token (bounded by token count). Successful
-   * REST min_order_size hydration replays a metadata-only copy of this snapshot
-   * through the live onSnapshot consumer so the engine observes the
-   * authoritative value immediately, without waiting for another WS event.
-   */
-  private readonly lastEmittedSnapshotByToken = new Map<string, MarketSnapshot>();
-  /** Consumer attached by the current run() loop; cleared when the loop exits. */
-  private streamOnSnapshot: PolymarketFeedHandlers["onSnapshot"] | undefined;
+  private minOrderSizeHydrationInFlightCount = 0;
+  private minOrderSizeHydrationObserver: MinOrderSizeHydrationObserver | null = null;
+  /** Metadata-only consumer attached by the current run() loop; cleared at exit. */
+  private streamOnMinOrderSizeHydrated: PolymarketFeedHandlers["onMinOrderSizeHydrated"] | undefined;
   private sequence = 0;
   private lastTimestampByToken = new Map<string, number>();
   private tokenIds: string[] = [];
@@ -257,6 +308,12 @@ export class PolymarketMarketDataAdapter {
       hydrateMinOrderSizeFromRest?: boolean;
       /** Override fetcher for deterministic tests and venue-specific wiring. */
       minOrderSizeFetcher?: MinOrderSizeFetcher;
+      /** Injectable time source for autonomous retry scheduling (default Date.now). */
+      minOrderSizeClock?: () => number;
+      /** Failure retry interval in ms (default MIN_ORDER_SIZE_REST_RETRY_MS). */
+      minOrderSizeRetryIntervalMs?: number;
+      /** Attempt cap per lifecycle (default MIN_ORDER_SIZE_REST_MAX_ATTEMPTS). */
+      minOrderSizeMaxAttempts?: number;
     } = {},
   ) {
     this.client = client ?? createPublicClient();
@@ -269,6 +326,9 @@ export class PolymarketMarketDataAdapter {
       queue: this.ingress,
     });
     this.stableAfterMs = options.stableAfterMs ?? MARKET_CONNECT_BOUNDS.stableAfterMs;
+    this.minOrderSizeClock = options.minOrderSizeClock ?? (() => Date.now());
+    this.minOrderSizeRetryIntervalMs = options.minOrderSizeRetryIntervalMs ?? MIN_ORDER_SIZE_REST_RETRY_MS;
+    this.minOrderSizeMaxAttempts = options.minOrderSizeMaxAttempts ?? MIN_ORDER_SIZE_REST_MAX_ATTEMPTS;
 
     let minOrderSizeFetcher = options.minOrderSizeFetcher ?? null;
     if (minOrderSizeFetcher == null && options.hydrateMinOrderSizeFromRest === true) {
@@ -286,6 +346,10 @@ export class PolymarketMarketDataAdapter {
       }
     }
     this.minOrderSizeFetcher = minOrderSizeFetcher;
+  }
+
+  setMinOrderSizeHydrationObserver(observer: MinOrderSizeHydrationObserver | null): void {
+    this.minOrderSizeHydrationObserver = observer;
   }
 
   lastReconnectDelayForTest(): number { return this.lastReconnectDelayMs; }
@@ -447,7 +511,7 @@ export class PolymarketMarketDataAdapter {
         this.lastTimestampByToken.delete(tokenId);
         this.anomalySampler.forget(tokenId);
         this.sync.drop(tokenId);
-        this.invalidateMinOrderSizeHydration(tokenId);
+        this.removeMinOrderSizeHydration(tokenId);
       }
       this.sync.retain(next);
       this.closeCurrentStream?.();
@@ -467,7 +531,9 @@ export class PolymarketMarketDataAdapter {
       return;
     }
     signal.addEventListener("abort", onAbort);
-    this.streamOnSnapshot = handlers?.onSnapshot;
+    this.streamOnMinOrderSizeHydrated = handlers?.onMinOrderSizeHydrated;
+    this.minOrderSizeHydrationShutdown = false;
+    this.clearMinOrderSizeHydrationLifecycle();
     try {
       while (!signal.aborted) {
         if (this.tokenIds.length === 0) {
@@ -585,8 +651,21 @@ export class PolymarketMarketDataAdapter {
       await handlers.onConnection({ feed: "polymarket", state: "STOPPED", at: new Date().toISOString(), reconnectCount });
     } finally {
       signal.removeEventListener("abort", onAbort);
-      this.streamOnSnapshot = undefined;
+      this.streamOnMinOrderSizeHydrated = undefined;
+      // Run shutdown: no autonomous retries may start afterwards, and any
+      // pending retry timer/state must be cleared.
+      this.minOrderSizeHydrationShutdown = true;
+      this.clearMinOrderSizeHydrationLifecycle();
     }
+  }
+
+  private clearMinOrderSizeHydrationLifecycle(): void {
+    if (this.minOrderSizeHydrationRetryTimer != null) {
+      clearInterval(this.minOrderSizeHydrationRetryTimer);
+      this.minOrderSizeHydrationRetryTimer = null;
+    }
+    this.minOrderSizeHydrationState.clear();
+    this.noteHydrationInFlightChanged();
   }
 
   private waitForTokens(signal: AbortSignal): Promise<void> {
@@ -734,8 +813,8 @@ export class PolymarketMarketDataAdapter {
     staged.levelsValid = true;
     this.lastTimestampByToken.set(tokenId, sourceMs);
     this.books.set(tokenId, staged);
-    if (staged.minOrderSize == null) this.requestMinOrderSizeHydration(tokenId);
     const synced = this.sync.markSyncedFromBook(tokenId);
+    if (staged.minOrderSize == null) this.requestMinOrderSizeHydration(tokenId);
     if (this.firstTrustedBookAtMs === 0) this.firstTrustedBookAtMs = Date.now();
     this.streamHadTrustedBooks = true;
     if (synced.wasResync) {
@@ -920,124 +999,166 @@ export class PolymarketMarketDataAdapter {
   }
 
   /**
-   * Enqueue a bounded authoritative min_order_size hydration for a token whose
-   * trusted WS full book omitted the field. See MIN_ORDER_SIZE_REST_* bounds:
-   * one in-flight request at a time, a per-epoch attempt cap, and a retry gap
-   * after failures. Never invoked from price_change processing.
+   * Enqueue or autonomously resume a bounded authoritative min_order_size
+   * hydration for a token whose trusted WS full book omitted the field. Bounds:
+   * exactly one physical in-flight request per token at any instant, a
+   * per-lifecycle attempt cap, a failure backoff, and autonomous retry that
+   * does not require another WS event. Never invoked from price_change
+   * processing.
    */
   private requestMinOrderSizeHydration(tokenId: string): void {
     const fetcher = this.minOrderSizeFetcher;
     if (!fetcher) return;
+    if (this.minOrderSizeHydrationShutdown) return;
     if (!this.tokenIdSet.has(tokenId)) return;
-    if (this.minOrderSizeHydrationPending.has(tokenId)) return;
-    const state = this.books.get(tokenId);
-    if (!state || state.minOrderSize != null) return;
-    const now = Date.now();
-    if (now < (this.minOrderSizeHydrationNextAt.get(tokenId) ?? 0)) return;
-    const epoch = this.sync.epochOf(tokenId);
-    const generation = this.minOrderSizeHydrationGeneration.get(tokenId) ?? 0;
-    this.minOrderSizeHydrationGeneration.set(tokenId, generation === 0 ? 1 : generation);
-    const currentGeneration = this.minOrderSizeHydrationGeneration.get(tokenId)!;
-    const attempts = this.minOrderSizeHydrationEpoch.get(tokenId) === epoch
-      ? (this.minOrderSizeHydrationAttempts.get(tokenId) ?? 0)
-      : 0;
-    if (attempts >= MIN_ORDER_SIZE_REST_MAX_ATTEMPTS) return;
-    this.minOrderSizeHydrationEpoch.set(tokenId, epoch);
-    this.minOrderSizeHydrationAttempts.set(tokenId, attempts);
-    // Identity-safe cleanup: only delete this exact promise from the pending map,
-    // so a stale completion can never erase a newer request's registration.
-    const pending = Promise.resolve()
-      .then(() => this.hydrateMinOrderSize(tokenId, epoch, currentGeneration))
-      .catch(() => undefined)
+    let hydration = this.minOrderSizeHydrationState.get(tokenId);
+    if (!hydration) {
+      hydration = { lifecycle: 0, flightId: 0, attempts: 0, retryAt: 0, removed: false };
+      this.minOrderSizeHydrationState.set(tokenId, hydration);
+    }
+    // A re-added token reuses its bumped-lifecycle entry (removal invalidated it).
+    if (hydration.removed) hydration.removed = false;
+    if (hydration.flightId !== 0) return; // one physical flight per token
+    const book = this.books.get(tokenId);
+    if (!book || book.minOrderSize != null) return;
+    const now = this.minOrderSizeClock();
+    if (now < hydration.retryAt) return; // failure backoff
+    if (hydration.attempts >= this.minOrderSizeMaxAttempts) return;
+    hydration.attempts += 1;
+    const flightId = ++this.minOrderSizeHydrationFlightSeq;
+    hydration.flightId = flightId;
+    const identity: MinOrderSizeHydrationIdentity = {
+      tokenId, lifecycle: hydration.lifecycle, epoch: this.sync.epochOf(tokenId), flightId,
+    };
+    this.ensureMinOrderSizeHydrationRetryTimer();
+    this.noteHydrationInFlightChanged();
+    this.minOrderSizeFetcherCalls += 1;
+    this.minOrderSizeHydrationObserver?.onHydrationAttempt?.();
+    const settle = (value: string | null): void => {
+      const current = this.minOrderSizeHydrationState.get(tokenId);
+      // A completion is stale when the lifecycle advanced (gap/malformed/epoch/
+      // reconnect) or this flight is no longer the registered one. Stale
+      // completions never apply and never touch newer retry/attempt state.
+      if (!current || current.lifecycle !== identity.lifecycle || current.flightId !== flightId) {
+        this.minOrderSizeHydrationObserver?.onHydrationStale?.();
+        return;
+      }
+      if (value == null) {
+        this.minOrderSizeHydrationObserver?.onHydrationFailure?.();
+        current.retryAt = this.minOrderSizeClock() + this.minOrderSizeRetryIntervalMs;
+        return;
+      }
+      this.minOrderSizeHydrationObserver?.onHydrationSuccess?.();
+      this.applyHydratedMinOrderSize(tokenId, identity, value);
+    };
+    void Promise.resolve()
+      .then(() => fetcher(tokenId))
+      .then((raw) => {
+        // Accept only a valid decimal string; anything else stays unknown so the
+        // protective path fails safely (MIN_ORDER_SIZE_UNKNOWN).
+        const value = raw == null ? null : decimalStringSchema.safeParse(String(raw)).success ? String(raw) : null;
+        settle(value);
+      })
+      .catch(() => settle(null))
       .finally(() => {
-        if (this.minOrderSizeHydrationPending.get(tokenId) === pending) {
-          this.minOrderSizeHydrationPending.delete(tokenId);
+        const current = this.minOrderSizeHydrationState.get(tokenId);
+        if (current && current.flightId === flightId) {
+          current.flightId = 0;
+          this.noteHydrationInFlightChanged();
+          // Removal during flight defers deletion until the stale flight settles
+          // (identity stays valid to block re-add reuse); then release it.
+          if (current.removed) {
+            this.minOrderSizeHydrationState.delete(tokenId);
+            this.noteHydrationInFlightChanged();
+            return;
+          }
+          // After settling, if the current lifecycle still needs hydration,
+          // resume autonomously (failure backoff still applies).
+          this.requestMinOrderSizeHydration(tokenId);
         }
       });
-    this.minOrderSizeHydrationPending.set(tokenId, pending);
-  }
-
-  /**
-   * Fetch and (if still safe) apply the authoritative min order size. Async and
-   * detached from the WS ingest hot path; failures are bounded and silent.
-   */
-  private async hydrateMinOrderSize(tokenId: string, epoch: number, generation: number): Promise<void> {
-    this.minOrderSizeFetcherCalls += 1;
-    let value: string | null = null;
-    try {
-      const raw = await this.minOrderSizeFetcher!(tokenId);
-      // Accept only a valid decimal string; anything else is treated as unknown
-      // so the protective path fails safely (MIN_ORDER_SIZE_UNKNOWN).
-      value = raw == null ? null : decimalStringSchema.safeParse(String(raw)).success ? String(raw) : null;
-    } catch {
-      value = null;
-    }
-    // A stale completion after a lifecycle invalidation must not touch newer
-    // backoff/attempt state, even when the response itself was a failure.
-    if ((this.minOrderSizeHydrationGeneration.get(tokenId) ?? 0) !== generation) return;
-    const attempts = this.minOrderSizeHydrationAttempts.get(tokenId) ?? 0;
-    if (value == null) {
-      this.minOrderSizeHydrationAttempts.set(tokenId, attempts + 1);
-      this.minOrderSizeHydrationNextAt.set(tokenId, Date.now() + MIN_ORDER_SIZE_REST_RETRY_MS);
-      return;
-    }
-    this.applyHydratedMinOrderSize(tokenId, epoch, generation, value);
   }
 
   /**
    * Apply the hydrated value only when the token is still managed, at the same
-   * stream epoch AND the same hydration generation (no reconnect/resync/gap/
-   * token-replacement in between), and its live book still lacks an
+   * stream epoch AND the same hydration lifecycle identity (no reconnect/
+   * resync/gap/token-replacement in between), and its live book still lacks an
    * authoritative value. A WS-supplied min_order_size that arrives first always
-   * wins.
+   * wins. After apply, consumers are notified through the metadata-only channel
+   * (never a market event).
    */
-  private applyHydratedMinOrderSize(tokenId: string, epoch: number, generation: number, value: string): void {
+  private applyHydratedMinOrderSize(tokenId: string, identity: MinOrderSizeHydrationIdentity, value: string): void {
     if (!this.tokenIdSet.has(tokenId)) return;
-    if (this.sync.epochOf(tokenId) !== epoch) return;
-    if ((this.minOrderSizeHydrationGeneration.get(tokenId) ?? 0) !== generation) return;
-    const state = this.books.get(tokenId);
-    if (!state || state.minOrderSize != null) return;
-    state.minOrderSize = value;
-    this.publishHydratedMinOrderSize(tokenId);
+    if (this.sync.epochOf(tokenId) !== identity.epoch) return;
+    const current = this.minOrderSizeHydrationState.get(tokenId);
+    if (!current || current.lifecycle !== identity.lifecycle) return;
+    const book = this.books.get(tokenId);
+    if (!book || book.minOrderSize != null) return;
+    book.minOrderSize = value;
+    this.minOrderSizeHydrationObserver?.onHydrationApplied?.();
+    this.emitMinOrderSizeHydrated(tokenId, value, identity.epoch);
+  }
+
+  private emitMinOrderSizeHydrated(tokenId: string, minOrderSize: string, tokenEpoch: number): void {
+    const handler = this.streamOnMinOrderSizeHydrated;
+    if (!handler) return;
+    void Promise.resolve(handler({ tokenId, minOrderSize, tokenEpoch })).catch(() => undefined);
   }
 
   /**
-   * Make a successful hydration immediately visible to the live consumer (the
-   * engine) without a further WS event: replay a metadata-only copy of the last
-   * emitted snapshot with the authoritative minOrderSize. Same token/market/
-   * event identity and sequence, unchanged book content — so this can never
-   * create fills, maker transitions, or triggers — and the original receivedAt
-   * is preserved (no fabricated freshness).
-   */
-  private publishHydratedMinOrderSize(tokenId: string): void {
-    const handler = this.streamOnSnapshot;
-    const previous = this.lastEmittedSnapshotByToken.get(tokenId);
-    const state = this.books.get(tokenId);
-    if (!handler || !previous || !state || state.minOrderSize == null) return;
-    const hydrated: MarketSnapshot = {
-      ...previous,
-      minOrderSize: state.minOrderSize,
-    };
-    this.lastEmittedSnapshotByToken.set(tokenId, hydrated);
-    void Promise.resolve(handler(hydrated)).catch(() => undefined);
-  }
-
-  /**
-   * Invalidate every hydration artifact for a token whose book/token lifecycle
-   * transitioned (gap, malformed-fail, token removal/replacement). The
-   * monotonic generation advances so an in-flight request started before the
-   * transition can neither apply its result nor clear a newer request's
-   * pending/backoff/attempt registration. The generation entry itself is
-   * preserved so a later re-request of the same token cannot collide with the
-   * stale request's captured generation.
+   * Advance the hydration lifecycle for a token whose book/token lifecycle
+   * transitioned (gap, malformed-fail, epoch change). In-flight requests become
+   * stale: they can neither apply nor mutate retry/backoff state, and the next
+   * launch receives a fresh identity. The state entry itself is kept (bounded
+   * per currently managed token); token removal deletes it entirely.
    */
   private invalidateMinOrderSizeHydration(tokenId: string): void {
-    this.minOrderSizeHydrationGeneration.set(tokenId, (this.minOrderSizeHydrationGeneration.get(tokenId) ?? 0) + 1);
-    this.minOrderSizeHydrationPending.delete(tokenId);
-    this.minOrderSizeHydrationEpoch.delete(tokenId);
-    this.minOrderSizeHydrationAttempts.delete(tokenId);
-    this.minOrderSizeHydrationNextAt.delete(tokenId);
-    this.lastEmittedSnapshotByToken.delete(tokenId);
+    const hydration = this.minOrderSizeHydrationState.get(tokenId);
+    if (!hydration) return;
+    hydration.lifecycle += 1;
+    hydration.attempts = 0;
+    hydration.retryAt = 0;
+  }
+
+  private removeMinOrderSizeHydration(tokenId: string): void {
+    const hydration = this.minOrderSizeHydrationState.get(tokenId);
+    if (hydration && hydration.flightId !== 0) {
+      // Defer deletion until the physical stale flight settles; invalidate now
+      // so the stale result can never apply to a same-token re-add.
+      hydration.lifecycle += 1;
+      hydration.attempts = 0;
+      hydration.retryAt = 0;
+      hydration.removed = true;
+      return;
+    }
+    this.minOrderSizeHydrationState.delete(tokenId);
+    this.noteHydrationInFlightChanged();
+  }
+
+  private ensureMinOrderSizeHydrationRetryTimer(): void {
+    if (this.minOrderSizeHydrationRetryTimer != null || this.minOrderSizeHydrationShutdown) return;
+    const timer = setInterval(() => this.tickMinOrderSizeHydrationRetries(), 1_000);
+    if (typeof (timer as { unref?: () => void }).unref === "function") (timer as { unref?: () => void }).unref?.();
+    this.minOrderSizeHydrationRetryTimer = timer;
+  }
+
+  /** One per-adapter bounded scan; requestMinOrderSizeHydration enforces every guard. */
+  private tickMinOrderSizeHydrationRetries(): void {
+    if (this.minOrderSizeHydrationShutdown) return;
+    for (const tokenId of [...this.minOrderSizeHydrationState.keys()]) {
+      this.requestMinOrderSizeHydration(tokenId);
+    }
+  }
+
+  private noteHydrationInFlightChanged(): void {
+    let count = 0;
+    for (const hydration of this.minOrderSizeHydrationState.values()) {
+      if (hydration.flightId !== 0) count += 1;
+    }
+    if (count !== this.minOrderSizeHydrationInFlightCount) {
+      this.minOrderSizeHydrationInFlightCount = count;
+      this.minOrderSizeHydrationObserver?.onHydrationInFlightChanged?.(count);
+    }
   }
 
   /** Test-only: authoritative min order size currently held for a token. */
@@ -1048,6 +1169,21 @@ export class PolymarketMarketDataAdapter {
   /** Test-only: how many times the min-order fetcher was invoked. */
   minOrderSizeFetcherCallCountForTest(): number {
     return this.minOrderSizeFetcherCalls;
+  }
+
+  /** Test-only: run one autonomous-retry scan synchronously (used with minOrderSizeClock). */
+  flushMinOrderSizeHydrationRetriesForTest(): void {
+    this.tickMinOrderSizeHydrationRetries();
+  }
+
+  /** Test-only: number of hydration lifecycle states (should stay bounded). */
+  minOrderSizeHydrationStateCountForTest(): number {
+    return this.minOrderSizeHydrationState.size;
+  }
+
+  /** Test-only: count of physically in-flight hydration requests. */
+  minOrderSizeHydrationInFlightForTest(): number {
+    return this.minOrderSizeHydrationInFlightCount;
   }
 
   /** Test-only: force a stream-epoch advance (reconnect/resync surrogate). */
@@ -1104,7 +1240,6 @@ export class PolymarketMarketDataAdapter {
       bidLevels: state.bids.size,
       askLevels: state.asks.size,
     });
-    this.lastEmittedSnapshotByToken.set(tokenId, snapshot);
     return snapshot;
   }
 }

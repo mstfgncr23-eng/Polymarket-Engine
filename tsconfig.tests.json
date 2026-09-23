@@ -1,0 +1,21 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": ".",
+    "exactOptionalPropertyTypes": false,
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "paths": {
+      "@pm/core": ["./packages/core/src/index.ts"],
+      "@pm/db": ["./packages/db/src/index.ts"],
+      "@pm/market-data": ["./packages/market-data/src/index.ts"]
+    }
+  },
+  "include": [
+    "tests/protective-min-order-rest-hydration.test.ts",
+    "tests/normalization-reference.ts"
+  ]
+}

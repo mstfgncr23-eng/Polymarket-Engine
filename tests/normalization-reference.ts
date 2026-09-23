@@ -17,6 +17,7 @@ export class ReferencePolymarketNormalizer {
     bids: Map<string, string>;
     asks: Map<string, string>;
     lastTradePrice: string | null;
+    minOrderSize: string | null;
     timestamp: string;
     hash: string | null;
   }>();
