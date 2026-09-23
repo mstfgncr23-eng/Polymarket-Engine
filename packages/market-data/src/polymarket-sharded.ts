@@ -121,6 +121,8 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
       if (singleOptions.marketWsUrl !== undefined) childOptions.marketWsUrl = singleOptions.marketWsUrl;
       if (transport?.queue) childOptions.ingress = transport.queue;
       if (singleOptions.stableAfterMs !== undefined) childOptions.stableAfterMs = singleOptions.stableAfterMs;
+      if (singleOptions.hydrateMinOrderSizeFromRest !== undefined) childOptions.hydrateMinOrderSizeFromRest = singleOptions.hydrateMinOrderSizeFromRest;
+      if (singleOptions.minOrderSizeFetcher !== undefined) childOptions.minOrderSizeFetcher = singleOptions.minOrderSizeFetcher;
       return new SinglePolymarketMarketDataAdapter(client, childOptions);
     });
   }

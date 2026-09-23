@@ -481,7 +481,7 @@ export class EngineService {
       referenceRapidMoveBps: this.triggerConfig.referenceRapidMoveBps,
     };
     this.riskLimits = riskLimitsSchema.parse({ maxExternalSignalsPerMinute: env.GROK_MCP_RATE_LIMIT_PER_MINUTE });
-    this.marketAdapter = adapters?.market ?? new PolymarketMarketDataAdapter();
+    this.marketAdapter = adapters?.market ?? new PolymarketMarketDataAdapter(undefined, { hydrateMinOrderSizeFromRest: true });
     if (this.marketAdapter instanceof PolymarketMarketDataAdapter) {
       this.marketAdapter.setNormalizeObserver(this.metrics.normalizeObserver());
       this.marketAdapter.setIngressObserver({

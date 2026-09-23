@@ -35,6 +35,18 @@ import { isBoundedMarketStreamTransport, type MarketStreamTransport } from "./ma
 import { abortableDelay, ExponentialBackoff } from "./reconnect.js";
 import { TokenSyncIndex } from "./token-sync.js";
 
+/**
+ * Resolves the authoritative minimum order size for a token, or null/undefined
+ * when unknown or unavailable.
+ *
+ * Production source: the CLOB REST order book (PublicClient.fetchOrderBook),
+ * whose official OrderBook schema REQUIRES `min_order_size` — unlike the WS
+ * MarketBookEventSchema, where the field is OPTIONAL. Never a per-price_change
+ * call: hydration is triggered only once per token when a trusted WS full book
+ * omits the field, with a bounded backoff and per-epoch attempt cap.
+ */
+export type MinOrderSizeFetcher = (tokenId: string) => Promise<string | null> | string | null;
+
 export interface DiscoveredMarket {
   id: string;
   slug: string;
@@ -138,6 +150,17 @@ interface BookLevel {
   quantity: string;
 }
 
+/**
+ * REST min_order_size hydration bounds:
+ * - at most one in-flight request per token,
+ * - at most MAX_ATTEMPTS requests per stream epoch (a reconnect/resync resets),
+ * - at least RETRY_MS between failed attempts (no unbounded retries),
+ * - never triggered by price_change events (only by trusted full-book commits
+ *   that omitted the field).
+ */
+const MIN_ORDER_SIZE_REST_MAX_ATTEMPTS = 5;
+const MIN_ORDER_SIZE_REST_RETRY_MS = 60_000;
+
 interface BookState {
   marketId: string;
   bids: Map<string, string>;
@@ -151,11 +174,11 @@ interface BookState {
   levelsValid: boolean;
   lastTradePrice: string | null;
   /**
-   * Authoritative minimum order size for the token, sourced from the CLOB
-   * full-book event's `min_order_size` field. Price-change events do not carry
-   * it, so it is committed with the full book and carried forward in BookState;
-   * without this the latest snapshot would silently report minOrderSize=null
-   * between full books.
+   * Authoritative minimum order size for the token. Preferred sources, in
+   * order: the CLOB full-book event's `min_order_size` (WS MarketBookEventSchema
+   * makes it optional), then a bounded REST order-book hydration when a trusted
+   * full book omits it (REST OrderBookSchema requires the field). Price-change
+   * events never carry it, so the committed value is carried forward in BookState.
    */
   minOrderSize: string | null;
   timestamp: string;
@@ -166,6 +189,13 @@ export class PolymarketMarketDataAdapter {
   private readonly client: PublicClient;
   private readonly marketsByToken = new Map<string, DiscoveredMarket>();
   private readonly books = new Map<string, BookState>();
+  private readonly minOrderSizeFetcher: MinOrderSizeFetcher | null;
+  /** Bounded REST hydration bookkeeping (per token, one in-flight request). */
+  private readonly minOrderSizeHydrationPending = new Map<string, Promise<void>>();
+  private readonly minOrderSizeHydrationEpoch = new Map<string, number>();
+  private readonly minOrderSizeHydrationAttempts = new Map<string, number>();
+  private readonly minOrderSizeHydrationNextAt = new Map<string, number>();
+  private minOrderSizeFetcherCalls = 0;
   private sequence = 0;
   private lastTimestampByToken = new Map<string, number>();
   private tokenIds: string[] = [];
@@ -192,7 +222,22 @@ export class PolymarketMarketDataAdapter {
 
   constructor(
     client?: PublicClient,
-    options: { transport?: MarketStreamTransport; marketWsUrl?: string; ingress?: BoundedIngressQueue; stableAfterMs?: number } = {},
+    options: {
+      transport?: MarketStreamTransport;
+      marketWsUrl?: string;
+      ingress?: BoundedIngressQueue;
+      stableAfterMs?: number;
+      /**
+       * Enable authoritative min_order_size hydration from the REST order-book
+       * path (PublicClient.fetchOrderBook) when a trusted WS full book omits
+       * min_order_size. The official REST OrderBook schema requires the field;
+       * the WS MarketBookEventSchema makes it optional. Off by default so
+       * adapter unit tests never perform network I/O; the engine enables it.
+       */
+      hydrateMinOrderSizeFromRest?: boolean;
+      /** Override fetcher for deterministic tests and venue-specific wiring. */
+      minOrderSizeFetcher?: MinOrderSizeFetcher;
+    } = {},
   ) {
     this.client = client ?? createPublicClient();
     if (options.transport && !isBoundedMarketStreamTransport(options.transport)) {
@@ -204,6 +249,23 @@ export class PolymarketMarketDataAdapter {
       queue: this.ingress,
     });
     this.stableAfterMs = options.stableAfterMs ?? MARKET_CONNECT_BOUNDS.stableAfterMs;
+
+    let minOrderSizeFetcher = options.minOrderSizeFetcher ?? null;
+    if (minOrderSizeFetcher == null && options.hydrateMinOrderSizeFromRest === true) {
+      // Nearest existing REST path: the same PublicClient that serves discovery
+      // and fetchPublicMarket exposes fetchOrderBook (OrderBook.minOrderSize).
+      const orderBookClient = this.client as unknown as {
+        fetchOrderBook?: (request: { assetId: string }) => Promise<{ minOrderSize?: string | null }>;
+      };
+      const fetchOrderBook = orderBookClient.fetchOrderBook;
+      if (typeof fetchOrderBook === "function") {
+        minOrderSizeFetcher = async (tokenId) => {
+          const book = await fetchOrderBook({ assetId: tokenId });
+          return book?.minOrderSize ?? null;
+        };
+      }
+    }
+    this.minOrderSizeFetcher = minOrderSizeFetcher;
   }
 
   lastReconnectDelayForTest(): number { return this.lastReconnectDelayMs; }
@@ -365,6 +427,7 @@ export class PolymarketMarketDataAdapter {
         this.lastTimestampByToken.delete(tokenId);
         this.anomalySampler.forget(tokenId);
         this.sync.drop(tokenId);
+        this.dropMinOrderSizeHydration(tokenId);
       }
       this.sync.retain(next);
       this.closeCurrentStream?.();
@@ -542,6 +605,7 @@ export class PolymarketMarketDataAdapter {
       this.sync.markGapped(tokenId, reason);
       this.books.delete(tokenId);
       this.lastTimestampByToken.delete(tokenId);
+      this.dropMinOrderSizeHydration(tokenId);
     }
     this.ingress.clear();
     this.logicalLossGapped = true;
@@ -561,6 +625,7 @@ export class PolymarketMarketDataAdapter {
   markTokenGappedForTest(tokenId: string, reason: IngressGapReason = "explicit_resubscribe"): void {
     this.sync.markGapped(tokenId, reason);
     this.books.delete(tokenId);
+    this.dropMinOrderSizeHydration(tokenId);
   }
 
   private normalizeEvent(event: unknown, handlers: Pick<PolymarketFeedHandlers, "onAnomaly" | "onResync" | "onGap">): MarketSnapshot[] {
@@ -622,7 +687,10 @@ export class PolymarketMarketDataAdapter {
       asksDirty: true,
       levelsValid: false,
       lastTradePrice: nullableString(payload.lastTradePrice),
-      minOrderSize: nullableString(payload.minOrderSize),
+      // Preserve the last known authoritative value across full books that
+      // omit min_order_size (WS field is optional), so a committed REST-hydrated
+      // or previously-supplied value is not lost until a book actively changes it.
+      minOrderSize: nullableString(payload.minOrderSize) ?? this.books.get(tokenId)?.minOrderSize ?? null,
       timestamp: new Date(sourceMs).toISOString(),
       hash: nullableString(payload.hash),
     };
@@ -641,6 +709,7 @@ export class PolymarketMarketDataAdapter {
     staged.levelsValid = true;
     this.lastTimestampByToken.set(tokenId, sourceMs);
     this.books.set(tokenId, staged);
+    if (staged.minOrderSize == null) this.requestMinOrderSizeHydration(tokenId);
     const synced = this.sync.markSyncedFromBook(tokenId);
     if (this.firstTrustedBookAtMs === 0) this.firstTrustedBookAtMs = Date.now();
     this.streamHadTrustedBooks = true;
@@ -782,6 +851,7 @@ export class PolymarketMarketDataAdapter {
       this.sync.markGapped(tokenId, "malformed");
       this.books.delete(tokenId);
       this.lastTimestampByToken.delete(tokenId);
+      this.dropMinOrderSizeHydration(tokenId);
     }
     if (!this.streamHadTrustedBooks) return;
     this.logicalLossGapped = true;
@@ -822,6 +892,94 @@ export class PolymarketMarketDataAdapter {
     };
     this.lastAnomaly = anomaly;
     handlers.onAnomaly?.(anomaly);
+  }
+
+  /**
+   * Enqueue a bounded authoritative min_order_size hydration for a token whose
+   * trusted WS full book omitted the field. See MIN_ORDER_SIZE_REST_* bounds:
+   * one in-flight request at a time, a per-epoch attempt cap, and a retry gap
+   * after failures. Never invoked from price_change processing.
+   */
+  private requestMinOrderSizeHydration(tokenId: string): void {
+    const fetcher = this.minOrderSizeFetcher;
+    if (!fetcher) return;
+    if (!this.tokenIdSet.has(tokenId)) return;
+    if (this.minOrderSizeHydrationPending.has(tokenId)) return;
+    const state = this.books.get(tokenId);
+    if (!state || state.minOrderSize != null) return;
+    const now = Date.now();
+    if (now < (this.minOrderSizeHydrationNextAt.get(tokenId) ?? 0)) return;
+    const epoch = this.sync.epochOf(tokenId);
+    const attempts = this.minOrderSizeHydrationEpoch.get(tokenId) === epoch
+      ? (this.minOrderSizeHydrationAttempts.get(tokenId) ?? 0)
+      : 0;
+    if (attempts >= MIN_ORDER_SIZE_REST_MAX_ATTEMPTS) return;
+    this.minOrderSizeHydrationEpoch.set(tokenId, epoch);
+    this.minOrderSizeHydrationAttempts.set(tokenId, attempts);
+    const pending = this.hydrateMinOrderSize(tokenId, epoch)
+      .catch(() => undefined)
+      .finally(() => { this.minOrderSizeHydrationPending.delete(tokenId); });
+    this.minOrderSizeHydrationPending.set(tokenId, pending);
+  }
+
+  /**
+   * Fetch and (if still safe) apply the authoritative min order size. Async and
+   * detached from the WS ingest hot path; failures are bounded and silent.
+   */
+  private async hydrateMinOrderSize(tokenId: string, epoch: number): Promise<void> {
+    this.minOrderSizeFetcherCalls += 1;
+    let value: string | null = null;
+    try {
+      const raw = await this.minOrderSizeFetcher!(tokenId);
+      // Accept only a valid decimal string; anything else is treated as unknown
+      // so the protective path fails safely (MIN_ORDER_SIZE_UNKNOWN).
+      value = raw == null ? null : decimalStringSchema.safeParse(String(raw)).success ? String(raw) : null;
+    } catch {
+      value = null;
+    }
+    const attempts = this.minOrderSizeHydrationAttempts.get(tokenId) ?? 0;
+    if (value == null) {
+      this.minOrderSizeHydrationAttempts.set(tokenId, attempts + 1);
+      this.minOrderSizeHydrationNextAt.set(tokenId, Date.now() + MIN_ORDER_SIZE_REST_RETRY_MS);
+      return;
+    }
+    this.applyHydratedMinOrderSize(tokenId, epoch, value);
+  }
+
+  /**
+   * Apply the hydrated value only when the token is still managed, at the same
+   * stream epoch (no reconnect/resync/replacement in between), and its live
+   * book still lacks an authoritative value. A WS-supplied min_order_size that
+   * arrives first always wins.
+   */
+  private applyHydratedMinOrderSize(tokenId: string, epoch: number, value: string): void {
+    if (!this.tokenIdSet.has(tokenId)) return;
+    if (this.sync.epochOf(tokenId) !== epoch) return;
+    const state = this.books.get(tokenId);
+    if (!state || state.minOrderSize != null) return;
+    state.minOrderSize = value;
+  }
+
+  private dropMinOrderSizeHydration(tokenId: string): void {
+    this.minOrderSizeHydrationPending.delete(tokenId);
+    this.minOrderSizeHydrationEpoch.delete(tokenId);
+    this.minOrderSizeHydrationAttempts.delete(tokenId);
+    this.minOrderSizeHydrationNextAt.delete(tokenId);
+  }
+
+  /** Test-only: authoritative min order size currently held for a token. */
+  hydratedMinOrderSizeForTest(tokenId: string): string | null {
+    return this.books.get(tokenId)?.minOrderSize ?? null;
+  }
+
+  /** Test-only: how many times the min-order fetcher was invoked. */
+  minOrderSizeFetcherCallCountForTest(): number {
+    return this.minOrderSizeFetcherCalls;
+  }
+
+  /** Test-only: force a stream-epoch advance (reconnect/resync surrogate). */
+  bumpTokenEpochForTest(tokenId: string, reason: IngressGapReason = "explicit_resubscribe"): void {
+    this.sync.beginEpoch([tokenId], reason);
   }
 
   private toSnapshot(

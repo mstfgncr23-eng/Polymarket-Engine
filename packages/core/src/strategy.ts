@@ -34,9 +34,10 @@ export interface StrategyCandidate {
  * - NO_EXECUTABLE_BID_DEPTH: the unpaired token book is absent for the position
  *   outcome, or the walk over executable bid levels produced zero quantity.
  * - MIN_ORDER_SIZE_UNKNOWN: the authoritative minimum order size is not known
- *   for this token. The CLOB full-book event carries `min_order_size`; until
- *   the adapter has committed one such full book (and carried the value
- *   forward), the protective SELL fails safely rather than inventing a size.
+ *   for this token. The CLOB full-book event's `min_order_size` is optional and
+ *   the adapter hydrates it from the REST order book (where the field is
+ *   required) when a trusted WS full book omits it; until either source is
+ *   known, the protective SELL fails safely rather than inventing a size.
  * - QUANTITY_BELOW_MIN_ORDER_SIZE: executable bid quantity exists but is below
  *   the known minimum order size for the token.
  */
