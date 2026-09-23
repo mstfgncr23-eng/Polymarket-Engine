@@ -195,6 +195,17 @@ export class PolymarketMarketDataAdapter {
   private readonly minOrderSizeHydrationEpoch = new Map<string, number>();
   private readonly minOrderSizeHydrationAttempts = new Map<string, number>();
   private readonly minOrderSizeHydrationNextAt = new Map<string, number>();
+  /**
+   * Monotonic per-token hydration generation. Every book/token lifecycle
+   * transition that invalidates an in-flight hydration (gap, malformed-fail,
+   * token removal) increments it; each request captures the current generation
+   * and a stale completion after such a transition can neither apply nor clear/
+   * overwrite newer pending/backoff/attempt state. TokenSyncIndex epoch is NOT
+   * sufficient alone: markGapped paths do not always advance the epoch.
+   * The entry is preserved across removal/re-add so a re-added token cannot be
+   * matched by a stale pre-removal request.
+   */
+  private readonly minOrderSizeHydrationGeneration = new Map<string, number>();
   private minOrderSizeFetcherCalls = 0;
   private sequence = 0;
   private lastTimestampByToken = new Map<string, number>();
@@ -427,7 +438,7 @@ export class PolymarketMarketDataAdapter {
         this.lastTimestampByToken.delete(tokenId);
         this.anomalySampler.forget(tokenId);
         this.sync.drop(tokenId);
-        this.dropMinOrderSizeHydration(tokenId);
+        this.invalidateMinOrderSizeHydration(tokenId);
       }
       this.sync.retain(next);
       this.closeCurrentStream?.();
@@ -605,7 +616,7 @@ export class PolymarketMarketDataAdapter {
       this.sync.markGapped(tokenId, reason);
       this.books.delete(tokenId);
       this.lastTimestampByToken.delete(tokenId);
-      this.dropMinOrderSizeHydration(tokenId);
+      this.invalidateMinOrderSizeHydration(tokenId);
     }
     this.ingress.clear();
     this.logicalLossGapped = true;
@@ -625,7 +636,7 @@ export class PolymarketMarketDataAdapter {
   markTokenGappedForTest(tokenId: string, reason: IngressGapReason = "explicit_resubscribe"): void {
     this.sync.markGapped(tokenId, reason);
     this.books.delete(tokenId);
-    this.dropMinOrderSizeHydration(tokenId);
+    this.invalidateMinOrderSizeHydration(tokenId);
   }
 
   private normalizeEvent(event: unknown, handlers: Pick<PolymarketFeedHandlers, "onAnomaly" | "onResync" | "onGap">): MarketSnapshot[] {
@@ -851,7 +862,7 @@ export class PolymarketMarketDataAdapter {
       this.sync.markGapped(tokenId, "malformed");
       this.books.delete(tokenId);
       this.lastTimestampByToken.delete(tokenId);
-      this.dropMinOrderSizeHydration(tokenId);
+      this.invalidateMinOrderSizeHydration(tokenId);
     }
     if (!this.streamHadTrustedBooks) return;
     this.logicalLossGapped = true;
@@ -910,15 +921,25 @@ export class PolymarketMarketDataAdapter {
     const now = Date.now();
     if (now < (this.minOrderSizeHydrationNextAt.get(tokenId) ?? 0)) return;
     const epoch = this.sync.epochOf(tokenId);
+    const generation = this.minOrderSizeHydrationGeneration.get(tokenId) ?? 0;
+    this.minOrderSizeHydrationGeneration.set(tokenId, generation === 0 ? 1 : generation);
+    const currentGeneration = this.minOrderSizeHydrationGeneration.get(tokenId)!;
     const attempts = this.minOrderSizeHydrationEpoch.get(tokenId) === epoch
       ? (this.minOrderSizeHydrationAttempts.get(tokenId) ?? 0)
       : 0;
     if (attempts >= MIN_ORDER_SIZE_REST_MAX_ATTEMPTS) return;
     this.minOrderSizeHydrationEpoch.set(tokenId, epoch);
     this.minOrderSizeHydrationAttempts.set(tokenId, attempts);
-    const pending = this.hydrateMinOrderSize(tokenId, epoch)
+    // Identity-safe cleanup: only delete this exact promise from the pending map,
+    // so a stale completion can never erase a newer request's registration.
+    const pending = Promise.resolve()
+      .then(() => this.hydrateMinOrderSize(tokenId, epoch, currentGeneration))
       .catch(() => undefined)
-      .finally(() => { this.minOrderSizeHydrationPending.delete(tokenId); });
+      .finally(() => {
+        if (this.minOrderSizeHydrationPending.get(tokenId) === pending) {
+          this.minOrderSizeHydrationPending.delete(tokenId);
+        }
+      });
     this.minOrderSizeHydrationPending.set(tokenId, pending);
   }
 
@@ -926,7 +947,7 @@ export class PolymarketMarketDataAdapter {
    * Fetch and (if still safe) apply the authoritative min order size. Async and
    * detached from the WS ingest hot path; failures are bounded and silent.
    */
-  private async hydrateMinOrderSize(tokenId: string, epoch: number): Promise<void> {
+  private async hydrateMinOrderSize(tokenId: string, epoch: number, generation: number): Promise<void> {
     this.minOrderSizeFetcherCalls += 1;
     let value: string | null = null;
     try {
@@ -937,30 +958,45 @@ export class PolymarketMarketDataAdapter {
     } catch {
       value = null;
     }
+    // A stale completion after a lifecycle invalidation must not touch newer
+    // backoff/attempt state, even when the response itself was a failure.
+    if ((this.minOrderSizeHydrationGeneration.get(tokenId) ?? 0) !== generation) return;
     const attempts = this.minOrderSizeHydrationAttempts.get(tokenId) ?? 0;
     if (value == null) {
       this.minOrderSizeHydrationAttempts.set(tokenId, attempts + 1);
       this.minOrderSizeHydrationNextAt.set(tokenId, Date.now() + MIN_ORDER_SIZE_REST_RETRY_MS);
       return;
     }
-    this.applyHydratedMinOrderSize(tokenId, epoch, value);
+    this.applyHydratedMinOrderSize(tokenId, epoch, generation, value);
   }
 
   /**
    * Apply the hydrated value only when the token is still managed, at the same
-   * stream epoch (no reconnect/resync/replacement in between), and its live
-   * book still lacks an authoritative value. A WS-supplied min_order_size that
-   * arrives first always wins.
+   * stream epoch AND the same hydration generation (no reconnect/resync/gap/
+   * token-replacement in between), and its live book still lacks an
+   * authoritative value. A WS-supplied min_order_size that arrives first always
+   * wins.
    */
-  private applyHydratedMinOrderSize(tokenId: string, epoch: number, value: string): void {
+  private applyHydratedMinOrderSize(tokenId: string, epoch: number, generation: number, value: string): void {
     if (!this.tokenIdSet.has(tokenId)) return;
     if (this.sync.epochOf(tokenId) !== epoch) return;
+    if ((this.minOrderSizeHydrationGeneration.get(tokenId) ?? 0) !== generation) return;
     const state = this.books.get(tokenId);
     if (!state || state.minOrderSize != null) return;
     state.minOrderSize = value;
   }
 
-  private dropMinOrderSizeHydration(tokenId: string): void {
+  /**
+   * Invalidate every hydration artifact for a token whose book/token lifecycle
+   * transitioned (gap, malformed-fail, token removal/replacement). The
+   * monotonic generation advances so an in-flight request started before the
+   * transition can neither apply its result nor clear a newer request's
+   * pending/backoff/attempt registration. The generation entry itself is
+   * preserved so a later re-request of the same token cannot collide with the
+   * stale request's captured generation.
+   */
+  private invalidateMinOrderSizeHydration(tokenId: string): void {
+    this.minOrderSizeHydrationGeneration.set(tokenId, (this.minOrderSizeHydrationGeneration.get(tokenId) ?? 0) + 1);
     this.minOrderSizeHydrationPending.delete(tokenId);
     this.minOrderSizeHydrationEpoch.delete(tokenId);
     this.minOrderSizeHydrationAttempts.delete(tokenId);

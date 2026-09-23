@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { evaluateProtectiveDeRiskCandidate, positionSchema } from "@pm/core";
-import { PolymarketMarketDataAdapter, type MinOrderSizeFetcher } from "@pm/market-data";
+import { MarketIngressMalformedError, PolymarketMarketDataAdapter, type MinOrderSizeFetcher } from "@pm/market-data";
 
 function liveBook(tokenId: string, timestamp: number, minOrderSize?: string, qty = "10") {
   return {
@@ -14,12 +14,13 @@ function liveBook(tokenId: string, timestamp: number, minOrderSize?: string, qty
   };
 }
 
-function liveDelta(tokenId: string, timestamp: number) {
+function liveDelta(tokenId: string, timestamp: number, fields: Record<string, unknown> = {}) {
   return {
     type: "price_change",
     payload: {
       timestamp,
       priceChanges: [{ tokenId, side: "BUY", price: "0.47", size: "9" }],
+      ...fields,
     },
   };
 }
@@ -86,6 +87,8 @@ it("4: REST availability failure leaves the field null, bounded, and protective 
     const instance = instanceWithFetcher(async () => { calls += 1; throw new Error("REST_UNAVAILABLE"); });
     const first = instance.normalizeSourceEvent(liveBook("tok-up", 1_000));
     expect(first[0]?.minOrderSize).toBeNull();
+    // The fetch is detached (one microtask behind ingest); wait for the attempt.
+    await waitFor(() => calls === 1);
     // Repeated full books within the 60s backoff do not generate unbounded REST.
     for (let seq = 2; seq <= 6; seq += 1) {
       const snapshot = instance.normalizeSourceEvent(liveBook("tok-up", seq * 1_000));
@@ -176,5 +179,71 @@ it("4: REST availability failure leaves the field null, bounded, and protective 
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(disabled.hydratedMinOrderSizeForTest("tok-up")).toBeNull();
     expect(disabled.minOrderSizeFetcherCallCountForTest()).toBe(0);
+  });
+it("6: real malformed-delta invalidation race: stale P1 cannot apply to the resync book nor clear P2's pending registration", async () => {
+    let calls = 0;
+    const resolvers: Array<(value: string | null) => void> = [];
+    const instance = instanceWithFetcher(() => {
+      calls += 1;
+      return new Promise<string | null>((resolve) => { resolvers.push(resolve); });
+    });
+    // P1 starts from an omit-book.
+    instance.normalizeSourceEvent(liveBook("tok-up", 1_000));
+    await waitFor(() => resolvers.length === 1);
+    // Real invalidation path (not the test epoch hook): a malformed price_change
+    // triggers failIncrementalTrust -> GAPPED + book deleted + hydration
+    // invalidation, WITHOUT advancing the TokenSyncIndex epoch.
+    expect(() => instance.normalizeSourceEvent(liveDelta("tok-up", 1_005, { tickSize: "nope" }))).toThrow(MarketIngressMalformedError);
+    expect(instance.hydratedMinOrderSizeForTest("tok-up")).toBeNull();
+    // Resync: a fresh omit-book is committed under the same sync epoch and
+    // starts P2 (generation bumped by the invalidation).
+    instance.normalizeSourceEvent(liveBook("tok-up", 2_000));
+    await waitFor(() => resolvers.length === 2 && calls === 2);
+    // Resolve the STALE P1 first: it must not hydrate the new book...
+    resolvers[0]!("99");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(instance.hydratedMinOrderSizeForTest("tok-up")).toBeNull();
+    // ...and must not clear P2's pending registration: another omit-book while
+    // P2 is pending must NOT start P3.
+    instance.normalizeSourceEvent(liveBook("tok-up", 3_000));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(calls).toBe(2);
+    // Resolve P2: the authoritative value applies normally.
+    resolvers[1]!("9");
+    await waitFor(() => instance.hydratedMinOrderSizeForTest("tok-up") === "9");
+    expect(calls).toBe(2);
+  });
+
+  it("7: same-token removal/re-add starts a fresh generation that stale requests cannot touch", async () => {
+    let calls = 0;
+    const resolvers: Array<(value: string | null) => void> = [];
+    const instance = instanceWithFetcher(() => {
+      calls += 1;
+      return new Promise<string | null>((resolve) => { resolvers.push(resolve); });
+    });
+    // P1 starts.
+    instance.normalizeSourceEvent(liveBook("tok-up", 1_000));
+    await waitFor(() => resolvers.length === 1);
+    // Real replacement lifecycle: remove tok-up, then re-add the same id. The
+    // sync epoch can reset to 1 (same as P1's captured epoch), so only the
+    // monotonic hydration generation can discriminate staleness here.
+    instance.setTokenIds(["tok-down"]);
+    instance.setTokenIds(["tok-up", "tok-down"]);
+    // A new omit-book after re-add starts P2 under the bumped generation.
+    instance.normalizeSourceEvent(liveBook("tok-up", 2_000));
+    await waitFor(() => resolvers.length === 2 && calls === 2);
+    // Stale P1 resolves now: the generation fence must block the apply even
+    // though token, epoch, and live book all match structurally.
+    resolvers[0]!("99");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(instance.hydratedMinOrderSizeForTest("tok-up")).toBeNull();
+    // P2's registration survives (no P3 on another omit-book).
+    instance.normalizeSourceEvent(liveBook("tok-up", 3_000));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(calls).toBe(2);
+    // The fresh request resolves normally.
+    resolvers[1]!("9");
+    await waitFor(() => instance.hydratedMinOrderSizeForTest("tok-up") === "9");
+    expect(instance.hydratedMinOrderSizeForTest("tok-down")).toBeNull();
   });
 });
