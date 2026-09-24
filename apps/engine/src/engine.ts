@@ -120,6 +120,7 @@ import {
   createRestProbe,
   type DiscoveredMarket,
   type FeedConnectionEvent,
+  type MinOrderSizeHydratedEvent,
   type PolymarketFeedAnomaly,
 } from "@pm/market-data";
 import { EngineMetrics, classifyJournalMetricClass } from "./metrics.js";
@@ -481,9 +482,10 @@ export class EngineService {
       referenceRapidMoveBps: this.triggerConfig.referenceRapidMoveBps,
     };
     this.riskLimits = riskLimitsSchema.parse({ maxExternalSignalsPerMinute: env.GROK_MCP_RATE_LIMIT_PER_MINUTE });
-    this.marketAdapter = adapters?.market ?? new PolymarketMarketDataAdapter();
+    this.marketAdapter = adapters?.market ?? new PolymarketMarketDataAdapter(undefined, { hydrateMinOrderSizeFromRest: true });
     if (this.marketAdapter instanceof PolymarketMarketDataAdapter) {
       this.marketAdapter.setNormalizeObserver(this.metrics.normalizeObserver());
+      this.marketAdapter.setMinOrderSizeHydrationObserver(this.metrics.minOrderSizeHydrationObserver());
       this.marketAdapter.setIngressObserver({
         onChange: (snapshot) => this.metrics.noteIngressSnapshot(snapshot),
       });
@@ -1108,6 +1110,7 @@ export class EngineService {
     this.marketLoopStarted = true;
     void this.marketAdapter.run(this.tokenIds, {
       onSnapshot: (snapshot) => this.onMarketSnapshot(snapshot),
+      onMinOrderSizeHydrated: (event) => this.onMinOrderSizeHydrated(event),
       onConnection: (event) => this.onConnection(event),
       onError: (error) => this.onFeedError("polymarket", error),
       onAnomaly: (anomaly) => this.onPolymarketAnomaly(anomaly),
@@ -2080,6 +2083,37 @@ export class EngineService {
     this.metrics.triggerDedupeEntries.set(this.triggerEngine.dedupeEntryCount());
     this.state.eventLatencyMs = performance.now() - started;
     this.metrics.eventLatency.observe((performance.now() - started) / 1000);
+  }
+
+  /**
+   * Metadata-only minOrderSize hydration notification. This is NOT a market
+   * event: it never consumes market sequence, never feeds TriggerEngine /
+   * NativeV2 shadow / resting-maker evolution / scout refresh, and increments no
+   * market-message telemetry. It patches only the cached snapshot's
+   * minOrderSize (state.marketSnapshots + the engine pair projection) after
+   * verifying the token is still managed, still synchronized, and at the same
+   * adapter epoch. The only economic follow-up is the bounded per-market
+   * protective de-risk check.
+   */
+  private onMinOrderSizeHydrated(event: MinOrderSizeHydratedEvent): void {
+    if (!this.state.recoveryComplete) return;
+    if (!event || !this.tokenIdSet.has(event.tokenId)) return;
+    if (!this.adapterTokenSynchronized(event.tokenId)) return;
+    if (this.adapterTokenEpoch(event.tokenId) !== event.tokenEpoch) return;
+    const current = this.state.marketSnapshots.get(event.tokenId);
+    if (!current) return; // never resurrect an old snapshot (post-gap/removal)
+    if (current.minOrderSize === event.minOrderSize) return; // idempotent
+    const patched: MarketSnapshot = { ...current, minOrderSize: event.minOrderSize };
+    this.state.marketSnapshots.set(event.tokenId, patched);
+    const pair = this.snapshots.get(current.marketId);
+    if (pair && pair[current.outcome]?.tokenId === event.tokenId && pair[current.outcome]?.sequence === current.sequence) {
+      pair[current.outcome] = patched;
+      this.snapshots.set(current.marketId, pair);
+    }
+    // Only economic follow-up hydration may cause: bounded per-market de-risk.
+    void this.maybeProtectiveDeRisk(current.marketId).catch((error) => {
+      this.logger.error({ err: error, marketId: current.marketId }, "protective de-risk attempt failed");
+    });
   }
 
   private async onReferenceTick(tick: ReferenceTick): Promise<void> {

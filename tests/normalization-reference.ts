@@ -17,6 +17,7 @@ export class ReferencePolymarketNormalizer {
     bids: Map<string, string>;
     asks: Map<string, string>;
     lastTradePrice: string | null;
+    minOrderSize: string | null;
     timestamp: string;
     hash: string | null;
   }>();
@@ -61,7 +62,8 @@ export class ReferencePolymarketNormalizer {
         bids: levelsToMap(payload.bids),
         asks: levelsToMap(payload.asks),
         lastTradePrice: nullableString(payload.lastTradePrice),
-        minOrderSize: nullableString(payload.minOrderSize),
+        // Mirror production: preserve the last known value when a full book omits it.
+        minOrderSize: nullableString(payload.minOrderSize) ?? this.books.get(tokenId)?.minOrderSize ?? null,
         timestamp: new Date(acceptedMs).toISOString(),
         hash: nullableString(payload.hash),
       };
