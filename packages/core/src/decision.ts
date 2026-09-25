@@ -90,6 +90,16 @@ export function decidePaperOrder(input: {
     signalExpiresAt: input.signalExpiresAt,
     feeScheduleKnown: schedule !== null, orderSizeUsd: notional.toFixed(),
     requiredCashUsd,
+    ...(input.candidate.intent === "HEDGE_SECOND_LEG"
+      ? {
+        hedgeCandidate: {
+          marketId: input.candidate.marketId,
+          outcome: input.candidate.outcome,
+          side: input.candidate.side,
+          quantity: input.candidate.quantity,
+        },
+      }
+      : {}),
   }, input.limits);
   if (!executableNow && !risk.vetoes.includes("INSUFFICIENT_DEPTH")) {
     risk.vetoes.push("INSUFFICIENT_DEPTH");

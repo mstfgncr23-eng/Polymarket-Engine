@@ -3543,6 +3543,20 @@ export class EngineService {
         marketExposureUsd: exposure.market, totalExposureUsd: exposure.total, directionalExposureUsd: exposure.directional,
         unhedgedExposureUsd: exposure.unhedged, unhedgedDurationMs: exposure.unhedgedDurationMs,
         intent: candidate.intent,
+...(candidate.intent === "HEDGE_SECOND_LEG"
+          ? {
+            hedgePosition: (() => {
+              const currentPosition = this.ledger.positions.get(candidate.marketId);
+              return currentPosition
+                ? {
+                  marketId: currentPosition.marketId,
+                  unpairedOutcome: currentPosition.unpairedOutcome,
+                  unpairedQuantity: currentPosition.unpairedQuantity,
+                }
+                : null;
+            })(),
+          }
+          : {}),
         projectedMarketExposureUsd: projected.market, projectedTotalExposureUsd: projected.total,
         projectedDirectionalExposureUsd: projected.directional, projectedUnhedgedExposureUsd: projected.unhedged,
         projectedAssetExposureUsd: projected.asset, availableCashUsd: this.ledger.availableCash().toFixed(),
