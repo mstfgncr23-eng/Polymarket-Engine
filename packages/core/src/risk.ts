@@ -130,6 +130,13 @@ export interface RiskInput {
   externalRiskRecommendedVeto: boolean;
   shuttingDown: boolean;
   /**
+   * Post-latency executable price for the candidate (decimal string): for
+   * TAKER orders the full-quantity book-walk VWAP, for MAKER orders the maker
+   * execution price. null/absent means it could not be established safely and
+   * the STRICT first-leg regime must apply (never the relaxed one).
+   */
+  executablePrice?: string | null;
+  /**
    * Candidate facts for HEDGE_SECOND_LEG verification. Populated by the
    * decision layer only for hedge candidates. The confidence exemption is
    * granted only when verifiedReducingHedge() passes against hedgePosition.
@@ -195,8 +202,19 @@ export function evaluateRisk(input: RiskInput, limits: RiskLimits): RiskEvaluati
   if (protective && !protectiveReducesRisk) vetoes.push("PROTECTIVE_DE_RISK_NOT_REDUCING");
   if (!riskReducingIntent && input.unhedgedDurationMs > limits.maxUnhedgedDurationMs) vetoes.push("MAX_UNHEDGED_DURATION");
   if (!protective && d(input.availableLiquidityUsd).lt(limits.minLiquidityUsd)) vetoes.push("MINIMUM_LIQUIDITY");
-  if (!protective && input.expectedEdge < limits.minExpectedEdge) vetoes.push("MINIMUM_EXPECTED_EDGE");
-  if (!riskReducingIntent && (!Number.isFinite(input.expectedROI) || input.expectedROI < limits.minExpectedROI)) {
+  // Fresh first-leg price-regime economic policy. ONLY an explicit OPEN_FIRST_LEG
+  // intent with a safely established post-latency executable price strictly
+  // below the boundary may use the NORMAL floors; every other intent (hedges,
+  // protective, unknown) and every price at/above the boundary keeps the strict
+  // floors. The regime is per-decision and never mutates the shared limits.
+  const normalFirstLegRegime = input.intent === "OPEN_FIRST_LEG"
+    && input.executablePrice !== undefined
+    && input.executablePrice !== null
+    && d(input.executablePrice).lt(limits.normalFirstLegMaxPriceExclusive);
+  const firstLegMinExpectedEdge = normalFirstLegRegime ? limits.normalFirstLegMinExpectedEdge : limits.minExpectedEdge;
+  const firstLegMinExpectedROI = normalFirstLegRegime ? limits.normalFirstLegMinExpectedROI : limits.minExpectedROI;
+  if (!protective && input.expectedEdge < firstLegMinExpectedEdge) vetoes.push("MINIMUM_EXPECTED_EDGE");
+  if (!riskReducingIntent && (!Number.isFinite(input.expectedROI) || input.expectedROI < firstLegMinExpectedROI)) {
     vetoes.push("MINIMUM_EXPECTED_ROI");
   }
   if (!protective && input.spread > limits.maxSpread) vetoes.push("MAXIMUM_SPREAD");

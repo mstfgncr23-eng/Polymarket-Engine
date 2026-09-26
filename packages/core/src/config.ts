@@ -19,6 +19,17 @@ export const riskLimitsSchema = z.object({
    * meaningful near $1 where a few cents of edge can still be tiny ROI.
    */
   minExpectedROI: z.number().nonnegative().default(0.02),
+  /**
+   * Fresh OPEN_FIRST_LEG price-regime boundary (exclusive). Post-latency
+   * executable first-leg price strictly BELOW this value selects the NORMAL
+   * first-leg economic floors (normalFirstLegMinExpectedEdge / ROI); at/above
+   * it the STRICT floors above remain unchanged. 0.90 exactly is STRICT.
+   */
+  normalFirstLegMaxPriceExclusive: z.number().min(0).max(1).default(0.9),
+  /** Relaxed net edge floor (USD/share) for fresh first-legs below the price boundary. */
+  normalFirstLegMinExpectedEdge: z.number().min(0).max(1).default(0.0125),
+  /** Relaxed expected ROI floor for fresh first-legs below the price boundary. */
+  normalFirstLegMinExpectedROI: z.number().nonnegative().default(0.015),
   maxSpread: z.number().min(0).max(1).default(0.08),
   minSignalConfidence: z.number().min(0).max(1).default(0.6),
   staleFeedTimeoutMs: z.number().int().positive().default(15_000),

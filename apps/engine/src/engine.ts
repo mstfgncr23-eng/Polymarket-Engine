@@ -3630,6 +3630,7 @@ export class EngineService {
     };
     await this.persistReportInput(createJournalEvent({ traceId: trigger.traceId, type: "RISK_EVALUATION", aggregateType: "risk", aggregateId: decision.risk.id, payload: {
       ...decision.risk, marketId: trigger.marketId, asset,
+      executablePrice: decision.executablePrice,
       ...(calibration ? { alpha: calibration } : {}),
     } }));
     if (!decision.accepted || !decision.order) {
