@@ -323,6 +323,7 @@ export const riskReasonCodeSchema = z.enum([
   "MARKET_NOT_ENTRY_QUALIFIED",
   "REFERENCE_PROVIDER_BLOCKED",
   "PROTECTIVE_DE_RISK_NOT_REDUCING",
+  "SNAPSHOT_TOKEN_MISMATCH",
 ]);
 export type RiskReasonCode = z.infer<typeof riskReasonCodeSchema>;
 

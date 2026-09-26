@@ -1,6 +1,86 @@
 import { d } from "./calculations.js";
-import { createId, type RiskEvaluation, type RiskReasonCode } from "./domain.js";
+import { createId, type Outcome, type RiskEvaluation, type RiskReasonCode, type Side } from "./domain.js";
 import type { RiskLimits } from "./config.js";
+
+/**
+ * Candidate facts used to verify a HEDGE_SECOND_LEG admission. Populated by the
+ * decision layer from the strategy candidate; never trusted from intent alone.
+ */
+export interface HedgeCandidateFacts {
+  marketId: string;
+  tokenId: string;
+  outcome: Outcome;
+  side: Side;
+  quantity: string;
+}
+
+/**
+ * Current durable position facts used to verify a HEDGE_SECOND_LEG admission.
+ * Populated by the engine from the live ledger at decision time.
+ */
+export interface HedgePositionFacts {
+  marketId: string;
+  unpairedOutcome: Outcome | null;
+  unpairedQuantity: string;
+  /**
+   * The EXPECTED opposite token id for the candidate outcome, resolved by the
+   * caller from CURRENT synchronized market state for `marketId` and the
+   * current `unpairedOutcome`. Never derived from the candidate. null when it
+   * cannot be resolved — the verification must fail closed.
+   */
+  expectedOppositeTokenId: string | null;
+}
+
+/**
+ * Deterministic verification that a HEDGE_SECOND_LEG candidate genuinely
+ * reduces/completes the CURRENT durable unpaired residual. The confidence
+ * exemption must never be granted from the intent label alone: every fact is
+ * re-derived from the stated candidate and the current position state, and the
+ * projected position must not increase directional or unhedged exposure.
+ *
+ * Returns false (fail closed) when any required fact is missing or unverifiable.
+ */
+export function verifiedReducingHedge(input: {
+  hedgeIntent: boolean;
+  candidate: HedgeCandidateFacts | null;
+  position: HedgePositionFacts | null;
+  projectedDirectionalExposureUsd: string | null | undefined;
+  directionalExposureUsd: string;
+  projectedUnhedgedExposureUsd: string | null | undefined;
+  unhedgedExposureUsd: string;
+}): boolean {
+  const { candidate, position } = input;
+  if (!input.hedgeIntent) return false;
+  if (!candidate || !position) return false;
+  // 1/3. Candidate reduces the position in the SAME market.
+  if (candidate.marketId !== position.marketId) return false;
+  // 2. A real unsettled position with a positive unpaired residual.
+  if (!position.unpairedOutcome) return false;
+  const residual = d(position.unpairedQuantity);
+  if (!residual.isFinite() || residual.lte(0)) return false;
+  // 5. The hedge is a BUY...
+  if (candidate.side !== "BUY") return false;
+  // 4. ...of the OPPOSITE outcome required to pair the residual.
+  const requiredOutcome: Outcome = position.unpairedOutcome === "UP" ? "DOWN" : "UP";
+  if (candidate.outcome !== requiredOutcome) return false;
+  // 4b. The candidate must trade the EXPECTED opposite TOKEN for that outcome,
+  // resolved from current market state — never trusted from the candidate.
+  if (!position.expectedOppositeTokenId) return false;
+  if (candidate.tokenId !== position.expectedOppositeTokenId) return false;
+  // 3/6. Quantity is strictly positive and cannot exceed the residual.
+  const quantity = d(candidate.quantity);
+  if (!quantity.isFinite() || quantity.lte(0) || quantity.gt(residual)) return false;
+  // 7. The projected position does not increase directional/unhedged exposure.
+  if (
+    input.projectedDirectionalExposureUsd === null
+    || input.projectedDirectionalExposureUsd === undefined
+    || input.projectedUnhedgedExposureUsd === null
+    || input.projectedUnhedgedExposureUsd === undefined
+  ) return false;
+  if (d(input.projectedDirectionalExposureUsd).gt(input.directionalExposureUsd)) return false;
+  if (d(input.projectedUnhedgedExposureUsd).gt(input.unhedgedExposureUsd)) return false;
+  return true;
+}
 
 export interface RiskInput {
   traceId: string;
@@ -49,6 +129,17 @@ export interface RiskInput {
   executionErrorsLastHour: number;
   externalRiskRecommendedVeto: boolean;
   shuttingDown: boolean;
+  /**
+   * Candidate facts for HEDGE_SECOND_LEG verification. Populated by the
+   * decision layer only for hedge candidates. The confidence exemption is
+   * granted only when verifiedReducingHedge() passes against hedgePosition.
+   */
+  hedgeCandidate?: HedgeCandidateFacts | null;
+  /**
+   * Current durable position facts for HEDGE_SECOND_LEG verification.
+   * Populated by the engine from the live ledger at decision time.
+   */
+  hedgePosition?: HedgePositionFacts | null;
 }
 
 export function evaluateRisk(input: RiskInput, limits: RiskLimits): RiskEvaluation {
@@ -57,6 +148,18 @@ export function evaluateRisk(input: RiskInput, limits: RiskLimits): RiskEvaluati
   const hedge = input.intent === "HEDGE_SECOND_LEG";
   const protective = input.intent === "PROTECTIVE_DE_RISK";
   const riskReducingIntent = hedge || protective;
+  // A hedge exempts the alpha-confidence gate only when it is VERIFIED against
+  // the current durable position (the confidence gate must still trap a fresh
+  // first-leg entry and a spoofed/stale hedge candidate).
+  const verifiedHedge = verifiedReducingHedge({
+    hedgeIntent: hedge,
+    candidate: input.hedgeCandidate ?? null,
+    position: input.hedgePosition ?? null,
+    projectedDirectionalExposureUsd: input.projectedDirectionalExposureUsd,
+    directionalExposureUsd: input.directionalExposureUsd,
+    projectedUnhedgedExposureUsd: input.projectedUnhedgedExposureUsd,
+    unhedgedExposureUsd: input.unhedgedExposureUsd,
+  });
   const marketExposure = input.projectedMarketExposureUsd ?? (riskReducingIntent ? input.marketExposureUsd : d(input.marketExposureUsd).plus(input.orderSizeUsd).toFixed());
   const assetExposure = input.projectedAssetExposureUsd ?? (riskReducingIntent ? (input.assetExposureUsd ?? "0") : d(input.assetExposureUsd ?? "0").plus(input.orderSizeUsd).toFixed());
   const totalExposure = input.projectedTotalExposureUsd ?? (riskReducingIntent ? input.totalExposureUsd : d(input.totalExposureUsd).plus(input.orderSizeUsd).toFixed());
@@ -97,7 +200,7 @@ export function evaluateRisk(input: RiskInput, limits: RiskLimits): RiskEvaluati
     vetoes.push("MINIMUM_EXPECTED_ROI");
   }
   if (!protective && input.spread > limits.maxSpread) vetoes.push("MAXIMUM_SPREAD");
-  if (!protective && input.signalConfidence < limits.minSignalConfidence) vetoes.push("MINIMUM_SIGNAL_CONFIDENCE");
+  if (!protective && !verifiedHedge && input.signalConfidence < limits.minSignalConfidence) vetoes.push("MINIMUM_SIGNAL_CONFIDENCE");
   if (!protective && input.signalExpiresAt.getTime() <= input.now.getTime()) vetoes.push("SIGNAL_EXPIRED");
   if (!protective && input.externalSignalsLastMinute >= limits.maxExternalSignalsPerMinute) vetoes.push("MAXIMUM_EXTERNAL_SIGNAL_RATE");
   // Cooldown throttles fresh directional entries. It must never trap a risk-reducing action.

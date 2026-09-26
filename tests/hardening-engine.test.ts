@@ -546,6 +546,13 @@ describe("risk-reducing fill lifecycle fences", () => {
       bids: [{ price: "0.50", quantity: "1000" }], asks: [{ price: "0.51", quantity: "1000" }],
       sourceTimestamp: receivedAt, receivedAt, sequence: 1,
     }));
+// The hedge leg book is required for hedge token identity revalidation; in
+    // production both legs are always streamed.
+    await market.emitSnapshot(snapshot({
+      marketId: "race-mkt", tokenId: "down", outcome: "DOWN", asset: "BTC",
+      bids: [{ price: "0.48", quantity: "1000" }], asks: [{ price: "0.49", quantity: "1000" }],
+      sourceTimestamp: receivedAt, receivedAt, sequence: 1,
+    }));
     try {
       await engine.applyObservedFill(paperFill("race-mkt", "UP", "0.40"));
       expect(engine.ledger.positions.get("race-mkt")?.unpairedQuantity).toBe("10");

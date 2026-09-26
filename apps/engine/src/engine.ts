@@ -1268,6 +1268,18 @@ export class EngineService {
     ) return "HEDGE_SECOND_LEG";
     return "OPEN_FIRST_LEG";
   }
+/**
+   * Resolve the CURRENT canonical tokenId for (marketId, outcome) from market
+   * metadata (authoritative when present) and the live snapshot pair (current).
+   * Returns null when the identity cannot be resolved — callers fail closed.
+   */
+  private currentTokenIdFor(marketId: string, outcome: Outcome): string | null {
+    const market = this.marketsById.get(marketId);
+    const canonical = market?.tokens?.find((token) => token.outcome === outcome)?.tokenId;
+    if (canonical) return canonical;
+    const snapshot = this.snapshots.get(marketId)?.[outcome];
+    return snapshot?.tokenId ?? null;
+  }
 
   private hasOutstandingFirstLegMaker(marketId: string): boolean {
     for (const resting of this.restingOrders.values()) {
@@ -3543,6 +3555,21 @@ export class EngineService {
         marketExposureUsd: exposure.market, totalExposureUsd: exposure.total, directionalExposureUsd: exposure.directional,
         unhedgedExposureUsd: exposure.unhedged, unhedgedDurationMs: exposure.unhedgedDurationMs,
         intent: candidate.intent,
+...(candidate.intent === "HEDGE_SECOND_LEG"
+          ? {
+            hedgePosition: (() => {
+              const currentPosition = this.ledger.positions.get(candidate.marketId);
+              if (!currentPosition?.unpairedOutcome) return null;
+              const requiredOutcome: Outcome = currentPosition.unpairedOutcome === "UP" ? "DOWN" : "UP";
+              return {
+                marketId: currentPosition.marketId,
+                unpairedOutcome: currentPosition.unpairedOutcome,
+                unpairedQuantity: currentPosition.unpairedQuantity,
+                expectedOppositeTokenId: this.currentTokenIdFor(currentPosition.marketId, requiredOutcome),
+              };
+            })(),
+          }
+          : {}),
         projectedMarketExposureUsd: projected.market, projectedTotalExposureUsd: projected.total,
         projectedDirectionalExposureUsd: projected.directional, projectedUnhedgedExposureUsd: projected.unhedged,
         projectedAssetExposureUsd: projected.asset, availableCashUsd: this.ledger.availableCash().toFixed(),
@@ -3890,6 +3917,17 @@ export class EngineService {
               }
               if (fill.outcome === currentPosition.unpairedOutcome) {
                 throw new RiskReductionLifecycleGuardRejectedError(fill.marketId, economicIntent, "HEDGE_OUTCOME_CHANGED");
+              }
+              // Token identity revalidation immediately before the durable
+              // economic mutation: the fill token must still be the canonical /
+              // current token for the required opposite outcome in this market.
+              const expectedHedgeToken = this.currentTokenIdFor(fill.marketId, fill.outcome);
+              if (!expectedHedgeToken || expectedHedgeToken !== fill.tokenId) {
+                throw new RiskReductionLifecycleGuardRejectedError(
+                  fill.marketId,
+                  economicIntent,
+                  expectedHedgeToken ? "HEDGE_TOKEN_MISMATCH" : "HEDGE_TOKEN_UNRESOLVABLE",
+                );
               }
             } else {
               if (fill.side !== "SELL") {
