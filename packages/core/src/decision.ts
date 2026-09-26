@@ -27,6 +27,11 @@ export interface PaperOrderDecision {
   slippageUsd: string | null;
   netExpectedEdge: number;
   bookVwap: string | null;
+  /**
+   * Post-latency executable price used for fresh first-leg regime selection
+   * (full-quantity book-walk VWAP for TAKER; maker execution price for MAKER).
+   */
+  executablePrice: string | null;
 }
 
 export function decidePaperOrder(input: {
@@ -60,6 +65,14 @@ export function decidePaperOrder(input: {
   const executableNow = orderType === "MAKER"
     ? (input.candidate.side === "BUY" ? bestBid !== undefined : bestAsk !== undefined)
     : walk.sufficientDepth;
+  // Price-regime input: the CURRENT post-latency executable price for the full
+  // candidate quantity. TAKER uses the book-walk VWAP; MAKER uses the maker
+  // execution price (existing decidePaperOrder semantics). Never the top ask
+  // alone, never the stale decision-time limitPrice, and null when the full
+  // quantity is not executable — the strict regime must fail closed.
+  const executablePriceForRegime = orderType === "MAKER"
+    ? (input.candidate.side === "BUY" ? (bestBid?.price ?? null) : (bestAsk?.price ?? null))
+    : (walk.sufficientDepth ? walk.vwap : null);
   const executionPrice = orderType === "MAKER" ? makerPrice : walk.vwap;
   const fee = schedule ? calculateFee(input.candidate.quantity, executionPrice, orderType, schedule) : null;
   const slippage = executableNow
@@ -96,6 +109,9 @@ export function decidePaperOrder(input: {
     signalExpiresAt: input.signalExpiresAt,
     feeScheduleKnown: schedule !== null, orderSizeUsd: notional.toFixed(),
     requiredCashUsd,
+    ...(input.candidate.intent === "OPEN_FIRST_LEG"
+      ? { executablePrice: executablePriceForRegime }
+      : {}),
     ...(input.candidate.intent === "HEDGE_SECOND_LEG"
       ? {
         hedgeCandidate: {
@@ -132,6 +148,7 @@ export function decidePaperOrder(input: {
     rawEdge: rawEdgeUsdPerShare, feeUsd: fee, slippageUsd: slippage,
     netExpectedEdge: netEvUsdPerShare,
     bookVwap: orderType === "TAKER" && walk.sufficientDepth ? walk.vwap : null,
+    executablePrice: executablePriceForRegime,
   };
 }
 
@@ -251,5 +268,6 @@ export function decideProtectivePaperOrder(input: {
     slippageUsd: slippage,
     netExpectedEdge: netEvUsdPerShare,
     bookVwap: executableNow ? walk.vwap : null,
+    executablePrice: null,
   };
 }
