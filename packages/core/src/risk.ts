@@ -8,6 +8,7 @@ import type { RiskLimits } from "./config.js";
  */
 export interface HedgeCandidateFacts {
   marketId: string;
+  tokenId: string;
   outcome: Outcome;
   side: Side;
   quantity: string;
@@ -21,6 +22,13 @@ export interface HedgePositionFacts {
   marketId: string;
   unpairedOutcome: Outcome | null;
   unpairedQuantity: string;
+  /**
+   * The EXPECTED opposite token id for the candidate outcome, resolved by the
+   * caller from CURRENT synchronized market state for `marketId` and the
+   * current `unpairedOutcome`. Never derived from the candidate. null when it
+   * cannot be resolved — the verification must fail closed.
+   */
+  expectedOppositeTokenId: string | null;
 }
 
 /**
@@ -55,6 +63,10 @@ export function verifiedReducingHedge(input: {
   // 4. ...of the OPPOSITE outcome required to pair the residual.
   const requiredOutcome: Outcome = position.unpairedOutcome === "UP" ? "DOWN" : "UP";
   if (candidate.outcome !== requiredOutcome) return false;
+  // 4b. The candidate must trade the EXPECTED opposite TOKEN for that outcome,
+  // resolved from current market state — never trusted from the candidate.
+  if (!position.expectedOppositeTokenId) return false;
+  if (candidate.tokenId !== position.expectedOppositeTokenId) return false;
   // 3/6. Quantity is strictly positive and cannot exceed the residual.
   const quantity = d(candidate.quantity);
   if (!quantity.isFinite() || quantity.lte(0) || quantity.gt(residual)) return false;

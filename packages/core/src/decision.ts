@@ -40,6 +40,12 @@ export function decidePaperOrder(input: {
   orderType?: "TAKER" | "MAKER";
 }): PaperOrderDecision {
   const orderType = input.orderType ?? "TAKER";
+// Post-latency snapshot identity fence: the selected snapshot must belong to
+  // the exact market/token/outcome being traded. A snapshot for another token
+  // (or another market/outcome) must fail closed, never price the order.
+  const snapshotMatchesCandidate = input.snapshotAfterDecisionLatency.marketId === input.candidate.marketId
+    && input.snapshotAfterDecisionLatency.tokenId === input.candidate.tokenId
+    && input.snapshotAfterDecisionLatency.outcome === input.candidate.outcome;
   const bestBid = input.snapshotAfterDecisionLatency.bids[0];
   const bestAsk = input.snapshotAfterDecisionLatency.asks[0];
   const makerPrice = input.candidate.side === "BUY"
@@ -94,6 +100,7 @@ export function decidePaperOrder(input: {
       ? {
         hedgeCandidate: {
           marketId: input.candidate.marketId,
+          tokenId: input.candidate.tokenId,
           outcome: input.candidate.outcome,
           side: input.candidate.side,
           quantity: input.candidate.quantity,
@@ -101,6 +108,10 @@ export function decidePaperOrder(input: {
       }
       : {}),
   }, input.limits);
+  if (!snapshotMatchesCandidate && !risk.vetoes.includes("SNAPSHOT_TOKEN_MISMATCH")) {
+    risk.vetoes.push("SNAPSHOT_TOKEN_MISMATCH");
+    risk.accepted = false;
+  }
   if (!executableNow && !risk.vetoes.includes("INSUFFICIENT_DEPTH")) {
     risk.vetoes.push("INSUFFICIENT_DEPTH");
     risk.accepted = false;

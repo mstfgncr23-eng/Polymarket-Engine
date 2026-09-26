@@ -56,9 +56,9 @@ describe("hedge residual guard survives the confidence-exemption change", () => 
         id: "first-leg", orderId: "order-first", tokenId: "down",
       }));
       expect(engine.ledger.positions.get("race-mkt")?.unpairedQuantity).toBe("10");
-
-      // A live, fresh, synchronized DOWN book is required before any protective
-      // SELL can fill (the de-risk book guard).
+// The DOWN book is required before any protective SELL (the de-risk book
+      // guard), and the UP book is required so the hedge token identity can be
+      // resolved (canonical/current token for the opposite outcome).
       const downBook = snapshot({
         eventId: createId("market-book"),
         marketId: "race-mkt", tokenId: "down", outcome: "DOWN",
@@ -66,6 +66,23 @@ describe("hedge residual guard survives the confidence-exemption change", () => 
         sourceTimestamp: TEST_NOW.toISOString(), receivedAt: TEST_NOW.toISOString(),
       });
       await market.emitSnapshot(downBook);
+      const upBook = snapshot({
+        eventId: createId("market-book-up"),
+        marketId: "race-mkt", tokenId: "up", outcome: "UP",
+        bids: [{ price: "0.47", quantity: "50" }], asks: [{ price: "0.48", quantity: "50" }],
+        sourceTimestamp: TEST_NOW.toISOString(), receivedAt: TEST_NOW.toISOString(),
+      });
+      await market.emitSnapshot(upBook);
+
+      // C: a hedge fill with the WRONG token (otherwise correct market/outcome/
+      // side/qty) must fail closed before it can mutate durable hedge inventory.
+      await expect(engine.applyObservedFill(paperFill("race-mkt", "UP", "0.48", {
+        id: "wrong-token-hedge", orderId: "order-wrong-token-hedge", tokenId: "wrong-token", quantity: "10",
+      }), "HEDGE_SECOND_LEG")).rejects.toThrow("HEDGE_TOKEN_MISMATCH");
+      expect(engine.ledger.positions.get("race-mkt")).toMatchObject({
+        upQuantity: "0", downQuantity: "10", unpairedOutcome: "DOWN", unpairedQuantity: "10",
+      });
+
 
       // Protective SELL wins half the race: residual is now DOWN 6.
       await engine.applyObservedFill(paperFill("race-mkt", "DOWN", "0.48", {
