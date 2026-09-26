@@ -15,8 +15,8 @@ import { now, safeRisk, snapshot } from "./fixtures.js";
 const limits = riskLimitsSchema.parse({});
 const STRICT_EDGE = limits.minExpectedEdge; // 0.015
 const STRICT_ROI = limits.minExpectedROI; // 0.020
-const NORMAL_EDGE = limits.normalFirstLegMinExpectedEdge; // 0.0125
-const NORMAL_ROI = limits.normalFirstLegMinExpectedROI; // 0.015
+const NORMAL_EDGE = limits.normalFirstLegMinExpectedEdge; // 0.010
+const NORMAL_ROI = limits.normalFirstLegMinExpectedROI; // 0.010
 const BOUNDARY = limits.normalFirstLegMaxPriceExclusive; // 0.90 exclusive
 
 const MARKET = "4886202";
@@ -111,17 +111,17 @@ describe("first-leg price-regime economic admission", () => {
     expect(risk.accepted).toBe(true);
   });
 
-  it("6: NORMAL edge floor failure (0.01249 < 0.0125)", () => {
+  it("6: NORMAL edge floor failure (0.00999 < 0.010)", () => {
     const risk = evaluateRisk(openRisk({
-      executablePrice: "0.85", expectedEdge: 0.01249, expectedROI: NORMAL_ROI,
+      executablePrice: "0.85", expectedEdge: 0.00999, expectedROI: NORMAL_ROI,
     }), limits);
     expect(risk.vetoes).toContain("MINIMUM_EXPECTED_EDGE");
     expect(risk.accepted).toBe(false);
   });
 
-  it("7: NORMAL ROI floor failure (0.01499 < 0.015)", () => {
+  it("7: NORMAL ROI floor failure (0.00999 < 0.010)", () => {
     const risk = evaluateRisk(openRisk({
-      executablePrice: "0.85", expectedEdge: 0.013, expectedROI: 0.01499,
+      executablePrice: "0.85", expectedEdge: 0.013, expectedROI: 0.00999,
     }), limits);
     expect(risk.vetoes).toContain("MINIMUM_EXPECTED_ROI");
     expect(risk.accepted).toBe(false);

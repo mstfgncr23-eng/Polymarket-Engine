@@ -27,9 +27,9 @@ export const riskLimitsSchema = z.object({
    */
   normalFirstLegMaxPriceExclusive: z.number().min(0).max(1).default(0.9),
   /** Relaxed net edge floor (USD/share) for fresh first-legs below the price boundary. */
-  normalFirstLegMinExpectedEdge: z.number().min(0).max(1).default(0.0125),
+  normalFirstLegMinExpectedEdge: z.number().min(0).max(1).default(0.01),
   /** Relaxed expected ROI floor for fresh first-legs below the price boundary. */
-  normalFirstLegMinExpectedROI: z.number().nonnegative().default(0.015),
+  normalFirstLegMinExpectedROI: z.number().nonnegative().default(0.01),
   maxSpread: z.number().min(0).max(1).default(0.08),
   minSignalConfidence: z.number().min(0).max(1).default(0.6),
   staleFeedTimeoutMs: z.number().int().positive().default(15_000),
