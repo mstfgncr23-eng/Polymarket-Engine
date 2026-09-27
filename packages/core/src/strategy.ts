@@ -18,7 +18,7 @@ export interface StrategyCandidate {
   side: "BUY" | "SELL";
   quantity: string;
   limitPrice: string;
-  intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK";
+  intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK" | "RESCUE_SECOND_LEG";
   /** Raw expected value in USD/share for a $1 binary payout. */
   rawEdgeUsdPerShare?: number;
   /** @deprecated Compatibility alias for rawEdgeUsdPerShare. */
@@ -113,6 +113,112 @@ export function buildProtectiveDeRiskCandidate(input: {
   maxOrderSizeUsd: number;
 }): StrategyCandidate | null {
   return evaluateProtectiveDeRiskCandidate(input).candidate;
+}
+
+/**
+ * Why a controlled-loss rescue (RESCUE_SECOND_LEG) candidate could not be
+ * built from the current position and opposite-outcome book. Diagnostic only;
+ * it never loosens the structural pair-lock bounds.
+ *
+ * - NO_UNPAIRED_RESIDUAL: the position has no unpaired inventory to pair
+ *   against, or the residual is not positive.
+ * - OPPOSITE_OUTCOME_UNRESOLVABLE: the supplied snapshot is not the outcome
+ *   required to pair the current unpaired residual.
+ * - NO_EXECUTABLE_ASK_DEPTH: the opposite book has no executable ask levels,
+ *   or the walk over asks produced zero quantity.
+ * - MIN_ORDER_SIZE_UNKNOWN: the authoritative minimum order size is unknown
+ *   for the opposite token (mirrors the protective SELL guard).
+ * - QUANTITY_BELOW_MIN_ORDER_SIZE: executable ask quantity exists but is below
+ *   the known minimum order size.
+ */
+export type RescueCandidateRejection =
+  | "NO_UNPAIRED_RESIDUAL"
+  | "OPPOSITE_OUTCOME_UNRESOLVABLE"
+  | "NO_EXECUTABLE_ASK_DEPTH"
+  | "MIN_ORDER_SIZE_UNKNOWN"
+  | "QUANTITY_BELOW_MIN_ORDER_SIZE";
+
+export interface RescueCandidateEvaluation {
+  candidate: StrategyCandidate | null;
+  /** Non-null exactly when candidate is null on the executable-quantity paths. */
+  reason: RescueCandidateRejection | null;
+}
+
+/**
+ * Build the controlled-loss opposite BUY candidate (RESCUE_SECOND_LEG).
+ *
+ * The rescue BUY is a risk-only pair-lock against the CURRENT unpaired
+ * residual: it may only BUY the opposite outcome, may never exceed the current
+ * unpaired quantity, and is capped by the executable ask depth and
+ * maxOrderSizeUsd. It is never a new directional trade and never a reversal —
+ * the resulting opposite inventory can never exceed the held residual, so the
+ * position can never flip into opposite-direction net exposure.
+ */
+export function evaluateRescueSecondLegCandidate(input: {
+  position: Position;
+  snapshot: MarketSnapshot;
+  maxOrderSizeUsd: number;
+}): RescueCandidateEvaluation {
+  const { position, snapshot } = input;
+  if (!position.unpairedOutcome || d(position.unpairedQuantity).lte(0)) {
+    return { candidate: null, reason: "NO_UNPAIRED_RESIDUAL" };
+  }
+  const requiredOutcome: Outcome = position.unpairedOutcome === "UP" ? "DOWN" : "UP";
+  if (snapshot.outcome !== requiredOutcome) return { candidate: null, reason: "OPPOSITE_OUTCOME_UNRESOLVABLE" };
+  const unpaired = d(position.unpairedQuantity);
+  const maxNotional = d(input.maxOrderSizeUsd);
+  if (unpaired.lte(0) || maxNotional.lte(0) || snapshot.asks.length === 0) {
+    return { candidate: null, reason: "NO_EXECUTABLE_ASK_DEPTH" };
+  }
+
+  let quantity = d(0);
+  let notional = d(0);
+  let worstPrice: string | null = null;
+  for (const level of snapshot.asks) {
+    const price = d(level.price);
+    const available = d(level.quantity);
+    if (price.lte(0) || available.lte(0)) continue;
+    const remainingInventory = unpaired.minus(quantity);
+    const remainingNotional = maxNotional.minus(notional);
+    if (remainingInventory.lte(0) || remainingNotional.lte(0)) break;
+    const capQuantity = remainingNotional.div(price);
+    let take = available;
+    if (take.gt(remainingInventory)) take = remainingInventory;
+    if (take.gt(capQuantity)) take = capQuantity;
+    if (take.lte(0)) break;
+    quantity = quantity.plus(take);
+    notional = notional.plus(take.mul(price));
+    worstPrice = level.price;
+  }
+
+  if (quantity.lte(0) || !worstPrice) return { candidate: null, reason: "NO_EXECUTABLE_ASK_DEPTH" };
+  if (!snapshot.minOrderSize) return { candidate: null, reason: "MIN_ORDER_SIZE_UNKNOWN" };
+  if (quantity.lt(snapshot.minOrderSize)) return { candidate: null, reason: "QUANTITY_BELOW_MIN_ORDER_SIZE" };
+  return {
+    candidate: {
+      strategyId: "controlled-loss-rescue",
+      strategyVersion: "controlled-loss-rescue-v1",
+      marketId: snapshot.marketId,
+      tokenId: snapshot.tokenId,
+      outcome: requiredOutcome,
+      side: "BUY",
+      quantity: decimal(quantity),
+      limitPrice: worstPrice,
+      intent: "RESCUE_SECOND_LEG",
+      rawEdgeUsdPerShare: 0,
+      rawExpectedEdge: 0,
+      reasonCodes: ["MAX_UNHEDGED_DURATION", "RESCUE_UNPAIRED_RESIDUAL", "OPPOSITE_ASK_EXECUTABLE"],
+    },
+    reason: null,
+  };
+}
+
+export function buildRescueSecondLegCandidate(input: {
+  position: Position;
+  snapshot: MarketSnapshot;
+  maxOrderSizeUsd: number;
+}): StrategyCandidate | null {
+  return evaluateRescueSecondLegCandidate(input).candidate;
 }
 
 export interface StrategyContext {

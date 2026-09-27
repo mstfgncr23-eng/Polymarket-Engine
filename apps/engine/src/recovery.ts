@@ -228,7 +228,7 @@ const fillPayloadSchema = z.object({
   positionId: z.string().min(1),
   reservationAfter: z.string().nullable(),
   restingAfter: restingPaperOrderSchema.nullable().optional(),
-  intent: z.enum(["OPEN_FIRST_LEG", "HEDGE_SECOND_LEG", "PROTECTIVE_DE_RISK"]).optional(),
+  intent: z.enum(["OPEN_FIRST_LEG", "HEDGE_SECOND_LEG", "PROTECTIVE_DE_RISK", "RESCUE_SECOND_LEG"]).optional(),
   deRisk: z.record(z.string(), z.unknown()).optional(),
 });
 

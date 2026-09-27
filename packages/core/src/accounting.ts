@@ -238,7 +238,7 @@ export interface PaperExposureProjectionInput {
     quantity: Decimal.Value;
     price: Decimal.Value;
     side?: "BUY" | "SELL";
-    intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK";
+    intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK" | "RESCUE_SECOND_LEG";
     asset?: string | null;
   };
   nowMs?: number;

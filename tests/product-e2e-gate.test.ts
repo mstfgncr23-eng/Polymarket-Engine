@@ -201,7 +201,11 @@ function eventTypes(journal: EventJournal): Promise<string[]> {
 
 describe("PR20 true product end-to-end gate", () => {
   it("Scenario A crosses one shared production chain from discovery through canonical report", async () => {
-    const setup = await setupScenario();
+    // Market ends 1h after START so the +1s profitable-hedge step runs BEFORE
+    // the protective deadline (PR2: normal hedge still wins pre-eligibility).
+    // A very short market would make the position instantly eligible and shift
+    // this scenario into the rescue-arbitration path instead.
+    const setup = await setupScenario({ endDateOffsetMs: 3_600_000 });
     try {
       const cashBefore = setup.engine.ledger.snapshot().cash;
       await beginAndGenerateTrigger(setup);
@@ -219,7 +223,7 @@ describe("PR20 true product end-to-end gate", () => {
       })).not.toBe("0");
       expect(paired?.unpairedQuantity).toBe("0");
 
-      setup.clock.nowMs = START_MS + 120_000;
+      setup.clock.nowMs = START_MS + 3_600_000 + 1_000;
       setup.resolutions.set("btc-mkt", {
         state: { closed: true },
         resolution: { umaResolutionStatus: "settled" },

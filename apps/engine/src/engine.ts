@@ -5,7 +5,12 @@ import {
   createId,
   decidePaperOrder,
   decideProtectivePaperOrder,
+  decideRescueSecondLegOrder,
+  arbitrateRiskReduction,
   evaluateProtectiveDeRiskCandidate,
+  evaluateRescueSecondLegCandidate,
+  type RescueCandidateEvaluation,
+  type RiskReductionCandidateEconomics,
   defaultNativeDecisionConfig,
   evaluateNativeDecision,
   NATIVE_DETERMINISTIC_AUTHORITY,
@@ -94,6 +99,9 @@ import {
   type NativeV2ShadowOpportunityRanking,
   DEFAULT_FIRST_LEG_RISK_CAP_USD,
   rolesForTriggerKind,
+  type RiskReductionSelection,
+  type RiskReductionSelectionReason,
+  type HedgePositionFacts,
 } from "@pm/core";
 import {
   CHECKPOINT_SCHEMA_VERSION,
@@ -202,7 +210,7 @@ class FirstLegLifecycleGuardRejectedError extends Error {
 class RiskReductionLifecycleGuardRejectedError extends Error {
   constructor(
     readonly marketId: string,
-    readonly intent: "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK",
+    readonly intent: "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK" | "RESCUE_SECOND_LEG",
     readonly reason: string,
   ) {
     super(`RISK_REDUCTION_LIFECYCLE_REJECTED:${marketId}:${intent}:${reason}`);
@@ -256,11 +264,21 @@ type GrokSubmissionResult = {
   signalId?: string;
 };
 
+type RiskReductionUnhedgedReason = "MAX_UNHEDGED_DURATION" | "PRE_EXPIRY_SAFETY";
+
 type ProtectiveDeRiskAudit = {
-  deRiskReason: "MAX_UNHEDGED_DURATION";
+  deRiskReason: RiskReductionUnhedgedReason;
+  /**
+   * Observability improvement (§44): distinguishes which deadline bound made
+   * the position protective-eligible — the hard unhedged duration
+   * (MAX_UNHEDGED_DURATION) or the expiry safety window (PRE_EXPIRY_SAFETY).
+   * Behavior is identical to the prior single label; this only removes the
+   * diagnostic ambiguity.
+   */
+  eligibilityReason: RiskReductionUnhedgedReason;
   unhedgedStartedAt: string;
   unhedgedDurationMs: number;
-  attemptedAction: "SELL_UNPAIRED";
+  attemptedAction: "SELL_UNPAIRED" | "RESCUE_SECOND_LEG" | "NONE";
   requestedQty: string;
   executableQty: string;
   executionPrice: string | null;
@@ -268,6 +286,23 @@ type ProtectiveDeRiskAudit = {
   residualExposure: string;
   retryCount: number;
   finalState: "ORDER_ADMITTED" | "RISK_VETO" | "RESIDUAL_UNHEDGED" | "RISK_NEUTRALIZED" | "EXECUTION_ERROR" | "STATE_CHANGED";
+  /** Rescue arbitration observability (bounded; detailed economics in journal). */
+  selection?: RiskReductionSelection;
+  selectionReason?: RiskReductionSelectionReason;
+  tieBreakUsed?: boolean;
+  aAvailable?: boolean;
+  aReason?: string | null;
+  aQuantity?: string | null;
+  aVwap?: string | null;
+  aFeeUsd?: string | null;
+  aGuaranteedSalvageUsd?: string | null;
+  bAvailable?: boolean;
+  bReason?: string | null;
+  bQuantity?: string | null;
+  bVwap?: string | null;
+  bFeeUsd?: string | null;
+  bRequiredCashUsd?: string | null;
+  bGuaranteedSalvageUsd?: string | null;
 };
 
 type NativeV2ShadowExecutionCapture = {
@@ -344,8 +379,13 @@ export class EngineService {
   private readonly recentTrades = new Map<string, number>();
   /** Ephemeral reservation for a not-yet-durable first-leg submission. */
   private readonly pendingFirstLegMarkets = new Set<string>();
-  /** One risk-reducing unwind flight per market; never block the websocket consumer. */
-  private readonly protectiveDeRiskInFlight = new Set<string>();
+  /**
+   * ONE risk-reduction ownership flight per market, shared by normal
+   * HEDGE_SECOND_LEG, controlled-loss RESCUE_SECOND_LEG and PROTECTIVE_DE_RISK
+   * so the same unpaired residual can never admit two independent economic
+   * mutations concurrently (PR2 single risk-reduction authority).
+   */
+  private readonly riskReductionInFlight = new Set<string>();
   private readonly protectiveDeRiskAttempts = new Map<string, number>();
   /** Earliest next durable de-risk evaluation per market. Ephemeral by design. */
   private readonly protectiveDeRiskNextAttemptAt = new Map<string, number>();
@@ -763,7 +803,7 @@ export class EngineService {
   async referenceTickForTest(tick: ReferenceTick): Promise<void> { await this.onReferenceTick(tick); }
   async applyObservedFill(
     fill: Parameters<PaperLedger["applyFill"]>[0],
-    intent?: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK",
+    intent?: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK" | "RESCUE_SECOND_LEG",
   ): Promise<void> { await this.applyFill(fill, { intent }); }
   async restMakerForTest(
     order: PaperOrder,
@@ -1311,6 +1351,24 @@ export class EngineService {
         resting.order.marketId !== marketId
         || !d(resting.remaining).gt(0)
         || this.restingOrderIntent(resting) !== "OPEN_FIRST_LEG"
+      ) continue;
+      await this.releaseMaker(orderId, { cancel: true, reason });
+    }
+  }
+
+  /**
+   * Fence resting HEDGE_SECOND_LEG makers at the rescue boundary. A hedge maker
+   * admitted BEFORE rescue ownership could fill behind the rescue action and
+   * re-consume the same residual; cancelling it is itself risk-reducing. This
+   * is proactive serialization, not a replacement for the final fill-time
+   * residual/token guards (defense-in-depth stays).
+   */
+  private async cancelRestingHedgeMakers(marketId: string, reason: string): Promise<void> {
+    for (const [orderId, resting] of [...this.restingOrders.entries()]) {
+      if (
+        resting.order.marketId !== marketId
+        || !d(resting.remaining).gt(0)
+        || this.restingOrderIntent(resting) !== "HEDGE_SECOND_LEG"
       ) continue;
       await this.releaseMaker(orderId, { cancel: true, reason });
     }
@@ -2065,7 +2123,14 @@ export class EngineService {
         }
         const evolved = evolveMakerOrder(resting, previous, snapshot);
         if (evolved.fill) {
-          await this.applyFill(evolved.fill, { restingAfter: evolved.resting });
+          // Capture the maker lifecycle intent synchronously here, BEFORE the
+          // async fill path. Rescue/cancel of the resting order during the
+          // applyFill boundary must not erase this identity: the PR2 fill-time
+          // residual/token guards key off economicIntent. restingOrderIntent
+          // keeps the legacy pre-PR1 inference, evaluated against the state
+          // that derived the fill instead of re-read after an await.
+          const restingIntent = this.restingOrderIntent(resting);
+          await this.applyFill(evolved.fill, { restingAfter: evolved.resting, intent: restingIntent });
         } else {
           this.restingOrders.set(orderId, evolved.resting);
           if (Number(evolved.resting.remaining) === 0) {
@@ -3369,6 +3434,33 @@ export class EngineService {
     if (candidate.intent === "OPEN_FIRST_LEG" && !this.isMarketSynchronized(candidate.marketId)) return;
     if (candidate.intent === "OPEN_FIRST_LEG" && assetNeedsReliableReference(this.referenceRequired.get(candidate.marketId), this.referenceUnreliable, this.assetByMarket.get(candidate.marketId))) return;
     if (candidate.intent === "HEDGE_SECOND_LEG" && !experimentAllowsHedge(this.experiment)) return;
+    // RESCUE_EXCLUSIVE (PR2): once protective eligibility is reached, the
+    // current unpaired residual has exactly ONE risk-reduction authority. The
+    // normal profitable-hedge path stops admitting new competing BUYs and the
+    // rescue arbiter alone decides between A (SELL) and B (pair-lock BUY) from
+    // fresh state. This preserves the pre-eligibility V1 exact behavior.
+    if (candidate.intent === "HEDGE_SECOND_LEG") {
+      const hedgePositionNow = this.ledger.positions.get(candidate.marketId);
+      if (hedgePositionNow?.unpairedOutcome) {
+        const hedgeEligibility = this.protectiveDeRiskEligibility(
+          candidate.marketId,
+          hedgePositionNow.unhedgedStartedAt ?? hedgePositionNow.openedAt,
+          this.nowFn().getTime(),
+        );
+        if (hedgeEligibility.eligible) {
+          const suppressedMarketId = candidate.marketId;
+          this.record("HEDGE_SUPPRESSED_RESCUE_EXCLUSIVE", trigger.traceId, suppressedMarketId, {
+            unpairedOutcome: hedgePositionNow.unpairedOutcome,
+            effectiveProtectiveDeadlineMs: hedgeEligibility.effectiveDeadlineMs,
+            marketEndMs: hedgeEligibility.marketEndMs,
+          }, this.assetByMarket.get(suppressedMarketId) ?? null);
+          void this.maybeProtectiveDeRisk(suppressedMarketId).catch((error) => {
+            this.logger.error({ err: error, marketId: suppressedMarketId }, "rescue arbitration attempt failed");
+          });
+          return;
+        }
+      }
+    }
 
     // Database health is an async hard-safety prerequisite. Resolve it before
     // the final first-leg economic capture so a slow health check cannot leave
@@ -3646,12 +3738,58 @@ export class EngineService {
     order: PaperOrder,
     decisionSnapshot: MarketSnapshot,
     duplicateKey: string,
-    intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK" = "OPEN_FIRST_LEG",
+    intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK" | "RESCUE_SECOND_LEG" = "OPEN_FIRST_LEG",
     deRisk?: ProtectiveDeRiskAudit,
   ): Promise<void> {
     if (intent === "OPEN_FIRST_LEG" && this.experimentStartPending) return;
     if (intent === "PROTECTIVE_DE_RISK" && order.orderType !== "TAKER") {
       throw new Error("PROTECTIVE_DE_RISK_REQUIRES_TAKER");
+    }
+    if (intent === "RESCUE_SECOND_LEG" && order.orderType !== "TAKER") {
+      throw new Error("RESCUE_SECOND_LEG_REQUIRES_TAKER");
+    }
+    const riskReductionOrder = intent === "HEDGE_SECOND_LEG"
+      || intent === "RESCUE_SECOND_LEG"
+      || intent === "PROTECTIVE_DE_RISK";
+    // PR2 single risk-reduction authority: exactly one risk-reduction admission
+    // may be in flight per market. RESCUE and PROTECTIVE submissions are
+    // already serialized by the maybeProtectiveDeRisk per-market flight (the
+    // shared set is held for their whole decision+execution lifetime), so only
+    // normal HEDGE submissions acquire/check the slot here — a hedge must never
+    // slip in behind rescue/protective ownership. A HEDGE MAKER admission holds
+    // the slot through its durable PAPER_MAKER_RESERVED so rescue cannot start
+    // A/B arbitration while a hedge maker is still being admitted/reserved; the
+    // slot is released again once the resting order is authoritative. A resting
+    // maker does NOT hold the slot for its resting lifetime.
+    const ownsRiskReductionFlight = intent === "HEDGE_SECOND_LEG";
+    if (ownsRiskReductionFlight) {
+      if (this.riskReductionInFlight.has(order.marketId)) {
+        this.record("RISK_REDUCTION_FLIGHT_BUSY", order.traceId, order.marketId, {
+          intent, orderId: order.id, reason: "RISK_REDUCTION_IN_FLIGHT",
+        }, decisionSnapshot.asset ?? null);
+        return;
+      }
+      // Admission-boundary eligibility re-check (post decision latency): a
+      // normal hedge must not slip in behind rescue ownership once protective
+      // eligibility became true.
+      if (intent === "HEDGE_SECOND_LEG") {
+        const posAtAdmission = this.ledger.positions.get(order.marketId);
+        if (posAtAdmission?.unpairedOutcome) {
+          const admissionEligibility = this.protectiveDeRiskEligibility(
+            order.marketId,
+            posAtAdmission.unhedgedStartedAt ?? posAtAdmission.openedAt,
+            this.nowFn().getTime(),
+          );
+          if (admissionEligibility.eligible) {
+            this.record("HEDGE_SUPPRESSED_RESCUE_EXCLUSIVE", order.traceId, order.marketId, {
+              unpairedOutcome: posAtAdmission.unpairedOutcome,
+              reason: "ELIGIBILITY_REACHED_BEFORE_ADMISSION",
+            }, decisionSnapshot.asset ?? null);
+            return;
+          }
+        }
+      }
+      this.riskReductionInFlight.add(order.marketId);
     }
     const firstLegReserved = intent === "OPEN_FIRST_LEG"
       ? this.tryReserveFirstLegAdmission(order.marketId)
@@ -3667,12 +3805,14 @@ export class EngineService {
         intent === "OPEN_FIRST_LEG"
         && this.firstLegLifecycleBlocked(order.marketId, true)
       ) return;
-      if (intent === "HEDGE_SECOND_LEG" || intent === "PROTECTIVE_DE_RISK") {
+      if (intent === "HEDGE_SECOND_LEG" || intent === "PROTECTIVE_DE_RISK" || intent === "RESCUE_SECOND_LEG") {
         // Once risk reduction starts, an older first-leg maker remainder must
         // not be allowed to refill directional exposure behind the action.
         await this.cancelOutstandingFirstLegMakers(
           order.marketId,
-          intent === "PROTECTIVE_DE_RISK" ? "PROTECTIVE_DE_RISK_ADMITTED" : "HEDGE_ADMITTED",
+          intent === "PROTECTIVE_DE_RISK" ? "PROTECTIVE_DE_RISK_ADMITTED"
+            : intent === "RESCUE_SECOND_LEG" ? "RESCUE_ADMITTED"
+            : "HEDGE_ADMITTED",
         );
       }
 
@@ -3689,7 +3829,10 @@ export class EngineService {
       try {
         if (order.orderType === "MAKER") {
           if (intent === "PROTECTIVE_DE_RISK") throw new Error("PROTECTIVE_DE_RISK_REQUIRES_TAKER");
-          await this.reserveMaker(order, decisionSnapshot, intent);
+          if (intent === "RESCUE_SECOND_LEG") throw new Error("RESCUE_SECOND_LEG_REQUIRES_TAKER");
+          // Resting makers are only ever first-leg or hedge orders; rescue is
+          // enforced TAKER-only above, so the cast is a pure TS narrowing aid.
+          await this.reserveMaker(order, decisionSnapshot, intent === "OPEN_FIRST_LEG" ? "OPEN_FIRST_LEG" : "HEDGE_SECOND_LEG");
           return;
         }
         await delay(this.env.PAPER_EXECUTION_LATENCY_MS);
@@ -3742,6 +3885,7 @@ export class EngineService {
       }
     } finally {
       if (firstLegReserved) this.pendingFirstLegMarkets.delete(order.marketId);
+      if (ownsRiskReductionFlight) this.riskReductionInFlight.delete(order.marketId);
     }
   }
 
@@ -3844,7 +3988,7 @@ export class EngineService {
     fill: Parameters<PaperLedger["applyFill"]>[0],
     extras: {
       restingAfter?: RestingPaperOrder | null;
-      intent?: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK";
+      intent?: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK" | "RESCUE_SECOND_LEG";
       deRisk?: ProtectiveDeRiskAudit;
     } = {},
   ): Promise<boolean> {
@@ -3891,12 +4035,27 @@ export class EngineService {
           if (priorFillAuthority) return;
           const currentPosition = this.ledger.positions.get(fill.marketId);
 
-          if (economicIntent === "HEDGE_SECOND_LEG" || economicIntent === "PROTECTIVE_DE_RISK") {
-            if (economicIntent === "PROTECTIVE_DE_RISK") {
-              // Final hard-safety revalidation immediately before the durable
-              // economic mutation. A flip since risk evaluation makes this a
-              // state-changed rejection (bounded, deterministic), never a
-              // durability/integrity fault.
+          if (economicIntent === "HEDGE_SECOND_LEG" || economicIntent === "PROTECTIVE_DE_RISK" || economicIntent === "RESCUE_SECOND_LEG") {
+            // DURABLE CANCEL WINS over an older in-flight HEDGE maker fill. A
+            // hedge maker fill derived before rescue ownership must not commit
+            // once the rescue durably cancelled the resting order: its
+            // `restingAfter` payload would resurrect the cancelled order
+            // without its reservation (resting_without_reservation invariant).
+            if (economicIntent === "HEDGE_SECOND_LEG" && fill.liquidityRole === "MAKER") {
+              const activeHedgeResting = this.restingOrders.get(fill.orderId);
+              if (
+                !activeHedgeResting
+                || !d(activeHedgeResting.remaining).gt(0)
+                || this.restingOrderIntent(activeHedgeResting) !== "HEDGE_SECOND_LEG"
+              ) {
+                throw new RiskReductionLifecycleGuardRejectedError(fill.marketId, "HEDGE_SECOND_LEG", "HEDGE_MAKER_NOT_ACTIVE");
+              }
+            }
+            // Protected actions (protective SELL and rescue pair-lock BUY)
+            // re-validate hard safety immediately before the durable economic
+            // mutation. A flip since risk evaluation makes this a state-changed
+            // rejection (bounded, deterministic), never a durability fault.
+            if (economicIntent === "PROTECTIVE_DE_RISK" || economicIntent === "RESCUE_SECOND_LEG") {
               const hardSafetyReason = this.protectiveFillHardSafetyReason(fill);
               if (hardSafetyReason) {
                 this.recordProtectiveDeRiskSuppressed(
@@ -3912,12 +4071,18 @@ export class EngineService {
             if (d(fill.quantity).gt(currentPosition.unpairedQuantity)) {
               throw new RiskReductionLifecycleGuardRejectedError(fill.marketId, economicIntent, "QUANTITY_EXCEEDS_RESIDUAL");
             }
-            if (economicIntent === "HEDGE_SECOND_LEG") {
+            if (economicIntent === "HEDGE_SECOND_LEG" || economicIntent === "RESCUE_SECOND_LEG") {
               if (fill.side !== "BUY") {
-                throw new RiskReductionLifecycleGuardRejectedError(fill.marketId, economicIntent, "HEDGE_SIDE_CHANGED");
+                throw new RiskReductionLifecycleGuardRejectedError(
+                  fill.marketId, economicIntent,
+                  economicIntent === "HEDGE_SECOND_LEG" ? "HEDGE_SIDE_CHANGED" : "RESCUE_SIDE_CHANGED",
+                );
               }
               if (fill.outcome === currentPosition.unpairedOutcome) {
-                throw new RiskReductionLifecycleGuardRejectedError(fill.marketId, economicIntent, "HEDGE_OUTCOME_CHANGED");
+                throw new RiskReductionLifecycleGuardRejectedError(
+                  fill.marketId, economicIntent,
+                  economicIntent === "HEDGE_SECOND_LEG" ? "HEDGE_OUTCOME_CHANGED" : "RESCUE_OUTCOME_CHANGED",
+                );
               }
               // Token identity revalidation immediately before the durable
               // economic mutation: the fill token must still be the canonical /
@@ -3927,7 +4092,9 @@ export class EngineService {
                 throw new RiskReductionLifecycleGuardRejectedError(
                   fill.marketId,
                   economicIntent,
-                  expectedHedgeToken ? "HEDGE_TOKEN_MISMATCH" : "HEDGE_TOKEN_UNRESOLVABLE",
+                  expectedHedgeToken
+                    ? (economicIntent === "RESCUE_SECOND_LEG" ? "RESCUE_TOKEN_MISMATCH" : "HEDGE_TOKEN_MISMATCH")
+                    : (economicIntent === "RESCUE_SECOND_LEG" ? "RESCUE_TOKEN_UNRESOLVABLE" : "HEDGE_TOKEN_UNRESOLVABLE"),
                 );
               }
             } else {
@@ -4030,10 +4197,12 @@ export class EngineService {
       }
       return false;
     }
-    if (economicIntent === "HEDGE_SECOND_LEG" || economicIntent === "PROTECTIVE_DE_RISK") {
+    if (economicIntent === "HEDGE_SECOND_LEG" || economicIntent === "PROTECTIVE_DE_RISK" || economicIntent === "RESCUE_SECOND_LEG") {
       await this.cancelOutstandingFirstLegMakers(
         fill.marketId,
-        economicIntent === "PROTECTIVE_DE_RISK" ? "PROTECTIVE_DE_RISK_FILLED" : "HEDGE_FILLED",
+        economicIntent === "PROTECTIVE_DE_RISK" ? "PROTECTIVE_DE_RISK_FILLED"
+          : economicIntent === "RESCUE_SECOND_LEG" ? "RESCUE_FILLED"
+          : "HEDGE_FILLED",
       );
     }
     return true;
@@ -4044,7 +4213,7 @@ export class EngineService {
     wasEmpty: boolean,
     projected: RecoverableEngineState,
     occurredAt: Date,
-    intent?: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK",
+    intent?: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK" | "RESCUE_SECOND_LEG",
     deRisk?: ProtectiveDeRiskAudit,
     unhedgedStartedAtBefore: string | null = null,
   ): DerivedAuditRecord[] {
@@ -4674,7 +4843,7 @@ export class EngineService {
   }
 
   private async maybeProtectiveDeRisk(marketId: string): Promise<void> {
-    if (this.protectiveDeRiskInFlight.has(marketId)) {
+    if (this.riskReductionInFlight.has(marketId)) {
       this.recordProtectiveDeRiskSuppressed(marketId, "GATE_IN_FLIGHT", "IN_FLIGHT");
       return;
     }
@@ -4727,12 +4896,18 @@ export class EngineService {
       return;
     }
 
-    this.protectiveDeRiskInFlight.add(marketId);
+    this.riskReductionInFlight.add(marketId);
     try {
       // Once the hard unhedged timeout is breached, no stale entry remainder
       // may keep increasing directional inventory while an exit is pending or
       // temporarily unexecutable. Cancelling it is itself risk-reducing.
       await this.cancelOutstandingFirstLegMakers(marketId, "MAX_UNHEDGED_DURATION");
+
+      // RESCUE boundary: a resting HEDGE_SECOND_LEG maker admitted BEFORE the
+      // rescue ownership must not stay economically live while the arbiter
+      // decides between A (SELL) and B (pair-lock). Cancel/fence it first, then
+      // re-read position and books from FRESH state.
+      await this.cancelRestingHedgeMakers(marketId, "RESCUE_ELIGIBLE");
 
       const position = this.ledger.positions.get(marketId);
       if (!position?.unpairedOutcome || d(position.unpairedQuantity).lte(0)) {
@@ -4788,13 +4963,48 @@ export class EngineService {
         return;
       }
 
-      const { candidate, reason: candidateRejection } = evaluateProtectiveDeRiskCandidate({
+      // ---- PR2 rescue arbitration: build BOTH candidates from the SAME
+      // rescue observation state (A = protective SELL, B = pair-lock BUY). ----
+      const oppositeOutcome: Outcome = position.unpairedOutcome === "UP" ? "DOWN" : "UP";
+      let oppositeSnapshot = this.snapshots.get(marketId)?.[oppositeOutcome]
+        ?? [...this.state.marketSnapshots.values()].find((item) => item.marketId === marketId && item.outcome === oppositeOutcome)
+        ?? null;
+      if (oppositeSnapshot && !this.adapterTokenSynchronized(oppositeSnapshot.tokenId)) {
+        // B is unavailable from an unsynchronized book; the arbiter may still
+        // choose A. Never price B from a stale/unsynced opposite book.
+        oppositeSnapshot = null;
+      }
+      if (oppositeSnapshot) {
+        // Coherent comparison (§16): B must be priced from a FRESH opposite
+        // book from the SAME observation window. A stale/absent/timestamp-
+        // disordered opposite ladder makes B unavailable (fail closed) instead
+        // of comparing A@fresh against B@stale.
+        const oppositeReceivedAtMs = Date.parse(oppositeSnapshot.receivedAt);
+        const oppositeAgeMs = now.getTime() - oppositeReceivedAtMs;
+        if (!Number.isFinite(oppositeReceivedAtMs) || oppositeAgeMs > this.riskLimits.staleFeedTimeoutMs) {
+          oppositeSnapshot = null;
+        }
+      }
+      const aEval = evaluateProtectiveDeRiskCandidate({
         position,
         snapshot,
         maxOrderSizeUsd: this.riskLimits.maxOrderSizeUsd,
       });
-      if (!candidate) {
-        const rejectionReason = candidateRejection ?? "NO_EXECUTABLE_BID_DEPTH";
+      const bEval: RescueCandidateEvaluation = oppositeSnapshot
+        ? evaluateRescueSecondLegCandidate({
+          position,
+          snapshot: oppositeSnapshot,
+          maxOrderSizeUsd: this.riskLimits.maxOrderSizeUsd,
+        })
+        : { candidate: null, reason: "NO_EXECUTABLE_ASK_DEPTH" };
+      const aReason: string | null = aEval.reason;
+      const bReason: string | null = bEval.reason;
+      if (!aEval.candidate && !bEval.candidate) {
+        // A-oriented diagnostic contract is preserved: when both are null the
+        // suppression reason keeps the unpaired-book reason (the old single
+        // candidate semantics); the opposite-book reason stays observable in
+        // extras for the rescue arbiter.
+        const rejectionReason = aEval.reason ?? bEval.reason ?? "NO_EXECUTABLE_DEPTH";
         const lastWaitingAt = this.protectiveDeRiskLastWaitingAt.get(marketId) ?? Number.NEGATIVE_INFINITY;
         if (now.getTime() - lastWaitingAt >= PROTECTIVE_DE_RISK_WAIT_SAMPLE_MS) {
           this.protectiveDeRiskLastWaitingAt.set(marketId, now.getTime());
@@ -4802,15 +5012,18 @@ export class EngineService {
             deRiskReason: "MAX_UNHEDGED_DURATION",
             unhedgedStartedAt,
             unhedgedDurationMs,
-            attemptedAction: "SELL_UNPAIRED",
+            attemptedAction: "NONE",
             requestedQty: position.unpairedQuantity,
             executableQty: "0",
             finalState: rejectionReason,
+            selection: "NONE",
+            aReason: aEval.reason,
+            bReason: bEval.reason,
           }, this.assetByMarket.get(marketId) ?? snapshot.asset ?? null);
         }
         this.recordProtectiveDeRiskSuppressed(
           marketId, "GATE_CANDIDATE_NULL", rejectionReason,
-          { position, snapshot, unhedgedDurationMs },
+          { position, snapshot, unhedgedDurationMs, extra: { aReason: aEval.reason, bReason: bEval.reason } },
         );
         return;
       }
@@ -4830,7 +5043,7 @@ export class EngineService {
           this.recordProtectiveDeRiskSuppressed(
             marketId, "GATE_RETRY_BACKOFF", "RETRY_BACKOFF",
             {
-              position, snapshot, candidate, unhedgedDurationMs,
+              position, snapshot, candidate: aEval.candidate, unhedgedDurationMs,
               extra: { retryNextAttemptAtMs: nextAttemptAt, vetoFingerprint },
             },
           );
@@ -4844,97 +5057,225 @@ export class EngineService {
 
       const asset = this.assetByMarket.get(marketId) ?? snapshot.asset ?? null;
       const exposure = computePaperExposures(this.ledger.positions.values(), marketId, this.assetByMarket, now.getTime());
-      const projected = projectPaperExposures({
-        current: exposure,
-        positions: projectableLegsFromPositions(this.ledger.positions.values(), this.assetByMarket),
-        candidate: {
-          marketId,
-          outcome: candidate.outcome,
-          quantity: candidate.quantity,
-          price: candidate.limitPrice,
-          side: "SELL",
-          intent: "PROTECTIVE_DE_RISK",
-          asset,
-        },
-        nowMs: now.getTime(),
-      });
+      const projectedA = aEval.candidate
+        ? projectPaperExposures({
+          current: exposure,
+          positions: projectableLegsFromPositions(this.ledger.positions.values(), this.assetByMarket),
+          candidate: {
+            marketId,
+            outcome: snapshot.outcome,
+            quantity: aEval.candidate.quantity,
+            price: aEval.candidate.limitPrice,
+            side: "SELL",
+            intent: "PROTECTIVE_DE_RISK",
+            asset,
+          },
+          nowMs: now.getTime(),
+        })
+        : null;
+      const projectedB = bEval.candidate && oppositeSnapshot
+        ? projectPaperExposures({
+          current: exposure,
+          positions: projectableLegsFromPositions(this.ledger.positions.values(), this.assetByMarket),
+          candidate: {
+            marketId,
+            outcome: oppositeOutcome,
+            quantity: bEval.candidate.quantity,
+            price: bEval.candidate.limitPrice,
+            side: "BUY",
+            intent: "RESCUE_SECOND_LEG",
+            asset,
+          },
+          nowMs: now.getTime(),
+        })
+        : null;
+      const ledger = this.ledger.snapshot();
+      const rescuePosition: HedgePositionFacts = {
+        marketId: position.marketId,
+        unpairedOutcome: position.unpairedOutcome,
+        unpairedQuantity: position.unpairedQuantity,
+        expectedOppositeTokenId: oppositeSnapshot ? this.currentTokenIdFor(marketId, oppositeOutcome) : null,
+      };
+      // Both candidates are priced from the SAME observation state: same now,
+      // same exposure snapshot, same ledger facts. Only the projected exposure
+      // differs per candidate (SELL vs BUY for the correct projected position).
+      const baseRiskCommon = {
+        now,
+        marketFeedAt: new Date(snapshot.receivedAt),
+        btcFeedAt: now,
+        referenceFeedAt: null,
+        referenceRequired: false,
+        asset,
+        assetExposureUsd: exposure.asset,
+        databaseAvailable: this.state.database === "UP",
+        timestampDisorder: this.timestampDisorder,
+        riskStateAvailable: this.protectiveRiskStateAvailable(),
+        dailyPnlUsd: ledger.netTradingPnl,
+        drawdownUsd: ledger.drawdown,
+        marketExposureUsd: exposure.market,
+        totalExposureUsd: exposure.total,
+        directionalExposureUsd: exposure.directional,
+        unhedgedExposureUsd: exposure.unhedged,
+        unhedgedDurationMs: exposure.unhedgedDurationMs,
+        availableCashUsd: this.ledger.availableCash().toFixed(),
+        referenceProviderBlocked: false,
+        marketEntryQualified: this.entryQualified.has(marketId),
+        externalSignalsLastMinute: 0,
+        lastStrategyTradeAt: this.lastTradeAt,
+        duplicateTrade: false,
+        experimentEntryOpen: experimentAllowsHedge(this.experiment),
+        executionErrorsLastHour,
+        externalRiskRecommendedVeto: false,
+        shuttingDown: this.state.draining,
+      };
+      const baseRiskA = {
+        ...baseRiskCommon,
+        projectedMarketExposureUsd: projectedA?.market,
+        projectedTotalExposureUsd: projectedA?.total,
+        projectedDirectionalExposureUsd: projectedA?.directional,
+        projectedUnhedgedExposureUsd: projectedA?.unhedged,
+        projectedAssetExposureUsd: projectedA?.asset,
+      };
+        const baseRiskB = {
+        ...baseRiskCommon,
+        projectedMarketExposureUsd: projectedB?.market,
+        projectedTotalExposureUsd: projectedB?.total,
+        projectedDirectionalExposureUsd: projectedB?.directional,
+        projectedUnhedgedExposureUsd: projectedB?.unhedged,
+        projectedAssetExposureUsd: projectedB?.asset,
+      };
       const retryCount = (this.protectiveDeRiskAttempts.get(marketId) ?? 0) + 1;
       this.protectiveDeRiskAttempts.set(marketId, retryCount);
       const traceId = createId("derisk");
       const triggerId = createId("derisk-trigger");
-      const ledger = this.ledger.snapshot();
-      const decision = decideProtectivePaperOrder({
-        candidate,
-        snapshotAfterDecisionLatency: snapshot,
-        limits: this.riskLimits,
-        traceId,
-        triggerId,
-        baseRisk: {
-          now,
-          marketFeedAt: new Date(snapshot.receivedAt),
-          btcFeedAt: now,
-          referenceFeedAt: null,
-          referenceRequired: false,
-          asset,
-          assetExposureUsd: exposure.asset,
-          databaseAvailable: this.state.database === "UP",
-          timestampDisorder: this.timestampDisorder,
-          riskStateAvailable: this.protectiveRiskStateAvailable(),
-          dailyPnlUsd: ledger.netTradingPnl,
-          drawdownUsd: ledger.drawdown,
-          marketExposureUsd: exposure.market,
-          totalExposureUsd: exposure.total,
-          directionalExposureUsd: exposure.directional,
-          unhedgedExposureUsd: exposure.unhedged,
-          unhedgedDurationMs: exposure.unhedgedDurationMs,
-          projectedMarketExposureUsd: projected.market,
-          projectedTotalExposureUsd: projected.total,
-          projectedDirectionalExposureUsd: projected.directional,
-          projectedUnhedgedExposureUsd: projected.unhedged,
-          projectedAssetExposureUsd: projected.asset,
-          availableCashUsd: this.ledger.availableCash().toFixed(),
-          referenceProviderBlocked: false,
-          marketEntryQualified: this.entryQualified.has(marketId),
-          externalSignalsLastMinute: 0,
-          lastStrategyTradeAt: this.lastTradeAt,
-          duplicateTrade: false,
-          experimentEntryOpen: experimentAllowsHedge(this.experiment),
-          executionErrorsLastHour,
-          externalRiskRecommendedVeto: false,
-          shuttingDown: this.state.draining,
-        },
-      });
-      this.state.latestRisk = decision.risk;
 
-      const residualQuantity = d(position.unpairedQuantity).minus(candidate.quantity);
+      // Evaluate A and B from the SAME rescue observation state (no compare
+      // across different book timestamps). VWAP-derived guaranteed salvage is
+      // the only economic comparison input — the first-leg entry price is sunk.
+      let aDecision: ReturnType<typeof decideProtectivePaperOrder> | null = null;
+      let bDecision: ReturnType<typeof decideRescueSecondLegOrder> | null = null;
+      let aDecisionReason: string | null = aReason;
+      let bDecisionReason: string | null = bReason;
+      if (aEval.candidate && projectedA) {
+        // The evaluated decision (with its risk/veto details) is kept even when
+        // rejected so the RISK_EVALUATION payload preserves the old protective
+        // veto observability contract (accepted=false, vetoes=...).
+        const evaluated = decideProtectivePaperOrder({
+          candidate: aEval.candidate,
+          snapshotAfterDecisionLatency: snapshot,
+          limits: this.riskLimits,
+          traceId,
+          triggerId,
+          baseRisk: baseRiskA,
+        });
+        aDecision = evaluated;
+        if (!evaluated.accepted) aDecisionReason = evaluated.risk.vetoes[0] ?? "RISK_VETO";
+      } else {
+        aDecisionReason = aReason ?? "NO_EXECUTABLE_BID_DEPTH";
+      }
+      if (bEval.candidate && oppositeSnapshot && projectedB) {
+        if (!rescuePosition.expectedOppositeTokenId || bEval.candidate.tokenId !== rescuePosition.expectedOppositeTokenId) {
+          bDecisionReason = "OPPOSITE_TOKEN_MISMATCH";
+        } else {
+          const evaluated = decideRescueSecondLegOrder({
+            candidate: bEval.candidate,
+            snapshotAfterDecisionLatency: oppositeSnapshot,
+            limits: this.riskLimits,
+            traceId,
+            triggerId,
+            baseRisk: baseRiskB,
+            rescuePosition,
+          });
+          bDecision = evaluated;
+          if (!evaluated.accepted) bDecisionReason = evaluated.risk.vetoes[0] ?? "RISK_VETO";
+        }
+      } else {
+        bDecisionReason = bReason ?? "NO_EXECUTABLE_ASK_DEPTH";
+      }
+
+      const aEconomics: RiskReductionCandidateEconomics = {
+        kind: "PROTECTIVE_DE_RISK",
+        accepted: aDecision?.accepted === true,
+        rejectionReason: aDecisionReason,
+        quantity: aDecision?.order?.quantity ?? null,
+        vwap: aDecision?.bookVwap ?? null,
+        feeUsd: aDecision?.feeUsdTotal ?? null,
+        guaranteedSalvageUsd: aDecision?.guaranteedSalvageUsd ?? null,
+      };
+      const bEconomics: RiskReductionCandidateEconomics = {
+        kind: "RESCUE_SECOND_LEG",
+        accepted: bDecision?.accepted === true,
+        rejectionReason: bDecisionReason,
+        quantity: bDecision?.order?.quantity ?? null,
+        vwap: bDecision?.bookVwap ?? null,
+        feeUsd: bDecision?.feeUsdTotal ?? null,
+        guaranteedSalvageUsd: bDecision?.guaranteedSalvageUsd ?? null,
+      };
+      const arbitration = arbitrateRiskReduction(aEconomics, bEconomics);
+      const selectedIntent: "PROTECTIVE_DE_RISK" | "RESCUE_SECOND_LEG" | null =
+        arbitration.selection === "NONE" ? null : arbitration.selection;
+      const selectedDecision = selectedIntent === "RESCUE_SECOND_LEG" ? bDecision : aDecision;
+      this.state.latestRisk = selectedDecision?.risk ?? null;
+      const eligibilityReason: RiskReductionUnhedgedReason = this.deRiskEligibilityReason(eligibility, unhedgedStartedAt);
+
+      const residualQuantity = selectedDecision?.order
+        ? d(position.unpairedQuantity).minus(selectedDecision.order.quantity)
+        : d(position.unpairedQuantity);
       const audit: ProtectiveDeRiskAudit = {
         deRiskReason: "MAX_UNHEDGED_DURATION",
+        eligibilityReason,
         unhedgedStartedAt,
         unhedgedDurationMs,
-        attemptedAction: "SELL_UNPAIRED",
+        attemptedAction: selectedIntent === "RESCUE_SECOND_LEG" ? "RESCUE_SECOND_LEG" : selectedIntent === "PROTECTIVE_DE_RISK" ? "SELL_UNPAIRED" : "NONE",
         requestedQty: position.unpairedQuantity,
-        executableQty: candidate.quantity,
-        executionPrice: decision.bookVwap,
+        executableQty: selectedDecision?.order?.quantity ?? "0",
+        executionPrice: selectedDecision?.bookVwap ?? null,
         residualQuantity: residualQuantity.gt(0) ? residualQuantity.toFixed() : "0",
-        residualExposure: projected.unhedged,
+        residualExposure: (selectedIntent === "RESCUE_SECOND_LEG" ? projectedB?.unhedged : projectedA?.unhedged) ?? exposure.unhedged,
         retryCount,
-        finalState: decision.accepted ? "ORDER_ADMITTED" : "RISK_VETO",
+        finalState: selectedDecision?.order ? "ORDER_ADMITTED" : "RISK_VETO",
+        selection: arbitration.selection,
+        selectionReason: arbitration.selectionReason,
+        tieBreakUsed: arbitration.tieBreakUsed,
+        aAvailable: aDecision?.accepted === true,
+        aReason: aDecisionReason,
+        aQuantity: aDecision?.order?.quantity ?? null,
+        aVwap: aDecision?.bookVwap ?? null,
+        aFeeUsd: aDecision?.feeUsdTotal ?? null,
+        aGuaranteedSalvageUsd: aDecision?.guaranteedSalvageUsd ?? null,
+        bAvailable: bDecision?.accepted === true,
+        bReason: bDecisionReason,
+        bQuantity: bDecision?.order?.quantity ?? null,
+        bVwap: bDecision?.bookVwap ?? null,
+        bFeeUsd: bDecision?.feeUsdTotal ?? null,
+        bRequiredCashUsd: bDecision?.requiredCashUsd ?? null,
+        bGuaranteedSalvageUsd: bDecision?.guaranteedSalvageUsd ?? null,
       };
 
       await this.persistReportInput(createJournalEvent({
         traceId,
         type: "RISK_EVALUATION",
         aggregateType: "risk",
-        aggregateId: decision.risk.id,
-        payload: { ...decision.risk, marketId, asset, intent: "PROTECTIVE_DE_RISK", deRisk: audit },
+        aggregateId: selectedDecision?.risk.id ?? (aDecision?.risk.id ?? bDecision?.risk.id ?? createId("risk")),
+        payload: {
+          ...(selectedDecision?.risk ?? aDecision?.risk ?? bDecision?.risk ?? {}),
+          marketId,
+          asset,
+          intent: selectedIntent
+            ?? (aDecision ? "PROTECTIVE_DE_RISK" : (bDecision ? "RESCUE_SECOND_LEG" : "NONE")),
+          deRisk: audit,
+        },
       }));
-      if (!decision.accepted || !decision.order) {
+      if (!selectedDecision || !selectedDecision.order) {
         this.protectiveDeRiskVetoFingerprint.set(marketId, hardStateFingerprint);
         this.protectiveDeRiskNextAttemptAt.set(marketId, now.getTime() + PROTECTIVE_DE_RISK_VETO_RETRY_MS);
-        for (const reason of decision.risk.vetoes) this.metrics.riskVetoes.inc({ reason });
+        // Preserve the old protective veto observability: prefer the protective
+        // (A) veto list, fall back to rescue (B), then the arbitration reason.
+        const vetoMetrics = aDecision?.risk.vetoes ?? bDecision?.risk.vetoes ?? [arbitration.selectionReason];
+        for (const reason of vetoMetrics) this.metrics.riskVetoes.inc({ reason });
         this.record("RISK_VETO", traceId, marketId, {
-          reasons: decision.risk.vetoes,
-          intent: "PROTECTIVE_DE_RISK",
+          reasons: vetoMetrics,
+          intent: selectedIntent ?? "NONE",
           deRisk: audit,
         }, asset);
         return;
@@ -4942,16 +5283,16 @@ export class EngineService {
 
       this.protectiveDeRiskVetoFingerprint.delete(marketId);
       this.record("RISK_ACCEPT", traceId, marketId, {
-        orderId: decision.order.id,
-        intent: "PROTECTIVE_DE_RISK",
+        orderId: selectedDecision.order.id,
+        intent: selectedIntent,
         deRisk: audit,
       }, asset);
       const unpairedBeforeSubmit = d(position.unpairedQuantity);
       await this.submitPaperOrder(
-        decision.order,
-        snapshot,
-        `${marketId}:${candidate.outcome}:PROTECTIVE_DE_RISK`,
-        "PROTECTIVE_DE_RISK",
+        selectedDecision.order,
+        selectedIntent === "RESCUE_SECOND_LEG" ? oppositeSnapshot! : snapshot,
+        `${marketId}:${selectedIntent === "RESCUE_SECOND_LEG" ? oppositeOutcome : snapshot.outcome}:${selectedIntent}`,
+        selectedIntent!,
         audit,
       );
       const afterSubmit = this.ledger.positions.get(marketId);
@@ -4964,19 +5305,32 @@ export class EngineService {
         this.protectiveDeRiskNextAttemptAt.delete(marketId);
       }
     } finally {
-      this.protectiveDeRiskInFlight.delete(marketId);
+      this.riskReductionInFlight.delete(marketId);
       const current = this.ledger.positions.get(marketId);
       if (!current || d(current.unpairedQuantity).lte(0)) this.clearProtectiveDeRiskState(marketId);
     }
   }
 
   /**
-   * Hard safety gate for a protective exit. The overload latch can trip to
-   * FAIL_CLOSED between the entry guard and this decision (async boundary while
-   * cancelling stale first-leg makers), and integrity faults and journal
-   * degradation are independent sticky signals. This re-reads the live latch
-   * facts in a fresh narrowing context instead of trusting an earlier guard.
+   * Distinguishes which deadline bound made the position protective-eligible:
+   * the hard unhedged duration or the expiry safety window (§44). Pure
+   * observability; the deadline math never changes.
    */
+  private deRiskEligibilityReason(
+    eligibility: { effectiveDeadlineMs: number | null; marketEndMs: number | null },
+    unhedgedStartedAt: string,
+  ): RiskReductionUnhedgedReason {
+    const startedMs = Date.parse(unhedgedStartedAt);
+    const durationDeadlineMs = Number.isFinite(startedMs) ? startedMs + this.riskLimits.maxUnhedgedDurationMs : null;
+    if (eligibility.marketEndMs != null && durationDeadlineMs != null) {
+      const expiryDeadlineMs = eligibility.marketEndMs - PROTECTIVE_DE_RISK_PRE_EXPIRY_SAFETY_MS;
+      if (eligibility.effectiveDeadlineMs != null && eligibility.effectiveDeadlineMs === expiryDeadlineMs && expiryDeadlineMs < durationDeadlineMs) {
+        return "PRE_EXPIRY_SAFETY";
+      }
+    }
+    return "MAX_UNHEDGED_DURATION";
+  }
+
   private protectiveRiskStateAvailable(): boolean {
     return !this.state.journalDegraded
       && !this.overload.hasIntegrityFault
@@ -6590,7 +6944,7 @@ function assetNeedsReliableReference(
 export function collectMarketFeedAt(
   pair: Partial<Record<Outcome, MarketSnapshot>> | undefined,
   outcome: Outcome,
-  intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK",
+  intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK" | "RESCUE_SECOND_LEG",
   fallbackReceivedAt?: string | Date | null,
 ): Date | null {
   const required = pair?.[outcome];

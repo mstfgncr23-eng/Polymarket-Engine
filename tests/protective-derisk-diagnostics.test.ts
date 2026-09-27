@@ -84,9 +84,15 @@ describe("protective de-risk diagnostic suppression observability", () => {
       const downBook = book(setup.clock, "DOWN", 1, [{ price: "0.40", quantity: "10" }]);
       await setup.market.emitSnapshot(book(setup.clock, "UP", 1, [{ price: "0.59", quantity: "300" }]));
       await setup.engine.applyObservedFill({ ...firstLeg(setup.clock, downBook.eventId), feeSchedule: downBook.feeSchedule });
-      setup.clock.nowMs = START_MS + 301_000;
+      setup.clock.nowMs = START_MS + 299_000;
       await setup.market.emitSnapshot(book(setup.clock, "DOWN", 2, [{ price: "0.45", quantity: "10" }]));
-      await setup.market.emitSnapshot(book(setup.clock, "UP", 2, [{ price: "0.55", quantity: "300" }]));
+      // Opposite asks @0.60 make the pair-lock salvage strictly worse than the
+      // protective SELL @0.45, so the old control path still selects A.
+      await setup.market.emitSnapshot(book(setup.clock, "UP", 2, [{ price: "0.55", quantity: "300" }], [{ price: "0.60", quantity: "300" }]));
+      // Load both books BEFORE eligibility so the post-deadline evaluation is a
+      // single deterministic attempt on the intended (fresh) state.
+      setup.clock.nowMs = START_MS + 301_000;
+      await setup.engine.tickMaintenance();
       await waitFor(
         () => setup.journal.queryEvents({ types: ["PAPER_FILL"] }),
         (rows) => rows.some((row) => row.payload.intent === "PROTECTIVE_DE_RISK"),
@@ -173,11 +179,17 @@ it("2 records UNHEDGED_DURATION_NOT_EXCEEDED before the policy deadline", async 
       const downBook = book(setup.clock, "DOWN", 1, [{ price: "0.40", quantity: "10" }]);
       await setup.market.emitSnapshot(book(setup.clock, "UP", 1, [{ price: "0.59", quantity: "300" }]));
       await setup.engine.applyObservedFill({ ...firstLeg(setup.clock, downBook.eventId), feeSchedule: downBook.feeSchedule });
-      // Store the DOWN book at +301s (blocked feed from then on) without a SELL
+      // Store the DOWN book at +299s (blocked feed from then on) without a SELL
       // (zero bid depth -> candidate-null row, proving the book made it).
-      setup.clock.nowMs = START_MS + 301_000;
+      setup.clock.nowMs = START_MS + 299_000;
       await setup.market.emitSnapshot(book(setup.clock, "DOWN", 2, [], [{ price: "0.40", quantity: "10" }]));
-      await setup.market.emitSnapshot(book(setup.clock, "UP", 2, [{ price: "0.55", quantity: "300" }]));
+      // No executable opposite asks: the A-side diagnostic must not be replaced
+      // by a rescue pair-lock (PR2 selects B only when B is actually executable).
+      await setup.market.emitSnapshot(book(setup.clock, "UP", 2, [{ price: "0.55", quantity: "300" }], []));
+      // Both books are fresh; step past the deadline and trigger the single
+      // deterministic evaluation.
+      setup.clock.nowMs = START_MS + 301_000;
+      await setup.engine.tickMaintenance();
       await waitFor(() => suppressed(setup), (list) => list.some((row) => row.payload.gate === "GATE_CANDIDATE_NULL"));
       // A different gate (SNAPSHOT_STALE) transitions within the same 60s
       // window and must emit immediately (rate limit is per market+gate).
@@ -203,9 +215,12 @@ it("2 records UNHEDGED_DURATION_NOT_EXCEEDED before the policy deadline", async 
       const downBook = book(setup.clock, "DOWN", 1, [{ price: "0.40", quantity: "10" }]);
       await setup.market.emitSnapshot(book(setup.clock, "UP", 1, [{ price: "0.59", quantity: "300" }]));
       await setup.engine.applyObservedFill({ ...firstLeg(setup.clock, downBook.eventId), feeSchedule: downBook.feeSchedule });
-      setup.clock.nowMs = START_MS + 301_000;
+      setup.clock.nowMs = START_MS + 299_000;
       await setup.market.emitSnapshot(book(setup.clock, "DOWN", 2, [], [{ price: "0.40", quantity: "10" }]));
-      await setup.market.emitSnapshot(book(setup.clock, "UP", 2, [{ price: "0.55", quantity: "300" }]));
+      // No executable opposite asks so the A-side suppression remains observable.
+      await setup.market.emitSnapshot(book(setup.clock, "UP", 2, [{ price: "0.55", quantity: "300" }], []));
+      setup.clock.nowMs = START_MS + 301_000;
+      await setup.engine.tickMaintenance();
       const rows = await waitFor(() => suppressed(setup), (list) => list.some((row) => row.payload.gate === "GATE_CANDIDATE_NULL"));
       const row = rows.find((item) => item.payload.gate === "GATE_CANDIDATE_NULL");
       expect(row?.payload.reason).toBe("NO_EXECUTABLE_BID_DEPTH");
@@ -229,12 +244,15 @@ it("2 records UNHEDGED_DURATION_NOT_EXCEEDED before the policy deadline", async 
       const downBook = book(setup.clock, "DOWN", 1, [{ price: "0.40", quantity: "10" }]);
       await setup.market.emitSnapshot(book(setup.clock, "UP", 1, [{ price: "0.59", quantity: "300" }]));
       await setup.engine.applyObservedFill({ ...firstLeg(setup.clock, downBook.eventId), feeSchedule: downBook.feeSchedule });
-      setup.clock.nowMs = START_MS + 301_000;
+      setup.clock.nowMs = START_MS + 299_000;
       await setup.market.emitSnapshot(snapshot({
         ...book(setup.clock, "DOWN", 2, [{ price: "0.45", quantity: "88961.66" }]),
         minOrderSize: null,
       }));
-      await setup.market.emitSnapshot(book(setup.clock, "UP", 2, [{ price: "0.55", quantity: "300" }]));
+      // No executable opposite asks so the A-side suppression remains observable.
+      await setup.market.emitSnapshot(book(setup.clock, "UP", 2, [{ price: "0.55", quantity: "300" }], []));
+      setup.clock.nowMs = START_MS + 301_000;
+      await setup.engine.tickMaintenance();
       const rows = await waitFor(() => suppressed(setup), (list) => list.some((row) => row.payload.gate === "GATE_CANDIDATE_NULL"));
       const row = rows.find((item) => item.payload.gate === "GATE_CANDIDATE_NULL");
       expect(row?.payload.reason).toBe("MIN_ORDER_SIZE_UNKNOWN");
@@ -260,11 +278,14 @@ it("2 records UNHEDGED_DURATION_NOT_EXCEEDED before the policy deadline", async 
       const downBook = book(setup.clock, "DOWN", 1, [{ price: "0.40", quantity: "10" }]);
       await setup.market.emitSnapshot(book(setup.clock, "UP", 1, [{ price: "0.59", quantity: "300" }]));
       await setup.engine.applyObservedFill({ ...firstLeg(setup.clock, downBook.eventId), feeSchedule: downBook.feeSchedule });
-      setup.clock.nowMs = START_MS + 301_000;
+      setup.clock.nowMs = START_MS + 299_000;
       // 0.5 executable shares against the fixture's known minimum order size
       // of 1: quantity exists but is below the minimum.
       await setup.market.emitSnapshot(book(setup.clock, "DOWN", 2, [{ price: "0.45", quantity: "0.5" }]));
-      await setup.market.emitSnapshot(book(setup.clock, "UP", 2, [{ price: "0.55", quantity: "300" }]));
+      // No executable opposite asks so the A-side suppression remains observable.
+      await setup.market.emitSnapshot(book(setup.clock, "UP", 2, [{ price: "0.55", quantity: "300" }], []));
+      setup.clock.nowMs = START_MS + 301_000;
+      await setup.engine.tickMaintenance();
       const rows = await waitFor(() => suppressed(setup), (list) => list.some((row) => row.payload.gate === "GATE_CANDIDATE_NULL"));
       const row = rows.find((item) => item.payload.gate === "GATE_CANDIDATE_NULL");
       expect(row?.payload.reason).toBe("QUANTITY_BELOW_MIN_ORDER_SIZE");
