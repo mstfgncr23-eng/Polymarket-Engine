@@ -4036,6 +4036,21 @@ export class EngineService {
           const currentPosition = this.ledger.positions.get(fill.marketId);
 
           if (economicIntent === "HEDGE_SECOND_LEG" || economicIntent === "PROTECTIVE_DE_RISK" || economicIntent === "RESCUE_SECOND_LEG") {
+            // DURABLE CANCEL WINS over an older in-flight HEDGE maker fill. A
+            // hedge maker fill derived before rescue ownership must not commit
+            // once the rescue durably cancelled the resting order: its
+            // `restingAfter` payload would resurrect the cancelled order
+            // without its reservation (resting_without_reservation invariant).
+            if (economicIntent === "HEDGE_SECOND_LEG" && fill.liquidityRole === "MAKER") {
+              const activeHedgeResting = this.restingOrders.get(fill.orderId);
+              if (
+                !activeHedgeResting
+                || !d(activeHedgeResting.remaining).gt(0)
+                || this.restingOrderIntent(activeHedgeResting) !== "HEDGE_SECOND_LEG"
+              ) {
+                throw new RiskReductionLifecycleGuardRejectedError(fill.marketId, "HEDGE_SECOND_LEG", "HEDGE_MAKER_NOT_ACTIVE");
+              }
+            }
             // Protected actions (protective SELL and rescue pair-lock BUY)
             // re-validate hard safety immediately before the durable economic
             // mutation. A flip since risk evaluation makes this a state-changed

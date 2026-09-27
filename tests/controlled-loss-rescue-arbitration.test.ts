@@ -756,6 +756,118 @@ it("decideRescueSecondLegOrder: salvage = q - notional - fee (TAKER ask walk)", 
       await setup.engine.stop();
     }
   });
+
+  it("Test 3: durable rescue CANCEL wins over an older in-flight hedge maker fill (no ghost resting, restart clean)", { timeout: 30_000 }, async () => {
+    const journal = new SettlementReadHoldJournal();
+    const clock: Clock = { nowMs: START_MS };
+    const endDate = new Date(START_MS + 3_600_000).toISOString();
+    const envFactory = () => qualifiedPaperEnv({
+      DISCOVERY_INTERVAL_MS: "3600000", ESTIMATED_INFRA_COST_PER_HOUR_USD: "0",
+      PAPER_EXECUTION_STYLE: "TAKER", PAPER_EXECUTION_LATENCY_MS: "0",
+    });
+    const make = (env: ReturnType<typeof envFactory>) => {
+      const market = new ScriptedMarketAdapter();
+      market.queue(discoveryReport([qualified("btc-mkt", "XRP", "btc-up", "btc-down", endDate)]));
+      return {
+        engine: new EngineService(env, journal, { error: () => undefined }, {
+          market: market as never,
+          referenceRegistry: new ScriptedReferenceRegistry() as never,
+          activation: new NoopGrokActivationBridge(),
+          now: () => new Date(clock.nowMs),
+          resolutionFetcher: async () => null,
+        }),
+        market,
+      };
+    };
+
+    const first = make(envFactory());
+    let preRestartCash: string | null = null;
+    try {
+      await first.engine.start();
+      await first.market.waitForHandlers();
+      expect((await first.engine.beginExperiment()).ok).toBe(true);
+      // 1) DOWN unpaired ~6.097 residual.
+      const downBook1 = book(clock, "DOWN", 1, []);
+      await first.engine.applyObservedFill({ ...firstLeg(clock, downBook1.eventId), feeSchedule: downBook1.feeSchedule });
+      expect(first.engine.ledger.positions.get("btc-mkt")?.unpairedQuantity).toBe("6.09756098");
+
+      // 2) Resting HEDGE_SECOND_LEG maker BUY UP 0.40 (real durable reserve path).
+      const upRest = book(clock, "UP", 2, [{ price: "0.40", quantity: "10" }], [{ price: "0.60", quantity: "1000" }]);
+      await first.market.emitSnapshot(upRest);
+      await first.engine.restMakerForTest(order("MAKER", {
+        id: "hedge-maker-3", marketId: "btc-mkt", tokenId: "btc-up", outcome: "UP", side: "BUY",
+        requestedPrice: "0.40", quantity: "6.09756098", createdAt: iso(clock),
+      }), upRest, "HEDGE_SECOND_LEG");
+      expect(first.engine.makerReservationsForTest().has("hedge-maker-3")).toBe(true);
+
+      // Train the maker queue empty, re-add a 2-share level, so the FINAL drop
+      // on the next snapshot derives exactly ~1 share (eligible 2 * 0.5).
+      clock.nowMs = START_MS + 1_000;
+      await first.market.emitSnapshot(book(clock, "UP", 3, [], [{ price: "0.60", quantity: "1000" }]));
+      clock.nowMs = START_MS + 2_000;
+      await first.market.emitSnapshot(book(clock, "UP", 4, [{ price: "0.40", quantity: "2" }], [{ price: "0.60", quantity: "1000" }]));
+
+      // 3) Derive ~1 share stale maker fill, 4) hold it at the settlement read.
+      let releaseFill!: () => void;
+      const fillHold = new Promise<void>((resolve) => { releaseFill = resolve; });
+      journal.setSettlementReadHoldForTest(fillHold);
+      clock.nowMs = eligibilityMs(3_600_000) + 1;
+      const derivingEmit = first.market.emitSnapshot(book(clock, "UP", 5, [], [{ price: "0.30", quantity: "6" }]));
+      await waitFor(() => journal.heldSettlementRead, (held) => held === true);
+
+      // 5/6/7) Rescue durably cancels the hedge maker, then A (PROTECTIVE)
+      // SELLs only ~1 share (executable bid depth = 1). B is fresh but vetoed
+      // by MINIMUM_LIQUIDITY, so the arbiter selects A.
+      await first.market.emitSnapshot(book(clock, "DOWN", 2, [{ price: "0.75", quantity: "1" }], []));
+      await waitFor(() => fills({ engine: first.engine, journal, market: first.market, clock }, "PROTECTIVE_DE_RISK"), (list) => list.length > 0);
+      expect(first.engine.makerReservationsForTest().has("hedge-maker-3")).toBe(false);
+      await waitFor(() => journal.queryDurableTransitions({ types: ["PAPER_ORDER_CANCELLED"], limit: 8 }), (rows) => rows.length > 0);
+      await waitFor(() => first.engine.restingOrdersForTest(), (orders) => orders.size === 0);
+      // 8) Residual ~5.097 remains (partial protective SELL only).
+      const afterRescue = first.engine.ledger.positions.get("btc-mkt");
+      expect(Number(afterRescue?.unpairedQuantity ?? 0)).toBeCloseTo(6.09756098 - 1, 8);
+// 9) Stale ~1-share fill <= residual, so NO_UNPAIRED/QUANTITY_EXCEEDS
+      // cannot reject it; 10) release -> HEDGE_MAKER_NOT_ACTIVE must reject it.
+      releaseFill();
+      await derivingEmit;
+      const fillRows = await journal.queryEvents({ types: ["PAPER_FILL"] });
+      expect(fillRows.some((row) => row.payload.orderId === "hedge-maker-3")).toBe(false);
+      const durableFills = await journal.queryDurableTransitions({ types: ["PAPER_FILL"], limit: 16 });
+      expect(durableFills.filter((row) => row.operationKey.startsWith("fill:")).map((row) => row.operationKey)).toHaveLength(2);
+      const after = first.engine.ledger.positions.get("btc-mkt");
+      expect(Number(after?.upQuantity ?? 0)).toBe(0);
+      expect(Number(after?.downQuantity ?? 0)).toBeCloseTo(6.09756098 - 1, 8);
+      expect(Number(after?.unpairedQuantity ?? 0)).toBeCloseTo(6.09756098 - 1, 8);
+      // No ghost resting and no canceled-order reservation.
+      expect(first.engine.restingOrdersForTest().has("hedge-maker-3")).toBe(false);
+      expect(first.engine.makerReservationsForTest().has("hedge-maker-3")).toBe(false);
+      expect(first.engine.integrityFault()).toBe(false);
+    } finally {
+      preRestartCash = first.engine.ledger.snapshot().cash;
+      await first.engine.stop();
+    }
+// Restart/recovery on the SAME journal: clean replay, no ghost maker,
+    // identical ledger economics.
+    const recovered = make(envFactory());
+    try {
+      await recovered.engine.start();
+      await recovered.market.waitForHandlers();
+      expect(recovered.engine.state.recoveryComplete).toBe(true);
+      expect(recovered.engine.overloadState()).not.toBe("FAIL_CLOSED");
+      expect(recovered.engine.restingOrdersForTest().size).toBe(0);
+      expect(recovered.engine.makerReservationsForTest().size).toBe(0);
+      const position = recovered.engine.ledger.positions.get("btc-mkt");
+      expect(Number(position?.upQuantity ?? 0)).toBe(0);
+      expect(Number(position?.downQuantity ?? 0)).toBeCloseTo(6.09756098 - 1, 8);
+      expect(Number(position?.unpairedQuantity ?? 0)).toBeCloseTo(6.09756098 - 1, 8);
+      if (preRestartCash !== null) {
+        expect(recovered.engine.ledger.snapshot().cash).toBe(preRestartCash);
+      }
+      expect(recovered.engine.integrityFault()).toBe(false);
+    } finally {
+      await recovered.engine.stop();
+    }
+  });
 });
 
 function baseRiskFor(snapshot: MarketSnapshot, now: Date) {
