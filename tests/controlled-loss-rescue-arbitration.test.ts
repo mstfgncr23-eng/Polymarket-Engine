@@ -9,6 +9,7 @@ import {
   walkBook,
   type MarketSnapshot,
   type PaperFill,
+  type ReferenceTick,
 } from "@pm/core";
 import { MemoryEventJournal } from "@pm/db";
 import { EngineService } from "../apps/engine/src/engine.js";
@@ -20,7 +21,7 @@ import {
   qualified,
   qualifiedPaperEnv,
 } from "./paper-engine-testkit.js";
-import { feeSchedule, snapshot as newSnapshot } from "./fixtures.js";
+import { feeSchedule, order, snapshot as newSnapshot } from "./fixtures.js";
 
 const START_MS = Date.parse("2026-01-01T00:00:00.000Z");
 type Clock = { nowMs: number };
@@ -34,6 +35,40 @@ function book(clock: Clock, outcome: "UP" | "DOWN", sequence: number,
     eventId: createId("market"), traceId: createId("trace"), marketId: "btc-mkt", tokenId, outcome, asset: "XRP",
     bids, asks, sourceTimestamp: iso(clock), receivedAt: iso(clock), sequence,
   });
+}
+
+function referenceTick(clock: Clock, price: string): ReferenceTick {
+  return {
+    eventId: createId("reference"), traceId: createId("trace"), asset: "XRP",
+    symbol: "XRPUSDT", venue: "deterministic-test", price, quantity: "1",
+    sourceTimestamp: iso(clock), receivedAt: iso(clock), tradeId: createId("trade"),
+  };
+}
+
+/**
+ * Test-only journal that can pause the engine's FIRST settlement-key lookup in
+ * applyFill (the async boundary right before a maker fill commits). Used to hold
+ * a real snapshot-derived resting-hedge fill in flight while rescue runs.
+ */
+class SettlementReadHoldJournal extends MemoryEventJournal {
+  private settlementHold: Promise<void> | null = null;
+  private settlementHoldConsumed = false;
+  setSettlementReadHoldForTest(hold: Promise<void> | null): void {
+    this.settlementHold = hold;
+    this.settlementHoldConsumed = false;
+  }
+  get heldSettlementRead(): boolean { return this.settlementHoldConsumed; }
+  override async readDurableByOperationKey(
+    operationKey: string,
+  ): Promise<Awaited<ReturnType<MemoryEventJournal["readDurableByOperationKey"]>>> {
+    if (this.settlementHold && !this.settlementHoldConsumed && operationKey.startsWith("settlement:")) {
+      this.settlementHoldConsumed = true;
+      const hold = this.settlementHold;
+      this.settlementHold = null;
+      await hold;
+    }
+    return super.readDurableByOperationKey(operationKey);
+  }
 }
 
 function firstLeg(clock: Clock, sourceEventId: string, price = "0.82", qty = "6.09756098"): PaperFill {
@@ -86,9 +121,8 @@ async function waitFor<T>(read: () => T | Promise<T>, predicate: (value: T) => b
   }
 }
 
-async function setupScenario(endOffsetMs: number, env: Record<string, string> = {}) {
+async function setupScenario(endOffsetMs: number, env: Record<string, string> = {}, journal: MemoryEventJournal = new MemoryEventJournal()) {
   const clock: Clock = { nowMs: START_MS };
-  const journal = new MemoryEventJournal();
   const market = new ScriptedMarketAdapter();
   const endDate = new Date(START_MS + endOffsetMs).toISOString();
   market.queue(discoveryReport([qualified("btc-mkt", "XRP", "btc-up", "btc-down", endDate)]));
@@ -526,6 +560,201 @@ it("decideRescueSecondLegOrder: salvage = q - notional - fee (TAKER ask walk)", 
     expect(arbitrateRiskReduction(a("4.5"), b(null))).toMatchObject({ selection: "PROTECTIVE_DE_RISK", selectionReason: "A_ONLY" });
     expect(arbitrateRiskReduction(a(null), b("4.8"))).toMatchObject({ selection: "RESCUE_SECOND_LEG", selectionReason: "B_ONLY" });
     expect(arbitrateRiskReduction(a(null), b(null))).toMatchObject({ selection: "NONE", selectionReason: "NEITHER_AVAILABLE" });
+  });
+
+  it("Test 1: HEDGE MAKER admission owns the risk-reduction flight — rescue waits, then cancels the resting hedge before A/B", { timeout: 30_000 }, async () => {
+    // Real path: strategy HEDGE candidate (MAKER) -> submitPaperOrder ->
+    // acquire shared flight -> PAPER_ORDER_CREATED held -> durable reserve.
+    const setup = await setupScenario(3_600_000, { PAPER_EXECUTION_STYLE: "MAKER" });
+    const { engine, journal, market, clock } = setup;
+    try {
+      expect((await engine.beginExperiment()).ok).toBe(true);
+      const downBook1 = book(clock, "DOWN", 1, []);
+      // Entry @0.39 so the pair is lockable vs the 0.40 UP ask (TemporalPairHedge
+      // strategy requires `1 - (firstAverage + ask) >= minExpectedEdge`).
+      await setup.engine.applyObservedFill({ ...firstLeg(clock, downBook1.eventId, "0.39"), feeSchedule: downBook1.feeSchedule });
+      expect(engine.ledger.positions.get("btc-mkt")?.unpairedQuantity).toBe("6.09756098");
+
+      let releaseHold: (() => void) | null = null;
+      const hold = new Promise<void>((resolve) => { releaseHold = resolve; });
+      journal.setAppendInFlightHoldForTest(hold, ["PAPER_ORDER_CREATED"]);
+      try {
+        // Pre-eligibility: a profitable lockable pair triggers a normal HEDGE
+        // MAKER admission. It is held at the PAPER_ORDER_CREATED append, BEFORE
+        // its durable PAPER_MAKER_RESERVED makes the resting order authoritative.
+        clock.nowMs = START_MS + 1_000;
+        await market.emitSnapshot(book(clock, "UP", 2, [{ price: "0.39", quantity: "2000" }], [{ price: "0.40", quantity: "300" }]));
+        await market.emitSnapshot(book(clock, "DOWN", 2, [{ price: "0.39", quantity: "2000" }], [{ price: "0.40", quantity: "300" }]));
+        await engine.ingestReferenceTickForTest(referenceTick(clock, "100"));
+        clock.nowMs = START_MS + 2_000;
+        await engine.ingestReferenceTickForTest(referenceTick(clock, "102"));
+        await waitFor(() => journal.inFlightAppends, (n) => n > 0);
+
+        // Eligibility flips while the MAKER admission is still being reserved.
+        clock.nowMs = eligibilityMs(3_600_000) + 1;
+        await market.emitSnapshot(book(clock, "UP", 3, [], [{ price: "0.30", quantity: "1000" }]));
+        await market.emitSnapshot(book(clock, "DOWN", 3, [{ price: "0.75", quantity: "1000" }], []));
+        const suppressedWhileHeld = await waitFor(
+          () => suppressed(setup),
+          (rows) => rows.some((row) => row.payload.gate === "GATE_IN_FLIGHT"),
+        );
+        expect(suppressedWhileHeld.some((row) => row.payload.gate === "GATE_IN_FLIGHT")).toBe(true);
+        // Rescue must NOT run A/B concurrently while hedge admission owns the slot.
+        expect((await fills(setup, "PROTECTIVE_DE_RISK"))).toHaveLength(0);
+        expect((await fills(setup, "RESCUE_SECOND_LEG"))).toHaveLength(0);
+        expect((await fills(setup, "HEDGE_SECOND_LEG"))).toHaveLength(0);
+      } finally {
+        releaseHold?.();
+        journal.setAppendInFlightHoldForTest(null);
+      }
+
+      // Admission completes: ONE authoritative resting HEDGE maker; the slot is
+      // released again (resting makers do not hold it for their lifetime).
+      await waitFor(() => engine.restingOrdersForTest(), (orders) => orders.size > 0);
+      const resting = [...engine.restingOrdersForTest().values()][0]!;
+      expect(resting.intent).toBe("HEDGE_SECOND_LEG");
+      const reserves = await journal.queryDurableTransitions({ types: ["PAPER_MAKER_RESERVED"], limit: 8 });
+      expect(reserves.filter((row) => row.payload.intent === "HEDGE_SECOND_LEG")).toHaveLength(1);
+      await waitFor(() => journal.inFlightAppends, (n) => n === 0);
+
+      // Rescue runs next: acquires the slot, cancels/fences the resting hedge,
+      // then fresh A/B arbitration (A wins: SELL @0.75 vs UP ask @0.30).
+      clock.nowMs = eligibilityMs(3_600_000) + 2_000;
+      await market.emitSnapshot(book(clock, "UP", 4, [], [{ price: "0.30", quantity: "1000" }]));
+      await market.emitSnapshot(book(clock, "DOWN", 4, [{ price: "0.75", quantity: "1000" }], []));
+      const protective = await waitFor(() => fills(setup, "PROTECTIVE_DE_RISK"), (list) => list.length > 0);
+      expect(protective[0]?.payload).toMatchObject({ side: "SELL", fillPrice: "0.75" });
+      expect((await fills(setup, "RESCUE_SECOND_LEG"))).toHaveLength(0);
+      await waitFor(
+        () => journal.queryDurableTransitions({ types: ["PAPER_ORDER_CANCELLED"], limit: 8 }),
+        (rows) => rows.length > 0,
+      );
+      await waitFor(() => engine.restingOrdersForTest(), (orders) => orders.size === 0);
+      const positionAfter = engine.ledger.positions.get("btc-mkt");
+      expect(Number(positionAfter?.upQuantity ?? 0)).toBe(0);
+      expect(Number(positionAfter?.downQuantity ?? 0)).toBe(0);
+      expect(positionAfter?.unpairedQuantity ?? "0").toBe("0");
+      expect(engine.integrityFault()).toBe(false);
+    } finally {
+      await setup.engine.stop();
+    }
+  });
+
+  it("Test 2: real resting-hedge maker fill held in flight keeps HEDGE intent; rescue flattens -> stale fill NO_UNPAIRED_RESIDUAL", { timeout: 30_000 }, async () => {
+    const journal = new SettlementReadHoldJournal();
+    const setup = await setupScenario(3_600_000, {}, journal);
+    const { engine, market, clock } = setup;
+    try {
+      expect((await engine.beginExperiment()).ok).toBe(true);
+      const downBook1 = book(clock, "DOWN", 1, []);
+      await engine.applyObservedFill({ ...firstLeg(clock, downBook1.eventId), feeSchedule: downBook1.feeSchedule });
+      const upRest = book(clock, "UP", 2, [{ price: "0.40", quantity: "10" }], [{ price: "0.60", quantity: "1000" }]);
+      await market.emitSnapshot(upRest);
+      // REAL resting maker: BUY UP 0.40 through the durable reserve path.
+      await engine.restMakerForTest(order("MAKER", {
+        id: "hedge-maker-1", marketId: "btc-mkt", tokenId: "btc-up", outcome: "UP", side: "BUY",
+        requestedPrice: "0.40", quantity: "6.09756098", createdAt: iso(clock),
+      }), upRest, "HEDGE_SECOND_LEG");
+      expect([...engine.restingOrdersForTest().values()][0]?.intent).toBe("HEDGE_SECOND_LEG");
+
+      // Train the queue empty (bid 0.40 drains; no fill), then derive a maker
+      // fill on the next drop and HOLD it at applyFill's settlement read. The
+      // deriving UP book is also the FRESH opposite ladder for B (age ~0).
+      clock.nowMs = START_MS + 1_000;
+      await market.emitSnapshot(book(clock, "UP", 3, [], [{ price: "0.60", quantity: "1000" }]));
+      clock.nowMs = START_MS + 2_000;
+      await market.emitSnapshot(book(clock, "UP", 4, [{ price: "0.40", quantity: "6" }], [{ price: "0.60", quantity: "1000" }]));
+
+      let releaseFill!: () => void;
+      const fillHold = new Promise<void>((resolve) => { releaseFill = resolve; });
+      journal.setSettlementReadHoldForTest(fillHold);
+      clock.nowMs = eligibilityMs(3_600_000) + 1;
+      const derivingEmit = market.emitSnapshot(book(clock, "UP", 5, [{ price: "0.40", quantity: "1" }], [{ price: "0.30", quantity: "1000" }]));
+      await waitFor(() => journal.heldSettlementRead, (held) => held === true);
+
+      // Rescue becomes eligible while the stale hedge maker fill is in flight.
+      await market.emitSnapshot(book(clock, "DOWN", 2, [{ price: "0.75", quantity: "1000" }], []));
+      await waitFor(() => fills(setup, "PROTECTIVE_DE_RISK"), (list) => list.length > 0);
+      expect(Number(engine.ledger.positions.get("btc-mkt")?.downQuantity ?? 0)).toBe(0);
+      expect(engine.ledger.positions.get("btc-mkt")?.unpairedQuantity ?? "0").toBe("0");
+      // The rescue cancelled the resting hedge before arbitration.
+      await waitFor(() => journal.queryDurableTransitions({ types: ["PAPER_ORDER_CANCELLED"], limit: 8 }), (rows) => rows.length > 0);
+      expect(engine.restingOrdersForTest().size).toBe(0);
+
+      // Release the stale fill: intent is STILL HEDGE_SECOND_LEG, so the final
+      // residual guard rejects it instead of reopening directional UP exposure.
+      releaseFill();
+      await derivingEmit;
+      const fillRowsAfter = await journal.queryEvents({ types: ["PAPER_FILL"] });
+      expect(fillRowsAfter.some((row) => row.payload.orderId === "hedge-maker-1")).toBe(false);
+      const durableFills = await journal.queryDurableTransitions({ types: ["PAPER_FILL"], limit: 16 });
+      // first-leg + protective = exactly two authoritative economic mutations.
+      expect(durableFills.filter((row) => row.operationKey.startsWith("fill:")).map((row) => row.operationKey)).toHaveLength(2);
+      expect(Number(engine.ledger.positions.get("btc-mkt")?.upQuantity ?? 0)).toBe(0);
+      expect(engine.ledger.positions.get("btc-mkt")?.unpairedQuantity ?? "0").toBe("0");
+      expect(engine.integrityFault()).toBe(false);
+    } finally {
+      await setup.engine.stop();
+    }
+  });
+
+  it("Test 2b: stale resting-hedge maker fill keeps HEDGE intent after residual reduced -> QUANTITY_EXCEEDS_RESIDUAL", { timeout: 30_000 }, async () => {
+    const journal = new SettlementReadHoldJournal();
+    const setup = await setupScenario(3_600_000, {}, journal);
+    const { engine, market, clock } = setup;
+    try {
+      expect((await engine.beginExperiment()).ok).toBe(true);
+      const downBook1 = book(clock, "DOWN", 1, []);
+      await engine.applyObservedFill({ ...firstLeg(clock, downBook1.eventId), feeSchedule: downBook1.feeSchedule });
+      const upRest = book(clock, "UP", 2, [{ price: "0.40", quantity: "10" }], [{ price: "0.60", quantity: "1000" }]);
+      await market.emitSnapshot(upRest);
+      await engine.restMakerForTest(order("MAKER", {
+        id: "hedge-maker-2", marketId: "btc-mkt", tokenId: "btc-up", outcome: "UP", side: "BUY",
+        requestedPrice: "0.40", quantity: "6.09756098", createdAt: iso(clock),
+      }), upRest, "HEDGE_SECOND_LEG");
+
+      clock.nowMs = START_MS + 1_000;
+      await market.emitSnapshot(book(clock, "UP", 3, [], [{ price: "0.60", quantity: "1000" }]));
+      clock.nowMs = START_MS + 2_000;
+      await market.emitSnapshot(book(clock, "UP", 4, [{ price: "0.40", quantity: "6" }], [{ price: "0.60", quantity: "1000" }]));
+
+      let releaseFill!: () => void;
+      const fillHold = new Promise<void>((resolve) => { releaseFill = resolve; });
+      journal.setSettlementReadHoldForTest(fillHold);
+      clock.nowMs = eligibilityMs(3_600_000) + 1;
+      const derivingEmit = market.emitSnapshot(book(clock, "UP", 5, [{ price: "0.40", quantity: "1" }], [{ price: "0.30", quantity: "1000" }]));
+      await waitFor(() => journal.heldSettlementRead, (held) => held === true);
+
+      // While the stale maker fill is held, a legitimate HEDGE_SECOND_LEG TAKER
+      // covers 4 of the 6.097 residual: current residual drops to ~2.097 while
+      // the held stale maker fill tries to commit 2.5 UP.
+      const legitFill: PaperFill = {
+        id: createId("fill-legit"), orderId: createId("order-legit"), traceId: createId("trace-legit"),
+        marketId: "btc-mkt", tokenId: "btc-up", outcome: "UP", side: "BUY", requestedPrice: "0.40",
+        fillPrice: "0.40", quantity: "4", liquidityRole: "TAKER", latencyMs: 0, slippageUsd: "0", feeUsd: "0",
+        timestamp: iso(clock), sourceMarketEventId: createId("event-legit"), fillConfidence: 1,
+        fillModel: "rescue-test:legit-hedge", feeSchedule: downBook1.feeSchedule,
+      };
+      await engine.applyObservedFill(legitFill, "HEDGE_SECOND_LEG");
+      const afterLegit = engine.ledger.positions.get("btc-mkt");
+      expect(Number(afterLegit?.upQuantity ?? 0)).toBeCloseTo(4, 8);
+      expect(Number(afterLegit?.unpairedQuantity ?? 0)).toBeCloseTo(6.09756098 - 4, 8);
+
+      releaseFill();
+      await derivingEmit;
+      // Intent is STILL HEDGE_SECOND_LEG, so the stale 2.5 fill > 2.097 residual
+      // hits QUANTITY_EXCEEDS_RESIDUAL and never becomes an economic mutation.
+      expect((await journal.queryEvents({ types: ["PAPER_FILL"] })).some((row) => row.payload.orderId === "hedge-maker-2")).toBe(false);
+      const durableFills = await journal.queryDurableTransitions({ types: ["PAPER_FILL"], limit: 16 });
+      expect(durableFills.filter((row) => row.operationKey.startsWith("fill:")).map((row) => row.operationKey)).toHaveLength(2);
+      const after = engine.ledger.positions.get("btc-mkt");
+      expect(Number(after?.upQuantity ?? 0)).toBeCloseTo(4, 8);
+      expect(Number(after?.downQuantity ?? 0)).toBeCloseTo(6.09756098, 8);
+      expect(Number(after?.unpairedQuantity ?? 0)).toBeCloseTo(6.09756098 - 4, 8);
+      expect(engine.integrityFault()).toBe(false);
+    } finally {
+      await setup.engine.stop();
+    }
   });
 });
 

@@ -2123,7 +2123,14 @@ export class EngineService {
         }
         const evolved = evolveMakerOrder(resting, previous, snapshot);
         if (evolved.fill) {
-          await this.applyFill(evolved.fill, { restingAfter: evolved.resting });
+          // Capture the maker lifecycle intent synchronously here, BEFORE the
+          // async fill path. Rescue/cancel of the resting order during the
+          // applyFill boundary must not erase this identity: the PR2 fill-time
+          // residual/token guards key off economicIntent. restingOrderIntent
+          // keeps the legacy pre-PR1 inference, evaluated against the state
+          // that derived the fill instead of re-read after an await.
+          const restingIntent = this.restingOrderIntent(resting);
+          await this.applyFill(evolved.fill, { restingAfter: evolved.resting, intent: restingIntent });
         } else {
           this.restingOrders.set(orderId, evolved.resting);
           if (Number(evolved.resting.remaining) === 0) {
@@ -3744,13 +3751,17 @@ export class EngineService {
     const riskReductionOrder = intent === "HEDGE_SECOND_LEG"
       || intent === "RESCUE_SECOND_LEG"
       || intent === "PROTECTIVE_DE_RISK";
-    // PR2 single risk-reduction authority: exactly one TAKER economic admission
+    // PR2 single risk-reduction authority: exactly one risk-reduction admission
     // may be in flight per market. RESCUE and PROTECTIVE submissions are
     // already serialized by the maybeProtectiveDeRisk per-market flight (the
     // shared set is held for their whole decision+execution lifetime), so only
     // normal HEDGE submissions acquire/check the slot here — a hedge must never
-    // slip in behind rescue/protective ownership.
-    const ownsRiskReductionFlight = intent === "HEDGE_SECOND_LEG" && order.orderType === "TAKER";
+    // slip in behind rescue/protective ownership. A HEDGE MAKER admission holds
+    // the slot through its durable PAPER_MAKER_RESERVED so rescue cannot start
+    // A/B arbitration while a hedge maker is still being admitted/reserved; the
+    // slot is released again once the resting order is authoritative. A resting
+    // maker does NOT hold the slot for its resting lifetime.
+    const ownsRiskReductionFlight = intent === "HEDGE_SECOND_LEG";
     if (ownsRiskReductionFlight) {
       if (this.riskReductionInFlight.has(order.marketId)) {
         this.record("RISK_REDUCTION_FLIGHT_BUSY", order.traceId, order.marketId, {
