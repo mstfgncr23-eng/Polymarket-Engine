@@ -32,25 +32,26 @@ export interface HedgePositionFacts {
 }
 
 /**
- * Deterministic verification that a HEDGE_SECOND_LEG candidate genuinely
- * reduces/completes the CURRENT durable unpaired residual. The confidence
- * exemption must never be granted from the intent label alone: every fact is
- * re-derived from the stated candidate and the current position state, and the
- * projected position must not increase directional or unhedged exposure.
+ * Shared deterministic structural verification for a risk-reducing opposite
+ * BUY (normal HEDGE_SECOND_LEG or controlled-loss RESCUE_SECOND_LEG): the
+ * candidate must pair the SAME market's CURRENT positive unpaired residual by
+ * BUYing the OPPOSITE outcome at the CURRENT canonical opposite token, in a
+ * positive quantity that never exceeds the residual, without increasing
+ * directional exposure. When `strictUnhedgedDecrease` is set (rescue), the
+ * projected unhedged exposure must strictly decrease.
  *
  * Returns false (fail closed) when any required fact is missing or unverifiable.
  */
-export function verifiedReducingHedge(input: {
-  hedgeIntent: boolean;
+function verifiedOppositeRiskReductionBuy(input: {
   candidate: HedgeCandidateFacts | null;
   position: HedgePositionFacts | null;
   projectedDirectionalExposureUsd: string | null | undefined;
   directionalExposureUsd: string;
   projectedUnhedgedExposureUsd: string | null | undefined;
   unhedgedExposureUsd: string;
+  strictUnhedgedDecrease: boolean;
 }): boolean {
   const { candidate, position } = input;
-  if (!input.hedgeIntent) return false;
   if (!candidate || !position) return false;
   // 1/3. Candidate reduces the position in the SAME market.
   if (candidate.marketId !== position.marketId) return false;
@@ -78,8 +79,74 @@ export function verifiedReducingHedge(input: {
     || input.projectedUnhedgedExposureUsd === undefined
   ) return false;
   if (d(input.projectedDirectionalExposureUsd).gt(input.directionalExposureUsd)) return false;
-  if (d(input.projectedUnhedgedExposureUsd).gt(input.unhedgedExposureUsd)) return false;
+  const projectedUnhedged = d(input.projectedUnhedgedExposureUsd);
+  const unhedged = d(input.unhedgedExposureUsd);
+  if (input.strictUnhedgedDecrease) {
+    if (projectedUnhedged.gte(unhedged)) return false;
+  } else if (projectedUnhedged.gt(unhedged)) {
+    return false;
+  }
   return true;
+}
+
+/**
+ * Deterministic verification that a HEDGE_SECOND_LEG candidate genuinely
+ * reduces/completes the CURRENT durable unpaired residual. The confidence
+ * exemption must never be granted from the intent label alone: every fact is
+ * re-derived from the stated candidate and the current position state, and the
+ * projected position must not increase directional or unhedged exposure.
+ *
+ * Returns false (fail closed) when any required fact is missing or unverifiable.
+ */
+export function verifiedReducingHedge(input: {
+  hedgeIntent: boolean;
+  candidate: HedgeCandidateFacts | null;
+  position: HedgePositionFacts | null;
+  projectedDirectionalExposureUsd: string | null | undefined;
+  directionalExposureUsd: string;
+  projectedUnhedgedExposureUsd: string | null | undefined;
+  unhedgedExposureUsd: string;
+}): boolean {
+  if (!input.hedgeIntent) return false;
+  return verifiedOppositeRiskReductionBuy({
+    candidate: input.candidate,
+    position: input.position,
+    projectedDirectionalExposureUsd: input.projectedDirectionalExposureUsd,
+    directionalExposureUsd: input.directionalExposureUsd,
+    projectedUnhedgedExposureUsd: input.projectedUnhedgedExposureUsd,
+    unhedgedExposureUsd: input.unhedgedExposureUsd,
+    strictUnhedgedDecrease: false,
+  });
+}
+
+/**
+ * Deterministic structural verification for a controlled-loss rescue
+ * (RESCUE_SECOND_LEG) — the same rigor as verifiedReducingHedge, with the
+ * stricter requirement that the projected unhedged exposure STRICTLY
+ * decreases (a rescue that does not strictly reduce the residual is not
+ * risk-reducing and must fail closed). Grants no risk-gate exemption from the
+ * intent label alone; every fact is re-derived from the candidate and the
+ * current position state.
+ */
+export function verifiedRescuePairLock(input: {
+  rescueIntent: boolean;
+  candidate: HedgeCandidateFacts | null;
+  position: HedgePositionFacts | null;
+  projectedDirectionalExposureUsd: string | null | undefined;
+  directionalExposureUsd: string;
+  projectedUnhedgedExposureUsd: string | null | undefined;
+  unhedgedExposureUsd: string;
+}): boolean {
+  if (!input.rescueIntent) return false;
+  return verifiedOppositeRiskReductionBuy({
+    candidate: input.candidate,
+    position: input.position,
+    projectedDirectionalExposureUsd: input.projectedDirectionalExposureUsd,
+    directionalExposureUsd: input.directionalExposureUsd,
+    projectedUnhedgedExposureUsd: input.projectedUnhedgedExposureUsd,
+    unhedgedExposureUsd: input.unhedgedExposureUsd,
+    strictUnhedgedDecrease: true,
+  });
 }
 
 export interface RiskInput {
@@ -102,7 +169,7 @@ export interface RiskInput {
   directionalExposureUsd: string;
   unhedgedExposureUsd: string;
   unhedgedDurationMs: number;
-  intent?: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK";
+  intent?: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK" | "RESCUE_SECOND_LEG";
   projectedMarketExposureUsd?: string;
   projectedTotalExposureUsd?: string;
   projectedDirectionalExposureUsd?: string;
@@ -147,6 +214,17 @@ export interface RiskInput {
    * Populated by the engine from the live ledger at decision time.
    */
   hedgePosition?: HedgePositionFacts | null;
+  /**
+   * Candidate facts for RESCUE_SECOND_LEG structural verification. Populated
+   * by the decision layer only for rescue candidates; verifiedRescuePairLock
+   * must pass (fail closed) before any risk-gate exemption is granted.
+   */
+  rescueCandidate?: HedgeCandidateFacts | null;
+  /**
+   * Current durable position facts for RESCUE_SECOND_LEG verification.
+   * Populated by the engine from the live ledger at decision time.
+   */
+  rescuePosition?: HedgePositionFacts | null;
 }
 
 export function evaluateRisk(input: RiskInput, limits: RiskLimits): RiskEvaluation {
@@ -154,14 +232,26 @@ export function evaluateRisk(input: RiskInput, limits: RiskLimits): RiskEvaluati
   const age = (value: Date | null) => value ? input.now.getTime() - value.getTime() : Number.POSITIVE_INFINITY;
   const hedge = input.intent === "HEDGE_SECOND_LEG";
   const protective = input.intent === "PROTECTIVE_DE_RISK";
-  const riskReducingIntent = hedge || protective;
-  // A hedge exempts the alpha-confidence gate only when it is VERIFIED against
-  // the current durable position (the confidence gate must still trap a fresh
-  // first-leg entry and a spoofed/stale hedge candidate).
+  const rescue = input.intent === "RESCUE_SECOND_LEG";
+  const riskReducingIntent = hedge || rescue || protective;
+  // RESCUE_SECOND_LEG is a risk-only pair-lock: like the protective SELL it
+  // must not be subject to directional alpha gates, but — unlike a normal
+  // hedge — the pair BUY may intentionally lock a small loss, so the alpha
+  // floors would be economically meaningless here. Exemptions are granted only
+  // when the structural verification passes (fail closed otherwise).
   const verifiedHedge = verifiedReducingHedge({
     hedgeIntent: hedge,
     candidate: input.hedgeCandidate ?? null,
     position: input.hedgePosition ?? null,
+    projectedDirectionalExposureUsd: input.projectedDirectionalExposureUsd,
+    directionalExposureUsd: input.directionalExposureUsd,
+    projectedUnhedgedExposureUsd: input.projectedUnhedgedExposureUsd,
+    unhedgedExposureUsd: input.unhedgedExposureUsd,
+  });
+  const verifiedRescue = verifiedRescuePairLock({
+    rescueIntent: rescue,
+    candidate: input.rescueCandidate ?? null,
+    position: input.rescuePosition ?? null,
     projectedDirectionalExposureUsd: input.projectedDirectionalExposureUsd,
     directionalExposureUsd: input.directionalExposureUsd,
     projectedUnhedgedExposureUsd: input.projectedUnhedgedExposureUsd,
@@ -179,13 +269,18 @@ export function evaluateRisk(input: RiskInput, limits: RiskLimits): RiskEvaluati
     && d(directionalExposure).lte(input.directionalExposureUsd)
     && d(unhedgedExposure).lt(input.unhedgedExposureUsd);
   if (age(input.marketFeedAt) > limits.staleFeedTimeoutMs) vetoes.push("MARKET_FEED_STALE");
-  if (!protective && input.referenceProviderBlocked === true) vetoes.push("REFERENCE_PROVIDER_BLOCKED");
-  if (!protective && input.referenceRequired === true) {
+  // RESCUE_SECOND_LEG safety depends on the executable Polymarket book + binary
+  // pair identity, NOT on directional fair-value prediction: the rescue BUY is
+  // exempt from reference-provider availability/staleness gates (documented
+  // policy). Every other hard safety gate below still applies.
+  const rescueExemptFromReference = !protective && !rescue;
+  if (rescueExemptFromReference && input.referenceProviderBlocked === true) vetoes.push("REFERENCE_PROVIDER_BLOCKED");
+  if (rescueExemptFromReference && input.referenceRequired === true) {
     if (age(input.referenceFeedAt ?? null) > limits.staleFeedTimeoutMs) {
       vetoes.push("REFERENCE_FEED_STALE");
       if ((input.asset ?? "BTC") === "BTC") vetoes.push("BTC_FEED_STALE");
     }
-  } else if (!protective && input.referenceRequired !== false && age(input.btcFeedAt) > limits.staleFeedTimeoutMs) {
+  } else if (rescueExemptFromReference && input.referenceRequired !== false && age(input.btcFeedAt) > limits.staleFeedTimeoutMs) {
     vetoes.push("BTC_FEED_STALE");
   }
   if (!input.databaseAvailable) vetoes.push("DATABASE_UNAVAILABLE");
@@ -213,20 +308,26 @@ export function evaluateRisk(input: RiskInput, limits: RiskLimits): RiskEvaluati
     && d(input.executablePrice).lt(limits.normalFirstLegMaxPriceExclusive);
   const firstLegMinExpectedEdge = normalFirstLegRegime ? limits.normalFirstLegMinExpectedEdge : limits.minExpectedEdge;
   const firstLegMinExpectedROI = normalFirstLegRegime ? limits.normalFirstLegMinExpectedROI : limits.minExpectedROI;
-  if (!protective && input.expectedEdge < firstLegMinExpectedEdge) vetoes.push("MINIMUM_EXPECTED_EDGE");
+  // A rescue pair-lock may intentionally lock a small loss; the alpha floors
+  // are skipped ONLY for structurally verified rescue candidates.
+  if (!protective && !rescue && input.expectedEdge < firstLegMinExpectedEdge) vetoes.push("MINIMUM_EXPECTED_EDGE");
   if (!riskReducingIntent && (!Number.isFinite(input.expectedROI) || input.expectedROI < firstLegMinExpectedROI)) {
     vetoes.push("MINIMUM_EXPECTED_ROI");
   }
-  if (!protective && input.spread > limits.maxSpread) vetoes.push("MAXIMUM_SPREAD");
-  if (!protective && !verifiedHedge && input.signalConfidence < limits.minSignalConfidence) vetoes.push("MINIMUM_SIGNAL_CONFIDENCE");
-  if (!protective && input.signalExpiresAt.getTime() <= input.now.getTime()) vetoes.push("SIGNAL_EXPIRED");
-  if (!protective && input.externalSignalsLastMinute >= limits.maxExternalSignalsPerMinute) vetoes.push("MAXIMUM_EXTERNAL_SIGNAL_RATE");
+  if (!protective && !rescue && input.spread > limits.maxSpread) vetoes.push("MAXIMUM_SPREAD");
+  if (!protective && !verifiedHedge && !verifiedRescue && input.signalConfidence < limits.minSignalConfidence) vetoes.push("MINIMUM_SIGNAL_CONFIDENCE");
+  if (!protective && !verifiedHedge && !verifiedRescue && input.signalExpiresAt.getTime() <= input.now.getTime()) vetoes.push("SIGNAL_EXPIRED");
+  if (!protective && !rescue && input.externalSignalsLastMinute >= limits.maxExternalSignalsPerMinute) vetoes.push("MAXIMUM_EXTERNAL_SIGNAL_RATE");
   // Cooldown throttles fresh directional entries. It must never trap a risk-reducing action.
   if (!riskReducingIntent && input.lastStrategyTradeAt && input.now.getTime() - input.lastStrategyTradeAt.getTime() < limits.strategyCooldownMs) vetoes.push("STRATEGY_COOLDOWN");
-  if (!protective && input.duplicateTrade) vetoes.push("DUPLICATE_TRADE");
+  if (!protective && !rescue && input.duplicateTrade) vetoes.push("DUPLICATE_TRADE");
   if (!input.feeScheduleKnown) vetoes.push("UNKNOWN_FEE_SCHEDULE");
   if (!protective && !input.experimentEntryOpen) vetoes.push("EXPERIMENT_ENTRY_CLOSED");
   if (input.marketEntryQualified === false && !riskReducingIntent) vetoes.push("MARKET_NOT_ENTRY_QUALIFIED");
+  // FAIL CLOSED: a rescue candidate that does not strictly reduce the durable
+  // unpaired residual through the verified opposite-token pair-lock can never
+  // receive the risk-reduction exemptions.
+  if (rescue && !verifiedRescue) vetoes.push("RESCUE_NOT_VERIFIED_REDUCING");
   const requiredCash = input.requiredCashUsd ?? input.orderSizeUsd;
   if (input.availableCashUsd !== undefined && d(input.availableCashUsd).lt(requiredCash)) vetoes.push("INSUFFICIENT_CASH");
   if (input.executionErrorsLastHour >= limits.maxExecutionErrorsPerHour) vetoes.push("ABNORMAL_EXECUTION_ERRORS");

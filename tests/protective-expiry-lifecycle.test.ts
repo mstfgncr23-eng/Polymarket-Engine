@@ -105,8 +105,11 @@ it("A: max unhedged duration remains authoritative when expiry is farther away",
       // Past the deadline with a fresh synchronized book: protective SELL
       // executes while the market is comfortably pre-expiry.
       setup.clock.nowMs = START_MS + 301_000;
+      // Opposite asks @0.60 make the pair-lock salvage strictly worse than the
+      // protective SELL @0.45; emit UP first so the DOWN-triggered rescue run
+      // observes the intended (fresh) opposite ladder.
+      await setup.market.emitSnapshot(book(setup.clock, "UP", 2, [{ price: "0.55", quantity: "300" }], [{ price: "0.60", quantity: "300" }]));
       await setup.market.emitSnapshot(book(setup.clock, "DOWN", 2, [{ price: "0.45", quantity: "10" }]));
-      await setup.market.emitSnapshot(book(setup.clock, "UP", 2, [{ price: "0.55", quantity: "300" }]));
       const rows = await waitFor(() => protectiveFills(setup), (list) => list.length === 1);
       expect(rows[0]?.payload).toMatchObject({ side: "SELL", quantity: "10", intent: "PROTECTIVE_DE_RISK" });
       expect(setup.engine.ledger.positions.has("btc-mkt")).toBe(false);
@@ -134,8 +137,8 @@ it("B: expiry bound forces eligibility BEFORE market end when less than maxUnhed
 
       // +41s: eligible under the expiry bound, far before the 5-minute duration.
       setup.clock.nowMs = START_MS + 41_000;
+      await setup.market.emitSnapshot(book(setup.clock, "UP", 2, [{ price: "0.55", quantity: "300" }], [{ price: "0.60", quantity: "300" }]));
       await setup.market.emitSnapshot(book(setup.clock, "DOWN", 2, [{ price: "0.45", quantity: "10" }]));
-      await setup.market.emitSnapshot(book(setup.clock, "UP", 2, [{ price: "0.55", quantity: "300" }]));
       const rows = await waitFor(() => protectiveFills(setup), (list) => list.length === 1);
       expect(rows[0]?.payload).toMatchObject({ side: "SELL", quantity: "10", intent: "PROTECTIVE_DE_RISK" });
       // Executed before the market's usable lifetime ended.
@@ -184,13 +187,13 @@ it("C: entry extremely close to expiry never executes after market end; skips de
       // Eligible (+80s, deadline +40s) candidate is admitted; hold its
       // PAPER_ORDER_CREATED append while the clock crosses market end (+120s).
       setup.clock.nowMs = START_MS + 80_000;
-      const timeoutBook = book(setup.clock, "DOWN", 2, [{ price: "0.45", quantity: "4" }]);
+      const timeoutBook = book(setup.clock, "DOWN", 2, [{ price: "0.50", quantity: "10" }]);
       let releaseHold: (() => void) | null = null;
       const hold = new Promise<void>((resolve) => { releaseHold = resolve; });
       setup.journal.setAppendInFlightHoldForTest(hold, ["PAPER_ORDER_CREATED"]);
       try {
+        await setup.market.emitSnapshot(book(setup.clock, "UP", 2, [{ price: "0.55", quantity: "300" }], [{ price: "0.60", quantity: "300" }]));
         await setup.market.emitSnapshot(timeoutBook);
-        await setup.market.emitSnapshot(book(setup.clock, "UP", 2, [{ price: "0.55", quantity: "300" }]));
         await waitFor(() => setup.journal.inFlightAppends, (value) => value > 0);
         // The market expires while the order is still pending.
         setup.clock.nowMs = START_MS + 121_000;
