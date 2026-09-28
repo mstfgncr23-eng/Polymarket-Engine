@@ -36,6 +36,18 @@ export const riskLimitsSchema = z.object({
   maxExternalSignalsPerMinute: z.number().int().positive().default(30),
   strategyCooldownMs: z.number().int().nonnegative().default(60_000),
   maxExecutionErrorsPerHour: z.number().int().positive().default(5),
+  /**
+   * PR3 early catastrophic pair-lock protection. Applied to an unpaired
+   * position BEFORE the old protective deadline: after the minimum unhedged
+   * age, when the realizable mark loss on the held leg reaches the trigger
+   * loss, a FULL fee-inclusive opposite pair-lock may buy the entire residual
+   * BUY the opposite outcome as long as the guaranteed terminal PnL is no worse
+   * than the configured max locked loss. Normal profitable hedges always take
+   * priority; the old deadline A/B rescue remains the final fallback.
+   */
+  catastrophicPairLockMinUnhedgedMs: z.number().int().nonnegative().default(10_000),
+  catastrophicPairLockTriggerLossUsd: z.number().nonnegative().default(0.35),
+  catastrophicPairLockMaxLockedLossUsd: z.number().nonnegative().default(0.60),
 });
 export type RiskLimits = z.infer<typeof riskLimitsSchema>;
 

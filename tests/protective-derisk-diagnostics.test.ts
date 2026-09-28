@@ -101,7 +101,12 @@ describe("protective de-risk diagnostic suppression observability", () => {
       const rows = await suppressed(setup);
       // The healthy path may emit pre-deadline duration or concurrent-flight
       // observability rows, but never any post-timeout snapshot/fence gate.
-      expect(rows.filter((r) => r.payload.gate !== "GATE_DURATION" && r.payload.gate !== "GATE_IN_FLIGHT")).toHaveLength(0);
+      // The PR3 early catastrophic gate intentionally evaluates every fresh
+      // state and audibly declines until the loss cap is satisfied (declining
+      // here is correct — the pair-lock would lock beyond the cap).
+      expect(rows.filter((r) => r.payload.gate !== "GATE_DURATION"
+        && r.payload.gate !== "GATE_IN_FLIGHT"
+        && r.payload.gate !== "EARLY_CATASTROPHIC_PAIR_LOCK")).toHaveLength(0);
     } finally {
       await setup.engine.stop();
     }

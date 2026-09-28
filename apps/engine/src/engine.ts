@@ -9,6 +9,9 @@ import {
   arbitrateRiskReduction,
   evaluateProtectiveDeRiskCandidate,
   evaluateRescueSecondLegCandidate,
+  evaluateEarlyCatastrophicPairLock,
+  computeGuaranteedLockedPnl,
+  type EarlyCatastrophicPairLockEvaluation,
   type RescueCandidateEvaluation,
   type RiskReductionCandidateEconomics,
   defaultNativeDecisionConfig,
@@ -264,7 +267,7 @@ type GrokSubmissionResult = {
   signalId?: string;
 };
 
-type RiskReductionUnhedgedReason = "MAX_UNHEDGED_DURATION" | "PRE_EXPIRY_SAFETY";
+type RiskReductionUnhedgedReason = "MAX_UNHEDGED_DURATION" | "PRE_EXPIRY_SAFETY" | "EARLY_CATASTROPHIC_PAIR_LOCK";
 
 type ProtectiveDeRiskAudit = {
   deRiskReason: RiskReductionUnhedgedReason;
@@ -4105,6 +4108,30 @@ export class EngineService {
                 throw new RiskReductionLifecycleGuardRejectedError(fill.marketId, economicIntent, "DE_RISK_OUTCOME_CHANGED");
               }
             }
+            // PR3 EARLY catastrophic pair-lock final fence: decided-state is not
+            // enough — revalidate immediately before the durable mutation that
+            // the fill still covers the ENTIRE current residual and that the
+            // ACTUAL fee-inclusive locked PnL (from the executed fill economics)
+            // stays within the configured loss cap. Any violation is a normal
+            // state-change rejection, never a durability fault.
+            if (extras.deRisk?.deRiskReason === "EARLY_CATASTROPHIC_PAIR_LOCK") {
+              if (!d(fill.quantity).eq(d(currentPosition.unpairedQuantity))) {
+                throw new RiskReductionLifecycleGuardRejectedError(fill.marketId, "RESCUE_SECOND_LEG", "EARLY_CATASTROPHIC_PARTIAL_FILL");
+              }
+              const earlyLockedPnl = computeGuaranteedLockedPnl({
+                position: currentPosition,
+                rescueQuantity: fill.quantity,
+                rescueVwap: fill.fillPrice,
+                rescueTakerFeeUsd: fill.feeUsd,
+              });
+              if (d(earlyLockedPnl).lt(d(-this.riskLimits.catastrophicPairLockMaxLockedLossUsd))) {
+                this.recordProtectiveDeRiskSuppressed(
+                  fill.marketId, "FINAL_FENCE", "EARLY_CATASTROPHIC_LOSS_CAP_EXCEEDED",
+                  { snapshot: this.snapshots.get(fill.marketId)?.[fill.outcome] ?? null },
+                );
+                throw new RiskReductionLifecycleGuardRejectedError(fill.marketId, "RESCUE_SECOND_LEG", "EARLY_CATASTROPHIC_LOSS_CAP_EXCEEDED");
+              }
+            }
             return;
           }
 
@@ -4842,6 +4869,209 @@ export class EngineService {
     };
   }
 
+  /**
+   * PR3: early catastrophic full pair-lock.
+   *
+   * Runs BEFORE the old protective deadline, continuously on every fresh
+   * synchronized market state (it is NOT gated behind protectiveDeRiskEligibility).
+   * B-only: buys the ENTIRE remaining residual of the opposite outcome when the
+   * fee-inclusive guaranteed terminal PnL stays within the configured loss cap.
+   * A currently available normal profitable hedge always takes priority.
+   * Returns true when this pass CONSUMED the shared risk-reduction decision
+   * (so the old deadline fallback must not also act on this same snapshot).
+   */
+  private async maybeEarlyCatastrophicPairLock(marketId: string): Promise<boolean> {
+    const position = this.ledger.positions.get(marketId);
+    if (!position?.unpairedOutcome || d(position.unpairedQuantity).lte(0)) return false;
+    if (this.settledMarkets.has(marketId)) return false;
+    if (this.riskReductionInFlight.has(marketId)) return false;
+    const now = this.nowFn();
+    const pair = this.snapshots.get(marketId);
+    const oppositeOutcome: Outcome = position.unpairedOutcome === "UP" ? "DOWN" : "UP";
+    const evaluation = evaluateEarlyCatastrophicPairLock({
+      position,
+      heldSnapshot: this.freshEarlyCatastrophicSnapshot(position.unpairedOutcome === "UP" ? (pair?.UP ?? null) : (pair?.DOWN ?? null), now.getTime()),
+      oppositeSnapshot: this.freshEarlyCatastrophicSnapshot(oppositeOutcome === "UP" ? (pair?.UP ?? null) : (pair?.DOWN ?? null), now.getTime()),
+      nowMs: now.getTime(),
+      maxOrderSizeUsd: this.riskLimits.maxOrderSizeUsd,
+      minimumLockedPairEdge: this.riskLimits.minExpectedEdge,
+      minUnhedgedMs: this.riskLimits.catastrophicPairLockMinUnhedgedMs,
+      triggerLossUsd: this.riskLimits.catastrophicPairLockTriggerLossUsd,
+      maxLockedLossUsd: this.riskLimits.catastrophicPairLockMaxLockedLossUsd,
+      snapshots: { UP: pair?.UP ?? null, DOWN: pair?.DOWN ?? null },
+    });
+    if (!evaluation.eligible || !evaluation.candidate) {
+      this.recordEarlyCatastrophicSuppressed(marketId, evaluation, now);
+      return false;
+    }
+    this.riskReductionInFlight.add(marketId);
+    try {
+      return await this.executeEarlyCatastrophicPairLock(marketId, position.unpairedOutcome, oppositeOutcome, now);
+    } finally {
+      this.riskReductionInFlight.delete(marketId);
+      const current = this.ledger.positions.get(marketId);
+      if (!current || d(current.unpairedQuantity).lte(0)) this.clearProtectiveDeRiskState(marketId);
+    }
+  }
+
+  /**
+   * Freshness/synchronization gate for one early-catastrophic book: the book
+   * must be present, adapter-synchronized and within the stale-feed timeout.
+   * Anything else yields null (fail closed; never price from stale data).
+   */
+  private freshEarlyCatastrophicSnapshot(snapshot: MarketSnapshot | null, nowMs: number): MarketSnapshot | null {
+    if (!snapshot) return null;
+    if (!this.adapterTokenSynchronized(snapshot.tokenId)) return null;
+    const receivedAtMs = Date.parse(snapshot.receivedAt);
+    if (!Number.isFinite(receivedAtMs) || nowMs - receivedAtMs > this.riskLimits.staleFeedTimeoutMs) return null;
+    return snapshot;
+  }
+
+  /**
+   * The in-flight half of the PR3 early catastrophic pair-lock. Runs while the
+   * shared risk-reduction flight is HELD. Re-reads fresh durable position and
+   * books after the async boundary and re-validates the ENTIRE eligibility
+   * (including normal-hedge priority and the loss cap) before acting.
+   * Returns true when this pass must consume the risk-reduction decision.
+   */
+  private async executeEarlyCatastrophicPairLock(
+    marketId: string,
+    unpairedOutcome: Outcome,
+    oppositeOutcome: Outcome,
+    now: Date,
+  ): Promise<boolean> {
+    const position = this.ledger.positions.get(marketId);
+    if (!position?.unpairedOutcome || position.unpairedOutcome !== unpairedOutcome || d(position.unpairedQuantity).lte(0)) {
+      this.recordProtectiveDeRiskSuppressed(marketId, "EARLY_CATASTROPHIC_PAIR_LOCK", "POSITION_CHANGED", { position: position ?? null });
+      return true;
+    }
+    if (this.settledMarkets.has(marketId)) return true;
+    const pair = this.snapshots.get(marketId);
+    const held = this.freshEarlyCatastrophicSnapshot(unpairedOutcome === "UP" ? (pair?.UP ?? null) : (pair?.DOWN ?? null), now.getTime());
+    const opposite = this.freshEarlyCatastrophicSnapshot(oppositeOutcome === "UP" ? (pair?.UP ?? null) : (pair?.DOWN ?? null), now.getTime());
+    const evaluation = evaluateEarlyCatastrophicPairLock({
+      position,
+      heldSnapshot: held,
+      oppositeSnapshot: opposite,
+      nowMs: now.getTime(),
+      maxOrderSizeUsd: this.riskLimits.maxOrderSizeUsd,
+      minimumLockedPairEdge: this.riskLimits.minExpectedEdge,
+      minUnhedgedMs: this.riskLimits.catastrophicPairLockMinUnhedgedMs,
+      triggerLossUsd: this.riskLimits.catastrophicPairLockTriggerLossUsd,
+      maxLockedLossUsd: this.riskLimits.catastrophicPairLockMaxLockedLossUsd,
+      snapshots: { UP: pair?.UP ?? null, DOWN: pair?.DOWN ?? null },
+    });
+    // Re-check AFTER the async boundary: revalidation wins. When a normal hedge
+    // is now available the early path yields (hedge priority) and this pass
+    // still owns the decision so the deadline fallback cannot double-act.
+    if (!evaluation.eligible || !evaluation.candidate || evaluation.hedgeAvailable || !opposite) {
+      this.recordEarlyCatastrophicSuppressed(marketId, evaluation, now);
+      return true;
+    }
+    const expectedOppositeTokenId = this.currentTokenIdFor(marketId, oppositeOutcome);
+    if (!expectedOppositeTokenId || evaluation.candidate.tokenId !== expectedOppositeTokenId) {
+      this.recordEarlyCatastrophicSuppressed(marketId, evaluation, now, { reason: "OPPOSITE_TOKEN_MISMATCH" });
+      return true;
+    }
+    const unhedgedStartedAt = position.unhedgedStartedAt ?? position.openedAt;
+    const unhedgedDurationMs = Math.max(0, now.getTime() - Date.parse(unhedgedStartedAt));
+    const asset = this.assetByMarket.get(marketId) ?? held?.asset ?? null;
+    const traceId = createId("derisk");
+    const audit: ProtectiveDeRiskAudit = {
+      deRiskReason: "EARLY_CATASTROPHIC_PAIR_LOCK",
+      eligibilityReason: "EARLY_CATASTROPHIC_PAIR_LOCK",
+      unhedgedStartedAt,
+      unhedgedDurationMs,
+      attemptedAction: "RESCUE_SECOND_LEG",
+      requestedQty: position.unpairedQuantity,
+      executableQty: evaluation.candidate.quantity,
+      executionPrice: evaluation.rescueVwap,
+      residualQuantity: "0",
+      residualExposure: "0",
+      retryCount: (this.protectiveDeRiskAttempts.get(marketId) ?? 0) + 1,
+      finalState: "ORDER_ADMITTED",
+      selection: "RESCUE_SECOND_LEG",
+      selectionReason: "EARLY_CATASTROPHIC_PAIR_LOCK",
+      tieBreakUsed: false,
+      aAvailable: false,
+      bAvailable: true,
+      bReason: null,
+      bQuantity: evaluation.candidate.quantity,
+      bVwap: evaluation.rescueVwap,
+      bFeeUsd: evaluation.rescueFeeUsd,
+      bRequiredCashUsd: evaluation.rescueNotionalUsd ?? null,
+      bGuaranteedSalvageUsd: evaluation.guaranteedLockedPnl,
+    };
+    // A resting hedge maker must not fill behind the pair-lock and re-consume
+    // the same residual (PR2 fencing; cancelling is itself risk-reducing).
+    await this.cancelRestingHedgeMakers(marketId, "EARLY_CATASTROPHIC_PAIR_LOCK");
+    this.record("RISK_ACCEPT", traceId, marketId, {
+      intent: "RESCUE_SECOND_LEG", orderId: createId("order"), deRisk: audit,
+    }, asset);
+    await this.persistReportInput(createJournalEvent({
+      traceId,
+      type: "RISK_EVALUATION",
+      aggregateType: "risk",
+      aggregateId: createId("risk"),
+      payload: {
+        id: createId("risk"), traceId, accepted: true, vetoes: [], utilization: {},
+        evaluatedAt: now.toISOString(),
+        marketId, asset, intent: "RESCUE_SECOND_LEG",
+        earlyCatastrophic: {
+          markLossUsd: evaluation.markLossUsd,
+          guaranteedLockedPnl: evaluation.guaranteedLockedPnl,
+          rescueNotionalUsd: evaluation.rescueNotionalUsd,
+          rescueVwap: evaluation.rescueVwap,
+        },
+        deRisk: audit,
+      },
+    }));
+const order: PaperOrder = {
+      id: createId("order"),
+      traceId,
+      triggerId: createId("derisk-trigger"),
+      strategyId: evaluation.candidate.strategyId,
+      marketId,
+      tokenId: evaluation.candidate.tokenId,
+      outcome: oppositeOutcome,
+      side: "BUY",
+      orderType: "TAKER",
+      requestedPrice: evaluation.candidate.limitPrice,
+      quantity: evaluation.candidate.quantity,
+      status: "PENDING",
+      createdAt: now.toISOString(),
+    };
+    await this.submitPaperOrder(
+      order,
+      opposite,
+      `${marketId}:${oppositeOutcome}:EARLY_CATASTROPHIC_PAIR_LOCK`,
+      "RESCUE_SECOND_LEG",
+      audit,
+    );
+    return true;
+  }
+
+  private recordEarlyCatastrophicSuppressed(
+    marketId: string,
+    evaluation: EarlyCatastrophicPairLockEvaluation,
+    now: Date,
+    extra: Record<string, unknown> = {},
+  ): void {
+    if (!evaluation.reason) return;
+    this.recordProtectiveDeRiskSuppressed(marketId, "EARLY_CATASTROPHIC_PAIR_LOCK", evaluation.reason, {
+      position: this.ledger.positions.get(marketId) ?? null,
+      unhedgedDurationMs: null,
+      extra: {
+        markLossUsd: evaluation.markLossUsd,
+        guaranteedLockedPnl: evaluation.guaranteedLockedPnl,
+        rescueNotionalUsd: evaluation.rescueNotionalUsd,
+        rescueVwap: evaluation.rescueVwap,
+        hedgeAvailable: evaluation.hedgeAvailable,
+        ...extra,
+      },
+    });
+  }
+  
   private async maybeProtectiveDeRisk(marketId: string): Promise<void> {
     if (this.riskReductionInFlight.has(marketId)) {
       this.recordProtectiveDeRiskSuppressed(marketId, "GATE_IN_FLIGHT", "IN_FLIGHT");
@@ -4875,6 +5105,13 @@ export class EngineService {
       this.recordProtectiveDeRiskSuppressed(marketId, "GATE_HARD_AUTHORITY", "INTEGRITY_OR_FAIL_CLOSED", { position: initial });
       return;
     }
+
+    // PR3 EARLY catastrophic pair-lock: explicitly NOT gated behind the old
+    // protective deadline. Every fresh synchronized state may discover it. It
+    // is B-only (full-residual opposite BUY) and yields to any currently
+    // available normal profitable hedge. When it consumes the shared
+    // risk-reduction decision, the old deadline fallback must not double-act.
+    if (await this.maybeEarlyCatastrophicPairLock(marketId)) return;
 
     const initialNow = this.nowFn();
     const initialStartedAt = initial.unhedgedStartedAt ?? initial.openedAt;

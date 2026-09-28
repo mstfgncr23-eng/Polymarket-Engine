@@ -435,7 +435,8 @@ export type RiskReductionSelectionReason =
   | "A_PREFERRED_TIE"
   | "A_ONLY"
   | "B_ONLY"
-  | "NEITHER_AVAILABLE";
+  | "NEITHER_AVAILABLE"
+  | "EARLY_CATASTROPHIC_PAIR_LOCK";
 
 /** Compact deterministic economics of one executable risk-reduction candidate. */
 export interface RiskReductionCandidateEconomics {
