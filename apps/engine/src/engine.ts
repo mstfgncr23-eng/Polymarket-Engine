@@ -217,6 +217,27 @@ class RiskReductionLifecycleGuardRejectedError extends Error {
   }
 }
 
+/**
+ * Normal serialized-boundary rejection for a NEW TAKER BUY whose actual
+ * fee-inclusive cash requirement exceeds CURRENT unreserved cash at the
+ * durable mutation boundary. This is the concurrency safety-net behind the
+ * earlier risk-admission cash check: multiple TAKER BUYs can be planned
+ * against the same pre-fill cash, and only the serialized durable boundary
+ * observes each preceding fill's committed effect. It is an expected
+ * concurrent economic state-change outcome, never a durability/DB/integrity
+ * failure and never execution corruption.
+ */
+export class TakerCashCommitGuardRejectedError extends Error {
+  constructor(
+    readonly fillId: string,
+    readonly marketId: string,
+    readonly requiredCash: string,
+    readonly availableCash: string,
+  ) {
+    super(`TAKER_CASH_FENCE_REJECTED:${fillId}:${marketId}:required=${requiredCash}:available=${availableCash}`);
+  }
+}
+
 function isJournalAdmissionRejectedError(error: unknown): boolean {
   return error instanceof JournalAdmissionRejected
     || (Boolean(error) && typeof error === "object" && (error as { name?: string }).name === "JournalAdmissionRejected");
@@ -1655,7 +1676,7 @@ export class EngineService {
     aggregateId: string;
     buildPayload: (occurredAt: Date) => Record<string, unknown>;
     occurredAt?: Date;
-    beforeCommit?: () => void;
+    beforeCommit?: () => void | Promise<void>;
     afterApply?: (transition: DurableTransition) => Promise<void>;
     checkpoint?: boolean;
   }): Promise<DurableCommitResult> {
@@ -1665,7 +1686,7 @@ export class EngineService {
       let commit: DurableCommitResult;
       try {
         const payload = await this.resolveDurablePayload(input, occurredAt);
-        input.beforeCommit?.();
+        await input.beforeCommit?.();
         commit = await this.journal.commitDurableTransition({
           operationKey: input.operationKey,
           type: input.type,
@@ -1684,6 +1705,11 @@ export class EngineService {
         // STATE_CHANGED rejection without latching the integrity fault; only
         // genuine durable/idempotency/cursor faults fail closed below.
         if (error instanceof RiskReductionLifecycleGuardRejectedError) throw error;
+        // A NEW TAKER BUY that fails the serialized cash fence is the same
+        // class of expected concurrent economic state-change rejection. It
+        // must pass through without latching an integrity fault, setting the
+        // database DOWN, or being classified as durable corruption.
+        if (error instanceof TakerCashCommitGuardRejectedError) throw error;
         if (error instanceof DurableCursorBehindError) {
           commit = await this.catchUpOrRejectStalePlan(input.operationKey, input.type, error);
         } else if (error instanceof IdempotencyConflictError) {
@@ -3869,6 +3895,21 @@ export class EngineService {
           }));
           return;
         }
+        if (error instanceof TakerCashCommitGuardRejectedError) {
+          // Normal concurrent cash race rejected at the serialized durable
+          // boundary. The NEW fill produced no economic mutation. It is
+          // bounded observability only and must not be counted as execution
+          // corruption (executionErrors feeds the execution-error risk veto).
+          this.record("TAKER_CASH_FENCE_REJECTED", order.traceId, order.marketId, {
+            orderId: order.id,
+            fillId: error.fillId,
+            marketId: error.marketId,
+            requiredCash: error.requiredCash,
+            availableCash: error.availableCash,
+            intent,
+          });
+          return;
+        }
         this.executionErrors.push(Date.now());
         const message = error instanceof Error ? error.message : String(error);
         const failureDeRisk = deRisk ? { ...deRisk, finalState: "EXECUTION_ERROR" as const } : undefined;
@@ -4031,8 +4072,30 @@ export class EngineService {
         type: "PAPER_FILL",
         aggregateType: "paper_fill",
         aggregateId: fill.id,
-        beforeCommit: () => {
+        beforeCommit: async () => {
           if (priorFillAuthority) return;
+          // NEW-fill TAKER BUY cash linearization at the serialized durable
+          // boundary. The admission-time availableCash read is stale while this
+          // call waits on DurableMutationGate: two TAKER BUYs on different
+          // markets can be planned against the same pre-fill cash and both
+          // pass earlier risk admission. Re-read the durable fill identity
+          // first so a concurrently-committed identical retry resolves as the
+          // existing idempotent result rather than an insufficient-cash
+          // failure, then fence only the genuinely NEW economic mutation
+          // against CURRENT unreserved cash.
+          if (fill.side === "BUY" && fill.liquidityRole === "TAKER") {
+            const fillAuthorityAtCommit = await this.journal.readDurableByOperationKey(`fill:${fill.id}`);
+            if (fillAuthorityAtCommit) return;
+            const actualRequiredCash = d(fill.quantity).mul(fill.fillPrice).plus(fill.feeUsd);
+            if (this.ledger.availableCash().lt(actualRequiredCash)) {
+              throw new TakerCashCommitGuardRejectedError(
+                fill.id,
+                fill.marketId,
+                actualRequiredCash.toFixed(),
+                this.ledger.availableCash().toFixed(),
+              );
+            }
+          }
           const currentPosition = this.ledger.positions.get(fill.marketId);
 
           if (economicIntent === "HEDGE_SECOND_LEG" || economicIntent === "PROTECTIVE_DE_RISK" || economicIntent === "RESCUE_SECOND_LEG") {
