@@ -19,7 +19,7 @@ import {
   qualified,
   qualifiedPaperEnv,
 } from "./paper-engine-testkit.js";
-import { feeSchedule, snapshot as newSnapshot } from "./fixtures.js";
+import { feeSchedule, order, snapshot as newSnapshot } from "./fixtures.js";
 
 const START_MS = Date.parse("2026-01-01T00:00:00.000Z");
 const END_OFFSET_MS = 3_600_000;
@@ -141,7 +141,7 @@ describe("PR3 early catastrophic pair-lock", { timeout: 40_000 }, () => {
 
       setup.clock.nowMs = START_MS + 20_000; // age > 10s
       await setup.market.emitSnapshot(book(setup.clock, "UP", 2, [{ price: "0.77", quantity: "1000" }], [{ price: "0.85", quantity: "1000" }]));
-      await setup.market.emitSnapshot(book(setup.clock, "DOWN", 2, [], [{ price: "0.24", quantity: "100" }]));
+      await setup.market.emitSnapshot(book(setup.clock, "DOWN", 2, [], [{ price: "0.24", quantity: "2000" }]));
 
       const rescues = await waitFor(() => fills(setup, "RESCUE_SECOND_LEG"), (rows) => rows.length > 0);
       expect(rescues[0]?.payload).toMatchObject({ side: "BUY", outcome: "DOWN", quantity: "5.74712644", fillPrice: "0.24" });
@@ -151,6 +151,20 @@ describe("PR3 early catastrophic pair-lock", { timeout: 40_000 }, () => {
       expect(evals.length).toBeGreaterThan(0);
       const pnl = Number(evals[0]?.payload?.earlyCatastrophic?.guaranteedLockedPnl ?? NaN);
       expect(pnl).toBeCloseTo(-0.5872, 2);
+      // AUDIT IDENTITY: RISK_EVALUATION aggregate == payload risk id; the order
+      // id from the canonical decision flows into PAPER_ORDER_CREATED and the
+      // rescue fill; intent/deRisk reason remains EARLY_CATASTROPHIC_PAIR_LOCK.
+      const earlyEval = evals[0]!;
+      expect(earlyEval.aggregateId).toBe(earlyEval.payload.id);
+      expect(earlyEval.payload.intent).toBe("RESCUE_SECOND_LEG");
+      expect(earlyEval.payload.deRisk?.deRiskReason).toBe("EARLY_CATASTROPHIC_PAIR_LOCK");
+      const createdRows = await setup.journal.queryEvents({ types: ["PAPER_ORDER_CREATED"] });
+      const earlyCreated = createdRows.find((row) =>
+        row.payload.intent === "RESCUE_SECOND_LEG" && row.payload.deRisk?.deRiskReason === "EARLY_CATASTROPHIC_PAIR_LOCK");
+      expect(earlyCreated).toBeTruthy();
+      const rescueFillRow = (await setup.journal.queryEvents({ types: ["PAPER_FILL"] }))
+        .find((row) => row.payload.intent === "RESCUE_SECOND_LEG");
+      expect(rescueFillRow?.payload.orderId).toBe(earlyCreated!.aggregateId);
       expect(setup.engine.integrityFault()).toBe(false);
     } finally {
       await setup.engine.stop();
@@ -169,7 +183,7 @@ describe("PR3 early catastrophic pair-lock", { timeout: 40_000 }, () => {
       });
       setup.clock.nowMs = START_MS + 20_000;
       await setup.market.emitSnapshot(book(setup.clock, "DOWN", 2, [{ price: "0.785", quantity: "1000" }], [{ price: "0.85", quantity: "1000" }]));
-      await setup.market.emitSnapshot(book(setup.clock, "UP", 2, [], [{ price: "0.22", quantity: "100" }]));
+      await setup.market.emitSnapshot(book(setup.clock, "UP", 2, [], [{ price: "0.22", quantity: "10000" }]));
 
       const rescues = await waitFor(() => fills(setup, "RESCUE_SECOND_LEG"), (rows) => rows.length > 0);
       expect(rescues[0]?.payload).toMatchObject({ side: "BUY", outcome: "UP", quantity: "5.88235294", fillPrice: "0.22" });
@@ -276,7 +290,7 @@ it("Test E: partial opposite depth -> no early rescue; next fresh snapshot retri
       // A LATER FRESH snapshot with full opposite depth retries successfully.
       setup.clock.nowMs = START_MS + 21_000;
       await setup.market.emitSnapshot(book(setup.clock, "UP", 3, [{ price: "0.70", quantity: "1000" }], [{ price: "0.82", quantity: "1000" }]));
-      await setup.market.emitSnapshot(book(setup.clock, "DOWN", 3, [], [{ price: "0.24", quantity: "100" }]));
+      await setup.market.emitSnapshot(book(setup.clock, "DOWN", 3, [], [{ price: "0.24", quantity: "2000" }]));
       const rescues = await waitFor(() => fills(setup, "RESCUE_SECOND_LEG"), (rows) => rows.length > 0);
       expect(rescues[0]?.payload).toMatchObject({ quantity: "6.25" });
       expect(number(setup.engine.ledger.positions.get("btc-mkt")?.unpairedQuantity)).toBe(0);
@@ -368,14 +382,10 @@ it("Test E: partial opposite depth -> no early rescue; next fresh snapshot retri
       oppositeSnapshot: book({ nowMs: START_MS + 50_000 }, "DOWN", 9, [], [{ price: "0.42", quantity: "5" }], ERROR_SCHEDULE),
       nowMs: START_MS + 50_000,
       maxOrderSizeUsd: LIMITS.maxOrderSizeUsd,
-      minimumLockedPairEdge: LIMITS.minExpectedEdge,
       minUnhedgedMs: 10_000,
       triggerLossUsd: 0.35,
       maxLockedLossUsd: 0.60,
-      snapshots: {
-        UP: book({ nowMs: START_MS + 50_000 }, "UP", 9, [{ price: "0.60", quantity: "5" }], [{ price: "0.72", quantity: "5" }], ERROR_SCHEDULE),
-        DOWN: book({ nowMs: START_MS + 50_000 }, "DOWN", 9, [], [{ price: "0.42", quantity: "5" }], ERROR_SCHEDULE),
-      },
+      hedgeAdmissible: false,
     });
     expect(exactEval.eligible).toBe(true);
     expect(Number(exactEval.guaranteedLockedPnl)).toBeCloseTo(-0.6, 6);
@@ -393,7 +403,7 @@ it("Test E: partial opposite depth -> no early rescue; next fresh snapshot retri
       });
       boundarySetup.clock.nowMs = START_MS + 20_000;
       await boundarySetup.market.emitSnapshot(book(boundarySetup.clock, "UP", 2, [{ price: "0.60", quantity: "1000" }], [{ price: "0.72", quantity: "1000" }], ERROR_SCHEDULE));
-      await boundarySetup.market.emitSnapshot(book(boundarySetup.clock, "DOWN", 2, [], [{ price: "0.42", quantity: "100" }], ERROR_SCHEDULE));
+      await boundarySetup.market.emitSnapshot(book(boundarySetup.clock, "DOWN", 2, [], [{ price: "0.42", quantity: "1000" }], ERROR_SCHEDULE));
       const rescues = await waitFor(() => fills(boundarySetup, "RESCUE_SECOND_LEG"), (rows) => rows.length > 0);
       expect(rescues[0]?.payload).toMatchObject({ quantity: "5", fillPrice: "0.42" });
       expect(number(boundarySetup.engine.ledger.positions.get("btc-mkt")?.unpairedQuantity)).toBe(0);
@@ -467,6 +477,195 @@ it("Test G: latency deterioration -> final-fence rejects the actual fill", async
       const evals = (await setup.journal.queryEvents({ types: ["RISK_EVALUATION"] }))
         .filter((row) => row.payload.deRisk?.deRiskReason === "MAX_UNHEDGED_DURATION");
       expect(evals.length).toBeGreaterThan(0);
+    } finally {
+      await setup.engine.stop();
+    }
+  });
+it("BLOCKER1-cash: canonical decideRescueSecondLegOrder rejects INSUFFICIENT_CASH (zero early fill)", async () => {
+    const setup = await setupScenario(END_OFFSET_MS, { PAPER_START_BALANCE: "20" });
+    try {
+      expect((await setup.engine.beginExperiment()).ok).toBe(true);
+      await setup.engine.applyObservedFill({
+        ...firstLeg(setup.clock, createId("event-first"), {
+          tokenId: "btc-up", outcome: "UP", requestedPrice: "0.90", fillPrice: "0.90",
+          quantity: "20", feeUsd: "0",
+        }),
+        feeSchedule: ERROR_SCHEDULE,
+      });
+      setup.clock.nowMs = START_MS + 20_000;
+      await setup.market.emitSnapshot(book(setup.clock, "UP", 2, [{ price: "0.80", quantity: "1000" }], [{ price: "0.92", quantity: "1000" }], ERROR_SCHEDULE));
+      await setup.market.emitSnapshot(book(setup.clock, "DOWN", 2, [], [{ price: "0.11", quantity: "10000" }], ERROR_SCHEDULE));
+      // Early conditions all pass (mark loss >= 0.35, full depth, cap >= -0.60),
+      // but canonical risk admission -> INSUFFICIENT_CASH (cash 2 < notional 2.2).
+      await waitFor(
+        () => suppressed(setup),
+        (rows) => rows.some((row) => row.payload.gate === "EARLY_CATASTROPHIC_PAIR_LOCK"),
+      );
+      expect((await fills(setup, "RESCUE_SECOND_LEG"))).toHaveLength(0);
+      const evals = await setup.journal.queryEvents({ types: ["RISK_EVALUATION"] });
+      const earlyEval = evals.filter((row) => row.payload.deRisk?.deRiskReason === "EARLY_CATASTROPHIC_PAIR_LOCK");
+      expect(earlyEval.length).toBeGreaterThan(0);
+      expect(earlyEval[0]?.payload.accepted).toBe(false);
+      expect(earlyEval[0]?.payload.vetoes).toContain("INSUFFICIENT_CASH");
+      expect(earlyEval[0]?.payload.deRisk?.finalState).toBe("RISK_VETO");
+      const durable = await setup.journal.queryDurableTransitions({ types: ["PAPER_FILL"], limit: 16 });
+      expect(durable.filter((row) => row.operationKey.startsWith("fill:")).map((row) => row.operationKey)).toHaveLength(1);
+      expect(setup.engine.ledger.positions.get("btc-mkt")?.unpairedQuantity).toBe("20");
+      expect(setup.engine.ledger.snapshot().cash).toBe("2"); // unchanged, retryable
+    } finally {
+      await setup.engine.stop();
+    }
+  });
+
+  it("BLOCKER1-exposure: canonical decideRescueSecondLegOrder rejects MAX_MARKET_EXPOSURE", async () => {
+    const setup = await setupScenario(END_OFFSET_MS);
+    try {
+      expect((await setup.engine.beginExperiment()).ok).toBe(true);
+      await setup.engine.applyObservedFill({
+        ...firstLeg(setup.clock, createId("event-first"), {
+          tokenId: "btc-up", outcome: "UP", requestedPrice: "0.90", fillPrice: "0.90",
+          quantity: "200", feeUsd: "0",
+        }),
+        feeSchedule: ERROR_SCHEDULE,
+      });
+      setup.clock.nowMs = START_MS + 20_000;
+      await setup.market.emitSnapshot(book(setup.clock, "UP", 2, [{ price: "0.85", quantity: "1000" }], [{ price: "0.92", quantity: "1000" }], ERROR_SCHEDULE));
+      await setup.market.emitSnapshot(book(setup.clock, "DOWN", 2, [], [{ price: "0.10", quantity: "10000" }], ERROR_SCHEDULE));
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      expect((await fills(setup, "RESCUE_SECOND_LEG"))).toHaveLength(0);
+      const evals = (await setup.journal.queryEvents({ types: ["RISK_EVALUATION"] }))
+        .filter((row) => row.payload.deRisk?.deRiskReason === "EARLY_CATASTROPHIC_PAIR_LOCK");
+      expect(evals.length).toBeGreaterThan(0);
+      expect(evals[0]?.payload.accepted).toBe(false);
+      expect(evals[0]?.payload.vetoes).toContain("MAX_MARKET_EXPOSURE");
+      expect(setup.engine.ledger.positions.get("btc-mkt")?.unpairedQuantity).toBe("200");
+    } finally {
+      await setup.engine.stop();
+    }
+  });
+it("BLOCKER2-deadline: at/after deadline the PR82 A/B fallback owns (early never fires even if eligible)", async () => {
+    const setup = await setupScenario(END_OFFSET_MS);
+    try {
+      expect((await setup.engine.beginExperiment()).ok).toBe(true);
+      await setup.engine.applyObservedFill({
+        ...firstLeg(setup.clock, createId("event-first"), {
+          requestedPrice: "0.60", fillPrice: "0.60", quantity: "10", feeUsd: "0",
+        }),
+        feeSchedule: ERROR_SCHEDULE,
+      });
+      setup.clock.nowMs = START_MS + 20_000;
+      await setup.market.emitSnapshot(book(setup.clock, "DOWN", 2, [{ price: "0.60", quantity: "1000" }], [{ price: "0.61", quantity: "1000" }]));
+      await setup.market.emitSnapshot(book(setup.clock, "UP", 2, [], [{ price: "0.30", quantity: "10000" }]));
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      expect((await fills(setup, "RESCUE_SECOND_LEG"))).toHaveLength(0); // healthy mark -> no early pre-deadline
+
+      setup.clock.nowMs = eligibilityMs(END_OFFSET_MS) + 1;
+      // Mark loss >= 0.35 and early cap pass, but the deadline owns the position.
+      await setup.market.emitSnapshot(book(setup.clock, "UP", 3, [], [{ price: "0.30", quantity: "10000" }]));
+      await setup.market.emitSnapshot(book(setup.clock, "DOWN", 3, [{ price: "0.75", quantity: "1000" }], []));
+      const protective = await waitFor(() => fills(setup, "PROTECTIVE_DE_RISK"), (rows) => rows.length > 0);
+      expect(protective[0]?.payload).toMatchObject({ side: "SELL", outcome: "DOWN", fillPrice: "0.75", quantity: "10" });
+      expect((await fills(setup, "RESCUE_SECOND_LEG"))).toHaveLength(0);
+      expect((await earlyEvals(setup))).toHaveLength(0);
+      const evals = (await setup.journal.queryEvents({ types: ["RISK_EVALUATION"] }))
+        .filter((row) => row.payload.deRisk?.deRiskReason === "MAX_UNHEDGED_DURATION");
+      expect(evals.length).toBeGreaterThan(0);
+      expect(evals[0]?.payload.deRisk?.selectionReason).toBe("A_STRICTLY_BETTER");
+    } finally {
+      await setup.engine.stop();
+    }
+  });
+
+  it("BLOCKER2-partial: old fallback partial SELL continues managing residual; early never takes over", async () => {
+    const setup = await setupScenario(END_OFFSET_MS);
+    try {
+      expect((await setup.engine.beginExperiment()).ok).toBe(true);
+      await setup.engine.applyObservedFill({
+        ...firstLeg(setup.clock, createId("event-first"), {
+          requestedPrice: "0.60", fillPrice: "0.60", quantity: "10", feeUsd: "0",
+        }),
+        feeSchedule: ERROR_SCHEDULE,
+      });
+      setup.clock.nowMs = START_MS + 20_000;
+      await setup.market.emitSnapshot(book(setup.clock, "DOWN", 2, [{ price: "0.60", quantity: "1000" }], [{ price: "0.61", quantity: "1000" }]));
+      await setup.market.emitSnapshot(book(setup.clock, "UP", 2, [], [{ price: "0.25", quantity: "10000" }]));
+
+      // At the deadline the fallback SELLs only 4 (bid depth 4): residual 6.
+      // Phase 1 uses an EMPTY opposite book so B is unavailable -> A_ONLY
+      // partial SELL.
+      setup.clock.nowMs = eligibilityMs(END_OFFSET_MS) + 1;
+      await setup.market.emitSnapshot(book(setup.clock, "UP", 3, [], []));
+      await setup.market.emitSnapshot(book(setup.clock, "DOWN", 3, [{ price: "0.75", quantity: "4" }], []));
+      await waitFor(() => fills(setup, "PROTECTIVE_DE_RISK"), (rows) => rows.length === 1);
+      expect(setup.engine.ledger.positions.get("btc-mkt")?.downQuantity).toBe("6");
+
+      // A later snapshot would satisfy the EARLY predicate, but the deadline
+      // fallback owns the residual: fallback B pairs the remaining 6. (Clock
+      // advances well past the fallback retry slot.)
+      setup.clock.nowMs = eligibilityMs(END_OFFSET_MS) + 6_000;
+      await setup.market.emitSnapshot(book(setup.clock, "UP", 4, [], [{ price: "0.15", quantity: "10000" }]));
+      await setup.market.emitSnapshot(book(setup.clock, "DOWN", 4, [{ price: "0.50", quantity: "1000" }], []));
+      const rescues = await waitFor(() => fills(setup, "RESCUE_SECOND_LEG"), (rows) => rows.length === 1);
+      expect(rescues[0]?.payload).toMatchObject({ quantity: "6", fillPrice: "0.15" });
+      expect((await earlyEvals(setup))).toHaveLength(0);
+      expect(setup.engine.ledger.positions.get("btc-mkt")?.unpairedQuantity).toBe("0");
+    } finally {
+      await setup.engine.stop();
+    }
+  });
+it("BLOCKER3-race: hedge becomes admissible AFTER early flight acquisition -> early yields, exactly one HEDGE", async () => {
+    const setup = await setupScenario(END_OFFSET_MS);
+    const { engine, journal, market, clock } = setup;
+    try {
+      expect((await engine.beginExperiment()).ok).toBe(true);
+      await engine.applyObservedFill({
+        ...firstLeg(clock, createId("event-first"), {
+          tokenId: "btc-up", outcome: "UP", requestedPrice: "0.80", fillPrice: "0.80",
+          quantity: "6.25", feeUsd: "0",
+        }),
+        feeSchedule: ERROR_SCHEDULE,
+      });
+      clock.nowMs = START_MS + 20_000;
+      // Seed a resting hedge maker + a DOWN book where the hedge is NOT
+      // admissible (ask 0.19 -> pair edge 0.01 < minExpectedEdge).
+      const downBook = book(clock, "DOWN", 2, [{ price: "0.14", quantity: "10" }], [{ price: "0.19", quantity: "10000" }], ERROR_SCHEDULE);
+      await market.emitSnapshot(downBook);
+      await engine.restMakerForTest(order("MAKER", {
+        id: "seed-hedge", marketId: "btc-mkt", tokenId: "btc-down", outcome: "DOWN", side: "BUY",
+        requestedPrice: "0.14", quantity: "1", createdAt: iso(clock),
+      }), downBook, "HEDGE_SECOND_LEG");
+
+      let releaseHold!: () => void;
+      const hold = new Promise<void>((resolve) => { releaseHold = resolve; });
+      journal.setAppendInFlightHoldForTest(hold, ["PAPER_ORDER_CANCELLED"]);
+      // THIS snapshot makes the early path eligible (mark loss >= 0.35, full
+      // depth at 0.19, cap passes) -> it acquires the flight -> its maker
+      // cancellation awaits the held PAPER_ORDER_CANCELLED append.
+      await market.emitSnapshot(book(clock, "UP", 2, [{ price: "0.70", quantity: "1000" }], [{ price: "0.82", quantity: "1000" }], ERROR_SCHEDULE));
+      await waitFor(
+        () => journal.queryDurableTransitions({ types: ["PAPER_ORDER_CANCELLED"], limit: 8 }),
+        (rows) => rows.length > 0,
+      );
+      await waitFor(() => journal.inFlightAppends, (value) => value > 0);
+
+      // WHILE the early path is suspended in its pre-admission cancellation
+      // boundary, a fresh snapshot makes the normal hedge GENUINELY admissible
+      // (ask 0.04 -> pair edge 0.16, liquidity >= 100).
+      clock.nowMs = START_MS + 21_000;
+      await market.emitSnapshot(book(clock, "UP", 3, [{ price: "0.70", quantity: "1000" }], [{ price: "0.82", quantity: "1000" }], ERROR_SCHEDULE));
+      await market.emitSnapshot(book(clock, "DOWN", 3, [{ price: "0.03", quantity: "10000" }], [{ price: "0.04", quantity: "10000" }], ERROR_SCHEDULE));
+      await engine.ingestReferenceTickForTest(referenceTick(clock, "100"));
+      clock.nowMs = START_MS + 22_000;
+      await engine.ingestReferenceTickForTest(referenceTick(clock, "102"));
+      releaseHold();
+      journal.setAppendInFlightHoldForTest(null);
+
+      const hedges = await waitFor(() => fills(setup, "HEDGE_SECOND_LEG"), (rows) => rows.length > 0);
+      expect(hedges).toHaveLength(1);
+      expect(hedges[0]?.payload).toMatchObject({ side: "BUY", outcome: "DOWN", quantity: "6.25", fillPrice: "0.04" });
+      expect((await fills(setup, "RESCUE_SECOND_LEG"))).toHaveLength(0);
+      expect((await fills(setup, "PROTECTIVE_DE_RISK"))).toHaveLength(0);
+      expect(setup.engine.ledger.positions.get("btc-mkt")?.unpairedQuantity).toBe("0");
     } finally {
       await setup.engine.stop();
     }

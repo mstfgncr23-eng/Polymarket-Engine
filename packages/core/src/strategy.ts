@@ -407,7 +407,9 @@ const HEDGE_AVAILABILITY_CONSENSUS: ConsensusDecision = {
  * Eligible only when ALL of the following hold for a real unpaired position:
  *  - minimum unhedged age elapsed (catastrophicPairLockMinUnhedgedMs);
  *  - conservative realizable mark loss on the held leg >= trigger loss;
- *  - NO currently available normal profitable hedge (HEDGE priority);
+ *  - the canonical normal-hedge decision for the FRESH synchronized books is NOT
+ *    admissible (HEDGE priority) — the engine computes `hedgeAdmissible` via the
+ *    same decidePaperOrder/evaluateRisk semantics as the running normal hedge;
  *  - the OPPOSITE book can fill the ENTIRE residual (full depth, max order size,
  *    known fee schedule / min order size) — a partial object is NEVER accepted;
  *  - the fee-inclusive guaranteed terminal PnL of the full pair-lock is no
@@ -419,11 +421,11 @@ export function evaluateEarlyCatastrophicPairLock(input: {
   oppositeSnapshot: MarketSnapshot | null;
   nowMs: number;
   maxOrderSizeUsd: number;
-  minimumLockedPairEdge: number;
   minUnhedgedMs: number;
   triggerLossUsd: number;
   maxLockedLossUsd: number;
-  snapshots: Record<Outcome, MarketSnapshot | null>;
+  /** Canonical normal-hedge admissibility from FRESH synchronized books. */
+  hedgeAdmissible: boolean;
 }): EarlyCatastrophicPairLockEvaluation {
   const empty = (): EarlyCatastrophicPairLockEvaluation => ({
     eligible: false, reason: null, candidate: null, markLossUsd: null, guaranteedLockedPnl: null,
@@ -444,12 +446,7 @@ export function evaluateEarlyCatastrophicPairLock(input: {
   if (d(markLossUsd).lt(input.triggerLossUsd)) {
     return { ...empty(), markLossUsd, reason: "MARK_LOSS_NOT_REACHED" };
   }
-  const hedgeAvailable = evaluateNormalHedgeCandidate({
-    position,
-    snapshots: input.snapshots,
-    maxOrderSizeUsd: input.maxOrderSizeUsd,
-    minimumLockedPairEdge: input.minimumLockedPairEdge,
-  }) !== null;
+  const hedgeAvailable = input.hedgeAdmissible;
   if (hedgeAvailable) {
     return { ...empty(), markLossUsd, hedgeAvailable, reason: "HEDGE_AVAILABLE_PRIORITY" };
   }
