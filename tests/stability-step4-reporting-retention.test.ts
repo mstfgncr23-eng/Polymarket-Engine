@@ -59,6 +59,7 @@ import { BoundedJournalWriter } from "../apps/engine/src/journal-writer.js";
 import { generateOperatorReport } from "../apps/engine/src/operator-report.js";
 import { defaultRetentionConfig, experimentIsActive, experimentIsMonitorOnly, RetentionManager } from "../apps/engine/src/retention-manager.js";
 import { loadSourceSeal } from "../apps/engine/src/source-seal.js";
+import { LOCAL_ARCHIVE_SENTINEL, LOCAL_ARCHIVE_SENTINEL_CONTENT } from "../apps/engine/src/archive.js";
 import { completeMetricsFlightKey, resetStrategyMetricsCacheForTest } from "../apps/engine/src/mcp.js";
 import { KeyedResultFlight } from "../apps/engine/src/runtime-supervisor.js";
 import { EngineMetrics } from "../apps/engine/src/metrics.js";
@@ -84,6 +85,19 @@ function ev(type: string, occurredAt: string, payload: Record<string, unknown> =
     aggregateId: String(payload.aggregateId ?? payload.marketId ?? type),
     payload: { experimentId: "exp-1", ...payload },
     occurredAt: new Date(occurredAt),
+  });
+}
+
+async function localArchiveRetentionConfig(
+  overrides: Parameters<typeof defaultRetentionConfig>[0] = {},
+) {
+  const directory = await mkdtemp(join(tmpdir(), "pm-retention-archive-"));
+  await writeFile(join(directory, LOCAL_ARCHIVE_SENTINEL), `${LOCAL_ARCHIVE_SENTINEL_CONTENT}\n`, "utf8");
+  return defaultRetentionConfig({
+    ...overrides,
+    localArchiveEnabled: true,
+    localArchiveDir: directory,
+    localArchiveBucketMs: 60_000,
   });
 }
 
@@ -324,7 +338,7 @@ describe("Step-4 retention classes and gates", () => {
     expect((await journal.queryEvents({ types: ["PAPER_FILL"] })).length).toBe(1);
   });
 
-  it("complete+grace unlocks monitor/telemetry; telemetry delete never removes execution evidence; batches ≤ cap", async () => {
+  it("complete+grace archives telemetry but keeps experiment-attributed monitor detail without a verified rollup", async () => {
     const journal = new MemoryEventJournal();
     const persistedAt = new Date("2026-09-01T00:00:00.000Z");
     await journal.append(ev("TRIGGER_EVENT", "2026-09-01T00:00:00.000Z", { kind: "BOOK_IMBALANCE" }, "trig-old"));
@@ -337,7 +351,7 @@ describe("Step-4 retention classes and gates", () => {
       earliestIncludedAt: null, latestIncludedAt: null, canonicalSummary: { ok: true }, renderedMarkdown: "ok",
       contentHash: "ok",
     });
-    const manager = new RetentionManager(journal, defaultRetentionConfig({
+    const manager = new RetentionManager(journal, await localArchiveRetentionConfig({
       enabled: true, telemetryTtlMs: 1, monitorTtlMs: 1, completedGraceMs: 1, batchSize: 200,
     }));
     const result = await manager.runCycle({
@@ -348,7 +362,7 @@ describe("Step-4 retention classes and gates", () => {
     expect(result.transientEligible).toBe(true);
     expect(result.lastBatchSize).toBeLessThanOrEqual(200);
     expect((await journal.queryEvents({ types: ["MARKET_SNAPSHOT"] })).length).toBe(0);
-    expect((await journal.queryEvents({ types: ["TRIGGER_EVENT"] })).length).toBe(0);
+    expect((await journal.queryEvents({ types: ["TRIGGER_EVENT"] })).length).toBe(1);
     expect((await journal.queryEvents({ types: ["PAPER_FILL"] })).length).toBe(1);
     expect(result.durableTransitionsPruned).toBe(false);
   });
@@ -651,14 +665,14 @@ describe("Step-4 acceptance: monitor-only and drain", () => {
   it("monitor-only / no experiment allows monitor TTL; active protects in-window; completed needs final+grace", async () => {
     const journal = new MemoryEventJournal();
     const now = new Date("2026-09-08T00:00:00.000Z");
-    await journal.append(ev("TRIGGER_EVENT", "2026-09-01T00:00:00.000Z", {}, "pre"));
-    const manager = new RetentionManager(journal, defaultRetentionConfig({ enabled: true, monitorTtlMs: 1, telemetryTtlMs: 1, completedGraceMs: 1, batchSize: 50, maxBatchesPerCycle: 8, maxRowsPerCycle: 400 }));
+    await journal.append(ev("TRIGGER_EVENT", "2026-09-01T00:00:00.000Z", { experimentId: null }, "pre"));
+    const manager = new RetentionManager(journal, await localArchiveRetentionConfig({ enabled: true, monitorTtlMs: 1, telemetryTtlMs: 1, completedGraceMs: 1, batchSize: 50, maxBatchesPerCycle: 8, maxRowsPerCycle: 400 }));
     expect(experimentIsMonitorOnly(null)).toBe(true);
     expect(experimentIsMonitorOnly({ id: "aborted", status: "ABORTED_START" })).toBe(true);
     const idle = await manager.runCycle({ experiment: null, now, degraded: false, failClosed: false, databaseUp: true });
     expect(idle.monitorOnlyEligible).toBe(true);
     expect((await journal.queryEvents({ types: ["TRIGGER_EVENT"] })).length).toBe(0);
-    await journal.append(ev("TRIGGER_EVENT", "2026-09-01T00:00:00.000Z", {}, "aborted-old"));
+    await journal.append(ev("TRIGGER_EVENT", "2026-09-01T00:00:00.000Z", { experimentId: null }, "aborted-old"));
     const aborted = await manager.runCycle({
       experiment: { id: "aborted", status: "ABORTED_START" },
       now, degraded: false, failClosed: false, databaseUp: true,
@@ -672,7 +686,7 @@ describe("Step-4 acceptance: monitor-only and drain", () => {
     await manager.runCycle({ experiment: { id: "aborted", status: "ABORTED_START" }, now, degraded: false, failClosed: false, databaseUp: true });
     expect(await journal.queryDurableTransitions({ types: ["EXPERIMENT_START_ABORTED"], limit: 8 })).toHaveLength(1);
     await journal.append(ev("TRIGGER_EVENT", "2026-09-07T00:00:00.000Z", {}, "in-window"));
-    await journal.append(ev("TRIGGER_EVENT", "2026-09-01T00:00:00.000Z", {}, "pre2"));
+    await journal.append(ev("TRIGGER_EVENT", "2026-09-01T00:00:00.000Z", { experimentId: null }, "pre2"));
     const active = await manager.runCycle({
       experiment: { id: "exp-1", status: "RUNNING", startedAt: "2026-09-06T00:00:00.000Z" },
       now, degraded: false, failClosed: false, databaseUp: true,
@@ -693,7 +707,7 @@ describe("Step-4 acceptance: monitor-only and drain", () => {
 
   it("multi-batch drain converges an eligible backlog instead of growing unbounded", async () => {
     const journal = new MemoryEventJournal();
-    const manager = new RetentionManager(journal, defaultRetentionConfig({
+    const manager = new RetentionManager(journal, await localArchiveRetentionConfig({
       enabled: true, telemetryTtlMs: 60_000, monitorTtlMs: 60_000, batchSize: 20,
       maxBatchesPerCycle: 5, maxRowsPerCycle: 100, cycleBudgetMs: 5_000,
     }));
@@ -984,7 +998,7 @@ describe("Step-4 acceptance: hard maxRowsPerCycle and effective retention config
     const run = async (batchSize: number, maxRowsPerCycle: number) => {
       const journal = new MemoryEventJournal();
       await seed(journal, 400);
-      const manager = new RetentionManager(journal, defaultRetentionConfig({
+      const manager = new RetentionManager(journal, await localArchiveRetentionConfig({
         enabled: true, telemetryTtlMs: 1, monitorTtlMs: 1, batchSize, maxRowsPerCycle,
         maxBatchesPerCycle: 20, cycleBudgetMs: 10_000,
       }));
@@ -1003,7 +1017,7 @@ describe("Step-4 acceptance: hard maxRowsPerCycle and effective retention config
     const journal = new MemoryEventJournal();
     const now = new Date("2026-09-08T00:00:00.000Z");
     await journal.append(ev("MARKET_SNAPSHOT", "2026-09-07T21:00:00.000Z", {}, "tel-2h"));
-    await journal.append(ev("TRIGGER_EVENT", "2026-09-07T10:00:00.000Z", {}, "mon-12h"));
+    await journal.append(ev("TRIGGER_EVENT", "2026-09-07T10:00:00.000Z", { experimentId: null }, "mon-12h"));
     const config = defaultRetentionConfig({
       enabled: true,
       telemetryTtlMs: 2 * 60 * 60_000,
@@ -1027,7 +1041,7 @@ describe("Step-4 acceptance: hard maxRowsPerCycle and effective retention config
     expect(cycle.eligibleBacklog).toBe(dry.telemetry.eligible + dry.monitor.eligible);
     const applyJournal = new MemoryEventJournal();
     await applyJournal.append(ev("MARKET_SNAPSHOT", "2026-09-07T21:00:00.000Z", {}, "tel-2h"));
-    await applyJournal.append(ev("TRIGGER_EVENT", "2026-09-07T10:00:00.000Z", {}, "mon-12h"));
+    await applyJournal.append(ev("TRIGGER_EVENT", "2026-09-07T10:00:00.000Z", { experimentId: null }, "mon-12h"));
     const apply = await applyJournalCleanup(applyJournal, {
       now, experiment: null, confirm: "I_UNDERSTAND_DESTRUCTIVE_CLEANUP", config,
     });
@@ -1231,7 +1245,7 @@ describe("Step-4 residual: checkpoint prune honors remaining cycle rows", () => 
       await journal.append(ev("MARKET_SNAPSHOT", "2026-01-01T00:00:00.000Z", { i }, `tel-cp-${i}`));
     }
     await seedCheckpoints(journal, 220);
-    const manager = new RetentionManager(journal, defaultRetentionConfig({
+    const manager = new RetentionManager(journal, await localArchiveRetentionConfig({
       enabled: true, checkpointKeep: 1, batchSize: 200, maxRowsPerCycle: 50,
       maxBatchesPerCycle: 8, cycleBudgetMs: 10_000, telemetryTtlMs: 1, monitorTtlMs: 1,
     }));

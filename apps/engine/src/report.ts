@@ -44,6 +44,7 @@ export interface ExperimentSummaryAccumulatorSnapshot {
   settlementBothQty: number;
   lastLedger?: LedgerState;
   maxDrawdown: number;
+  maxDirectionalExposureUsd?: number;
   riskCount: number;
   accepted: number;
   paperOrders: number;
@@ -101,6 +102,7 @@ export class ExperimentSummaryAccumulator {
   private settlementBothQty = 0;
   private lastLedger: LedgerState | undefined;
   private maxDrawdown = 0;
+  private maxDirectionalExposureUsd = 0;
   private riskCount = 0;
   private accepted = 0;
   private paperOrders = 0;
@@ -170,7 +172,8 @@ export class ExperimentSummaryAccumulator {
       latestPositions: [...this.latestPositions.entries()].map(([id, position]) => [id, structuredClone(position)]),
       settledMarketIds: [...this.settledMarketIds], settledPositionIds: [...this.settledPositionIds], settlementCount: this.settlementCount,
       settlementPnlUsd: this.settlementPnlUsd, settlementBothQty: this.settlementBothQty, lastLedger: this.lastLedger ? structuredClone(this.lastLedger) : undefined,
-      maxDrawdown: this.maxDrawdown, riskCount: this.riskCount, accepted: this.accepted, paperOrders: this.paperOrders,
+      maxDrawdown: this.maxDrawdown, maxDirectionalExposureUsd: this.maxDirectionalExposureUsd,
+      riskCount: this.riskCount, accepted: this.accepted, paperOrders: this.paperOrders,
       makerOrders: this.makerOrders, takerOrders: this.takerOrders, fillCount: this.fillCount, makerFills: this.makerFills, takerFills: this.takerFills,
       firstLegCount: this.firstLegCount, hedgeCompleteCount: this.hedgeCompleteCount, hedgeDurationSum: this.hedgeDurationSum, hedgeDurationN: this.hedgeDurationN,
       pairRealizedNetSum: this.pairRealizedNetSum, pairRealizedNetN: this.pairRealizedNetN, pairRealizedGrossSum: this.pairRealizedGrossSum, pairRealizedGrossN: this.pairRealizedGrossN,
@@ -191,6 +194,7 @@ export class ExperimentSummaryAccumulator {
     this.latestPositions.clear(); for (const [id, position] of snapshot.latestPositions ?? []) this.latestPositions.set(id, structuredClone(position));
     this.settledMarketIds.clear(); for (const id of snapshot.settledMarketIds ?? []) this.settledMarketIds.add(id); this.settledPositionIds.clear(); for (const id of snapshot.settledPositionIds ?? []) this.settledPositionIds.add(id);
     this.settlementCount = assign("settlementCount", 0); this.settlementPnlUsd = assign("settlementPnlUsd", 0); this.settlementBothQty = assign("settlementBothQty", 0); this.lastLedger = snapshot.lastLedger ? structuredClone(snapshot.lastLedger) : undefined;
+    this.maxDirectionalExposureUsd = assign("maxDirectionalExposureUsd", 0);
     for (const key of ["maxDrawdown","riskCount","accepted","paperOrders","makerOrders","takerOrders","fillCount","makerFills","takerFills","firstLegCount","hedgeCompleteCount","hedgeDurationSum","hedgeDurationN","pairRealizedNetSum","pairRealizedNetN","pairRealizedGrossSum","pairRealizedGrossN","failedHedgeCount","positionWins","positionLosses","positionBreakeven","grossWins","grossLosses","grossBreakeven","rejectedWouldHaveWon","acceptedLost","worstUnhedgedUsd"] as const) (this as unknown as Record<string, unknown>)[key] = snapshot[key];
     const replaceRecord = (target: Record<string, unknown>, source: Record<string, unknown> | undefined) => { for (const key of Object.keys(target)) delete target[key]; Object.assign(target, structuredClone(source ?? {})); };
     replaceRecord(this.modelCounts, snapshot.modelCounts); replaceRecord(this.modelCosts, snapshot.modelCosts); replaceRecord(this.failureStatistics, snapshot.failureStatistics); replaceRecord(this.eventCountByMarket, snapshot.eventCountByMarket); replaceRecord(this.eventCountByAsset, snapshot.eventCountByAsset); replaceRecord(this.byMarket, snapshot.byMarket); replaceRecord(this.byAsset, snapshot.byAsset); replaceRecord(this.agentSignals, snapshot.agentSignals); replaceRecord(this.regimes, snapshot.regimes); replaceRecord(this.hours, snapshot.hours);
@@ -236,14 +240,26 @@ export class ExperimentSummaryAccumulator {
         }
       }
     } else if (type === "POSITION_UPDATED") {
-      this.latestPositions.set(event.aggregateId, event.payload as unknown as Position);
+      const position = event.payload as unknown as Position;
+      const previous = this.latestPositions.get(event.aggregateId);
+      // FIRST_LEG_FILLED counts the initial cycle. A later fully-paired -> unpaired
+      // transition is a fresh opening cycle even though the Position object persists.
+      if (previous && Number(previous.unpairedQuantity) <= 0 && Number(position.unpairedQuantity) > 0) {
+        this.firstLegCount += 1;
+      }
+      this.maxDirectionalExposureUsd = Math.max(this.maxDirectionalExposureUsd, directionalExposureUsd(position));
+      this.latestPositions.set(event.aggregateId, position);
     } else if (type === "PNL_SNAPSHOT") {
       this.lastLedger = event.payload as unknown as LedgerState;
       this.maxDrawdown = Math.max(this.maxDrawdown, Number((event.payload as { drawdown?: unknown }).drawdown ?? 0));
     } else if (type === "RISK_EVALUATION") {
-      this.riskCount += 1;
-      if ((event.payload as { accepted?: boolean }).accepted === true) this.accepted += 1;
-      this.addRiskAttribution(event);
+      const payload = event.payload as { accepted?: boolean; intent?: unknown; deRisk?: unknown };
+      const protective = payload.intent === "PROTECTIVE_DE_RISK" || payload.deRisk != null;
+      if (!protective) {
+        this.riskCount += 1;
+        if (payload.accepted === true) this.accepted += 1;
+        this.addRiskAttribution(event);
+      }
     } else if (type === "PAPER_ORDER_CREATED") {
       this.paperOrders += 1;
       const payload = event.payload as { orderType?: unknown; type?: unknown };
@@ -251,11 +267,14 @@ export class ExperimentSummaryAccumulator {
       if (payload.orderType === "TAKER" || payload.type === "TAKER") this.takerOrders += 1;
     } else if (type === "FIRST_LEG_FILLED") this.firstLegCount += 1;
     else if (type === "HEDGE_COMPLETE") {
-      this.hedgeCompleteCount += 1;
-      const duration = Number((event.payload as { unhedgedDurationMs?: unknown }).unhedgedDurationMs);
-      if (Number.isFinite(duration)) {
-        this.hedgeDurationSum += duration;
-        this.hedgeDurationN += 1;
+      const completionMode = (event.payload as { completionMode?: unknown }).completionMode;
+      if (completionMode !== "PROTECTIVE_DE_RISK") {
+        this.hedgeCompleteCount += 1;
+        const duration = Number((event.payload as { unhedgedDurationMs?: unknown }).unhedgedDurationMs);
+        if (Number.isFinite(duration)) {
+          this.hedgeDurationSum += duration;
+          this.hedgeDurationN += 1;
+        }
       }
     } else if (type === "CONSENSUS_DECISION" && (event.payload as { authority?: unknown }).authority === "NATIVE_DETERMINISTIC_V1") {
       this.modelCounts.NATIVE_DETERMINISTIC_V1 = (this.modelCounts.NATIVE_DETERMINISTIC_V1 ?? 0) + 1;
@@ -273,7 +292,9 @@ export class ExperimentSummaryAccumulator {
       const status = String((event.payload as { status?: unknown }).status ?? "MCP");
       if (status !== "HANDLED") this.failureStatistics[`MCP_${status}`] = (this.failureStatistics[`MCP_${status}`] ?? 0) + 1;
     } else if (type === "PAPER_EXECUTION_ERROR") {
-      this.failureStatistics.PAPER_EXECUTION_ERROR = (this.failureStatistics.PAPER_EXECUTION_ERROR ?? 0) + 1;
+      if ((event.payload as { stateChanged?: unknown }).stateChanged !== true) {
+        this.failureStatistics.PAPER_EXECUTION_ERROR = (this.failureStatistics.PAPER_EXECUTION_ERROR ?? 0) + 1;
+      }
     } else if (type === "PAIR_REALIZED") {
       const net = netRealizedEdgeOf(event);
       if (Number.isFinite(net)) { this.pairRealizedNetSum += net; this.pairRealizedNetN += 1; }
@@ -349,7 +370,7 @@ export class ExperimentSummaryAccumulator {
       netTradingPnlUsd: netTradingPnl, aiCostUsd: aiCost, estimatedInfrastructureCostUsd: infraCost,
       economicPnlUsd: Number(ledger?.netEconomicPnl ?? netTradingPnl - aiCost - infraCost),
       maximumDrawdownUsd: Math.max(0, this.maxDrawdown),
-      maximumDirectionalExposureUsd: Math.max(0, ...positions.map((position) => Number(position.unpairedQuantity) * Number(position.unpairedOutcome === "UP" ? position.averageUpCost : position.averageDownCost))),
+      maximumDirectionalExposureUsd: Math.max(0, this.maxDirectionalExposureUsd),
       averageUnhedgedDurationMs: this.hedgeDurationN ? this.hedgeDurationSum / this.hedgeDurationN : 0,
       worstUnhedgedEvent: this.worstUnhedgedEvent,
       averagePairCost: pairCosts.length ? average(pairCosts) : null,
@@ -371,7 +392,7 @@ export class ExperimentSummaryAccumulator {
       performanceByMarketRegime: this.regimes,
       performanceByHour: this.hours,
       rejectedTradesThatWouldHaveWon: this.rejectedWouldHaveWon,
-      acceptedTradesThatLost: this.acceptedLost, failureStatistics: this.failureStatistics,
+      acceptedTradesThatLost: this.positionLosses, failureStatistics: this.failureStatistics,
       hedgeFailureRate: rate(this.failedHedgeCount, this.firstLegCount),
       executableOpportunityRate: rate(this.fillCount, this.riskCount),
       metricsScope: extrasScope,
@@ -679,6 +700,15 @@ function latestByAggregate(events: readonly JournalEvent[]): JournalEvent[] {
   const map = new Map<string, JournalEvent>();
   for (const event of events) map.set(event.aggregateId, event);
   return [...map.values()];
+}
+function directionalExposureUsd(position: Position): number {
+  const quantity = Number(position.unpairedQuantity);
+  if (!Number.isFinite(quantity) || quantity <= 0 || !position.unpairedOutcome) return 0;
+  // Keep the existing blended-side cost convention here. Residual-lot cost basis
+  // is a separate risk/accounting correctness concern and is intentionally out of scope.
+  const averageCost = Number(position.unpairedOutcome === "UP" ? position.averageUpCost : position.averageDownCost);
+  if (!Number.isFinite(averageCost) || averageCost <= 0) return 0;
+  return quantity * averageCost;
 }
 function average(values: readonly number[]): number { return values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0; }
 function averageOrNull(values: readonly number[]): number | null {

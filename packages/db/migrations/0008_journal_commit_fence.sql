@@ -51,6 +51,11 @@ BEGIN
   END IF;
   RETURN NEW;
 END $$;
+-- Pin the trigger function's lookup path. Supabase's security advisor flags
+-- mutable function search_path, and the engine never needs caller-controlled
+-- schema resolution here.
+ALTER FUNCTION public.assign_journal_commit_seq() SET search_path = pg_catalog, public;
+
 DROP TRIGGER IF EXISTS journal_events_commit_seq_trigger ON journal_events;
 CREATE TRIGGER journal_events_commit_seq_trigger
 BEFORE INSERT ON journal_events

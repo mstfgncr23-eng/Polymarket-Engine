@@ -23,6 +23,9 @@ export const RETENTION_DEFAULTS = {
   maxBatchesPerCycle: 20,
   maxRowsPerCycle: 4_000,
   enabled: false,
+  localArchiveEnabled: false,
+  localArchiveDir: "/data/archive",
+  localArchiveBucketMs: 60 * 60_000,
 } as const;
 
 export const RETENTION_BATCH_SIZE_MAX = 500;
@@ -56,6 +59,27 @@ export const MONITOR_CONTROL_EVENT_TYPES = [
   "MCP_INTERACTION", "SYSTEM_HEALTH_EVENT", "DISCOVERY_RECONCILED",
   "REFERENCE_FEED_STARTED", "REFERENCE_FEED_STOPPED", "REFERENCE_UNSUPPORTED",
   "REFERENCE_PROBE_TRANSIENT", "REFERENCE_PROVIDER_BLOCKED",
+  // Diagnostic-only observability (short PAPER soak). Purge-safe monitor_control
+  // class; report class stays operational (non-canonical, never protected).
+  "PROTECTIVE_DE_RISK_SUPPRESSED",
+] as const;
+
+/**
+ * Journal-only operational audit. These rows are useful to humans but are not
+ * recovery authority; durable_transitions/checkpoints own recovery. They may
+ * leave hot Postgres only after checksum-verified local archival.
+ */
+export const LOCAL_ARCHIVE_OPERATIONAL_EVENT_TYPES = [
+  "ENGINE_STARTED", "ENGINE_DRAINING", "ENGINE_STOPPED", "STATE_RECOVERED",
+  "EXPERIMENT_START_VALIDATED", "EXPERIMENT_START_ABORTED",
+  "EXPERIMENT_REPORT_GENERATED", "EXPERIMENT_SOURCE_SEALED",
+  "INFRASTRUCTURE_COST_ACCRUED",
+] as const;
+
+export const LOCAL_ARCHIVE_PURGE_SAFE_EVENT_TYPES = [
+  ...TELEMETRY_EVENT_TYPES,
+  ...MONITOR_CONTROL_EVENT_TYPES,
+  ...LOCAL_ARCHIVE_OPERATIONAL_EVENT_TYPES,
 ] as const;
 
 const AUDIT_SET = new Set<string>(AUDIT_CRITICAL_EVENT_TYPES);
@@ -100,6 +124,10 @@ export const OPERATIONAL_MONITOR_EVENT_TYPES = [
   "REFERENCE_PROBE_TRANSIENT", "REFERENCE_PROVIDER_BLOCKED",
   "SYSTEM_HEALTH_EVENT",
   "EXPERIMENT_REPORT_GENERATED", "EXPERIMENT_SOURCE_SEALED",
+  // Diagnostic-only (short soak): records why a protective de-risk attempt was
+  // suppressed (gate + live snapshot/sync/depth facts). Rate-bounded per market
+  // by the engine; never canonical, never hashed, never source-sealed.
+  "PROTECTIVE_DE_RISK_SUPPRESSED",
 ] as const;
 
 export type ReportInputClass = "canonical" | "operational";

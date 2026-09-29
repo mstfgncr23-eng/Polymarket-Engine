@@ -306,6 +306,7 @@ export const riskReasonCodeSchema = z.enum([
   "MAX_UNHEDGED_DURATION",
   "MINIMUM_LIQUIDITY",
   "MINIMUM_EXPECTED_EDGE",
+  "MINIMUM_EXPECTED_ROI",
   "MAXIMUM_SPREAD",
   "MINIMUM_SIGNAL_CONFIDENCE",
   "SIGNAL_EXPIRED",
@@ -321,6 +322,9 @@ export const riskReasonCodeSchema = z.enum([
   "INSUFFICIENT_CASH",
   "MARKET_NOT_ENTRY_QUALIFIED",
   "REFERENCE_PROVIDER_BLOCKED",
+  "PROTECTIVE_DE_RISK_NOT_REDUCING",
+  "RESCUE_NOT_VERIFIED_REDUCING",
+  "SNAPSHOT_TOKEN_MISMATCH",
 ]);
 export type RiskReasonCode = z.infer<typeof riskReasonCodeSchema>;
 
@@ -384,6 +388,8 @@ export const positionSchema = z.object({
   pairedQuantity: decimalStringSchema,
   unpairedOutcome: outcomeSchema.nullable(),
   unpairedQuantity: decimalStringSchema,
+  /** Start of the current unpaired episode. Optional for legacy checkpoints. */
+  unhedgedStartedAt: timestampSchema.nullable().optional(),
   combinedPairCost: decimalStringSchema,
   totalFees: decimalStringSchema,
   totalSlippage: decimalStringSchema,

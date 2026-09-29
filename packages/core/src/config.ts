@@ -13,12 +13,41 @@ export const riskLimitsSchema = z.object({
   minLiquidityUsd: z.number().nonnegative().default(100),
   /** Minimum net expected value in USD/share for a $1 binary payout. */
   minExpectedEdge: z.number().min(0).max(1).default(0.015),
+  /**
+   * Minimum fee/slippage-adjusted expected return on executable first-leg
+   * notional. Unlike the absolute edge floor, this stays economically
+   * meaningful near $1 where a few cents of edge can still be tiny ROI.
+   */
+  minExpectedROI: z.number().nonnegative().default(0.02),
+  /**
+   * Fresh OPEN_FIRST_LEG price-regime boundary (exclusive). Post-latency
+   * executable first-leg price strictly BELOW this value selects the NORMAL
+   * first-leg economic floors (normalFirstLegMinExpectedEdge / ROI); at/above
+   * it the STRICT floors above remain unchanged. 0.90 exactly is STRICT.
+   */
+  normalFirstLegMaxPriceExclusive: z.number().min(0).max(1).default(0.9),
+  /** Relaxed net edge floor (USD/share) for fresh first-legs below the price boundary. */
+  normalFirstLegMinExpectedEdge: z.number().min(0).max(1).default(0.01),
+  /** Relaxed expected ROI floor for fresh first-legs below the price boundary. */
+  normalFirstLegMinExpectedROI: z.number().nonnegative().default(0.01),
   maxSpread: z.number().min(0).max(1).default(0.08),
   minSignalConfidence: z.number().min(0).max(1).default(0.6),
   staleFeedTimeoutMs: z.number().int().positive().default(15_000),
   maxExternalSignalsPerMinute: z.number().int().positive().default(30),
   strategyCooldownMs: z.number().int().nonnegative().default(60_000),
   maxExecutionErrorsPerHour: z.number().int().positive().default(5),
+  /**
+   * PR3 early catastrophic pair-lock protection. Applied to an unpaired
+   * position BEFORE the old protective deadline: after the minimum unhedged
+   * age, when the realizable mark loss on the held leg reaches the trigger
+   * loss, a FULL fee-inclusive opposite pair-lock may buy the entire residual
+   * BUY the opposite outcome as long as the guaranteed terminal PnL is no worse
+   * than the configured max locked loss. Normal profitable hedges always take
+   * priority; the old deadline A/B rescue remains the final fallback.
+   */
+  catastrophicPairLockMinUnhedgedMs: z.number().int().nonnegative().default(10_000),
+  catastrophicPairLockTriggerLossUsd: z.number().nonnegative().default(0.35),
+  catastrophicPairLockMaxLockedLossUsd: z.number().nonnegative().default(0.60),
 });
 export type RiskLimits = z.infer<typeof riskLimitsSchema>;
 
@@ -152,6 +181,60 @@ export const engineEnvSchema = z.object({
     (value) => value === undefined ? undefined : value === true || value === "true" || value === "1",
     z.boolean().optional(),
   ).default(false),
+  /**
+   * Human/forensic journal archive on durable local storage. Journal rows that
+   * are not runtime/recovery authority must never be purged before an archive
+   * segment is atomically written and checksum-verified.
+   */
+  LOCAL_ARCHIVE_ENABLED: z.preprocess(
+    (value) => value === undefined ? undefined : value === true || value === "true" || value === "1",
+    z.boolean().optional(),
+  ).default(false),
+  LOCAL_ARCHIVE_DIR: z.string().min(1).default("/data/archive"),
+  LOCAL_ARCHIVE_BUCKET_MS: z.coerce.number().int().min(60_000).default(60 * 60_000),
+  /**
+   * Durable Native V2 learning memory. Default false so production OVH/Fly is
+   * unchanged until an operator opts in. Fail-soft when enabled.
+   */
+  LEARNING_ENABLED: z.preprocess(
+    (value) => value === undefined ? undefined : value === true || value === "true" || value === "1",
+    z.boolean().optional(),
+  ).default(false),
+  /** Host-mounted durable directory inside the engine container. */
+  LEARNING_DATA_DIR: z.string().min(1).default("/data/learning"),
+  /**
+   * Operational DEFAULT max durable learning bytes (not a measured capacity
+   * requirement). Prefer append segments; writer stops accepting new samples
+   * once exceeded and marks learning degraded.
+   */
+  LEARNING_MAX_BYTES: z.coerce.number().int().positive().default(256_000_000),
+  /** Comma-separated checkpoint seconds before expiry. Default: 240,180,120,60,30,15,5 */
+  LEARNING_CHECKPOINT_SECONDS: z.string().default("240,180,120,60,30,15,5"),
+  /** Optional dedicated poll interval for non-economic learning settlement labels. */
+  LEARNING_SETTLEMENT_POLL_MS: z.coerce.number().int().positive().optional(),
+  /**
+   * Learned V2 shadow runtime (PR5). Default false. When enabled, loads a
+   * verified candidate for advisory prediction only — never V1 authority.
+   */
+  LEARNING_SHADOW_ENABLED: z.preprocess(
+    (value) => value === undefined ? undefined : value === true || value === "true" || value === "1",
+    z.boolean().optional(),
+  ).default(false),
+  /** Absolute path to candidate.json for shadow load (alternative to model id). */
+  LEARNING_SHADOW_MODEL_PATH: z.string().min(1).optional(),
+  /** Registry model id under LEARNING_DATA_DIR/models (alternative to path). */
+  LEARNING_SHADOW_MODEL_ID: z.string().min(1).optional(),
+  /**
+   * Future controlled PAPER authority for PAPER_APPROVED models.
+   * Default false. PR5 has NO engine execution hook — enabling this alone
+   * cannot submit orders.
+   */
+  LEARNING_PAPER_AUTHORITY_ENABLED: z.preprocess(
+    (value) => value === undefined ? undefined : value === true || value === "true" || value === "1",
+    z.boolean().optional(),
+  ).default(false),
+  /** Explicit operator-approved model id for a future controlled PAPER path. */
+  LEARNING_PAPER_AUTHORITY_MODEL_ID: z.string().min(1).optional(),
 });
 export type EngineEnv = z.infer<typeof engineEnvSchema>;
 

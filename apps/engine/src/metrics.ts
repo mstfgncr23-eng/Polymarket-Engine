@@ -1,7 +1,7 @@
 import { performance } from "node:perf_hooks";
 import { Counter, Gauge, Histogram, Registry, collectDefaultMetrics } from "prom-client";
 import { triggerKindSchema, type TriggerEmitObserver } from "@pm/core";
-import { INGRESS_GAP_REASONS } from "@pm/market-data";
+import { INGRESS_GAP_REASONS, type MinOrderSizeHydrationObserver } from "@pm/market-data";
 import { DURABLE_METRIC_TYPES, type DurableMetricType } from "@pm/db";
 import { RECOVERY_FAILURE_REASONS, type RecoveryFailureReason } from "./recovery.js";
 import { REJECTION_REASONS, WORK_LANES, type RejectionReason, type WorkLane } from "./runtime-supervisor.js";
@@ -51,6 +51,37 @@ export interface MarketNormalizeObserver {
 export class EngineMetrics {
   readonly registry = new Registry();
   readonly marketMessages = new Counter({ name: "market_messages_total", help: "Normalized market messages", registers: [this.registry] });
+  // MinOrderSize hydration observability: low-cardinality, no token/market labels.
+  readonly minOrderSizeHydrationAttempts = new Counter({
+    name: "polymarket_min_order_size_hydration_attempt_total",
+    help: "REST min order size hydration attempts",
+    registers: [this.registry],
+  });
+  readonly minOrderSizeHydrationSuccesses = new Counter({
+    name: "polymarket_min_order_size_hydration_success_total",
+    help: "Successful REST min order size hydration responses",
+    registers: [this.registry],
+  });
+  readonly minOrderSizeHydrationFailures = new Counter({
+    name: "polymarket_min_order_size_hydration_failure_total",
+    help: "Failed REST min order size hydration responses (throw/invalid/null)",
+    registers: [this.registry],
+  });
+  readonly minOrderSizeHydrationStale = new Counter({
+    name: "polymarket_min_order_size_hydration_stale_total",
+    help: "Hydration completions dropped as stale (lifecycle/epoch mismatch)",
+    registers: [this.registry],
+  });
+  readonly minOrderSizeHydrationInFlight = new Gauge({
+    name: "polymarket_min_order_size_hydration_in_flight",
+    help: "Current physically in-flight min order size hydration requests",
+    registers: [this.registry],
+  });
+  readonly minOrderSizeMetadataApplied = new Counter({
+    name: "polymarket_min_order_size_metadata_applied_total",
+    help: "Min order size metadata applied to consumers",
+    registers: [this.registry],
+  });
   readonly wsReconnects = new Counter({ name: "ws_reconnects_total", help: "WebSocket reconnects", labelNames: ["feed"], registers: [this.registry] });
   readonly triggers = new Counter({ name: "triggers_total", help: "Triggers", labelNames: ["kind", "severity"], registers: [this.registry] });
   readonly mcpInteractions = new Counter({ name: "grok_mcp_interactions_total", help: "Authenticated and rejected Grok MCP interactions", labelNames: ["status", "method"], registers: [this.registry] });
@@ -452,6 +483,12 @@ export class EngineMetrics {
     labelNames: ["lane"],
     registers: [this.registry],
   });
+  readonly runtimeWorkExpired = new Counter({
+    name: "runtime_work_expired_total",
+    help: "Admitted trigger work discarded from the queue after its economic deadline",
+    labelNames: ["lane"],
+    registers: [this.registry],
+  });
 
   readonly journalDirectWaiting = new Gauge({
     name: "journal_direct_waiting",
@@ -615,6 +652,7 @@ export class EngineMetrics {
       this.runtimeWorkOldestAge.set({ lane }, 0);
       this.runtimeWorkQueueBytes.set({ lane }, 0);
       this.runtimeWorkFailures.inc({ lane }, 0);
+      this.runtimeWorkExpired.inc({ lane }, 0);
       for (const reason of REJECTION_REASONS) this.runtimeWorkRejected.inc({ lane, reason }, 0);
     }
     for (const journalClass of JOURNAL_METRIC_CLASSES) {
@@ -738,6 +776,17 @@ export class EngineMetrics {
     };
   }
 
+  minOrderSizeHydrationObserver(): MinOrderSizeHydrationObserver {
+    return {
+      onHydrationAttempt: () => this.minOrderSizeHydrationAttempts.inc(),
+      onHydrationSuccess: () => this.minOrderSizeHydrationSuccesses.inc(),
+      onHydrationFailure: () => this.minOrderSizeHydrationFailures.inc(),
+      onHydrationStale: () => this.minOrderSizeHydrationStale.inc(),
+      onHydrationApplied: () => this.minOrderSizeMetadataApplied.inc(),
+      onHydrationInFlightChanged: (count) => this.minOrderSizeHydrationInFlight.set(count),
+    };
+  }
+
   noteProcessTriggerStart(): void {
     this.processTriggerInFlightCount += 1;
     this.processTriggerInFlight.set(this.processTriggerInFlightCount);
@@ -780,6 +829,7 @@ export class EngineMetrics {
       setOldestAge: (lane: WorkLane, seconds: number) => this.runtimeWorkOldestAge.set({ lane }, seconds),
       incRejected: (lane: WorkLane, reason: RejectionReason) => this.runtimeWorkRejected.inc({ lane, reason }),
       incFailed: (lane: WorkLane) => this.runtimeWorkFailures.inc({ lane }),
+      incExpired: (lane: WorkLane) => this.runtimeWorkExpired.inc({ lane }),
     };
   }
 

@@ -1,8 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { MemoryEventJournal } from "@pm/db";
+import { paperOrderSchema, type RestingPaperOrder } from "@pm/core";
 import { EngineService } from "../apps/engine/src/engine.js";
+import { durableIdentityConflicts } from "../apps/engine/src/recovery.js";
 import { NoopGrokActivationBridge } from "../apps/engine/src/activation/index.js";
 import { discoveryReport, qualified, qualifiedPaperEnv, ScriptedMarketAdapter, ScriptedReferenceRegistry, paperFill } from "./paper-engine-testkit.js";
+import { snapshot } from "./fixtures.js";
 
 const logger = { error: () => undefined };
 
@@ -98,6 +101,143 @@ describe("Step 5 durable DB fault path", () => {
       } finally {
         await recovered.stop();
       }
+    } finally {
+      await engine.stop();
+    }
+  }, 15_000);
+
+  it("treats durable maker intent as economic identity while preserving legacy rows", () => {
+    const resting = { order: { id: "o1" }, remaining: "10" };
+    const base = { orderId: "o1", reserved: "5", resting };
+    expect(durableIdentityConflicts(
+      "PAPER_MAKER_RESERVED",
+      { ...base, intent: "OPEN_FIRST_LEG" },
+      { ...base, intent: "HEDGE_SECOND_LEG" },
+    )).toBe(true);
+    expect(durableIdentityConflicts(
+      "PAPER_MAKER_RESERVED",
+      base,
+      { ...base, intent: "OPEN_FIRST_LEG" },
+    )).toBe(false);
+  });
+
+  it("persists maker lifecycle intent across restart", async () => {
+    const journal = new MemoryEventJournal();
+    const engine = await startPaper(journal);
+    const maker = paperOrderSchema.parse({
+      id: "maker-first-intent",
+      traceId: "trace-maker-first-intent",
+      triggerId: "trigger-maker-first-intent",
+      strategyId: "temporal-pair-hedge",
+      marketId: "step5-durable",
+      tokenId: "step5-up",
+      outcome: "UP",
+      side: "BUY",
+      orderType: "MAKER",
+      requestedPrice: "0.40",
+      quantity: "10",
+      status: "PENDING",
+      createdAt: new Date().toISOString(),
+    });
+    const book = snapshot({
+      marketId: "step5-durable",
+      tokenId: "step5-up",
+      outcome: "UP",
+      bids: [{ price: "0.40", quantity: "100" }],
+      asks: [{ price: "0.41", quantity: "100" }],
+    });
+    try {
+      await engine.restMakerForTest(maker, book, "OPEN_FIRST_LEG");
+      expect(engine.restingOrdersForTest().get(maker.id)?.intent).toBe("OPEN_FIRST_LEG");
+
+      // Simulate a pre-PR1 checkpoint that persisted the resting order before
+      // RestingPaperOrder itself carried intent. The durable reserve already
+      // has the authoritative top-level intent and recovery must reattach it.
+      const internals = engine as unknown as { restingOrders: Map<string, RestingPaperOrder> };
+      const current = internals.restingOrders.get(maker.id);
+      if (!current) throw new Error("missing resting maker");
+      const legacyResting = structuredClone(current);
+      delete legacyResting.intent;
+      internals.restingOrders.set(maker.id, legacyResting);
+      expect(engine.restingOrdersForTest().get(maker.id)?.intent).toBeUndefined();
+    } finally {
+      await engine.stop();
+    }
+
+    const recovered = await startPaper(journal);
+    try {
+      expect(recovered.restingOrdersForTest().get(maker.id)?.intent).toBe("OPEN_FIRST_LEG");
+    } finally {
+      await recovered.stop();
+    }
+  });
+
+  it("rejects and cancels a stale first-leg maker remainder after the market becomes paired", async () => {
+    const journal = new MemoryEventJournal();
+    const engine = await startPaper(journal);
+    const maker = paperOrderSchema.parse({
+      id: "maker-stale-first-leg",
+      traceId: "trace-maker-stale-first-leg",
+      triggerId: "trigger-maker-stale-first-leg",
+      strategyId: "temporal-pair-hedge",
+      marketId: "step5-durable",
+      tokenId: "step5-up",
+      outcome: "UP",
+      side: "BUY",
+      orderType: "MAKER",
+      requestedPrice: "0.40",
+      quantity: "10",
+      status: "PENDING",
+      createdAt: new Date().toISOString(),
+    });
+    const book = snapshot({
+      marketId: "step5-durable",
+      tokenId: "step5-up",
+      outcome: "UP",
+      bids: [{ price: "0.40", quantity: "100" }],
+      asks: [{ price: "0.41", quantity: "100" }],
+    });
+    try {
+      await engine.restMakerForTest(maker, book, "OPEN_FIRST_LEG");
+      const first = paperFill("step5-durable", "UP", "0.40", {
+        id: "maker-first-partial",
+        orderId: maker.id,
+        tokenId: "step5-up",
+        quantity: "5",
+        liquidityRole: "MAKER",
+        feeUsd: "0",
+      });
+      await engine.applyObservedFill(first);
+      expect(engine.state.snapshot().positions[0]?.unpairedQuantity).toBe("5");
+
+      const hedge = paperFill("step5-durable", "DOWN", "0.50", {
+        id: "paired-hedge",
+        tokenId: "step5-down",
+        quantity: "5",
+        feeUsd: "0",
+      });
+      await engine.applyObservedFill(hedge);
+      const paired = engine.state.snapshot().positions[0];
+      expect(paired?.pairedQuantity).toBe("5");
+      expect(paired?.unpairedQuantity).toBe("0");
+
+      const stale = paperFill("step5-durable", "UP", "0.40", {
+        id: "maker-stale-remainder",
+        orderId: maker.id,
+        tokenId: "step5-up",
+        quantity: "1",
+        liquidityRole: "MAKER",
+        feeUsd: "0",
+      });
+      await engine.applyObservedFill(stale);
+
+      const after = engine.state.snapshot().positions[0];
+      expect(after?.upQuantity).toBe("5");
+      expect(after?.downQuantity).toBe("5");
+      expect(after?.unpairedQuantity).toBe("0");
+      expect(engine.restingOrdersForTest().has(maker.id)).toBe(false);
+      const rows = await journal.queryDurableTransitions({ types: ["PAPER_FILL"], limit: 50 });
+      expect(rows.some((row) => row.operationKey === `fill:${stale.id}`)).toBe(false);
     } finally {
       await engine.stop();
     }

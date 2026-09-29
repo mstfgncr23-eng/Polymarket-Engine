@@ -50,7 +50,12 @@ export function refreshExperiment(
 ): ExperimentManifest {
   if (manifest.status === "IDLE" || manifest.status === "COMPLETED" || manifest.status === "FAILED" || manifest.status === "ABORTED_START") return manifest;
   if (manifest.status === "RUNNING" && manifest.entryClosesAt && now.getTime() >= new Date(manifest.entryClosesAt).getTime()) {
-    return { ...manifest, status: "ENTRY_CLOSED" };
+    // The durable ENTRY_CLOSED manifest must carry the actual unresolved
+    // position count at the entry-close boundary. options.unresolvedCount is
+    // authoritative when supplied by the engine; otherwise preserve whatever
+    // the manifest already recorded so restart/replay reproduces the same value.
+    const unresolved = options.unresolvedCount ?? manifest.unresolvedPositionCount;
+    return { ...manifest, status: "ENTRY_CLOSED", unresolvedPositionCount: unresolved };
   }
   if (manifest.status === "ENTRY_CLOSED") {
     const policy = manifest.closePolicy ?? "observe_until_settlement";
@@ -70,11 +75,13 @@ export function refreshExperiment(
   return manifest;
 }
 
-export function experimentAllowsFirstLeg(manifest: ExperimentManifest | null): boolean {
+export function experimentAllowsFirstLeg(manifest: ExperimentManifest | null, now = new Date()): boolean {
   // A durable EXPERIMENT_STARTED row is intentionally pending until the
-  // feed/reference validation transition is authoritative.  Legacy manifests
-  // without the optional field remain compatible.
-  return manifest?.status === "RUNNING" && manifest.startValidationPending !== true;
+  // feed/reference validation transition is authoritative. A first leg is
+  // also forbidden once the durable entry deadline has arrived.
+  if (manifest?.status !== "RUNNING" || manifest.startValidationPending === true || !manifest.entryClosesAt) return false;
+  const deadline = new Date(manifest.entryClosesAt).getTime();
+  return Number.isFinite(deadline) && now.getTime() < deadline;
 }
 
 export function experimentAllowsHedge(manifest: ExperimentManifest | null): boolean {

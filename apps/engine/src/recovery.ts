@@ -168,11 +168,29 @@ export function durableIdentityConflicts(
     Object.fromEntries(keys.map((key) => [key, row[key] ?? null]))
   );
   switch (type) {
-    case "PAPER_FILL":
-      return hashDurablePayload({ fill: existing.fill ?? null }) !== hashDurablePayload({ fill: incoming.fill ?? null });
-    case "PAPER_MAKER_RESERVED":
-      return hashDurablePayload(pick(existing, ["orderId", "reserved", "resting"]))
+    case "PAPER_FILL": {
+      const fillConflict = hashDurablePayload({ fill: existing.fill ?? null })
+        !== hashDurablePayload({ fill: incoming.fill ?? null });
+      if (fillConflict) return true;
+      // Intent was added after legacy fills existed. Once persisted, a retry
+      // cannot reinterpret the same economic fill as another lifecycle action.
+      if (Object.prototype.hasOwnProperty.call(existing, "intent")) {
+        return existing.intent !== incoming.intent;
+      }
+      return false;
+    }
+    case "PAPER_MAKER_RESERVED": {
+      const baseConflict = hashDurablePayload(pick(existing, ["orderId", "reserved", "resting"]))
         !== hashDurablePayload(pick(incoming, ["orderId", "reserved", "resting"]));
+      if (baseConflict) return true;
+      // intent became replay-authoritative for lifecycle correctness. Existing
+      // pre-intent rows remain readable; rows that already carry intent must
+      // reject a retry that changes its economic meaning.
+      if (Object.prototype.hasOwnProperty.call(existing, "intent")) {
+        return existing.intent !== incoming.intent;
+      }
+      return false;
+    }
     case "PAPER_MAKER_RELEASED":
     case "PAPER_ORDER_CANCELLED":
       return hashDurablePayload(pick(existing, ["orderId", "cancel", "reason"]))
@@ -210,12 +228,15 @@ const fillPayloadSchema = z.object({
   positionId: z.string().min(1),
   reservationAfter: z.string().nullable(),
   restingAfter: restingPaperOrderSchema.nullable().optional(),
+  intent: z.enum(["OPEN_FIRST_LEG", "HEDGE_SECOND_LEG", "PROTECTIVE_DE_RISK", "RESCUE_SECOND_LEG"]).optional(),
+  deRisk: z.record(z.string(), z.unknown()).optional(),
 });
 
 const reservePayloadSchema = z.object({
   orderId: z.string().min(1),
   reserved: z.string(),
   resting: restingPaperOrderSchema,
+  intent: z.enum(["OPEN_FIRST_LEG", "HEDGE_SECOND_LEG"]).optional(),
 });
 
 const releasePayloadSchema = z.object({
@@ -264,7 +285,27 @@ export function applyDurableTransition(state: RecoverableEngineState, transition
         state.experiment = experimentManifestSchema.parse(transition.payload.experiment ?? transition.payload);
         if (transition.type === "EXPERIMENT_STARTED") {
           const at = state.experiment.startedAt ? new Date(state.experiment.startedAt) : new Date(transition.occurredAt);
-          state.ledger.resetOperatingCostBaseline(at);
+          const ledger = state.ledger.snapshot();
+          const openPosition = [...state.ledger.positions.values()].some(
+            (position) => d(position.upQuantity).gt(0) || d(position.downQuantity).gt(0),
+          );
+          const restingOrder = [...state.restingOrders.values()].some(
+            (order) => d(order.remaining).gt(0),
+          );
+          const makerReservation = [...state.makerReservations.values()].some(
+            (amount) => d(amount).gt(0),
+          );
+          if (openPosition || restingOrder || makerReservation || d(ledger.reservedCash).gt(0)) {
+            throw new RecoveryFailClosedError(
+              "invariant",
+              "experiment start attempted with economic residue",
+            );
+          }
+
+          const fresh = new PaperLedger(state.experiment.startingBalance, at);
+          state.ledger.restore(fresh.snapshot(), []);
+          state.restingOrders.clear();
+          state.makerReservations.clear();
           state.lastInfrastructureAccrualAt = at.getTime();
         }
         return;
@@ -272,7 +313,10 @@ export function applyDurableTransition(state: RecoverableEngineState, transition
         const payload = reservePayloadSchema.parse(transition.payload);
         state.ledger.reserve(payload.reserved, new Date(transition.occurredAt));
         state.makerReservations.set(payload.orderId, payload.reserved);
-        state.restingOrders.set(payload.orderId, payload.resting);
+        const resting = payload.intent && !payload.resting.intent
+          ? { ...payload.resting, intent: payload.intent }
+          : payload.resting;
+        state.restingOrders.set(payload.orderId, resting);
         return;
       }
       case "PAPER_MAKER_RELEASED":

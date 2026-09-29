@@ -7,7 +7,7 @@ import {
   type PaperFill,
   type TriggerEvent,
 } from "@pm/core";
-import { MemoryEventJournal } from "@pm/db";
+import { IdempotencyConflictError, MemoryEventJournal } from "@pm/db";
 import {
   type DiscoveryReport,
   type DiscoveredMarket,
@@ -435,10 +435,11 @@ describe("B/D/R/T settlement, close policy, recovery, accelerated lifecycle", ()
       expect(reports.some((event) => event.type === "EXPERIMENT_COMPLETED")).toBe(true);
       expect(reports.some((event) => event.type === "EXPERIMENT_REPORT_GENERATED")).toBe(true);
       expect(engine.activationFootprint().latency).toBeLessThanOrEqual(20);
+      const completedExperimentId = engine.experimentManifest()?.id;
       const restart = await engine.beginExperiment();
-      expect(restart.ok).toBe(false);
-      expect(restart.blockers).toEqual(expect.arrayContaining(["EXPERIMENT_ALREADY_COMPLETED"]));
-      expect(engine.experimentManifest()?.id).toBe(engine.experimentManifest()?.id);
+      expect(restart.ok).toBe(true);
+      expect(engine.experimentManifest()?.status).toBe("RUNNING");
+      expect(engine.experimentManifest()?.id).not.toBe(completedExperimentId);
     } finally {
       await engine.stop();
     }
@@ -473,7 +474,7 @@ describe("B/D/R/T settlement, close policy, recovery, accelerated lifecycle", ()
     }
   });
 
-  it("restores open position, resting maker, ENTRY_CLOSED experiment, and activation latency", async () => {
+  it("restores open position and ENTRY_CLOSED experiment after timed-out entry maker cancellation", async () => {
     const journal = new MemoryEventJournal();
     let nowMs = Date.parse("2026-09-01T00:00:00.000Z");
     const market = new ScriptedMarketAdapter();
@@ -500,7 +501,10 @@ describe("B/D/R/T settlement, close policy, recovery, accelerated lifecycle", ()
     nowMs += 48 * 3_600_000 + 1;
     await first.tickMaintenance();
     expect(first.experimentManifest()?.status).toBe("ENTRY_CLOSED");
-    const reserved = first.reservedCash();
+    expect(first.restingOrderCount()).toBe(0);
+    expect(first.reservedCash()).toBe("0");
+    const timeoutCancels = await journal.queryEvents({ types: ["PAPER_ORDER_CANCELLED"] });
+    expect(timeoutCancels.some((event) => event.payload.reason === "MAX_UNHEDGED_DURATION")).toBe(true);
     const experimentId = first.experimentManifest()?.id;
     await first.stop();
 
@@ -513,11 +517,193 @@ describe("B/D/R/T settlement, close policy, recovery, accelerated lifecycle", ()
       expect(second.experimentManifest()?.id).toBe(experimentId);
       expect(second.experimentManifest()?.status).toBe("ENTRY_CLOSED");
       expect(second.ledger.positions.get("btc-15m")?.upQuantity).toBe("10");
-      expect(second.restingOrderCount()).toBeGreaterThan(0);
-      expect(second.reservedCash()).toBe(reserved);
+      expect(second.restingOrderCount()).toBe(0);
+      expect(second.reservedCash()).toBe("0");
       expect(second.state.activationLatency.length).toBeGreaterThan(0);
     } finally {
       await second.stop();
+    }
+  });
+});
+
+describe("risk-reducing fill lifecycle fences", () => {
+  it("rejects stale hedge/de-risk fills that would cross the current unpaired residual", async () => {
+    const journal = new MemoryEventJournal();
+    const market = new ScriptedMarketAdapter();
+    const env = engineEnvSchema.parse({
+      NODE_ENV: "test",
+      JOURNAL_MODE: "memory",
+      TRADING_MODE: "paper",
+      POLYMARKET_TOKEN_IDS: "up,down",
+    });
+    const engine = new EngineService(env, journal, logger, { market: market as never });
+    await engine.start();
+    // A live, fresh, synchronized execution book is required for a protective
+    // SELL; establish the UP book the de-risk fills walk.
+    const receivedAt = new Date().toISOString();
+    await market.emitSnapshot(snapshot({
+      marketId: "race-mkt", tokenId: "up", outcome: "UP", asset: "BTC",
+      bids: [{ price: "0.50", quantity: "1000" }], asks: [{ price: "0.51", quantity: "1000" }],
+      sourceTimestamp: receivedAt, receivedAt, sequence: 1,
+    }));
+// The hedge leg book is required for hedge token identity revalidation; in
+    // production both legs are always streamed.
+    await market.emitSnapshot(snapshot({
+      marketId: "race-mkt", tokenId: "down", outcome: "DOWN", asset: "BTC",
+      bids: [{ price: "0.48", quantity: "1000" }], asks: [{ price: "0.49", quantity: "1000" }],
+      sourceTimestamp: receivedAt, receivedAt, sequence: 1,
+    }));
+    try {
+      await engine.applyObservedFill(paperFill("race-mkt", "UP", "0.40"));
+      expect(engine.ledger.positions.get("race-mkt")?.unpairedQuantity).toBe("10");
+
+      await engine.applyObservedFill({
+        ...paperFill("race-mkt", "UP", "0.35"),
+        id: "derisk-partial-fill",
+        orderId: "derisk-partial-order",
+        tokenId: "up",
+        side: "SELL",
+        quantity: "4",
+      }, "PROTECTIVE_DE_RISK");
+      expect(engine.ledger.positions.get("race-mkt")).toMatchObject({
+        upQuantity: "6",
+        downQuantity: "0",
+        unpairedOutcome: "UP",
+        unpairedQuantity: "6",
+      });
+
+      await expect(engine.applyObservedFill({
+        ...paperFill("race-mkt", "DOWN", "0.50"),
+        id: "stale-hedge-fill",
+        orderId: "stale-hedge-order",
+        tokenId: "down",
+        quantity: "10",
+      }, "HEDGE_SECOND_LEG")).rejects.toThrow("QUANTITY_EXCEEDS_RESIDUAL");
+      // Scenario B regression: protective won the race, so the stale hedge is
+      // rejected as a normal state change — never as durability corruption.
+      expect(engine.ledger.positions.get("race-mkt")).toMatchObject({
+        upQuantity: "6",
+        downQuantity: "0",
+        unpairedOutcome: "UP",
+        unpairedQuantity: "6",
+      });
+      expect(engine.integrityFault()).toBe(false);
+      expect(engine.overloadState()).not.toBe("FAIL_CLOSED");
+      expect(engine.state.database).toBe("UP");
+
+      await engine.applyObservedFill({
+        ...paperFill("race-mkt", "DOWN", "0.50"),
+        id: "fresh-hedge-fill",
+        orderId: "fresh-hedge-order",
+        tokenId: "down",
+        quantity: "6",
+      }, "HEDGE_SECOND_LEG");
+      expect(engine.ledger.positions.get("race-mkt")).toMatchObject({
+        upQuantity: "6",
+        downQuantity: "6",
+        unpairedOutcome: null,
+        unpairedQuantity: "0",
+      });
+
+      await expect(engine.applyObservedFill({
+        ...paperFill("race-mkt", "UP", "0.34"),
+        id: "stale-derisk-fill",
+        orderId: "stale-derisk-order",
+        tokenId: "up",
+        side: "SELL",
+        quantity: "6",
+      }, "PROTECTIVE_DE_RISK")).rejects.toThrow("NO_UNPAIRED_RESIDUAL");
+      // Scenario A regression: the hedge won the race, so the stale protective
+      // fill is rejected as a normal state change — never as corruption.
+      expect(engine.ledger.positions.get("race-mkt")).toMatchObject({
+        upQuantity: "6",
+        downQuantity: "6",
+        unpairedOutcome: null,
+        unpairedQuantity: "0",
+      });
+      expect(engine.integrityFault()).toBe(false);
+      expect(engine.overloadState()).not.toBe("FAIL_CLOSED");
+      expect(engine.state.database).toBe("UP");
+    } finally {
+      await engine.stop();
+    }
+  });
+
+  it("Scenario gap regression: rejects a protective SELL when no live execution book exists at the boundary", async () => {
+    const journal = new MemoryEventJournal();
+    const env = engineEnvSchema.parse({
+      NODE_ENV: "test",
+      JOURNAL_MODE: "memory",
+      TRADING_MODE: "paper",
+      POLYMARKET_TOKEN_IDS: "up,down",
+    });
+    const engine = new EngineService(env, journal, logger, { market: pendingFeed() as never });
+    await engine.start();
+    try {
+      await engine.applyObservedFill({
+        ...paperFill("race-mkt", "UP", "0.40"),
+        id: "gap-first-leg",
+        orderId: "gap-first-order",
+      });
+      expect(engine.ledger.positions.get("race-mkt")?.unpairedQuantity).toBe("10");
+
+      // The final authoritative fence requires a live execution book. A feed
+      // gap between protective admission and commit must reject the fill with
+      // a bounded state change, never an integrity fault.
+      await expect(engine.applyObservedFill({
+        ...paperFill("race-mkt", "UP", "0.35"),
+        id: "gap-derisk-fill",
+        orderId: "gap-derisk-order",
+        tokenId: "race-mkt-up",
+        side: "SELL",
+        quantity: "4",
+      }, "PROTECTIVE_DE_RISK")).rejects.toThrow("MARKET_BOOK_UNAVAILABLE");
+      expect(engine.ledger.positions.get("race-mkt")).toMatchObject({
+        upQuantity: "10", downQuantity: "0", unpairedOutcome: "UP", unpairedQuantity: "10",
+      });
+      expect(engine.integrityFault()).toBe(false);
+      expect(engine.overloadState()).not.toBe("FAIL_CLOSED");
+      expect(engine.state.database).toBe("UP");
+      const protectiveFills = (await journal.queryEvents({ types: ["PAPER_FILL"] }))
+        .filter((row) => row.payload.intent === "PROTECTIVE_DE_RISK");
+      expect(protectiveFills).toHaveLength(0);
+    } finally {
+      await engine.stop();
+    }
+  });
+
+  it("Scenario D regression: genuine durable/idempotency conflicts still fail closed", async () => {
+    const journal = new MemoryEventJournal();
+    const env = engineEnvSchema.parse({
+      NODE_ENV: "test",
+      JOURNAL_MODE: "memory",
+      TRADING_MODE: "paper",
+      POLYMARKET_TOKEN_IDS: "up,down",
+    });
+    const engine = new EngineService(env, journal, logger, { market: pendingFeed() as never });
+    await engine.start();
+    try {
+      const buy = paperFill("race-mkt", "UP", "0.40", {
+        id: "idem-conflict-fill",
+        orderId: "idem-conflict-order",
+        feeUsd: "0",
+        slippageUsd: "0",
+      });
+      await engine.applyObservedFill(buy);
+      expect(engine.ledger.positions.get("race-mkt")?.upQuantity).toBe("10");
+
+      // A retry of the same durable economic identity with a different payload
+      // is genuine idempotency corruption. The guard-error reclassification
+      // above must never swallow it: the engine must still fail closed.
+      const conflict = { ...buy, quantity: "3" };
+      await expect(engine.applyObservedFill(conflict)).rejects.toBeInstanceOf(IdempotencyConflictError);
+      expect(engine.integrityFault()).toBe(true);
+      expect(engine.overloadState()).toBe("FAIL_CLOSED");
+      // Idempotency conflicts are data-conflict failures, not connection loss:
+      // database stays UP while the engine refuses further authoritative work.
+      expect(engine.state.database).toBe("UP");
+    } finally {
+      await engine.stop();
     }
   });
 });

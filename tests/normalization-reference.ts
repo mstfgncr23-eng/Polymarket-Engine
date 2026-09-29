@@ -17,6 +17,7 @@ export class ReferencePolymarketNormalizer {
     bids: Map<string, string>;
     asks: Map<string, string>;
     lastTradePrice: string | null;
+    minOrderSize: string | null;
     timestamp: string;
     hash: string | null;
   }>();
@@ -61,6 +62,8 @@ export class ReferencePolymarketNormalizer {
         bids: levelsToMap(payload.bids),
         asks: levelsToMap(payload.asks),
         lastTradePrice: nullableString(payload.lastTradePrice),
+        // Mirror production: preserve the last known value when a full book omits it.
+        minOrderSize: nullableString(payload.minOrderSize) ?? this.books.get(tokenId)?.minOrderSize ?? null,
         timestamp: new Date(acceptedMs).toISOString(),
         hash: nullableString(payload.hash),
       };
@@ -118,7 +121,7 @@ export class ReferencePolymarketNormalizer {
 
   private toSnapshot(
     tokenId: string,
-    state: { bids: Map<string, string>; asks: Map<string, string>; lastTradePrice: string | null; timestamp: string; hash: string | null },
+    state: { bids: Map<string, string>; asks: Map<string, string>; lastTradePrice: string | null; minOrderSize: string | null; timestamp: string; hash: string | null },
     raw: Record<string, unknown>,
   ): MarketSnapshot {
     const market = this.marketsByToken.get(tokenId);
@@ -135,7 +138,9 @@ export class ReferencePolymarketNormalizer {
       asks: sortedLevels(state.asks, "asc"),
       lastTradePrice: state.lastTradePrice,
       tickSize: nullableString(raw.tickSize),
-      minOrderSize: nullableString(raw.minOrderSize),
+      // Mirror the production carry-forward: the last committed full-book
+      // min_order_size remains authoritative for price_change-derived snapshots.
+      minOrderSize: state.minOrderSize ?? nullableString(raw.minOrderSize),
       feeSchedule: market.feeSchedule,
       sourceTimestamp: state.timestamp,
       receivedAt: new Date().toISOString(),
