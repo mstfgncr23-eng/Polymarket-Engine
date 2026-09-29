@@ -238,6 +238,28 @@ export class TakerCashCommitGuardRejectedError extends Error {
   }
 }
 
+/**
+ * Normal serialized-boundary rejection for a NEW maker cash reservation whose
+ * required reservation exceeds CURRENT unreserved cash at the durable mutation
+ * boundary. The reserveMaker preflight is a cheap, non-serialized admission
+ * read: two different-market maker admissions can be planned against the same
+ * pre-reservation cash and both pass it. Only the serialized durable boundary
+ * observes each preceding reservation's committed effect. It is an expected
+ * concurrent economic state-change outcome, never a durability/DB/integrity
+ * failure and never execution corruption. The rejection writes no
+ * PAPER_MAKER_RESERVED, reserves no cash, and creates no resting order state.
+ */
+export class MakerReservationCashCommitGuardRejectedError extends Error {
+  constructor(
+    readonly orderId: string,
+    readonly marketId: string,
+    readonly requiredCash: string,
+    readonly availableCash: string,
+  ) {
+    super(`MAKER_CASH_FENCE_REJECTED:${orderId}:${marketId}:required=${requiredCash}:available=${availableCash}`);
+  }
+}
+
 function isJournalAdmissionRejectedError(error: unknown): boolean {
   return error instanceof JournalAdmissionRejected
     || (Boolean(error) && typeof error === "object" && (error as { name?: string }).name === "JournalAdmissionRejected");
@@ -1710,6 +1732,11 @@ export class EngineService {
         // must pass through without latching an integrity fault, setting the
         // database DOWN, or being classified as durable corruption.
         if (error instanceof TakerCashCommitGuardRejectedError) throw error;
+        // A NEW maker cash reservation that fails the serialized cash fence
+        // is the same class of expected concurrent economic state-change
+        // rejection as the TAKER fence: no PAPER_MAKER_RESERVED was written,
+        // no cash was reserved, and no resting order state was created.
+        if (error instanceof MakerReservationCashCommitGuardRejectedError) throw error;
         if (error instanceof DurableCursorBehindError) {
           commit = await this.catchUpOrRejectStalePlan(input.operationKey, input.type, error);
         } else if (error instanceof IdempotencyConflictError) {
@@ -3910,6 +3937,21 @@ export class EngineService {
           });
           return;
         }
+        if (error instanceof MakerReservationCashCommitGuardRejectedError) {
+          // Normal concurrent cash race rejected at the serialized durable
+          // boundary. The NEW maker reservation produced no economic mutation
+          // (no durable PAPER_MAKER_RESERVED, no reservedCash change, no
+          // resting order state). Bounded observability only; it must not be
+          // counted as execution corruption.
+          this.record("MAKER_CASH_FENCE_REJECTED", order.traceId, order.marketId, {
+            orderId: error.orderId,
+            marketId: error.marketId,
+            requiredCash: error.requiredCash,
+            availableCash: error.availableCash,
+            intent,
+          });
+          return;
+        }
         this.executionErrors.push(Date.now());
         const message = error instanceof Error ? error.message : String(error);
         const failureDeRisk = deRisk ? { ...deRisk, finalState: "EXECUTION_ERROR" as const } : undefined;
@@ -3954,6 +3996,29 @@ export class EngineService {
       type: "PAPER_MAKER_RESERVED",
       aggregateType: "paper_order",
       aggregateId: order.id,
+      beforeCommit: async () => {
+        // Authoritative maker cash fence at the serialized DurableMutationGate
+        // boundary (the same gate that makes resolveDurablePayload and the
+        // journal insert atomic). The reserveMaker preflight above is a
+        // non-serialized admission read: two different-market maker plans can
+        // both observe the same available cash and pass it. Re-fence CURRENT
+        // unreserved cash here so a NEW PAPER_MAKER_RESERVED is never durably
+        // written unless applying it would succeed against ledger.reserve().
+        // A retry of the SAME reservation identity (one that resolved inside
+        // resolveDurablePayload, or a compacted retry) must resolve as the
+        // existing durable identity instead of being rejected or reserving
+        // cash twice.
+        const reserveAuthorityAtCommit = await this.journal.readDurableByOperationKey(`maker:${order.id}:reserve`);
+        if (reserveAuthorityAtCommit) return;
+        if (this.ledger.availableCash().lt(notional)) {
+          throw new MakerReservationCashCommitGuardRejectedError(
+            order.id,
+            order.marketId,
+            notional,
+            this.ledger.availableCash().toFixed(),
+          );
+        }
+      },
       buildPayload: (occurredAt) => ({
         ...auth,
         derivedAudit: [
