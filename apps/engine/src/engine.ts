@@ -12,7 +12,11 @@ import {
   evaluateEarlyCatastrophicPairLock,
   evaluateNormalHedgeCandidate,
   computeGuaranteedLockedPnl,
+  walkBook,
+  calculateFee,
+  computeRealizableMarkLossUsd,
   type EarlyCatastrophicPairLockEvaluation,
+  type EarlyCatastrophicRejectionReason,
   type ConsensusDecision,
   type RescueCandidateEvaluation,
   type RiskReductionCandidateEconomics,
@@ -288,13 +292,13 @@ type GrokSubmissionResult = {
   signalId?: string;
 };
 
-type RiskReductionUnhedgedReason = "MAX_UNHEDGED_DURATION" | "PRE_EXPIRY_SAFETY" | "EARLY_CATASTROPHIC_PAIR_LOCK";
+type RiskReductionUnhedgedReason = "MAX_UNHEDGED_DURATION" | "PRE_EXPIRY_SAFETY" | "EARLY_CATASTROPHIC_PAIR_LOCK" | "EARLY_HEDGE_ADOPTION";
 
 type ProtectiveDeRiskAudit = {
   deRiskReason: RiskReductionUnhedgedReason;
   /**
-   * Observability improvement (§44): distinguishes which deadline bound made
-   * the position protective-eligible — the hard unhedged duration
+   * Observability improvement (Â§44): distinguishes which deadline bound made
+   * the position protective-eligible â€” the hard unhedged duration
    * (MAX_UNHEDGED_DURATION) or the expiry safety window (PRE_EXPIRY_SAFETY).
    * Behavior is identical to the prior single label; this only removes the
    * diagnostic ambiguity.
@@ -302,7 +306,7 @@ type ProtectiveDeRiskAudit = {
   eligibilityReason: RiskReductionUnhedgedReason;
   unhedgedStartedAt: string;
   unhedgedDurationMs: number;
-  attemptedAction: "SELL_UNPAIRED" | "RESCUE_SECOND_LEG" | "NONE";
+  attemptedAction: "SELL_UNPAIRED" | "RESCUE_SECOND_LEG" | "HEDGE_SECOND_LEG" | "NONE";
   requestedQty: string;
   executableQty: string;
   executionPrice: string | null;
@@ -384,9 +388,9 @@ export class EngineService {
   private readonly nativeV2OpportunityRanker = new NativeV2ShadowOpportunityRanker();
   private readonly nativeV2ShadowStore = new NativeV2ShadowStore();
   private readonly learningStore: LearningSampleStore | null;
-  /** PR5 learned V2 shadow runtime — advisory only; never V1 authority. */
+  /** PR5 learned V2 shadow runtime â€” advisory only; never V1 authority. */
   private readonly learningRuntime: LearningRuntime;
-  /** Isolated V2 shadow portfolio — never mutates V1 ledger/cash/positions. */
+  /** Isolated V2 shadow portfolio â€” never mutates V1 ledger/cash/positions. */
   private readonly counterfactualStore: NativeV2CounterfactualStore;
   private nativeV2ShadowExecutionBusy = false;
   private lastLearningSettlementPollAt = 0;
@@ -413,6 +417,20 @@ export class EngineService {
   private readonly protectiveDeRiskAttempts = new Map<string, number>();
   /** Earliest next durable de-risk evaluation per market. Ephemeral by design. */
   private readonly protectiveDeRiskNextAttemptAt = new Map<string, number>();
+  /**
+   * PR3 early-catastrophic retry/veto pacing mirrors PR82: a stable canonical
+   * veto must not generate critical RISK_EVALUATION writes at snapshot rate.
+   * Ephemeral by design; cleared on neutralization/settlement/market removal.
+   */
+  private readonly earlyCatastrophicNextAttemptAt = new Map<string, number>();
+  /** Fingerprint of the last stable early veto (vetoes + material inputs). */
+  private readonly earlyCatastrophicVetoFingerprint = new Map<string, string | null>();
+  /** Instrumentation: number of canonical hedge-priority decisions evaluated by PR3. */
+  private pr3HedgeDecisionCount = 0;
+  /** Last PR3 hedge-check gating reason per market (instrumentation, bounded). */
+  private readonly pr3HedgeDebug = new Map<string, { stage: string; vetoes: string[] | null }>();
+  /** Last runtime-basis asset resolved by decideWithRuntimeBasis (parity test). */
+  private lastRuntimeBasisAssetForTest: string | null = null;
   /** Identifies whether a hard veto is materially unchanged during backoff. */
   private readonly protectiveDeRiskVetoFingerprint = new Map<string, string>();
   /** Bounds non-durable waiting feed/SSE samples when no sell depth exists. */
@@ -1080,7 +1098,7 @@ export class EngineService {
         entryClosesAt: this.nowFn().toISOString(),
         completedAt: null,
         markToMarketAt: null,
-        // Manual/operator close-entries is another RUNNING → ENTRY_CLOSED
+        // Manual/operator close-entries is another RUNNING â†’ ENTRY_CLOSED
         // boundary; the durable manifest must carry the actual unresolved
         // position count, exactly like the deadline and recovery paths.
         unresolvedPositionCount: this.countUnresolvedPositions(),
@@ -1335,7 +1353,7 @@ export class EngineService {
 /**
    * Resolve the CURRENT canonical tokenId for (marketId, outcome) from market
    * metadata (authoritative when present) and the live snapshot pair (current).
-   * Returns null when the identity cannot be resolved — callers fail closed.
+   * Returns null when the identity cannot be resolved â€” callers fail closed.
    */
   private currentTokenIdFor(marketId: string, outcome: Outcome): string | null {
     const market = this.marketsById.get(marketId);
@@ -1439,6 +1457,8 @@ export class EngineService {
       // historical turnover cannot accumulate in checkpoints/RAM.
       this.settledMarkets.delete(marketId);
       this.settlementBackoff.delete(marketId);
+      this.earlyCatastrophicNextAttemptAt.delete(marketId);
+      this.earlyCatastrophicVetoFingerprint.delete(marketId);
       this.snapshots.delete(marketId);
       this.triggerEngine.dropMarket(marketId);
       this.nativeV2Shadow.dropMarket(marketId);
@@ -2394,7 +2414,7 @@ export class EngineService {
 
   /**
    * Number of ledger positions with positive up or down quantity. This is the
-   * authoritative unresolved-position count used at the RUNNING → ENTRY_CLOSED
+   * authoritative unresolved-position count used at the RUNNING â†’ ENTRY_CLOSED
    * boundary so the durable manifest reproduces the same value across restart/
    * replay.
    */
@@ -2473,7 +2493,7 @@ export class EngineService {
       ? evaluateNativeV2ShadowFairProbability(shadowV2FeatureVector)
       : null;
     // PR1 learning foundation: durable samples after V2 fair succeeds, before
-    // opportunity/ranking. Fail-soft — never throw into the trading path.
+    // opportunity/ranking. Fail-soft â€” never throw into the trading path.
     if (this.learningStore && shadowV2FeatureVector && shadowV2FairProbability) {
       try {
         {
@@ -2494,7 +2514,7 @@ export class EngineService {
         // Learning must never affect V1/V2/risk/execution authority.
       }
     }
-    // PR5 learned V2 shadow — advisory only. Fail-soft; never mutates V1.
+    // PR5 learned V2 shadow â€” advisory only. Fail-soft; never mutates V1.
     let learnedV2Shadow: LearnedV2ShadowEvaluation | null = null;
     try {
       learnedV2Shadow = this.learningRuntime.evaluateShadow({
@@ -2661,7 +2681,7 @@ export class EngineService {
         currentPair?.DOWN?.eventId ?? "",
       ].filter(Boolean))],
       preflightBlockers: [...new Set(blockers)],
-      // V2-only counterfactual portfolio — never the authoritative V1 paper ledger.
+      // V2-only counterfactual portfolio â€” never the authoritative V1 paper ledger.
       positions: cfState.positions,
       assetByMarketEntries: [...this.assetByMarket.entries()],
       ledger: cfState.ledger,
@@ -2862,7 +2882,7 @@ export class EngineService {
     let counterfactual: Record<string, unknown> | null = null;
     if (wouldSubmitOrder && decision.order && this.counterfactualStore.isRecoveryReady()) {
       const actionKey = nativeV2CounterfactualActionKey(marketId, selectedAtDecision.outcome, "OPEN_FIRST_LEG");
-      // Decision-time capture only — discovery refresh after reserve must not change historical settlement semantics.
+      // Decision-time capture only â€” discovery refresh after reserve must not change historical settlement semantics.
       const capturedLookup = input.settlementLookup;
       if (
         !capturedLookup
@@ -3636,71 +3656,20 @@ export class EngineService {
       decisionConsensus.estimatedEdge = executableFair.rawEdgeUsdPerShare;
     }
 
-    const duplicateKey = `${candidate.marketId}:${candidate.outcome}:${candidate.intent}`;
     const now = this.nowFn();
     const signalExpiry = new Date(decisionNative.expiresAt);
-    const asset = trigger.asset ?? this.assetByMarket.get(candidate.marketId) ?? snapshot.asset ?? null;
-    const exposure = computePaperExposures(this.ledger.positions.values(), candidate.marketId, this.assetByMarket, now.getTime());
-    const projected = projectPaperExposures({
-      current: exposure,
-      positions: projectableLegsFromPositions(this.ledger.positions.values(), this.assetByMarket),
-      candidate: {
-        marketId: candidate.marketId, outcome: candidate.outcome, quantity: candidate.quantity,
-        price: candidate.limitPrice, side: candidate.side, intent: candidate.intent, asset,
-      },
-      nowMs: now.getTime(),
-    });
-    const referenceRequired = this.referenceRequired.get(candidate.marketId) === true;
-    const referenceFeedAt = asset ? dateOrNull(this.state.referenceLastMessageAt(asset)) : null;
-    const blocked = asset ? this.referenceBlocked.get(asset) : undefined;
-    const marketFeedAt = collectMarketFeedAt(pair, candidate.outcome, candidate.intent, snapshot.receivedAt);
-    const decision = decidePaperOrder({
+    const { decision, duplicateKey } = this.decideWithRuntimeBasis({
       candidate,
       consensus: decisionConsensus,
-      snapshotAfterDecisionLatency: snapshot,
-      limits: this.riskLimits,
       triggerId: trigger.id,
       signalExpiresAt: signalExpiry,
-      orderType: this.env.PAPER_EXECUTION_STYLE,
-      baseRisk: {
-        now, marketFeedAt,
-        btcFeedAt: asset === "BTC" ? referenceFeedAt ?? dateOrNull(this.state.lastBtcMessageAt) : now,
-        referenceFeedAt, referenceRequired, asset, assetExposureUsd: exposure.asset,
-        databaseAvailable, timestampDisorder: this.timestampDisorder, riskStateAvailable: true,
-        dailyPnlUsd: this.ledger.snapshot().netTradingPnl, drawdownUsd: this.ledger.snapshot().drawdown,
-        marketExposureUsd: exposure.market, totalExposureUsd: exposure.total, directionalExposureUsd: exposure.directional,
-        unhedgedExposureUsd: exposure.unhedged, unhedgedDurationMs: exposure.unhedgedDurationMs,
-        intent: candidate.intent,
-...(candidate.intent === "HEDGE_SECOND_LEG"
-          ? {
-            hedgePosition: (() => {
-              const currentPosition = this.ledger.positions.get(candidate.marketId);
-              if (!currentPosition?.unpairedOutcome) return null;
-              const requiredOutcome: Outcome = currentPosition.unpairedOutcome === "UP" ? "DOWN" : "UP";
-              return {
-                marketId: currentPosition.marketId,
-                unpairedOutcome: currentPosition.unpairedOutcome,
-                unpairedQuantity: currentPosition.unpairedQuantity,
-                expectedOppositeTokenId: this.currentTokenIdFor(currentPosition.marketId, requiredOutcome),
-              };
-            })(),
-          }
-          : {}),
-        projectedMarketExposureUsd: projected.market, projectedTotalExposureUsd: projected.total,
-        projectedDirectionalExposureUsd: projected.directional, projectedUnhedgedExposureUsd: projected.unhedged,
-        projectedAssetExposureUsd: projected.asset, availableCashUsd: this.ledger.availableCash().toFixed(),
-        referenceProviderBlocked: Boolean(blocked),
-        marketEntryQualified: this.entryQualified.has(candidate.marketId),
-        externalSignalsLastMinute: 0,
-        lastStrategyTradeAt: this.lastTradeAt,
-        duplicateTrade: (this.recentTrades.get(duplicateKey) ?? 0) > now.getTime() - this.riskLimits.strategyCooldownMs,
-        experimentEntryOpen: candidate.intent === "HEDGE_SECOND_LEG"
-          ? experimentAllowsHedge(this.experiment)
-          : experimentAllowsFirstLeg(this.experiment, now),
-        executionErrorsLastHour: this.executionErrors.filter((at) => now.getTime() - at < 3_600_000).length,
-        externalRiskRecommendedVeto: false, shuttingDown: this.state.draining,
-      },
+      snapshot,
+      pair,
+      now,
+      databaseAvailable,
+      assetOverride: trigger.asset,
     });
+    const asset = trigger.asset ?? this.assetByMarket.get(candidate.marketId) ?? snapshot.asset ?? null;
     this.state.latestRisk = decision.risk;
     const executionStyle = decision.order?.orderType ?? this.env.PAPER_EXECUTION_STYLE;
     const calibration = executableFair ? {
@@ -3764,8 +3733,9 @@ export class EngineService {
     duplicateKey: string,
     intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK" | "RESCUE_SECOND_LEG" = "OPEN_FIRST_LEG",
     deRisk?: ProtectiveDeRiskAudit,
-  ): Promise<void> {
-    if (intent === "OPEN_FIRST_LEG" && this.experimentStartPending) return;
+    options?: { skipPreCreateFirstLegCancel?: boolean },
+  ): Promise<boolean> {
+    if (intent === "OPEN_FIRST_LEG" && this.experimentStartPending) return false;
     if (intent === "PROTECTIVE_DE_RISK" && order.orderType !== "TAKER") {
       throw new Error("PROTECTIVE_DE_RISK_REQUIRES_TAKER");
     }
@@ -3779,7 +3749,7 @@ export class EngineService {
     // may be in flight per market. RESCUE and PROTECTIVE submissions are
     // already serialized by the maybeProtectiveDeRisk per-market flight (the
     // shared set is held for their whole decision+execution lifetime), so only
-    // normal HEDGE submissions acquire/check the slot here — a hedge must never
+    // normal HEDGE submissions acquire/check the slot here â€” a hedge must never
     // slip in behind rescue/protective ownership. A HEDGE MAKER admission holds
     // the slot through its durable PAPER_MAKER_RESERVED so rescue cannot start
     // A/B arbitration while a hedge maker is still being admitted/reserved; the
@@ -3791,7 +3761,7 @@ export class EngineService {
         this.record("RISK_REDUCTION_FLIGHT_BUSY", order.traceId, order.marketId, {
           intent, orderId: order.id, reason: "RISK_REDUCTION_IN_FLIGHT",
         }, decisionSnapshot.asset ?? null);
-        return;
+        return false;
       }
       // Admission-boundary eligibility re-check (post decision latency): a
       // normal hedge must not slip in behind rescue ownership once protective
@@ -3809,7 +3779,7 @@ export class EngineService {
               unpairedOutcome: posAtAdmission.unpairedOutcome,
               reason: "ELIGIBILITY_REACHED_BEFORE_ADMISSION",
             }, decisionSnapshot.asset ?? null);
-            return;
+            return false;
           }
         }
       }
@@ -3818,26 +3788,37 @@ export class EngineService {
     const firstLegReserved = intent === "OPEN_FIRST_LEG"
       ? this.tryReserveFirstLegAdmission(order.marketId)
       : false;
-    if (intent === "OPEN_FIRST_LEG" && !firstLegReserved) return;
+    if (intent === "OPEN_FIRST_LEG" && !firstLegReserved) return false;
 
     try {
       // Last economic admission fence immediately before PAPER_ORDER_CREATED.
       // close-entries and the native decision path are serialized by the same
       // experimentBoundaryGate, while deadline expiry closes durably here.
-      if (intent === "OPEN_FIRST_LEG" && !(await this.ensureFirstLegEntryOpen())) return;
+      if (intent === "OPEN_FIRST_LEG" && !(await this.ensureFirstLegEntryOpen())) return false;
       if (
         intent === "OPEN_FIRST_LEG"
         && this.firstLegLifecycleBlocked(order.marketId, true)
-      ) return;
+      ) return false;
       if (intent === "HEDGE_SECOND_LEG" || intent === "PROTECTIVE_DE_RISK" || intent === "RESCUE_SECOND_LEG") {
-        // Once risk reduction starts, an older first-leg maker remainder must
-        // not be allowed to refill directional exposure behind the action.
-        await this.cancelOutstandingFirstLegMakers(
-          order.marketId,
-          intent === "PROTECTIVE_DE_RISK" ? "PROTECTIVE_DE_RISK_ADMITTED"
-            : intent === "RESCUE_SECOND_LEG" ? "RESCUE_ADMITTED"
-            : "HEDGE_ADMITTED",
-        );
+        if (options?.skipPreCreateFirstLegCancel) {
+          // EARLY path: first-leg makers were durably fenced BEFORE the final
+          // synchronous fence. Assert synchronously that none remain, and do NOT
+          // enter an async cancellation boundary between fence and
+          // PAPER_ORDER_CREATED (Fix 1). Generic HEDGE/PR82/PROTECTIVE behavior
+          // is unchanged (no option passed).
+          if (this.hasOutstandingFirstLegMaker(order.marketId)) {
+            throw new Error("EARLY_FIRST_LEG_FENCE_VIOLATION");
+          }
+        } else {
+          // Once risk reduction starts, an older first-leg maker remainder must
+          // not be allowed to refill directional exposure behind the action.
+          await this.cancelOutstandingFirstLegMakers(
+            order.marketId,
+            intent === "PROTECTIVE_DE_RISK" ? "PROTECTIVE_DE_RISK_ADMITTED"
+              : intent === "RESCUE_SECOND_LEG" ? "RESCUE_ADMITTED"
+              : "HEDGE_ADMITTED",
+          );
+        }
       }
 
       this.metrics.paperOrders.inc({ type: order.orderType });
@@ -3857,7 +3838,7 @@ export class EngineService {
           // Resting makers are only ever first-leg or hedge orders; rescue is
           // enforced TAKER-only above, so the cast is a pure TS narrowing aid.
           await this.reserveMaker(order, decisionSnapshot, intent === "OPEN_FIRST_LEG" ? "OPEN_FIRST_LEG" : "HEDGE_SECOND_LEG");
-          return;
+          return true;
         }
         await delay(this.env.PAPER_EXECUTION_LATENCY_MS);
         const current = this.state.marketSnapshots.get(order.tokenId);
@@ -3891,7 +3872,7 @@ export class EngineService {
               ...(stateChangedDeRisk ? { deRisk: stateChangedDeRisk } : {}),
             },
           }));
-          return;
+          return false;
         }
         this.executionErrors.push(Date.now());
         const message = error instanceof Error ? error.message : String(error);
@@ -3911,6 +3892,7 @@ export class EngineService {
       if (firstLegReserved) this.pendingFirstLegMarkets.delete(order.marketId);
       if (ownsRiskReductionFlight) this.riskReductionInFlight.delete(order.marketId);
     }
+    return true;
   }
 
   private async reserveMaker(
@@ -4130,12 +4112,12 @@ export class EngineService {
               }
             }
             // PR3 EARLY catastrophic pair-lock final fence: decided-state is not
-            // enough — revalidate immediately before the durable mutation that
+            // enough â€” revalidate immediately before the durable mutation that
             // the fill still covers the ENTIRE current residual and that the
             // ACTUAL fee-inclusive locked PnL (from the executed fill economics)
             // stays within the configured loss cap. Any violation is a normal
             // state-change rejection, never a durability fault.
-            if (extras.deRisk?.deRiskReason === "EARLY_CATASTROPHIC_PAIR_LOCK") {
+            if (economicIntent === "RESCUE_SECOND_LEG" && extras.deRisk?.deRiskReason === "EARLY_CATASTROPHIC_PAIR_LOCK") {
               if (!d(fill.quantity).eq(d(currentPosition.unpairedQuantity))) {
                 throw new RiskReductionLifecycleGuardRejectedError(fill.marketId, "RESCUE_SECOND_LEG", "EARLY_CATASTROPHIC_PARTIAL_FILL");
               }
@@ -4914,21 +4896,38 @@ export class EngineService {
    * always takes priority. Returns true when this pass CONSUMED the shared
    * risk-reduction decision (so the old deadline fallback must not also act).
    */
-  private async maybeEarlyCatastrophicPairLock(marketId: string): Promise<boolean> {
-    if (!this.protectiveDeadlineNotOwned(marketId)) return false;
+  private async maybeEarlyCatastrophicPairLock(marketId: string): Promise<{ acted: boolean }> {
+    if (!this.earlyAuthority(marketId)) return { acted: false };
     const position = this.ledger.positions.get(marketId);
-    if (!position?.unpairedOutcome || d(position.unpairedQuantity).lte(0)) return false;
-    if (this.settledMarkets.has(marketId)) return false;
-    if (this.riskReductionInFlight.has(marketId)) return false;
+    if (!position?.unpairedOutcome || d(position.unpairedQuantity).lte(0)) return { acted: false };
+    if (this.settledMarkets.has(marketId)) return { acted: false };
+    if (this.riskReductionInFlight.has(marketId)) return { acted: false };
     const now = this.nowFn();
     const pair = this.snapshots.get(marketId);
     const oppositeOutcome: Outcome = position.unpairedOutcome === "UP" ? "DOWN" : "UP";
     const held = this.freshEarlyCatastrophicSnapshot(position.unpairedOutcome === "UP" ? (pair?.UP ?? null) : (pair?.DOWN ?? null), now.getTime());
     const opposite = this.freshEarlyCatastrophicSnapshot(oppositeOutcome === "UP" ? (pair?.UP ?? null) : (pair?.DOWN ?? null), now.getTime());
-    const evaluation = this.evaluateEarlyCatastrophic(marketId, position, held, opposite, now, pair);
-    if (!evaluation.evaluation.eligible || !evaluation.evaluation.candidate) {
-      this.recordEarlyCatastrophicSuppressed(marketId, evaluation.evaluation, now);
-      return false;
+    // CHEAP stage ONLY on the per-snapshot hot path (Section 8): real residual +
+    // min age + mark-loss trigger + full opposite depth + loss cap. No canonical
+    // hedge decision / risk projection runs unless the early action is otherwise
+    // actionable.
+    const cheap = this.earlyCheapGate({ position, held, opposite, nowMs: now.getTime() });
+    if (!cheap.ok) {
+      this.recordEarlyCatastrophicSuppressed(marketId, {
+        eligible: false, reason: cheap.reason, candidate: cheap.candidate,
+        markLossUsd: cheap.markLossUsd, guaranteedLockedPnl: cheap.guaranteedLockedPnl,
+        rescueNotionalUsd: cheap.rescueNotionalUsd, rescueVwap: cheap.rescueVwap,
+        rescueFeeUsd: cheap.rescueFeeUsd, hedgeAvailable: false,
+      }, now);
+      return { acted: false };
+    }
+    // Section 7 pacing: a stable canonical veto must not regenerate critical
+    // RISK_EVALUATION writes at snapshot rate.
+    if (this.earlyAttemptPaced(marketId, position, opposite, now)) {
+      this.recordProtectiveDeRiskSuppressed(marketId, "EARLY_CATASTROPHIC_PAIR_LOCK", "RETRY_BACKOFF", {
+        position, extra: { retryNextAttemptAtMs: this.earlyCatastrophicNextAttemptAt.get(marketId) ?? null },
+      });
+      return { acted: false };
     }
     this.riskReductionInFlight.add(marketId);
     try {
@@ -4940,16 +4939,23 @@ export class EngineService {
     }
   }
 
-  /** True while the old protective deadline does NOT yet own the position. */
-  private protectiveDeadlineNotOwned(marketId: string): boolean {
+  /**
+   * PR3 early ownership: the early catastrophic path is allowed only while the
+   * old protective deadline has NOT yet been reached AND marketEnd has NOT been
+   * reached (at/after marketEnd, settlement/expiry authority is exclusive).
+   */
+  private earlyAuthority(marketId: string): boolean {
     const position = this.ledger.positions.get(marketId);
-    if (!position?.unpairedOutcome) return false;
+    if (!position?.unpairedOutcome || d(position.unpairedQuantity).lte(0)) return false;
     const now = this.nowFn();
-    return !this.protectiveDeRiskEligibility(
+    const eligibility = this.protectiveDeRiskEligibility(
       marketId,
       position.unhedgedStartedAt ?? position.openedAt,
       now.getTime(),
-    ).eligible;
+    );
+    if (eligibility.marketEndMs != null && now.getTime() >= eligibility.marketEndMs) return false;
+    if (eligibility.eligible) return false;
+    return true;
   }
 
   /**
@@ -4961,7 +4967,10 @@ export class EngineService {
     if (!snapshot) return null;
     if (!this.adapterTokenSynchronized(snapshot.tokenId)) return null;
     const receivedAtMs = Date.parse(snapshot.receivedAt);
-    if (!Number.isFinite(receivedAtMs) || nowMs - receivedAtMs > this.riskLimits.staleFeedTimeoutMs) return null;
+    // Future-dated books must fail closed: a negative age must never authorize
+    // an early action or suppress it via a "fresh but impossible" hedge check.
+    if (!Number.isFinite(receivedAtMs) || receivedAtMs > nowMs) return null;
+    if (nowMs - receivedAtMs > this.riskLimits.staleFeedTimeoutMs) return null;
     return snapshot;
   }
 
@@ -4978,6 +4987,22 @@ export class EngineService {
     now: Date,
     pair: Partial<Record<Outcome, MarketSnapshot>> | undefined,
   ): { evaluation: EarlyCatastrophicPairLockEvaluation; held: MarketSnapshot | null; opposite: MarketSnapshot | null } {
+    // STAGED evaluation (Section 8): all cheap catastrophic gates run BEFORE any
+    // canonical normal-hedge decision / risk projection. The expensive
+    // hedge-priority work happens only when the early action is actionable.
+    const cheap = this.earlyCheapGate({ position, held, opposite, nowMs: now.getTime() });
+    if (!cheap.ok) {
+      return {
+        evaluation: {
+          eligible: false, reason: cheap.reason, candidate: cheap.candidate,
+          markLossUsd: cheap.markLossUsd, guaranteedLockedPnl: cheap.guaranteedLockedPnl,
+          rescueNotionalUsd: cheap.rescueNotionalUsd, rescueVwap: cheap.rescueVwap,
+          rescueFeeUsd: cheap.rescueFeeUsd, hedgeAvailable: false,
+        },
+        held,
+        opposite,
+      };
+    }
     const hedgeAdmissible = this.normalHedgeAdmissible(marketId, position, {
       UP: this.freshEarlyCatastrophicSnapshot(pair?.UP ?? null, now.getTime()),
       DOWN: this.freshEarlyCatastrophicSnapshot(pair?.DOWN ?? null, now.getTime()),
@@ -4999,12 +5024,117 @@ export class EngineService {
     };
   }
 
-  /**
-   * Canonical normal-hedge decision (strategy candidate -> decidePaperOrder with
-   * the SAME hedge base-risk semantics as the running evaluateTrade path),
-   * evaluated against FRESH synchronized canonical books. Returns null when the
-   * hedge is unavailable (candidate absent, books stale/unsynced, or decision
-   * rejected).
+/**
+   * SHARED normal decision + risk basis (Section 2/10 of the pre-merge pass).
+   *
+   * This is the ONE semantic source for `decidePaperOrder` inputs used by BOTH
+   * the live `evaluateTrade` normal-hedge/first-leg path and the PR3 hedge
+   * priority check. It consumes the same externally material state as the live
+   * path: reference-required/blocked/feed freshness, last BTC message,
+   * PAPER_EXECUTION_STYLE, current database health, exposure/projection,
+   * cooldown, experiment hedge gate and execution-error count.
+   */
+  private decideWithRuntimeBasis(input: {
+    candidate: StrategyCandidate;
+    consensus: ConsensusDecision;
+    triggerId: string;
+    signalExpiresAt: Date;
+    snapshot: MarketSnapshot;
+    pair: Partial<Record<Outcome, MarketSnapshot>>;
+    now: Date;
+    databaseAvailable: boolean;
+    /** Live trigger asset override (trigger.asset) — preserves pre-PR3 semantics. */
+    assetOverride?: string | null;
+  }): { decision: ReturnType<typeof decidePaperOrder>; duplicateKey: string } {
+    const { candidate, consensus, triggerId, signalExpiresAt, snapshot, pair, now, databaseAvailable, assetOverride } = input;
+    const duplicateKey = `${candidate.marketId}:${candidate.outcome}:${candidate.intent}`;
+    const asset = assetOverride ?? this.assetByMarket.get(candidate.marketId) ?? snapshot.asset ?? null;
+    this.lastRuntimeBasisAssetForTest = asset;
+    const exposure = computePaperExposures(this.ledger.positions.values(), candidate.marketId, this.assetByMarket, now.getTime());
+    const projected = projectPaperExposures({
+      current: exposure,
+      positions: projectableLegsFromPositions(this.ledger.positions.values(), this.assetByMarket),
+      candidate: {
+        marketId: candidate.marketId, outcome: candidate.outcome, quantity: candidate.quantity,
+        price: candidate.limitPrice, side: candidate.side, intent: candidate.intent, asset,
+      },
+      nowMs: now.getTime(),
+    });
+    const referenceRequired = this.referenceRequired.get(candidate.marketId) === true;
+    const referenceFeedAt = asset ? dateOrNull(this.state.referenceLastMessageAt(asset)) : null;
+    const blocked = asset ? this.referenceBlocked.get(asset) : undefined;
+    const marketFeedAt = collectMarketFeedAt(pair, candidate.outcome, candidate.intent, snapshot.receivedAt);
+    const decision = decidePaperOrder({
+      candidate,
+      consensus,
+      snapshotAfterDecisionLatency: snapshot,
+      limits: this.riskLimits,
+      triggerId,
+      signalExpiresAt,
+      orderType: this.env.PAPER_EXECUTION_STYLE,
+      baseRisk: {
+        now, marketFeedAt,
+        btcFeedAt: asset === "BTC" ? referenceFeedAt ?? dateOrNull(this.state.lastBtcMessageAt) : now,
+        referenceFeedAt, referenceRequired, asset, assetExposureUsd: exposure.asset,
+        databaseAvailable, timestampDisorder: this.timestampDisorder, riskStateAvailable: true,
+        dailyPnlUsd: this.ledger.snapshot().netTradingPnl, drawdownUsd: this.ledger.snapshot().drawdown,
+        marketExposureUsd: exposure.market, totalExposureUsd: exposure.total, directionalExposureUsd: exposure.directional,
+        unhedgedExposureUsd: exposure.unhedged, unhedgedDurationMs: exposure.unhedgedDurationMs,
+        intent: candidate.intent,
+        ...(candidate.intent === "HEDGE_SECOND_LEG"
+          ? {
+            hedgePosition: (() => {
+              const currentPosition = this.ledger.positions.get(candidate.marketId);
+              if (!currentPosition?.unpairedOutcome) return null;
+              const requiredOutcome: Outcome = currentPosition.unpairedOutcome === "UP" ? "DOWN" : "UP";
+              return {
+                marketId: currentPosition.marketId,
+                unpairedOutcome: currentPosition.unpairedOutcome,
+                unpairedQuantity: currentPosition.unpairedQuantity,
+                expectedOppositeTokenId: this.currentTokenIdFor(currentPosition.marketId, requiredOutcome),
+              };
+            })(),
+          }
+          : {}),
+        projectedMarketExposureUsd: projected.market, projectedTotalExposureUsd: projected.total,
+        projectedDirectionalExposureUsd: projected.directional, projectedUnhedgedExposureUsd: projected.unhedged,
+        projectedAssetExposureUsd: projected.asset, availableCashUsd: this.ledger.availableCash().toFixed(),
+        referenceProviderBlocked: Boolean(blocked),
+        marketEntryQualified: this.entryQualified.has(candidate.marketId),
+        externalSignalsLastMinute: 0,
+        lastStrategyTradeAt: this.lastTradeAt,
+        duplicateTrade: (this.recentTrades.get(duplicateKey) ?? 0) > now.getTime() - this.riskLimits.strategyCooldownMs,
+        experimentEntryOpen: candidate.intent === "HEDGE_SECOND_LEG"
+          ? experimentAllowsHedge(this.experiment)
+          : experimentAllowsFirstLeg(this.experiment, now),
+        executionErrorsLastHour: this.executionErrors.filter((at) => now.getTime() - at < 3_600_000).length,
+        externalRiskRecommendedVeto: false, shuttingDown: this.state.draining,
+      },
+    });
+    return { decision, duplicateKey };
+  }
+
+  /** Instrumentation: canonical hedge-priority decisions evaluated by PR3. */
+  pr3HedgeDecisionCountForTest(): number {
+    return this.pr3HedgeDecisionCount;
+  }
+
+  /** Test hook: seed the strategy cooldown so a hedge decision vetoes via DUPLICATE_TRADE. */
+  seedRecentTradeForTest(marketId: string, outcome: Outcome): void {
+    this.recentTrades.set(`${marketId}:${outcome}:HEDGE_SECOND_LEG`, this.nowFn().getTime());
+  }
+
+  /** Test hook: expose the shared normal-hedge decision (Sections 2/10). */
+  normalHedgeDecisionForTest(marketId: string, position: Position, pair: Record<Outcome, MarketSnapshot | null>, now: Date): ReturnType<typeof decidePaperOrder> | null {
+    return this.normalHedgeDecision(marketId, position, pair, now);
+  }
+/**
+   * Canonical normal-hedge decision for PR3 hedge priority. Uses the SAME
+   * decideWithRuntimeBasis as the live hedge path (Section 2): candidate from
+   * FRESH synchronized books, real reference/execution-state semantics and the
+   * configured PAPER_EXECUTION_STYLE. Returns null when the hedge is not
+   * available (candidate absent, books stale/unsynced/future, or decision
+   * rejected). Counted for hot-path instrumentation (Section 8).
    */
   private normalHedgeDecision(
     marketId: string,
@@ -5012,85 +5142,76 @@ export class EngineService {
     pair: Record<Outcome, MarketSnapshot | null>,
     now: Date,
   ): ReturnType<typeof decidePaperOrder> | null {
-    if (!position.unpairedOutcome || d(position.unpairedQuantity).lte(0)) return null;
+    if (!position.unpairedOutcome || d(position.unpairedQuantity).lte(0)) {
+      this.pr3HedgeDebug.set(marketId, { stage: "NO_UNPAIRED", vetoes: null });
+      return null;
+    }
     const freshUp = this.freshEarlyCatastrophicSnapshot(pair.UP, now.getTime());
     const freshDown = this.freshEarlyCatastrophicSnapshot(pair.DOWN, now.getTime());
-    if (!freshUp || !freshDown) return null;
+    if (!freshUp || !freshDown) {
+      this.pr3HedgeDebug.set(marketId, { stage: `BOOK_UNAVAILABLE_${freshUp ? "DOWN" : freshDown ? "UP" : "BOTH"}`, vetoes: null });
+      return null;
+    }
     const candidate = evaluateNormalHedgeCandidate({
       position,
       snapshots: { UP: freshUp, DOWN: freshDown },
       maxOrderSizeUsd: this.riskLimits.maxOrderSizeUsd,
       minimumLockedPairEdge: this.riskLimits.minExpectedEdge,
     });
-    if (!candidate) return null;
+    if (!candidate) {
+      this.pr3HedgeDebug.set(marketId, { stage: "NO_CANDIDATE", vetoes: null });
+      return null;
+    }
     const snapshot = candidate.outcome === "UP" ? freshUp : freshDown;
-    if (snapshot.tokenId !== candidate.tokenId) return null;
-    const duplicateKey = `${candidate.marketId}:${candidate.outcome}:${candidate.intent}`;
-    const asset = this.assetByMarket.get(marketId) ?? freshUp.asset ?? null;
-    const exposure = computePaperExposures(this.ledger.positions.values(), marketId, this.assetByMarket, now.getTime());
-    const projected = projectPaperExposures({
-      current: exposure,
-      positions: projectableLegsFromPositions(this.ledger.positions.values(), this.assetByMarket),
-      candidate: {
-        marketId, outcome: candidate.outcome, quantity: candidate.quantity,
-        price: candidate.limitPrice, side: candidate.side, intent: candidate.intent, asset,
-      },
-      nowMs: now.getTime(),
-    });
-    const requiredOutcome: Outcome = position.unpairedOutcome === "UP" ? "DOWN" : "UP";
-    const ledger = this.ledger.snapshot();
-    return decidePaperOrder({
+    if (snapshot.tokenId !== candidate.tokenId) {
+      this.pr3HedgeDebug.set(marketId, { stage: `TOKEN_MISMATCH_${candidate.tokenId}`, vetoes: null });
+      return null;
+    }
+    this.pr3HedgeDecisionCount += 1;
+    const decision = this.decideWithRuntimeBasis({
       candidate,
       consensus: HEDGE_CHECK_CONSENSUS,
-      snapshotAfterDecisionLatency: snapshot,
-      limits: this.riskLimits,
       triggerId: "early-catastrophic-hedge-check",
       signalExpiresAt: new Date(now.getTime() + 60_000),
-      orderType: "TAKER",
-      baseRisk: {
-        now,
-        marketFeedAt: collectMarketFeedAt({ UP: freshUp, DOWN: freshDown }, candidate.outcome, "HEDGE_SECOND_LEG", snapshot.receivedAt),
-        btcFeedAt: now,
-        referenceFeedAt: null,
-        referenceRequired: false,
-        asset,
-        assetExposureUsd: exposure.asset,
-        databaseAvailable: this.state.database === "UP",
-        timestampDisorder: this.timestampDisorder,
-        riskStateAvailable: this.protectiveRiskStateAvailable(),
-        dailyPnlUsd: ledger.netTradingPnl,
-        drawdownUsd: ledger.drawdown,
-        marketExposureUsd: exposure.market,
-        totalExposureUsd: exposure.total,
-        directionalExposureUsd: exposure.directional,
-        unhedgedExposureUsd: exposure.unhedged,
-        unhedgedDurationMs: exposure.unhedgedDurationMs,
-        intent: "HEDGE_SECOND_LEG",
-        hedgePosition: {
-          marketId: position.marketId,
-          unpairedOutcome: position.unpairedOutcome,
-          unpairedQuantity: position.unpairedQuantity,
-          expectedOppositeTokenId: this.currentTokenIdFor(marketId, requiredOutcome),
-        },
-        projectedMarketExposureUsd: projected.market,
-        projectedTotalExposureUsd: projected.total,
-        projectedDirectionalExposureUsd: projected.directional,
-        projectedUnhedgedExposureUsd: projected.unhedged,
-        projectedAssetExposureUsd: projected.asset,
-        availableCashUsd: this.ledger.availableCash().toFixed(),
-        referenceProviderBlocked: false,
-        marketEntryQualified: this.entryQualified.has(marketId),
-        externalSignalsLastMinute: 0,
-        lastStrategyTradeAt: this.lastTradeAt,
-        duplicateTrade: (this.recentTrades.get(duplicateKey) ?? 0) > now.getTime() - this.riskLimits.strategyCooldownMs,
-        experimentEntryOpen: experimentAllowsHedge(this.experiment),
-        executionErrorsLastHour: this.executionErrors.filter((at) => now.getTime() - at < 3_600_000).length,
-        externalRiskRecommendedVeto: false,
-        shuttingDown: this.state.draining,
-      },
-    });
+      snapshot,
+      pair: { UP: freshUp, DOWN: freshDown },
+      now,
+      databaseAvailable: this.state.database === "UP",
+    }).decision;
+    this.pr3HedgeDebug.set(marketId, { stage: "DECIDED", vetoes: decision.risk.vetoes });
+    return decision;
   }
 
+  /** Test hook: last PR3 hedge-check gating reason per market. */
+  pr3HedgeDebugForTest(marketId: string): { stage: string; vetoes: string[] | null } | null {
+    return this.pr3HedgeDebug.get(marketId) ?? null;
+  }
+
+  /** Test hook: last asset resolved by the shared runtime decision basis. */
+  runtimeBasisAssetForTest(): string | null {
+    return this.lastRuntimeBasisAssetForTest;
+  }
+
+  /** Test hook: drive the shared runtime decision basis with an explicit asset override. */
+  decideWithRuntimeBasisForTest(
+    candidate: StrategyCandidate,
+    pair: Record<Outcome, MarketSnapshot>,
+    now: Date,
+    assetOverride: string | null,
+  ): ReturnType<typeof decidePaperOrder> {
+    const snapshot = candidate.outcome === "UP" ? pair.UP : pair.DOWN;
+    return this.decideWithRuntimeBasis({
+      candidate,
+      consensus: HEDGE_CHECK_CONSENSUS,
+      triggerId: "runtime-basis-parity-test",
+      signalExpiresAt: new Date(now.getTime() + 60_000),
+      snapshot,
+      pair,
+      now,
+      databaseAvailable: this.state.database === "UP",
+      assetOverride,
+    }).decision;
+  }
   /** Canonical normal-hedge admissibility: the decision is actually accepted. */
   private normalHedgeAdmissible(
     marketId: string,
@@ -5103,120 +5224,195 @@ export class EngineService {
   }
 
 /**
-   * The in-flight half of the PR3 early catastrophic pair-lock. Runs while the
-   * shared risk-reduction flight is HELD. The economic action enters the SAME
-   * canonical deterministic rescue risk admission as PR82 (BLOCKER 1) and the
-   * final admission re-check happens after every pre-admission async boundary
-   * (BLOCKER 3). See earlyCatastrophicInFlight for the full lifecycle.
+   * The in-flight half of the PR3 early catastrophic pair-lock (pre-merge
+   * pass Sections 1-9, 11). Runs while the shared risk-reduction flight is
+   * HELD. All durable/awaiting work (hedge-maker fencing, same-market
+   * first-leg cancellation, canonical RISK_EVALUATION persistence) happens
+   * BEFORE the final SYNCHRONOUS economic fence; between that fence and
+   * PAPER_ORDER_CREATED no state-changing await remains. If a normal hedge is
+   * canonically admissible at any decision point it is ADOPTED from this same
+   * flight (actual execution, never a hypothetical priority). Returns
+   * { acted } — true only when a durable economic order was created (hedge
+   * adoption or early rescue).
    */
   private async executeEarlyCatastrophicPairLock(
     marketId: string,
     unpairedOutcome: Outcome,
     oppositeOutcome: Outcome,
     now: Date,
-  ): Promise<boolean> {
+  ): Promise<{ acted: boolean }> {
     return this.earlyCatastrophicInFlight(marketId, unpairedOutcome, oppositeOutcome, now);
   }
 
   /**
-   * Full canonical early-catastrophic in-flight lifecycle (BLOCKERS 1-4 +
-   * audit identity). Only a decision actually ACCEPTED by the canonical
-   * decideRescueSecondLegOrder/evaluateRisk may produce a PaperOrder; nothing
-   * here manufactures accepted/vetoes. The final admission re-check runs after
-   * every pre-admission async boundary.
+   * Full canonical early-catastrophic in-flight lifecycle (Sections 1, 3, 5,
+   * 6, 9). Returns { acted } — true only when a durable economic order was
+   * created (hedge adoption or early rescue).
    */
   private async earlyCatastrophicInFlight(
     marketId: string,
     unpairedOutcome: Outcome,
     oppositeOutcome: Outcome,
     now: Date,
-  ): Promise<boolean> {
-    // PRE-DEADLINE ownership (BLOCKER 2): pre-deadline only. Once the old
-    // protective eligibility is true, the PR82 A/B fallback exclusively owns
-    // the position — the early B path never steals it (return false so the
-    // deadline fallback acts on this snapshot).
-    if (!this.protectiveDeadlineNotOwned(marketId)) {
+  ): Promise<{ acted: boolean }> {
+    if (!this.earlyAuthority(marketId)) {
       this.recordProtectiveDeRiskSuppressed(marketId, "EARLY_CATASTROPHIC_PAIR_LOCK", "DEADLINE_OWNERSHIP", { position: this.ledger.positions.get(marketId) ?? null });
-      return false;
+      return { acted: false };
     }
     const position0 = this.ledger.positions.get(marketId);
     if (!position0?.unpairedOutcome || position0.unpairedOutcome !== unpairedOutcome || d(position0.unpairedQuantity).lte(0)) {
       this.recordProtectiveDeRiskSuppressed(marketId, "EARLY_CATASTROPHIC_PAIR_LOCK", "POSITION_CHANGED", { position: position0 ?? null });
-      return true;
+      return { acted: false };
     }
-    if (this.settledMarkets.has(marketId)) return true;
-    const pair = this.snapshots.get(marketId);
-    const evaluation = this.evaluateEarlyCatastrophicWithBooks(marketId, position0, unpairedOutcome, oppositeOutcome, now, pair);
-    if (!evaluation.evaluation.eligible || !evaluation.evaluation.candidate || evaluation.evaluation.hedgeAvailable || !evaluation.opposite) {
-      this.recordEarlyCatastrophicSuppressed(marketId, evaluation.evaluation, now);
-      return true;
+    if (this.settledMarkets.has(marketId)) return { acted: false };
+
+    // (1) VALID resting HEDGE maker owns the residual -> EARLY yields (Fix 3).
+    if (this.activeHedgeMakerOwnsResidual(marketId, oppositeOutcome)) {
+      const p0 = position0;
+      this.recordProtectiveDeRiskSuppressed(marketId, "EARLY_CATASTROPHIC_PAIR_LOCK", "HEDGE_MAKER_OWNS_RESIDUAL", {
+        position: p0, snapshot: null, unhedgedDurationMs: Math.max(0, this.nowFn().getTime() - Date.parse(p0.unhedgedStartedAt ?? p0.openedAt)),
+      });
+      return { acted: false };
+    }
+    // Fence only OBSOLETE/STALE hedge makers (valid ones already yielded above).
+    await this.fenceObsoleteHedgeMakers(marketId);
+
+    // (2) Cheap + canonical evaluation on FRESH state (post hedge-maker cancel).
+    let nowCurrent = this.nowFn();
+    let fresh = this.evaluateEarlyCatastrophicWithBooks(marketId, position0, unpairedOutcome, oppositeOutcome, nowCurrent, this.snapshots.get(marketId));
+    if (fresh.evaluation.hedgeAvailable) {
+      // Section 3: a canonically admissible normal hedge is ADOPTED from this
+      // same flight (actual execution), never left to a hypothetical trigger.
+      const hedgeDecision = this.normalHedgeDecision(marketId, position0, {
+        UP: this.freshEarlyCatastrophicSnapshot(this.snapshots.get(marketId)?.UP ?? null, nowCurrent.getTime()),
+        DOWN: this.freshEarlyCatastrophicSnapshot(this.snapshots.get(marketId)?.DOWN ?? null, nowCurrent.getTime()),
+      }, nowCurrent);
+      if (hedgeDecision?.accepted && hedgeDecision.order && fresh.opposite) {
+        return await this.adoptHedgeFromEarlyFlight(marketId, hedgeDecision, fresh.opposite, nowCurrent);
+      }
+      this.recordEarlyCatastrophicSuppressed(marketId, fresh.evaluation, nowCurrent);
+      return { acted: false };
+    }
+    if (!fresh.evaluation.eligible || !fresh.evaluation.candidate || !fresh.opposite) {
+      this.recordEarlyCatastrophicSuppressed(marketId, fresh.evaluation, nowCurrent);
+      return { acted: false };
     }
     const expectedOppositeTokenId = this.currentTokenIdFor(marketId, oppositeOutcome);
-    if (!expectedOppositeTokenId || evaluation.evaluation.candidate.tokenId !== expectedOppositeTokenId) {
-      this.recordEarlyCatastrophicSuppressed(marketId, evaluation.evaluation, now, { reason: "OPPOSITE_TOKEN_MISMATCH" });
-      return true;
+    if (!expectedOppositeTokenId || fresh.evaluation.candidate.tokenId !== expectedOppositeTokenId) {
+      this.recordEarlyCatastrophicSuppressed(marketId, fresh.evaluation, nowCurrent, { reason: "OPPOSITE_TOKEN_MISMATCH" });
+      return { acted: false };
     }
-    const asset = this.assetByMarket.get(marketId) ?? evaluation.held?.asset ?? null;
-    const admission = this.admitEarlyRescue(marketId, position0, oppositeOutcome, evaluation.held, evaluation.opposite, evaluation.evaluation.candidate, now, asset);
-    if (!admission) return true;
+    let asset = this.assetByMarket.get(marketId) ?? fresh.held?.asset ?? null;
+// (3) PREFLIGHT canonical admission. Only an INSUFFICIENT_CASH-only veto
+    //     with releasable same-market first-leg reservations triggers durable
+    //     cancellation; any other veto is persisted (paced, Section 7).
+    let admission = this.admitEarlyRescue(marketId, position0, oppositeOutcome, fresh.held, fresh.opposite, fresh.evaluation.candidate, nowCurrent, asset);
+    if (admission && !admission.decision.accepted) {
+      if (this.earlySameMarketFirstLegReservationCoverage(marketId, admission.decision)) {
+        await this.cancelOutstandingFirstLegMakers(marketId, "EARLY_CATASTROPHIC_PAIR_LOCK");
+        nowCurrent = this.nowFn();
+        fresh = this.evaluateEarlyCatastrophicWithBooks(marketId, position0, unpairedOutcome, oppositeOutcome, nowCurrent, this.snapshots.get(marketId));
+        if (fresh.evaluation.hedgeAvailable) {
+          const hedgeDecision = this.normalHedgeDecision(marketId, position0, {
+            UP: this.freshEarlyCatastrophicSnapshot(this.snapshots.get(marketId)?.UP ?? null, nowCurrent.getTime()),
+            DOWN: this.freshEarlyCatastrophicSnapshot(this.snapshots.get(marketId)?.DOWN ?? null, nowCurrent.getTime()),
+          }, nowCurrent);
+          if (hedgeDecision?.accepted && hedgeDecision.order && fresh.opposite) {
+            return await this.adoptHedgeFromEarlyFlight(marketId, hedgeDecision, fresh.opposite, nowCurrent);
+          }
+          this.recordEarlyCatastrophicSuppressed(marketId, fresh.evaluation, nowCurrent);
+          return { acted: false };
+        }
+        if (!fresh.evaluation.eligible || !fresh.evaluation.candidate || !fresh.opposite) {
+          this.recordEarlyCatastrophicSuppressed(marketId, fresh.evaluation, nowCurrent);
+          return { acted: false };
+        }
+        asset = this.assetByMarket.get(marketId) ?? fresh.held?.asset ?? null;
+        admission = this.admitEarlyRescue(marketId, position0, oppositeOutcome, fresh.held, fresh.opposite, fresh.evaluation.candidate, nowCurrent, asset);
+      } else {
+        await this.persistEarlyEvaluation(marketId, admission.decision, fresh.evaluation, nowCurrent, asset, false);
+        this.noteEarlyRiskVetoes(admission.decision);
+        this.recordEarlyCatastrophicSuppressed(marketId, fresh.evaluation, nowCurrent, {
+          reason: admission.decision.risk.vetoes[0] ?? "RISK_VETO",
+          vetoes: admission.decision.risk.vetoes,
+        });
+        this.paceEarlyAttempt(marketId, admission.decision, fresh, nowCurrent, false);
+        return { acted: false };
+      }
+    }
+    if (!admission) return { acted: false };
     if (!admission.decision.accepted) {
-      await this.persistEarlyEvaluation(marketId, admission.decision, evaluation.evaluation, now, asset, false);
-      this.recordEarlyCatastrophicSuppressed(marketId, evaluation.evaluation, now, {
+      await this.persistEarlyEvaluation(marketId, admission.decision, fresh.evaluation, nowCurrent, asset, false);
+      this.noteEarlyRiskVetoes(admission.decision);
+      this.recordEarlyCatastrophicSuppressed(marketId, fresh.evaluation, nowCurrent, {
         reason: admission.decision.risk.vetoes[0] ?? "RISK_VETO",
         vetoes: admission.decision.risk.vetoes,
       });
-      return true;
+      this.paceEarlyAttempt(marketId, admission.decision, fresh, nowCurrent, false);
+      return { acted: false };
     }
+// (4) Durable same-market first-leg cancellation MUST precede the final
+    //     admission so submission's internal cancelOutstandingFirstLegMakers is
+    //     a NO-OP and the final fence truly linearizes (Section 1 / RACE-B).
+    await this.cancelOutstandingFirstLegMakers(marketId, "EARLY_CATASTROPHIC_PAIR_LOCK");
 
-    // PRE-ADMISSION async boundary: resting-hedge maker fencing.
-    await this.cancelRestingHedgeMakers(marketId, "EARLY_CATASTROPHIC_PAIR_LOCK");
-
-    // BLOCKER 3: FINAL ADMISSION RECHECK after all pre-admission async
-    // boundaries — re-read durable position, fresh canonical synchronized books,
-    // deadline ownership, full-residual identity + cap, canonical hedge
-    // admissibility; then RE-RUN the canonical rescue decision on the fresh
-    // state. Only then may PAPER_ORDER_CREATED happen.
-    const recheck = await this.finalEarlyAdmissionRecheck(marketId, unpairedOutcome, oppositeOutcome);
-    if (!recheck) return true;
-    if (recheck.evaluation.hedgeAvailable) {
-      this.recordEarlyCatastrophicSuppressed(marketId, recheck.evaluation, recheck.now);
-      return true;
-    }
-    const assetFresh = this.assetByMarket.get(marketId) ?? recheck.held?.asset ?? null;
-    const admissionFresh = this.admitEarlyRescue(
-      marketId, recheck.position, oppositeOutcome,
-      recheck.held, recheck.opposite, recheck.evaluation.candidate!, recheck.now, assetFresh,
-    );
-    if (!admissionFresh || !admissionFresh.decision.accepted) {
-      if (admissionFresh) {
-        await this.persistEarlyEvaluation(marketId, admissionFresh.decision, recheck.evaluation, recheck.now, assetFresh, false);
-        this.recordEarlyCatastrophicSuppressed(marketId, recheck.evaluation, recheck.now, {
-          reason: admissionFresh.decision.risk.vetoes[0] ?? "RISK_VETO",
-          vetoes: admissionFresh.decision.risk.vetoes,
+    // (5) FINAL canonical admission (post all reservations released).
+    const finalDecisionAttempt = this.admitEarlyRescue(marketId, position0, oppositeOutcome, fresh.held, fresh.opposite, fresh.evaluation.candidate, this.nowFn(), asset);
+    if (!finalDecisionAttempt || !finalDecisionAttempt.decision.accepted) {
+      if (finalDecisionAttempt) {
+        await this.persistEarlyEvaluation(marketId, finalDecisionAttempt.decision, fresh.evaluation, this.nowFn(), asset, false);
+        this.noteEarlyRiskVetoes(finalDecisionAttempt.decision);
+        this.recordEarlyCatastrophicSuppressed(marketId, fresh.evaluation, this.nowFn(), {
+          reason: finalDecisionAttempt.decision.risk.vetoes[0] ?? "RISK_VETO",
+          vetoes: finalDecisionAttempt.decision.risk.vetoes,
         });
+        this.paceEarlyAttempt(marketId, finalDecisionAttempt.decision, fresh, this.nowFn(), false);
       }
-      return true;
+      return { acted: false };
     }
-    const decision = admissionFresh.decision;
-    const audit = this.buildEarlyAudit(marketId, recheck.position, decision, recheck.evaluation, recheck.now, true);
-    // AUDIT IDENTITY: RISK_ACCEPT.orderId == decision order id == id that flows
-    // into PAPER_ORDER_CREATED and the fill; RISK_EVALUATION aggregateId == risk id.
+    const decision = finalDecisionAttempt.decision;
+
+    // (6) Persist the accepted canonical RISK_EVALUATION (await boundary).
+    await this.persistEarlyEvaluation(marketId, decision, fresh.evaluation, this.nowFn(), asset, true);
+    this.paceEarlyAttempt(marketId, decision, fresh, this.nowFn(), true);
+
+    // (7) FINAL SYNCHRONOUS FENCE — validates the PERSISTED decision whose
+    //     risk/order identity is fixed (Fix 2). This is the last sync point
+    //     before EARLY submit: no machine-await follows (Fix 1).
+    const fence = this.finalEarlyEconomicFence(marketId, unpairedOutcome, oppositeOutcome, decision, fresh.opposite, asset);
+    if (fence.adoptHedge) {
+      const hedgeDecision = this.normalHedgeDecision(marketId, position0, {
+        UP: this.freshEarlyCatastrophicSnapshot(this.snapshots.get(marketId)?.UP ?? null, this.nowFn().getTime()),
+        DOWN: this.freshEarlyCatastrophicSnapshot(this.snapshots.get(marketId)?.DOWN ?? null, this.nowFn().getTime()),
+      }, this.nowFn());
+      if (hedgeDecision?.accepted && hedgeDecision.order && fence.opposite) {
+        return await this.adoptHedgeFromEarlyFlight(marketId, hedgeDecision, fence.opposite, this.nowFn());
+      }
+      this.recordProtectiveDeRiskSuppressed(marketId, "EARLY_CATASTROPHIC_PAIR_LOCK", "HEDGE_ADOPTION_REGRESSED", { position: position0, snapshot: fence.opposite ?? null });
+      return { acted: false };
+    }
+    if (!fence.ok) {
+      this.recordProtectiveDeRiskSuppressed(marketId, "EARLY_CATASTROPHIC_PAIR_LOCK", fence.reason, { position: position0, snapshot: fence.opposite ?? null });
+      return { acted: false };
+    }
+    const audit = this.buildEarlyAudit(marketId, position0, decision, fresh.evaluation, this.nowFn(), true);
+    this.state.latestRisk = decision.risk;
     this.record("RISK_ACCEPT", decision.risk.traceId, marketId, {
       orderId: decision.order!.id,
       intent: "RESCUE_SECOND_LEG",
       deRisk: audit,
-    }, assetFresh);
-    await this.persistEarlyEvaluation(marketId, decision, recheck.evaluation, recheck.now, assetFresh, true);
-    await this.submitPaperOrder(
+    }, asset);
+    const created = await this.submitPaperOrder(
       decision.order!,
-      recheck.opposite!,
+      fence.opposite!,
       `${marketId}:${oppositeOutcome}:EARLY_CATASTROPHIC_PAIR_LOCK`,
       "RESCUE_SECOND_LEG",
       audit,
+      { skipPreCreateFirstLegCancel: true },
     );
-    return true;
+    return { acted: created };
   }
-/** Selects FRESH canonical held/opposite books and runs the PR3 predicate. */
+/** Selects FRESH canonical held/opposite books and runs the staged PR3 predicate. */
   private evaluateEarlyCatastrophicWithBooks(
     marketId: string,
     position: Position,
@@ -5232,11 +5428,351 @@ export class EngineService {
   }
 
   /**
-   * Canonical deterministic rescue risk admission (BLOCKER 1): the ONLY source
-   * of accepted/vetoes and of the PaperOrder identity is decideRescueSecondLegOrder
-   * (which runs evaluateRisk with rescue structural verification) against the
-   * current durable position, projected exposure, available cash, database/risk
-   * state, execution-error count and canonical opposite token.
+   * True when a VALID resting HEDGE_SECOND_LEG maker already owns the required
+   * opposite residual (current token, remaining > 0). Such a maker is actual
+   * hedge authority — EARLY yields instead of cancelling it (Fix 3).
+   */
+  private activeHedgeMakerOwnsResidual(marketId: string, oppositeOutcome: Outcome): boolean {
+    const expectedTokenId = this.currentTokenIdFor(marketId, oppositeOutcome);
+    if (!expectedTokenId) return false;
+    for (const resting of this.restingOrders.values()) {
+      if (resting.order.marketId !== marketId) continue;
+      if (!d(resting.remaining).gt(0)) continue;
+      if (this.restingOrderIntent(resting) !== "HEDGE_SECOND_LEG") continue;
+      if (resting.order.tokenId !== expectedTokenId) continue;
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Fence only OBSOLETE/STALE resting hedge makers (token no longer matches the
+   * current opposite outcome). VALID makers already yielded in
+   * activeHedgeMakerOwnsResidual, so no live hedge authority is destroyed before
+   * rescue owns the residual (Fix 3).
+   */
+  private async fenceObsoleteHedgeMakers(marketId: string): Promise<void> {
+    const position = this.ledger.positions.get(marketId);
+    if (!position?.unpairedOutcome) return;
+    const oppositeOutcome: Outcome = position.unpairedOutcome === "UP" ? "DOWN" : "UP";
+    const expectedTokenId = this.currentTokenIdFor(marketId, oppositeOutcome);
+    for (const [orderId, resting] of [...this.restingOrders.entries()]) {
+      if (resting.order.marketId !== marketId) continue;
+      if (!d(resting.remaining).gt(0)) continue;
+      if (this.restingOrderIntent(resting) !== "HEDGE_SECOND_LEG") continue;
+      if (expectedTokenId && resting.order.tokenId === expectedTokenId) continue;
+      await this.releaseMaker(orderId, { cancel: true, reason: "EARLY_CATASTROPHIC_PAIR_LOCK_STALE_MAKER" });
+    }
+  }
+
+
+  /**
+   * CHEAP catastrophic gate (Section 8): pure decimal/book math only —
+   * no canonical hedge decision, no decidePaperOrder/evaluateRisk — so the
+   * non-actionable snapshot hot path does NO expensive canonical work. A full
+   * residual + loss cap are prerequisites before any hedge/risk admission runs.
+   */
+  private earlyCheapGate(input: {
+    position: Position | null;
+    held: MarketSnapshot | null;
+    opposite: MarketSnapshot | null;
+    nowMs: number;
+  }): {
+    ok: boolean;
+    reason: EarlyCatastrophicRejectionReason | null;
+    markLossUsd: string | null;
+    candidate: StrategyCandidate | null;
+    rescueNotionalUsd: string | null;
+    rescueVwap: string | null;
+    rescueFeeUsd: string | null;
+    guaranteedLockedPnl: string | null;
+  } {
+    const empty = {
+      ok: false as const, reason: "NO_UNPAIRED_RESIDUAL", markLossUsd: null as string | null,
+      candidate: null as StrategyCandidate | null, rescueNotionalUsd: null as string | null,
+      rescueVwap: null as string | null, rescueFeeUsd: null as string | null, guaranteedLockedPnl: null as string | null,
+    };
+    const { position, held, opposite, nowMs } = input;
+    if (!position?.unpairedOutcome || d(position.unpairedQuantity).lte(0)) return { ...empty, reason: "NO_UNPAIRED_RESIDUAL" };
+    const startedAt = position.unhedgedStartedAt ?? position.openedAt;
+    const startedMs = Date.parse(startedAt);
+    const unhedgedAgeMs = Number.isFinite(startedMs) ? Math.max(0, nowMs - startedMs) : Number.POSITIVE_INFINITY;
+    if (!Number.isFinite(unhedgedAgeMs) || unhedgedAgeMs < this.riskLimits.catastrophicPairLockMinUnhedgedMs) {
+      return { ...empty, reason: "UNHEDGED_AGE_NOT_REACHED" };
+    }
+    if (!held) return { ...empty, reason: "MARK_UNAVAILABLE" };
+    const markLossUsd = computeRealizableMarkLossUsd(position, held);
+    if (markLossUsd === null) return { ...empty, reason: "MARK_UNAVAILABLE" };
+    if (d(markLossUsd).lt(this.riskLimits.catastrophicPairLockTriggerLossUsd)) {
+      return { ...empty, markLossUsd: String(markLossUsd), reason: "MARK_LOSS_NOT_REACHED" };
+    }
+    if (!opposite) return { ...empty, markLossUsd: String(markLossUsd), reason: "OPPOSITE_ASK_UNAVAILABLE" };
+    const candidateEvaluation = evaluateRescueSecondLegCandidate({ position, snapshot: opposite, maxOrderSizeUsd: this.riskLimits.maxOrderSizeUsd });
+    const candidate = candidateEvaluation.candidate;
+    if (!candidate) return { ...empty, markLossUsd: String(markLossUsd), reason: "OPPOSITE_ASK_UNAVAILABLE" };
+    if (!d(candidate.quantity).eq(d(position.unpairedQuantity))) {
+      return { ...empty, markLossUsd: String(markLossUsd), candidate, reason: "PARTIAL_OPPOSITE_DEPTH" };
+    }
+    if (!opposite.feeSchedule || !opposite.minOrderSize) {
+      return { ...empty, markLossUsd: String(markLossUsd), candidate, reason: "OPPOSITE_ASK_UNAVAILABLE" };
+    }
+    const walk = walkBook(opposite.asks, candidate.quantity, candidate.limitPrice, "BUY");
+    if (!walk.sufficientDepth || !d(walk.filledQuantity).eq(candidate.quantity)) {
+      return { ...empty, markLossUsd: String(markLossUsd), candidate, reason: "PARTIAL_OPPOSITE_DEPTH" };
+    }
+    const rescueFeeUsd = calculateFee(candidate.quantity, walk.vwap, "TAKER", opposite.feeSchedule);
+    const guaranteedLockedPnl = computeGuaranteedLockedPnl({
+      position, rescueQuantity: candidate.quantity, rescueVwap: walk.vwap, rescueTakerFeeUsd: rescueFeeUsd,
+    });
+    if (d(guaranteedLockedPnl).lt(d(-this.riskLimits.catastrophicPairLockMaxLockedLossUsd))) {
+      return {
+        ...empty, markLossUsd: String(markLossUsd), candidate, guaranteedLockedPnl,
+        rescueNotionalUsd: walk.notional, rescueVwap: walk.vwap, rescueFeeUsd, reason: "LOCKED_LOSS_EXCEEDS_CAP",
+      };
+    }
+    return {
+      ok: true, reason: null, markLossUsd: String(markLossUsd), candidate,
+      rescueNotionalUsd: walk.notional, rescueVwap: walk.vwap, rescueFeeUsd, guaranteedLockedPnl,
+    };
+  }
+/**
+   * True when a vetoed rescue admission is blocked ONLY by INSUFFICIENT_CASH
+   * and the SAME-MARKET first-leg maker reservations would cover the deficit
+   * (Section 6). Unrelated markets are never counted as releasable cash.
+   */
+  private earlySameMarketFirstLegReservationCoverage(
+    marketId: string,
+    decision: ReturnType<typeof decideRescueSecondLegOrder>,
+  ): boolean {
+    const vetoes = decision.risk.vetoes;
+    if (vetoes.length !== 1 || vetoes[0] !== "INSUFFICIENT_CASH") return false;
+    const requiredCash = decision.requiredCashUsd ?? "0";
+    const deficit = d(requiredCash).minus(this.ledger.availableCash());
+    if (deficit.lte(0)) return false;
+    let releasable = d(0);
+    for (const [orderId, reserved] of this.makerReservations.entries()) {
+      const resting = this.restingOrders.get(orderId);
+      if (!resting || resting.order.marketId !== marketId) continue;
+      if (this.restingOrderIntent(resting) !== "OPEN_FIRST_LEG") continue;
+      releasable = releasable.plus(reserved);
+    }
+    return releasable.gte(deficit);
+  }
+
+  /** Section 7: stable-veto pacing for early RISK_EVALUATION writes. */
+  private earlyAttemptFingerprint(position: Position, opposite: MarketSnapshot | null): string {
+    const topAsk = opposite?.asks[0] ?? null;
+    return JSON.stringify([
+      position.marketId,
+      position.unpairedQuantity,
+      this.ledger.availableCash().toFixed(),
+      topAsk?.price ?? null,
+      topAsk?.quantity ?? null,
+      position.unhedgedStartedAt ?? position.openedAt,
+    ]);
+  }
+
+  private paceEarlyAttempt(
+    marketId: string,
+    decision: ReturnType<typeof decideRescueSecondLegOrder>,
+    fresh: { held: MarketSnapshot | null; opposite: MarketSnapshot | null },
+    now: Date,
+    accepted: boolean,
+  ): void {
+    this.protectiveDeRiskAttempts.set(marketId, (this.protectiveDeRiskAttempts.get(marketId) ?? 0) + 1);
+    if (accepted) {
+      this.earlyCatastrophicNextAttemptAt.set(marketId, now.getTime() + PROTECTIVE_DE_RISK_RETRY_MS);
+      this.earlyCatastrophicVetoFingerprint.delete(marketId);
+      return;
+    }
+    const position = this.ledger.positions.get(marketId);
+    const fingerprint = `${decision.risk.vetoes.join("|")}|${position ? this.earlyAttemptFingerprint(position, fresh.opposite) : "none"}`;
+    this.earlyCatastrophicVetoFingerprint.set(marketId, fingerprint);
+    this.earlyCatastrophicNextAttemptAt.set(marketId, now.getTime() + PROTECTIVE_DE_RISK_VETO_RETRY_MS);
+  }
+
+  private earlyAttemptPaced(marketId: string, position: Position, opposite: MarketSnapshot | null, now: Date): boolean {
+    const nextAttemptAt = this.earlyCatastrophicNextAttemptAt.get(marketId) ?? 0;
+    if (now.getTime() < nextAttemptAt) {
+      const stored = this.earlyCatastrophicVetoFingerprint.get(marketId);
+      if (stored != null) {
+        const current = this.earlyAttemptFingerprint(position, opposite);
+        if (stored.endsWith(`|${current}`)) return true;
+      } else {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private noteEarlyRiskVetoes(decision: ReturnType<typeof decideRescueSecondLegOrder>): void {
+    for (const reason of decision.risk.vetoes) this.metrics.riskVetoes.inc({ reason });
+    this.state.latestRisk = decision.risk;
+  }
+/**
+   * FINAL SYNCHRONOUS ECONOMIC FENCE (Section 1). Runs at the last possible
+   * synchronous point before an EARLY PAPER_ORDER_CREATED, after every
+   * pre-admission await. Proves: durable position residual/outcome unchanged,
+   * market not settled/expired, early pre-deadline authority still owned
+   * (never at/after marketEnd), canonical books fresh/synchronized and not
+   * future-dated, full residual still executable, loss cap still passes and a
+   * canonical rescue decision against current cash/exposure/risk state is still
+   * acceptable. Also re-evaluates normal-hedge admissibility so a hedge that
+   * became authoritative during the last async boundary wins (ADOPTED).
+   * No state-changing await exists between this fence and EARLY submit.
+   */
+private finalEarlyEconomicFence(
+    marketId: string,
+    unpairedOutcome: Outcome,
+    oppositeOutcome: Outcome,
+    persistedDecision: ReturnType<typeof decideRescueSecondLegOrder>,
+    oppositeAtDecision: MarketSnapshot | null,
+    assetAtDecision: string | null,
+  ): {
+    ok: boolean;
+    reason: string;
+    adoptHedge: boolean;
+    opposite?: MarketSnapshot | null;
+  } {
+    const now = this.nowFn();
+    const position = this.ledger.positions.get(marketId);
+    if (!position?.unpairedOutcome || position.unpairedOutcome !== unpairedOutcome || d(position.unpairedQuantity).lte(0)) {
+      return { ok: false, reason: "POSITION_CHANGED", adoptHedge: false };
+    }
+    if (this.settledMarkets.has(marketId)) return { ok: false, reason: "SETTLED_MARKET", adoptHedge: false };
+    // Fix 6: pre-deadline ownership must hold at the fence instant too.
+    if (!this.earlyAuthority(marketId)) return { ok: false, reason: "DEADLINE_OWNERSHIP", adoptHedge: false };
+    const pair = this.snapshots.get(marketId);
+    const held = this.freshEarlyCatastrophicSnapshot(unpairedOutcome === "UP" ? (pair?.UP ?? null) : (pair?.DOWN ?? null), now.getTime());
+    const opposite = this.freshEarlyCatastrophicSnapshot(oppositeOutcome === "UP" ? (pair?.UP ?? null) : (pair?.DOWN ?? null), now.getTime());
+    if (!held || !opposite) return { ok: false, reason: "BOOK_UNAVAILABLE_OR_FUTURE_STALE", adoptHedge: false };
+    // Persisted decision identity must still match the CURRENT token/residual.
+    const persistedOrder = persistedDecision.order;
+    if (!persistedOrder) return { ok: false, reason: "ORDER_MISSING", adoptHedge: false };
+    const expectedTokenId = this.currentTokenIdFor(marketId, oppositeOutcome);
+    if (!expectedTokenId || persistedOrder.tokenId !== expectedTokenId) {
+      return { ok: false, reason: "OPPOSITE_TOKEN_MISMATCH", adoptHedge: false };
+    }
+    if (!d(persistedOrder.quantity).eq(d(position.unpairedQuantity))) {
+      return { ok: false, reason: "RESIDUAL_CHANGED", adoptHedge: false };
+    }
+    // A normal hedge that became canonically admissible is ADOPTED instead of
+    // the persisted rescue (only valid while pre-deadline; earlyAuthority above).
+    const hedgeDecision = this.normalHedgeDecision(marketId, position, {
+      UP: this.freshEarlyCatastrophicSnapshot(pair?.UP ?? null, now.getTime()),
+      DOWN: this.freshEarlyCatastrophicSnapshot(pair?.DOWN ?? null, now.getTime()),
+    }, now);
+    if (hedgeDecision?.accepted && hedgeDecision.order) {
+      return { ok: true, reason: "HEDGE_ADOPTED", adoptHedge: true, opposite };
+    }
+    // VALIDATION-ONLY canonical admission (Fix 2): never persisted, never
+    // submitted. Only used to prove the PERSISTED decision is still executable.
+    const candidateValidation = evaluateRescueSecondLegCandidate({ position, snapshot: opposite, maxOrderSizeUsd: this.riskLimits.maxOrderSizeUsd }).candidate;
+    if (!candidateValidation || !d(candidateValidation.quantity).eq(d(position.unpairedQuantity))) {
+      return { ok: false, reason: "PARTIAL_OPPOSITE_DEPTH", adoptHedge: false };
+    }
+    if (!opposite.feeSchedule || !opposite.minOrderSize) {
+      return { ok: false, reason: "BOOK_UNAVAILABLE_OR_FUTURE_STALE", adoptHedge: false };
+    }
+    const validation = this.admitEarlyRescue(marketId, position, oppositeOutcome, held, opposite, candidateValidation, now, assetAtDecision ?? held.asset ?? null);
+    if (!validation || !validation.decision.accepted || !validation.decision.order) {
+      return { ok: false, reason: "ADMISSION_REGRESSED", adoptHedge: false };
+    }
+    const vOrder = validation.decision.order;
+    if (vOrder.tokenId !== persistedOrder.tokenId || !d(vOrder.quantity).eq(d(persistedOrder.quantity))) {
+      return { ok: false, reason: "STATE_CHANGED", adoptHedge: false };
+    }
+    // Current-walk economics: actual fill (PAPER) at the CURRENT executable book
+    // must still satisfy the configured loss cap for the PERSISTED order.
+    const walk = walkBook(opposite.asks, persistedOrder.quantity, persistedOrder.requestedPrice, "BUY");
+    if (!walk.sufficientDepth || !d(walk.filledQuantity).eq(persistedOrder.quantity)) {
+      return { ok: false, reason: "PARTIAL_OPPOSITE_DEPTH", adoptHedge: false };
+    }
+    const feeUsd = calculateFee(persistedOrder.quantity, walk.vwap, "TAKER", opposite.feeSchedule);
+    const lockedPnl = computeGuaranteedLockedPnl({ position, rescueQuantity: persistedOrder.quantity, rescueVwap: walk.vwap, rescueTakerFeeUsd: feeUsd });
+    if (d(lockedPnl).lt(d(-this.riskLimits.catastrophicPairLockMaxLockedLossUsd))) {
+      return { ok: false, reason: "LOSS_CAP_EXCEEDED", adoptHedge: false };
+    }
+    return { ok: true, reason: "OK", adoptHedge: false, opposite };
+  }
+  /**
+   * Section 3: ADOPT the normal hedge from the SAME risk-reduction flight. The
+   * early flight is released and the live HEDGE_SECOND_LEG submission re-acquires
+   * it in the same synchronous tick (exactly-one risk-reduction authority
+   * preserved, no interleaving). The residual is never left naked to a
+   * hypothetical hedge.
+   */
+  private async adoptHedgeFromEarlyFlight(
+    marketId: string,
+    hedgeDecision: ReturnType<typeof decidePaperOrder>,
+    oppositeSnapshot: MarketSnapshot,
+    now: Date,
+  ): Promise<{ acted: boolean }> {
+    // Fix 6: never adopt a normal hedge as a NEW pre-deadline decision once the
+    // protective deadline (or marketEnd) owns the position. Yield to the
+    // caller's same-pass PR82 handoff instead — no extra snapshot required.
+    if (!this.earlyAuthority(marketId)) {
+      this.recordProtectiveDeRiskSuppressed(marketId, "EARLY_CATASTROPHIC_PAIR_LOCK", "DEADLINE_OWNERSHIP", { position: this.ledger.positions.get(marketId) ?? null });
+      return { acted: false };
+    }
+    const order = hedgeDecision.order!;
+    const snapshot = order.tokenId === oppositeSnapshot.tokenId
+      ? oppositeSnapshot
+      : (this.state.marketSnapshots.get(order.tokenId) ?? oppositeSnapshot);
+    const asset = this.assetByMarket.get(marketId) ?? snapshot.asset ?? null;
+    const audit = this.buildHedgeAdoptionAudit(marketId, order, now);
+    this.record("RISK_ACCEPT", order.traceId, marketId, { orderId: order.id, intent: "HEDGE_SECOND_LEG", deRisk: audit }, asset);
+    this.record("NORMAL_HEDGE_ADOPTED_UNDER_EARLY_FLIGHT", order.traceId, marketId, {
+      orderId: order.id, reason: "EARLY_HEDGE_PRIORITY_ADOPTION",
+    }, asset);
+    this.riskReductionInFlight.delete(marketId);
+    try {
+      const created = await this.submitPaperOrder(
+        order,
+        snapshot,
+        `${order.marketId}:${order.outcome}:HEDGE_SECOND_LEG`,
+        "HEDGE_SECOND_LEG",
+        audit,
+      );
+      return { acted: created };
+    } finally {
+      // NOTE: the HEDGE submission owns/releases the flight itself; if it was
+      // suppressed (deadline reached) the caller's same-pass handoff covers it.
+      this.riskReductionInFlight.delete(marketId);
+    }
+  }
+
+  private buildHedgeAdoptionAudit(marketId: string, order: PaperOrder, now: Date): ProtectiveDeRiskAudit {
+    const position = this.ledger.positions.get(marketId);
+    const unhedgedStartedAt = position?.unhedgedStartedAt ?? position?.openedAt ?? now.toISOString();
+    return {
+      deRiskReason: "EARLY_HEDGE_ADOPTION",
+      eligibilityReason: "EARLY_HEDGE_ADOPTION",
+      unhedgedStartedAt,
+      unhedgedDurationMs: Math.max(0, now.getTime() - Date.parse(unhedgedStartedAt)),
+      attemptedAction: "HEDGE_SECOND_LEG",
+      requestedQty: position?.unpairedQuantity ?? "0",
+      executableQty: order.quantity,
+      executionPrice: null,
+      residualQuantity: "0",
+      residualExposure: "0",
+      retryCount: (this.protectiveDeRiskAttempts.get(marketId) ?? 0) + 1,
+      finalState: "ORDER_ADMITTED",
+      selection: "NONE",
+      tieBreakUsed: false,
+      aAvailable: false,
+      bAvailable: false,
+      bReason: null,
+      bQuantity: null, bVwap: null, bFeeUsd: null, bRequiredCashUsd: null, bGuaranteedSalvageUsd: null,
+    };
+  }
+/**
+   * Canonical deterministic rescue risk admission (Section 1/10): the ONLY
+   * source of accepted/vetoes and of the PaperOrder identity is
+   * decideRescueSecondLegOrder (which runs evaluateRisk with rescue structural
+   * verification) against the current durable position, projected exposure,
+   * available cash, database/risk state, execution-error count and canonical
+   * opposite token. PR3-only gates stay outside this canonical rescue policy.
    */
   private admitEarlyRescue(
     marketId: string,
@@ -5270,9 +5806,10 @@ export class EngineService {
   }
 
   /**
-   * Shared PR82/PR3 canonical rescue risk basis — the same construction as the
-   * old deadline B path. All risk GATES are enforced only by the canonical
-   * decideRescueSecondLegOrder/evaluateRisk; this only assembles the facts.
+   * Canonical RESCUE risk basis constructed from the SAME facts the PR82
+   * deadline fallback uses for its B decision (exposures, ledger,
+   * availableCash, feed/database/risk state). PR3-only gates are NOT here;
+   * parity with PR82's inline construction is proven by test.
    */
   private buildRescueRiskBasis(input: {
     marketId: string;
@@ -5345,53 +5882,7 @@ export class EngineService {
       rescuePosition,
     };
   }
-/**
-   * FINAL ADMISSION RECHECK (BLOCKER 3): runs after every pre-admission async
-   * cancellation/persistence boundary — the last safe point before
-   * PAPER_ORDER_CREATED. Re-reads the durable position, fresh canonical
-   * synchronized books, deadline ownership, full-residual identity + cap and
-   * canonical hedge admissibility. Returns null (consume) when the early action
-   * must be skipped for this pass.
-   */
-  private async finalEarlyAdmissionRecheck(
-    marketId: string,
-    unpairedOutcome: Outcome,
-    oppositeOutcome: Outcome,
-  ): Promise<{
-    position: Position;
-    held: MarketSnapshot | null;
-    opposite: MarketSnapshot | null;
-    evaluation: EarlyCatastrophicPairLockEvaluation;
-    now: Date;
-  } | null> {
-    const now = this.nowFn();
-    const position = this.ledger.positions.get(marketId);
-    if (!position?.unpairedOutcome || position.unpairedOutcome !== unpairedOutcome || d(position.unpairedQuantity).lte(0)) {
-      this.recordProtectiveDeRiskSuppressed(marketId, "EARLY_CATASTROPHIC_PAIR_LOCK", "POSITION_CHANGED", { position: position ?? null });
-      return null;
-    }
-    if (this.settledMarkets.has(marketId)) return null;
-    if (!this.protectiveDeadlineNotOwned(marketId)) {
-      this.recordProtectiveDeRiskSuppressed(marketId, "EARLY_CATASTROPHIC_PAIR_LOCK", "DEADLINE_OWNERSHIP", { position });
-      return null;
-    }
-    const pair = this.snapshots.get(marketId);
-    const held = this.freshEarlyCatastrophicSnapshot(unpairedOutcome === "UP" ? (pair?.UP ?? null) : (pair?.DOWN ?? null), now.getTime());
-    const opposite = this.freshEarlyCatastrophicSnapshot(oppositeOutcome === "UP" ? (pair?.UP ?? null) : (pair?.DOWN ?? null), now.getTime());
-    const evaluation = this.evaluateEarlyCatastrophic(marketId, position, held, opposite, now, pair);
-    if (!evaluation.evaluation.eligible || !evaluation.evaluation.candidate || !evaluation.opposite) {
-      this.recordEarlyCatastrophicSuppressed(marketId, evaluation.evaluation, now);
-      return null;
-    }
-    const expectedOppositeTokenId = this.currentTokenIdFor(marketId, oppositeOutcome);
-    if (!expectedOppositeTokenId || evaluation.evaluation.candidate.tokenId !== expectedOppositeTokenId) {
-      this.recordEarlyCatastrophicSuppressed(marketId, evaluation.evaluation, now, { reason: "OPPOSITE_TOKEN_MISMATCH" });
-      return null;
-    }
-    return { position, held, opposite, evaluation: evaluation.evaluation, now };
-  }
-
-  private buildEarlyAudit(
+private buildEarlyAudit(
     marketId: string,
     position: Position,
     decision: ReturnType<typeof decideRescueSecondLegOrder>,
@@ -5401,6 +5892,9 @@ export class EngineService {
   ): ProtectiveDeRiskAudit {
     const unhedgedStartedAt = position.unhedgedStartedAt ?? position.openedAt;
     const unhedgedDurationMs = Math.max(0, now.getTime() - Date.parse(unhedgedStartedAt));
+    // residualExposure is a DOLLAR value (market-price exposure), not shares.
+    const averageHeldCost = position.unpairedOutcome === "UP" ? position.averageUpCost : position.averageDownCost;
+    const residualExposureUsd = d(position.unpairedQuantity).mul(averageHeldCost).toFixed();
     return {
       deRiskReason: "EARLY_CATASTROPHIC_PAIR_LOCK",
       eligibilityReason: "EARLY_CATASTROPHIC_PAIR_LOCK",
@@ -5411,7 +5905,7 @@ export class EngineService {
       executableQty: accepted ? (decision.order?.quantity ?? "0") : "0",
       executionPrice: accepted ? (decision.bookVwap ?? null) : null,
       residualQuantity: accepted ? "0" : position.unpairedQuantity,
-      residualExposure: accepted ? "0" : (position.unpairedOutcome ? position.unpairedQuantity : "0"),
+      residualExposure: accepted ? "0" : (position.unpairedOutcome ? residualExposureUsd : "0"),
       retryCount: (this.protectiveDeRiskAttempts.get(marketId) ?? 0) + 1,
       finalState: accepted ? "ORDER_ADMITTED" : "RISK_VETO",
       selection: "RESCUE_SECOND_LEG",
@@ -5423,7 +5917,7 @@ export class EngineService {
       bQuantity: accepted ? (decision.order?.quantity ?? null) : null,
       bVwap: accepted ? decision.bookVwap : null,
       bFeeUsd: accepted ? decision.feeUsdTotal : null,
-      bRequiredCashUsd: null,
+      bRequiredCashUsd: accepted ? (decision.requiredCashUsd ?? null) : null,
       bGuaranteedSalvageUsd: accepted ? decision.guaranteedSalvageUsd : null,
     };
   }
@@ -5484,7 +5978,7 @@ export class EngineService {
       this.recordProtectiveDeRiskSuppressed(marketId, "GATE_IN_FLIGHT", "IN_FLIGHT");
       return;
     }
-    const initial = this.ledger.positions.get(marketId);
+    let initial = this.ledger.positions.get(marketId);
     if (!initial?.unpairedOutcome || d(initial.unpairedQuantity).lte(0)) {
       this.clearProtectiveDeRiskState(marketId);
       return;
@@ -5518,29 +6012,53 @@ export class EngineService {
     // fallback exclusively owns the position (B-only never steals the
     // fallback). Pre-deadline priority: normal profitable hedge -> early
     // catastrophic full pair-lock -> WAIT (deadline fallback later).
-    const initialNow = this.nowFn();
-    const initialStartedAt = initial.unhedgedStartedAt ?? initial.openedAt;
-    const initialDurationMs = Math.max(0, initialNow.getTime() - Date.parse(initialStartedAt));
-    const initialEligibility = this.protectiveDeRiskEligibility(marketId, initialStartedAt, initialNow.getTime());
-    if (
-      !initialEligibility.eligible
-      && await this.maybeEarlyCatastrophicPairLock(marketId)
-    ) return;
-
+    let initialNow = this.nowFn();
+    let initialStartedAt = initial.unhedgedStartedAt ?? initial.openedAt;
+    let initialDurationMs = Math.max(0, initialNow.getTime() - Date.parse(initialStartedAt));
+    let initialEligibility = this.protectiveDeRiskEligibility(marketId, initialStartedAt, initialNow.getTime());
     if (!initialEligibility.eligible) {
-      const initialMarketExpired = initialEligibility.marketEndMs != null && initialNow.getTime() >= initialEligibility.marketEndMs;
-      this.recordProtectiveDeRiskSuppressed(
-        marketId, "GATE_DURATION", initialMarketExpired ? "MARKET_EXPIRED" : "UNHEDGED_DURATION_NOT_EXCEEDED",
-        {
-          position: initial,
-          unhedgedDurationMs: Number.isFinite(initialDurationMs) ? initialDurationMs : null,
-          extra: {
-            effectiveProtectiveDeadlineMs: initialEligibility.effectiveDeadlineMs,
-            marketEndMs: initialEligibility.marketEndMs,
+      const earlyResult = await this.maybeEarlyCatastrophicPairLock(marketId);
+      if (earlyResult.acted) return;
+      // Re-read durable state AFTER the early phase: the deadline may have been
+      // crossed during an early await. Authority handoff must occur in the SAME
+      // pass (Section 4) — no extra snapshot/tick required.
+      const afterEarly = this.ledger.positions.get(marketId);
+      if (!afterEarly?.unpairedOutcome || d(afterEarly.unpairedQuantity).lte(0)) {
+        this.clearProtectiveDeRiskState(marketId);
+        return;
+      }
+      if (!experimentAllowsHedge(this.experiment)) {
+        this.recordProtectiveDeRiskSuppressed(marketId, "GATE_HEDGE_UNAVAILABLE", "HEDGE_UNAVAILABLE", { position: afterEarly });
+        return;
+      }
+      if (this.settledMarkets.has(marketId)) {
+        this.recordProtectiveDeRiskSuppressed(marketId, "GATE_SETTLED_MARKET", "SETTLED_MARKET", { position: afterEarly });
+        return;
+      }
+      initial = afterEarly;
+      initialNow = this.nowFn();
+      initialStartedAt = initial.unhedgedStartedAt ?? initial.openedAt;
+      initialDurationMs = Math.max(0, initialNow.getTime() - Date.parse(initialStartedAt));
+      initialEligibility = this.protectiveDeRiskEligibility(marketId, initialStartedAt, initialNow.getTime());
+      if (!initialEligibility.eligible) {
+        const initialMarketExpired = initialEligibility.marketEndMs != null && initialNow.getTime() >= initialEligibility.marketEndMs;
+        this.recordProtectiveDeRiskSuppressed(
+          marketId, "GATE_DURATION", initialMarketExpired ? "MARKET_EXPIRED" : "UNHEDGED_DURATION_NOT_EXCEEDED",
+          {
+            position: initial,
+            unhedgedDurationMs: Number.isFinite(initialDurationMs) ? initialDurationMs : null,
+            extra: {
+              effectiveProtectiveDeadlineMs: initialEligibility.effectiveDeadlineMs,
+              marketEndMs: initialEligibility.marketEndMs,
+            },
           },
-        },
-      );
-      return;
+        );
+        return;
+      }
+      // Deadline crossed during the early phase -> PR82 fallback owns the
+      // position in this same pass. Early backoff must never delay it.
+      this.earlyCatastrophicNextAttemptAt.delete(marketId);
+      this.earlyCatastrophicVetoFingerprint.delete(marketId);
     }
 
     this.riskReductionInFlight.add(marketId);
@@ -5622,7 +6140,7 @@ export class EngineService {
         oppositeSnapshot = null;
       }
       if (oppositeSnapshot) {
-        // Coherent comparison (§16): B must be priced from a FRESH opposite
+        // Coherent comparison (Â§16): B must be priced from a FRESH opposite
         // book from the SAME observation window. A stale/absent/timestamp-
         // disordered opposite ladder makes B unavailable (fail closed) instead
         // of comparing A@fresh against B@stale.
@@ -5798,7 +6316,7 @@ export class EngineService {
 
       // Evaluate A and B from the SAME rescue observation state (no compare
       // across different book timestamps). VWAP-derived guaranteed salvage is
-      // the only economic comparison input — the first-leg entry price is sunk.
+      // the only economic comparison input â€” the first-leg entry price is sunk.
       let aDecision: ReturnType<typeof decideProtectivePaperOrder> | null = null;
       let bDecision: ReturnType<typeof decideRescueSecondLegOrder> | null = null;
       let aDecisionReason: string | null = aReason;
@@ -5960,7 +6478,7 @@ export class EngineService {
 
   /**
    * Distinguishes which deadline bound made the position protective-eligible:
-   * the hard unhedged duration or the expiry safety window (§44). Pure
+   * the hard unhedged duration or the expiry safety window (Â§44). Pure
    * observability; the deadline math never changes.
    */
   private deRiskEligibilityReason(
@@ -5993,7 +6511,7 @@ export class EngineService {
    * journal degraded, overload integrity fault / FAIL_CLOSED, timestamp
    * disorder, shutdown, a feed gap (no live book), token desynchronization,
    * or stale/absent/future required market execution state must prevent a new
-   * protective economic mutation — rejected as a normal state change, never
+   * protective economic mutation â€” rejected as a normal state change, never
    * as an integrity fault.
    */
   private protectiveFillHardSafetyReason(fill: Parameters<PaperLedger["applyFill"]>[0]): string | null {
@@ -6150,6 +6668,8 @@ export class EngineService {
     this.protectiveDeRiskNextAttemptAt.delete(marketId);
     this.protectiveDeRiskVetoFingerprint.delete(marketId);
     this.protectiveDeRiskLastWaitingAt.delete(marketId);
+    this.earlyCatastrophicNextAttemptAt.delete(marketId);
+    this.earlyCatastrophicVetoFingerprint.delete(marketId);
     // Diagnostic suppression timestamps are keyed per (market, gate).
     for (const key of [...this.protectiveDeRiskLastSuppressEmitAt.keys()]) {
       if (key.startsWith(`${marketId}\u0000`)) this.protectiveDeRiskLastSuppressEmitAt.delete(key);
@@ -6226,7 +6746,7 @@ export class EngineService {
             ?? (lookup.slug ? await this.resolutionFetcher(lookup.slug) : null);
           if (!raw) continue;
           this.learningStore.labelMarket(marketId, raw, lookup.yesMapsTo, lookup.noMapsTo, now);
-          // CF settlement uses the same authoritative public resolution parse — never invents winners.
+          // CF settlement uses the same authoritative public resolution parse â€” never invents winners.
           const parsed = parsePublicBinaryResolution(raw, lookup.yesMapsTo, lookup.noMapsTo);
           if (parsed.status === "resolved" && parsed.upPayoff && parsed.downPayoff
             && this.counterfactualStore.isRecoveryReady()) {

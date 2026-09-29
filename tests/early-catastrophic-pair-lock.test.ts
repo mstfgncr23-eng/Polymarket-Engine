@@ -429,11 +429,22 @@ it("Test G: latency deterioration -> final-fence rejects the actual fill", async
       await setup.market.emitSnapshot(book(setup.clock, "DOWN", 2, [], [{ price: "0.10", quantity: "4" }, { price: "0.30", quantity: "1000" }], ERROR_SCHEDULE));
       await waitFor(() => earlyEvals(setup), (rows) => rows.length > 0);
 
+      // Hold the EARLY submission at its PAPER_ORDER_CREATED persistence so the
+      // final synchronous fence has already passed on the GOOD ladder and the
+      // admission/order are durable, then reshape the book during the paper
+      // execution latency -> the applyFill FINAL-FENCE loss-cap MUST reject.
+      let releaseHold!: () => void;
+      const hold = new Promise<void>((resolve) => { releaseHold = resolve; });
+      setup.journal.setAppendInFlightHoldForTest(hold, ["PAPER_ORDER_CREATED"]);
+      await waitFor(() => setup.journal.inFlightAppends, (value) => value > 0);
+
       // During paper latency the opposite book reshapes toward the worst level:
       // full fill at VWAP 0.30 -> locked pnl = 6.25 - 5.625 - 1.875 = -2.50 <
       // -0.60 -> the FINAL-FENCE loss-cap revalidation MUST reject the mutation.
       setup.clock.nowMs = START_MS + 20_400;
       await setup.market.emitSnapshot(book(setup.clock, "DOWN", 3, [], [{ price: "0.30", quantity: "1000" }], ERROR_SCHEDULE));
+      releaseHold();
+      setup.journal.setAppendInFlightHoldForTest(null);
       await waitFor(
         () => suppressed(setup),
         (rows) => rows.some((row) => row.payload.gate === "FINAL_FENCE" && row.payload.reason === "EARLY_CATASTROPHIC_LOSS_CAP_EXCEEDED"),
@@ -442,8 +453,9 @@ it("Test G: latency deterioration -> final-fence rejects the actual fill", async
       const durableFills = await setup.journal.queryDurableTransitions({ types: ["PAPER_FILL"], limit: 16 });
       expect(durableFills.filter((row) => row.operationKey.startsWith("fill:")).map((row) => row.operationKey)).toHaveLength(1);
       expect(setup.engine.ledger.positions.get("btc-mkt")?.unpairedQuantity).toBe("6.25");
-      // State remains retryable: a fresh GOOD snapshot can still fire later.
-      setup.clock.nowMs = START_MS + 21_000;
+      // State remains retryable: a fresh GOOD snapshot can still fire later
+      // (after the accepted-attempt retry cooldown lapses).
+      setup.clock.nowMs = START_MS + 26_000;
       await setup.market.emitSnapshot(book(setup.clock, "UP", 4, [{ price: "0.80", quantity: "1000" }], [{ price: "0.92", quantity: "1000" }], ERROR_SCHEDULE));
       await setup.market.emitSnapshot(book(setup.clock, "DOWN", 4, [], [{ price: "0.10", quantity: "4" }, { price: "0.30", quantity: "1000" }], ERROR_SCHEDULE));
       const retries = await waitFor(() => fills(setup, "RESCUE_SECOND_LEG"), (rows) => rows.length > 0);
@@ -626,14 +638,16 @@ it("BLOCKER3-race: hedge becomes admissible AFTER early flight acquisition -> ea
         feeSchedule: ERROR_SCHEDULE,
       });
       clock.nowMs = START_MS + 20_000;
-      // Seed a resting hedge maker + a DOWN book where the hedge is NOT
-      // admissible (ask 0.19 -> pair edge 0.01 < minExpectedEdge).
+      // Seed a resting hedge maker on the STALE (held-side) token so it is
+      // obsolete vs the current opposite token and EARLY fences it (Fix 3:
+      // a VALID maker would cause EARLY to yield instead).
+      const upBookForSeed = book(clock, "UP", 2, [{ price: "0.14", quantity: "10" }], [], ERROR_SCHEDULE);
       const downBook = book(clock, "DOWN", 2, [{ price: "0.14", quantity: "10" }], [{ price: "0.19", quantity: "10000" }], ERROR_SCHEDULE);
       await market.emitSnapshot(downBook);
       await engine.restMakerForTest(order("MAKER", {
-        id: "seed-hedge", marketId: "btc-mkt", tokenId: "btc-down", outcome: "DOWN", side: "BUY",
+        id: "seed-hedge", marketId: "btc-mkt", tokenId: "btc-up", outcome: "UP", side: "BUY",
         requestedPrice: "0.14", quantity: "1", createdAt: iso(clock),
-      }), downBook, "HEDGE_SECOND_LEG");
+      }), upBookForSeed, "HEDGE_SECOND_LEG");
 
       let releaseHold!: () => void;
       const hold = new Promise<void>((resolve) => { releaseHold = resolve; });
