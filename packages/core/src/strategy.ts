@@ -1,4 +1,5 @@
-import { d, decimal } from "./calculations.js";
+import { calculateFee, d, decimal, walkBook } from "./calculations.js";
+import { conservativeRealizableMark } from "./settlement.js";
 import type { ConsensusDecision, MarketSnapshot, Outcome, Position } from "./domain.js";
 
 /**
@@ -292,4 +293,194 @@ export class TemporalPairHedgeStrategy implements Strategy {
       reasonCodes: ["CONSENSUS_DIRECTION", "TEMPORAL_FIRST_LEG", "FIRST_LEG_RISK_CAPPED"],
     };
   }
+}
+
+// ---------------------------------------------------------------------------
+// PR3: early catastrophic pair-lock (pure decision layer)
+// ---------------------------------------------------------------------------
+
+/** Why the early catastrophic pair-lock is not eligible right now. */
+export type EarlyCatastrophicRejectionReason =
+  | "NO_UNPAIRED_RESIDUAL"
+  | "UNHEDGED_AGE_NOT_REACHED"
+  | "MARK_UNAVAILABLE"
+  | "MARK_LOSS_NOT_REACHED"
+  | "OPPOSITE_ASK_UNAVAILABLE"
+  | "HEDGE_AVAILABLE_PRIORITY"
+  | "PARTIAL_OPPOSITE_DEPTH"
+  | "LOCKED_LOSS_EXCEEDS_CAP";
+
+export interface EarlyCatastrophicPairLockEvaluation {
+  eligible: boolean;
+  reason: EarlyCatastrophicRejectionReason | null;
+  candidate: StrategyCandidate | null;
+  markLossUsd: string | null;
+  guaranteedLockedPnl: string | null;
+  rescueNotionalUsd: string | null;
+  rescueVwap: string | null;
+  rescueFeeUsd: string | null;
+  hedgeAvailable: boolean;
+}
+
+/**
+ * Conservative realizable mark loss on the CURRENT unpaired inventory: the held
+ * average cost minus the conservative long-inventory realizable mark (best bid)
+ * times the unpaired quantity, floored at zero. Null when the mark is
+ * unavailable (callers fail closed — never treat a missing mark as a loss).
+ */
+export function computeRealizableMarkLossUsd(
+  position: Position,
+  heldSnapshot: MarketSnapshot | null,
+): string | null {
+  if (!position.unpairedOutcome || d(position.unpairedQuantity).lte(0)) return null;
+  const heldAverageCost = position.unpairedOutcome === "UP" ? position.averageUpCost : position.averageDownCost;
+  const heldRealizableMark = conservativeRealizableMark(heldSnapshot);
+  if (heldRealizableMark === null) return null;
+  const deterioration = d(heldAverageCost).minus(heldRealizableMark);
+  const markLoss = d(position.unpairedQuantity).mul(deterioration.gt(0) ? deterioration : d(0));
+  return decimal(markLoss);
+}
+
+/**
+ * Fee-inclusive guaranteed terminal PnL of a FULL opposite pair-lock: after
+ * buying the entire missing residual, every share is paired and each paired
+ * share guarantees a $1 payout, so the terminal settlement value equals the
+ * final equal paired quantity. VWAP/notional already carries execution-price
+ * economics; slippage is telemetry and is NOT subtracted again.
+ */
+export function computeGuaranteedLockedPnl(input: {
+  position: Position;
+  rescueQuantity: string;
+  rescueVwap: string;
+  rescueTakerFeeUsd: string;
+}): string {
+  const up = d(input.position.upQuantity);
+  const down = d(input.position.downQuantity);
+  const finalPaired = up.gte(down) ? up : down;
+  const inventoryCost = up.mul(input.position.averageUpCost).plus(down.mul(input.position.averageDownCost));
+  const rescueNotional = d(input.rescueQuantity).mul(input.rescueVwap);
+  const totalFees = d(input.position.totalFees).plus(input.rescueTakerFeeUsd);
+  return decimal(finalPaired.minus(inventoryCost).minus(rescueNotional).minus(totalFees));
+}
+
+/**
+ * The normal profitable HEDGE_SECOND_LEG candidate for the current unpaired
+ * position, using THE SAME economic definition as the running strategy
+ * (TemporalPairHedgeStrategy.evaluate unbounded pair-lock): the first-leg
+ * average cost plus the opposite ask must lock at least minimumLockedPairEdge.
+ * The consensus is unused by the hedge branch of the strategy.
+ */
+export function evaluateNormalHedgeCandidate(input: {
+  position: Position | null;
+  snapshots: Record<Outcome, MarketSnapshot | null>;
+  maxOrderSizeUsd: number;
+  minimumLockedPairEdge: number;
+}): StrategyCandidate | null {
+  if (!input.position?.unpairedOutcome || d(input.position.unpairedQuantity).lte(0)) return null;
+  const candidate = new TemporalPairHedgeStrategy().evaluate({
+    consensus: HEDGE_AVAILABILITY_CONSENSUS,
+    snapshots: input.snapshots,
+    position: input.position,
+    maxOrderSizeUsd: input.maxOrderSizeUsd,
+    minimumLockedPairEdge: input.minimumLockedPairEdge,
+  });
+  return candidate?.intent === "HEDGE_SECOND_LEG" ? candidate : null;
+}
+
+const HEDGE_AVAILABILITY_CONSENSUS: ConsensusDecision = {
+  id: "early-catastrophic-hedge-availability",
+  traceId: "early-catastrophic-hedge-availability",
+  triggerId: "early-catastrophic-hedge-availability",
+  consensusDirection: "UP",
+  consensusConfidence: 1,
+  agentAgreement: 1,
+  signalFreshness: 1,
+  conflicts: [],
+  estimatedEdge: 0,
+  evidenceIds: ["early-catastrophic-hedge-availability"],
+  calculatedAt: new Date(0).toISOString(),
+};
+
+/**
+ * Early catastrophic pair-lock eligibility (PR3).
+ *
+ * Eligible only when ALL of the following hold for a real unpaired position:
+ *  - minimum unhedged age elapsed (catastrophicPairLockMinUnhedgedMs);
+ *  - conservative realizable mark loss on the held leg >= trigger loss;
+ *  - the canonical normal-hedge decision for the FRESH synchronized books is NOT
+ *    admissible (HEDGE priority) — the engine computes `hedgeAdmissible` via the
+ *    same decidePaperOrder/evaluateRisk semantics as the running normal hedge;
+ *  - the OPPOSITE book can fill the ENTIRE residual (full depth, max order size,
+ *    known fee schedule / min order size) — a partial object is NEVER accepted;
+ *  - the fee-inclusive guaranteed terminal PnL of the full pair-lock is no
+ *    worse than the max locked loss (bounded), comparing with Decimal math.
+ */
+export function evaluateEarlyCatastrophicPairLock(input: {
+  position: Position | null;
+  heldSnapshot: MarketSnapshot | null;
+  oppositeSnapshot: MarketSnapshot | null;
+  nowMs: number;
+  maxOrderSizeUsd: number;
+  minUnhedgedMs: number;
+  triggerLossUsd: number;
+  maxLockedLossUsd: number;
+  /** Canonical normal-hedge admissibility from FRESH synchronized books. */
+  hedgeAdmissible: boolean;
+}): EarlyCatastrophicPairLockEvaluation {
+  const empty = (): EarlyCatastrophicPairLockEvaluation => ({
+    eligible: false, reason: null, candidate: null, markLossUsd: null, guaranteedLockedPnl: null,
+    rescueNotionalUsd: null, rescueVwap: null, rescueFeeUsd: null, hedgeAvailable: false,
+  });
+  const { position } = input;
+  if (!position?.unpairedOutcome || d(position.unpairedQuantity).lte(0)) {
+    return { ...empty(), reason: "NO_UNPAIRED_RESIDUAL" };
+  }
+  const startedAt = position.unhedgedStartedAt ?? position.openedAt;
+  const startedMs = Date.parse(startedAt);
+  const unhedgedAgeMs = Number.isFinite(startedMs) ? Math.max(0, input.nowMs - startedMs) : Number.POSITIVE_INFINITY;
+  if (!Number.isFinite(unhedgedAgeMs) || unhedgedAgeMs < input.minUnhedgedMs) {
+    return { ...empty(), reason: "UNHEDGED_AGE_NOT_REACHED" };
+  }
+  const markLossUsd = computeRealizableMarkLossUsd(position, input.heldSnapshot);
+  if (markLossUsd === null) return { ...empty(), reason: "MARK_UNAVAILABLE" };
+  if (d(markLossUsd).lt(input.triggerLossUsd)) {
+    return { ...empty(), markLossUsd, reason: "MARK_LOSS_NOT_REACHED" };
+  }
+  const hedgeAvailable = input.hedgeAdmissible;
+  if (hedgeAvailable) {
+    return { ...empty(), markLossUsd, hedgeAvailable, reason: "HEDGE_AVAILABLE_PRIORITY" };
+  }
+  const opposite = input.oppositeSnapshot;
+  if (!opposite) return { ...empty(), markLossUsd, hedgeAvailable, reason: "OPPOSITE_ASK_UNAVAILABLE" };
+  const candidateEvaluation = evaluateRescueSecondLegCandidate({ position, snapshot: opposite, maxOrderSizeUsd: input.maxOrderSizeUsd });
+  const candidate = candidateEvaluation.candidate;
+  if (!candidate) return { ...empty(), markLossUsd, hedgeAvailable, reason: "OPPOSITE_ASK_UNAVAILABLE" };
+  if (!d(candidate.quantity).eq(d(position.unpairedQuantity))) {
+    return { ...empty(), markLossUsd, hedgeAvailable, candidate, reason: "PARTIAL_OPPOSITE_DEPTH" };
+  }
+  if (!opposite.feeSchedule || !opposite.minOrderSize) {
+    return { ...empty(), markLossUsd, hedgeAvailable, candidate, reason: "OPPOSITE_ASK_UNAVAILABLE" };
+  }
+  const walk = walkBook(opposite.asks, candidate.quantity, candidate.limitPrice, "BUY");
+  if (!walk.sufficientDepth || !d(walk.filledQuantity).eq(candidate.quantity)) {
+    return { ...empty(), markLossUsd, hedgeAvailable, candidate, reason: "PARTIAL_OPPOSITE_DEPTH" };
+  }
+  const rescueFeeUsd = calculateFee(candidate.quantity, walk.vwap, "TAKER", opposite.feeSchedule);
+  const guaranteedLockedPnl = computeGuaranteedLockedPnl({
+    position,
+    rescueQuantity: candidate.quantity,
+    rescueVwap: walk.vwap,
+    rescueTakerFeeUsd: rescueFeeUsd,
+  });
+  if (d(guaranteedLockedPnl).lt(d(-input.maxLockedLossUsd))) {
+    return {
+      ...empty(), markLossUsd, hedgeAvailable, candidate, guaranteedLockedPnl,
+      rescueNotionalUsd: walk.notional, rescueVwap: walk.vwap, rescueFeeUsd,
+      reason: "LOCKED_LOSS_EXCEEDS_CAP",
+    };
+  }
+  return {
+    eligible: true, reason: null, candidate, markLossUsd, guaranteedLockedPnl,
+    rescueNotionalUsd: walk.notional, rescueVwap: walk.vwap, rescueFeeUsd, hedgeAvailable,
+  };
 }
