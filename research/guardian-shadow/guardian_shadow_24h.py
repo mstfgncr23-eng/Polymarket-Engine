@@ -419,6 +419,11 @@ class GuardianShadow:
             self.tokens_changed.clear()
             self.ws_generation += 1
             generation = self.ws_generation
+            # A reconnect begins a new trust epoch. Incrementals are ignored
+            # until each token receives a fresh full book in this generation.
+            for token in tokens:
+                if token in self.books:
+                    self.books[token].trusted = False
             try:
                 async with self.session.ws_connect(CLOB_WS, autoping=True, heartbeat=20) as ws:
                     await ws.send_json({
