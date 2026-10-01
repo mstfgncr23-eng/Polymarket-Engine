@@ -20,6 +20,7 @@ import aiohttp
 getcontext().prec = 40
 TRIGGER_LOSS = Decimal("0.35")
 PAIR_LOCK_CAP = Decimal("0.60")
+NORMAL_MIN_LOCKED_EDGE = Decimal("0.015")
 MAX_ORDER_SIZE_USD = Decimal("25")
 STALE_BOOK_SECONDS = 15.0
 LATENCY_MS = (25, 50, 100, 150, 250, 500)
@@ -262,6 +263,7 @@ class GuardianShadow:
             "clob_ws": CLOB_WS,
             "trigger_loss_usd": str(TRIGGER_LOSS),
             "pair_lock_cap_usd": str(PAIR_LOCK_CAP),
+            "normal_min_locked_edge": str(NORMAL_MIN_LOCKED_EDGE),
             "max_order_size_usd": str(MAX_ORDER_SIZE_USD),
             "latency_ms": list(LATENCY_MS),
             "stale_book_seconds": STALE_BOOK_SECONDS,
@@ -621,6 +623,26 @@ class GuardianShadow:
                     failure_reason = "RESCUE_EXECUTION_ERROR"
             except ValueError:
                 pass
+        # Stage 0: preserve profitable NORMAL_HEDGE priority exactly at the
+        # economic strategy boundary. The running engine remains authoritative;
+        # if the current opposite best ask locks at least minExpectedEdge, the
+        # shadow helper must not preempt it.
+        held_outcome = str(position["unpairedOutcome"])
+        opp_outcome = "DOWN" if held_outcome == "UP" else "UP"
+        opp_token = self.market_tokens.get(market, {}).get(opp_outcome)
+        opp_book = self.fresh_book(opp_token)
+        if opp_book and opp_book.asks:
+            best_ask = min(D(p) for p, q in opp_book.asks.items() if D(q) > 0)
+            first_avg = D(position["averageUpCost"] if held_outcome == "UP" else position["averageDownCost"])
+            locked_edge = Decimal(1) - first_avg - best_ask
+            if locked_edge >= NORMAL_MIN_LOCKED_EDGE:
+                self.record_status(
+                    key, "NORMAL_HEDGE_PRIORITY", market,
+                    {**econ, "normal_locked_edge": dec(locked_edge)},
+                    trigger_source,
+                )
+                return
+
         lock_info = econ.get("lock")
         if failure_reason is None:
             if lock_info is not None and D(lock_info["guaranteed_locked_pnl"]) >= -PAIR_LOCK_CAP:
