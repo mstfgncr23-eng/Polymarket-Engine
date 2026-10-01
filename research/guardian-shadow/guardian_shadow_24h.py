@@ -751,6 +751,61 @@ class GuardianShadow:
                 }
         return result
 
+    def rescue_error_for_episode(self, market: str, position: dict[str, Any]) -> bool:
+        error_at = self.rescue_error_at.get(market)
+        episode_started = position.get("unhedgedStartedAt") or position.get("openedAt")
+        if not error_at or not episode_started:
+            return False
+        try:
+            error_dt = datetime.fromisoformat(error_at.replace("Z", "+00:00"))
+            start_dt = datetime.fromisoformat(str(episode_started).replace("Z", "+00:00"))
+            return error_dt >= start_dt
+        except ValueError:
+            self.note_incomplete(
+                "INVALID_EPISODE_TIMESTAMP",
+                {"market_id": market, "error_at": error_at, "episode_started": episode_started},
+            )
+            return False
+
+    async def revalidate_authority(
+        self,
+        market: str,
+        expected_episode_key: str,
+        trigger_source: str,
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        try:
+            state = await self.get_json("/api/shadow/guardian-state")
+            await self.apply_guardian_state(state, "decision_revalidation", evaluate=False)
+        except Exception as exc:
+            self.note_incomplete(
+                "AUTHORITY_REVALIDATION_ERROR",
+                {"market_id": market, "trigger_source": trigger_source, "error": repr(exc)},
+            )
+            self.observations.write({
+                "at": utc_now(), "type": "AUTHORITY_REVALIDATION_ERROR",
+                "market_id": market, "trigger_source": trigger_source, "error": repr(exc),
+            })
+            return None
+
+        position = self.positions.get(market)
+        authority = self.authority.get(market)
+        if position is None or authority is None:
+            self.observations.write({
+                "at": utc_now(), "type": "AUTHORITY_POSITION_CHANGED",
+                "market_id": market, "expected_episode_key": expected_episode_key,
+                "observed_episode_key": None,
+            })
+            return None
+        current_key = episode_key(position)
+        if current_key != expected_episode_key:
+            self.observations.write({
+                "at": utc_now(), "type": "AUTHORITY_POSITION_CHANGED",
+                "market_id": market, "expected_episode_key": expected_episode_key,
+                "observed_episode_key": current_key,
+            })
+            return None
+        return position, authority
+
     async def evaluate_market(self, market: str, trigger_source: str) -> None:
         position = self.positions.get(market)
         if not position:
@@ -758,57 +813,82 @@ class GuardianShadow:
         key = episode_key(position)
         if key in self.shadow_closed:
             return
+
+        # Cheap direct-market screen. No counterfactual action is committed from
+        # this state alone; any candidate helper action is revalidated against
+        # canonical engine authority immediately before the final synchronous
+        # direct-book fence below.
         econ = self.economics(position)
         mark = econ.get("mark_loss_usd")
         if mark is None or D(mark) < TRIGGER_LOSS:
             self.record_status(key, "BELOW_TRIGGER", market, econ, trigger_source)
             return
 
-        failure_reason = None
-        error_at = self.rescue_error_at.get(market)
-        episode_started = position.get("unhedgedStartedAt") or position.get("openedAt")
-        if error_at and episode_started:
-            try:
-                error_dt = datetime.fromisoformat(error_at.replace("Z", "+00:00"))
-                start_dt = datetime.fromisoformat(str(episode_started).replace("Z", "+00:00"))
-                if error_dt >= start_dt:
-                    failure_reason = "RESCUE_EXECUTION_ERROR"
-            except ValueError:
-                pass
-        # Stage 0: preserve profitable NORMAL_HEDGE priority exactly at the
-        # economic strategy boundary. The running engine remains authoritative;
-        # if the current opposite best ask locks at least minExpectedEdge, the
-        # shadow helper must not preempt it.
-        held_outcome = str(position["unpairedOutcome"])
-        opp_outcome = "DOWN" if held_outcome == "UP" else "UP"
-        opp_token = self.market_tokens.get(market, {}).get(opp_outcome)
-        opp_book = self.fresh_book(opp_token)
-        if opp_book and opp_book.asks:
-            best_ask = min(D(p) for p, q in opp_book.asks.items() if D(q) > 0)
-            first_avg = D(position["averageUpCost"] if held_outcome == "UP" else position["averageDownCost"])
-            locked_edge = Decimal(1) - first_avg - best_ask
-            if locked_edge >= NORMAL_MIN_LOCKED_EDGE:
-                self.record_status(
-                    key, "NORMAL_HEDGE_PRIORITY", market,
-                    {**econ, "normal_locked_edge": dec(locked_edge)},
-                    trigger_source,
-                )
-                return
-
+        exec_failed = self.rescue_error_for_episode(market, position)
         lock_info = econ.get("lock")
-        if failure_reason is None:
-            if lock_info is not None and D(lock_info["guaranteed_locked_pnl"]) >= -PAIR_LOCK_CAP:
-                self.record_status(key, "PR3_AFFORDABLE", market, econ, trigger_source)
-                return
-            failure_reason = "PR3_CAP_OR_DEPTH_FAIL"
+        if not exec_failed and lock_info is not None and D(lock_info["guaranteed_locked_pnl"]) >= -PAIR_LOCK_CAP:
+            self.record_status(key, "PR3_AFFORDABLE", market, econ, trigger_source)
+            return
 
-        sell_info = econ.get("sell")
+        initial_failure = "RESCUE_EXECUTION_ERROR" if exec_failed else "PR3_CAP_OR_DEPTH_FAIL"
+        if econ.get("sell") is None:
+            self.record_status(key, "HELPER_NOT_EXECUTABLE", market, econ, trigger_source, initial_failure)
+            return
+
+        # Atomic authority fence: before a shadow SELL can exist, re-read the
+        # current durable/in-memory engine authority for the SAME unpaired
+        # episode. This is the canonical Stage-0 ownership check, not an
+        # approximation from the public book.
+        revalidated = await self.revalidate_authority(market, key, trigger_source)
+        if revalidated is None:
+            return
+        current_position, authority = revalidated
+
+        if authority.get("normalHedgeAdmissible") is True:
+            self.record_status(
+                key, "NORMAL_HEDGE_PRIORITY", market, self.economics(current_position),
+                trigger_source, "CANONICAL_NORMAL_HEDGE_ADMISSIBLE",
+            )
+            return
+        if authority.get("hedgeMakerOwnsResidual") is True:
+            self.record_status(
+                key, "HEDGE_MAKER_PRIORITY", market, self.economics(current_position),
+                trigger_source, "HEDGE_MAKER_OWNS_RESIDUAL",
+            )
+            return
+
+        current_exec_failed = self.rescue_error_for_episode(market, current_position)
+        if authority.get("riskReductionInFlight") is True and not current_exec_failed:
+            self.record_status(
+                key, "RISK_REDUCTION_IN_FLIGHT", market, self.economics(current_position),
+                trigger_source, "RISK_REDUCTION_IN_FLIGHT",
+            )
+            return
+
+        # Final synchronous economic fence. There is no await from this point
+        # through action persistence, so the public book used for mark/lock/SELL
+        # is one event-loop state.
+        current_econ = self.economics(current_position)
+        current_mark = current_econ.get("mark_loss_usd")
+        if current_mark is None or D(current_mark) < TRIGGER_LOSS:
+            self.record_status(key, "BELOW_TRIGGER_AFTER_REVALIDATION", market, current_econ, trigger_source)
+            return
+
+        current_lock = current_econ.get("lock")
+        if not current_exec_failed and current_lock is not None and D(current_lock["guaranteed_locked_pnl"]) >= -PAIR_LOCK_CAP:
+            self.record_status(key, "PR3_AFFORDABLE_AFTER_REVALIDATION", market, current_econ, trigger_source)
+            return
+
+        failure_reason = "RESCUE_EXECUTION_ERROR" if current_exec_failed else "PR3_CAP_OR_DEPTH_FAIL"
+        sell_info = current_econ.get("sell")
         if sell_info is None:
-            self.record_status(key, "HELPER_NOT_EXECUTABLE", market, econ, trigger_source, failure_reason)
+            self.record_status(key, "HELPER_NOT_EXECUTABLE_AFTER_REVALIDATION", market, current_econ, trigger_source, failure_reason)
             return
 
         decision_ns = time.monotonic_ns()
         action_id = "gsh_" + hashlib.sha256(f"{key}|{decision_ns}".encode()).hexdigest()[:20]
+        held_token = current_econ.get("held_token")
+        opposite_token = current_econ.get("opposite_token")
         action = {
             "action_id": action_id,
             "decision_at": utc_now(),
@@ -819,10 +899,28 @@ class GuardianShadow:
             "trigger_source": trigger_source,
             "failure_reason": failure_reason,
             "policy": "TWO_STAGE_GUARDIAN_V1_LOCKED",
-            "position": position,
-            "economics": econ,
+            "position": current_position,
+            "canonical_authority": authority,
+            "economics": current_econ,
+            "held_meta": self.token_meta.get(str(held_token or "")),
+            "opposite_meta": self.token_meta.get(str(opposite_token or "")),
+            "held_book": self.book_evidence(self.books.get(str(held_token or ""))),
+            "opposite_book": self.book_evidence(self.books.get(str(opposite_token or ""))),
         }
+
+        # Keep raw direct-CLOB evidence through the latest latency target even
+        # if the real PAPER engine neutralizes the position immediately after
+        # this shadow decision.
+        self.latency_watch_until_ns[market] = max(
+            self.latency_watch_until_ns.get(market, 0),
+            decision_ns + (max(LATENCY_MS) + 25) * 1_000_000,
+        )
+        self.write_book_checkpoint(market, "HELPER_DECISION")
         self.actions.write(action)
+        self.actions.sync()
+        self.book_checkpoints.sync()
+        self.raw_clob.sync()
+
         self.shadow_closed.add(key)
         self.helper_actions += 1
         pnl = D(sell_info["guaranteed_terminal_pnl"])
@@ -836,8 +934,11 @@ class GuardianShadow:
             "pnl": str(pnl),
             "failure_reason": failure_reason,
         })
+
         for ms in LATENCY_MS:
-            asyncio.create_task(self.capture_latency(action, ms))
+            task = asyncio.create_task(self.capture_latency(action, ms))
+            self.latency_tasks.add(task)
+            task.add_done_callback(self.latency_tasks.discard)
 
     def record_status(
         self,
