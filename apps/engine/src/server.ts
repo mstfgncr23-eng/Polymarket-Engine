@@ -335,6 +335,52 @@ export async function createApiServer(input: {
     reply.header("Content-Disposition", `attachment; filename="native-v2-shadow-${experiment}.json"`);
     return reply.type("application/json; charset=utf-8").send(JSON.stringify(payload));
   });
+  // Read-only observation surface for the external two-stage Guardian shadow soak.
+  // This endpoint never mutates engine state, never submits orders, and exposes
+  // only already-trusted in-memory books plus the current paper position state.
+  app.get("/api/shadow/guardian-state", async (request, reply) => {
+    const denied = await requireRead(request, reply);
+    if (denied) return denied;
+    const dashboard = input.state.snapshot();
+    const marketSnapshots = [...input.state.marketSnapshots.values()];
+    const unpaired = dashboard.positions.filter((position) =>
+      position.unpairedOutcome !== null && Number(position.unpairedQuantity) > 0
+    );
+    reply.header("Cache-Control", "no-store");
+    return {
+      paperMode: true as const,
+      generatedAt: new Date().toISOString(),
+      experimentId: dashboard.engine.experimentId,
+      experimentStatus: dashboard.engine.experimentStatus,
+      positions: unpaired.map((position) => {
+        const heldOutcome = position.unpairedOutcome!;
+        const oppositeOutcome = heldOutcome === "UP" ? "DOWN" : "UP";
+        const heldSnapshot = marketSnapshots.find((snapshot) =>
+          snapshot.marketId === position.marketId && snapshot.outcome === heldOutcome
+        ) ?? null;
+        const oppositeSnapshot = marketSnapshots.find((snapshot) =>
+          snapshot.marketId === position.marketId && snapshot.outcome === oppositeOutcome
+        ) ?? null;
+        return {
+          position,
+          heldSnapshot: heldSnapshot ? structuredClone(heldSnapshot) : null,
+          oppositeSnapshot: oppositeSnapshot ? structuredClone(oppositeSnapshot) : null,
+        };
+      }),
+      tokenMap: marketSnapshots.map((snapshot) => ({
+        marketId: snapshot.marketId,
+        tokenId: snapshot.tokenId,
+        outcome: snapshot.outcome,
+        asset: snapshot.asset ?? null,
+        minOrderSize: snapshot.minOrderSize,
+        tickSize: snapshot.tickSize,
+        feeSchedule: snapshot.feeSchedule ? structuredClone(snapshot.feeSchedule) : null,
+        sourceTimestamp: snapshot.sourceTimestamp,
+        receivedAt: snapshot.receivedAt,
+      })),
+    };
+  });
+
   app.get("/api/history/equity", async (request, reply) => {
     const denied = await requireRead(request, reply);
     if (denied) return denied;
