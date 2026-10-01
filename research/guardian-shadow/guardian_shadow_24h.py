@@ -164,8 +164,10 @@ def walk(book: Book, qty: Decimal, side: str, max_notional: Decimal = MAX_ORDER_
     levels_used = 0
     for price, available in book.levels(side):
         remaining_notional = max_notional - notional
-        if remaining_notional <= 0 or price <= 0:
+        if remaining_notional <= 0:
             break
+        if price <= 0:
+            continue
         take = min(remaining, available, remaining_notional / price)
         if take <= 0:
             continue
