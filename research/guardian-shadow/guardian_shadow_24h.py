@@ -1115,79 +1115,204 @@ class GuardianShadow:
             print(compact_json(summary), flush=True)
             await asyncio.sleep(30)
 
+    def operator_stop(self, reason: str) -> None:
+        if self.stop.is_set():
+            return
+        self.stop_reason = reason
+        self.note_incomplete("OPERATOR_STOP", {"reason": reason})
+        self.stop.set()
+
     async def stop_condition_loop(self) -> None:
         no_start_deadline = time.monotonic() + 600
         while not self.stop.is_set():
-            now = time.monotonic()
-            if self.experiment_started_mono is None:
-                if now > no_start_deadline:
-                    raise RuntimeError("EXPERIMENT_DID_NOT_START_WITHIN_10_MINUTES")
-            else:
-                elapsed = now - self.experiment_started_mono
-                duration = self.args.duration_hours * 3600
-                if self.experiment_status == "COMPLETED" and elapsed >= duration * 0.95:
+            if self.bound_experiment_id is None:
+                if time.monotonic() > no_start_deadline:
+                    self.stop_reason = "EXPERIMENT_DID_NOT_START"
+                    self.note_incomplete("EXPERIMENT_DID_NOT_START_WITHIN_10_MINUTES")
                     self.stop.set()
                     return
-                if elapsed >= duration and self.experiment_status in ("ENTRY_CLOSED", "COMPLETED"):
-                    if self.experiment_status == "COMPLETED":
+                await asyncio.sleep(1)
+                continue
+
+            if self.experiment_id != self.bound_experiment_id:
+                self.stop_reason = "EXPERIMENT_ID_CHANGED"
+                self.note_incomplete(
+                    "EXPERIMENT_ID_CHANGED",
+                    {"bound": self.bound_experiment_id, "observed": self.experiment_id},
+                )
+                self.stop.set()
+                return
+
+            if self.experiment_status == "COMPLETED":
+                self.stop_reason = "EXPERIMENT_COMPLETED"
+                self.stop.set()
+                return
+            if self.experiment_status in ("FAILED", "ABORTED_START"):
+                self.stop_reason = f"EXPERIMENT_{self.experiment_status}"
+                self.note_incomplete(
+                    "EXPERIMENT_TERMINAL_FAILURE",
+                    {"experiment_id": self.experiment_id, "status": self.experiment_status},
+                )
+                self.stop.set()
+                return
+
+            if self.entry_closes_at:
+                try:
+                    closes = datetime.fromisoformat(str(self.entry_closes_at).replace("Z", "+00:00"))
+                    deadline = closes.timestamp() + self.args.settlement_grace_minutes * 60
+                    if time.time() > deadline and self.experiment_status != "COMPLETED":
+                        self.stop_reason = "EXPERIMENT_NOT_COMPLETED_WITHIN_GRACE"
+                        self.note_incomplete(
+                            "EXPERIMENT_NOT_COMPLETED_WITHIN_GRACE",
+                            {
+                                "experiment_id": self.experiment_id,
+                                "status": self.experiment_status,
+                                "entry_closes_at": self.entry_closes_at,
+                                "grace_minutes": self.args.settlement_grace_minutes,
+                            },
+                        )
                         self.stop.set()
                         return
-                    if self.entry_closed_mono is None:
-                        self.entry_closed_mono = now
-                    if now - self.entry_closed_mono >= self.args.settlement_grace_minutes * 60:
-                        self.stop.set()
-                        return
-            await asyncio.sleep(5)
+                except ValueError:
+                    self.stop_reason = "EXPERIMENT_TIMESTAMP_INVALID"
+                    self.note_incomplete(
+                        "EXPERIMENT_TIMESTAMP_INVALID",
+                        {"entry_closes_at": self.entry_closes_at},
+                    )
+                    self.stop.set()
+                    return
+            await asyncio.sleep(1)
 
     async def finish(self) -> None:
+        # The 500ms probe plus the contract's +25ms observation window must be
+        # allowed to settle before any completion decision is sealed.
+        pending = list(self.latency_tasks)
+        if pending:
+            try:
+                await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), timeout=2.0)
+            except asyncio.TimeoutError:
+                self.note_incomplete(
+                    "LATENCY_TASK_TIMEOUT",
+                    {"pending": sum(1 for task in pending if not task.done())},
+                )
+                for task in pending:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+
+        expected_latency = self.helper_actions * len(LATENCY_MS)
+        if self.latency_samples_written != expected_latency:
+            self.note_incomplete(
+                "LATENCY_SAMPLE_COUNT_MISMATCH",
+                {
+                    "helper_actions": self.helper_actions,
+                    "expected": expected_latency,
+                    "observed": self.latency_samples_written,
+                },
+            )
+
+        # Seal one final canonical authority read. Failure here invalidates a
+        # COMPLETE claim because experiment identity/status could not be proven.
+        try:
+            final_state = await self.get_json("/api/shadow/guardian-state")
+            await self.apply_guardian_state(final_state, "final_state", evaluate=False)
+            self.atomic_json("final_guardian_state.json", final_state)
+        except Exception as exc:
+            self.note_incomplete("FINAL_GUARDIAN_STATE_UNAVAILABLE", {"error": repr(exc)})
+
         try:
             self.atomic_json("final_dashboard.json", await self.get_json("/api/dashboard"))
         except Exception as exc:
             self.atomic_json("final_dashboard_error.json", {"at": utc_now(), "error": repr(exc)})
+            self.note_incomplete("FINAL_DASHBOARD_UNAVAILABLE", {"error": repr(exc)})
+
+        complete = (
+            self.bound_experiment_id is not None
+            and self.experiment_id == self.bound_experiment_id
+            and self.experiment_status == "COMPLETED"
+            and self.stop_reason == "EXPERIMENT_COMPLETED"
+            and not self.incomplete_reasons
+        )
+        run_status = "COMPLETE" if complete else "TEST_INCOMPLETE"
         self.atomic_json("run_complete.json", {
+            "status": run_status,
             "completed_at": utc_now(),
+            "stop_reason": self.stop_reason,
+            "source_git_sha": self.args.source_git_sha,
             "experiment_id": self.experiment_id,
+            "bound_experiment_id": self.bound_experiment_id,
             "experiment_status": self.experiment_status,
+            "experiment_started_at": self.experiment_started_at,
+            "entry_closes_at": self.entry_closes_at,
             "helper_actions": self.helper_actions,
+            "latency_samples_expected": expected_latency,
+            "latency_samples_written": self.latency_samples_written,
+            "latency_unknown_samples": self.latency_unknown_samples,
+            "incomplete_reasons": sorted(self.incomplete_reasons),
             "worst_helper_guaranteed_pnl": str(self.min_helper_pnl) if self.min_helper_pnl is not None else None,
             "raw_active_market_events": self.raw_events,
             "paper_only": True,
         })
+
+        self.sync_writers()
         for writer in (
-            self.engine_events,
-            self.position_states,
-            self.raw_clob,
-            self.observations,
-            self.actions,
-            self.latency,
-            self.ledger,
+            self.engine_events, self.position_states, self.raw_clob,
+            self.observations, self.actions, self.latency, self.ledger,
+            self.book_checkpoints, self.integrity,
         ):
             writer.close()
 
+        if not complete:
+            (self.out / "TEST_INCOMPLETE.txt").write_text(
+                "TEST INCOMPLETE\n" + "\n".join(sorted(self.incomplete_reasons)) + "\n",
+                encoding="utf-8",
+            )
+
+        # Hash the sealed evidence set after all append-only files are closed.
+        evidence_files = sorted(
+            p for p in self.out.iterdir()
+            if p.is_file() and p.name not in {"SHA256SUMS.txt"}
+        )
+        sums = "".join(f"{sha256_file(path)}  {path.name}\n" for path in evidence_files)
+        (self.out / "SHA256SUMS.txt").write_text(sums, encoding="utf-8")
+
     async def run(self) -> None:
         timeout = aiohttp.ClientTimeout(total=None, sock_connect=10, sock_read=None)
+        fatal: Exception | None = None
+        tasks: list[asyncio.Task[Any]] = []
         async with aiohttp.ClientSession(timeout=timeout) as session:
             self.session = session
-            await self.preflight()
-            tasks = [
-                asyncio.create_task(self.state_loop()),
-                asyncio.create_task(self.sse_loop()),
-                asyncio.create_task(self.ws_loop()),
-                asyncio.create_task(self.summary_loop()),
-                asyncio.create_task(self.stop_condition_loop()),
-            ]
             try:
+                await self.preflight()
+                tasks = [
+                    asyncio.create_task(self.state_loop(), name="state_loop"),
+                    asyncio.create_task(self.sse_loop(), name="sse_loop"),
+                    asyncio.create_task(self.ws_loop(), name="clob_loop"),
+                    asyncio.create_task(self.summary_loop(), name="summary_loop"),
+                    asyncio.create_task(self.stop_condition_loop(), name="stop_condition_loop"),
+                ]
                 while not self.stop.is_set():
                     for task in tasks:
-                        if task.done() and task.exception():
-                            raise task.exception()
+                        if task.done():
+                            exc = task.exception()
+                            if exc is not None:
+                                raise RuntimeError(f"BACKGROUND_TASK_FAILED:{task.get_name()}:{exc!r}") from exc
                     await asyncio.sleep(0.25)
+            except Exception as exc:
+                fatal = exc
+                self.stop_reason = self.stop_reason or "FATAL_EXCEPTION"
+                self.note_incomplete("FATAL_EXCEPTION", {"error": repr(exc)})
+                self.stop.set()
             finally:
                 self.stop.set()
                 for task in tasks:
-                    task.cancel()
+                    if not task.done():
+                        task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
                 await self.finish()
+
+        if fatal is not None:
+            raise fatal
 
 
 def parse_args() -> argparse.Namespace:
@@ -1209,7 +1334,7 @@ async def amain() -> None:
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
-            loop.add_signal_handler(sig, shadow.stop.set)
+            loop.add_signal_handler(sig, lambda s=sig: shadow.operator_stop(s.name))
         except NotImplementedError:
             pass
     await shadow.run()
