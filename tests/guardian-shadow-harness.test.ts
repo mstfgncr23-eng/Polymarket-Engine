@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -15,6 +16,19 @@ describe("guardian shadow harness", () => {
     expect(result.status, result.stderr || result.stdout).toBe(0);
   });
 
+  it("python policy/unit tests pass without network access", () => {
+    const result = spawnSync("python3", [
+      resolve("research/guardian-shadow/test_guardian_shadow.py"),
+    ], { encoding: "utf8" });
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+  });
+
+  it("vendors the exact user TEST_CONTRACT bytes", () => {
+    const contract = readFileSync(resolve("research/guardian-shadow/TEST_CONTRACT.md"));
+    const digest = createHash("sha256").update(contract).digest("hex");
+    expect(digest).toBe("545fd28c6452d2b5af6ed69c74b1cb4aff1423562311e91f88b44650a83aa9a9");
+  });
+
   it("observer stays read-only", () => {
     const text = readFileSync(
       resolve("research/guardian-shadow/guardian_shadow_24h.py"),
@@ -25,6 +39,11 @@ describe("guardian shadow harness", () => {
     expect(text).toContain('NORMAL_MIN_LOCKED_EDGE = Decimal("0.015")');
     expect(text).toContain('TRIGGER_LOSS = Decimal("0.35")');
     expect(text).toContain('PAIR_LOCK_CAP = Decimal("0.60")');
+    expect(text).toContain('EXPECTED_CONTRACT_SHA256 = "545fd28c6452d2b5af6ed69c74b1cb4aff1423562311e91f88b44650a83aa9a9"');
+    expect(text).toContain("revalidate_authority");
+    expect(text).toContain('authority.get("normalHedgeAdmissible") is True');
+    expect(text).toContain('authority.get("hedgeMakerOwnsResidual") is True');
+    expect(text).toContain('authority.get("riskReductionInFlight") is True');
     expect(text).toContain("book.received_mono_ns >= target_ns");
     expect(text).toContain("book.received_mono_ns <= deadline_ns");
     expect(text).toContain('status = "KNOWN" if observed and sell_executable else "UNKNOWN"');
