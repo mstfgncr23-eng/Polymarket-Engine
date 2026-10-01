@@ -154,14 +154,21 @@ def main() -> None:
         pnls.append(Decimal(str(value)))
         failure_reasons[str(action.get("failure_reason"))] += 1
 
+    engine_events = read_rows(root / "engine_events.jsonl")
     order_intent: dict[str, str] = {}
     fills: Counter[str] = Counter()
-    for rec in read_rows(root / "engine_events.jsonl"):
+    # Authority polls are newest-first while SSE is chronological, so event
+    # ingestion order is intentionally not trusted. Resolve order intent in a
+    # first pass, then attribute fills in a second pass.
+    for rec in engine_events:
         event = rec.get("event") or {}
         detail = event.get("detail") or {}
         if event.get("type") == "PAPER_ORDER_CREATED" and detail.get("orderId"):
             order_intent[str(detail["orderId"])] = str(detail.get("intent"))
-        elif event.get("type") == "PAPER_FILL":
+    for rec in engine_events:
+        event = rec.get("event") or {}
+        detail = event.get("detail") or {}
+        if event.get("type") == "PAPER_FILL":
             intent = order_intent.get(str(detail.get("orderId")))
             if intent:
                 fills[intent] += 1
