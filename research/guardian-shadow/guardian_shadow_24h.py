@@ -478,6 +478,7 @@ class GuardianShadow:
                     self.last_ledger_write = now
             except Exception as exc:
                 self.observations.write({"at": utc_now(), "type": "STATE_POLL_ERROR", "error": repr(exc)})
+                self.note_incomplete("STATE_POLL_ERROR", {"error": repr(exc)}, critical=bool(self.positions))
             try:
                 await asyncio.wait_for(self.refresh.wait(), timeout=1.0)
                 self.refresh.clear()
@@ -510,6 +511,7 @@ class GuardianShadow:
                             break
             except Exception as exc:
                 self.observations.write({"at": utc_now(), "type": "SSE_ERROR", "error": repr(exc)})
+                self.note_incomplete("ENGINE_SSE_GAP", {"error": repr(exc)}, critical=bool(self.positions))
                 await asyncio.sleep(1)
 
     async def handle_sse(self, event_name: str, data: dict[str, Any]) -> None:
@@ -588,6 +590,14 @@ class GuardianShadow:
                     "at": utc_now(), "type": "CLOB_ERROR",
                     "ws_generation": generation, "error": repr(exc),
                 })
+                watched = bool(self.positions) or any(
+                    until >= time.monotonic_ns() for until in self.latency_watch_until_ns.values()
+                )
+                self.note_incomplete(
+                    "CLOB_GAP",
+                    {"error": repr(exc), "ws_generation": generation},
+                    critical=watched,
+                )
                 await asyncio.sleep(1)
 
     async def handle_clob_payload(self, text: str, generation: int) -> None:
@@ -613,7 +623,7 @@ class GuardianShadow:
                     continue
                 market = str(self.token_meta[token].get("marketId"))
                 touched.add(market)
-                if market in self.positions:
+                if self.market_needs_raw(market, recv_ns):
                     self.write_raw(raw, recv_at, recv_ns, generation)
             elif typ == "price_change":
                 raw_markets: set[str] = set()
@@ -636,17 +646,25 @@ class GuardianShadow:
                     market = str(self.token_meta[token].get("marketId"))
                     touched.add(market)
                     raw_markets.add(market)
-                if any(m in self.positions for m in raw_markets):
+                if any(self.market_needs_raw(m, recv_ns) for m in raw_markets):
                     self.write_raw(raw, recv_at, recv_ns, generation)
             elif typ == "last_trade_price":
                 token = str(raw.get("asset_id") or "")
                 meta = self.token_meta.get(token)
-                if meta and str(meta.get("marketId")) in self.positions:
+                if meta and self.market_needs_raw(str(meta.get("marketId")), recv_ns):
                     self.write_raw(raw, recv_at, recv_ns, generation)
 
         for market in touched:
             if market in self.positions:
                 await self.evaluate_market(market, "clob_update")
+
+    def market_needs_raw(self, market: str, now_ns: int | None = None) -> bool:
+        current_ns = now_ns if now_ns is not None else time.monotonic_ns()
+        until = self.latency_watch_until_ns.get(market, 0)
+        if until and until < current_ns:
+            self.latency_watch_until_ns.pop(market, None)
+            until = 0
+        return market in self.positions or until >= current_ns
 
     def write_raw(self, raw: dict[str, Any], recv_at: str, recv_ns: int, generation: int) -> None:
         self.raw_events += 1
