@@ -5396,7 +5396,11 @@ export class EngineService {
           asset: market.asset ?? null,
           minOrderSize: snapshot?.minOrderSize ?? null,
           tickSize: snapshot?.tickSize ?? null,
-          feeSchedule: market.feeSchedule ? structuredClone(market.feeSchedule) : snapshot?.feeSchedule ? structuredClone(snapshot.feeSchedule) : null,
+          feeSchedule: snapshot?.feeSchedule
+            ? structuredClone(snapshot.feeSchedule)
+            : market.feeSchedule
+              ? structuredClone(market.feeSchedule)
+              : null,
           sourceTimestamp: snapshot?.sourceTimestamp ?? null,
           receivedAt: snapshot?.receivedAt ?? null,
         });
