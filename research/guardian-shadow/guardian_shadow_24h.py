@@ -43,6 +43,19 @@ def compact_json(value: Any) -> str:
     return json.dumps(value, separators=(",", ":"), sort_keys=True, ensure_ascii=False)
 
 
+def parse_source_ms(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        number = int(str(value))
+        return number if number > 0 else None
+    except ValueError:
+        try:
+            return int(datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp() * 1000)
+        except ValueError:
+            return None
+
+
 class Jsonl:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -64,12 +77,21 @@ class Book:
     bids: dict[str, str] = field(default_factory=dict)
     asks: dict[str, str] = field(default_factory=dict)
     source_timestamp: str | None = None
+    source_ms: int | None = None
     received_at: str | None = None
     received_mono_ns: int = 0
     ws_generation: int = 0
     trusted: bool = False
 
-    def set_full(self, raw: dict[str, Any], generation: int) -> None:
+    def set_full(self, raw: dict[str, Any], generation: int) -> bool:
+        incoming_ms = parse_source_ms(raw.get("timestamp"))
+        if (
+            generation == self.ws_generation
+            and incoming_ms is not None
+            and self.source_ms is not None
+            and incoming_ms < self.source_ms
+        ):
+            return False
         self.bids = {
             str(x.get("price")): str(x.get("size", x.get("quantity", "0")))
             for x in raw.get("bids", [])
@@ -82,17 +104,28 @@ class Book:
         }
         self._stamp(raw.get("timestamp"), generation)
         self.trusted = True
+        return True
 
-    def change(self, side: str, price: str, size: str, source_ts: Any, generation: int) -> None:
+    def change(self, side: str, price: str, size: str, source_ts: Any, generation: int) -> bool:
+        incoming_ms = parse_source_ms(source_ts)
+        if (
+            generation == self.ws_generation
+            and incoming_ms is not None
+            and self.source_ms is not None
+            and incoming_ms < self.source_ms
+        ):
+            return False
         levels = self.bids if side == "BUY" else self.asks
         if D(size) <= 0:
             levels.pop(price, None)
         else:
             levels[price] = size
         self._stamp(source_ts, generation)
+        return True
 
     def _stamp(self, source_ts: Any, generation: int) -> None:
         self.source_timestamp = str(source_ts) if source_ts is not None else None
+        self.source_ms = parse_source_ms(source_ts)
         self.received_at = utc_now()
         self.received_mono_ns = time.monotonic_ns()
         self.ws_generation = generation
@@ -433,7 +466,10 @@ class GuardianShadow:
                 token = str(raw.get("asset_id") or "")
                 if token not in self.token_meta:
                     continue
-                self.books.setdefault(token, Book(token)).set_full(raw, generation)
+                accepted = self.books.setdefault(token, Book(token)).set_full(raw, generation)
+                if not accepted:
+                    self.observations.write({"at": recv_at, "type": "CLOB_STALE_DROP", "token_id": token})
+                    continue
                 market = str(self.token_meta[token].get("marketId"))
                 touched.add(market)
                 if market in self.positions:
@@ -452,7 +488,10 @@ class GuardianShadow:
                     side = str(ch.get("side") or "").upper()
                     if side not in ("BUY", "SELL"):
                         continue
-                    book.change(side, str(ch.get("price")), str(ch.get("size", "0")), raw.get("timestamp"), generation)
+                    accepted = book.change(side, str(ch.get("price")), str(ch.get("size", "0")), raw.get("timestamp"), generation)
+                    if not accepted:
+                        self.observations.write({"at": recv_at, "type": "CLOB_STALE_DROP", "token_id": token})
+                        continue
                     market = str(self.token_meta[token].get("marketId"))
                     touched.add(market)
                     raw_markets.add(market)
