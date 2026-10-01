@@ -25,6 +25,9 @@ describe("guardian shadow harness", () => {
     expect(text).toContain('NORMAL_MIN_LOCKED_EDGE = Decimal("0.015")');
     expect(text).toContain('TRIGGER_LOSS = Decimal("0.35")');
     expect(text).toContain('PAIR_LOCK_CAP = Decimal("0.60")');
+    expect(text).toContain("book.received_mono_ns >= target_ns");
+    expect(text).toContain("book.received_mono_ns <= deadline_ns");
+    expect(text).toContain('status = "KNOWN" if observed and sell_executable else "UNKNOWN"');
     expect(text).toContain("wss://ws-subscriptions-clob.polymarket.com/ws/market");
     expect(text).not.toContain("py_clob_client");
     expect(text).not.toContain("create_order");
