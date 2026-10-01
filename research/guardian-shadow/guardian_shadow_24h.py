@@ -242,6 +242,7 @@ class GuardianShadow:
         self.latency_watch_until_ns: dict[str, int] = {}
         self.incomplete_reasons: set[str] = set()
         self.bound_experiment_id: str | None = None
+        self.experiment_validated = False
         self.stop_reason: str | None = None
         self.ws_generation = 0
         self.raw_events = 0
@@ -397,7 +398,10 @@ class GuardianShadow:
         self.experiment_started_at = experiment.get("startedAt")
         self.entry_closes_at = experiment.get("entryClosesAt")
 
-        if self.experiment_status in ("RUNNING", "ENTRY_CLOSED", "COMPLETED"):
+        active_or_bound_terminal = self.experiment_status in ("RUNNING", "ENTRY_CLOSED") or (
+            self.experiment_status == "COMPLETED" and self.bound_experiment_id is not None and self.experiment_id == self.bound_experiment_id
+        )
+        if active_or_bound_terminal:
             duration = experiment.get("durationHours")
             git_sha = str(experiment.get("gitSha") or "")
             if duration is None or D(duration) != Decimal("24"):
@@ -436,6 +440,8 @@ class GuardianShadow:
                     self.stop.set()
 
         self.note_experiment_status()
+        if active_or_bound_terminal and not self.incomplete_reasons:
+            self.experiment_validated = True
 
         old_tokens = set(self.token_meta)
         meta: dict[str, dict[str, Any]] = {}
@@ -563,7 +569,9 @@ class GuardianShadow:
             engine = data.get("engine") or {}
             self.experiment_id = engine.get("experimentId")
             self.experiment_status = engine.get("experimentStatus")
-            self.note_experiment_status()
+            # SSE carries only bounded dashboard state. Exact experiment
+            # manifest/SHA validation and authority binding happen only through
+            # /api/shadow/guardian-state.
             positions = {
                 str(p.get("marketId")): p
                 for p in data.get("positions", [])
@@ -851,6 +859,10 @@ class GuardianShadow:
         return position, authority
 
     async def evaluate_market(self, market: str, trigger_source: str) -> None:
+        if not self.experiment_validated or self.bound_experiment_id is None:
+            return
+        if self.experiment_id != self.bound_experiment_id or self.experiment_status not in ("RUNNING", "ENTRY_CLOSED"):
+            return
         position = self.positions.get(market)
         if not position:
             return
