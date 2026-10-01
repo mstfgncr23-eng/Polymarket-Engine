@@ -269,7 +269,69 @@ class GuardianShadow:
         tmp.write_text(json.dumps(value, indent=2, sort_keys=True), encoding="utf-8")
         os.replace(tmp, path)
 
+    def note_incomplete(self, reason: str, detail: dict[str, Any] | None = None, critical: bool = True) -> None:
+        self.integrity.write({
+            "at": utc_now(),
+            "monotonic_ns": time.monotonic_ns(),
+            "reason": reason,
+            "critical": critical,
+            "detail": detail or {},
+            "active_markets": sorted(self.positions),
+        })
+        if critical:
+            self.incomplete_reasons.add(reason)
+
+    def sync_writers(self) -> None:
+        for writer in (
+            self.engine_events, self.position_states, self.raw_clob,
+            self.observations, self.actions, self.latency, self.ledger,
+            self.book_checkpoints, self.integrity,
+        ):
+            writer.sync()
+
+    def book_evidence(self, book: Book | None) -> dict[str, Any] | None:
+        if book is None or not book.trusted:
+            return None
+        return {
+            "token_id": book.token_id,
+            "source_timestamp": book.source_timestamp,
+            "source_ms": book.source_ms,
+            "received_at": book.received_at,
+            "received_mono_ns": book.received_mono_ns,
+            "ws_generation": book.ws_generation,
+            "age_ms": book.age_ms(),
+            "bids": [[dec(p), dec(q)] for p, q in book.levels("SELL")],
+            "asks": [[dec(p), dec(q)] for p, q in book.levels("BUY")],
+        }
+
+    def write_book_checkpoint(self, market: str, reason: str) -> None:
+        position = self.positions.get(market)
+        if not position:
+            return
+        held_outcome = str(position["unpairedOutcome"])
+        opposite_outcome = "DOWN" if held_outcome == "UP" else "UP"
+        mapping = self.market_tokens.get(market, {})
+        held_token = mapping.get(held_outcome)
+        opposite_token = mapping.get(opposite_outcome)
+        self.book_checkpoints.write({
+            "at": utc_now(),
+            "monotonic_ns": time.monotonic_ns(),
+            "reason": reason,
+            "market_id": market,
+            "episode_key": episode_key(position),
+            "position": position,
+            "held_meta": self.token_meta.get(held_token or ""),
+            "opposite_meta": self.token_meta.get(opposite_token or ""),
+            "held_book": self.book_evidence(self.books.get(held_token or "")),
+            "opposite_book": self.book_evidence(self.books.get(opposite_token or "")),
+        })
+
     async def preflight(self) -> None:
+        if abs(self.args.duration_hours - 24.0) > 1e-12:
+            raise RuntimeError(f"LOCKED_DURATION_MUST_BE_24H:{self.args.duration_hours}")
+        if not CONTRACT_PATH.exists():
+            raise RuntimeError("TEST_CONTRACT_MISSING")
+
         health = await self.get_json("/health")
         ready = await self.get_json("/ready")
         state = await self.get_json("/api/shadow/guardian-state")
@@ -277,12 +339,37 @@ class GuardianShadow:
             raise RuntimeError("PAPER_SAFETY_GATE_FAILED")
         if ready.get("status") != "ready":
             raise RuntimeError(f"ENGINE_NOT_READY:{ready}")
+
+        risk = state.get("riskConfiguration") or {}
+        expected = {
+            "maxOrderSizeUsd": MAX_ORDER_SIZE_USD,
+            "minExpectedEdge": NORMAL_MIN_LOCKED_EDGE,
+            "staleFeedTimeoutMs": Decimal(str(int(STALE_BOOK_SECONDS * 1000))),
+            "catastrophicPairLockMinUnhedgedMs": Decimal("10000"),
+            "catastrophicPairLockTriggerLossUsd": TRIGGER_LOSS,
+            "catastrophicPairLockMaxLockedLossUsd": PAIR_LOCK_CAP,
+        }
+        for key, value in expected.items():
+            observed = risk.get(key)
+            if observed is None or D(observed) != value:
+                raise RuntimeError(f"RISK_CONFIG_MISMATCH:{key}:expected={value}:observed={observed}")
+
+        experiment = state.get("experiment")
+        status = (experiment or {}).get("status")
+        if status in ("RUNNING", "ENTRY_CLOSED"):
+            raise RuntimeError(f"ACTIVE_EXPERIMENT_AT_PREFLIGHT:{status}")
+        if state.get("positions"):
+            raise RuntimeError("OPEN_POSITION_AT_PREFLIGHT")
+
         self.atomic_json("manifest.json", {
-            "schema": 1,
+            "schema": 2,
             "kind": "two-stage-guardian-shadow-24h",
             "started_at": self.start_wall,
             "engine_url": self.base,
             "clob_ws": CLOB_WS,
+            "observer_sha256": sha256_file(Path(__file__)),
+            "contract_sha256": sha256_file(CONTRACT_PATH),
+            "source_git_sha": self.args.source_git_sha,
             "trigger_loss_usd": str(TRIGGER_LOSS),
             "pair_lock_cap_usd": str(PAIR_LOCK_CAP),
             "normal_min_locked_edge": str(NORMAL_MIN_LOCKED_EDGE),
@@ -291,15 +378,19 @@ class GuardianShadow:
             "stale_book_seconds": STALE_BOOK_SECONDS,
             "duration_hours": self.args.duration_hours,
             "settlement_grace_minutes": self.args.settlement_grace_minutes,
+            "risk_configuration": risk,
             "paper_safety": True,
             "health": health,
             "ready": ready,
         })
-        await self.apply_guardian_state(state, "preflight")
+        await self.apply_guardian_state(state, "preflight", evaluate=False)
 
-    async def apply_guardian_state(self, state: dict[str, Any], source: str) -> None:
-        self.experiment_id = state.get("experimentId")
-        self.experiment_status = state.get("experimentStatus")
+    async def apply_guardian_state(self, state: dict[str, Any], source: str, evaluate: bool = True) -> None:
+        experiment = state.get("experiment") or {}
+        self.experiment_id = experiment.get("id")
+        self.experiment_status = experiment.get("status")
+        self.experiment_started_at = experiment.get("startedAt")
+        self.entry_closes_at = experiment.get("entryClosesAt")
         self.note_experiment_status()
 
         old_tokens = set(self.token_meta)
@@ -316,23 +407,40 @@ class GuardianShadow:
         self.market_tokens = mapping
         if set(meta) != old_tokens:
             self.tokens_changed.set()
+            self.integrity.write({
+                "at": utc_now(), "monotonic_ns": time.monotonic_ns(),
+                "reason": "TOKEN_MAP_CHANGED", "critical": False,
+                "detail": {"old_count": len(old_tokens), "new_count": len(meta)},
+                "active_markets": sorted(self.positions),
+            })
 
         positions: dict[str, dict[str, Any]] = {}
+        authority: dict[str, dict[str, Any]] = {}
         for item in state.get("positions", []):
             p = item.get("position") or {}
             market = str(p.get("marketId") or "")
             if market and D(p.get("unpairedQuantity", "0")) > 0 and p.get("unpairedOutcome") in ("UP", "DOWN"):
                 positions[market] = p
-        await self.set_positions(positions, source)
+                authority[market] = item
+        self.authority = authority
+        await self.set_positions(positions, source, evaluate=evaluate)
 
     def note_experiment_status(self) -> None:
         now = time.monotonic()
-        if self.experiment_status == "RUNNING" and self.experiment_started_mono is None:
-            self.experiment_started_mono = now
+        if self.experiment_status == "RUNNING":
+            if self.bound_experiment_id is None:
+                self.bound_experiment_id = self.experiment_id
+                self.experiment_started_mono = now
+            elif self.experiment_id != self.bound_experiment_id:
+                self.note_incomplete(
+                    "EXPERIMENT_ID_CHANGED",
+                    {"bound": self.bound_experiment_id, "observed": self.experiment_id},
+                )
         if self.experiment_status == "ENTRY_CLOSED" and self.entry_closed_mono is None:
             self.entry_closed_mono = now
 
-    async def set_positions(self, positions: dict[str, dict[str, Any]], source: str) -> None:
+    async def set_positions(self, positions: dict[str, dict[str, Any]], source: str, evaluate: bool = True) -> None:
+        previous_markets = set(self.positions)
         fingerprint = hashlib.sha256(compact_json(positions).encode()).hexdigest()
         if fingerprint != self.position_fingerprint:
             self.position_fingerprint = fingerprint
@@ -341,12 +449,16 @@ class GuardianShadow:
                 "monotonic_ns": time.monotonic_ns(),
                 "source": source,
                 "positions": positions,
+                "authority": {m: self.authority.get(m) for m in positions},
                 "experiment_id": self.experiment_id,
                 "experiment_status": self.experiment_status,
             })
         self.positions = positions
-        for market in positions:
-            await self.evaluate_market(market, "position_state")
+        for market in set(positions) - previous_markets:
+            self.write_book_checkpoint(market, "POSITION_ACTIVATED")
+        if evaluate:
+            for market in positions:
+                await self.evaluate_market(market, "position_state")
 
     async def state_loop(self) -> None:
         while not self.stop.is_set():
