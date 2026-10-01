@@ -9,6 +9,7 @@ describe("guardian shadow harness", () => {
     const files = [
       resolve("research/guardian-shadow/guardian_shadow_24h.py"),
       resolve("research/guardian-shadow/analyze_shadow.py"),
+      resolve("research/guardian-shadow/test_guardian_shadow.py"),
     ];
     const result = spawnSync("python3", ["-m", "py_compile", ...files], {
       encoding: "utf8",
@@ -27,6 +28,16 @@ describe("guardian shadow harness", () => {
     const contract = readFileSync(resolve("research/guardian-shadow/TEST_CONTRACT.md"));
     const digest = createHash("sha256").update(contract).digest("hex");
     expect(digest).toBe("545fd28c6452d2b5af6ed69c74b1cb4aff1423562311e91f88b44650a83aa9a9");
+  });
+
+  it("analyzer preserves UNKNOWN and refuses incomplete numeric conclusions", () => {
+    const text = readFileSync(
+      resolve("research/guardian-shadow/analyze_shadow.py"),
+      "utf8",
+    );
+    expect(text).toContain('run_complete.get("status") != "COMPLETE"');
+    expect(text).toContain("full-policy delayed PnL = UNKNOWN; delayed meteor result = UNKNOWN");
+    expect(text).toContain("no numeric conclusion is emitted from an incomplete run");
   });
 
   it("observer stays read-only", () => {
