@@ -20,6 +20,7 @@ import aiohttp
 getcontext().prec = 40
 TRIGGER_LOSS = Decimal("0.35")
 PAIR_LOCK_CAP = Decimal("0.60")
+MAX_ORDER_SIZE_USD = Decimal("25")
 STALE_BOOK_SECONDS = 15.0
 LATENCY_MS = (25, 50, 100, 150, 250, 500)
 CLOB_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -110,13 +111,16 @@ class Book:
         )
 
 
-def walk(book: Book, qty: Decimal, side: str) -> dict[str, Any]:
+def walk(book: Book, qty: Decimal, side: str, max_notional: Decimal = MAX_ORDER_SIZE_USD) -> dict[str, Any]:
     remaining = qty
     notional = Decimal(0)
     worst: Decimal | None = None
     levels_used = 0
     for price, available in book.levels(side):
-        take = min(remaining, available)
+        remaining_notional = max_notional - notional
+        if remaining_notional <= 0 or price <= 0:
+            break
+        take = min(remaining, available, remaining_notional / price)
         if take <= 0:
             continue
         notional += take * price
@@ -184,7 +188,7 @@ class GuardianShadow:
         self.position_fingerprint = ""
         self.shadow_closed: set[str] = set()
         self.last_status: dict[str, str] = {}
-        self.rescue_error_at: dict[str, int] = {}
+        self.rescue_error_at: dict[str, str] = {}
         self.ws_generation = 0
         self.raw_events = 0
         self.helper_actions = 0
@@ -225,6 +229,7 @@ class GuardianShadow:
             "clob_ws": CLOB_WS,
             "trigger_loss_usd": str(TRIGGER_LOSS),
             "pair_lock_cap_usd": str(PAIR_LOCK_CAP),
+            "max_order_size_usd": str(MAX_ORDER_SIZE_USD),
             "latency_ms": list(LATENCY_MS),
             "stale_book_seconds": STALE_BOOK_SECONDS,
             "duration_hours": self.args.duration_hours,
@@ -363,7 +368,7 @@ class GuardianShadow:
         market = str(data.get("marketId") or "")
         detail = data.get("detail") or {}
         if typ == "PAPER_EXECUTION_ERROR" and detail.get("intent") == "RESCUE_SECOND_LEG" and market:
-            self.rescue_error_at[market] = time.monotonic_ns()
+            self.rescue_error_at[market] = str(data.get("at") or utc_now())
             await self.evaluate_market(market, "rescue_execution_error")
         if typ in {
             "PAPER_FILL", "PAPER_ORDER_CREATED", "PAPER_EXECUTION_ERROR",
@@ -561,7 +566,17 @@ class GuardianShadow:
             self.record_status(key, "BELOW_TRIGGER", market, econ, trigger_source)
             return
 
-        failure_reason = "RESCUE_EXECUTION_ERROR" if market in self.rescue_error_at else None
+        failure_reason = None
+        error_at = self.rescue_error_at.get(market)
+        episode_started = position.get("unhedgedStartedAt") or position.get("openedAt")
+        if error_at and episode_started:
+            try:
+                error_dt = datetime.fromisoformat(error_at.replace("Z", "+00:00"))
+                start_dt = datetime.fromisoformat(str(episode_started).replace("Z", "+00:00"))
+                if error_dt >= start_dt:
+                    failure_reason = "RESCUE_EXECUTION_ERROR"
+            except ValueError:
+                pass
         lock_info = econ.get("lock")
         if failure_reason is None:
             if lock_info is not None and D(lock_info["guaranteed_locked_pnl"]) >= -PAIR_LOCK_CAP:
