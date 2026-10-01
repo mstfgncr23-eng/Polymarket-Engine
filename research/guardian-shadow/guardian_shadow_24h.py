@@ -329,6 +329,11 @@ class GuardianShadow:
     async def preflight(self) -> None:
         if abs(self.args.duration_hours - 24.0) > 1e-12:
             raise RuntimeError(f"LOCKED_DURATION_MUST_BE_24H:{self.args.duration_hours}")
+        if (
+            len(self.args.source_git_sha) != 40
+            or any(ch not in "0123456789abcdef" for ch in self.args.source_git_sha.lower())
+        ):
+            raise RuntimeError(f"INVALID_SOURCE_GIT_SHA:{self.args.source_git_sha}")
         if not CONTRACT_PATH.exists():
             raise RuntimeError("TEST_CONTRACT_MISSING")
 
@@ -391,6 +396,45 @@ class GuardianShadow:
         self.experiment_status = experiment.get("status")
         self.experiment_started_at = experiment.get("startedAt")
         self.entry_closes_at = experiment.get("entryClosesAt")
+
+        if self.experiment_status in ("RUNNING", "ENTRY_CLOSED", "COMPLETED"):
+            duration = experiment.get("durationHours")
+            git_sha = str(experiment.get("gitSha") or "")
+            if duration is None or D(duration) != Decimal("24"):
+                self.note_incomplete(
+                    "EXPERIMENT_DURATION_MISMATCH",
+                    {"expected": "24", "observed": duration, "experiment_id": self.experiment_id},
+                )
+                self.stop_reason = "EXPERIMENT_DURATION_MISMATCH"
+                self.stop.set()
+            if git_sha != self.args.source_git_sha:
+                self.note_incomplete(
+                    "EXPERIMENT_GIT_SHA_MISMATCH",
+                    {"expected": self.args.source_git_sha, "observed": git_sha, "experiment_id": self.experiment_id},
+                )
+                self.stop_reason = "EXPERIMENT_GIT_SHA_MISMATCH"
+                self.stop.set()
+
+            if self.experiment_started_at and self.entry_closes_at:
+                try:
+                    started = datetime.fromisoformat(str(self.experiment_started_at).replace("Z", "+00:00"))
+                    closes = datetime.fromisoformat(str(self.entry_closes_at).replace("Z", "+00:00"))
+                    duration_seconds = (closes - started).total_seconds()
+                    if abs(duration_seconds - 24 * 3600) > 1:
+                        self.note_incomplete(
+                            "EXPERIMENT_WINDOW_MISMATCH",
+                            {"duration_seconds": duration_seconds, "experiment_id": self.experiment_id},
+                        )
+                        self.stop_reason = "EXPERIMENT_WINDOW_MISMATCH"
+                        self.stop.set()
+                except ValueError:
+                    self.note_incomplete(
+                        "EXPERIMENT_TIMESTAMP_INVALID",
+                        {"startedAt": self.experiment_started_at, "entryClosesAt": self.entry_closes_at},
+                    )
+                    self.stop_reason = "EXPERIMENT_TIMESTAMP_INVALID"
+                    self.stop.set()
+
         self.note_experiment_status()
 
         old_tokens = set(self.token_meta)
@@ -1111,6 +1155,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--engine-url", default=os.getenv("ENGINE_BASE_URL", "http://127.0.0.1:8080"))
     p.add_argument("--engine-read-token", default=os.getenv("ENGINE_READ_TOKEN"))
+    p.add_argument("--source-git-sha", required=True)
     p.add_argument("--output-dir", required=True)
     p.add_argument("--duration-hours", type=float, default=24.0)
     p.add_argument("--settlement-grace-minutes", type=float, default=30.0)
