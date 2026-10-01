@@ -657,6 +657,8 @@ class GuardianShadow:
         if typ in {
             "PAPER_FILL", "PAPER_ORDER_CREATED", "PAPER_EXECUTION_ERROR",
             "POSITION_UPDATED", "HEDGE_COMPLETE", "RISK_ACCEPT", "RISK_VETO",
+            "EXPERIMENT_STARTED", "EXPERIMENT_START_VALIDATED",
+            "EXPERIMENT_ENTRY_CLOSED", "EXPERIMENT_COMPLETED", "EXPERIMENT_FAILED",
         }:
             self.refresh.set()
 
