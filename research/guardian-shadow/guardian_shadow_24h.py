@@ -642,18 +642,10 @@ class GuardianShadow:
 
     async def handle_sse(self, event_name: str, data: dict[str, Any]) -> None:
         if event_name == "snapshot":
-            engine = data.get("engine") or {}
-            self.experiment_id = engine.get("experimentId")
-            self.experiment_status = engine.get("experimentStatus")
-            # SSE carries only bounded dashboard state. Exact experiment
-            # manifest/SHA validation and authority binding happen only through
-            # /api/shadow/guardian-state.
-            positions = {
-                str(p.get("marketId")): p
-                for p in data.get("positions", [])
-                if D(p.get("unpairedQuantity", "0")) > 0 and p.get("unpairedOutcome") in ("UP", "DOWN")
-            }
-            await self.set_positions(positions, "engine_sse")
+            # Dashboard snapshots are intentionally non-authoritative for this
+            # proof harness. They may race a newer HTTP authority read. Use
+            # them only as a prompt for an immediate canonical refresh.
+            self.refresh.set()
             return
 
         if event_name != "decision":
