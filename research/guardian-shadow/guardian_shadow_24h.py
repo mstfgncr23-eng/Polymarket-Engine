@@ -26,6 +26,7 @@ STALE_BOOK_SECONDS = 15.0
 LATENCY_MS = (25, 50, 100, 150, 250, 500)
 CLOB_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 CONTRACT_PATH = Path(__file__).with_name("TEST_CONTRACT.md")
+EXPECTED_CONTRACT_SHA256 = "545fd28c6452d2b5af6ed69c74b1cb4aff1423562311e91f88b44650a83aa9a9"
 
 
 def utc_now() -> str:
@@ -341,6 +342,11 @@ class GuardianShadow:
             raise RuntimeError(f"INVALID_SOURCE_GIT_SHA:{self.args.source_git_sha}")
         if not CONTRACT_PATH.exists():
             raise RuntimeError("TEST_CONTRACT_MISSING")
+        contract_hash = sha256_file(CONTRACT_PATH)
+        if contract_hash != EXPECTED_CONTRACT_SHA256:
+            raise RuntimeError(
+                f"TEST_CONTRACT_HASH_MISMATCH:expected={EXPECTED_CONTRACT_SHA256}:observed={contract_hash}"
+            )
 
         health = await self.get_json("/health")
         ready = await self.get_json("/ready")
@@ -379,7 +385,7 @@ class GuardianShadow:
             "engine_url": self.base,
             "clob_ws": CLOB_WS,
             "observer_sha256": sha256_file(Path(__file__)),
-            "contract_sha256": sha256_file(CONTRACT_PATH),
+            "contract_sha256": contract_hash,
             "source_git_sha": self.args.source_git_sha,
             "trigger_loss_usd": str(TRIGGER_LOSS),
             "pair_lock_cap_usd": str(PAIR_LOCK_CAP),
