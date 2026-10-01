@@ -499,6 +499,10 @@ class GuardianShadow:
         self.token_meta = meta
         self.market_tokens = mapping
         if set(meta) != old_tokens:
+            # Token-set transitions invalidate all direct book authority before
+            # any position evaluation can run against a half-old mapping.
+            for book in self.books.values():
+                book.trusted = False
             self.tokens_changed.set()
             self.integrity.write({
                 "at": utc_now(), "monotonic_ns": time.monotonic_ns(),
@@ -701,8 +705,18 @@ class GuardianShadow:
                                 continue
                             await self.handle_clob_payload(msg.data, generation)
                         elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                            for token in tokens:
+                                if token in self.books:
+                                    self.books[token].trusted = False
+                            self.observations.write({
+                                "at": utc_now(), "type": "CLOB_CLOSED",
+                                "ws_generation": generation, "message_type": str(msg.type),
+                            })
                             break
             except Exception as exc:
+                for token in tokens:
+                    if token in self.books:
+                        self.books[token].trusted = False
                 self.observations.write({
                     "at": utc_now(), "type": "CLOB_ERROR",
                     "ws_generation": generation, "error": repr(exc),
