@@ -596,7 +596,11 @@ class GuardianShadow:
         typ = str(data.get("type") or "")
         market = str(data.get("marketId") or "")
         detail = data.get("detail") or {}
-        if typ == "PAPER_EXECUTION_ERROR" and detail.get("intent") == "RESCUE_SECOND_LEG" and market:
+        rescue_failure = (
+            typ == "PAPER_EXECUTION_ERROR"
+            or typ == "RISK_REDUCTION_LIFECYCLE_BLOCKED"
+        )
+        if rescue_failure and detail.get("intent") == "RESCUE_SECOND_LEG" and market:
             self.rescue_error_at[market] = str(data.get("at") or utc_now())
             return market
         return None
