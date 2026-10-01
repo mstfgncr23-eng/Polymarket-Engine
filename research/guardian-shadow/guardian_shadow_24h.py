@@ -247,6 +247,8 @@ class GuardianShadow:
         self.ws_generation = 0
         self.raw_events = 0
         self.helper_actions = 0
+        self.latency_samples_written = 0
+        self.latency_unknown_samples = 0
         self.min_helper_pnl: Decimal | None = None
         self.experiment_id: str | None = None
         self.experiment_status: str | None = None
@@ -367,6 +369,7 @@ class GuardianShadow:
         if state.get("positions"):
             raise RuntimeError("OPEN_POSITION_AT_PREFLIGHT")
 
+        (self.out / "TEST_CONTRACT.md").write_bytes(CONTRACT_PATH.read_bytes())
         self.atomic_json("manifest.json", {
             "schema": 2,
             "kind": "two-stage-guardian-shadow-24h",
@@ -1067,6 +1070,9 @@ class GuardianShadow:
                 "held_meta": self.token_meta.get(held_token or ""),
                 "economics": econ if status == "KNOWN" else None,
             })
+            self.latency_samples_written += 1
+            if status == "UNKNOWN":
+                self.latency_unknown_samples += 1
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -1082,6 +1088,8 @@ class GuardianShadow:
                 "error": repr(exc),
                 "economics": None,
             })
+            self.latency_samples_written += 1
+            self.latency_unknown_samples += 1
             # Latency failure is represented as UNKNOWN by contract. It is not
             # converted into a fill or meteor, but remains explicit evidence.
         finally:
