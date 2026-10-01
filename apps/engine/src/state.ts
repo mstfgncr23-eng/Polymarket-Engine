@@ -312,6 +312,11 @@ export class EngineStateStore {
     if (this.feed.length > 500) this.feed.length = 500;
   }
 
+  /** Bounded read-only feed used by observation sidecars; never exposes a live array. */
+  decisionFeedForObservation(limit = 200): DecisionFeedItem[] {
+    return structuredClone(this.feed.slice(0, Math.max(0, Math.min(limit, 500))));
+  }
+
   snapshot(): DashboardSnapshot {
     const alive = this.engineAlive();
     return {
