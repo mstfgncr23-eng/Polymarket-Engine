@@ -716,15 +716,47 @@ class GuardianShadow:
         wait = (target_ns - time.monotonic_ns()) / 1_000_000_000
         if wait > 0:
             await asyncio.sleep(wait)
+
+        position = action["position"]
+        market = str(action["market_id"])
+        held_outcome = str(position["unpairedOutcome"])
+        held_token = self.market_tokens.get(market, {}).get(held_outcome)
+        deadline_ns = target_ns + 25_000_000
+        observed = False
+        observed_book_ns = None
+
+        # Contract rule: a delayed sample is KNOWN only when a locally received
+        # held-side book state exists at/after the target and within +25 ms.
+        # Reusing the decision-time book is forbidden.
+        while time.monotonic_ns() <= deadline_ns:
+            book = self.books.get(held_token or "")
+            if (
+                book is not None
+                and book.trusted
+                and book.received_mono_ns >= target_ns
+                and book.received_mono_ns <= deadline_ns
+            ):
+                observed = True
+                observed_book_ns = book.received_mono_ns
+                break
+            await asyncio.sleep(0.001)
+
         actual_ns = time.monotonic_ns()
+        econ = self.economics(position) if observed else None
+        sell_executable = bool(econ and econ.get("sell") is not None)
+        status = "KNOWN" if observed and sell_executable else "UNKNOWN"
         self.latency.write({
             "action_id": action["action_id"],
-            "market_id": action["market_id"],
+            "market_id": market,
             "target_latency_ms": latency_ms,
             "captured_at": utc_now(),
             "captured_mono_ns": actual_ns,
             "scheduler_error_ms": (actual_ns - target_ns) / 1_000_000.0,
-            "economics": self.economics(action["position"]),
+            "observed_book_mono_ns": observed_book_ns,
+            "book_observed_within_25ms": observed,
+            "full_sell_executable": sell_executable,
+            "status": status,
+            "economics": econ if status == "KNOWN" else None,
         })
 
     async def summary_loop(self) -> None:
