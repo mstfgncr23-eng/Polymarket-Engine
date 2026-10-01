@@ -25,6 +25,7 @@ MAX_ORDER_SIZE_USD = Decimal("25")
 STALE_BOOK_SECONDS = 15.0
 LATENCY_MS = (25, 50, 100, 150, 250, 500)
 CLOB_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+CONTRACT_PATH = Path(__file__).with_name("TEST_CONTRACT.md")
 
 
 def utc_now() -> str:
@@ -66,9 +67,12 @@ class Jsonl:
     def write(self, value: dict[str, Any]) -> None:
         self.fh.write(compact_json(value) + "\n")
 
-    def close(self) -> None:
+    def sync(self) -> None:
         self.fh.flush()
         os.fsync(self.fh.fileno())
+
+    def close(self) -> None:
+        self.sync()
         self.fh.close()
 
 
@@ -209,6 +213,8 @@ class GuardianShadow:
         self.actions = Jsonl(self.out / "guardian_actions.jsonl")
         self.latency = Jsonl(self.out / "latency_samples.jsonl")
         self.ledger = Jsonl(self.out / "ledger_samples.jsonl")
+        self.book_checkpoints = Jsonl(self.out / "book_checkpoints.jsonl")
+        self.integrity = Jsonl(self.out / "integrity_events.jsonl")
 
         self.session: aiohttp.ClientSession | None = None
         self.stop = asyncio.Event()
@@ -219,16 +225,24 @@ class GuardianShadow:
         self.market_tokens: dict[str, dict[str, str]] = {}
         self.books: dict[str, Book] = {}
         self.positions: dict[str, dict[str, Any]] = {}
+        self.authority: dict[str, dict[str, Any]] = {}
         self.position_fingerprint = ""
         self.shadow_closed: set[str] = set()
         self.last_status: dict[str, str] = {}
         self.rescue_error_at: dict[str, str] = {}
+        self.latency_tasks: set[asyncio.Task[Any]] = set()
+        self.latency_watch_until_ns: dict[str, int] = {}
+        self.incomplete_reasons: set[str] = set()
+        self.bound_experiment_id: str | None = None
+        self.stop_reason: str | None = None
         self.ws_generation = 0
         self.raw_events = 0
         self.helper_actions = 0
         self.min_helper_pnl: Decimal | None = None
         self.experiment_id: str | None = None
         self.experiment_status: str | None = None
+        self.experiment_started_at: str | None = None
+        self.entry_closes_at: str | None = None
         self.experiment_started_mono: float | None = None
         self.entry_closed_mono: float | None = None
         self.start_wall = utc_now()
