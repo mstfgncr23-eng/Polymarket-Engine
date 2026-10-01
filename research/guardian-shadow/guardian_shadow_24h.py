@@ -241,6 +241,7 @@ class GuardianShadow:
         self.shadow_closed: set[str] = set()
         self.last_status: dict[str, str] = {}
         self.rescue_error_at: dict[str, str] = {}
+        self.seen_engine_event_ids: set[str] = set()
         self.latency_tasks: set[asyncio.Task[Any]] = set()
         self.latency_watch_until_ns: dict[str, int] = {}
         self.incomplete_reasons: set[str] = set()
@@ -475,6 +476,10 @@ class GuardianShadow:
                 "active_markets": sorted(self.positions),
             })
 
+        for event in state.get("recentRiskEvents", []):
+            if isinstance(event, dict):
+                self.ingest_engine_event(event, source="authority_poll")
+
         positions: dict[str, dict[str, Any]] = {}
         authority: dict[str, dict[str, Any]] = {}
         for item in state.get("positions", []):
@@ -575,6 +580,27 @@ class GuardianShadow:
                 self.note_incomplete("ENGINE_SSE_GAP", {"error": repr(exc)}, critical=bool(self.positions))
                 await asyncio.sleep(1)
 
+    def ingest_engine_event(self, data: dict[str, Any], source: str) -> str | None:
+        event_id = str(data.get("id") or "")
+        if not event_id:
+            event_id = hashlib.sha256(compact_json(data).encode()).hexdigest()
+        if event_id in self.seen_engine_event_ids:
+            return None
+        self.seen_engine_event_ids.add(event_id)
+        self.engine_events.write({
+            "received_at": utc_now(),
+            "received_mono_ns": time.monotonic_ns(),
+            "source": source,
+            "event": data,
+        })
+        typ = str(data.get("type") or "")
+        market = str(data.get("marketId") or "")
+        detail = data.get("detail") or {}
+        if typ == "PAPER_EXECUTION_ERROR" and detail.get("intent") == "RESCUE_SECOND_LEG" and market:
+            self.rescue_error_at[market] = str(data.get("at") or utc_now())
+            return market
+        return None
+
     async def handle_sse(self, event_name: str, data: dict[str, Any]) -> None:
         if event_name == "snapshot":
             engine = data.get("engine") or {}
@@ -593,17 +619,10 @@ class GuardianShadow:
 
         if event_name != "decision":
             return
-        self.engine_events.write({
-            "received_at": utc_now(),
-            "received_mono_ns": time.monotonic_ns(),
-            "event": data,
-        })
+        rescue_market = self.ingest_engine_event(data, source="engine_sse")
+        if rescue_market:
+            await self.evaluate_market(rescue_market, "rescue_execution_error")
         typ = str(data.get("type") or "")
-        market = str(data.get("marketId") or "")
-        detail = data.get("detail") or {}
-        if typ == "PAPER_EXECUTION_ERROR" and detail.get("intent") == "RESCUE_SECOND_LEG" and market:
-            self.rescue_error_at[market] = str(data.get("at") or utc_now())
-            await self.evaluate_market(market, "rescue_execution_error")
         if typ in {
             "PAPER_FILL", "PAPER_ORDER_CREATED", "PAPER_EXECUTION_ERROR",
             "POSITION_UPDATED", "HEDGE_COMPLETE", "RISK_ACCEPT", "RISK_VETO",
