@@ -769,6 +769,39 @@ class GuardianShadow:
             return None
         return book
 
+    def full_sell_economics(
+        self,
+        position: dict[str, Any],
+        held_token: str,
+        held: Book,
+        held_meta: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        qty = D(position["unpairedQuantity"])
+        sell_walk = walk(held, qty, "SELL")
+        if not sell_walk["full"]:
+            return None
+        min_sell = held_meta.get("minOrderSize")
+        if min_sell is None or qty < D(min_sell):
+            return None
+        sell_fee = fee(qty, D(sell_walk["vwap"]), held_meta.get("feeSchedule"))
+        if sell_fee is None:
+            return None
+        up, down = D(position["upQuantity"]), D(position["downQuantity"])
+        paired = min(up, down)
+        inventory_cost = up * D(position["averageUpCost"]) + down * D(position["averageDownCost"])
+        pnl = paired + D(sell_walk["notional"]) - inventory_cost - D(position["totalFees"]) - sell_fee
+        return {
+            **sell_walk,
+            "fee_usd": dec(sell_fee, 5),
+            "guaranteed_terminal_pnl": dec(pnl),
+            "token_id": held_token,
+            "book_source_timestamp": held.source_timestamp,
+            "book_received_at": held.received_at,
+            "book_received_mono_ns": held.received_mono_ns,
+            "book_age_ms": held.age_ms(),
+            "ws_generation": held.ws_generation,
+        }
+
     def economics(self, position: dict[str, Any]) -> dict[str, Any]:
         market = str(position["marketId"])
         held_outcome = str(position["unpairedOutcome"])
@@ -800,22 +833,8 @@ class GuardianShadow:
         result["mark_loss_usd"] = dec(qty * max(avg_cost - best_bid, Decimal(0)))
 
         held_meta = self.token_meta.get(held_token or "", {})
-        sell_walk = walk(held, qty, "SELL")
-        sell_fee = fee(qty, D(sell_walk["vwap"]), held_meta.get("feeSchedule")) if sell_walk["full"] else None
-        min_sell = held_meta.get("minOrderSize")
-        if sell_walk["full"] and sell_fee is not None and min_sell is not None and qty >= D(min_sell):
-            up, down = D(position["upQuantity"]), D(position["downQuantity"])
-            paired = min(up, down)
-            inventory_cost = up * D(position["averageUpCost"]) + down * D(position["averageDownCost"])
-            pnl = paired + D(sell_walk["notional"]) - inventory_cost - D(position["totalFees"]) - sell_fee
-            result["sell"] = {
-                **sell_walk,
-                "fee_usd": dec(sell_fee, 5),
-                "guaranteed_terminal_pnl": dec(pnl),
-                "book_received_at": held.received_at,
-                "book_age_ms": held.age_ms(),
-                "ws_generation": held.ws_generation,
-            }
+        if held_token:
+            result["sell"] = self.full_sell_economics(position, held_token, held, held_meta)
 
         if opp:
             opp_meta = self.token_meta.get(opp_token or "", {})
@@ -1058,8 +1077,8 @@ class GuardianShadow:
         target_ns = int(action["decision_mono_ns"]) + latency_ms * 1_000_000
         market = str(action["market_id"])
         position = action["position"]
-        held_outcome = str(position["unpairedOutcome"])
-        held_token = self.market_tokens.get(market, {}).get(held_outcome)
+        held_token = str(((action.get("economics") or {}).get("held_token")) or "")
+        held_meta = action.get("held_meta") or {}
         deadline_ns = target_ns + 25_000_000
 
         try:
@@ -1081,8 +1100,18 @@ class GuardianShadow:
                 await asyncio.sleep(0.001)
 
             actual_ns = time.monotonic_ns()
-            econ = self.economics(position) if observed_book is not None else None
-            sell_executable = bool(econ and econ.get("sell") is not None)
+            delayed_sell = (
+                self.full_sell_economics(position, held_token, observed_book, held_meta)
+                if observed_book is not None and held_token
+                else None
+            )
+            econ = {
+                "market_id": market,
+                "held_token": held_token,
+                "quantity": str(position.get("unpairedQuantity")),
+                "sell": delayed_sell,
+            } if observed_book is not None else None
+            sell_executable = delayed_sell is not None
             status = "KNOWN" if observed_book is not None and sell_executable else "UNKNOWN"
             self.latency.write({
                 "action_id": action["action_id"],
