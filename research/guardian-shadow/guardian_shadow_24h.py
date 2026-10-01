@@ -434,6 +434,17 @@ class GuardianShadow:
             self.experiment_status == "COMPLETED" and self.bound_experiment_id is not None and self.experiment_id == self.bound_experiment_id
         )
         if active_or_bound_terminal:
+            if not self.experiment_id or not self.experiment_started_at or not self.entry_closes_at:
+                self.note_incomplete(
+                    "EXPERIMENT_MANIFEST_INCOMPLETE",
+                    {
+                        "id": self.experiment_id,
+                        "startedAt": self.experiment_started_at,
+                        "entryClosesAt": self.entry_closes_at,
+                    },
+                )
+                self.stop_reason = "EXPERIMENT_MANIFEST_INCOMPLETE"
+                self.stop.set()
             duration = experiment.get("durationHours")
             git_sha = str(experiment.get("gitSha") or "")
             if duration is None or D(duration) != Decimal("24"):
@@ -710,9 +721,11 @@ class GuardianShadow:
         recv_at, recv_ns = utc_now(), time.monotonic_ns()
         try:
             decoded = json.loads(text)
-        except json.JSONDecodeError:
-            self.observations.write({"at": recv_at, "type": "CLOB_MALFORMED"})
-            return
+        except json.JSONDecodeError as exc:
+            for book in self.books.values():
+                book.trusted = False
+            self.observations.write({"at": recv_at, "type": "CLOB_MALFORMED", "error": repr(exc)})
+            raise RuntimeError("CLOB_MALFORMED") from exc
         events = decoded if isinstance(decoded, list) else [decoded]
         touched: set[str] = set()
         for raw in events:
@@ -744,7 +757,8 @@ class GuardianShadow:
                         continue
                     side = str(ch.get("side") or "").upper()
                     if side not in ("BUY", "SELL"):
-                        continue
+                        book.trusted = False
+                        raise RuntimeError(f"CLOB_INVALID_SIDE:{side}")
                     accepted = book.change(side, str(ch.get("price")), str(ch.get("size", "0")), raw.get("timestamp"), generation)
                     if not accepted:
                         self.observations.write({"at": recv_at, "type": "CLOB_STALE_DROP", "token_id": token})
@@ -797,6 +811,8 @@ class GuardianShadow:
         held_meta: dict[str, Any],
     ) -> dict[str, Any] | None:
         qty = D(position["unpairedQuantity"])
+        if held.token_id != held_token or qty <= 0:
+            return None
         sell_walk = walk(held, qty, "SELL")
         if not sell_walk["full"]:
             return None
@@ -870,7 +886,10 @@ class GuardianShadow:
                     **lock_walk,
                     "fee_usd": dec(lock_fee, 5),
                     "guaranteed_locked_pnl": dec(locked),
+                    "token_id": opp_token,
+                    "book_source_timestamp": opp.source_timestamp,
                     "book_received_at": opp.received_at,
+                    "book_received_mono_ns": opp.received_mono_ns,
                     "book_age_ms": opp.age_ms(),
                     "ws_generation": opp.ws_generation,
                 }
@@ -910,6 +929,14 @@ class GuardianShadow:
                 "at": utc_now(), "type": "AUTHORITY_REVALIDATION_ERROR",
                 "market_id": market, "trigger_source": trigger_source, "error": repr(exc),
             })
+            return None
+
+        if (
+            self.stop.is_set()
+            or not self.experiment_validated
+            or self.bound_experiment_id is None
+            or self.experiment_id != self.bound_experiment_id
+        ):
             return None
 
         position = self.positions.get(market)
@@ -1349,10 +1376,20 @@ class GuardianShadow:
                 encoding="utf-8",
             )
 
-        # Hash the sealed evidence set after all append-only files are closed.
+        # Hash only process-sealed evidence. Externally managed stdout/log/pid
+        # files are intentionally excluded because they may still be open.
+        sealed_names = [
+            "TEST_CONTRACT.md", "manifest.json", "engine_events.jsonl",
+            "position_states.jsonl", "clob_active_markets.jsonl",
+            "guardian_observations.jsonl", "guardian_actions.jsonl",
+            "latency_samples.jsonl", "ledger_samples.jsonl",
+            "book_checkpoints.jsonl", "integrity_events.jsonl",
+            "final_guardian_state.json", "final_dashboard.json",
+            "final_dashboard_error.json", "run_complete.json",
+            "TEST_INCOMPLETE.txt", "live_summary.json",
+        ]
         evidence_files = sorted(
-            p for p in self.out.iterdir()
-            if p.is_file() and p.name not in {"SHA256SUMS.txt"}
+            (self.out / name) for name in sealed_names if (self.out / name).is_file()
         )
         sums = "".join(f"{sha256_file(path)}  {path.name}\n" for path in evidence_files)
         (self.out / "SHA256SUMS.txt").write_text(sums, encoding="utf-8")
