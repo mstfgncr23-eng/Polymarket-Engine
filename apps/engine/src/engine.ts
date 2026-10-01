@@ -5173,11 +5173,13 @@ export class EngineService {
     databaseAvailable: boolean;
     /** Live trigger asset override (trigger.asset) — preserves pre-PR3 semantics. */
     assetOverride?: string | null;
+    /** Read-only observers set false so test/debug instrumentation is not mutated. */
+    instrument?: boolean;
   }): { decision: ReturnType<typeof decidePaperOrder>; duplicateKey: string } {
     const { candidate, consensus, triggerId, signalExpiresAt, snapshot, pair, now, databaseAvailable, assetOverride } = input;
     const duplicateKey = `${candidate.marketId}:${candidate.outcome}:${candidate.intent}`;
     const asset = assetOverride ?? this.assetByMarket.get(candidate.marketId) ?? snapshot.asset ?? null;
-    this.lastRuntimeBasisAssetForTest = asset;
+    if (input.instrument !== false) this.lastRuntimeBasisAssetForTest = asset;
     const exposure = computePaperExposures(this.ledger.positions.values(), candidate.marketId, this.assetByMarket, now.getTime());
     const projected = projectPaperExposures({
       current: exposure,
@@ -5308,6 +5310,114 @@ export class EngineService {
     }).decision;
     this.pr3HedgeDebug.set(marketId, { stage: "DECIDED", vetoes: decision.risk.vetoes });
     return decision;
+  }
+
+  /**
+   * Side-effect-free canonical NORMAL hedge decision for the external Guardian
+   * observer. This deliberately shares the live decision/risk basis but skips
+   * PR3 debug counters/maps and test instrumentation.
+   */
+  private normalHedgeDecisionReadOnly(
+    marketId: string,
+    position: Position,
+    pair: Record<Outcome, MarketSnapshot | null>,
+    now: Date,
+  ): ReturnType<typeof decidePaperOrder> | null {
+    if (!position.unpairedOutcome || d(position.unpairedQuantity).lte(0)) return null;
+    const freshUp = this.freshEarlyCatastrophicSnapshot(pair.UP, now.getTime());
+    const freshDown = this.freshEarlyCatastrophicSnapshot(pair.DOWN, now.getTime());
+    if (!freshUp || !freshDown) return null;
+    const candidate = evaluateNormalHedgeCandidate({
+      position,
+      snapshots: { UP: freshUp, DOWN: freshDown },
+      maxOrderSizeUsd: this.riskLimits.maxOrderSizeUsd,
+      minimumLockedPairEdge: this.riskLimits.minExpectedEdge,
+    });
+    if (!candidate) return null;
+    const snapshot = candidate.outcome === "UP" ? freshUp : freshDown;
+    if (snapshot.tokenId !== candidate.tokenId) return null;
+    return this.decideWithRuntimeBasis({
+      candidate,
+      consensus: HEDGE_CHECK_CONSENSUS,
+      triggerId: "guardian-shadow-normal-check",
+      signalExpiresAt: new Date(now.getTime() + 60_000),
+      snapshot,
+      pair: { UP: freshUp, DOWN: freshDown },
+      now,
+      databaseAvailable: this.state.database === "UP",
+      instrument: false,
+    }).decision;
+  }
+
+  /**
+   * Observation-only authority surface for the external two-stage Guardian
+   * forward soak. No durable state, order state, counters, debug maps, or
+   * economic state are mutated here.
+   */
+  guardianShadowReadState(): Record<string, unknown> {
+    const now = this.nowFn();
+    const positions = [...this.ledger.positions.values()]
+      .filter((position) => position.unpairedOutcome && d(position.unpairedQuantity).gt(0))
+      .map((position) => {
+        const pair = this.snapshots.get(position.marketId);
+        const normalDecision = this.normalHedgeDecisionReadOnly(position.marketId, position, {
+          UP: pair?.UP ?? null,
+          DOWN: pair?.DOWN ?? null,
+        }, now);
+        const oppositeOutcome: Outcome = position.unpairedOutcome === "UP" ? "DOWN" : "UP";
+        const held = position.unpairedOutcome === "UP" ? pair?.UP ?? null : pair?.DOWN ?? null;
+        const opposite = oppositeOutcome === "UP" ? pair?.UP ?? null : pair?.DOWN ?? null;
+        return {
+          position: structuredClone(position),
+          normalHedgeAdmissible: normalDecision?.accepted === true && normalDecision.order != null,
+          normalHedgeVetoes: normalDecision?.risk.vetoes ?? [],
+          normalHedgeOrder: normalDecision?.order ? {
+            tokenId: normalDecision.order.tokenId,
+            outcome: normalDecision.order.outcome,
+            quantity: normalDecision.order.quantity,
+            requestedPrice: normalDecision.order.requestedPrice,
+          } : null,
+          hedgeMakerOwnsResidual: this.activeHedgeMakerOwnsResidual(position.marketId, oppositeOutcome),
+          riskReductionInFlight: this.riskReductionInFlight.has(position.marketId),
+          heldSnapshot: held ? structuredClone(held) : null,
+          oppositeSnapshot: opposite ? structuredClone(opposite) : null,
+        };
+      });
+
+    const tokenMap: Array<Record<string, unknown>> = [];
+    for (const market of this.marketsById.values()) {
+      for (const token of market.tokens) {
+        if (!token.tokenId || !this.tokenIdSet.has(token.tokenId)) continue;
+        const snapshot = this.state.marketSnapshots.get(token.tokenId) ?? null;
+        tokenMap.push({
+          marketId: market.id,
+          tokenId: token.tokenId,
+          outcome: token.outcome,
+          asset: market.asset ?? null,
+          minOrderSize: snapshot?.minOrderSize ?? null,
+          tickSize: snapshot?.tickSize ?? null,
+          feeSchedule: market.feeSchedule ? structuredClone(market.feeSchedule) : snapshot?.feeSchedule ? structuredClone(snapshot.feeSchedule) : null,
+          sourceTimestamp: snapshot?.sourceTimestamp ?? null,
+          receivedAt: snapshot?.receivedAt ?? null,
+        });
+      }
+    }
+
+    return {
+      paperMode: true,
+      generatedAt: now.toISOString(),
+      experiment: this.experiment ? structuredClone(this.experiment) : null,
+      riskConfiguration: {
+        maxOrderSizeUsd: this.riskLimits.maxOrderSizeUsd,
+        minExpectedEdge: this.riskLimits.minExpectedEdge,
+        staleFeedTimeoutMs: this.riskLimits.staleFeedTimeoutMs,
+        catastrophicPairLockMinUnhedgedMs: this.riskLimits.catastrophicPairLockMinUnhedgedMs,
+        catastrophicPairLockTriggerLossUsd: this.riskLimits.catastrophicPairLockTriggerLossUsd,
+        catastrophicPairLockMaxLockedLossUsd: this.riskLimits.catastrophicPairLockMaxLockedLossUsd,
+      },
+      positions,
+      tokenMap,
+    };
   }
 
   /** Test hook: last PR3 hedge-check gating reason per market. */
