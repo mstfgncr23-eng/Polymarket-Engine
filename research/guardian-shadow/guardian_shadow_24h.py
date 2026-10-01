@@ -1028,6 +1028,7 @@ class GuardianShadow:
             "trigger_source": trigger_source,
             "failure_reason": failure_reason,
             "policy": "TWO_STAGE_GUARDIAN_V1_LOCKED",
+            "evidence_class": "FORWARD_CONTEMPORANEOUS_SHADOW",
             "position": current_position,
             "canonical_authority": authority,
             "economics": current_econ,
