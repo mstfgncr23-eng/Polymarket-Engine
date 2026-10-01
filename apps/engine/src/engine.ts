@@ -5417,7 +5417,7 @@ export class EngineService {
       },
       positions,
       tokenMap,
-      recentRiskEvents: this.state.decisionFeedForObservation(200).filter((item) =>
+      recentRiskEvents: this.state.decisionFeedForObservation(500).filter((item) =>
         item.type === "PAPER_EXECUTION_ERROR"
         || item.type === "RISK_REDUCTION_LIFECYCLE_BLOCKED"
         || item.type === "PAPER_ORDER_CREATED"
@@ -5425,7 +5425,7 @@ export class EngineService {
         || item.type === "HEDGE_COMPLETE"
         || item.type === "RISK_ACCEPT"
         || item.type === "RISK_VETO"
-      ),
+      ).slice(0, 200),
     };
   }
 
