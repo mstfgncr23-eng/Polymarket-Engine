@@ -99,6 +99,16 @@ class Book:
 
     def set_full(self, raw: dict[str, Any], generation: int) -> bool:
         incoming_ms = parse_source_ms(raw.get("timestamp"))
+        if incoming_ms is None:
+            self.trusted = False
+            raise ValueError("CLOB_SOURCE_TIMESTAMP_MISSING")
+        for side_name in ("bids", "asks"):
+            for level in raw.get(side_name, []):
+                price = D(level.get("price"))
+                size = D(level.get("size", level.get("quantity", "0")))
+                if price <= 0 or price > 1 or size < 0:
+                    self.trusted = False
+                    raise ValueError(f"CLOB_INVALID_LEVEL:{side_name}:{price}:{size}")
         if (
             generation == self.ws_generation
             and incoming_ms is not None
@@ -122,6 +132,14 @@ class Book:
 
     def change(self, side: str, price: str, size: str, source_ts: Any, generation: int) -> bool:
         incoming_ms = parse_source_ms(source_ts)
+        if incoming_ms is None:
+            self.trusted = False
+            raise ValueError("CLOB_SOURCE_TIMESTAMP_MISSING")
+        parsed_price = D(price)
+        parsed_size = D(size)
+        if parsed_price <= 0 or parsed_price > 1 or parsed_size < 0:
+            self.trusted = False
+            raise ValueError(f"CLOB_INVALID_CHANGE:{side}:{parsed_price}:{parsed_size}")
         if (
             generation == self.ws_generation
             and incoming_ms is not None
@@ -193,6 +211,8 @@ def walk(book: Book, qty: Decimal, side: str, max_notional: Decimal = MAX_ORDER_
 def fee(qty: Decimal, price: Decimal, schedule: dict[str, Any] | None) -> Decimal | None:
     if not schedule:
         return None
+    if qty < 0 or price < 0 or price > 1:
+        raise ValueError(f"INVALID_FEE_INPUT:{qty}:{price}")
     rate = D(schedule.get("rate", "0"))
     exponent = int(schedule.get("exponent", 1))
     value = qty * rate * ((price * (Decimal(1) - price)) ** exponent)
