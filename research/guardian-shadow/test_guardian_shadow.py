@@ -228,6 +228,66 @@ class ShadowCase(unittest.IsolatedAsyncioTestCase):
         finally:
             await self.close_shadow(temp, shadow)
 
+    async def test_authority_poll_replays_newest_first_risk_feed_chronologically(self):
+        temp, shadow = self.make_shadow()
+        try:
+            start = shadow.positions["m"]["unhedgedStartedAt"]
+            state = {
+                "paperMode": True,
+                "experiment": {
+                    "id": "exp",
+                    "status": "RUNNING",
+                    "durationHours": 24,
+                    "gitSha": "a" * 40,
+                    "closePolicy": "observe_until_settlement",
+                    "startedAt": "2026-01-01T00:00:00.000Z",
+                    "entryClosesAt": "2026-01-02T00:00:00.000Z",
+                    "unresolvedPositionCount": 1,
+                },
+                "riskConfiguration": {
+                    "maxOrderSizeUsd": 25,
+                    "minExpectedEdge": 0.015,
+                    "staleFeedTimeoutMs": 15000,
+                    "catastrophicPairLockMinUnhedgedMs": 10000,
+                    "catastrophicPairLockTriggerLossUsd": 0.35,
+                    "catastrophicPairLockMaxLockedLossUsd": 0.60,
+                },
+                "positions": [{
+                    "position": shadow.positions["m"],
+                    "normalHedgeAdmissible": False,
+                    "normalHedgeVetoes": [],
+                    "hedgeMakerOwnsResidual": False,
+                    "riskReductionInFlight": False,
+                }],
+                "tokenMap": list(shadow.token_meta.values()),
+                # Engine feed order is newest-first: failure appears before create.
+                "recentRiskEvents": [
+                    {
+                        "id": "failure",
+                        "at": "2026-01-01T00:00:02.000Z",
+                        "type": "RISK_REDUCTION_LIFECYCLE_BLOCKED",
+                        "marketId": "m",
+                        "detail": {"intent": "RESCUE_SECOND_LEG", "orderId": "o1"},
+                    },
+                    {
+                        "id": "created",
+                        "at": "2026-01-01T00:00:01.000Z",
+                        "type": "PAPER_ORDER_CREATED",
+                        "marketId": "m",
+                        "detail": {
+                            "intent": "RESCUE_SECOND_LEG",
+                            "orderId": "o1",
+                            "deRisk": {"unhedgedStartedAt": start},
+                        },
+                    },
+                ],
+            }
+            await shadow.apply_guardian_state(state, "unit_authority_poll", evaluate=False)
+            self.assertTrue(shadow.rescue_error_for_episode("m", shadow.positions["m"]))
+            self.assertNotIn("RESCUE_FAILURE_EPISODE_UNBOUND", shadow.incomplete_reasons)
+        finally:
+            await self.close_shadow(temp, shadow)
+
     async def test_position_activation_without_trusted_books_invalidates_evidence(self):
         temp, shadow = self.make_shadow()
         try:

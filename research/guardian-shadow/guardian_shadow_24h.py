@@ -591,7 +591,10 @@ class GuardianShadow:
                 "active_markets": sorted(self.positions),
             })
 
-        for event in state.get("recentRiskEvents", []):
+        # The engine decision feed is newest-first. Replay it oldest-first so
+        # PAPER_ORDER_CREATED establishes order -> episode identity before a
+        # later lifecycle/error event for the same rescue order is classified.
+        for event in reversed(state.get("recentRiskEvents", [])):
             if isinstance(event, dict):
                 self.ingest_engine_event(event, source="authority_poll")
 
