@@ -183,7 +183,15 @@ class ShadowCase(unittest.IsolatedAsyncioTestCase):
         temp, shadow = self.make_shadow()
         try:
             shadow.books["d"] = full_book("d", {"0.09": "100"}, {"0.10": "100"})
-            shadow.rescue_error_at["m"] = "2026-01-01T00:00:01.000Z"
+            start = shadow.positions["m"]["unhedgedStartedAt"]
+            identity = gs.rescue_episode_identity("m", start)
+            shadow.rescue_failure_episodes[identity] = {
+                "event_id": "e1",
+                "event_type": "PAPER_EXECUTION_ERROR",
+                "at": "2026-01-01T00:00:01.000Z",
+                "order_id": "o1",
+                "unhedged_started_at": start,
+            }
             async def revalidate(market, key, source):
                 return shadow.positions[market], shadow.authority[market]
             async def no_latency(action, ms):
@@ -196,6 +204,38 @@ class ShadowCase(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(shadow.helper_actions, 1)
             action = json.loads((Path(temp.name) / "guardian_actions.jsonl").read_text().strip())
             self.assertEqual(action["failure_reason"], "RESCUE_EXECUTION_ERROR")
+        finally:
+            await self.close_shadow(temp, shadow)
+
+    async def test_rescue_failure_never_carries_into_a_new_episode(self):
+        temp, shadow = self.make_shadow()
+        try:
+            current = shadow.positions["m"]
+            current_start = current["unhedgedStartedAt"]
+            shadow.rescue_failure_episodes[gs.rescue_episode_identity("m", current_start)] = {
+                "event_id": "e1",
+                "event_type": "PAPER_EXECUTION_ERROR",
+                "at": "2026-01-01T00:00:01.000Z",
+                "order_id": "o1",
+                "unhedged_started_at": current_start,
+            }
+            self.assertTrue(shadow.rescue_error_for_episode("m", current))
+
+            newer = dict(current)
+            newer["unhedgedStartedAt"] = "2026-01-01T00:01:00.000Z"
+            newer["openedAt"] = "2026-01-01T00:01:00.000Z"
+            self.assertFalse(shadow.rescue_error_for_episode("m", newer))
+        finally:
+            await self.close_shadow(temp, shadow)
+
+    async def test_position_activation_without_trusted_books_invalidates_evidence(self):
+        temp, shadow = self.make_shadow()
+        try:
+            shadow.positions = {}
+            shadow.position_fingerprint = ""
+            shadow.books["u"].trusted = False
+            await shadow.set_positions({"m": position()}, "unit_activation", evaluate=False)
+            self.assertIn("POSITION_ACTIVATED_WITHOUT_TRUSTED_BOOKS", shadow.incomplete_reasons)
         finally:
             await self.close_shadow(temp, shadow)
 
@@ -244,6 +284,19 @@ class ShadowCase(unittest.IsolatedAsyncioTestCase):
 
 
 class PureMathCase(unittest.TestCase):
+    def test_completion_residue_gate_requires_zero_positions_and_reserved_cash(self):
+        good_state = {"positions": [], "experiment": {"unresolvedPositionCount": 0}}
+        good_dashboard = {"positions": [], "balance": {"reservedCash": "0"}}
+        self.assertEqual(gs.completion_residue_reasons(good_state, good_dashboard), [])
+
+        bad_state = {"positions": [{"marketId": "m"}], "experiment": {"unresolvedPositionCount": 1}}
+        bad_dashboard = {"positions": [{"marketId": "m"}], "balance": {"reservedCash": "1.25"}}
+        reasons = set(gs.completion_residue_reasons(bad_state, bad_dashboard))
+        self.assertIn("FINAL_UNPAIRED_POSITIONS_REMAIN", reasons)
+        self.assertIn("FINAL_UNRESOLVED_POSITIONS_REMAIN", reasons)
+        self.assertIn("FINAL_OPEN_POSITIONS_REMAIN", reasons)
+        self.assertIn("FINAL_RESERVED_CASH_REMAIN", reasons)
+
     def test_walk_skips_zero_price_and_enforces_notional_cap(self):
         book = full_book("x", {}, {"0": "100", "0.50": "100"})
         result = gs.walk(book, Decimal("10"), "BUY", Decimal("25"))

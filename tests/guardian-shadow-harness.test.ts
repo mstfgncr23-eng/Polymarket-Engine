@@ -52,6 +52,9 @@ describe("guardian shadow harness", () => {
     expect(text).toContain('PAIR_LOCK_CAP = Decimal("0.60")');
     expect(text).toContain('EXPECTED_CONTRACT_SHA256 = "545fd28c6452d2b5af6ed69c74b1cb4aff1423562311e91f88b44650a83aa9a9"');
     expect(text).toContain("revalidate_authority");
+    expect(text).toContain("rescue_episode_identity");
+    expect(text).toContain("POSITION_ACTIVATED_WITHOUT_TRUSTED_BOOKS");
+    expect(text).toContain("FINAL_RESERVED_CASH_REMAIN");
     expect(text).toContain('authority.get("normalHedgeAdmissible") is True');
     expect(text).toContain('authority.get("hedgeMakerOwnsResidual") is True');
     expect(text).toContain('authority.get("riskReductionInFlight") is True');

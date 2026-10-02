@@ -5433,9 +5433,6 @@ export class EngineService {
     };
   }
 
-  /** Test hook: canonical PR3 hedge decisions, used to prove read-only shadow observation. */
-  pr3HedgeDecisionCountForTest(): number { return this.pr3HedgeDecisionCount; }
-
   /** Test hook: last PR3 hedge-check gating reason per market. */
   pr3HedgeDebugForTest(marketId: string): { stage: string; vetoes: string[] | null } | null {
     return this.pr3HedgeDebug.get(marketId) ?? null;

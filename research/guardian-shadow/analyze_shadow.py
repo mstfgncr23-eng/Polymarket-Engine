@@ -101,6 +101,17 @@ def main() -> None:
         reasons.append("EXPERIMENT_ID_MISMATCH")
     if run_complete.get("paper_only") is not True:
         reasons.append("PAPER_SAFETY_NOT_PROVEN")
+    if run_complete.get("final_open_positions") != 0:
+        reasons.append(f"FINAL_OPEN_POSITIONS:{run_complete.get('final_open_positions')}")
+    if run_complete.get("final_unpaired_positions") != 0:
+        reasons.append(f"FINAL_UNPAIRED_POSITIONS:{run_complete.get('final_unpaired_positions')}")
+    if run_complete.get("final_unresolved_position_count") != 0:
+        reasons.append(f"FINAL_UNRESOLVED_POSITIONS:{run_complete.get('final_unresolved_position_count')}")
+    try:
+        if Decimal(str(run_complete.get("final_reserved_cash"))) != 0:
+            reasons.append(f"FINAL_RESERVED_CASH:{run_complete.get('final_reserved_cash')}")
+    except Exception:
+        reasons.append("FINAL_RESERVED_CASH_INVALID")
 
     manifest_path = root / "manifest.json"
     contract_path = root / "TEST_CONTRACT.md"

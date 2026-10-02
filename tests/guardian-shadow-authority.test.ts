@@ -88,9 +88,22 @@ describe("guardian shadow canonical authority surface", () => {
     await engine.start();
     try {
       await market.waitForHandlers();
-      await market.emitSnapshot(book("UP", [{ price: "0.70", quantity: "1000" }], [{ price: "0.81", quantity: "1000" }]));
-      await market.emitSnapshot(book("DOWN", [{ price: "0.04", quantity: "1000" }], [{ price: "0.05", quantity: "10000" }]));
+      const upBook = book("UP", [{ price: "0.70", quantity: "1000" }], [{ price: "0.81", quantity: "1000" }]);
+      const downBook = book("DOWN", [{ price: "0.04", quantity: "1000" }], [{ price: "0.05", quantity: "10000" }]);
+      await market.emitSnapshot(upBook);
+      await market.emitSnapshot(downBook);
       await engine.applyObservedFill(firstLeg(), "OPEN_FIRST_LEG");
+
+      const currentPosition = engine.ledger.positions.get("btc-mkt");
+      expect(currentPosition).toBeDefined();
+      const canonicalNormal = engine.normalHedgeDecisionForTest(
+        "btc-mkt",
+        currentPosition!,
+        { UP: upBook, DOWN: downBook },
+        new Date(START),
+      );
+      const expectedNormalAdmissible = canonicalNormal?.accepted === true && canonicalNormal.order != null;
+      const expectedNormalVetoes = canonicalNormal?.risk.vetoes ?? [];
 
       const ledgerBefore = engine.ledger.snapshot();
       const positionBefore = structuredClone(engine.ledger.positions.get("btc-mkt"));
@@ -117,6 +130,8 @@ describe("guardian shadow canonical authority surface", () => {
       expect(first.paperMode).toBe(true);
       expect(first.positions).toHaveLength(1);
       expect(first.positions[0]?.position.marketId).toBe("btc-mkt");
+      expect(first.positions[0]?.normalHedgeAdmissible).toBe(expectedNormalAdmissible);
+      expect(first.positions[0]?.normalHedgeVetoes).toEqual(expectedNormalVetoes);
       expect(first.riskConfiguration).toMatchObject({
         maxOrderSizeUsd: 25,
         minExpectedEdge: 0.015,

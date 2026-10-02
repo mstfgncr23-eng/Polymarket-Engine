@@ -229,6 +229,58 @@ def episode_key(position: dict[str, Any]) -> str:
     ])
 
 
+def rescue_episode_identity(market: str, unhedged_started_at: Any) -> str:
+    return f"{market}|{str(unhedged_started_at)}"
+
+
+def completion_residue_reasons(
+    final_state: dict[str, Any] | None,
+    final_dashboard: dict[str, Any] | None,
+) -> list[str]:
+    reasons: list[str] = []
+    if not isinstance(final_state, dict):
+        return ["FINAL_GUARDIAN_STATE_UNAVAILABLE"]
+
+    state_positions = final_state.get("positions")
+    if not isinstance(state_positions, list):
+        reasons.append("FINAL_STATE_POSITIONS_MISSING")
+    elif state_positions:
+        reasons.append("FINAL_UNPAIRED_POSITIONS_REMAIN")
+
+    experiment = final_state.get("experiment") or {}
+    unresolved = experiment.get("unresolvedPositionCount") if isinstance(experiment, dict) else None
+    if unresolved is None:
+        reasons.append("FINAL_UNRESOLVED_COUNT_MISSING")
+    else:
+        try:
+            if int(unresolved) != 0:
+                reasons.append("FINAL_UNRESOLVED_POSITIONS_REMAIN")
+        except (TypeError, ValueError):
+            reasons.append("FINAL_UNRESOLVED_COUNT_INVALID")
+
+    if not isinstance(final_dashboard, dict):
+        reasons.append("FINAL_DASHBOARD_UNAVAILABLE")
+        return reasons
+
+    dashboard_positions = final_dashboard.get("positions")
+    if not isinstance(dashboard_positions, list):
+        reasons.append("FINAL_DASHBOARD_POSITIONS_MISSING")
+    elif dashboard_positions:
+        reasons.append("FINAL_OPEN_POSITIONS_REMAIN")
+
+    balance = final_dashboard.get("balance") or {}
+    reserved = balance.get("reservedCash") if isinstance(balance, dict) else None
+    if reserved is None:
+        reasons.append("FINAL_RESERVED_CASH_UNKNOWN")
+    else:
+        try:
+            if D(reserved) != 0:
+                reasons.append("FINAL_RESERVED_CASH_REMAIN")
+        except Exception:
+            reasons.append("FINAL_RESERVED_CASH_INVALID")
+    return reasons
+
+
 class GuardianShadow:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -260,7 +312,8 @@ class GuardianShadow:
         self.position_fingerprint = ""
         self.shadow_closed: set[str] = set()
         self.last_status: dict[str, str] = {}
-        self.rescue_error_at: dict[str, str] = {}
+        self.rescue_order_episode: dict[str, str] = {}
+        self.rescue_failure_episodes: dict[str, dict[str, Any]] = {}
         self.seen_engine_event_ids: set[str] = set()
         self.latency_tasks: set[asyncio.Task[Any]] = set()
         self.latency_watch_until_ns: dict[str, int] = {}
@@ -330,6 +383,25 @@ class GuardianShadow:
             "bids": [[dec(p), dec(q)] for p, q in book.levels("SELL")],
             "asks": [[dec(p), dec(q)] for p, q in book.levels("BUY")],
         }
+
+    def evidence_window_active(self) -> bool:
+        return (
+            self.bound_experiment_id is not None
+            and self.experiment_id == self.bound_experiment_id
+            and self.experiment_status in ("RUNNING", "ENTRY_CLOSED")
+        )
+
+    def position_direct_books_ready(self, position: dict[str, Any]) -> bool:
+        market = str(position.get("marketId") or "")
+        held_outcome = str(position.get("unpairedOutcome") or "")
+        if held_outcome not in ("UP", "DOWN"):
+            return False
+        opposite_outcome = "DOWN" if held_outcome == "UP" else "UP"
+        mapping = self.market_tokens.get(market, {})
+        return (
+            self.fresh_book(mapping.get(held_outcome)) is not None
+            and self.fresh_book(mapping.get(opposite_outcome)) is not None
+        )
 
     def write_book_checkpoint(self, market: str, reason: str) -> None:
         position = self.positions.get(market)
@@ -461,6 +533,14 @@ class GuardianShadow:
                 )
                 self.stop_reason = "EXPERIMENT_GIT_SHA_MISMATCH"
                 self.stop.set()
+            close_policy = str(experiment.get("closePolicy") or "")
+            if close_policy != "observe_until_settlement":
+                self.note_incomplete(
+                    "EXPERIMENT_CLOSE_POLICY_MISMATCH",
+                    {"expected": "observe_until_settlement", "observed": close_policy, "experiment_id": self.experiment_id},
+                )
+                self.stop_reason = "EXPERIMENT_CLOSE_POLICY_MISMATCH"
+                self.stop.set()
 
             if self.experiment_started_at and self.entry_closes_at:
                 try:
@@ -556,6 +636,16 @@ class GuardianShadow:
             })
         self.positions = positions
         for market in set(positions) - previous_markets:
+            position = positions[market]
+            if self.evidence_window_active() and not self.position_direct_books_ready(position):
+                self.note_incomplete(
+                    "POSITION_ACTIVATED_WITHOUT_TRUSTED_BOOKS",
+                    {
+                        "market_id": market,
+                        "episode_key": episode_key(position),
+                        "source": source,
+                    },
+                )
             self.write_book_checkpoint(market, "POSITION_ACTIVATED")
         if evaluate:
             for market in positions:
@@ -579,7 +669,11 @@ class GuardianShadow:
                     self.last_ledger_write = now
             except Exception as exc:
                 self.observations.write({"at": utc_now(), "type": "STATE_POLL_ERROR", "error": repr(exc)})
-                self.note_incomplete("STATE_POLL_ERROR", {"error": repr(exc)}, critical=bool(self.positions))
+                self.note_incomplete(
+                    "STATE_POLL_ERROR",
+                    {"error": repr(exc)},
+                    critical=bool(self.positions) or self.evidence_window_active(),
+                )
             try:
                 await asyncio.wait_for(self.refresh.wait(), timeout=1.0)
                 self.refresh.clear()
@@ -612,7 +706,11 @@ class GuardianShadow:
                             break
             except Exception as exc:
                 self.observations.write({"at": utc_now(), "type": "SSE_ERROR", "error": repr(exc)})
-                self.note_incomplete("ENGINE_SSE_GAP", {"error": repr(exc)}, critical=bool(self.positions))
+                self.note_incomplete(
+                    "ENGINE_SSE_GAP",
+                    {"error": repr(exc)},
+                    critical=bool(self.positions) or self.evidence_window_active(),
+                )
                 await asyncio.sleep(1)
 
     def ingest_engine_event(self, data: dict[str, Any], source: str) -> str | None:
@@ -630,14 +728,46 @@ class GuardianShadow:
         })
         typ = str(data.get("type") or "")
         market = str(data.get("marketId") or "")
-        detail = data.get("detail") or {}
-        rescue_failure = (
-            typ == "PAPER_EXECUTION_ERROR"
-            or typ == "RISK_REDUCTION_LIFECYCLE_BLOCKED"
-        )
-        if rescue_failure and detail.get("intent") == "RESCUE_SECOND_LEG" and market:
-            self.rescue_error_at[market] = str(data.get("at") or utc_now())
-            return market
+        detail_raw = data.get("detail") or {}
+        detail = detail_raw if isinstance(detail_raw, dict) else {}
+        intent = str(detail.get("intent") or "")
+        order_id = str(detail.get("orderId") or "")
+        de_risk_raw = detail.get("deRisk") or {}
+        de_risk = de_risk_raw if isinstance(de_risk_raw, dict) else {}
+        unhedged_started_at = de_risk.get("unhedgedStartedAt")
+
+        if typ == "PAPER_ORDER_CREATED" and intent == "RESCUE_SECOND_LEG" and market and order_id and unhedged_started_at:
+            self.rescue_order_episode[order_id] = rescue_episode_identity(market, unhedged_started_at)
+
+        rescue_failure = typ in ("PAPER_EXECUTION_ERROR", "RISK_REDUCTION_LIFECYCLE_BLOCKED")
+        if rescue_failure and intent == "RESCUE_SECOND_LEG" and market:
+            identity = (
+                rescue_episode_identity(market, unhedged_started_at)
+                if unhedged_started_at
+                else self.rescue_order_episode.get(order_id)
+            )
+            if identity:
+                self.rescue_failure_episodes[identity] = {
+                    "event_id": event_id,
+                    "event_type": typ,
+                    "at": str(data.get("at") or utc_now()),
+                    "order_id": order_id or None,
+                    "unhedged_started_at": unhedged_started_at,
+                }
+                return market
+            self.observations.write({
+                "at": utc_now(),
+                "type": "RESCUE_FAILURE_EPISODE_UNBOUND",
+                "market_id": market,
+                "event_id": event_id,
+                "event_type": typ,
+                "order_id": order_id or None,
+            })
+            self.note_incomplete(
+                "RESCUE_FAILURE_EPISODE_UNBOUND",
+                {"market_id": market, "event_id": event_id, "event_type": typ, "order_id": order_id or None},
+                critical=market in self.positions or self.evidence_window_active(),
+            )
         return None
 
     async def handle_sse(self, event_name: str, data: dict[str, Any]) -> None:
@@ -904,20 +1034,10 @@ class GuardianShadow:
         return result
 
     def rescue_error_for_episode(self, market: str, position: dict[str, Any]) -> bool:
-        error_at = self.rescue_error_at.get(market)
         episode_started = position.get("unhedgedStartedAt") or position.get("openedAt")
-        if not error_at or not episode_started:
+        if not episode_started:
             return False
-        try:
-            error_dt = datetime.fromisoformat(error_at.replace("Z", "+00:00"))
-            start_dt = datetime.fromisoformat(str(episode_started).replace("Z", "+00:00"))
-            return error_dt >= start_dt
-        except ValueError:
-            self.note_incomplete(
-                "INVALID_EPISODE_TIMESTAMP",
-                {"market_id": market, "error_at": error_at, "episode_started": episode_started},
-            )
-            return False
+        return rescue_episode_identity(market, episode_started) in self.rescue_failure_episodes
 
     async def revalidate_authority(
         self,
@@ -1328,7 +1448,10 @@ class GuardianShadow:
             )
 
         # Seal one final canonical authority read. Failure here invalidates a
-        # COMPLETE claim because experiment identity/status could not be proven.
+        # COMPLETE claim because experiment identity/status and zero economic
+        # residue could not be proven.
+        final_state: dict[str, Any] | None = None
+        final_dashboard: dict[str, Any] | None = None
         try:
             final_state = await self.get_json("/api/shadow/guardian-state")
             await self.apply_guardian_state(final_state, "final_state", evaluate=False)
@@ -1337,10 +1460,34 @@ class GuardianShadow:
             self.note_incomplete("FINAL_GUARDIAN_STATE_UNAVAILABLE", {"error": repr(exc)})
 
         try:
-            self.atomic_json("final_dashboard.json", await self.get_json("/api/dashboard"))
+            final_dashboard = await self.get_json("/api/dashboard")
+            self.atomic_json("final_dashboard.json", final_dashboard)
         except Exception as exc:
             self.atomic_json("final_dashboard_error.json", {"at": utc_now(), "error": repr(exc)})
             self.note_incomplete("FINAL_DASHBOARD_UNAVAILABLE", {"error": repr(exc)})
+
+        residue_reasons = completion_residue_reasons(final_state, final_dashboard)
+        for reason in residue_reasons:
+            self.note_incomplete(reason, {"phase": "final_completion_seal"})
+
+        final_open_positions = (
+            len(final_dashboard.get("positions") or [])
+            if isinstance(final_dashboard, dict) and isinstance(final_dashboard.get("positions"), list)
+            else None
+        )
+        final_unpaired_positions = (
+            len(final_state.get("positions") or [])
+            if isinstance(final_state, dict) and isinstance(final_state.get("positions"), list)
+            else None
+        )
+        final_experiment = final_state.get("experiment") if isinstance(final_state, dict) else None
+        final_unresolved_count = (
+            final_experiment.get("unresolvedPositionCount")
+            if isinstance(final_experiment, dict)
+            else None
+        )
+        final_balance = final_dashboard.get("balance") if isinstance(final_dashboard, dict) else None
+        final_reserved_cash = final_balance.get("reservedCash") if isinstance(final_balance, dict) else None
 
         complete = (
             self.bound_experiment_id is not None
@@ -1368,6 +1515,11 @@ class GuardianShadow:
             "worst_helper_guaranteed_pnl": str(self.min_helper_pnl) if self.min_helper_pnl is not None else None,
             "raw_active_market_events": self.raw_events,
             "paper_only": True,
+            "final_open_positions": final_open_positions,
+            "final_unpaired_positions": final_unpaired_positions,
+            "final_unresolved_position_count": final_unresolved_count,
+            "final_reserved_cash": final_reserved_cash,
+            "completion_residue_reasons": residue_reasons,
         })
 
         self.sync_writers()

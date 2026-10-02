@@ -17,6 +17,9 @@ This directory is observation-only. It must not submit a Polymarket order, mutat
 9. No partial success is invented.
 10. Once the helper acts for an episode, that episode is counterfactually closed for the primary shadow policy. The real PAPER engine remains untouched.
 11. Capture real-time post-decision state at 25/50/100/150/250/500 ms. No historical interpolation.
+12. A rescue execution failure belongs only to the exact `market + unhedgedStartedAt` episode carried by canonical de-risk evidence; it never leaks into a later episode.
+13. A newly activated exposure without trusted direct books is an evidence-integrity failure, not an inferred fill.
+14. The run may seal `COMPLETE` only when the canonical experiment is completed and final open positions, unpaired positions, unresolved count, and reserved cash are all zero.
 
 ## Historical lock
 
