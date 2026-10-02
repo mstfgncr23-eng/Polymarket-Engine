@@ -311,6 +311,8 @@ class ShadowCase(unittest.IsolatedAsyncioTestCase):
                 "market_id": "m",
                 "position": shadow.positions["m"],
                 "decision_mono_ns": target_anchor_ns - 25_000_000,
+                "economics": {"held_token": "u"},
+                "held_meta": shadow.token_meta["u"],
             }
             book = shadow.books["u"]
             book._stamp("1767225600030", 1)
@@ -330,6 +332,8 @@ class ShadowCase(unittest.IsolatedAsyncioTestCase):
                 "market_id": "m",
                 "position": shadow.positions["m"],
                 "decision_mono_ns": gs.time.monotonic_ns(),
+                "economics": {"held_token": "u"},
+                "held_meta": shadow.token_meta["u"],
             }
             await shadow.capture_latency(action2, 1)
             rows = [
