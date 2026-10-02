@@ -60,7 +60,7 @@ describe("guardian shadow harness", () => {
     expect(text).toContain('authority.get("riskReductionInFlight") is True');
     expect(text).toContain("book.received_mono_ns >= target_ns");
     expect(text).toContain("book.received_mono_ns <= deadline_ns");
-    expect(text).toContain('status = "KNOWN" if observed and sell_executable else "UNKNOWN"');
+    expect(text).toContain('status = "KNOWN" if observed_book is not None and sell_executable else "UNKNOWN"');
     expect(text).toContain("wss://ws-subscriptions-clob.polymarket.com/ws/market");
     expect(text).not.toContain("py_clob_client");
     expect(text).not.toContain("create_order");

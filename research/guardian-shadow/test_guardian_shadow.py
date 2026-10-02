@@ -302,21 +302,21 @@ class ShadowCase(unittest.IsolatedAsyncioTestCase):
     async def test_latency_known_requires_new_full_sell_state_inside_25ms_window(self):
         temp, shadow = self.make_shadow()
         try:
+            # Make the target effectively "now", then stamp a genuinely
+            # post-target local receipt. This tests the exact +25ms contract
+            # without depending on CI scheduler timing.
+            target_anchor_ns = gs.time.monotonic_ns()
             action = {
                 "action_id": "a1",
                 "market_id": "m",
                 "position": shadow.positions["m"],
-                "decision_mono_ns": gs.time.monotonic_ns(),
+                "decision_mono_ns": target_anchor_ns - 25_000_000,
             }
+            book = shadow.books["u"]
+            book._stamp("1767225600030", 1)
+            self.assertGreaterEqual(book.received_mono_ns, target_anchor_ns)
 
-            async def update_after_target():
-                await asyncio.sleep(0.030)
-                book = shadow.books["u"]
-                book._stamp("1767225600030", 1)
-
-            updater = asyncio.create_task(update_after_target())
             await shadow.capture_latency(action, 25)
-            await updater
             rows = [
                 json.loads(line)
                 for line in (Path(temp.name) / "latency_samples.jsonl").read_text().splitlines()

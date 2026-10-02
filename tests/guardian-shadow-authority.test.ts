@@ -149,7 +149,7 @@ describe("guardian shadow canonical authority surface", () => {
       expect(engine.reservedCash()).toBe(reservedBefore);
       expect(engine.pr3HedgeDecisionCountForTest()).toBe(pr3CountBefore);
       expect(engine.runtimeBasisAssetForTest()).toBe(runtimeAssetBefore);
-      expect((await journal.queryEvents({})).toHaveLength(journalBefore);
+      expect(await journal.queryEvents({})).toHaveLength(journalBefore);
     } finally {
       await engine.stop();
     }
