@@ -25,6 +25,7 @@ MAX_ORDER_SIZE_USD = Decimal("25")
 STALE_BOOK_SECONDS = 15.0
 LATENCY_MS = (25, 50, 100, 150, 250, 500)
 CLOB_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+SSE_READ_BUFSIZE = 2 * 1024 * 1024
 CONTRACT_PATH = Path(__file__).with_name("TEST_CONTRACT.md")
 EXPECTED_CONTRACT_SHA256 = "545fd28c6452d2b5af6ed69c74b1cb4aff1423562311e91f88b44650a83aa9a9"
 
@@ -1561,7 +1562,7 @@ class GuardianShadow:
         timeout = aiohttp.ClientTimeout(total=None, sock_connect=10, sock_read=None)
         fatal: Exception | None = None
         tasks: list[asyncio.Task[Any]] = []
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with aiohttp.ClientSession(timeout=timeout, read_bufsize=SSE_READ_BUFSIZE) as session:
             self.session = session
             try:
                 await self.preflight()
