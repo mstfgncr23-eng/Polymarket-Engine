@@ -3,6 +3,7 @@ import {
   experimentManifestSchema,
   ledgerStateSchema,
   paperFillSchema,
+  paperOrderSchema,
   PaperLedger,
   positionSchema,
   restingPaperOrderSchema,
@@ -29,7 +30,8 @@ import { z, ZodError } from "zod";
  *    EXPERIMENT_STARTED, EXPERIMENT_START_VALIDATED, EXPERIMENT_START_ABORTED,
  *    EXPERIMENT_ENTRY_CLOSED, EXPERIMENT_COMPLETED
  *    PAPER_MAKER_RESERVED, PAPER_MAKER_RELEASED, PAPER_ORDER_CANCELLED
- *    PAPER_FILL (taker + maker partial/full)
+ *    RISK_REDUCTION_ADMITTED, RISK_REDUCTION_FAILED (shared taker ownership)
+ *    PAPER_FILL (taker + maker partial/full; releases matching taker ownership)
  *    POSITION_SETTLED (includes resolution payoffs; no provider call on replay)
  *    LEDGER_MARK_TO_MARKET, INFRASTRUCTURE_COST_ACCRUED
  *
@@ -131,6 +133,7 @@ export function cloneRecoverableState(state: RecoverableEngineState): Recoverabl
     restingOrders: new Map([...state.restingOrders.entries()].map(([id, order]) => [id, structuredClone(order)])),
     makerReservations: new Map(state.makerReservations),
     settledMarkets: new Set(state.settledMarkets),
+    riskReductionOwners: new Map([...(state.riskReductionOwners ?? [])].map(([market, owner]) => [market, structuredClone(owner)])),
     lastInfrastructureAccrualAt: state.lastInfrastructureAccrualAt,
   };
 }
@@ -221,6 +224,30 @@ export interface RecoverableEngineState {
   makerReservations: Map<string, string>;
   settledMarkets: Set<string>;
   lastInfrastructureAccrualAt: number;
+  /** Optional only for checkpoints/tests written before durable taker admission. */
+  riskReductionOwners?: Map<string, RiskReductionOwnership>;
+}
+
+export const riskReductionOwnershipSchema = z.object({
+  marketId: z.string().min(1),
+  unhedgedStartedAt: z.string().datetime({ offset: true }),
+  intent: z.enum(["HEDGE_SECOND_LEG", "PROTECTIVE_DE_RISK", "RESCUE_SECOND_LEG"]),
+  order: paperOrderSchema,
+  admittedResidualQuantity: z.string().refine((v) => d(v).isFinite() && d(v).gt(0)),
+  decisionReceivedAt: z.string().datetime({ offset: true }),
+  state: z.literal("ADMITTED"),
+  deRisk: z.record(z.string(), z.unknown()).optional(),
+}).superRefine((owner, ctx) => {
+  if (owner.order.marketId !== owner.marketId || owner.order.orderType !== "TAKER"
+    || owner.order.status !== "PENDING" || !d(owner.order.quantity).gt(0) || d(owner.order.quantity).gt(owner.admittedResidualQuantity)
+    || owner.order.side !== (owner.intent === "PROTECTIVE_DE_RISK" ? "SELL" : "BUY")) {
+    ctx.addIssue({ code: "custom", message: "invalid risk-reduction taker identity" });
+  }
+});
+export type RiskReductionOwnership = z.infer<typeof riskReductionOwnershipSchema>;
+
+export function unhedgedEpisode(position: Position): string {
+  return position.unhedgedStartedAt ?? position.openedAt;
 }
 
 const fillPayloadSchema = z.object({
@@ -277,6 +304,30 @@ export function applyDurableTransition(state: RecoverableEngineState, transition
   }
   try {
     switch (transition.type) {
+      case "RISK_REDUCTION_ADMITTED": {
+        const owner = riskReductionOwnershipSchema.parse(transition.payload.ownership);
+        const owners = state.riskReductionOwners ??= new Map();
+        if (owners.has(owner.marketId)) throw new RecoveryFailClosedError("invariant", "overlapping taker ownership");
+        const position = state.ledger.positions.get(owner.marketId);
+        if (!position?.unpairedOutcome || state.settledMarkets.has(owner.marketId)
+          || unhedgedEpisode(position) !== owner.unhedgedStartedAt
+          || !d(position.unpairedQuantity).eq(owner.admittedResidualQuantity)) {
+          throw new RecoveryFailClosedError("invariant", "admission does not match durable residual");
+        }
+        owners.set(owner.marketId, owner);
+        return;
+      }
+      case "RISK_REDUCTION_FAILED": {
+        const owner = riskReductionOwnershipSchema.parse(transition.payload.ownership);
+        if (typeof transition.payload.reason !== "string" || !transition.payload.reason) {
+          throw new RecoveryFailClosedError("malformed", "failure missing reason");
+        }
+        const current = state.riskReductionOwners?.get(owner.marketId);
+        if (current?.order.id === owner.order.id && current.unhedgedStartedAt === owner.unhedgedStartedAt) {
+          state.riskReductionOwners!.delete(owner.marketId);
+        }
+        return;
+      }
     case "EXPERIMENT_STARTED":
     case "EXPERIMENT_START_VALIDATED":
     case "EXPERIMENT_START_ABORTED":
@@ -335,8 +386,22 @@ export function applyDurableTransition(state: RecoverableEngineState, transition
       }
       case "PAPER_FILL": {
         const payload = fillPayloadSchema.parse(transition.payload);
+        const owner = state.riskReductionOwners?.get(payload.fill.marketId);
+        if (owner?.order.id === payload.fill.orderId) {
+          const position = state.ledger.positions.get(owner.marketId);
+          if (!position?.unpairedOutcome || unhedgedEpisode(position) !== owner.unhedgedStartedAt
+            || !d(position.unpairedQuantity).eq(owner.admittedResidualQuantity)
+            || payload.fill.tokenId !== owner.order.tokenId || payload.fill.outcome !== owner.order.outcome
+            || payload.fill.side !== owner.order.side || !d(payload.fill.quantity).eq(owner.order.quantity)) {
+            throw new RecoveryFailClosedError("invariant", "fill does not match admitted taker ownership");
+          }
+        }
         applyFillReservation(state, payload.fill, payload.reservationAfter, new Date(transition.occurredAt));
         state.ledger.applyFill(payload.fill, { positionId: payload.positionId });
+        // Completion is atomic with the economic fill, never a later release.
+        if (state.riskReductionOwners?.get(payload.fill.marketId)?.order.id === payload.fill.orderId) {
+          state.riskReductionOwners.delete(payload.fill.marketId);
+        }
         if (payload.restingAfter) {
           if (!d(payload.restingAfter.remaining).gt(0)) state.restingOrders.delete(payload.fill.orderId);
           else state.restingOrders.set(payload.fill.orderId, payload.restingAfter);
@@ -348,6 +413,7 @@ export function applyDurableTransition(state: RecoverableEngineState, transition
       case "POSITION_SETTLED": {
         const payload = settlementPayloadSchema.parse(transition.payload);
         state.ledger.settlePosition(payload.marketId, payload.upPayoff, payload.downPayoff, new Date(payload.settledAt));
+        state.riskReductionOwners?.delete(payload.marketId);
         return;
       }
       case "LEDGER_MARK_TO_MARKET": {
@@ -436,6 +502,10 @@ export function validatePostReplayInvariants(
     reasons.push(`reserved_cash_mismatch:${reserved.toFixed()}!=${reservationSum.toFixed()}`);
   }
   const status = state.experiment?.status;
+  for (const [marketId, owner] of state.riskReductionOwners ?? []) {
+    if (!riskReductionOwnershipSchema.safeParse(owner).success || marketId !== owner.marketId) reasons.push("risk_reduction_owner_invalid");
+    if (state.settledMarkets.has(marketId)) reasons.push("settled_and_pending_taker");
+  }
   if (status && !["IDLE", "CREATED", "RUNNING", "ENTRY_CLOSED", "COMPLETED", "FAILED", "ABORTED_START"].includes(status)) {
     reasons.push("experiment_status_invalid");
   }
