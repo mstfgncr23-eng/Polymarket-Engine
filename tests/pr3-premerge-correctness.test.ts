@@ -10,6 +10,7 @@ import {
 } from "@pm/core";
 import { MemoryEventJournal } from "@pm/db";
 import { EngineService } from "../apps/engine/src/engine.js";
+import type { RiskReductionOwnership } from "../apps/engine/src/recovery.js";
 import { NoopGrokActivationBridge } from "../apps/engine/src/activation/index.js";
 import {
   ScriptedMarketAdapter,
@@ -97,6 +98,31 @@ async function setupScenario(endOffsetMs: number, env: Record<string, string> = 
   return { engine, journal, market, clock };
 }
 type Scenario = Awaited<ReturnType<typeof setupScenario>>;
+
+// Read-only test inspection; lifecycle progression still uses real adapter
+// callbacks and the existing journal append hold, without a production hook.
+const parityAuthority = (setup: Scenario) => setup.engine as unknown as {
+  riskReductionOwners: Map<string, RiskReductionOwnership>;
+  riskReductionInFlight: Set<string>;
+};
+const parityRiskOrders = (setup: Scenario) => setup.journal.queryEvents({ types: ["PAPER_ORDER_CREATED"] })
+  .then((rows) => rows.filter((row) => ["HEDGE_SECOND_LEG", "RESCUE_SECOND_LEG", "PROTECTIVE_DE_RISK", "GUARDIAN_PROTECTIVE_SELL"].includes(row.payload.intent)));
+const parityRiskFills = (setup: Scenario) => setup.journal.queryEvents({ types: ["PAPER_FILL"] })
+  .then((rows) => rows.filter((row) => ["HEDGE_SECOND_LEG", "RESCUE_SECOND_LEG", "PROTECTIVE_DE_RISK", "GUARDIAN_PROTECTIVE_SELL"].includes(row.payload.intent)));
+
+async function seedParityPosition(setup: Scenario): Promise<void> {
+  expect((await setup.engine.beginExperiment()).ok).toBe(true);
+  await setup.engine.applyObservedFill({ ...upPosition(setup.clock, "0.80", "5", "0"), feeSchedule: ERROR_SCHEDULE });
+  setup.clock.nowMs = START_MS + 20_000;
+}
+async function emitParityBooks(setup: Scenario, sequence: number): Promise<void> {
+  await setup.market.emitSnapshot(book(setup.clock, "btc-mkt", "UP", sequence, [{ price: "0.70", quantity: "1000" }], [], ERROR_SCHEDULE));
+  await setup.market.emitSnapshot(book(setup.clock, "btc-mkt", "DOWN", sequence, [{ price: "0.24", quantity: "1000" }], [{ price: "0.30", quantity: "1000" }], ERROR_SCHEDULE));
+}
+async function waitForParityIdle(setup: Scenario): Promise<void> {
+  await waitFor(() => parityAuthority(setup).riskReductionOwners.size === 0
+    && !parityAuthority(setup).riskReductionInFlight.has("btc-mkt"), Boolean);
+}
 
 const fills = (setup: Scenario, intent: string) =>
   setup.journal.queryEvents({ types: ["PAPER_FILL"] }).then((rows) => rows.filter((row) => row.payload.intent === intent));
@@ -502,28 +528,100 @@ it("DEADLINE-HANDOFF-SAME-PASS: early begins pre-deadline but deadline crossed d
     }
   });
 
-  it("PARITY: same state yields equal canonical RESCUE decision pre-deadline (early) and at-deadline (PR82 B fallback)", async () => {
-    const early = await setupScenario(END_OFFSET_MS, { PAPER_START_BALANCE: "12" });
-    const deadline = await setupScenario(END_OFFSET_MS, { PAPER_START_BALANCE: "12" });
-    for (const setup of [early, deadline]) {
-      expect((await setup.engine.beginExperiment()).ok).toBe(true);
-      await setup.engine.applyObservedFill({ ...upPosition(setup.clock, "0.80", "5", "0"), feeSchedule: ERROR_SCHEDULE });
-      setup.clock.nowMs = START_MS + 20_000;
-      await setup.market.emitSnapshot(book(setup.clock, "btc-mkt", "UP", 2, [{ price: "0.70", quantity: "1000" }], [], ERROR_SCHEDULE));
-      await setup.market.emitSnapshot(book(setup.clock, "btc-mkt", "DOWN", 2, [{ price: "0.24", quantity: "1000" }], [{ price: "0.30", quantity: "1000" }], ERROR_SCHEDULE));
+  it("PARITY-LIFECYCLE-A: completed EARLY PR3 leaves no residual for deadline protection", async () => {
+    const setup = await setupScenario(END_OFFSET_MS, { PAPER_START_BALANCE: "12" });
+    try {
+      await seedParityPosition(setup);
+      await emitParityBooks(setup, 2);
+      const earlyFills = await waitFor(() => fills(setup, "RESCUE_SECOND_LEG"), (rows) => rows.length > 0);
+      await waitForParityIdle(setup);
+      expect(earlyFills).toHaveLength(1);
+      expect(earlyFills[0]?.payload).toMatchObject({ side: "BUY", outcome: "DOWN", tokenId: "btc-mkt-down",
+        quantity: "5", fillPrice: "0.3", feeUsd: "0", deRisk: { deRiskReason: "EARLY_CATASTROPHIC_PAIR_LOCK" } });
+      const orders = await parityRiskOrders(setup);
+      expect(orders).toHaveLength(1);
+      expect(orders[0]?.payload).toMatchObject({ id: earlyFills[0]?.payload.orderId, intent: "RESCUE_SECOND_LEG", quantity: "5" });
+      expect(setup.engine.ledger.positions.get("btc-mkt")).toMatchObject({
+        upQuantity: "5", downQuantity: "5", pairedQuantity: "5", unpairedQuantity: "0", unpairedOutcome: null });
+
+      // The economic action and owner release have completed BEFORE time moves.
+      setup.clock.nowMs = eligibilityMs(END_OFFSET_MS) + 1;
+      await emitParityBooks(setup, 3);
+      await waitForParityIdle(setup);
+      expect(setup.engine.ledger.positions.get("btc-mkt")?.unpairedQuantity).toBe("0");
+      expect(await parityRiskOrders(setup)).toHaveLength(1);
+      expect(await parityRiskFills(setup)).toHaveLength(1);
+      expect(await fills(setup, "PROTECTIVE_DE_RISK")).toHaveLength(0);
+      expect(await fills(setup, "GUARDIAN_PROTECTIVE_SELL")).toHaveLength(0);
+      expect((await setup.journal.queryEvents({ types: ["RISK_EVALUATION"] }))
+        .filter((row) => row.payload.deRisk?.deRiskReason === "MAX_UNHEDGED_DURATION")).toHaveLength(0);
+      expect(await setup.journal.queryDurableTransitions({ types: ["RISK_REDUCTION_ADMITTED"], limit: 100 })).toHaveLength(1);
+      expect(await setup.journal.queryDurableTransitions({ types: ["RISK_REDUCTION_FAILED"], limit: 100 })).toHaveLength(0);
+    } finally {
+      await setup.engine.stop();
     }
-    // PRE-deadline -> EARLY rescue decision (accepted/vetoes captured).
-    const earlyFills = await waitFor(() => fills(early, "RESCUE_SECOND_LEG"), (rows) => rows.length > 0);
-    expect(earlyFills).toHaveLength(1);
-    // AT-deadline -> PR82 fallback B decision from the SAME underlying state.
-    deadline.clock.nowMs = eligibilityMs(END_OFFSET_MS) + 1;
-    await deadline.market.emitSnapshot(book(deadline.clock, "btc-mkt", "UP", 3, [{ price: "0.70", quantity: "1000" }], [], ERROR_SCHEDULE));
-    await deadline.market.emitSnapshot(book(deadline.clock, "btc-mkt", "DOWN", 3, [{ price: "0.24", quantity: "1000" }], [{ price: "0.30", quantity: "1000" }], ERROR_SCHEDULE));
-    const deadlineFills = await waitFor(() => fills(deadline, "RESCUE_SECOND_LEG"), (rows) => rows.length > 0);
-    expect(deadlineFills).toHaveLength(1);
-    // Both full-residual BUY at the same vwap (same ask walk) -> identical decree.
-    expect(earlyFills[0]?.payload.quantity).toBe(deadlineFills[0]?.payload.quantity);
-    for (const setup of [early, deadline]) {
+  });
+  it("PARITY-LIFECYCLE-B: durably pending EARLY PR3 hands the deadline tie to one held SELL", async () => {
+    const setup = await setupScenario(END_OFFSET_MS, { PAPER_START_BALANCE: "12" });
+    let release!: () => void;
+    try {
+      await seedParityPosition(setup);
+      const beforeSell = setup.engine.ledger.snapshot();
+      // PR87 admission is committed/applied before its derived order audit.
+      // Holding that audit prevents submitPaperOrder from entering execution.
+      setup.journal.setAppendInFlightHoldForTest(new Promise<void>((resolve) => { release = resolve; }), ["PAPER_ORDER_CREATED"]);
+      await emitParityBooks(setup, 2);
+      const admissions = await waitFor(() => setup.journal.queryDurableTransitions({ types: ["RISK_REDUCTION_ADMITTED"], limit: 100 }),
+        (rows) => rows.length === 1 && parityAuthority(setup).riskReductionOwners.has("btc-mkt") && setup.journal.inFlightAppends > 0);
+      const pending = parityAuthority(setup).riskReductionOwners.get("btc-mkt")!;
+      expect(pending).toMatchObject({ intent: "RESCUE_SECOND_LEG", state: "ADMITTED", admittedResidualQuantity: "5",
+        order: { id: admissions[0]?.payload.ownership.order.id, status: "PENDING", side: "BUY", tokenId: "btc-mkt-down", quantity: "5" },
+        deRisk: { deRiskReason: "EARLY_CATASTROPHIC_PAIR_LOCK" } });
+      expect(await parityRiskOrders(setup)).toHaveLength(0); // exact held audit boundary
+      expect(await parityRiskFills(setup)).toHaveLength(0);
+      expect(setup.engine.ledger.positions.get("btc-mkt")?.unpairedQuantity).toBe("5");
+
+      setup.clock.nowMs = eligibilityMs(END_OFFSET_MS) + 1;
+      await emitParityBooks(setup, 3);
+      expect(parityAuthority(setup).riskReductionOwners.get("btc-mkt")?.order.id).toBe(pending.order.id);
+      expect(await parityRiskFills(setup)).toHaveLength(0);
+      release(); setup.journal.setAppendInFlightHoldForTest(null);
+      // No new tick/book after release: the original call chain must hand off.
+      const sells = await waitFor(() => fills(setup, "PROTECTIVE_DE_RISK"), (rows) => rows.length > 0);
+      await waitForParityIdle(setup);
+      const failed = await setup.journal.queryDurableTransitions({ types: ["RISK_REDUCTION_FAILED"], limit: 100 });
+      expect(failed).toHaveLength(1);
+      expect(failed[0]?.payload).toMatchObject({ executionFailure: false, ownership: { intent: "RESCUE_SECOND_LEG", order: { id: pending.order.id } } });
+      expect(String(failed[0]?.payload.reason)).toContain("EARLY_CATASTROPHIC_DEADLINE_OWNERSHIP");
+      expect(await fills(setup, "RESCUE_SECOND_LEG")).toHaveLength(0);
+      const lifecycleError = (await setup.journal.queryEvents({ types: ["PAPER_EXECUTION_ERROR"] }))[0];
+      expect(lifecycleError?.payload).toMatchObject({ orderId: pending.order.id, intent: "RESCUE_SECOND_LEG", stateChanged: true });
+      expect(setup.engine.runtimeBookkeepingForTest().executionErrors).toBe(0);
+      expect(sells).toHaveLength(1);
+      expect(sells[0]?.payload).toMatchObject({ side: "SELL", outcome: "UP", tokenId: "btc-mkt-up", quantity: pending.admittedResidualQuantity,
+        fillPrice: "0.7", feeUsd: "0", slippageUsd: "0", deRisk: { deRiskReason: "MAX_UNHEDGED_DURATION",
+          selection: "PROTECTIVE_DE_RISK", selectionReason: "A_PREFERRED_TIE", tieBreakUsed: true,
+          aAvailable: true, bAvailable: true, aGuaranteedSalvageUsd: "3.5", bGuaranteedSalvageUsd: "3.5" } });
+      const orders = await parityRiskOrders(setup);
+      expect(orders).toHaveLength(2);
+      expect(orders.find((row) => row.payload.intent === "RESCUE_SECOND_LEG")?.payload.id).toBe(pending.order.id);
+      expect(orders.find((row) => row.payload.intent === "PROTECTIVE_DE_RISK")?.payload.id).toBe(sells[0]?.payload.orderId);
+      expect(orders.filter((row) => row.payload.intent === "GUARDIAN_PROTECTIVE_SELL")).toHaveLength(0);
+      expect(await parityRiskFills(setup)).toHaveLength(1);
+      expect(setup.engine.ledger.positions.has("btc-mkt")).toBe(false);
+      expect(parityAuthority(setup).riskReductionOwners.size).toBe(0);
+      expect(setup.engine.ledger.snapshot()).toMatchObject({ cash: "11.5", realizedPnl: "-0.5", netTradingPnl: "-0.5", fees: "0", slippage: "0" });
+      expect(number(setup.engine.ledger.snapshot().cash) - number(beforeSell.cash)).toBe(3.5);
+      expect(await setup.journal.queryDurableTransitions({ types: ["RISK_REDUCTION_ADMITTED"], limit: 100 })).toHaveLength(2);
+      expect(await setup.journal.queryDurableTransitions({ types: ["PAPER_FILL"], limit: 100 })).toHaveLength(2); // first leg + actual SELL
+
+      await emitParityBooks(setup, 4);
+      await waitForParityIdle(setup);
+      expect(await parityRiskOrders(setup)).toHaveLength(2);
+      expect(await parityRiskFills(setup)).toHaveLength(1);
+      expect(setup.engine.ledger.positions.has("btc-mkt")).toBe(false);
+    } finally {
+      release?.(); setup.journal.setAppendInFlightHoldForTest(null);
       await setup.engine.stop();
     }
   });
