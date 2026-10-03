@@ -7,7 +7,14 @@ import { AsyncLocalStorage } from "node:async_hooks";
  */
 export class DurableMutationGate {
   private chain = Promise.resolve();
-  private readonly held = new AsyncLocalStorage<true>();
+  private readonly held = new AsyncLocalStorage<boolean>();
+
+  /** A trading submission may be spawned by a fill's afterApply callback.
+   * It is independent work, not a reentrant mutation of that fill. Inheriting
+   * the callback's lock context would bypass serialization during/after it. */
+  outside<T>(work: () => Promise<T>): Promise<T> {
+    return this.held.run(false, work);
+  }
 
   async run<T>(work: () => Promise<T>): Promise<T> {
     if (this.held.getStore()) return work();
