@@ -309,8 +309,9 @@ const PROTECTIVE_DE_RISK_WAIT_SAMPLE_MS = 5_000;
 const PROTECTIVE_DE_RISK_PRE_EXPIRY_SAFETY_MS = 80_000;
 /**
  * Diagnostic-only bound for PROTECTIVE_DE_RISK_SUPPRESSED observability rows.
- * At most one durable row per market per 60s, aligned to the maintenance
- * cadence. Pure observability: never affects trading decisions or timing.
+ * Ordinary polling emits at most one durable row per gate per 60s, aligned to
+ * the maintenance cadence. Accepted-attempt terminal facts use a separate
+ * attempt identity. Pure observability: never affects economic authority.
  */
 const PROTECTIVE_DE_RISK_SUPPRESS_EMIT_MIN_MS = 60_000;
 
@@ -347,6 +348,9 @@ type GrokSubmissionResult = {
 
 type RiskReductionUnhedgedReason = "GUARDIAN_PROTECTIVE_SELL" | "MAX_UNHEDGED_DURATION" | "PRE_EXPIRY_SAFETY" | "EARLY_CATASTROPHIC_PAIR_LOCK" | "EARLY_HEDGE_ADOPTION";
 
+type EarlyAdmissionAttempt = { riskId: string; admitted: boolean; reason: string };
+type EarlyPairLockResult = { acted: boolean; acceptedWithoutAdmission?: boolean };
+
 type ProtectiveDeRiskAudit = {
   deRiskReason: RiskReductionUnhedgedReason;
   /**
@@ -366,7 +370,7 @@ type ProtectiveDeRiskAudit = {
   residualQuantity: string;
   residualExposure: string;
   retryCount: number;
-  finalState: "ORDER_ADMITTED" | "RISK_VETO" | "RESIDUAL_UNHEDGED" | "RISK_NEUTRALIZED" | "EXECUTION_ERROR" | "STATE_CHANGED";
+  finalState: "PRECHECK_ACCEPTED" | "ORDER_ADMITTED" | "RISK_VETO" | "RESIDUAL_UNHEDGED" | "RISK_NEUTRALIZED" | "EXECUTION_ERROR" | "STATE_CHANGED";
   /** Rescue arbitration observability (bounded; detailed economics in journal). */
   selection?: RiskReductionSelection;
   selectionReason?: RiskReductionSelectionReason;
@@ -3882,15 +3886,21 @@ export class EngineService {
     });
   }
 
-  private async admitRiskReduction(owner: RiskReductionOwnership): Promise<boolean> {
+  private async admitRiskReduction(owner: RiskReductionOwnership, attempt?: EarlyAdmissionAttempt): Promise<boolean> {
     const old = this.riskReductionOwners.get(owner.marketId);
     if (old) {
-      if (old.unhedgedStartedAt === owner.unhedgedStartedAt) return false;
+      if (old.unhedgedStartedAt === owner.unhedgedStartedAt) {
+        if (attempt) attempt.reason = "TAKER_ALREADY_OWNS_RESIDUAL";
+        return false;
+      }
       await this.failRiskReduction(old, "EPISODE_SUPERSEDED");
     }
     // A completed/failed action identity can never be re-admitted by a retry.
     if (await this.journal.readDurableByOperationKey(`risk-reduction:${owner.order.id}:admitted`)
-      || await this.journal.readDurableByOperationKey(`fill:risk-reduction-fill:${owner.order.id}`)) return false;
+      || await this.journal.readDurableByOperationKey(`fill:risk-reduction-fill:${owner.order.id}`)) {
+      if (attempt) attempt.reason = "ACTION_IDENTITY_ALREADY_USED";
+      return false;
+    }
     try {
       await this.commitAuthoritative({
         operationKey: `risk-reduction:${owner.order.id}:admitted`, type: "RISK_REDUCTION_ADMITTED",
@@ -3926,9 +3936,17 @@ export class EngineService {
               ...(owner.deRisk ? { deRisk: owner.deRisk } : {}) } },
         ] }),
       });
+      if (attempt) attempt.admitted = true;
+      if (owner.deRisk?.deRiskReason === "EARLY_CATASTROPHIC_PAIR_LOCK") {
+        // The retry slot belongs to an actual durable action, including an
+        // admitted action whose execution subsequently fails. Never preflight.
+        this.earlyCatastrophicNextAttemptAt.set(owner.marketId, this.nowFn().getTime() + PROTECTIVE_DE_RISK_RETRY_MS);
+        this.earlyCatastrophicVetoFingerprint.delete(owner.marketId);
+      }
       return true;
     } catch (error) {
       if (!(error instanceof RiskReductionLifecycleGuardRejectedError)) throw error;
+      if (attempt) attempt.reason = error.reason;
       this.record("RISK_REDUCTION_LIFECYCLE_BLOCKED", owner.order.traceId, owner.marketId, {
         orderId: owner.order.id, intent: owner.intent, reason: error.reason,
       });
@@ -3971,7 +3989,7 @@ export class EngineService {
     duplicateKey: string,
     intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK" | "RESCUE_SECOND_LEG" | "GUARDIAN_PROTECTIVE_SELL" = "OPEN_FIRST_LEG",
     deRisk?: ProtectiveDeRiskAudit,
-    options?: { skipPreCreateFirstLegCancel?: boolean; resume?: boolean },
+    options?: { skipPreCreateFirstLegCancel?: boolean; resume?: boolean; earlyAttempt?: EarlyAdmissionAttempt },
   ): Promise<boolean> {
     if (intent === "OPEN_FIRST_LEG") return this.executeSubmittedPaperOrder(order, decisionSnapshot, duplicateKey, intent, deRisk, options);
     return this.durableGate.outside(() => this.executeSubmittedPaperOrder(order, decisionSnapshot, duplicateKey, intent, deRisk, options));
@@ -3983,7 +4001,7 @@ export class EngineService {
     duplicateKey: string,
     intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK" | "RESCUE_SECOND_LEG" | "GUARDIAN_PROTECTIVE_SELL" = "OPEN_FIRST_LEG",
     deRisk?: ProtectiveDeRiskAudit,
-    options?: { skipPreCreateFirstLegCancel?: boolean; resume?: boolean },
+    options?: { skipPreCreateFirstLegCancel?: boolean; resume?: boolean; earlyAttempt?: EarlyAdmissionAttempt },
   ): Promise<boolean> {
     if (intent === "OPEN_FIRST_LEG" && this.experimentStartPending) return false;
     if ((intent === "PROTECTIVE_DE_RISK" || intent === "GUARDIAN_PROTECTIVE_SELL") && order.orderType !== "TAKER") {
@@ -4083,7 +4101,13 @@ export class EngineService {
             unhedgedStartedAt: deRisk?.unhedgedStartedAt ?? unhedgedEpisode(positionAtSubmission),
             intent, order, admittedResidualQuantity: positionAtSubmission.unpairedQuantity,
             decisionReceivedAt: decisionSnapshot.receivedAt, state: "ADMITTED", ...(deRisk ? { deRisk } : {}) });
-          if (!(await this.admitRiskReduction(durableOwner))) return false;
+          // ORDER_ADMITTED is emitted only by the durable admission's derived
+          // order audit, never by the preceding RISK_EVALUATION/RISK_ACCEPT.
+          if (deRisk?.deRiskReason === "EARLY_CATASTROPHIC_PAIR_LOCK") {
+            deRisk = { ...deRisk, finalState: "ORDER_ADMITTED" };
+            durableOwner.deRisk = deRisk;
+          }
+          if (!(await this.admitRiskReduction(durableOwner, options?.earlyAttempt))) return false;
         }
       }
       if (!options?.resume) this.metrics.paperOrders.inc({ type: order.orderType });
@@ -5307,7 +5331,7 @@ export class EngineService {
    * always takes priority. Returns true when this pass CONSUMED the shared
    * risk-reduction decision (so the old deadline fallback must not also act).
    */
-  private async maybeEarlyCatastrophicPairLock(marketId: string): Promise<{ acted: boolean }> {
+  private async maybeEarlyCatastrophicPairLock(marketId: string): Promise<EarlyPairLockResult> {
     if (!this.earlyAuthority(marketId)) return { acted: false };
     const position = this.ledger.positions.get(marketId);
     if (!position?.unpairedOutcome || d(position.unpairedQuantity).lte(0)) return { acted: false };
@@ -5786,7 +5810,7 @@ export class EngineService {
     unpairedOutcome: Outcome,
     oppositeOutcome: Outcome,
     now: Date,
-  ): Promise<{ acted: boolean }> {
+  ): Promise<EarlyPairLockResult> {
     return this.earlyCatastrophicInFlight(marketId, unpairedOutcome, oppositeOutcome, now);
   }
 
@@ -5800,7 +5824,7 @@ export class EngineService {
     unpairedOutcome: Outcome,
     oppositeOutcome: Outcome,
     now: Date,
-  ): Promise<{ acted: boolean }> {
+  ): Promise<EarlyPairLockResult> {
     if (!this.earlyAuthority(marketId)) {
       this.recordProtectiveDeRiskSuppressed(marketId, "EARLY_CATASTROPHIC_PAIR_LOCK", "DEADLINE_OWNERSHIP", { position: this.ledger.positions.get(marketId) ?? null });
       return { acted: false };
@@ -5922,41 +5946,85 @@ export class EngineService {
     await this.persistEarlyEvaluation(marketId, decision, fresh.evaluation, this.nowFn(), asset, true);
     this.paceEarlyAttempt(marketId, decision, fresh, this.nowFn(), true);
 
-    // (7) FINAL SYNCHRONOUS FENCE — validates the PERSISTED decision whose
-    //     risk/order identity is fixed (Fix 2). This is the last sync point
-    //     before EARLY submit: no machine-await follows (Fix 1).
-    const fence = this.finalEarlyEconomicFence(marketId, unpairedOutcome, oppositeOutcome, decision, fresh.opposite, asset);
-    if (fence.adoptHedge) {
-      const hedgeDecision = this.normalHedgeDecision(marketId, position0, {
-        UP: this.freshEarlyCatastrophicSnapshot(this.snapshots.get(marketId)?.UP ?? null, this.nowFn().getTime()),
-        DOWN: this.freshEarlyCatastrophicSnapshot(this.snapshots.get(marketId)?.DOWN ?? null, this.nowFn().getTime()),
-      }, this.nowFn());
-      if (hedgeDecision?.accepted && hedgeDecision.order && fence.opposite) {
-        return await this.adoptHedgeFromEarlyFlight(marketId, hedgeDecision, fence.opposite, this.nowFn());
+    const attempt: EarlyAdmissionAttempt = { riskId: decision.risk.id, admitted: false, reason: "SUBMISSION_NOT_ADMITTED" };
+    try {
+      // (7) FINAL SYNCHRONOUS FENCE — validates the PERSISTED decision whose
+      //     risk/order identity is fixed (Fix 2). This is the last sync point
+      //     before EARLY submit: no machine-await follows (Fix 1).
+      const fence = this.finalEarlyEconomicFence(marketId, unpairedOutcome, oppositeOutcome, decision, fresh.opposite, asset);
+      if (fence.adoptHedge) {
+        attempt.reason = "NORMAL_HEDGE_PRIORITY";
+        const hedgeDecision = this.normalHedgeDecision(marketId, position0, {
+          UP: this.freshEarlyCatastrophicSnapshot(this.snapshots.get(marketId)?.UP ?? null, this.nowFn().getTime()),
+          DOWN: this.freshEarlyCatastrophicSnapshot(this.snapshots.get(marketId)?.DOWN ?? null, this.nowFn().getTime()),
+        }, this.nowFn());
+        if (hedgeDecision?.accepted && hedgeDecision.order && fence.opposite) {
+          return await this.adoptHedgeFromEarlyFlight(marketId, hedgeDecision, fence.opposite, this.nowFn());
+        }
+        this.recordProtectiveDeRiskSuppressed(marketId, "EARLY_CATASTROPHIC_PAIR_LOCK", "HEDGE_ADOPTION_REGRESSED", { position: position0, snapshot: fence.opposite ?? null });
+        return { acted: false, acceptedWithoutAdmission: true };
       }
-      this.recordProtectiveDeRiskSuppressed(marketId, "EARLY_CATASTROPHIC_PAIR_LOCK", "HEDGE_ADOPTION_REGRESSED", { position: position0, snapshot: fence.opposite ?? null });
-      return { acted: false };
+      if (!fence.ok) {
+        attempt.reason = `FINAL_FENCE_${fence.reason}`;
+        this.recordProtectiveDeRiskSuppressed(marketId, "EARLY_CATASTROPHIC_PAIR_LOCK", fence.reason, { position: position0, snapshot: fence.opposite ?? null });
+        return { acted: false, acceptedWithoutAdmission: true };
+      }
+      const audit = this.buildEarlyAudit(marketId, position0, decision, fresh.evaluation, this.nowFn(), true);
+      this.state.latestRisk = decision.risk;
+      this.record("RISK_ACCEPT", decision.risk.traceId, marketId, {
+        orderId: decision.order!.id,
+        intent: "RESCUE_SECOND_LEG",
+        deRisk: audit,
+      }, asset);
+      const created = await this.submitPaperOrder(
+        decision.order!,
+        fence.opposite!,
+        `${marketId}:${oppositeOutcome}:EARLY_CATASTROPHIC_PAIR_LOCK`,
+        "RESCUE_SECOND_LEG",
+        audit,
+        { skipPreCreateFirstLegCancel: true, earlyAttempt: attempt },
+      );
+      return { acted: created, acceptedWithoutAdmission: !attempt.admitted };
+    } catch (error) {
+      attempt.reason = `PRE_ADMISSION_ERROR:${error instanceof Error ? error.message : String(error)}`;
+      throw error;
+    } finally {
+      if (!attempt.admitted) await this.recordEarlyAttemptTerminated(marketId, decision.order!, attempt);
     }
-    if (!fence.ok) {
-      this.recordProtectiveDeRiskSuppressed(marketId, "EARLY_CATASTROPHIC_PAIR_LOCK", fence.reason, { position: position0, snapshot: fence.opposite ?? null });
-      return { acted: false };
+  }
+
+  /** One operational fact per accepted attempt, independent of the ordinary
+   * polling suppression gate. No economic transition or report hash input. */
+  private async recordEarlyAttemptTerminated(marketId: string, order: PaperOrder, attempt: EarlyAdmissionAttempt): Promise<void> {
+    // A post-commit crash/error can occur before submit returns or marks the
+    // local attempt. Durable authority wins over that local result too.
+    try {
+      if (await this.journal.readDurableByOperationKey(`risk-reduction:${order.id}:admitted`)) return;
+    } catch (error) {
+      this.logger.error({ error, marketId, orderId: order.id }, "PR3 terminal admission lookup failed");
+      return;
     }
-    const audit = this.buildEarlyAudit(marketId, position0, decision, fresh.evaluation, this.nowFn(), true);
-    this.state.latestRisk = decision.risk;
-    this.record("RISK_ACCEPT", decision.risk.traceId, marketId, {
-      orderId: decision.order!.id,
-      intent: "RESCUE_SECOND_LEG",
-      deRisk: audit,
-    }, asset);
-    const created = await this.submitPaperOrder(
-      decision.order!,
-      fence.opposite!,
-      `${marketId}:${oppositeOutcome}:EARLY_CATASTROPHIC_PAIR_LOCK`,
-      "RESCUE_SECOND_LEG",
-      audit,
-      { skipPreCreateFirstLegCancel: true },
-    );
-    return { acted: created };
+    const position = this.ledger.positions.get(marketId);
+    const facts = {
+      gate: "EARLY_ACCEPTED_ATTEMPT_TERMINATED", reason: attempt.reason,
+      marketId, orderId: order.id, riskEvaluationId: attempt.riskId,
+      intent: "RESCUE_SECOND_LEG", precheckAccepted: true, durableAdmission: false,
+      finalState: "STATE_CHANGED", experimentId: this.experiment?.id ?? null,
+      unhedgedStartedAt: position ? unhedgedEpisode(position) : null,
+      residualQuantity: position?.unpairedQuantity ?? "0",
+      competingOwnerOrderId: this.riskReductionOwners.get(marketId)?.order.id ?? null,
+    };
+    this.record("PROTECTIVE_DE_RISK_SUPPRESSED", order.traceId, marketId, facts);
+    try {
+      await this.journal.append(createJournalEvent({
+        id: derivedAuditEventId("EARLY_ACCEPTED_ATTEMPT_TERMINATED", order.id),
+        traceId: order.traceId, type: "PROTECTIVE_DE_RISK_SUPPRESSED",
+        aggregateType: "paper_order", aggregateId: order.id, payload: facts,
+      }), {});
+    } catch (error) {
+      // Diagnostic write failures must not change economic authority/health.
+      this.logger.error({ error, marketId, orderId: order.id, reason: attempt.reason }, "PR3 terminal diagnostic append failed");
+    }
   }
 /** Selects FRESH canonical held/opposite books and runs the staged PR3 predicate. */
   private evaluateEarlyCatastrophicWithBooks(
@@ -6127,7 +6195,9 @@ export class EngineService {
   ): void {
     this.protectiveDeRiskAttempts.set(marketId, (this.protectiveDeRiskAttempts.get(marketId) ?? 0) + 1);
     if (accepted) {
-      this.earlyCatastrophicNextAttemptAt.set(marketId, now.getTime() + PROTECTIVE_DE_RISK_RETRY_MS);
+      // Acceptance retires a previous veto, but consumes no action retry slot.
+      // admitRiskReduction installs the 5s slot only after durable admission.
+      this.earlyCatastrophicNextAttemptAt.delete(marketId);
       this.earlyCatastrophicVetoFingerprint.delete(marketId);
       return;
     }
@@ -6211,6 +6281,10 @@ private finalEarlyEconomicFence(
     if (hedgeDecision?.accepted && hedgeDecision.order) {
       return { ok: true, reason: "HEDGE_ADOPTED", adoptHedge: true, opposite };
     }
+    // The held mark can improve during either pre-admission await. Reapply
+    // the current PR3 predicate as well as the persisted-order execution fences.
+    const currentGate = this.earlyCheapGate({ position, held, opposite, nowMs: now.getTime() });
+    if (!currentGate.ok) return { ok: false, reason: currentGate.reason ?? "ADMISSION_REGRESSED", adoptHedge: false };
     // VALIDATION-ONLY canonical admission (Fix 2): never persisted, never
     // submitted. Only used to prove the PERSISTED decision is still executable.
     const candidateValidation = evaluateRescueSecondLegCandidate({ position, snapshot: opposite, maxOrderSizeUsd: this.riskLimits.maxOrderSizeUsd }).candidate;
@@ -6222,7 +6296,8 @@ private finalEarlyEconomicFence(
     }
     const validation = this.admitEarlyRescue(marketId, position, oppositeOutcome, held, opposite, candidateValidation, now, assetAtDecision ?? held.asset ?? null);
     if (!validation || !validation.decision.accepted || !validation.decision.order) {
-      return { ok: false, reason: "ADMISSION_REGRESSED", adoptHedge: false };
+      return { ok: false, reason: validation?.decision.risk.vetoes.length
+        ? `RISK_VETO:${validation.decision.risk.vetoes.join("|")}` : "ADMISSION_REGRESSED", adoptHedge: false };
     }
     const vOrder = validation.decision.order;
     if (vOrder.tokenId !== persistedOrder.tokenId || !d(vOrder.quantity).eq(d(persistedOrder.quantity))) {
@@ -6450,10 +6525,10 @@ private buildEarlyAudit(
       requestedQty: position.unpairedQuantity,
       executableQty: accepted ? (decision.order?.quantity ?? "0") : "0",
       executionPrice: accepted ? (decision.bookVwap ?? null) : null,
-      residualQuantity: accepted ? "0" : position.unpairedQuantity,
-      residualExposure: accepted ? "0" : (position.unpairedOutcome ? residualExposureUsd : "0"),
+      residualQuantity: position.unpairedQuantity,
+      residualExposure: position.unpairedOutcome ? residualExposureUsd : "0",
       retryCount: (this.protectiveDeRiskAttempts.get(marketId) ?? 0) + 1,
-      finalState: accepted ? "ORDER_ADMITTED" : "RISK_VETO",
+      finalState: accepted ? "PRECHECK_ACCEPTED" : "RISK_VETO",
       selection: "RESCUE_SECOND_LEG",
       selectionReason: "EARLY_CATASTROPHIC_PAIR_LOCK",
       tieBreakUsed: false,
@@ -6663,6 +6738,8 @@ private buildEarlyAudit(
       return await this.submitPaperOrder(decision.order, held, `guardian:${decision.order.id}`, "GUARDIAN_PROTECTIVE_SELL", deRisk);
     } finally {
       this.riskReductionInFlight.delete(marketId);
+      const remaining = this.ledger.positions.get(marketId);
+      if (!remaining?.unpairedOutcome || d(remaining.unpairedQuantity).lte(0)) this.clearProtectiveDeRiskState(marketId);
     }
   }
 
@@ -6733,7 +6810,12 @@ private buildEarlyAudit(
       // NORMAL/PR3 eligible while that callback yields to the shared flight.
       // Recheck priority once in this same pass, avoiding a lost wake-up.
       const priorityRecheck = await this.maybeEarlyCatastrophicPairLock(marketId);
-      if (priorityRecheck.acted) return;
+      const afterPriority = this.ledger.positions.get(marketId);
+      if (this.riskReductionBusy(marketId) || !afterPriority?.unpairedOutcome
+        || !d(afterPriority.unpairedQuantity).eq(residualBeforeEarly)) return;
+      // This bounded retry can itself lose admission while callbacks yield to
+      // its flight. Give current Guardian authority one final same-pass check.
+      if (priorityRecheck.acceptedWithoutAdmission && await this.maybeGuardianProtectiveSell(marketId)) return;
       // Re-read durable state AFTER the early phase: the deadline may have been
       // crossed during an early await. Authority handoff must occur in the SAME
       // pass (Section 4) — no extra snapshot/tick required.
