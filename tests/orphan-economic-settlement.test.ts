@@ -3,6 +3,8 @@ import { d, settlementCashDelta, settlementRealizedDelta, type BinarySettlementL
 import { MemoryEventJournal } from "@pm/db";
 import { EngineService } from "../apps/engine/src/engine.js";
 import { NoopGrokActivationBridge } from "../apps/engine/src/activation/index.js";
+import { validatePostReplayInvariants, type RecoverableEngineState } from "../apps/engine/src/recovery.js";
+import { order, snapshot } from "./fixtures.js";
 import {
   cleanupAllocatedLearningDataDirs, discoveryReport, paperFill, qualified,
   qualifiedPaperEnv, ScriptedMarketAdapter, ScriptedReferenceRegistry,
@@ -19,6 +21,8 @@ function deferred() {
 function internals(engine: EngineService) {
   return engine as unknown as {
     cancelVanishedMakers(ids: readonly string[]): Promise<void>;
+    releaseMaker(id: string, options: { cancel?: boolean; reason?: string }): Promise<void>;
+    recoverableBag(): RecoverableEngineState;
     pollSettlements(): Promise<void>;
     resolveSettlementLookup(id: string, economic?: boolean): BinarySettlementLookup | null;
     economicSettlementLookups: Map<string, BinarySettlementLookup>;
@@ -50,6 +54,68 @@ async function open(engine: EngineService) {
 }
 
 describe("economic settlement survives discovery reconciliation", () => {
+  it("preserves a first-leg maker admitted after vanished-maker cancellation snapshots orders", async () => {
+    const s = await setup();
+    const reached = deferred();
+    const resume = deferred();
+    const first = order("MAKER", { marketId: MARKET, tokenId: "orphan-up", outcome: "UP" });
+    const late = order("MAKER", { marketId: MARKET, tokenId: "orphan-up", outcome: "UP" });
+    const book = snapshot({ marketId: MARKET, tokenId: "orphan-up", outcome: "UP" });
+    const original = internals(s.engine).releaseMaker.bind(s.engine);
+    const hold = vi.spyOn(internals(s.engine), "releaseMaker").mockImplementation(async (id, options) => {
+      await original(id, options);
+      if (id === first.id && options.reason === "MARKET_REMOVED") {
+        // The real cancelVanishedMakers iterator already snapshotted the old
+        // order. Pause its release await after the durable reservation release.
+        reached.resolve();
+        await resume.promise;
+      }
+    });
+    let refresh: Promise<void> | undefined;
+    const assertReservations = async () => {
+      const latest = await s.engine.latestDurableSequenceForTest();
+      expect(validatePostReplayInvariants(internals(s.engine).recoverableBag(),
+        s.engine.lastAppliedDurableCursorForTest(), latest)).toEqual({ ok: true, reasons: [] });
+    };
+    try {
+      await s.engine.restMakerForTest(first, book, "OPEN_FIRST_LEG");
+      s.market.queue(discoveryReport([]));
+      refresh = s.engine.reconcileDiscovery();
+      await reached.promise;
+      expect(s.engine.restingOrdersForTest().has(first.id)).toBe(false);
+      expect(s.engine.makerReservationsForTest().has(first.id)).toBe(false);
+      await s.engine.restMakerForTest(late, book, "OPEN_FIRST_LEG");
+      expect(s.engine.ledger.positions.has(MARKET)).toBe(false);
+      expect(s.engine.restingOrdersForTest().has(late.id)).toBe(true);
+      expect(d(s.engine.makerReservationsForTest().get(late.id)!)).toEqual(d(s.engine.reservedCash()));
+      await assertReservations();
+      resume.resolve();
+      await refresh;
+      hold.mockRestore();
+      expect(s.engine.restingOrdersForTest().get(late.id)?.intent).toBe("OPEN_FIRST_LEG");
+      expect(d(s.engine.reservedCash()).gt(0)).toBe(true);
+      expect(s.engine.monitoredMarketIds()).toContain(MARKET);
+      expect(s.engine.subscribedTokenIds()).toContain("orphan-up");
+      expect(s.engine.monitoredMarketIds()).not.toContain("historical");
+      expect(s.engine.entryQualifiedIds()).not.toContain(MARKET);
+      await assertReservations();
+      // Once the last obligation is released, historical context is removable.
+      await s.engine.cancelMakerForTest(late.id);
+      s.market.queue(discoveryReport([]));
+      await s.engine.reconcileDiscovery();
+      expect(s.engine.monitoredMarketIds()).toEqual([]);
+      expect(s.engine.restingOrderCount()).toBe(0);
+      expect(s.engine.makerReservationsForTest().size).toBe(0);
+      expect(d(s.engine.reservedCash()).isZero()).toBe(true);
+      await assertReservations();
+    } finally {
+      resume.resolve();
+      await refresh;
+      hold.mockRestore();
+      await s.engine.stop();
+    }
+  });
+
   it("re-reads obligations after cancellation yields to a first-leg fill, then evicts completed history", async () => {
     const s = await setup();
     const reached = deferred();

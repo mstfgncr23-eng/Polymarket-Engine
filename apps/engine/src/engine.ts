@@ -1323,10 +1323,9 @@ export class EngineService {
     const vanishedMakerMarkets = this.vanishedRestingMarketIds(nextMarkets);
     await this.cancelVanishedMakers(vanishedMakerMarkets);
 
-    // Cancellation yields to fills. Reconcile CURRENT obligations at the
+    // Cancellation yields to fills and maker admissions. Reconcile CURRENT obligations at the
     // destructive boundary, with no await between this read and map replacement.
     obligations = this.obligationMarketIds();
-    const currentOpenPositions = this.openPositionMarketIds();
     for (const id of nextMarkets.keys()) {
       if (!nextEntryQualified.has(id) && !obligations.has(id)) nextMarkets.delete(id);
     }
@@ -1335,7 +1334,9 @@ export class EngineService {
         ?? report.qualified.find((item) => item.id === id);
       const previous = this.marketsById.get(id);
       if (fresh) nextMarkets.set(id, fresh);
-      else if (previous && currentOpenPositions.has(id)) nextMarkets.set(id, previous);
+      // Every current obligation needs context, including makers admitted after
+      // cancellation snapshotted its orders. Unobligated history is excluded.
+      else if (previous) nextMarkets.set(id, previous);
     }
 
     this.entryQualified.clear();
