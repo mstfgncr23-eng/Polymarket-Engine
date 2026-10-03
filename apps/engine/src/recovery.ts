@@ -12,6 +12,7 @@ import {
   type PaperFill,
   type Position,
   type RestingPaperOrder,
+  type BinarySettlementLookup,
 } from "@pm/core";
 import {
   CHECKPOINT_SCHEMA_VERSION,
@@ -133,6 +134,7 @@ export function cloneRecoverableState(state: RecoverableEngineState): Recoverabl
     restingOrders: new Map([...state.restingOrders.entries()].map(([id, order]) => [id, structuredClone(order)])),
     makerReservations: new Map(state.makerReservations),
     settledMarkets: new Set(state.settledMarkets),
+    settlementLookups: new Map([...(state.settlementLookups ?? [])].map(([id, lookup]) => [id, structuredClone(lookup)])),
     riskReductionOwners: new Map([...(state.riskReductionOwners ?? [])].map(([market, owner]) => [market, structuredClone(owner)])),
     riskReductionFailures: new Map([...(state.riskReductionFailures ?? [])].map(([market, failure]) => [market, structuredClone(failure)])),
     lastInfrastructureAccrualAt: state.lastInfrastructureAccrualAt,
@@ -224,6 +226,8 @@ export interface RecoverableEngineState {
   restingOrders: Map<string, RestingPaperOrder>;
   makerReservations: Map<string, string>;
   settledMarkets: Set<string>;
+  /** Fill-time identity, retained only while economic inventory remains. */
+  settlementLookups?: Map<string, BinarySettlementLookup>;
   lastInfrastructureAccrualAt: number;
   /** Optional only for checkpoints/tests written before durable taker admission. */
   riskReductionOwners?: Map<string, RiskReductionOwnership>;
@@ -260,6 +264,14 @@ export function unhedgedEpisode(position: Position): string {
   return position.unhedgedStartedAt ?? position.openedAt;
 }
 
+export const settlementLookupSchema = z.object({
+  marketId: z.string().min(1),
+  slug: z.string().nullable(),
+  endDate: z.string().datetime({ offset: true }),
+  yesMapsTo: z.enum(["UP", "DOWN"]),
+  noMapsTo: z.enum(["UP", "DOWN"]),
+}).refine((lookup) => lookup.yesMapsTo !== lookup.noMapsTo);
+
 const fillPayloadSchema = z.object({
   fill: paperFillSchema,
   positionId: z.string().min(1),
@@ -267,6 +279,7 @@ const fillPayloadSchema = z.object({
   restingAfter: restingPaperOrderSchema.nullable().optional(),
   intent: z.enum(["OPEN_FIRST_LEG", "HEDGE_SECOND_LEG", "PROTECTIVE_DE_RISK", "RESCUE_SECOND_LEG", "GUARDIAN_PROTECTIVE_SELL"]).optional(),
   deRisk: z.record(z.string(), z.unknown()).optional(),
+  settlementLookup: settlementLookupSchema.optional(),
 });
 
 const reservePayloadSchema = z.object({
@@ -408,6 +421,9 @@ export function applyDurableTransition(state: RecoverableEngineState, transition
       }
       case "PAPER_FILL": {
         const payload = fillPayloadSchema.parse(transition.payload);
+        if (payload.settlementLookup && payload.settlementLookup.marketId !== payload.fill.marketId) {
+          throw new RecoveryFailClosedError("invariant", "fill settlement lookup market mismatch");
+        }
         const owner = state.riskReductionOwners?.get(payload.fill.marketId);
         if (owner?.order.id === payload.fill.orderId) {
           const position = state.ledger.positions.get(owner.marketId);
@@ -421,6 +437,13 @@ export function applyDurableTransition(state: RecoverableEngineState, transition
         applyFillReservation(state, payload.fill, payload.reservationAfter, new Date(transition.occurredAt));
         state.ledger.applyFill(payload.fill, { positionId: payload.positionId });
         const remaining = state.ledger.positions.get(payload.fill.marketId);
+        const lookups = state.settlementLookups ??= new Map();
+        if (remaining && (d(remaining.upQuantity).gt(0) || d(remaining.downQuantity).gt(0))) {
+          // Preserve the original economic mapping across hedges and rediscovery.
+          if (payload.settlementLookup && !lookups.has(payload.fill.marketId)) {
+            lookups.set(payload.fill.marketId, structuredClone(payload.settlementLookup));
+          }
+        } else lookups.delete(payload.fill.marketId);
         const failure = state.riskReductionFailures?.get(payload.fill.marketId);
         if (failure && (!remaining?.unpairedOutcome || !d(remaining.unpairedQuantity).gt(0)
           || unhedgedEpisode(remaining) !== failure.ownership.unhedgedStartedAt
@@ -442,6 +465,7 @@ export function applyDurableTransition(state: RecoverableEngineState, transition
       case "POSITION_SETTLED": {
         const payload = settlementPayloadSchema.parse(transition.payload);
         state.ledger.settlePosition(payload.marketId, payload.upPayoff, payload.downPayoff, new Date(payload.settledAt));
+        state.settlementLookups?.delete(payload.marketId);
         state.riskReductionOwners?.delete(payload.marketId);
         state.riskReductionFailures?.delete(payload.marketId);
         return;
