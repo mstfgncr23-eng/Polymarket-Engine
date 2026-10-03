@@ -6811,7 +6811,7 @@ private buildEarlyAudit(
       // Recheck priority once in this same pass, avoiding a lost wake-up.
       const priorityRecheck = await this.maybeEarlyCatastrophicPairLock(marketId);
       const afterPriority = this.ledger.positions.get(marketId);
-      if (this.riskReductionBusy(marketId) || !afterPriority?.unpairedOutcome
+      if (priorityRecheck.acted || this.riskReductionBusy(marketId) || !afterPriority?.unpairedOutcome
         || !d(afterPriority.unpairedQuantity).eq(residualBeforeEarly)) return;
       // This bounded retry can itself lose admission while callbacks yield to
       // its flight. Give current Guardian authority one final same-pass check.
