@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { d, executePaperTaker, type MarketSnapshot, type PaperOrder } from "@pm/core";
+import { d, evaluateRisk, executePaperTaker, riskLimitsSchema, type MarketSnapshot, type PaperOrder } from "@pm/core";
 import { MemoryEventJournal } from "@pm/db";
 import { EngineService } from "../apps/engine/src/engine.js";
 import { NoopGrokActivationBridge } from "../apps/engine/src/activation/index.js";
 import { type RiskReductionOwnership, unhedgedEpisode } from "../apps/engine/src/recovery.js";
 import { ScriptedMarketAdapter, ScriptedReferenceRegistry, discoveryReport, qualified, qualifiedPaperEnv, paperFill } from "./paper-engine-testkit.js";
-import { order, snapshot } from "./fixtures.js";
+import { order, safeRisk, snapshot } from "./fixtures.js";
 
 const START = Date.parse("2026-01-01T00:00:00Z");
 const MARKET = "guardian-mkt";
@@ -110,6 +110,66 @@ async function restart(s: Scenario) {
 }
 
 describe("Engine Guardian real PAPER authority", () => {
+  it.each(["cap", "depth"])("unrelated hourly execution errors cannot veto a real full Guardian SELL after PR3 %s failure", async (failure) => {
+    const s = await start(); try {
+      await seed(s);
+      if (failure === "depth") setBook(s, "DOWN", { asks: [{ price: "0.30", quantity: "2" }] });
+      const maxErrors = riskLimitsSchema.parse({}).maxExecutionErrorsPerHour;
+      s.engine.seedRuntimeBookkeepingForTest({ executionErrors: Array(maxErrors + 1).fill(s.clock.ms - 1000) });
+      expect(await s.journal.queryDurableTransitions({ types: ["RISK_REDUCTION_FAILED"], limit: 100 })).toHaveLength(0);
+      expect(internal(s.engine).evaluateGuardian(MARKET).decision?.accepted).toBe(true);
+      await internal(s.engine).maybeProtectiveDeRisk(MARKET);
+      const orders = await guardianOrders(s);
+      const fills = await guardianFills(s);
+      expect(orders).toHaveLength(1); expect(fills).toHaveLength(1);
+      expect(fills[0]?.payload).toMatchObject({ orderId: orders[0]?.aggregateId, side: "SELL", outcome: "UP", quantity: "5" });
+      expect(residual(s)).toBe("0"); expect(internal(s.engine).riskReductionOwners.size).toBe(0);
+    } finally { await s.engine.stop(); }
+  });
+  it.each(["database", "journal", "integrity"])("hourly-error exemption retains the %s hard Guardian authority fence", async (fault) => {
+    const s = await start(); try {
+      await seed(s);
+      s.engine.seedRuntimeBookkeepingForTest({ executionErrors: Array(100).fill(s.clock.ms - 1000) });
+      expect(internal(s.engine).evaluateGuardian(MARKET).decision?.accepted).toBe(true);
+      if (fault === "database") s.engine.state.database = "DOWN";
+      if (fault === "journal") s.engine.state.journalDegraded = true;
+      if (fault === "integrity") s.engine.abandonWithoutCheckpointForTest();
+      expect(internal(s.engine).evaluateGuardian(MARKET).reason).toBe("HARD_AUTHORITY_UNAVAILABLE");
+      expect(await internal(s.engine).maybeGuardianProtectiveSell(MARKET)).toBe(false);
+      expect(await guardianOrders(s)).toHaveLength(0); expect(await guardianFills(s)).toHaveLength(0);
+      expect(await s.journal.queryDurableTransitions({ types: ["RISK_REDUCTION_ADMITTED"], limit: 100 })).toHaveLength(0);
+      expect(residual(s)).toBe("5");
+    } finally { await s.engine.stop(); }
+  });
+  it("an actual Guardian execution failure remains durable and observable despite the hourly-error exemption", async () => {
+    const s = await start(); let release!: () => void;
+    try {
+      await seed(s);
+      s.engine.seedRuntimeBookkeepingForTest({ executionErrors: Array(100).fill(s.clock.ms - 1000) });
+      s.journal.setAppendInFlightHoldForTest(new Promise<void>((r) => { release = r; }), ["PAPER_ORDER_CREATED"]);
+      const pending = internal(s.engine).maybeGuardianProtectiveSell(MARKET);
+      await waitFor(() => internal(s.engine).riskReductionOwners.has(MARKET) && s.journal.inFlightAppends > 0);
+      const owner = internal(s.engine).riskReductionOwners.get(MARKET)!;
+      // Fresh valid held book still belongs to this exact residual, but no
+      // longer supplies the full order. The actual simulator must fail.
+      setBook(s, "UP", { bids: [{ price: "0.60", quantity: "2" }] });
+      release(); s.journal.setAppendInFlightHoldForTest(null);
+      await pending;
+      const failed = await s.journal.queryDurableTransitions({ types: ["RISK_REDUCTION_FAILED"], limit: 100 });
+      expect(failed).toHaveLength(1);
+      expect(failed[0]?.payload).toMatchObject({ executionFailure: true, reason: "INSUFFICIENT_DEPTH",
+        ownership: { intent: "GUARDIAN_PROTECTIVE_SELL", order: { id: owner.order.id } } });
+      expect((await rows(s, "PAPER_EXECUTION_ERROR"))[0]?.payload).toMatchObject({
+        intent: "GUARDIAN_PROTECTIVE_SELL", orderId: owner.order.id, message: "INSUFFICIENT_DEPTH" });
+      expect(await guardianFills(s)).toHaveLength(0); expect(residual(s)).toBe("5");
+      expect(internal(s.engine).riskReductionOwners.size).toBe(0);
+    } finally { release?.(); s.journal.setAppendInFlightHoldForTest(null); await s.engine.stop(); }
+  });
+  it.each(["OPEN_FIRST_LEG", "HEDGE_SECOND_LEG", "RESCUE_SECOND_LEG", "PROTECTIVE_DE_RISK"] as const)("retains the global execution-error veto for %s", (intent) => {
+    const limits = riskLimitsSchema.parse({});
+    expect(evaluateRisk(safeRisk({ intent, executionErrorsLastHour: limits.maxExecutionErrorsPerHour + 1 }), limits).vetoes)
+      .toContain("ABNORMAL_EXECUTION_ERRORS");
+  });
   it("yields to canonical normal profitable hedge", async () => {
     const s = await start(); try {
       await seed(s); setBook(s, "DOWN", { bids: [{ price: "0.09", quantity: "10000" }], asks: [{ price: "0.10", quantity: "10000" }] });

@@ -14,6 +14,14 @@ A full executable opposite lock within the existing loss cap also prevents it,
 unless an actual rescue execution failed for this exact residual episode.
 The age/loss/cap configuration remains 10000 ms / $0.35 / $0.60.
 
+Guardian alone is exempt from the global `ABNORMAL_EXECUTION_ERRORS` hourly
+counter veto: unrelated historical errors cannot trap an emergency full SELL.
+Normal, PR3 and old protective intents keep that veto. Database/journal/integrity,
+fresh held book, exact episode/token/residual, settlement and full execution
+checks remain; an actual Guardian simulator failure still records durable
+`RISK_REDUCTION_FAILED` with `executionFailure: true` and PAPER_EXECUTION_ERROR,
+releases ownership, and leaves residual open without a fabricated fill.
+
 `evaluateGuardian` is the only Guardian implementation. It checks current
 position, episode, held token, synchronized/nonfuture/fresh books, age/loss,
 canonical normal admissibility, maker/taker ownership, full opposite depth and
@@ -90,10 +98,15 @@ depth, price, opposite liquidity, fee schedule, or timeout was reduced.
 | Test G: latency deterioration -> final-fence rejects the actual fill | PR3's actual fee-inclusive loss cap must reject a deteriorated latency fill; residual remains available for later protection | All original ladders, callback ordering, price, depth, fee, latency and timeout remain. Adds an explicit wait for durable Guardian PAPER_ORDER_CREATED before the later improved opposite callback, anchoring that race during Guardian latency. Expected later action changes from PR3 retry to one full real Guardian SELL. | All original final-fence/cap rejection, no-rescue-fill, durable fill-count and still-open-residual assertions remain. Adds full Guardian identity/quantity/price, zero terminal exposure, and no later PR3 consumption. PR3 improvement before Guardian admission is separately rejected by canonical admission race tests; after-admission ownership is now deterministic. |
 
 The 20-test PR3 pre-merge correctness suite remains unchanged, including its
-hot-path counts and normal-admission races. The new 36-test Engine Guardian suite covers
+hot-path counts and normal-admission races. The new 46-test Engine Guardian suite covers
 full UP/DOWN SELL economics, cap/depth/exact-failure integration, normal/maker/PR3
 priority, serialized races, no partial fabrication, duplication, latency changes,
 recovery crash boundaries, settlement and old deadline ownership.
+The review correction adds 10 cases: cap/depth SELL despite excess generic
+errors, three hard authority faults, actual durable Guardian execution failure,
+and four other intents retaining their global error veto. The actual failure
+case deterministically holds the post-admission order audit, changes full depth,
+then releases execution; it does not rely on winning a wall-time race.
 
 Python policy tests are intentionally replaced by passive recording tests. The
 canonical policy and real execution assertions now live in the engine suite;
@@ -131,17 +144,17 @@ runtime. They do not claim to preserve retired counterfactual business logic.
 ## Validation
 
 Final focused run: `pnpm test -- tests/engine-guardian-paper.test.ts
-tests/early-catastrophic-pair-lock.test.ts tests/durable-risk-reduction-ownership.test.ts
-tests/pr3-premerge-correctness.test.ts --maxWorkers=2`: all 85 tests pass
-(Guardian 36, existing early PR3 13, PR87 16, PR3 pre-merge 20).
+tests/durable-risk-reduction-ownership.test.ts tests/early-catastrophic-pair-lock.test.ts
+tests/pr3-premerge-correctness.test.ts`: all 95 tests pass
+(Guardian 46, existing early PR3 13, PR87 16, PR3 pre-merge 20).
 Engine typecheck, engine build and synthetic CLI smoke pass.
-Final full `pnpm test -- --maxWorkers=2`: 91 files pass, 2 skipped;
-1073 tests pass, 10 skipped. The unrestricted full suite was also run: one
-earlier run passed, but the latest unrestricted run failed only the unchanged
-PARITY test described below (1072 passed, 1 failed, 10 skipped).
-These results are disclosed together; worker limiting is not claimed to fix
-the intermittent behavior. No existing test timeout, skip, assertion or liquidity
-fixture was adjusted to obtain a passing suite.
+Final full `pnpm test`, default worker settings: 90 files pass, 1 fails, 2 skipped;
+1082 tests pass, 1 fails, 10 skipped. Only the unchanged PARITY test times out.
+No worker override or rerun was used to hide this failure. Repeated exact-test
+BASE/HEAD measurements and captured root cause are documented in
+[PARITY_TRIAGE.md](PARITY_TRIAGE.md) with every run's IDs in
+[PARITY_TRIAGE_RUNS.csv](PARITY_TRIAGE_RUNS.csv). No existing test timeout, skip,
+assertion or liquidity fixture was adjusted to obtain a passing suite.
 
 ## Limits
 
@@ -151,16 +164,17 @@ hard safety vetoes or expiry leave exposure open for retry/settlement. No live
 order path or new execution simulator exists. A real 24h PAPER run still requires
 review, deployment of this engine revision and operator startup; none is done here.
 
-The unchanged `PARITY: same state yields equal canonical RESCUE decision
-pre-deadline (early) and at-deadline (PR82 B fallback)` test intermittently times
-out in grouped runs. It has both passed and failed on this branch; a required-base
-comparison passed its PR3 tests and did not reproduce that timeout, so regression
-attribution is unresolved. Its two engine instances both receive pre-deadline
-books before one clock advances. Which order has already completed at that point
-can change the tested lifecycle phase. The existing deadline arbitration also
-prefers SELL on equal guaranteed salvage. This is a possible explanation, not a
-captured diagnosis of the failing run. No fixture, assertion, timeout, or skip in
-that test has been changed. A separate deterministic engine test explicitly
-admits PR3, crosses the deadline before fill, and verifies durable release,
-the existing tie-preferred protective SELL, zero residual, and no Guardian or
-duplicate consumption. Review the intermittent validation result before a soak.
+The unchanged PARITY test has now been triaged with identical commands and
+instrumentation on the required BASE and reviewed HEAD: 14/30 BASE timeouts and
+11/30 HEAD timeouts. Every failure captures pending early PR3 at deadline
+advancement, its existing deadline-fence release, then the old equal-salvage
+protective SELL with zero residual while the test waits for RESCUE. Every pass
+completed PR3 before advancement and did not test deadline fallback at all.
+This establishes pre-existing scheduling sensitivity and the test's incorrect
+deadline-action assumption, with no observed HEAD failure-rate increase in this
+finite sample. It does not prove population-rate equivalence. Guardian never
+executes in these parity runs. No fixture, assertion, timeout, skip or deadline
+tie rule was changed. The full suite still has this known test blocker; its
+separate redesign/review remains before an unconditional green validation claim
+or soak readiness. The deterministic handoff test verifies the correct existing
+SELL behavior without duplicates.

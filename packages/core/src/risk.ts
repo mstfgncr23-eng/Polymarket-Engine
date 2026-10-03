@@ -330,7 +330,11 @@ export function evaluateRisk(input: RiskInput, limits: RiskLimits): RiskEvaluati
   if (rescue && !verifiedRescue) vetoes.push("RESCUE_NOT_VERIFIED_REDUCING");
   const requiredCash = input.requiredCashUsd ?? input.orderSizeUsd;
   if (input.availableCashUsd !== undefined && d(input.availableCashUsd).lt(requiredCash)) vetoes.push("INSUFFICIENT_CASH");
-  if (input.executionErrorsLastHour >= limits.maxExecutionErrorsPerHour) vetoes.push("ABNORMAL_EXECUTION_ERRORS");
+  // Guardian's emergency full SELL must not be trapped by unrelated hourly
+  // errors. Its actual execution failures and hard authority fences remain in
+  // the shared durable engine lifecycle; all other intents keep this veto.
+  if (input.intent !== "GUARDIAN_PROTECTIVE_SELL"
+    && input.executionErrorsLastHour >= limits.maxExecutionErrorsPerHour) vetoes.push("ABNORMAL_EXECUTION_ERRORS");
   if (!protective && input.externalRiskRecommendedVeto) vetoes.push("EXTERNAL_RISK_RECOMMENDED_VETO");
   if (input.shuttingDown) vetoes.push("SHUTTING_DOWN");
 
