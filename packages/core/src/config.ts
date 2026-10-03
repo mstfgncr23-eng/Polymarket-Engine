@@ -13,6 +13,8 @@ export const riskLimitsSchema = z.object({
   minLiquidityUsd: z.number().nonnegative().default(100),
   /** Minimum net expected value in USD/share for a $1 binary payout. */
   minExpectedEdge: z.number().min(0).max(1).default(0.015),
+  /** Dedicated gross locked pair edge floor for NORMAL HEDGE_SECOND_LEG only. */
+  normalHedgeMinLockedPairEdge: z.number().min(0).max(1).default(0.015),
   /**
    * Minimum fee/slippage-adjusted expected return on executable first-leg
    * notional. Unlike the absolute edge floor, this stays economically
@@ -94,6 +96,8 @@ export const engineEnvSchema = z.object({
   PAPER_START_BALANCE: z.coerce.number().positive().default(1000),
   PAPER_EXECUTION_LATENCY_MS: z.coerce.number().int().nonnegative().default(150),
   PAPER_EXECUTION_STYLE: z.enum(["TAKER", "MAKER"]).default("TAKER"),
+  /** Runtime override for NORMAL HEDGE_SECOND_LEG gross locked pair edge floor. */
+  NORMAL_HEDGE_MIN_LOCKED_PAIR_EDGE: z.coerce.number().min(0).max(1).default(0.015),
   EXPERIMENT_DURATION_HOURS: z.coerce.number().positive().default(48),
   EXPERIMENT_CLOSE_POLICY: z.enum(["observe_until_settlement", "mark_to_market"]).default("observe_until_settlement"),
   ENGINE_REGION: z.string().default("fra"),
