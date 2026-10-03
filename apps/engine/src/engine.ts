@@ -187,6 +187,7 @@ import {
   stablePositionId,
   riskReductionOwnershipSchema,
   riskReductionExecutionFailureSchema,
+  settlementLookupSchema,
   type RiskReductionExecutionFailure,
   unhedgedEpisode,
   validatePostReplayInvariants,
@@ -213,6 +214,10 @@ import {
 
 class ExperimentStartGuardRejectedError extends Error {
   constructor() { super("EXPERIMENT_START_MARKET_TRUTH_CHANGED"); }
+}
+
+class SettlementObligationChangedError extends Error {
+  constructor() { super("SETTLEMENT_OBLIGATION_CHANGED"); }
 }
 
 class FirstLegLifecycleGuardRejectedError extends Error {
@@ -503,6 +508,7 @@ export class EngineService {
   private readonly entryQualified = new Set<string>();
   private readonly managedMarketIds = new Set<string>();
   private readonly settledMarkets = new Set<string>();
+  private readonly economicSettlementLookups = new Map<string, BinarySettlementLookup>();
   private readonly settlementBackoff = new Map<string, number>();
   private readonly assetByMarket = new Map<string, string | null>();
   private readonly assetIndex = new AssetMarketIndex();
@@ -1300,7 +1306,7 @@ export class EngineService {
     const previousMarketIds = new Set(this.marketsById.keys());
     const previousAssets = new Set([...this.assetByMarket.values()].filter((asset): asset is string => Boolean(asset)));
     const previousTokens = [...this.tokenIds];
-    const obligations = this.obligationMarketIds();
+    let obligations = this.obligationMarketIds();
     const nextEntryQualified = new Set(report.qualified.map((market) => market.id));
 
     const nextMarkets = new Map<string, DiscoveredMarket>();
@@ -1316,6 +1322,22 @@ export class EngineService {
 
     const vanishedMakerMarkets = this.vanishedRestingMarketIds(nextMarkets);
     await this.cancelVanishedMakers(vanishedMakerMarkets);
+
+    // Cancellation yields to fills and maker admissions. Reconcile CURRENT obligations at the
+    // destructive boundary, with no await between this read and map replacement.
+    obligations = this.obligationMarketIds();
+    for (const id of nextMarkets.keys()) {
+      if (!nextEntryQualified.has(id) && !obligations.has(id)) nextMarkets.delete(id);
+    }
+    for (const id of obligations) {
+      const fresh = report.discovered.find((item) => item.id === id)
+        ?? report.qualified.find((item) => item.id === id);
+      const previous = this.marketsById.get(id);
+      if (fresh) nextMarkets.set(id, fresh);
+      // Every current obligation needs context, including makers admitted after
+      // cancellation snapshotted its orders. Unobligated history is excluded.
+      else if (previous) nextMarkets.set(id, previous);
+    }
 
     this.entryQualified.clear();
     for (const id of nextEntryQualified) this.entryQualified.add(id);
@@ -1704,6 +1726,7 @@ export class EngineService {
       restingOrders: this.restingOrders,
       makerReservations: this.makerReservations,
       settledMarkets: this.settledMarkets,
+      settlementLookups: this.economicSettlementLookups,
       lastInfrastructureAccrualAt: this.lastInfrastructureAccrualAt,
       riskReductionOwners: this.riskReductionOwners,
       riskReductionFailures: this.riskReductionFailures,
@@ -1780,6 +1803,7 @@ export class EngineService {
         if (error instanceof CrashInjectedError) throw error;
         if (error instanceof ExperimentStartGuardRejectedError) throw error;
         if (error instanceof FirstLegLifecycleGuardRejectedError) throw error;
+        if (error instanceof SettlementObligationChangedError) throw error;
         // A stale/raced hedge-vs-protective fill is an expected lifecycle
         // rejection, not durability corruption. It must rethrow as a normal
         // STATE_CHANGED rejection without latching the integrity fault; only
@@ -2020,6 +2044,13 @@ export class EngineService {
     const ledger = ledgerStateSchema.parse(payload.ledger);
     const positions = Array.isArray(payload.positions) ? payload.positions.map((item) => positionSchema.parse(item)) : [];
     this.ledger.restore(ledger, positions);
+    this.economicSettlementLookups.clear();
+    for (const raw of (payload.settlementLookups ?? []) as unknown[]) {
+      const lookup = settlementLookupSchema.parse(raw);
+      if (this.openPositionMarketIds().has(lookup.marketId)) {
+        this.economicSettlementLookups.set(lookup.marketId, lookup);
+      }
+    }
     this.state.setLedger(this.ledger.snapshot());
     this.experiment = payload.experiment ? experimentManifestSchema.parse(payload.experiment) : createIdleExperiment({
       durationHours: this.env.EXPERIMENT_DURATION_HOURS, strategyVersion: this.strategy.version,
@@ -4302,6 +4333,9 @@ export class EngineService {
       riskReductionOwnership?: RiskReductionOwnership;
     } = {},
   ): Promise<boolean> {
+    // Capture before any asynchronous fill work can lose live discovery context.
+    // The same lookup type used by learning/CF is persisted with economic authority.
+    const settlementLookup = this.resolveSettlementLookup(fill.marketId, true);
     // A settlement is the terminal authority for this market. The live bit
     // is normally restored from the verified checkpoint; the durable lookup
     // covers a rediscovery/retry after bounded replay-key pressure evicted the
@@ -4529,6 +4563,7 @@ export class EngineService {
           const unhedgedStartedAtBefore = previousAtCommit?.unhedgedStartedAt ?? previousAtCommit?.openedAt ?? null;
           const auth = {
             fill, positionId, reservationAfter, restingAfter,
+            ...(settlementLookup ? { settlementLookup } : {}),
             ...(economicIntent ? { intent: economicIntent } : {}),
             ...(extras.deRisk ? { deRisk: extras.deRisk } : {}),
           };
@@ -5083,6 +5118,7 @@ export class EngineService {
           riskReductionFailures: [...this.riskReductionFailures.values()],
           managedMarkets: [...this.obligationMarketIds()],
           settledMarkets: [...this.settledMarkets],
+          settlementLookups: [...this.economicSettlementLookups.values()],
           marketMetadata: [...this.marketsById.values()].map((market) => ({ ...market, raw: {} })),
           lastInfrastructureAccrualAt: this.lastInfrastructureAccrualAt,
           derivedAuditCursor: this.derivedAuditCursor,
@@ -7365,11 +7401,18 @@ private buildEarlyAudit(
     for (const position of [...this.ledger.positions.values()]) {
       if (this.settledMarkets.has(position.marketId)) continue;
       if (Number(position.upQuantity) === 0 && Number(position.downQuantity) === 0) continue;
-      const market = this.marketsById.get(position.marketId);
-      if (!market?.endDate || new Date(market.endDate).getTime() > now.getTime()) continue;
+      const lookup = this.resolveSettlementLookup(position.marketId, true);
+      if (!lookup || !Number.isFinite(Date.parse(lookup.endDate))
+        || Date.parse(lookup.endDate) > now.getTime()
+        || !isAuthoritativeBinaryMapping(lookup.yesMapsTo, lookup.noMapsTo)) continue;
       const waitUntil = this.settlementBackoff.get(position.marketId) ?? 0;
       if (now.getTime() < waitUntil) continue;
-      await this.settleMarket(position.marketId, market);
+      try {
+        await this.settleMarket(position.marketId, lookup);
+      } catch (error) {
+        if (!(error instanceof SettlementObligationChangedError)) throw error;
+        // Inventory was closed while the resolution request/commit was in flight.
+      }
     }
   }
 
@@ -7380,7 +7423,7 @@ private buildEarlyAudit(
    */
 
   private settlementLookupFromMarket(market: DiscoveredMarket): BinarySettlementLookup | null {
-    if (!market.endDate) return null;
+    if (!market.endDate || !Number.isFinite(Date.parse(market.endDate))) return null;
     const yes = market.qualification.binary.yesOutcome;
     const no = market.qualification.binary.noOutcome;
     if (!isAuthoritativeBinaryMapping(yes, no)) return null;
@@ -7393,7 +7436,11 @@ private buildEarlyAudit(
     };
   }
 
-  private resolveSettlementLookup(marketId: string): BinarySettlementLookup | null {
+  private resolveSettlementLookup(marketId: string, economic = false): BinarySettlementLookup | null {
+    // Economic inventory retains its own original capture; learning/CF callers
+    // keep their existing decision-time lookup precedence.
+    const fromEconomic = economic ? this.economicSettlementLookups.get(marketId) : null;
+    if (fromEconomic) return fromEconomic;
     // Prefer decision/accept-time durable captures over live discovery so a later
     // re-discovery cannot rewrite historical YES/NO settlement semantics.
     const fromCf = this.counterfactualStore.settlementLookupFor(marketId);
@@ -7465,7 +7512,7 @@ private buildEarlyAudit(
     }
   }
 
-  private async settleMarket(marketId: string, market: DiscoveredMarket): Promise<void> {
+  private async settleMarket(marketId: string, lookup: BinarySettlementLookup): Promise<void> {
     if (this.settledMarkets.has(marketId)) return;
     // There is no economic obligation to settle when no position remains. In
     // particular this prevents an old rediscovered market from creating a new
@@ -7480,26 +7527,26 @@ private buildEarlyAudit(
       this.settledMarkets.add(marketId);
       return;
     }
-    const raw = await this.resolutionFetcher(market.id) ?? (market.slug ? await this.resolutionFetcher(market.slug) : null);
+    const raw = await this.resolutionFetcher(lookup.marketId) ?? (lookup.slug ? await this.resolutionFetcher(lookup.slug) : null);
     if (!raw) {
       this.bumpSettlementBackoff(marketId);
       return;
     }
-    const binary = market.qualification.binary;
     const parsed = parsePublicBinaryResolution(
       raw,
-      binary.yesOutcome === "DOWN" || binary.yesOutcome === "UP" ? binary.yesOutcome : "UP",
-      binary.noOutcome === "DOWN" || binary.noOutcome === "UP" ? binary.noOutcome : "DOWN",
+      lookup.yesMapsTo,
+      lookup.noMapsTo,
     );
     if (parsed.status !== "resolved" || parsed.upPayoff === null || parsed.downPayoff === null || !parsed.winner) {
       this.bumpSettlementBackoff(marketId);
       return;
     }
     const settledAt = this.nowFn();
-    const positionBefore = this.ledger.positions.get(marketId);
+    let positionBefore = this.ledger.positions.get(marketId);
+    if (!positionBefore || (!d(positionBefore.upQuantity).gt(0) && !d(positionBefore.downQuantity).gt(0))) return;
     const upPayoff = parsed.upPayoff;
     const downPayoff = parsed.downPayoff;
-    const asset = this.assetByMarket.get(marketId) ?? market.asset;
+    const asset = this.assetByMarket.get(marketId) ?? null;
     const experimentId = this.experiment?.id ?? null;
     await this.commitAuthoritative({
       operationKey,
@@ -7508,13 +7555,18 @@ private buildEarlyAudit(
       aggregateId: positionBefore?.id ?? marketId,
       occurredAt: settledAt,
       buildPayload: (occurredAt) => {
+        // Build economics from inventory at the serialized mutation boundary.
+        positionBefore = this.ledger.positions.get(marketId);
+        if (!positionBefore || (!d(positionBefore.upQuantity).gt(0) && !d(positionBefore.downQuantity).gt(0))) {
+          throw new SettlementObligationChangedError();
+        }
         const auth = {
           marketId,
           upPayoff,
           downPayoff,
           settledAt: occurredAt.toISOString(),
           winner: parsed.winner,
-          slug: market.slug,
+          slug: lookup.slug,
           resolution: parsed,
         };
         return {
