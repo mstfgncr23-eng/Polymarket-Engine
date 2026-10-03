@@ -615,7 +615,10 @@ export class EngineService {
       ...defaultNativeDecisionConfig,
       referenceRapidMoveBps: this.triggerConfig.referenceRapidMoveBps,
     };
-    this.riskLimits = riskLimitsSchema.parse({ maxExternalSignalsPerMinute: env.GROK_MCP_RATE_LIMIT_PER_MINUTE });
+    this.riskLimits = riskLimitsSchema.parse({
+      maxExternalSignalsPerMinute: env.GROK_MCP_RATE_LIMIT_PER_MINUTE,
+      normalHedgeMinLockedPairEdge: env.NORMAL_HEDGE_MIN_LOCKED_PAIR_EDGE,
+    });
     this.marketAdapter = adapters?.market ?? new PolymarketMarketDataAdapter(undefined, { hydrateMinOrderSizeFromRest: true });
     if (this.marketAdapter instanceof PolymarketMarketDataAdapter) {
       this.marketAdapter.setNormalizeObserver(this.metrics.normalizeObserver());
@@ -3552,7 +3555,7 @@ export class EngineService {
     let decisionNative = native;
     let candidate = this.strategy.evaluate({
       consensus: decisionConsensus, snapshots: { UP: pair.UP ?? null, DOWN: pair.DOWN ?? null }, position,
-      maxOrderSizeUsd: this.riskLimits.maxOrderSizeUsd, minimumLockedPairEdge: this.riskLimits.minExpectedEdge,
+      maxOrderSizeUsd: this.riskLimits.maxOrderSizeUsd, minimumLockedPairEdge: this.riskLimits.normalHedgeMinLockedPairEdge,
     });
     if (!candidate) return;
     if (
@@ -3681,7 +3684,7 @@ export class EngineService {
         snapshots: { UP: currentPair.UP, DOWN: currentPair.DOWN },
         position,
         maxOrderSizeUsd: this.riskLimits.maxOrderSizeUsd,
-        minimumLockedPairEdge: this.riskLimits.minExpectedEdge,
+        minimumLockedPairEdge: this.riskLimits.normalHedgeMinLockedPairEdge,
       });
       if (
         !revalidatedCandidate
@@ -5541,7 +5544,7 @@ export class EngineService {
       position,
       snapshots: { UP: freshUp, DOWN: freshDown },
       maxOrderSizeUsd: this.riskLimits.maxOrderSizeUsd,
-      minimumLockedPairEdge: this.riskLimits.minExpectedEdge,
+      minimumLockedPairEdge: this.riskLimits.normalHedgeMinLockedPairEdge,
     });
     if (!candidate) {
       this.pr3HedgeDebug.set(marketId, { stage: "NO_CANDIDATE", vetoes: null });
@@ -5586,7 +5589,7 @@ export class EngineService {
       position,
       snapshots: { UP: freshUp, DOWN: freshDown },
       maxOrderSizeUsd: this.riskLimits.maxOrderSizeUsd,
-      minimumLockedPairEdge: this.riskLimits.minExpectedEdge,
+      minimumLockedPairEdge: this.riskLimits.normalHedgeMinLockedPairEdge,
     });
     if (!candidate) return null;
     const snapshot = candidate.outcome === "UP" ? freshUp : freshDown;
@@ -5669,6 +5672,7 @@ export class EngineService {
       riskConfiguration: {
         maxOrderSizeUsd: this.riskLimits.maxOrderSizeUsd,
         minExpectedEdge: this.riskLimits.minExpectedEdge,
+        normalHedgeMinLockedPairEdge: this.riskLimits.normalHedgeMinLockedPairEdge,
         staleFeedTimeoutMs: this.riskLimits.staleFeedTimeoutMs,
         catastrophicPairLockMinUnhedgedMs: this.riskLimits.catastrophicPairLockMinUnhedgedMs,
         catastrophicPairLockTriggerLossUsd: this.riskLimits.catastrophicPairLockTriggerLossUsd,

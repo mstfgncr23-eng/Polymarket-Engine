@@ -73,6 +73,7 @@ describe("guardian shadow canonical authority surface", () => {
         ESTIMATED_INFRA_COST_PER_HOUR_USD: "0",
         PAPER_EXECUTION_STYLE: "TAKER",
         PAPER_EXECUTION_LATENCY_MS: "0",
+        NORMAL_HEDGE_MIN_LOCKED_PAIR_EDGE: "0.04",
       }),
       journal,
       { error: () => undefined },
@@ -89,7 +90,8 @@ describe("guardian shadow canonical authority surface", () => {
     try {
       await market.waitForHandlers();
       const upBook = book("UP", [{ price: "0.70", quantity: "1000" }], [{ price: "0.81", quantity: "1000" }]);
-      const downBook = book("DOWN", [{ price: "0.04", quantity: "1000" }], [{ price: "0.05", quantity: "10000" }]);
+      // first-leg 0.80 + opposite ask 0.17 => gross locked edge 0.03, below the dedicated 0.04 floor.
+      const downBook = book("DOWN", [{ price: "0.15", quantity: "1000" }], [{ price: "0.17", quantity: "10000" }]);
       await market.emitSnapshot(upBook);
       await market.emitSnapshot(downBook);
       await engine.applyObservedFill(firstLeg(), "OPEN_FIRST_LEG");
@@ -102,6 +104,7 @@ describe("guardian shadow canonical authority surface", () => {
         { UP: upBook, DOWN: downBook },
         new Date(START),
       );
+      expect(canonicalNormal).toBeNull();
       const expectedNormalAdmissible = canonicalNormal?.accepted === true && canonicalNormal.order != null;
       const expectedNormalVetoes = canonicalNormal?.risk.vetoes ?? [];
 
@@ -135,6 +138,7 @@ describe("guardian shadow canonical authority surface", () => {
       expect(first.riskConfiguration).toMatchObject({
         maxOrderSizeUsd: 25,
         minExpectedEdge: 0.015,
+        normalHedgeMinLockedPairEdge: 0.04,
         staleFeedTimeoutMs: 15000,
         catastrophicPairLockMinUnhedgedMs: 10000,
         catastrophicPairLockTriggerLossUsd: 0.35,
