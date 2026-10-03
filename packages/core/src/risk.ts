@@ -169,7 +169,7 @@ export interface RiskInput {
   directionalExposureUsd: string;
   unhedgedExposureUsd: string;
   unhedgedDurationMs: number;
-  intent?: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK" | "RESCUE_SECOND_LEG";
+  intent?: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK" | "RESCUE_SECOND_LEG" | "GUARDIAN_PROTECTIVE_SELL";
   projectedMarketExposureUsd?: string;
   projectedTotalExposureUsd?: string;
   projectedDirectionalExposureUsd?: string;
@@ -231,7 +231,7 @@ export function evaluateRisk(input: RiskInput, limits: RiskLimits): RiskEvaluati
   const vetoes: RiskReasonCode[] = [];
   const age = (value: Date | null) => value ? input.now.getTime() - value.getTime() : Number.POSITIVE_INFINITY;
   const hedge = input.intent === "HEDGE_SECOND_LEG";
-  const protective = input.intent === "PROTECTIVE_DE_RISK";
+  const protective = input.intent === "PROTECTIVE_DE_RISK" || input.intent === "GUARDIAN_PROTECTIVE_SELL";
   const rescue = input.intent === "RESCUE_SECOND_LEG";
   const riskReducingIntent = hedge || rescue || protective;
   // RESCUE_SECOND_LEG is a risk-only pair-lock: like the protective SELL it
@@ -330,7 +330,11 @@ export function evaluateRisk(input: RiskInput, limits: RiskLimits): RiskEvaluati
   if (rescue && !verifiedRescue) vetoes.push("RESCUE_NOT_VERIFIED_REDUCING");
   const requiredCash = input.requiredCashUsd ?? input.orderSizeUsd;
   if (input.availableCashUsd !== undefined && d(input.availableCashUsd).lt(requiredCash)) vetoes.push("INSUFFICIENT_CASH");
-  if (input.executionErrorsLastHour >= limits.maxExecutionErrorsPerHour) vetoes.push("ABNORMAL_EXECUTION_ERRORS");
+  // Guardian's emergency full SELL must not be trapped by unrelated hourly
+  // errors. Its actual execution failures and hard authority fences remain in
+  // the shared durable engine lifecycle; all other intents keep this veto.
+  if (input.intent !== "GUARDIAN_PROTECTIVE_SELL"
+    && input.executionErrorsLastHour >= limits.maxExecutionErrorsPerHour) vetoes.push("ABNORMAL_EXECUTION_ERRORS");
   if (!protective && input.externalRiskRecommendedVeto) vetoes.push("EXTERNAL_RISK_RECOMMENDED_VETO");
   if (input.shuttingDown) vetoes.push("SHUTTING_DOWN");
 

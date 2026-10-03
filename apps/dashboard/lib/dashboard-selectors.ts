@@ -294,6 +294,7 @@ export function shortId(value: string | null | undefined, length = 18): string {
 export function eventSummary(event: DashboardEvent): string {
   const detail = event.detail;
   const parts: string[] = [];
+  if (detail.intent === "GUARDIAN_PROTECTIVE_SELL") parts.push("GUARDIAN PROTECTIVE SELL");
   if (event.type === "ASTRA_PROVIDER_DISPATCH_STARTED") parts.push("provider dispatch started");
   if (typeof detail.kind === "string") parts.push(detail.kind);
   if (detail.paidCandidate === "REJECTED") parts.push("paid Astra rejected");

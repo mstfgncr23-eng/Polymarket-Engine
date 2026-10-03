@@ -186,6 +186,8 @@ import {
   RecoveryFailClosedError,
   stablePositionId,
   riskReductionOwnershipSchema,
+  riskReductionExecutionFailureSchema,
+  type RiskReductionExecutionFailure,
   unhedgedEpisode,
   validatePostReplayInvariants,
   type DerivedAuditRecord,
@@ -222,7 +224,7 @@ class FirstLegLifecycleGuardRejectedError extends Error {
 class RiskReductionLifecycleGuardRejectedError extends Error {
   constructor(
     readonly marketId: string,
-    readonly intent: "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK" | "RESCUE_SECOND_LEG",
+    readonly intent: "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK" | "RESCUE_SECOND_LEG" | "GUARDIAN_PROTECTIVE_SELL",
     readonly reason: string,
   ) {
     super(`RISK_REDUCTION_LIFECYCLE_REJECTED:${marketId}:${intent}:${reason}`);
@@ -338,7 +340,7 @@ type GrokSubmissionResult = {
   signalId?: string;
 };
 
-type RiskReductionUnhedgedReason = "MAX_UNHEDGED_DURATION" | "PRE_EXPIRY_SAFETY" | "EARLY_CATASTROPHIC_PAIR_LOCK" | "EARLY_HEDGE_ADOPTION";
+type RiskReductionUnhedgedReason = "GUARDIAN_PROTECTIVE_SELL" | "MAX_UNHEDGED_DURATION" | "PRE_EXPIRY_SAFETY" | "EARLY_CATASTROPHIC_PAIR_LOCK" | "EARLY_HEDGE_ADOPTION";
 
 type ProtectiveDeRiskAudit = {
   deRiskReason: RiskReductionUnhedgedReason;
@@ -377,6 +379,8 @@ type ProtectiveDeRiskAudit = {
   bFeeUsd?: string | null;
   bRequiredCashUsd?: string | null;
   bGuaranteedSalvageUsd?: string | null;
+  guardianReason?: string;
+  rescueFailureOrderId?: string | null;
 };
 
 type NativeV2ShadowExecutionCapture = {
@@ -461,6 +465,7 @@ export class EngineService {
    */
   private readonly riskReductionInFlight = new Set<string>();
   private readonly riskReductionOwners = new Map<string, RiskReductionOwnership>();
+  private readonly riskReductionFailures = new Map<string, RiskReductionExecutionFailure>();
   private readonly protectiveDeRiskAttempts = new Map<string, number>();
   /** Earliest next durable de-risk evaluation per market. Ephemeral by design. */
   private readonly protectiveDeRiskNextAttemptAt = new Map<string, number>();
@@ -892,7 +897,7 @@ export class EngineService {
   async referenceTickForTest(tick: ReferenceTick): Promise<void> { await this.onReferenceTick(tick); }
   async applyObservedFill(
     fill: Parameters<PaperLedger["applyFill"]>[0],
-    intent?: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK" | "RESCUE_SECOND_LEG",
+    intent?: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK" | "RESCUE_SECOND_LEG" | "GUARDIAN_PROTECTIVE_SELL",
   ): Promise<void> { await this.applyFill(fill, { intent }); }
   async restMakerForTest(
     order: PaperOrder,
@@ -1698,6 +1703,7 @@ export class EngineService {
       settledMarkets: this.settledMarkets,
       lastInfrastructureAccrualAt: this.lastInfrastructureAccrualAt,
       riskReductionOwners: this.riskReductionOwners,
+      riskReductionFailures: this.riskReductionFailures,
     };
   }
 
@@ -2035,6 +2041,15 @@ export class EngineService {
       const owner = riskReductionOwnershipSchema.parse(raw);
       if (this.riskReductionOwners.has(owner.marketId)) throw new RecoveryFailClosedError("invariant", "duplicate pending taker");
       this.riskReductionOwners.set(owner.marketId, owner);
+    }
+    if (payload.riskReductionFailures !== undefined && !Array.isArray(payload.riskReductionFailures)) {
+      throw new RecoveryFailClosedError("malformed", "taker failures must be an array");
+    }
+    for (const raw of (payload.riskReductionFailures ?? []) as unknown[]) {
+      const failure = riskReductionExecutionFailureSchema.parse(raw);
+      const marketId = failure.ownership.marketId;
+      if (this.riskReductionFailures.has(marketId)) throw new RecoveryFailClosedError("invariant", "duplicate taker failure");
+      this.riskReductionFailures.set(marketId, failure);
     }
     const triggers = Array.isArray(payload.activeTriggers) ? payload.activeTriggers.map((item) => triggerEventSchema.parse(item)) : [];
     for (const trigger of triggers) {
@@ -3822,13 +3837,13 @@ export class EngineService {
     };
   }
 
-  private async failRiskReduction(owner: RiskReductionOwnership, reason: string): Promise<void> {
+  private async failRiskReduction(owner: RiskReductionOwnership, reason: string, executionFailure = false): Promise<void> {
     const current = this.riskReductionOwners.get(owner.marketId);
     if (current?.order.id !== owner.order.id || current.unhedgedStartedAt !== owner.unhedgedStartedAt) return;
     await this.commitAuthoritative({
       operationKey: `risk-reduction:${owner.order.id}:failed`, type: "RISK_REDUCTION_FAILED",
       aggregateType: "paper_order", aggregateId: owner.order.id,
-      buildPayload: () => ({ ownership: owner, reason,
+      buildPayload: () => ({ ownership: owner, reason, executionFailure,
         derivedAudit: [this.ownershipAudit(owner, "RISK_REDUCTION_FAILED", reason)] }),
     });
   }
@@ -3855,6 +3870,10 @@ export class EngineService {
             || owner.order.outcome !== (owner.order.side === "SELL" ? position.unpairedOutcome : position.unpairedOutcome === "UP" ? "DOWN" : "UP")
             || owner.order.tokenId !== this.currentTokenIdFor(owner.marketId, owner.order.outcome)) {
             throw new RiskReductionLifecycleGuardRejectedError(owner.marketId, owner.intent, "ADMISSION_RESIDUAL_CHANGED");
+          }
+          if (owner.intent === "GUARDIAN_PROTECTIVE_SELL") {
+            const evaluation = this.evaluateGuardian(owner.marketId, owner.order);
+            if (!evaluation.decision?.accepted) throw new RiskReductionLifecycleGuardRejectedError(owner.marketId, owner.intent, evaluation.reason);
           }
           // The new durable boundary is another await after PR3's economic
           // fence. Repeat that fence here, inside the serialized mutation gate.
@@ -3916,7 +3935,7 @@ export class EngineService {
     order: PaperOrder,
     decisionSnapshot: MarketSnapshot,
     duplicateKey: string,
-    intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK" | "RESCUE_SECOND_LEG" = "OPEN_FIRST_LEG",
+    intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK" | "RESCUE_SECOND_LEG" | "GUARDIAN_PROTECTIVE_SELL" = "OPEN_FIRST_LEG",
     deRisk?: ProtectiveDeRiskAudit,
     options?: { skipPreCreateFirstLegCancel?: boolean; resume?: boolean },
   ): Promise<boolean> {
@@ -3928,12 +3947,12 @@ export class EngineService {
     order: PaperOrder,
     decisionSnapshot: MarketSnapshot,
     duplicateKey: string,
-    intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK" | "RESCUE_SECOND_LEG" = "OPEN_FIRST_LEG",
+    intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK" | "RESCUE_SECOND_LEG" | "GUARDIAN_PROTECTIVE_SELL" = "OPEN_FIRST_LEG",
     deRisk?: ProtectiveDeRiskAudit,
     options?: { skipPreCreateFirstLegCancel?: boolean; resume?: boolean },
   ): Promise<boolean> {
     if (intent === "OPEN_FIRST_LEG" && this.experimentStartPending) return false;
-    if (intent === "PROTECTIVE_DE_RISK" && order.orderType !== "TAKER") {
+    if ((intent === "PROTECTIVE_DE_RISK" || intent === "GUARDIAN_PROTECTIVE_SELL") && order.orderType !== "TAKER") {
       throw new Error("PROTECTIVE_DE_RISK_REQUIRES_TAKER");
     }
     if (intent === "RESCUE_SECOND_LEG" && order.orderType !== "TAKER") {
@@ -3941,7 +3960,7 @@ export class EngineService {
     }
     const riskReductionOrder = intent === "HEDGE_SECOND_LEG"
       || intent === "RESCUE_SECOND_LEG"
-      || intent === "PROTECTIVE_DE_RISK";
+      || intent === "PROTECTIVE_DE_RISK" || intent === "GUARDIAN_PROTECTIVE_SELL";
     // PR2 single risk-reduction authority: exactly one risk-reduction admission
     // may be in flight per market. RESCUE and PROTECTIVE submissions are
     // already serialized by the maybeProtectiveDeRisk per-market flight (the
@@ -3998,7 +4017,7 @@ export class EngineService {
         intent === "OPEN_FIRST_LEG"
         && this.firstLegLifecycleBlocked(order.marketId, true)
       ) return false;
-      if (intent === "HEDGE_SECOND_LEG" || intent === "PROTECTIVE_DE_RISK" || intent === "RESCUE_SECOND_LEG") {
+      if (intent === "HEDGE_SECOND_LEG" || intent === "PROTECTIVE_DE_RISK" || intent === "RESCUE_SECOND_LEG" || intent === "GUARDIAN_PROTECTIVE_SELL") {
         if (options?.skipPreCreateFirstLegCancel) {
           // EARLY path: first-leg makers were durably fenced BEFORE the final
           // synchronous fence. Assert synchronously that none remain, and do NOT
@@ -4013,7 +4032,7 @@ export class EngineService {
           // not be allowed to refill directional exposure behind the action.
           await this.cancelOutstandingFirstLegMakers(
             order.marketId,
-            intent === "PROTECTIVE_DE_RISK" ? "PROTECTIVE_DE_RISK_ADMITTED"
+            (intent === "PROTECTIVE_DE_RISK" || intent === "GUARDIAN_PROTECTIVE_SELL") ? `${intent}_ADMITTED`
               : intent === "RESCUE_SECOND_LEG" ? "RESCUE_ADMITTED"
               : "HEDGE_ADMITTED",
           );
@@ -4045,7 +4064,7 @@ export class EngineService {
       this.recentTrades.set(duplicateKey, Date.now());
       try {
         if (order.orderType === "MAKER") {
-          if (intent === "PROTECTIVE_DE_RISK") throw new Error("PROTECTIVE_DE_RISK_REQUIRES_TAKER");
+          if (intent === "PROTECTIVE_DE_RISK" || intent === "GUARDIAN_PROTECTIVE_SELL") throw new Error("PROTECTIVE_DE_RISK_REQUIRES_TAKER");
           if (intent === "RESCUE_SECOND_LEG") throw new Error("RESCUE_SECOND_LEG_REQUIRES_TAKER");
           // Resting makers are only ever first-leg or hedge orders; rescue is
           // enforced TAKER-only above, so the cast is a pure TS narrowing aid.
@@ -4055,6 +4074,9 @@ export class EngineService {
         await delay(this.env.PAPER_EXECUTION_LATENCY_MS);
         const current = this.state.marketSnapshots.get(order.tokenId);
         if (!current || new Date(current.receivedAt).getTime() < new Date(decisionSnapshot.receivedAt).getTime()) throw new Error("STALE_EXECUTION_SNAPSHOT");
+        if (intent === "GUARDIAN_PROTECTIVE_SELL" && !this.freshEarlyCatastrophicSnapshot(current, this.nowFn().getTime())) {
+          throw new RiskReductionLifecycleGuardRejectedError(order.marketId, intent, "GUARDIAN_EXECUTION_BOOK_UNAVAILABLE");
+        }
         if (durableOwner) {
           const residual = this.ledger.positions.get(order.marketId);
           if (this.riskReductionOwners.get(order.marketId)?.order.id !== order.id
@@ -4073,7 +4095,8 @@ export class EngineService {
         else if (durableOwner) await this.failRiskReduction(durableOwner, "FILL_NOT_APPLIED");
       } catch (error) {
         if (this.overload.hasIntegrityFault || error instanceof IdempotencyConflictError || error instanceof CrashInjectedError || (error instanceof JournalAdmissionRejected && error.critical)) throw error;
-        if (durableOwner) await this.failRiskReduction(durableOwner, error instanceof Error ? error.message : String(error));
+        if (durableOwner) await this.failRiskReduction(durableOwner, error instanceof Error ? error.message : String(error),
+          !(error instanceof RiskReductionLifecycleGuardRejectedError) && !(error instanceof TakerCashCommitGuardRejectedError) && !(error instanceof MakerReservationCashCommitGuardRejectedError));
         if (error instanceof RiskReductionLifecycleGuardRejectedError) {
           const stateChangedDeRisk = deRisk ? { ...deRisk, finalState: "STATE_CHANGED" as const } : undefined;
           this.record("RISK_REDUCTION_LIFECYCLE_BLOCKED", order.traceId, order.marketId, {
@@ -4271,7 +4294,7 @@ export class EngineService {
     fill: Parameters<PaperLedger["applyFill"]>[0],
     extras: {
       restingAfter?: RestingPaperOrder | null;
-      intent?: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK" | "RESCUE_SECOND_LEG";
+      intent?: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK" | "RESCUE_SECOND_LEG" | "GUARDIAN_PROTECTIVE_SELL";
       deRisk?: ProtectiveDeRiskAudit;
       riskReductionOwnership?: RiskReductionOwnership;
     } = {},
@@ -4360,7 +4383,7 @@ export class EngineService {
             }
           }
 
-          if (economicIntent === "HEDGE_SECOND_LEG" || economicIntent === "PROTECTIVE_DE_RISK" || economicIntent === "RESCUE_SECOND_LEG") {
+          if (economicIntent === "HEDGE_SECOND_LEG" || economicIntent === "PROTECTIVE_DE_RISK" || economicIntent === "RESCUE_SECOND_LEG" || economicIntent === "GUARDIAN_PROTECTIVE_SELL") {
             // DURABLE CANCEL WINS over an older in-flight HEDGE maker fill. A
             // hedge maker fill derived before rescue ownership must not commit
             // once the rescue durably cancelled the resting order: its
@@ -4380,7 +4403,7 @@ export class EngineService {
             // re-validate hard safety immediately before the durable economic
             // mutation. A flip since risk evaluation makes this a state-changed
             // rejection (bounded, deterministic), never a durability fault.
-            if (economicIntent === "PROTECTIVE_DE_RISK" || economicIntent === "RESCUE_SECOND_LEG") {
+            if (economicIntent === "PROTECTIVE_DE_RISK" || economicIntent === "RESCUE_SECOND_LEG" || economicIntent === "GUARDIAN_PROTECTIVE_SELL") {
               const hardSafetyReason = this.protectiveFillHardSafetyReason(fill);
               if (hardSafetyReason) {
                 this.recordProtectiveDeRiskSuppressed(
@@ -4429,6 +4452,13 @@ export class EngineService {
               if (fill.outcome !== currentPosition.unpairedOutcome) {
                 throw new RiskReductionLifecycleGuardRejectedError(fill.marketId, economicIntent, "DE_RISK_OUTCOME_CHANGED");
               }
+            }
+            if (economicIntent === "GUARDIAN_PROTECTIVE_SELL" && (!owner || !d(fill.quantity).eq(currentPosition.unpairedQuantity))) {
+              throw new RiskReductionLifecycleGuardRejectedError(fill.marketId, economicIntent, "GUARDIAN_FULL_RESIDUAL_REQUIRED");
+            }
+            if (economicIntent === "GUARDIAN_PROTECTIVE_SELL" && !this.freshEarlyCatastrophicSnapshot(
+              this.state.marketSnapshots.get(fill.tokenId) ?? null, this.nowFn().getTime())) {
+              throw new RiskReductionLifecycleGuardRejectedError(fill.marketId, economicIntent, "GUARDIAN_EXECUTION_BOOK_UNAVAILABLE");
             }
             // PR3 EARLY catastrophic pair-lock final fence: decided-state is not
             // enough â€” revalidate immediately before the durable mutation that
@@ -4517,7 +4547,8 @@ export class EngineService {
           };
         },
         afterApply: async () => {
-          this.record("PAPER_FILL", fill.traceId, fill.marketId, { fillId: fill.id, orderId: fill.orderId, price: fill.fillPrice, quantity: fill.quantity, role: fill.liquidityRole });
+          this.record("PAPER_FILL", fill.traceId, fill.marketId, { fillId: fill.id, orderId: fill.orderId, price: fill.fillPrice, quantity: fill.quantity, role: fill.liquidityRole,
+            ...(economicIntent ? { intent: economicIntent } : {}) });
           this.metrics.paperFills.inc({ role: fill.liquidityRole });
           const position = this.ledger.positions.get(fill.marketId);
           if (position) {
@@ -4556,10 +4587,10 @@ export class EngineService {
       }
       return false;
     }
-    if (economicIntent === "HEDGE_SECOND_LEG" || economicIntent === "PROTECTIVE_DE_RISK" || economicIntent === "RESCUE_SECOND_LEG") {
+    if (economicIntent === "HEDGE_SECOND_LEG" || economicIntent === "PROTECTIVE_DE_RISK" || economicIntent === "RESCUE_SECOND_LEG" || economicIntent === "GUARDIAN_PROTECTIVE_SELL") {
       await this.cancelOutstandingFirstLegMakers(
         fill.marketId,
-        economicIntent === "PROTECTIVE_DE_RISK" ? "PROTECTIVE_DE_RISK_FILLED"
+        (economicIntent === "PROTECTIVE_DE_RISK" || economicIntent === "GUARDIAN_PROTECTIVE_SELL") ? `${economicIntent}_FILLED`
           : economicIntent === "RESCUE_SECOND_LEG" ? "RESCUE_FILLED"
           : "HEDGE_FILLED",
       );
@@ -4572,7 +4603,7 @@ export class EngineService {
     wasEmpty: boolean,
     projected: RecoverableEngineState,
     occurredAt: Date,
-    intent?: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK" | "RESCUE_SECOND_LEG",
+    intent?: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK" | "RESCUE_SECOND_LEG" | "GUARDIAN_PROTECTIVE_SELL",
     deRisk?: ProtectiveDeRiskAudit,
     unhedgedStartedAtBefore: string | null = null,
   ): DerivedAuditRecord[] {
@@ -4643,6 +4674,22 @@ export class EngineService {
           ...(deRisk ? { deRisk: this.finalizeProtectiveDeRiskAudit(deRisk, fill, position) } : {}),
         },
         sourceEventId: fill.id,
+      });
+    } else if (intent === "GUARDIAN_PROTECTIVE_SELL") {
+      // A full SELL removes an empty position from PaperLedger. Report that
+      // actual terminal result in the same fill commit; never recreate it in
+      // the ledger merely to produce a POSITION_UPDATED audit.
+      const previous = this.ledger.positions.get(fill.marketId)!;
+      records.push({
+        id: derivedAuditEventId("POSITION_UPDATED", fill.id), type: "POSITION_UPDATED",
+        aggregateType: "position", aggregateId: previous.id, traceId: fill.traceId,
+        sourceEventId: fill.id,
+        payload: { ...structuredClone(previous), upQuantity: "0", downQuantity: "0",
+          pairedQuantity: "0", unpairedQuantity: "0", unpairedOutcome: null, unhedgedStartedAt: null,
+          totalFees: d(previous.totalFees).plus(fill.feeUsd).toFixed(),
+          totalSlippage: d(previous.totalSlippage).plus(fill.slippageUsd).toFixed(),
+          updatedAt: fill.timestamp, closed: true, intent, experimentId,
+          ...(deRisk ? { deRisk: this.finalizeProtectiveDeRiskAudit(deRisk, fill, undefined) } : {}) },
       });
     }
     records.push({
@@ -5030,6 +5077,7 @@ export class EngineService {
           activationLatency: this.activation.snapshot(),
           makerReservations: Object.fromEntries(this.makerReservations),
           riskReductionOwners: [...this.riskReductionOwners.values()],
+          riskReductionFailures: [...this.riskReductionFailures.values()],
           managedMarkets: [...this.obligationMarketIds()],
           settledMarkets: [...this.settledMarkets],
           marketMetadata: [...this.marketsById.values()].map((market) => ({ ...market, raw: {} })),
@@ -5231,6 +5279,17 @@ export class EngineService {
     const oppositeOutcome: Outcome = position.unpairedOutcome === "UP" ? "DOWN" : "UP";
     const held = this.freshEarlyCatastrophicSnapshot(position.unpairedOutcome === "UP" ? (pair?.UP ?? null) : (pair?.DOWN ?? null), now.getTime());
     const opposite = this.freshEarlyCatastrophicSnapshot(oppositeOutcome === "UP" ? (pair?.UP ?? null) : (pair?.DOWN ?? null), now.getTime());
+    if (this.rescueExecutionFailure(position)) {
+      // The failure override skips a repeated PR3 attempt, never NORMAL.
+      const hedge = this.normalHedgeDecision(marketId, position, {
+        UP: this.freshEarlyCatastrophicSnapshot(pair?.UP ?? null, now.getTime()),
+        DOWN: this.freshEarlyCatastrophicSnapshot(pair?.DOWN ?? null, now.getTime()),
+      }, now);
+      if (!hedge?.accepted || !hedge.order || !opposite) return { acted: false };
+      this.riskReductionInFlight.add(marketId);
+      try { return await this.adoptHedgeFromEarlyFlight(marketId, hedge, opposite, now); }
+      finally { this.riskReductionInFlight.delete(marketId); }
+    }
     // CHEAP stage ONLY on the per-snapshot hot path (Section 8): real residual +
     // min age + mark-loss trigger + full opposite depth + loss cap. No canonical
     // hedge decision / risk projection runs unless the early action is otherwise
@@ -6420,11 +6479,161 @@ private buildEarlyAudit(
     });
   }
   
+  /** Only a durable, actual rescue execution failure for this exact residual
+   * episode can override an otherwise affordable PR3 opportunity. */
+  private rescueExecutionFailure(position: Position): RiskReductionExecutionFailure | null {
+    const failure = this.riskReductionFailures.get(position.marketId);
+    const owner = failure?.ownership;
+    return owner?.intent === "RESCUE_SECOND_LEG"
+      && owner.marketId === position.marketId
+      && owner.unhedgedStartedAt === unhedgedEpisode(position)
+      && d(owner.admittedResidualQuantity).eq(position.unpairedQuantity)
+      ? failure! : null;
+  }
+
+  /** The sole Guardian policy. Synchronous and validation-only; also called
+   * inside PR87's serialized admission boundary after all decision awaits. */
+  private evaluateGuardian(marketId: string, persistedOrder?: PaperOrder): {
+    reason: string; markLossUsd: string | null; rescueFailureOrderId: string | null;
+    decision: ReturnType<typeof decideProtectivePaperOrder> | null;
+    held: MarketSnapshot | null; position: Position | null;
+  } {
+    const position = this.ledger.positions.get(marketId) ?? null;
+    const result = { reason: "NO_UNPAIRED_RESIDUAL", markLossUsd: null as string | null,
+      rescueFailureOrderId: null as string | null, decision: null as ReturnType<typeof decideProtectivePaperOrder> | null,
+      held: null as MarketSnapshot | null, position };
+    if (!position?.unpairedOutcome || !d(position.unpairedQuantity).gt(0)) return result;
+    if (this.env.TRADING_MODE !== "paper" || !experimentAllowsHedge(this.experiment)
+      || this.state.database !== "UP" || this.state.journalDegraded || this.overload.hasIntegrityFault
+      || this.overload.state === "FAIL_CLOSED" || this.state.draining) return { ...result, reason: "HARD_AUTHORITY_UNAVAILABLE" };
+    if (this.settledMarkets.has(marketId) || !this.earlyAuthority(marketId)) return { ...result, reason: "DEADLINE_OR_SETTLEMENT_AUTHORITY" };
+    if (this.riskReductionOwners.has(marketId)) return { ...result, reason: "TAKER_ALREADY_OWNS_RESIDUAL" };
+    const now = this.nowFn();
+    if (now.getTime() - Date.parse(unhedgedEpisode(position)) < this.riskLimits.catastrophicPairLockMinUnhedgedMs) {
+      return { ...result, reason: "UNHEDGED_AGE_NOT_REACHED" };
+    }
+    const pair = this.snapshots.get(marketId);
+    const fresh = { UP: this.freshEarlyCatastrophicSnapshot(pair?.UP ?? null, now.getTime()),
+      DOWN: this.freshEarlyCatastrophicSnapshot(pair?.DOWN ?? null, now.getTime()) };
+    const held = fresh[position.unpairedOutcome];
+    const oppositeOutcome: Outcome = position.unpairedOutcome === "UP" ? "DOWN" : "UP";
+    const opposite = fresh[oppositeOutcome];
+    if (!held || held.tokenId !== this.currentTokenIdFor(marketId, position.unpairedOutcome)) return { ...result, reason: "HELD_BOOK_UNAVAILABLE" };
+    result.held = held;
+    result.markLossUsd = computeRealizableMarkLossUsd(position, held);
+    if (result.markLossUsd === null || d(result.markLossUsd).lt(this.riskLimits.catastrophicPairLockTriggerLossUsd)) {
+      return { ...result, reason: "MARK_LOSS_NOT_REACHED" };
+    }
+    if (this.activeHedgeMakerOwnsResidual(marketId, oppositeOutcome)) return { ...result, reason: "HEDGE_MAKER_PRIORITY" };
+    const normal = this.normalHedgeDecisionReadOnly(marketId, position, fresh, now);
+    if (normal?.accepted && normal.order) return { ...result, reason: "NORMAL_HEDGE_PRIORITY" };
+    const failure = this.rescueExecutionFailure(position);
+    let reason: string;
+    if (failure) {
+      reason = "SAME_EPISODE_RESCUE_EXECUTION_FAILED";
+      result.rescueFailureOrderId = failure.ownership.order.id;
+    } else {
+      // Unknown/stale opposite data is not proof of missing depth. A trusted
+      // empty/partial ladder is. Price the FULL residual rather than PR82's
+      // intentionally partial/max-notional candidate.
+      if (!opposite || opposite.tokenId !== this.currentTokenIdFor(marketId, oppositeOutcome)
+        || !opposite.feeSchedule || !opposite.minOrderSize) return { ...result, reason: "PR3_BOOK_UNAVAILABLE" };
+      const lockWalk = walkBook(opposite.asks, position.unpairedQuantity, "1", "BUY");
+      if (!lockWalk.sufficientDepth || !d(lockWalk.filledQuantity).eq(position.unpairedQuantity)) reason = "PR3_FULL_DEPTH_UNAVAILABLE";
+      else {
+        const pnl = computeGuaranteedLockedPnl({ position, rescueQuantity: position.unpairedQuantity,
+          rescueVwap: lockWalk.vwap, rescueTakerFeeUsd: calculateFee(position.unpairedQuantity, lockWalk.vwap, "TAKER", opposite.feeSchedule) });
+        if (d(pnl).gte(-this.riskLimits.catastrophicPairLockMaxLockedLossUsd)) return { ...result, reason: "PR3_PRIORITY" };
+        reason = "PR3_LOCKED_LOSS_EXCEEDS_CAP";
+      }
+    }
+    const candidate = evaluateProtectiveDeRiskCandidate({ position, snapshot: held,
+      maxOrderSizeUsd: this.riskLimits.maxOrderSizeUsd }).candidate;
+    if (!candidate || !d(candidate.quantity).eq(position.unpairedQuantity)) return { ...result, reason: "FULL_SELL_UNAVAILABLE" };
+    candidate.intent = "GUARDIAN_PROTECTIVE_SELL";
+    candidate.strategyId = "engine-guardian";
+    candidate.strategyVersion = "engine-guardian-v1";
+    candidate.reasonCodes = [reason, "FULL_HELD_RESIDUAL_SELL"];
+    if (persistedOrder) {
+      if (persistedOrder.tokenId !== held.tokenId || persistedOrder.outcome !== position.unpairedOutcome
+        || persistedOrder.side !== "SELL" || persistedOrder.orderType !== "TAKER"
+        || !d(persistedOrder.quantity).eq(position.unpairedQuantity)) return { ...result, reason: "GUARDIAN_RESIDUAL_CHANGED" };
+      candidate.limitPrice = persistedOrder.requestedPrice;
+    }
+    const asset = this.assetByMarket.get(marketId) ?? held.asset ?? null;
+    const exposure = computePaperExposures(this.ledger.positions.values(), marketId, this.assetByMarket, now.getTime());
+    const projected = projectPaperExposures({ current: exposure,
+      positions: projectableLegsFromPositions(this.ledger.positions.values(), this.assetByMarket),
+      candidate: { marketId, outcome: candidate.outcome, quantity: candidate.quantity, price: candidate.limitPrice,
+        side: "SELL", intent: candidate.intent, asset }, nowMs: now.getTime() });
+    const ledger = this.ledger.snapshot();
+    const decision = decideProtectivePaperOrder({ candidate, snapshotAfterDecisionLatency: held,
+      limits: this.riskLimits, traceId: persistedOrder?.traceId ?? position.id,
+      triggerId: persistedOrder?.triggerId ?? position.id,
+      baseRisk: {
+        now, marketFeedAt: new Date(held.receivedAt), btcFeedAt: now, referenceRequired: false,
+        asset, assetExposureUsd: exposure.asset, databaseAvailable: this.state.database === "UP",
+        timestampDisorder: this.timestampDisorder, riskStateAvailable: this.protectiveRiskStateAvailable(),
+        dailyPnlUsd: ledger.netTradingPnl, drawdownUsd: ledger.drawdown,
+        marketExposureUsd: exposure.market, totalExposureUsd: exposure.total,
+        directionalExposureUsd: exposure.directional, unhedgedExposureUsd: exposure.unhedged,
+        unhedgedDurationMs: exposure.unhedgedDurationMs,
+        projectedMarketExposureUsd: projected.market, projectedTotalExposureUsd: projected.total,
+        projectedDirectionalExposureUsd: projected.directional, projectedUnhedgedExposureUsd: projected.unhedged,
+        projectedAssetExposureUsd: projected.asset, availableCashUsd: this.ledger.availableCash().toFixed(),
+        externalSignalsLastMinute: 0, lastStrategyTradeAt: this.lastTradeAt, duplicateTrade: false,
+        experimentEntryOpen: experimentAllowsHedge(this.experiment),
+        executionErrorsLastHour: this.executionErrors.filter((at) => now.getTime() - at < 3_600_000).length,
+        externalRiskRecommendedVeto: false, shuttingDown: this.state.draining,
+      } });
+    return { ...result, reason: decision.accepted ? reason : `RISK_VETO:${decision.risk.vetoes.join("|")}`, decision };
+  }
+
+  private async maybeGuardianProtectiveSell(marketId: string): Promise<boolean> {
+    if (this.riskReductionBusy(marketId)) {
+      this.record("GUARDIAN_BLOCKED", marketId, marketId, { reason: "RISK_REDUCTION_IN_FLIGHT" });
+      return false;
+    }
+    const evaluation = this.evaluateGuardian(marketId);
+    const { decision, position, held } = evaluation;
+    const evidence = { intent: "GUARDIAN_PROTECTIVE_SELL", eligible: decision?.accepted === true,
+      reason: evaluation.reason, marketId, unhedgedStartedAt: position ? unhedgedEpisode(position) : null,
+      heldTokenId: held?.tokenId ?? null, quantity: position?.unpairedQuantity ?? "0",
+      markLossUsd: evaluation.markLossUsd, rescueFailureOrderId: evaluation.rescueFailureOrderId,
+      orderId: decision?.order?.id ?? null };
+    this.record("GUARDIAN_EVALUATION", position?.id ?? marketId, marketId, evidence);
+    if (!decision?.accepted || !decision.order || !position || !held) {
+      return false;
+    }
+    this.riskReductionInFlight.add(marketId);
+    try {
+      // Freeze decision episode facts before any await: PaperLedger may update
+      // the existing Position object in place while diagnostic persistence waits.
+      const deRisk: ProtectiveDeRiskAudit = {
+        deRiskReason: "GUARDIAN_PROTECTIVE_SELL", eligibilityReason: "GUARDIAN_PROTECTIVE_SELL",
+        unhedgedStartedAt: unhedgedEpisode(position), unhedgedDurationMs: this.nowFn().getTime() - Date.parse(unhedgedEpisode(position)),
+        attemptedAction: "SELL_UNPAIRED", requestedQty: position.unpairedQuantity, executableQty: decision.order.quantity,
+        executionPrice: decision.bookVwap, residualQuantity: position.unpairedQuantity,
+        residualExposure: computePaperExposures(this.ledger.positions.values(), marketId, this.assetByMarket).unhedged,
+        retryCount: 0, finalState: "ORDER_ADMITTED", guardianReason: evaluation.reason,
+        rescueFailureOrderId: evaluation.rescueFailureOrderId,
+      };
+      await this.persistReportInput(createJournalEvent({ traceId: decision.order.traceId,
+        type: "GUARDIAN_EVALUATION", aggregateType: "position", aggregateId: position.id, payload: evidence }));
+      return await this.submitPaperOrder(decision.order, held, `guardian:${decision.order.id}`, "GUARDIAN_PROTECTIVE_SELL", deRisk);
+    } finally {
+      this.riskReductionInFlight.delete(marketId);
+    }
+  }
+
   private async maybeProtectiveDeRisk(marketId: string): Promise<void> {
     const pending = this.riskReductionOwners.get(marketId);
     if (pending) {
       await this.resumeRiskReduction(pending);
-      return;
+      // A resumed order can be durably released by a deadline/state fence.
+      // Callbacks received while it owned the episode already yielded; hand
+      // the still-open residual to current authority in this same pass.
+      if (this.riskReductionOwners.has(marketId) || this.riskReductionInFlight.has(marketId)) return;
     }
     if (this.riskReductionInFlight.has(marketId)) {
       this.recordProtectiveDeRiskSuppressed(marketId, "GATE_IN_FLIGHT", "IN_FLIGHT");
@@ -6463,14 +6672,28 @@ private buildEarlyAudit(
     // BEFORE the old protective deadline. At/after the deadline the PR82 A/B
     // fallback exclusively owns the position (B-only never steals the
     // fallback). Pre-deadline priority: normal profitable hedge -> early
-    // catastrophic full pair-lock -> WAIT (deadline fallback later).
+    // catastrophic full pair-lock -> Guardian full held SELL -> WAIT (deadline fallback later).
     let initialNow = this.nowFn();
     let initialStartedAt = initial.unhedgedStartedAt ?? initial.openedAt;
     let initialDurationMs = Math.max(0, initialNow.getTime() - Date.parse(initialStartedAt));
     let initialEligibility = this.protectiveDeRiskEligibility(marketId, initialStartedAt, initialNow.getTime());
     if (!initialEligibility.eligible) {
+      const residualBeforeEarly = initial.unpairedQuantity;
       const earlyResult = await this.maybeEarlyCatastrophicPairLock(marketId);
-      if (earlyResult.acted) return;
+      if (earlyResult.acted) {
+        const remaining = this.ledger.positions.get(marketId);
+        if (!remaining?.unpairedOutcome || this.riskReductionOwners.has(marketId)
+          || !d(remaining.unpairedQuantity).eq(residualBeforeEarly)) return;
+        // Order creation did not consume the residual: execution/fence failure
+        // released its shared owner. Revalidate Guardian or deadline authority
+        // in this same pass, without waiting for another book callback.
+      }
+      if (await this.maybeGuardianProtectiveSell(marketId)) return;
+      // A book callback arriving during Guardian's admission await could make
+      // NORMAL/PR3 eligible while that callback yields to the shared flight.
+      // Recheck priority once in this same pass, avoiding a lost wake-up.
+      const priorityRecheck = await this.maybeEarlyCatastrophicPairLock(marketId);
+      if (priorityRecheck.acted) return;
       // Re-read durable state AFTER the early phase: the deadline may have been
       // crossed during an early await. Authority handoff must occur in the SAME
       // pass (Section 4) — no extra snapshot/tick required.
@@ -8565,7 +8788,7 @@ function assetNeedsReliableReference(
 export function collectMarketFeedAt(
   pair: Partial<Record<Outcome, MarketSnapshot>> | undefined,
   outcome: Outcome,
-  intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK" | "RESCUE_SECOND_LEG",
+  intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK" | "RESCUE_SECOND_LEG" | "GUARDIAN_PROTECTIVE_SELL",
   fallbackReceivedAt?: string | Date | null,
 ): Date | null {
   const required = pair?.[outcome];
