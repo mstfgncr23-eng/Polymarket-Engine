@@ -1,28 +1,24 @@
-# Guardian 24-hour forward shadow
+# Engine Guardian and passive recording
 
-This harness observes the locked two-stage Guardian policy without changing trading authority.
+Engine Guardian is the sole production Guardian policy and executes real PAPER
+taker SELL orders through shared durable risk-reduction ownership. The Python
+`guardian_shadow_24h.py` filename is retained for tooling compatibility; its former
+counterfactual policy, eligibility, execution economics, failure tracking, and
+shadow-close state have been deleted.
 
-## Safety
+The Python script now records unmodified read-only engine runtime responses, SSE
+lines, public CLOB frames for engine-reported unpaired markets, request latency,
+and runtime diagnostics. It never evaluates Guardian eligibility, submits engine
+mutations/orders, or computes counterfactual fills or PnL. It requires a read token
+and a PAPER runtime. The prior command's engine URL, read token, source SHA,
+output directory, and duration arguments remain; settlement-grace and historical
+shadow completeness semantics are retired. No recorder has been started by this PR.
 
-- PAPER only.
-- No private key.
-- No live order client.
-- Engine access is read-only through /events, /api/dashboard and /api/shadow/guardian-state.
-- Market data comes from the public Polymarket CLOB WebSocket.
-- Raw CLOB frames are persisted only while the corresponding market has an open unpaired PAPER position.
-- Shadow files live outside Postgres under /data/guardian-shadow.
+`LOCKED_POLICY.md`, the exact `TEST_CONTRACT.md` bytes, and `analyze_shadow.py`
+remain historical research artifacts for already-recorded shadow runs. The old
+analyzer is not an analyzer for the new passive recording format and does not
+constitute a runtime policy authority. Actual executions and PnL must be read from
+the engine journal and experiment archive.
 
-## Files
-
-- LOCKED_POLICY.md: frozen policy contract.
-- guardian_shadow_24h.py: real-time observer and latency sampler.
-- analyze_shadow.py: post-run observation summary.
-- requirements.txt: Python dependency pin.
-
-## Runtime prerequisites
-
-The PAPER engine must be built from this analysis branch, ready on 127.0.0.1:8080, and started with EXPERIMENT_DURATION_HOURS=24. The observer should start before the experiment so its direct CLOB books are warm before the first PAPER leg.
-
-Final strategy-level PnL remains an offline proof step after the soak. It must combine the canonical experiment archive with the raw shadow files. Missing execution state must remain UNKNOWN.
-
-Evidence integrity is fail-closed: active-experiment authority/SSE gaps, a position that activates before trusted direct books are available, an unbound rescue-failure episode, or non-zero final economic residue prevents a `COMPLETE` seal.
+See `ENGINE_GUARDIAN.md` for the production flow, lifecycle, test-scope changes,
+and operating limits.

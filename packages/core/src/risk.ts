@@ -169,7 +169,7 @@ export interface RiskInput {
   directionalExposureUsd: string;
   unhedgedExposureUsd: string;
   unhedgedDurationMs: number;
-  intent?: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK" | "RESCUE_SECOND_LEG";
+  intent?: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK" | "RESCUE_SECOND_LEG" | "GUARDIAN_PROTECTIVE_SELL";
   projectedMarketExposureUsd?: string;
   projectedTotalExposureUsd?: string;
   projectedDirectionalExposureUsd?: string;
@@ -231,7 +231,7 @@ export function evaluateRisk(input: RiskInput, limits: RiskLimits): RiskEvaluati
   const vetoes: RiskReasonCode[] = [];
   const age = (value: Date | null) => value ? input.now.getTime() - value.getTime() : Number.POSITIVE_INFINITY;
   const hedge = input.intent === "HEDGE_SECOND_LEG";
-  const protective = input.intent === "PROTECTIVE_DE_RISK";
+  const protective = input.intent === "PROTECTIVE_DE_RISK" || input.intent === "GUARDIAN_PROTECTIVE_SELL";
   const rescue = input.intent === "RESCUE_SECOND_LEG";
   const riskReducingIntent = hedge || rescue || protective;
   // RESCUE_SECOND_LEG is a risk-only pair-lock: like the protective SELL it

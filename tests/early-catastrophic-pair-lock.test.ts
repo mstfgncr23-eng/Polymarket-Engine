@@ -194,7 +194,7 @@ describe("PR3 early catastrophic pair-lock", { timeout: 40_000 }, () => {
       await setup.engine.stop();
     }
   });
-it("Test C (4962594 false-rescue control): locked > cap -> NO rescue, then normal hedge path", async () => {
+it("Test C (4962594 false-rescue control): over-cap PR3 yields to Guardian; next episode takes normal hedge", async () => {
     const setup = await setupScenario(END_OFFSET_MS);
     try {
       expect((await setup.engine.beginExperiment()).ok).toBe(true);
@@ -210,18 +210,23 @@ it("Test C (4962594 false-rescue control): locked > cap -> NO rescue, then norma
       await setup.market.emitSnapshot(book(setup.clock, "DOWN", 2, [], [{ price: "0.23", quantity: "100" }]));
       await new Promise((resolve) => setTimeout(resolve, 300));
       expect((await fills(setup, "RESCUE_SECOND_LEG"))).toHaveLength(0);
-      expect(setup.engine.ledger.positions.get("btc-mkt")?.unpairedQuantity).toBe("5.68181818");
-      // The early path evaluated and suppressed (per-market audible at least
-      // once per 60s); the cap exceeded, so the position stays untouched.
+      const guardian = await waitFor(() => fills(setup, "GUARDIAN_PROTECTIVE_SELL"), (rows) => rows.length > 0);
+      expect(guardian).toHaveLength(1);
+      expect(guardian[0]?.payload).toMatchObject({ side: "SELL", outcome: "UP", tokenId: "btc-up", quantity: "5.68181818", fillPrice: "0.79" });
+      expect(setup.engine.ledger.positions.has("btc-mkt")).toBe(false);
+      // Integrated production flow: PR3 is suppressed by the same cap, while
+      // the original full held SELL ladder now lets Guardian close the episode.
       await waitFor(
         () => suppressed(setup),
         (rows) => rows.some((row) => row.payload.gate === "EARLY_CATASTROPHIC_PAIR_LOCK"),
       );
 
-      // Improve the opposite ask to a NORMAL PROFITABLE hedge state: the hedge
-      // must now fire, not the early rescue. Ask depth notional >= minLiquidity
-      // so the normal hedge RISK check accepts it.
+      // A later NEW episode preserves the original normal-hedge acceptance
+      // coverage. The closed Guardian episode must never be consumed again.
       setup.clock.nowMs = START_MS + 21_000;
+      await setup.engine.applyObservedFill({ ...firstLeg(setup.clock, createId("event-next"), {
+        tokenId: "btc-up", outcome: "UP", requestedPrice: "0.88", fillPrice: "0.88", quantity: "5.68181818", feeUsd: "0.04200",
+      }), feeSchedule });
       await setup.market.emitSnapshot(book(setup.clock, "UP", 3, [{ price: "0.79", quantity: "1000" }], [{ price: "0.89", quantity: "1000" }]));
       await setup.market.emitSnapshot(book(setup.clock, "DOWN", 3, [{ price: "0.04", quantity: "100" }], [{ price: "0.05", quantity: "10000" }]));
       await setup.engine.ingestReferenceTickForTest(referenceTick(setup.clock, "100"));
@@ -231,6 +236,7 @@ it("Test C (4962594 false-rescue control): locked > cap -> NO rescue, then norma
       const hedges = await waitFor(() => fills(setup, "HEDGE_SECOND_LEG"), (rows) => rows.length > 0);
       expect(hedges[0]?.payload).toMatchObject({ side: "BUY", outcome: "DOWN", quantity: "5.68181818", fillPrice: "0.05" });
       expect((await fills(setup, "RESCUE_SECOND_LEG"))).toHaveLength(0);
+      expect((await fills(setup, "GUARDIAN_PROTECTIVE_SELL"))).toHaveLength(1);
       expect(setup.engine.ledger.positions.get("btc-mkt")?.unpairedQuantity).toBe("0");
     } finally {
       await setup.engine.stop();
@@ -264,7 +270,7 @@ it("Test C (4962594 false-rescue control): locked > cap -> NO rescue, then norma
       await setup.engine.stop();
     }
   });
-it("Test E: partial opposite depth -> no early rescue; next fresh snapshot retries full", async () => {
+it("Test E: partial opposite depth yields to full Guardian SELL; a new episode can still pair-lock", async () => {
     const setup = await setupScenario(END_OFFSET_MS);
     try {
       expect((await setup.engine.beginExperiment()).ok).toBe(true);
@@ -281,19 +287,30 @@ it("Test E: partial opposite depth -> no early rescue; next fresh snapshot retri
       await setup.market.emitSnapshot(book(setup.clock, "DOWN", 2, [], [{ price: "0.24", quantity: "2" }]));
       await new Promise((resolve) => setTimeout(resolve, 300));
       expect((await fills(setup, "RESCUE_SECOND_LEG"))).toHaveLength(0);
-      expect(setup.engine.ledger.positions.get("btc-mkt")?.unpairedQuantity).toBe("6.25");
+      const guardian = await waitFor(() => fills(setup, "GUARDIAN_PROTECTIVE_SELL"), (rows) => rows.length > 0);
+      expect(guardian).toHaveLength(1);
+      expect(guardian[0]?.payload).toMatchObject({ side: "SELL", outcome: "UP", quantity: "6.25", fillPrice: "0.7" });
+      expect(setup.engine.ledger.positions.has("btc-mkt")).toBe(false);
       await waitFor(
         () => suppressed(setup),
         (rows) => rows.some((row) => row.payload.gate === "EARLY_CATASTROPHIC_PAIR_LOCK"),
       );
 
-      // A LATER FRESH snapshot with full opposite depth retries successfully.
+      // Preserve the original full-depth PR3 retry coverage in a new episode;
+      // it cannot execute against the already closed Guardian episode.
       setup.clock.nowMs = START_MS + 21_000;
-      await setup.market.emitSnapshot(book(setup.clock, "UP", 3, [{ price: "0.70", quantity: "1000" }], [{ price: "0.82", quantity: "1000" }]));
       await setup.market.emitSnapshot(book(setup.clock, "DOWN", 3, [], [{ price: "0.24", quantity: "2000" }]));
+      expect((await fills(setup, "RESCUE_SECOND_LEG"))).toHaveLength(0);
+      await setup.engine.applyObservedFill({ ...firstLeg(setup.clock, createId("event-next"), {
+        tokenId: "btc-up", outcome: "UP", requestedPrice: "0.80", fillPrice: "0.80", quantity: "6.25", feeUsd: "0.07",
+      }), feeSchedule });
+      setup.clock.nowMs = START_MS + 31_000;
+      await setup.market.emitSnapshot(book(setup.clock, "UP", 4, [{ price: "0.70", quantity: "1000" }], [{ price: "0.82", quantity: "1000" }]));
+      await setup.market.emitSnapshot(book(setup.clock, "DOWN", 4, [], [{ price: "0.24", quantity: "2000" }]));
       const rescues = await waitFor(() => fills(setup, "RESCUE_SECOND_LEG"), (rows) => rows.length > 0);
       expect(rescues[0]?.payload).toMatchObject({ quantity: "6.25" });
       expect(number(setup.engine.ledger.positions.get("btc-mkt")?.unpairedQuantity)).toBe(0);
+      expect((await fills(setup, "GUARDIAN_PROTECTIVE_SELL"))).toHaveLength(1);
     } finally {
       await setup.engine.stop();
     }
@@ -453,14 +470,22 @@ it("Test G: latency deterioration -> final-fence rejects the actual fill", async
       const durableFills = await setup.journal.queryDurableTransitions({ types: ["PAPER_FILL"], limit: 16 });
       expect(durableFills.filter((row) => row.operationKey.startsWith("fill:")).map((row) => row.operationKey)).toHaveLength(1);
       expect(setup.engine.ledger.positions.get("btc-mkt")?.unpairedQuantity).toBe("6.25");
-      // State remains retryable: a fresh GOOD snapshot can still fire later
-      // (after the accepted-attempt retry cooldown lapses).
+      // Integrated flow after PR3's guarded failure: the same fresh held SELL
+      // ladder can now admit Guardian before the later GOOD opposite callback.
+      // Keep the original callback order and liquidity/race scenario intact.
       setup.clock.nowMs = START_MS + 26_000;
       await setup.market.emitSnapshot(book(setup.clock, "UP", 4, [{ price: "0.80", quantity: "1000" }], [{ price: "0.92", quantity: "1000" }], ERROR_SCHEDULE));
+      // Anchor this later race at durable Guardian admission. The improved
+      // opposite callback then arrives during its original PAPER latency;
+      // a PR3 improvement BEFORE admission is covered by the admission races.
+      await waitFor(() => setup.journal.queryEvents({ types: ["PAPER_ORDER_CREATED"] }),
+        (rows) => rows.some((row) => row.payload.intent === "GUARDIAN_PROTECTIVE_SELL"));
       await setup.market.emitSnapshot(book(setup.clock, "DOWN", 4, [], [{ price: "0.10", quantity: "4" }, { price: "0.30", quantity: "1000" }], ERROR_SCHEDULE));
-      const retries = await waitFor(() => fills(setup, "RESCUE_SECOND_LEG"), (rows) => rows.length > 0);
-      expect(retries[0]?.payload).toMatchObject({ quantity: "6.25" });
-      expect(number(setup.engine.ledger.positions.get("btc-mkt")?.unpairedQuantity)).toBe(0);
+      const guardian = await waitFor(() => fills(setup, "GUARDIAN_PROTECTIVE_SELL"), (rows) => rows.length > 0);
+      expect(guardian).toHaveLength(1);
+      expect(guardian[0]?.payload).toMatchObject({ side: "SELL", outcome: "UP", quantity: "6.25", fillPrice: "0.8" });
+      expect((await fills(setup, "RESCUE_SECOND_LEG"))).toHaveLength(0);
+      expect(setup.engine.ledger.positions.has("btc-mkt")).toBe(false);
     } finally {
       await setup.engine.stop();
     }

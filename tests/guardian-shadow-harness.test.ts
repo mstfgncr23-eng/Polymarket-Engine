@@ -17,7 +17,7 @@ describe("guardian shadow harness", () => {
     expect(result.status, result.stderr || result.stdout).toBe(0);
   });
 
-  it("python policy/unit tests pass without network access", () => {
+  it("passive recorder unit tests pass without network access", () => {
     const result = spawnSync("python3", [
       resolve("research/guardian-shadow/test_guardian_shadow.py"),
     ], { encoding: "utf8" });
@@ -40,31 +40,24 @@ describe("guardian shadow harness", () => {
     expect(text).toContain("no numeric conclusion is emitted from an incomplete run");
   });
 
-  it("observer stays read-only", () => {
+  it("recorder has no independent Guardian policy or execution authority", () => {
     const text = readFileSync(
       resolve("research/guardian-shadow/guardian_shadow_24h.py"),
       "utf8",
     );
-    expect(text).toContain("TWO_STAGE_GUARDIAN_V1_LOCKED");
-    expect(text).toContain("NORMAL_HEDGE_PRIORITY");
-    expect(text).toContain('NORMAL_MIN_LOCKED_EDGE = Decimal("0.015")');
-    expect(text).toContain('TRIGGER_LOSS = Decimal("0.35")');
-    expect(text).toContain('PAIR_LOCK_CAP = Decimal("0.60")');
-    expect(text).toContain('EXPECTED_CONTRACT_SHA256 = "545fd28c6452d2b5af6ed69c74b1cb4aff1423562311e91f88b44650a83aa9a9"');
-    expect(text).toContain("revalidate_authority");
-    expect(text).toContain("rescue_episode_identity");
-    expect(text).toContain("POSITION_ACTIVATED_WITHOUT_TRUSTED_BOOKS");
-    expect(text).toContain("FINAL_RESERVED_CASH_REMAIN");
-    expect(text).toContain('authority.get("normalHedgeAdmissible") is True');
-    expect(text).toContain('authority.get("hedgeMakerOwnsResidual") is True');
-    expect(text).toContain('authority.get("riskReductionInFlight") is True');
-    expect(text).toContain("book.received_mono_ns >= target_ns");
-    expect(text).toContain("book.received_mono_ns <= deadline_ns");
-    expect(text).toContain('status = "KNOWN" if observed_book is not None and sell_executable else "UNKNOWN"');
+    expect(text).toContain("PASSIVE_ENGINE_GUARDIAN_RECORDER_V1");
+    expect(text).toContain('"policy_authority": "Engine Guardian"');
+    expect(text).toContain('"counterfactual_policy": False');
+    expect(text).toContain('READ_PATHS = ("/api/dashboard", "/api/shadow/guardian-state", "/events")');
+    expect(text).toContain('"request_latency_ns"');
+    for (const removedPolicy of ["evaluate_market", "TRIGGER_LOSS", "PAIR_LOCK_CAP", "shadow_closed", "rescue_error_for_episode", "guaranteed_locked_pnl"]) {
+      expect(text).not.toContain(removedPolicy);
+    }
     expect(text).toContain("wss://ws-subscriptions-clob.polymarket.com/ws/market");
     expect(text).not.toContain("py_clob_client");
     expect(text).not.toContain("create_order");
     expect(text).not.toContain("post(");
+    expect(text).not.toContain("session.request(");
     expect(text).not.toContain("/api/operator/");
   });
 });
