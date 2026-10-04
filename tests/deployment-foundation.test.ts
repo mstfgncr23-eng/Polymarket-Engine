@@ -6,6 +6,7 @@ import { PaperLedger, engineEnvSchema, parseEngineEnv } from "@pm/core";
 import { MemoryEventJournal } from "@pm/db";
 import { GET as eventsProxy } from "../apps/dashboard/app/api/engine/events/route.js";
 import { GET as snapshotProxy } from "../apps/dashboard/app/api/engine/snapshot/route.js";
+import { stopDashboardCache } from "../apps/dashboard/lib/snapshot-cache.js";
 import { ScriptedMarketAdapter, ScriptedReferenceRegistry } from "./paper-engine-testkit.js";
 import { createGrokActivationBridge, NoopGrokActivationBridge } from "../apps/engine/src/activation/index.js";
 import { EngineService } from "../apps/engine/src/engine.js";
@@ -178,7 +179,8 @@ describe("deployment foundation", () => {
     }
   });
 
-  it("7 dashboard proxy ENGINE_UNREACHABLE (mock fetch failure)", async () => {
+  it("7 empty cache reports ENGINE_UNREACHABLE while local SSE stays connected", async () => {
+    stopDashboardCache();
     vi.stubEnv("ENGINE_INTERNAL_URL", "http://engine.internal:8080");
     vi.stubEnv("ENGINE_READ_TOKEN", "proxy-read-token");
     vi.stubGlobal("fetch", vi.fn(async () => {
@@ -188,22 +190,11 @@ describe("deployment foundation", () => {
     expect(snapshot.status).toBe(503);
     expect(await snapshot.json()).toEqual({ error: "ENGINE_UNREACHABLE" });
     const events = await eventsProxy(new Request("http://dashboard.local/api/engine/events"));
-    expect(events.status).toBe(503);
-    expect(events.headers.get("content-type")).toMatch(/application\/json/);
-    expect(await events.json()).toEqual({ error: "ENGINE_UNREACHABLE" });
-
-    const stream = new ReadableStream({
-      start(controller) {
-        controller.enqueue(new TextEncoder().encode("event: snapshot\ndata: {}\n\n"));
-        controller.close();
-      },
-    });
-    vi.stubGlobal("fetch", vi.fn(async () => new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } })));
-    const live = await eventsProxy(new Request("http://dashboard.local/api/engine/events"));
-    expect(live.status).toBe(200);
-    expect(live.headers.get("content-type")).toBe("text/event-stream");
-    expect(live.body).toBeTruthy();
-    await live.body?.cancel();
+    expect(events.status).toBe(200);
+    expect(events.headers.get("content-type")).toBe("text/event-stream");
+    expect(events.body).toBeTruthy();
+    await events.body?.cancel();
+    stopDashboardCache();
   });
 
   it("8 readiness does not require qualified markets", async () => {

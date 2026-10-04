@@ -24,6 +24,7 @@ import {
   type DurableTransition,
 } from "@pm/db";
 import { z, ZodError } from "zod";
+import { accountResultFill, completeResult, emptyResultAccounting, resultAccountingSchema, type ResultAccounting } from "./trading-results.js";
 
 /**
  * MUTATION INVENTORY (Step 2 — replay-authoritative vs derived)
@@ -131,6 +132,7 @@ export function cloneRecoverableState(state: RecoverableEngineState): Recoverabl
   ledger.restore(snapshot, [...state.ledger.positions.values()]);
   return {
     ledger,
+    resultAccounting: structuredClone(state.resultAccounting ?? emptyResultAccounting()),
     experiment: state.experiment ? structuredClone(state.experiment) : null,
     restingOrders: new Map([...state.restingOrders.entries()].map(([id, order]) => [id, structuredClone(order)])),
     makerReservations: new Map(state.makerReservations),
@@ -223,6 +225,7 @@ export function durableIdentityConflicts(
 }
 
 export interface RecoverableEngineState {
+  resultAccounting?: ResultAccounting;
   nakedDirectionalDiagnostics?: Map<string, NakedDirectionalDiagnostic>;
   ledger: PaperLedger;
   experiment: ExperimentManifest | null;
@@ -394,6 +397,7 @@ export function applyDurableTransition(state: RecoverableEngineState, transition
 
           const fresh = new PaperLedger(state.experiment.startingBalance, at);
           state.ledger.restore(fresh.snapshot(), []);
+          state.resultAccounting = emptyResultAccounting();
           state.restingOrders.clear();
           state.makerReservations.clear();
           state.lastInfrastructureAccrualAt = at.getTime();
@@ -439,8 +443,10 @@ export function applyDurableTransition(state: RecoverableEngineState, transition
           }
         }
         applyFillReservation(state, payload.fill, payload.reservationAfter, new Date(transition.occurredAt));
+        const previous = state.ledger.positions.get(payload.fill.marketId);
         state.ledger.applyFill(payload.fill, { positionId: payload.positionId });
         const remaining = state.ledger.positions.get(payload.fill.marketId);
+        accountResultFill(state.resultAccounting ??= emptyResultAccounting(), payload.fill, previous, remaining);
         if (payload.nakedDirectionalSoak === true && remaining) {
           const diagnostics = state.nakedDirectionalDiagnostics ??= new Map();
           if (!diagnostics.has(payload.fill.marketId)) {
@@ -478,7 +484,8 @@ export function applyDurableTransition(state: RecoverableEngineState, transition
       }
       case "POSITION_SETTLED": {
         const payload = settlementPayloadSchema.parse(transition.payload);
-        state.ledger.settlePosition(payload.marketId, payload.upPayoff, payload.downPayoff, new Date(payload.settledAt));
+        const settled = state.ledger.settlePosition(payload.marketId, payload.upPayoff, payload.downPayoff, new Date(payload.settledAt));
+        if (settled) completeResult(state.resultAccounting ??= emptyResultAccounting(), payload.marketId, settled.realizedDelta, settled.position.totalFees);
         state.settlementLookups?.delete(payload.marketId);
         state.riskReductionOwners?.delete(payload.marketId);
         state.riskReductionFailures?.delete(payload.marketId);
@@ -547,6 +554,16 @@ export function validatePostReplayInvariants(
   expectedCursor: number,
 ): ReplayInvariantReport {
   const reasons: string[] = [];
+  if (state.resultAccounting && !resultAccountingSchema.safeParse(state.resultAccounting).success) reasons.push("result_accounting_invalid");
+  for (const marketId of Object.keys(state.resultAccounting?.episodes ?? {})) {
+    if (!state.ledger.positions.has(marketId)) reasons.push("result_episode_without_position");
+  }
+  if (state.resultAccounting?.available) {
+    for (const position of state.ledger.positions.values()) {
+      const episode = state.resultAccounting.episodes[position.marketId];
+      if (!episode || !d(episode.fees).eq(position.totalFees)) reasons.push("result_episode_fees_mismatch");
+    }
+  }
   let ledger: LedgerState;
   try {
     ledger = ledgerStateSchema.parse(state.ledger.snapshot());

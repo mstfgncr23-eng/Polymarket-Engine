@@ -1,4 +1,17 @@
+export interface CacheMetadata {
+  lastUpstreamSync: string | null;
+  sourceGeneratedAt: string | null;
+  cacheAgeMs: number | null;
+  mode: "LOW_IMPACT" | "IDLE" | "DEGRADED";
+  pollIntervalMs: number;
+  staleAfterMs: number;
+  upstreamReachable: boolean;
+  stale: boolean;
+}
+
 export interface DashboardSnapshot {
+  cache?: CacheMetadata;
+  tradingResults?: { completed: number; wins: number; losses: number; breakeven: number; winRate: number | null } | null;
   paperMode: true;
   generatedAt: string;
   engine: {

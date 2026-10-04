@@ -173,6 +173,7 @@ import { HotResearchCache, isScoutRole, SCOUT_ROLES } from "./activation/hot-res
 import { BoundedJournalWriter } from "./journal-writer.js";
 import { evaluateExperimentPreflight, isGenuineEntryQualifiedMarket } from "./preflight.js";
 import { CrashInjectedError, CrashInjector, type CrashInjectionPoint } from "./crash-injection.js";
+import { emptyResultAccounting, resultAccountingSchema } from "./trading-results.js";
 import { DurableMutationGate } from "./durable-gate.js";
 import {
   applyDurableTransition,
@@ -1743,6 +1744,7 @@ export class EngineService {
   private recoverableBag(): RecoverableEngineState {
     return {
       ledger: this.ledger,
+      resultAccounting: this.state.resultAccounting,
       experiment: this.experiment,
       restingOrders: this.restingOrders,
       makerReservations: this.makerReservations,
@@ -1756,6 +1758,7 @@ export class EngineService {
   }
 
   private adoptRecoveredBag(bag: RecoverableEngineState): void {
+    this.state.resultAccounting = bag.resultAccounting ?? emptyResultAccounting();
     this.experiment = bag.experiment;
     this.lastInfrastructureAccrualAt = bag.lastInfrastructureAccrualAt;
     this.syncRecoveredProjection();
@@ -1952,6 +1955,7 @@ export class EngineService {
           throw new RecoveryFailClosedError("malformed", "checkpoint content hash mismatch");
         }
         const restored = this.hydrateCheckpointPayload(payload);
+        if (payload.resultAccounting === undefined) await this.restoreLegacyResults(parseCheckpointDurableCursor(payload) ?? 0);
         if (isLegacyCheckpointPayload(payload)) {
           const safety = assessLegacyCheckpointSafety({
             experiment: this.experiment,
@@ -2049,6 +2053,44 @@ export class EngineService {
     }
   }
 
+  /** Upgrade old checkpoints only when the complete current experiment history proves the totals. */
+  private async restoreLegacyResults(cursor: number): Promise<void> {
+    const ledger = this.ledger.snapshot();
+    if (!this.experiment?.startedAt && !this.ledger.positions.size && d(ledger.realizedPnl).eq(0) && d(ledger.fees).eq(0)) {
+      this.state.resultAccounting = emptyResultAccounting();
+      return;
+    }
+    const start = await this.journal.readDurableByOperationKey(`experiment:${this.experiment?.id}:started`);
+    if (!start || start.sequence > cursor || !start.payload.experiment) return;
+    const bag: RecoverableEngineState = {
+      ledger: new PaperLedger(this.experiment!.startingBalance), experiment: null,
+      restingOrders: new Map(), makerReservations: new Map(), settledMarkets: new Set(),
+      lastInfrastructureAccrualAt: 0, resultAccounting: emptyResultAccounting(),
+    };
+    // Recovery-only journal reads. Neither dashboard nor /api/dashboard queries storage.
+    try {
+      applyDurableTransition(bag, start);
+      let applied = start.sequence;
+      while (applied < cursor) {
+        const before = applied;
+        const page = await this.journal.readDurableTransitionsAfter(applied, this.recoveryPageSize);
+        if (!page.length) return;
+        for (const row of page) {
+          if (row.sequence > cursor) break;
+          if (row.sequence !== applied + 1) return; // Retention removed required evidence.
+          applyDurableTransition(bag, row);
+          applied = row.sequence;
+        }
+        if (applied === before) return;
+      }
+      if (bag.experiment?.id !== this.experiment?.id || !d(bag.ledger.snapshot().realizedPnl).eq(ledger.realizedPnl)
+        || !d(bag.ledger.snapshot().fees).eq(ledger.fees)) return;
+      this.state.resultAccounting = bag.resultAccounting!;
+    } catch {
+      // Missing legacy evidence cannot change trading authority. Display unavailable until a new experiment.
+    }
+  }
+
   private async restoreRestingMakerIntentsFromDurable(): Promise<void> {
     for (const [orderId, resting] of this.restingOrders) {
       if (resting.intent) continue;
@@ -2066,6 +2108,8 @@ export class EngineService {
     const ledger = ledgerStateSchema.parse(payload.ledger);
     const positions = Array.isArray(payload.positions) ? payload.positions.map((item) => positionSchema.parse(item)) : [];
     this.ledger.restore(ledger, positions);
+    this.state.resultAccounting = payload.resultAccounting === undefined
+      ? emptyResultAccounting(false) : resultAccountingSchema.parse(payload.resultAccounting);
     this.economicSettlementLookups.clear();
     for (const raw of (payload.settlementLookups ?? []) as unknown[]) {
       const lookup = settlementLookupSchema.parse(raw);
@@ -5185,6 +5229,7 @@ export class EngineService {
           schemaVersion: CHECKPOINT_SCHEMA_VERSION,
           durableCursor: this.lastAppliedDurableCursor,
           ledger: this.ledger.snapshot(), positions: [...this.ledger.positions.values()], experiment: this.experiment,
+          resultAccounting: structuredClone(this.state.resultAccounting),
           restingOrders: [...this.restingOrders.values()], activeTriggers: [...this.activeTriggers.values()],
           grokSignals: [...this.signalsByTrigger.values()].flatMap((signals) => [...signals.values()]),
           activationLatency: this.activation.snapshot(),

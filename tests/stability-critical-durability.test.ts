@@ -80,6 +80,7 @@ function criticalSnapshot(engine: EngineService) {
   const experiment = engine.experimentManifest();
   return {
     ledger: engine.ledger.snapshot(),
+    tradingResults: engine.state.snapshot().tradingResults,
     positions: [...engine.ledger.positions.values()].map((item) => structuredClone(item)).sort((a, b) => a.marketId.localeCompare(b.marketId)),
     restingOrders: [...engine.restingOrdersForTest().values()]
       .map((item) => structuredClone(item))
@@ -345,6 +346,7 @@ describe("A-T critical durability matrix", () => {
     });
     await recovered.start();
     expect(recovered.ledger.positions.has("btc-mkt")).toBe(false);
+    expect(recovered.state.snapshot().tradingResults).toEqual({ completed: 1, wins: 1, losses: 0, breakeven: 0, winRate: 1 });
     expect(fetches).toBe(fetchesAfterCrash);
     await recovered.tickMaintenance();
     expect(recovered.ledger.positions.has("btc-mkt")).toBe(false);

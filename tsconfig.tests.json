@@ -2,6 +2,8 @@
   "extends": "./tsconfig.base.json",
   "compilerOptions": {
     "noEmit": true,
+    "jsx": "react-jsx",
+    "lib": ["ES2024", "DOM"],
     "rootDir": ".",
     "exactOptionalPropertyTypes": false,
     "module": "esnext",
@@ -16,6 +18,8 @@
   },
   "include": [
     "tests/protective-min-order-rest-hydration.test.ts",
-    "tests/normalization-reference.ts"
+    "tests/normalization-reference.ts",
+    "tests/dashboard-low-impact.test.ts",
+    "tests/trading-results-durable.test.ts"
   ]
 }
