@@ -1,3 +1,5 @@
+import { nakedDirectionalDiagnosticSchema, observeNakedDirectionalPosition, noteNakedDirectionalAnomaly, compactNakedDirectionalObservation,
+  nakedDirectionalSummary, SOAK_PERSIST_INTERVAL_MS, type NakedDirectionalDiagnostic } from "@pm/core";
 import {
   PaperLedger,
   TemporalPairHedgeStrategy,
@@ -203,6 +205,7 @@ import {
   RUNTIME_BOUNDS,
   RuntimeSupervisor,
   SingleFlight,
+  SharedResultFlight,
   isCriticalPersistenceType,
   isRiskHedgeSettlementKind,
   remapTriggerRejection,
@@ -474,6 +477,10 @@ export class EngineService {
    */
   private readonly riskReductionInFlight = new Set<string>();
   private readonly riskReductionOwners = new Map<string, RiskReductionOwnership>();
+  private readonly nakedDirectionalDiagnostics = new Map<string, NakedDirectionalDiagnostic>();
+  private readonly soakPersistedRevisions = new Map<string, number>();
+  private readonly soakPersistedObservationCounts = new Map<string, number>();
+  private lastSoakPersistAt = 0;
   private readonly riskReductionFailures = new Map<string, RiskReductionExecutionFailure>();
   private readonly protectiveDeRiskAttempts = new Map<string, number>();
   /** Earliest next durable de-risk evaluation per market. Ephemeral by design. */
@@ -549,6 +556,8 @@ export class EngineService {
   private started = false;
   private bootstrapFailed = false;
   private maintenanceTimer: NodeJS.Timeout | null = null;
+  private soakPersistenceTimer: NodeJS.Timeout | null = null;
+  private readonly soakPersistenceFlight = new SharedResultFlight<void>();
   private discoveryTimer: NodeJS.Timeout | null = null;
   private lastInfrastructureAccrualAt = Date.now();
   private lastScheduledReviewAt = 0;
@@ -754,6 +763,7 @@ export class EngineService {
     await this.restoreSourceSealState();
     await this.restoreReportSourceIntegrity();
     this.state.recoveryComplete = true;
+    this.noteSoakAnomaly("RECOVERY_OBSERVATION_GAP", { reason: "No observations are fabricated during downtime" });
     const configuredTokens = splitList(this.env.POLYMARKET_TOKEN_IDS);
     if (configuredTokens.length > 0) {
       configuredTokens.forEach((tokenId, index) => this.marketAdapter.registerManualToken(tokenId, tokenId, index % 2 === 0 ? "UP" : "DOWN"));
@@ -779,6 +789,10 @@ export class EngineService {
 
     this.maintenanceTimer = setInterval(() => { void this.runMaintenance(); }, 60_000);
     this.maintenanceTimer.unref();
+    this.soakPersistenceTimer = setInterval(() => {
+      void this.flushSoakDiagnostics().catch((error) => this.logger.error({ err: error }, "soak diagnostic persistence failed"));
+    }, SOAK_PERSIST_INTERVAL_MS);
+    this.soakPersistenceTimer.unref();
     if (configuredTokens.length === 0) {
       this.discoveryTimer = setInterval(() => { void this.runDiscovery().catch((error) => this.logger.error({ err: error }, "discovery refresh failed")); }, this.env.DISCOVERY_INTERVAL_MS);
       this.discoveryTimer.unref();
@@ -803,6 +817,8 @@ export class EngineService {
     this.referenceRetryTimers.clear();
     if (this.maintenanceTimer) clearInterval(this.maintenanceTimer);
     this.maintenanceTimer = null;
+    if (this.soakPersistenceTimer) clearInterval(this.soakPersistenceTimer);
+    this.soakPersistenceTimer = null;
     if (this.discoveryTimer) clearInterval(this.discoveryTimer);
     this.discoveryTimer = null;
     if (this.experiment?.status === "RUNNING" || this.experiment?.status === "ENTRY_CLOSED") {
@@ -1023,14 +1039,14 @@ export class EngineService {
       const now = this.nowFn();
       const next = startExperiment({
         id: undefined, durationHours: this.env.EXPERIMENT_DURATION_HOURS, strategyVersion: this.strategy.version,
-        riskConfiguration: this.riskLimits,
+        riskConfiguration: { ...this.riskLimits, nakedDirectionalSoakEnabled: this.env.NAKED_DIRECTIONAL_SOAK_ENABLED },
         modelConfiguration: {
           provider: "native_deterministic", version: NATIVE_DETERMINISTIC_MODEL_VERSION,
           localExecution: true, externalInference: false, authority: NATIVE_DETERMINISTIC_AUTHORITY,
         },
         startingBalance: this.ledger.snapshot().startingBalance, systemVersion: "0.1.0",
         gitSha: process.env.GIT_SHA ?? process.env.FLY_IMAGE_REF ?? "unknown", now,
-        closePolicy: this.env.EXPERIMENT_CLOSE_POLICY,
+        closePolicy: this.env.NAKED_DIRECTIONAL_SOAK_ENABLED ? "observe_until_settlement" : this.env.EXPERIMENT_CLOSE_POLICY,
       });
       const startFeedGeneration = this.experimentFeedGeneration;
       this.experimentStartPending = true;
@@ -1262,6 +1278,7 @@ export class EngineService {
       onError: (error) => this.onFeedError("polymarket", error),
       onAnomaly: (anomaly) => this.onPolymarketAnomaly(anomaly),
       onGap: (event) => {
+        this.noteSoakAnomaly(event.reason === "count_limit" ? "SLOW_CONSUMER" : "INGRESS_GAP", { ...event });
         this.noteExperimentFeedInvalidation();
         this.invalidateMarketProjections(event.tokenIds);
         this.metrics.noteIngressGap(event.reason);
@@ -1734,6 +1751,7 @@ export class EngineService {
       lastInfrastructureAccrualAt: this.lastInfrastructureAccrualAt,
       riskReductionOwners: this.riskReductionOwners,
       riskReductionFailures: this.riskReductionFailures,
+      nakedDirectionalDiagnostics: this.nakedDirectionalDiagnostics,
     };
   }
 
@@ -2089,6 +2107,14 @@ export class EngineService {
       if (this.riskReductionFailures.has(marketId)) throw new RecoveryFailClosedError("invariant", "duplicate taker failure");
       this.riskReductionFailures.set(marketId, failure);
     }
+    if (payload.nakedDirectionalDiagnostics !== undefined && !Array.isArray(payload.nakedDirectionalDiagnostics)) {
+      throw new RecoveryFailClosedError("malformed", "soak diagnostics must be an array");
+    }
+    for (const raw of (payload.nakedDirectionalDiagnostics ?? []) as unknown[]) {
+      const diagnostic = nakedDirectionalDiagnosticSchema.parse(raw);
+      if (this.nakedDirectionalDiagnostics.has(diagnostic.marketId)) throw new RecoveryFailClosedError("invariant", "duplicate soak diagnostic");
+      this.nakedDirectionalDiagnostics.set(diagnostic.marketId, diagnostic);
+    }
     const triggers = Array.isArray(payload.activeTriggers) ? payload.activeTriggers.map((item) => triggerEventSchema.parse(item)) : [];
     for (const trigger of triggers) {
       this.activeTriggers.set(trigger.id, trigger);
@@ -2266,6 +2292,7 @@ export class EngineService {
     const previous = pair[snapshot.outcome];
     pair[snapshot.outcome] = snapshot;
     this.snapshots.set(snapshot.marketId, pair);
+    this.observeSoakPosition(snapshot.marketId);
     this.nativeV2Shadow.ingestMarket(snapshot);
     if (snapshot.asset) {
       this.assetByMarket.set(snapshot.marketId, snapshot.asset);
@@ -3573,7 +3600,7 @@ export class EngineService {
     if (!pair) return;
     let position = this.ledger.positions.get(trigger.marketId ?? "") ?? null;
     if (this.experiment) {
-      const next = refreshExperiment(this.experiment, this.nowFn(), {
+      const next = refreshExperiment(this.soakLifecycleManifest(this.experiment), this.nowFn(), {
         openPositions: openPositionsRemain(this.ledger.positions.values()),
         unresolvedCount: this.countUnresolvedPositions(),
       });
@@ -3593,6 +3620,7 @@ export class EngineService {
       maxOrderSizeUsd: this.riskLimits.maxOrderSizeUsd, minimumLockedPairEdge: this.riskLimits.normalHedgeMinLockedPairEdge,
     });
     if (!candidate) return;
+    if (candidate.intent === "HEDGE_SECOND_LEG" && this.soakBlocksPostEntry(candidate.marketId)) return;
     if (
       candidate.intent === "OPEN_FIRST_LEG"
       && this.firstLegLifecycleBlocked(candidate.marketId)
@@ -3887,6 +3915,7 @@ export class EngineService {
   }
 
   private async admitRiskReduction(owner: RiskReductionOwnership, attempt?: EarlyAdmissionAttempt): Promise<boolean> {
+    if (this.soakBlocksPostEntry(owner.marketId)) return false;
     const old = this.riskReductionOwners.get(owner.marketId);
     if (old) {
       if (old.unhedgedStartedAt === owner.unhedgedStartedAt) {
@@ -3957,6 +3986,10 @@ export class EngineService {
   /** Recovery waits for real fresh books and continues the original order.
    * No fresh decision/order identity is generated for a pending admission. */
   private async resumeRiskReduction(owner: RiskReductionOwnership): Promise<void> {
+    if (this.soakBlocksPostEntry(owner.marketId)) {
+      await this.failRiskReduction(owner, "NAKED_DIRECTIONAL_SOAK_DISABLED_AUTHORITY");
+      return;
+    }
     if (this.riskReductionInFlight.has(owner.marketId) || this.state.database !== "UP"
       || this.state.journalDegraded || this.overload.hasIntegrityFault || this.overload.state === "FAIL_CLOSED") return;
     this.riskReductionInFlight.add(owner.marketId);
@@ -4004,6 +4037,9 @@ export class EngineService {
     options?: { skipPreCreateFirstLegCancel?: boolean; resume?: boolean; earlyAttempt?: EarlyAdmissionAttempt },
   ): Promise<boolean> {
     if (intent === "OPEN_FIRST_LEG" && this.experimentStartPending) return false;
+    if (this.soakBlocksPostEntry(order.marketId) && (intent !== "OPEN_FIRST_LEG" || order.side !== "BUY"
+      || (this.ledger.positions.get(order.marketId)?.unpairedOutcome
+        && this.ledger.positions.get(order.marketId)!.unpairedOutcome !== order.outcome))) return false;
     if ((intent === "PROTECTIVE_DE_RISK" || intent === "GUARDIAN_PROTECTIVE_SELL") && order.orderType !== "TAKER") {
       throw new Error("PROTECTIVE_DE_RISK_REQUIRES_TAKER");
     }
@@ -4235,6 +4271,9 @@ export class EngineService {
     snapshot: MarketSnapshot,
     intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" = "OPEN_FIRST_LEG",
   ): Promise<void> {
+    if (this.soakBlocksPostEntry(order.marketId) && (intent !== "OPEN_FIRST_LEG" || order.side !== "BUY"
+      || (this.ledger.positions.get(order.marketId)?.unpairedOutcome
+        && this.ledger.positions.get(order.marketId)!.unpairedOutcome !== order.outcome))) return;
     const notional = makerReserveNotional(order.quantity, order.requestedPrice, snapshot.feeSchedule);
     const priorReserve = await this.journal.readDurableByOperationKey(`maker:${order.id}:reserve`);
     const compactedRetry = Boolean(priorReserve && Object.keys(priorReserve.payload).length === 0);
@@ -4375,6 +4414,10 @@ export class EngineService {
       : null;
     const economicIntent = extras.intent
       ?? (restingAtAdmission ? this.restingOrderIntent(restingAtAdmission) : undefined);
+    if (this.soakBlocksPostEntry(fill.marketId) && (fill.side !== "BUY"
+      || (economicIntent !== undefined && economicIntent !== "OPEN_FIRST_LEG")
+      || (this.ledger.positions.get(fill.marketId)?.unpairedOutcome
+        && this.ledger.positions.get(fill.marketId)!.unpairedOutcome !== fill.outcome))) return false;
     const priorFillAuthority = await this.journal.readDurableByOperationKey(`fill:${fill.id}`);
     const compactedRetry = Boolean(priorFillAuthority && Object.keys(priorFillAuthority.payload).length === 0);
     // A fill with no existing position is a first leg. The post-commit start
@@ -4587,6 +4630,9 @@ export class EngineService {
           const unhedgedStartedAtBefore = previousAtCommit?.unhedgedStartedAt ?? previousAtCommit?.openedAt ?? null;
           const auth = {
             fill, positionId, reservationAfter, restingAfter,
+            ...(this.nakedDirectionalSoakEnabled() && fill.side === "BUY"
+              && (economicIntent === "OPEN_FIRST_LEG" || (!economicIntent && wasEmptyAtCommit))
+              ? { nakedDirectionalSoak: true } : {}),
             ...(settlementLookup ? { settlementLookup } : {}),
             ...(economicIntent ? { intent: economicIntent } : {}),
             ...(extras.deRisk ? { deRisk: extras.deRisk } : {}),
@@ -4609,6 +4655,7 @@ export class EngineService {
           };
         },
         afterApply: async () => {
+          this.observeSoakPosition(fill.marketId);
           this.record("PAPER_FILL", fill.traceId, fill.marketId, { fillId: fill.id, orderId: fill.orderId, price: fill.fillPrice, quantity: fill.quantity, role: fill.liquidityRole,
             ...(economicIntent ? { intent: economicIntent } : {}) });
           this.metrics.paperFills.inc({ role: fill.liquidityRole });
@@ -4790,6 +4837,7 @@ export class EngineService {
   }
 
   private async onConnection(event: FeedConnectionEvent): Promise<void> {
+    this.noteSoakAnomaly(event.reconnectCount > 0 ? "RECONNECT" : `FEED_${event.state}`, { ...event }, undefined, event.asset ?? undefined);
     if (event.feed === "polymarket") {
       if (event.state !== "CONNECTED") this.noteExperimentFeedInvalidation();
       const connection = this.state.connections.polymarket;
@@ -4834,6 +4882,8 @@ export class EngineService {
   }
 
   private onPolymarketAnomaly(anomaly: PolymarketFeedAnomaly): void {
+    this.noteSoakAnomaly(`BOOK_${anomaly.kind.toUpperCase()}`, { ...anomaly },
+      anomaly.tokenId ? this.state.marketSnapshots.get(anomaly.tokenId)?.marketId : undefined);
     if (anomaly.kind === "stale") {
       this.metrics.staleEventsDropped.inc();
       if (anomaly.regressionMs != null) this.metrics.staleEventRegression.observe(anomaly.regressionMs);
@@ -4858,6 +4908,7 @@ export class EngineService {
   }
 
   private async onFeedError(feed: string, error: Error): Promise<void> {
+    this.noteSoakAnomaly(/slow.consumer|overflow/i.test(error.message) ? "SLOW_CONSUMER" : "FEED_ERROR", { feed, message: error.message.slice(0, 512) });
     const close = error instanceof ClobMarketCloseError ? { close: error.diagnostic } : {};
     this.logger.error({ err: { name: error.name, message: error.message }, feed, ...close }, "market feed error");
     await this.safeAppend(createJournalEvent({
@@ -5140,6 +5191,7 @@ export class EngineService {
           makerReservations: Object.fromEntries(this.makerReservations),
           riskReductionOwners: [...this.riskReductionOwners.values()],
           riskReductionFailures: [...this.riskReductionFailures.values()],
+          nakedDirectionalDiagnostics: [...this.nakedDirectionalDiagnostics.values()],
           managedMarkets: [...this.obligationMarketIds()],
           settledMarkets: [...this.settledMarkets],
           settlementLookups: [...this.economicSettlementLookups.values()],
@@ -5203,6 +5255,8 @@ export class EngineService {
   }
 
   private async maintainExperiment(): Promise<void> {
+    for (const marketId of this.nakedDirectionalDiagnostics.keys()) this.observeSoakPosition(marketId);
+    await this.flushSoakDiagnostics();
     // CF + learning settlement obligations are restart-durable and must poll even when
     // no experiment is active (expired markets may be absent from discovery).
     await this.pollLearningSettlements();
@@ -5217,7 +5271,7 @@ export class EngineService {
     const previous = this.experiment.status;
     const open = openPositionsRemain(this.ledger.positions.values());
     const unresolved = [...this.ledger.positions.values()].filter((position) => Number(position.upQuantity) > 0 || Number(position.downQuantity) > 0).length;
-    let next = refreshExperiment(this.experiment, this.nowFn(), { openPositions: open, unresolvedCount: unresolved });
+    let next = refreshExperiment(this.soakLifecycleManifest(this.experiment), this.nowFn(), { openPositions: open, unresolvedCount: unresolved });
     if (next.status === "ENTRY_CLOSED" && (next.closePolicy ?? "observe_until_settlement") === "mark_to_market") {
       const marked = await this.markToMarketClose(unresolved);
       next = refreshExperiment(next, this.nowFn(), {
@@ -5254,6 +5308,89 @@ export class EngineService {
     if (shouldWriteFinalReport(this.experiment, stillOpen) && !this.reportGenerated) {
       await this.writeFinalReport();
     }
+  }
+
+  private nakedDirectionalSoakEnabled(): boolean {
+    // Runtime configuration only opts in the NEXT experiment at beginExperiment.
+    // Existing authority (including legacy manifests without the flag) is durable.
+    return this.experiment?.riskConfiguration.nakedDirectionalSoakEnabled === true;
+  }
+
+  private soakLifecycleManifest(manifest: ExperimentManifest): ExperimentManifest {
+    return manifest.riskConfiguration.nakedDirectionalSoakEnabled === true
+      ? { ...manifest, closePolicy: "observe_until_settlement" } : manifest;
+  }
+
+  private soakBlocksPostEntry(marketId: string): boolean {
+    return this.nakedDirectionalSoakEnabled() || this.nakedDirectionalDiagnostics.has(marketId);
+  }
+
+  private observeSoakPosition(marketId: string): void {
+    const diagnostic = this.nakedDirectionalDiagnostics.get(marketId);
+    const position = this.ledger.positions.get(marketId);
+    if (!diagnostic || !position) return;
+    const pair = this.snapshots.get(marketId);
+    const held = pair?.[diagnostic.entryDirection] ?? null;
+    const opposite = pair?.[diagnostic.entryDirection === "UP" ? "DOWN" : "UP"] ?? null;
+    const previous = diagnostic.current;
+    observeNakedDirectionalPosition(diagnostic, position, {
+      held, opposite, heldSynchronized: !!held && this.adapterTokenSynchronized(held.tokenId),
+      oppositeSynchronized: !!opposite && this.adapterTokenSynchronized(opposite.tokenId),
+      now: this.nowFn(), staleTimeoutMs: this.riskLimits.staleFeedTimeoutMs,
+      feedState: this.state.connections.polymarket.state,
+    });
+    for (const side of ["heldFreshness", "oppositeFreshness"] as const) {
+      const freshness = diagnostic.current![side];
+      if (freshness !== "FRESH" && previous?.[side] !== freshness) {
+        noteNakedDirectionalAnomaly(diagnostic, this.nowFn(), `BOOK_${freshness}`, { side });
+      }
+    }
+  }
+
+  private noteSoakAnomaly(kind: string, detail: Record<string, unknown>, marketId?: string, asset?: string): void {
+    for (const diagnostic of this.nakedDirectionalDiagnostics.values()) {
+      if (marketId && diagnostic.marketId !== marketId) continue;
+      if (asset && this.assetByMarket.get(diagnostic.marketId) !== asset) continue;
+      const tokenIds = Array.isArray(detail.tokenIds) ? detail.tokenIds : typeof detail.tokenId === "string" ? [detail.tokenId] : null;
+      if (tokenIds && !tokenIds.some((tokenId) => tokenId === this.currentTokenIdFor(diagnostic.marketId, "UP")
+        || tokenId === this.currentTokenIdFor(diagnostic.marketId, "DOWN"))) continue;
+      const bounded = { ...detail, ...(tokenIds ? { tokenIds: tokenIds.filter((id) =>
+        id === this.currentTokenIdFor(diagnostic.marketId, "UP") || id === this.currentTokenIdFor(diagnostic.marketId, "DOWN")) } : {}) };
+      noteNakedDirectionalAnomaly(diagnostic, this.nowFn(), kind, bounded);
+    }
+  }
+
+  /** Low-frequency durable batch. No database operation runs in the book observer. */
+  private async flushSoakDiagnostics(): Promise<void> {
+    // Timer and maintenance share one bounded write. Journal admission owns the
+    // entire flight, including waiting for the durable gate, so shutdown joins it.
+    await this.soakPersistenceFlight.run(async () => {
+      const nowMs = this.nowFn().getTime();
+      if (this.state.draining || nowMs - this.lastSoakPersistAt < SOAK_PERSIST_INTERVAL_MS || this.nakedDirectionalDiagnostics.size === 0) return;
+      if (this.state.database !== "UP" || this.state.journalDegraded || this.overload.hasIntegrityFault) return;
+      if (![...this.nakedDirectionalDiagnostics.values()].some((item) => this.ledger.positions.has(item.marketId)
+        && item.revision > (this.soakPersistedRevisions.get(item.marketId) ?? -1))) return;
+      await this.journalAdmission.run("audit", true, async () => {
+        await this.commitAuthoritative({
+          operationKey: `soak:${createId("observation")}`, type: "NAKED_DIRECTIONAL_OBSERVATION",
+          aggregateType: "experiment", aggregateId: this.experiment?.id ?? "paper",
+          buildPayload: () => {
+            const diagnostics = [...this.nakedDirectionalDiagnostics.values()]
+              .filter((item) => this.ledger.positions.has(item.marketId)
+                && item.revision > (this.soakPersistedRevisions.get(item.marketId) ?? -1))
+              .map((item) => compactNakedDirectionalObservation(item, this.soakPersistedObservationCounts.get(item.marketId) ?? 0));
+            return { diagnostics, derivedAudit: [] };
+          },
+          afterApply: async (transition) => {
+            for (const diagnostic of transition.payload.diagnostics as NakedDirectionalDiagnostic[]) {
+              this.soakPersistedRevisions.set(diagnostic.marketId, diagnostic.revision);
+              this.soakPersistedObservationCounts.set(diagnostic.marketId, diagnostic.observationCount);
+            }
+            this.lastSoakPersistAt = nowMs;
+          },
+        });
+      });
+    });
   }
 
   private async maybeScheduledReview(): Promise<void> {
@@ -5332,6 +5469,7 @@ export class EngineService {
    * risk-reduction decision (so the old deadline fallback must not also act).
    */
   private async maybeEarlyCatastrophicPairLock(marketId: string): Promise<EarlyPairLockResult> {
+    if (this.soakBlocksPostEntry(marketId)) return { acted: false };
     if (!this.earlyAuthority(marketId)) return { acted: false };
     const position = this.ledger.positions.get(marketId);
     if (!position?.unpairedOutcome || d(position.unpairedQuantity).lte(0)) return { acted: false };
@@ -6710,6 +6848,7 @@ private buildEarlyAudit(
   }
 
   private async maybeGuardianProtectiveSell(marketId: string): Promise<boolean> {
+    if (this.soakBlocksPostEntry(marketId)) return false;
     if (this.riskReductionBusy(marketId)) {
       this.record("GUARDIAN_BLOCKED", marketId, marketId, { reason: "RISK_REDUCTION_IN_FLIGHT" });
       return false;
@@ -6749,6 +6888,7 @@ private buildEarlyAudit(
   }
 
   private async maybeProtectiveDeRisk(marketId: string): Promise<void> {
+    if (this.soakBlocksPostEntry(marketId)) return;
     const pending = this.riskReductionOwners.get(marketId);
     if (pending) {
       await this.resumeRiskReduction(pending);
@@ -7660,13 +7800,20 @@ private buildEarlyAudit(
           ...auth,
           derivedAudit: [...this.buildSettlementDerivedAudit({
             marketId, asset, experimentId, parsed, positionBefore, upPayoff, downPayoff, occurredAt, auth,
-          }), ...(this.riskReductionOwners.has(marketId)
+          }), ...(this.nakedDirectionalDiagnostics.has(marketId) ? [{
+            id: derivedAuditEventId("NAKED_DIRECTIONAL_SUMMARY", positionBefore.id),
+            type: "NAKED_DIRECTIONAL_SUMMARY", aggregateType: "position", aggregateId: positionBefore.id, traceId: positionBefore.id,
+            payload: { ...nakedDirectionalSummary(this.nakedDirectionalDiagnostics.get(marketId)!, parsed.winner!, occurredAt,
+              settlementRealizedDelta(positionBefore, upPayoff, downPayoff)), experimentId, asset },
+          }] : []), ...(this.riskReductionOwners.has(marketId)
             ? [this.ownershipAudit(this.riskReductionOwners.get(marketId)!, "RISK_REDUCTION_FAILED", "SETTLEMENT_SUPERSEDED")]
             : [])],
         };
       },
       afterApply: async () => {
         this.settledMarkets.add(marketId);
+        this.soakPersistedRevisions.delete(marketId);
+        this.soakPersistedObservationCounts.delete(marketId);
         this.settlementBackoff.delete(marketId);
         this.clearProtectiveDeRiskState(marketId);
         if (!positionBefore) return;
@@ -7778,6 +7925,7 @@ private buildEarlyAudit(
   }
 
   private async markToMarketClose(unresolvedCount: number): Promise<boolean> {
+    if (this.nakedDirectionalSoakEnabled() || this.nakedDirectionalDiagnostics.size > 0) return false;
     const prices: Record<string, { up: string; down: string }> = {};
     for (const position of this.ledger.positions.values()) {
       const pair = this.snapshots.get(position.marketId);
