@@ -1,3 +1,4 @@
+import { createNakedDirectionalDiagnostic, nakedDirectionalDiagnosticSchema, mergeNakedDirectionalObservation, type NakedDirectionalDiagnostic } from "@pm/core";
 import {
   d,
   experimentManifestSchema,
@@ -138,6 +139,7 @@ export function cloneRecoverableState(state: RecoverableEngineState): Recoverabl
     riskReductionOwners: new Map([...(state.riskReductionOwners ?? [])].map(([market, owner]) => [market, structuredClone(owner)])),
     riskReductionFailures: new Map([...(state.riskReductionFailures ?? [])].map(([market, failure]) => [market, structuredClone(failure)])),
     lastInfrastructureAccrualAt: state.lastInfrastructureAccrualAt,
+    nakedDirectionalDiagnostics: new Map([...(state.nakedDirectionalDiagnostics ?? [])].map(([market, diagnostic]) => [market, structuredClone(diagnostic)])),
   };
 }
 
@@ -221,6 +223,7 @@ export function durableIdentityConflicts(
 }
 
 export interface RecoverableEngineState {
+  nakedDirectionalDiagnostics?: Map<string, NakedDirectionalDiagnostic>;
   ledger: PaperLedger;
   experiment: ExperimentManifest | null;
   restingOrders: Map<string, RestingPaperOrder>;
@@ -273,6 +276,7 @@ export const settlementLookupSchema = z.object({
 }).refine((lookup) => lookup.yesMapsTo !== lookup.noMapsTo);
 
 const fillPayloadSchema = z.object({
+  nakedDirectionalSoak: z.boolean().optional(),
   fill: paperFillSchema,
   positionId: z.string().min(1),
   reservationAfter: z.string().nullable(),
@@ -437,6 +441,16 @@ export function applyDurableTransition(state: RecoverableEngineState, transition
         applyFillReservation(state, payload.fill, payload.reservationAfter, new Date(transition.occurredAt));
         state.ledger.applyFill(payload.fill, { positionId: payload.positionId });
         const remaining = state.ledger.positions.get(payload.fill.marketId);
+        if (payload.nakedDirectionalSoak === true && remaining) {
+          const diagnostics = state.nakedDirectionalDiagnostics ??= new Map();
+          if (!diagnostics.has(payload.fill.marketId)) {
+            diagnostics.set(payload.fill.marketId, createNakedDirectionalDiagnostic(remaining, payload.fill));
+          }
+          const diagnostic = diagnostics.get(payload.fill.marketId)!;
+          diagnostic.entryPrice = payload.fill.outcome === "UP" ? remaining.averageUpCost : remaining.averageDownCost;
+          diagnostic.entryQuantity = remaining.unpairedQuantity;
+          diagnostic.entryFee = remaining.totalFees;
+        }
         const lookups = state.settlementLookups ??= new Map();
         if (remaining && (d(remaining.upQuantity).gt(0) || d(remaining.downQuantity).gt(0))) {
           // Preserve the original economic mapping across hedges and rediscovery.
@@ -468,6 +482,20 @@ export function applyDurableTransition(state: RecoverableEngineState, transition
         state.settlementLookups?.delete(payload.marketId);
         state.riskReductionOwners?.delete(payload.marketId);
         state.riskReductionFailures?.delete(payload.marketId);
+        state.nakedDirectionalDiagnostics?.delete(payload.marketId);
+        return;
+      }
+      case "NAKED_DIRECTIONAL_OBSERVATION": {
+        const diagnostics = z.array(nakedDirectionalDiagnosticSchema).parse(transition.payload.diagnostics);
+        for (const diagnostic of diagnostics) {
+          const position = state.ledger.positions.get(diagnostic.marketId);
+          if (!position || position.id !== diagnostic.positionId) throw new RecoveryFailClosedError("invariant", "soak observation without real position");
+          const map = state.nakedDirectionalDiagnostics ??= new Map();
+          const previous = map.get(diagnostic.marketId);
+          // Live books may advance while this compact snapshot waits on the
+          // durable gate. Never overwrite newer in-memory extrema.
+          if (!previous || previous.revision < diagnostic.revision) map.set(diagnostic.marketId, mergeNakedDirectionalObservation(previous, diagnostic));
+        }
         return;
       }
       case "LEDGER_MARK_TO_MARKET": {
@@ -556,6 +584,12 @@ export function validatePostReplayInvariants(
     reasons.push(`reserved_cash_mismatch:${reserved.toFixed()}!=${reservationSum.toFixed()}`);
   }
   const status = state.experiment?.status;
+  for (const [marketId, diagnostic] of state.nakedDirectionalDiagnostics ?? []) {
+    if (!nakedDirectionalDiagnosticSchema.safeParse(diagnostic).success
+      || diagnostic.marketId !== marketId || state.ledger.positions.get(marketId)?.id !== diagnostic.positionId) {
+      reasons.push("naked_directional_diagnostic_invalid");
+    }
+  }
   for (const [marketId, owner] of state.riskReductionOwners ?? []) {
     if (!riskReductionOwnershipSchema.safeParse(owner).success || marketId !== owner.marketId) reasons.push("risk_reduction_owner_invalid");
     if (state.settledMarkets.has(marketId)) reasons.push("settled_and_pending_taker");
@@ -619,6 +653,7 @@ export function parseCheckpointDerivedAuditCursor(payload: Record<string, unknow
 }
 
 export const CRITICAL_AUDIT_TYPES = [
+  "NAKED_DIRECTIONAL_SUMMARY",
   "PAPER_FILL",
   "PAPER_MAKER_RESERVED",
   "PAPER_MAKER_RELEASED",

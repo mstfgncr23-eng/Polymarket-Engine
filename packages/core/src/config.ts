@@ -89,6 +89,11 @@ export type QualificationConfig = z.infer<typeof qualificationConfigSchema>;
 export const engineEnvSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
   TRADING_MODE: z.literal("paper").default("paper"),
+  /** Explicit PAPER diagnostic authority: actual first legs held to resolution. */
+  NAKED_DIRECTIONAL_SOAK_ENABLED: z.preprocess(
+    (value) => value === undefined ? undefined : value === true || value === "true" || value === "1",
+    z.boolean().optional(),
+  ).default(false),
   PORT: z.coerce.number().int().positive().default(8080),
   LOG_LEVEL: z.string().default("info"),
   DATABASE_URL: z.string().url().optional(),
