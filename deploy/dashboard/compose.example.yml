@@ -1,0 +1,31 @@
+services:
+  dashboard:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.dashboard
+    # Linux/OVH host networking lets the container reach the host SSH tunnel.
+    # HOSTNAME limits the listener to localhost; Caddy runs on the host.
+    network_mode: host
+    environment:
+      HOSTNAME: 127.0.0.1
+      PORT: 3000
+      ENGINE_INTERNAL_URL: http://127.0.0.1:18080
+      ENGINE_READ_TOKEN: ${ENGINE_READ_TOKEN:?Set a server-side read token}
+      DASHBOARD_POLL_IDLE_MS: ${DASHBOARD_POLL_IDLE_MS:-10000}
+      DASHBOARD_POLL_ACTIVE_MS: ${DASHBOARD_POLL_ACTIVE_MS:-60000}
+      DASHBOARD_POLL_DEGRADED_MS: ${DASHBOARD_POLL_DEGRADED_MS:-120000}
+      DASHBOARD_UPSTREAM_TIMEOUT_MS: ${DASHBOARD_UPSTREAM_TIMEOUT_MS:-3000}
+    restart: unless-stopped
+    init: true
+    healthcheck:
+      # Liveness, deliberately independent of Frankfurt availability.
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'

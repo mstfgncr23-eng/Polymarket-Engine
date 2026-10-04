@@ -1,0 +1,7 @@
+# Replace with the operator-owned domain. Caddy runs on the Gravelines host.
+dashboard.example.com {
+    encode zstd gzip
+    reverse_proxy 127.0.0.1:3000 {
+        flush_interval -1
+    }
+}

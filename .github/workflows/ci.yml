@@ -33,6 +33,7 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
+      - run: pnpm exec tsc -p tsconfig.tests.json
       - run: pnpm test
       - run: pnpm build
       - run: pnpm smoke
@@ -48,3 +49,10 @@ jobs:
         run: >
           docker run --rm --user engine --entrypoint sh polymarket-engine:ci -c
           'test "$(id -un)" = engine && test -w /app/reports && touch /app/reports/.writable && test -f /app/reports/.writable'
+
+  dashboard-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build dashboard standalone image
+        run: docker build -f Dockerfile.dashboard -t polymarket-dashboard:ci .
