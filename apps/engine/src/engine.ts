@@ -5989,21 +5989,19 @@ export class EngineService {
       attempt.reason = `PRE_ADMISSION_ERROR:${error instanceof Error ? error.message : String(error)}`;
       throw error;
     } finally {
-      if (!attempt.admitted) await this.recordEarlyAttemptTerminated(marketId, decision.order!, attempt);
+      // Terminal observability must never hold the economic flight/handoff.
+      // Consume unexpected rejections as well as the helper's I/O failures.
+      if (!attempt.admitted) void this.recordEarlyAttemptTerminated(marketId, decision.order!, attempt).catch((error) => {
+        this.logger.error({ error, marketId, orderId: decision.order!.id, reason: attempt.reason }, "PR3 terminal diagnostic failed");
+      });
     }
   }
 
   /** One operational fact per accepted attempt, independent of the ordinary
    * polling suppression gate. No economic transition or report hash input. */
   private async recordEarlyAttemptTerminated(marketId: string, order: PaperOrder, attempt: EarlyAdmissionAttempt): Promise<void> {
-    // A post-commit crash/error can occur before submit returns or marks the
-    // local attempt. Durable authority wins over that local result too.
-    try {
-      if (await this.journal.readDurableByOperationKey(`risk-reduction:${order.id}:admitted`)) return;
-    } catch (error) {
-      this.logger.error({ error, marketId, orderId: order.id }, "PR3 terminal admission lookup failed");
-      return;
-    }
+    // Freeze termination facts before detached I/O: current economic authority
+    // may consume or replace the residual while the lookup/append is pending.
     const position = this.ledger.positions.get(marketId);
     const facts = {
       gate: "EARLY_ACCEPTED_ATTEMPT_TERMINATED", reason: attempt.reason,
@@ -6014,16 +6012,23 @@ export class EngineService {
       residualQuantity: position?.unpairedQuantity ?? "0",
       competingOwnerOrderId: this.riskReductionOwners.get(marketId)?.order.id ?? null,
     };
-    this.record("PROTECTIVE_DE_RISK_SUPPRESSED", order.traceId, marketId, facts);
     try {
+      if (this.abort.signal.aborted) return;
+      // A post-commit error can precede the local admitted flag. Preserve the
+      // durable check, but only on this detached operational path.
+      if (await this.journal.readDurableByOperationKey(`risk-reduction:${order.id}:admitted`)) return;
+      // stop() need not wait for an uncancellable diagnostic lookup, and its
+      // late result must never start an append against the closed journal.
+      if (this.abort.signal.aborted) return;
+      this.record("PROTECTIVE_DE_RISK_SUPPRESSED", order.traceId, marketId, facts);
       await this.journal.append(createJournalEvent({
         id: derivedAuditEventId("EARLY_ACCEPTED_ATTEMPT_TERMINATED", order.id),
         traceId: order.traceId, type: "PROTECTIVE_DE_RISK_SUPPRESSED",
         aggregateType: "paper_order", aggregateId: order.id, payload: facts,
-      }), {});
+      }), { signal: this.abort.signal });
     } catch (error) {
       // Diagnostic write failures must not change economic authority/health.
-      this.logger.error({ error, marketId, orderId: order.id, reason: attempt.reason }, "PR3 terminal diagnostic append failed");
+      this.logger.error({ error, marketId, orderId: order.id, reason: attempt.reason }, "PR3 terminal diagnostic persistence failed");
     }
   }
 /** Selects FRESH canonical held/opposite books and runs the staged PR3 predicate. */

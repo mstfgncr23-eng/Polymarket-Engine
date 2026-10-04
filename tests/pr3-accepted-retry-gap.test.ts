@@ -11,6 +11,7 @@ const START = Date.parse("2026-01-01T00:00:00Z");
 const MARKET = "retry-gap";
 const fee = feeScheduleSchema.parse({ rate: "0", exponent: 1, takerOnly: true, rebateRate: "0", source: "configured_test_fixture", effectiveAt: new Date(START).toISOString() });
 type Outcome = "UP" | "DOWN";
+type Attempt = { riskId: string; admitted: boolean; reason: string };
 type Internals = {
   snapshots: Map<string, Partial<Record<Outcome, MarketSnapshot>>>;
   riskReductionOwners: Map<string, RiskReductionOwnership>;
@@ -23,20 +24,24 @@ type Internals = {
   evaluateGuardian(m: string): { reason: string };
   applyFill(fill: PaperFill, extras: Record<string, unknown>): Promise<boolean>;
   recordProtectiveDeRiskSuppressed(m: string, gate: string, reason: string): void;
+  recordEarlyAttemptTerminated(m: string, order: import("@pm/core").PaperOrder, attempt: Attempt): Promise<void>;
+  admitRiskReduction(owner: RiskReductionOwnership, attempt?: Attempt): Promise<boolean>;
 };
 const internal = (s: Scenario) => s.engine as unknown as Internals;
 
 // Hooks run at exact journal awaits; no sleeps, polling, or production hooks.
 class BoundaryJournal extends MemoryEventJournal {
   onAppend?: (event: JournalEvent) => void | Promise<void>;
-  onRead?: (key: string) => void;
+  onRead?: (key: string) => void | Promise<void>;
+  beforeAppend?: (event: JournalEvent) => void | Promise<void>;
   override async append(...args: Parameters<MemoryEventJournal["append"]>) {
+    await this.beforeAppend?.(args[0]);
     const result = await super.append(...args);
     await this.onAppend?.(args[0]);
     return result;
   }
   override async readDurableByOperationKey(key: string) {
-    this.onRead?.(key);
+    await this.onRead?.(key);
     return super.readDurableByOperationKey(key);
   }
 }
@@ -309,14 +314,18 @@ describe("PR3 accepted-without-action retry lifecycle", () => {
     const s = await start(); try {
       s.journal.onAppend = (event) => {
         if (event.type === "RISK_EVALUATION" && event.payload.accepted) s.market.markTokenSync(`${MARKET}-down`, "GAPPED");
-        if (event.payload.gate === "EARLY_ACCEPTED_ATTEMPT_TERMINATED") { setBook(s, "UP"); setBook(s, "DOWN"); }
       };
+      const guardian = internal(s).evaluateGuardian.bind(internal(s));
+      vi.spyOn(internal(s), "evaluateGuardian").mockImplementation((m) => {
+        // Resync when economic authority resumes, independent of diagnostics.
+        setBook(s, "UP"); setBook(s, "DOWN"); return guardian(m);
+      });
       await internal(s).maybeProtectiveDeRisk(MARKET);
       expect(await evaluations(s)).toHaveLength(2); expect(await terminal(s)).toHaveLength(2);
       expect(await rows(s, "PAPER_ORDER_CREATED")).toHaveLength(0);
       expect(internal(s).earlyCatastrophicNextAttemptAt.has(MARKET)).toBe(false);
       expect(residual(s)).toBe("5"); await assertIdle(s);
-    } finally { await s.engine.stop(); }
+    } finally { vi.restoreAllMocks(); await s.engine.stop(); }
   });
 
   it("a second same-pass PR3 rejection still hands the changed residual to current Guardian authority", async () => {
@@ -328,12 +337,146 @@ describe("PR3 accepted-without-action retry lifecycle", () => {
           if (accepts === 1) s.market.markTokenSync(`${MARKET}-down`, "GAPPED");
           else setBook(s, "DOWN", { asks: [{ price: "0.40", quantity: "10000" }] });
         }
-        if (event.payload.gate === "EARLY_ACCEPTED_ATTEMPT_TERMINATED" && accepts === 1) { setBook(s, "UP"); setBook(s, "DOWN"); }
       };
+      const guardian = internal(s).evaluateGuardian.bind(internal(s));
+      vi.spyOn(internal(s), "evaluateGuardian").mockImplementation((m) => {
+        if (accepts === 1) { setBook(s, "UP"); setBook(s, "DOWN"); }
+        return guardian(m);
+      });
       await internal(s).maybeProtectiveDeRisk(MARKET);
       expect(await evaluations(s)).toHaveLength(2); expect(await terminal(s)).toHaveLength(2);
       expect((await rows(s, "PAPER_ORDER_CREATED"))[0]!.payload.intent).toBe("GUARDIAN_PROTECTIVE_SELL");
       expect(await rows(s, "RISK_REDUCTION_ADMITTED")).toHaveLength(1); expect(residual(s)).toBe("0"); await assertIdle(s);
-    } finally { await s.engine.stop(); }
+    } finally { vi.restoreAllMocks(); await s.engine.stop(); }
+  });
+});
+
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+function captureTerminalTask(s: Scenario) {
+  const original = internal(s).recordEarlyAttemptTerminated.bind(internal(s));
+  const tasks: Promise<void>[] = [];
+  vi.spyOn(internal(s), "recordEarlyAttemptTerminated").mockImplementation((...args) => {
+    const task = original(...args); tasks.push(task); return task;
+  });
+  return tasks;
+}
+
+describe("PR3 terminal observability never owns economic handoff", () => {
+  it.each(["read", "append"] as const)("Guardian completes before a held terminal diagnostic %s is released", async (phase) => {
+    const s = await start();
+    const entered = deferred(), release = deferred();
+    const tasks = captureTerminalTask(s);
+    let handoff: Promise<void> | undefined;
+    try {
+      vi.useFakeTimers({ toFake: ["setTimeout"] });
+      afterFirstAccepted(s, () => setBook(s, "DOWN", { asks: [{ price: "0.40", quantity: "10000" }] }));
+      if (phase === "read") {
+        let held = false;
+        s.journal.onRead = async (key) => {
+          if (!held && key.startsWith("risk-reduction:") && key.endsWith(":admitted")) {
+            held = true; entered.resolve(); await release.promise;
+          }
+        };
+      } else s.journal.beforeAppend = async (event) => {
+        if (event.payload.gate === "EARLY_ACCEPTED_ATTEMPT_TERMINATED") { entered.resolve(); await release.promise; }
+      };
+      handoff = internal(s).maybeProtectiveDeRisk(MARKET);
+      await entered.promise;
+      await vi.runAllTimersAsync();
+      // These assertions run while diagnostic persistence is still held. The
+      // previous implementation cannot admit or fill Guardian at this point.
+      expect(residual(s)).toBe("0");
+      expect((await rows(s, "PAPER_ORDER_CREATED"))[0]!.payload.intent).toBe("GUARDIAN_PROTECTIVE_SELL");
+      expect(await rows(s, "RISK_REDUCTION_COMPLETED")).toHaveLength(1);
+      expect(await terminal(s)).toHaveLength(0);
+      await handoff; await assertIdle(s);
+      await Promise.all(Array.from({ length: 6 }, () => internal(s).maybeProtectiveDeRisk(MARKET)));
+      release.resolve(); await Promise.all(tasks);
+      expect(await terminal(s)).toHaveLength(1);
+      expect((await terminal(s))[0]!.payload).toMatchObject({ residualQuantity: "5", reason: "FINAL_FENCE_LOCKED_LOSS_EXCEEDS_CAP", durableAdmission: false });
+      expect(tasks).toHaveLength(1);
+    } finally {
+      release.resolve(); await vi.runAllTimersAsync(); await handoff; await Promise.all(tasks);
+      vi.useRealTimers(); vi.restoreAllMocks(); await s.engine.stop();
+    }
+  });
+
+  it.each(["read", "append"] as const)("stop does not wait for a held diagnostic %s or append after journal closure", async (phase) => {
+    const s = await start();
+    const entered = deferred(), release = deferred();
+    const tasks = captureTerminalTask(s);
+    let handoff: Promise<void> | undefined;
+    try {
+      vi.useFakeTimers({ toFake: ["setTimeout"] });
+      afterFirstAccepted(s, () => setBook(s, "DOWN", { asks: [{ price: "0.40", quantity: "10000" }] }));
+      if (phase === "read") {
+        let held = false;
+        s.journal.onRead = async (key) => {
+          if (!held && key.startsWith("risk-reduction:") && key.endsWith(":admitted")) {
+            held = true; entered.resolve(); await release.promise;
+          }
+        };
+      } else s.journal.beforeAppend = async (event) => {
+        if (event.payload.gate === "EARLY_ACCEPTED_ATTEMPT_TERMINATED") { entered.resolve(); await release.promise; }
+      };
+      const closed = vi.spyOn(s.journal, "close");
+      handoff = internal(s).maybeProtectiveDeRisk(MARKET);
+      await entered.promise; await vi.runAllTimersAsync();
+      expect(residual(s)).toBe("0"); await handoff;
+      await s.engine.stop();
+      expect(closed).toHaveBeenCalledOnce();
+      release.resolve(); await Promise.all(tasks);
+      expect(await terminal(s)).toHaveLength(0);
+      expect(s.engine.integrityFault()).toBe(false);
+    } finally {
+      release.resolve(); await vi.runAllTimersAsync(); await handoff; await Promise.all(tasks);
+      vi.useRealTimers(); vi.restoreAllMocks(); await s.engine.stop();
+    }
+  });
+
+  it.each(["read", "append", "unexpected"] as const)("detached diagnostic %s rejection is handled without changing economic health", async (phase) => {
+    const s = await start();
+    const unhandled = vi.fn();
+    process.on("unhandledRejection", unhandled);
+    try {
+      const tasks = captureTerminalTask(s);
+      const logger = vi.spyOn((s.engine as unknown as { logger: { error(...args: unknown[]): void } }).logger, "error");
+      afterFirstAccepted(s, () => setBook(s, "DOWN", { asks: [{ price: "0.40", quantity: "10000" }] }));
+      if (phase === "read") {
+        let failed = false;
+        s.journal.onRead = (key) => {
+          if (!failed && key.startsWith("risk-reduction:") && key.endsWith(":admitted")) { failed = true; throw new Error("DIAGNOSTIC_READ_REJECTED"); }
+        };
+      } else if (phase === "append") s.journal.beforeAppend = (event) => {
+        if (event.payload.gate === "EARLY_ACCEPTED_ATTEMPT_TERMINATED") throw new Error("DIAGNOSTIC_APPEND_REJECTED");
+      };
+      else vi.spyOn(internal(s), "recordEarlyAttemptTerminated").mockRejectedValue(new Error("UNEXPECTED_DIAGNOSTIC_REJECTION"));
+      await internal(s).maybeProtectiveDeRisk(MARKET); await Promise.all(tasks);
+      expect(residual(s)).toBe("0"); expect(await terminal(s)).toHaveLength(0);
+      expect(logger).toHaveBeenCalled(); expect(unhandled).not.toHaveBeenCalled();
+      expect(s.engine.state.database).toBe("UP"); expect(s.engine.state.journalDegraded).toBe(false); await assertIdle(s);
+    } finally { process.off("unhandledRejection", unhandled); vi.restoreAllMocks(); await s.engine.stop(); }
+  });
+
+  it.each(["AFTER_DURABLE_COMMIT_BEFORE_APPLY", "AFTER_APPLY_BEFORE_DERIVED_AUDIT"] as const)("%s never becomes a false non-admission terminal fact", async (point) => {
+    const s = await start();
+    try {
+      const tasks = captureTerminalTask(s);
+      const original = internal(s).admitRiskReduction.bind(internal(s));
+      vi.spyOn(internal(s), "admitRiskReduction").mockImplementation((owner, attempt) => {
+        s.engine.setCrashInjectionForTest(point, { operationKey: `risk-reduction:${owner.order.id}:admitted` });
+        return original(owner, attempt);
+      });
+      await expect(internal(s).maybeEarlyCatastrophicPairLock(MARKET)).rejects.toThrow("CRASH_INJECTED");
+      await Promise.all(tasks);
+      expect(tasks).toHaveLength(1);
+      expect(await s.journal.queryDurableTransitions({ types: ["RISK_REDUCTION_ADMITTED"], limit: 10 })).toHaveLength(1);
+      expect(await terminal(s)).toHaveLength(0);
+      expect((await evaluations(s))[0]!.payload.deRisk.finalState).toBe("PRECHECK_ACCEPTED");
+    } finally { vi.restoreAllMocks(); await s.engine.stop(); }
   });
 });
