@@ -205,6 +205,7 @@ import {
   RUNTIME_BOUNDS,
   RuntimeSupervisor,
   SingleFlight,
+  SharedResultFlight,
   isCriticalPersistenceType,
   isRiskHedgeSettlementKind,
   remapTriggerRejection,
@@ -555,6 +556,8 @@ export class EngineService {
   private started = false;
   private bootstrapFailed = false;
   private maintenanceTimer: NodeJS.Timeout | null = null;
+  private soakPersistenceTimer: NodeJS.Timeout | null = null;
+  private readonly soakPersistenceFlight = new SharedResultFlight<void>();
   private discoveryTimer: NodeJS.Timeout | null = null;
   private lastInfrastructureAccrualAt = Date.now();
   private lastScheduledReviewAt = 0;
@@ -786,6 +789,10 @@ export class EngineService {
 
     this.maintenanceTimer = setInterval(() => { void this.runMaintenance(); }, 60_000);
     this.maintenanceTimer.unref();
+    this.soakPersistenceTimer = setInterval(() => {
+      void this.flushSoakDiagnostics().catch((error) => this.logger.error({ err: error }, "soak diagnostic persistence failed"));
+    }, SOAK_PERSIST_INTERVAL_MS);
+    this.soakPersistenceTimer.unref();
     if (configuredTokens.length === 0) {
       this.discoveryTimer = setInterval(() => { void this.runDiscovery().catch((error) => this.logger.error({ err: error }, "discovery refresh failed")); }, this.env.DISCOVERY_INTERVAL_MS);
       this.discoveryTimer.unref();
@@ -810,6 +817,8 @@ export class EngineService {
     this.referenceRetryTimers.clear();
     if (this.maintenanceTimer) clearInterval(this.maintenanceTimer);
     this.maintenanceTimer = null;
+    if (this.soakPersistenceTimer) clearInterval(this.soakPersistenceTimer);
+    this.soakPersistenceTimer = null;
     if (this.discoveryTimer) clearInterval(this.discoveryTimer);
     this.discoveryTimer = null;
     if (this.experiment?.status === "RUNNING" || this.experiment?.status === "ENTRY_CLOSED") {
@@ -5302,12 +5311,14 @@ export class EngineService {
   }
 
   private nakedDirectionalSoakEnabled(): boolean {
-    return this.env.NAKED_DIRECTIONAL_SOAK_ENABLED
-      || this.experiment?.riskConfiguration.nakedDirectionalSoakEnabled === true;
+    // Runtime configuration only opts in the NEXT experiment at beginExperiment.
+    // Existing authority (including legacy manifests without the flag) is durable.
+    return this.experiment?.riskConfiguration.nakedDirectionalSoakEnabled === true;
   }
 
   private soakLifecycleManifest(manifest: ExperimentManifest): ExperimentManifest {
-    return this.nakedDirectionalSoakEnabled() ? { ...manifest, closePolicy: "observe_until_settlement" } : manifest;
+    return manifest.riskConfiguration.nakedDirectionalSoakEnabled === true
+      ? { ...manifest, closePolicy: "observe_until_settlement" } : manifest;
   }
 
   private soakBlocksPostEntry(marketId: string): boolean {
@@ -5351,26 +5362,34 @@ export class EngineService {
 
   /** Low-frequency durable batch. No database operation runs in the book observer. */
   private async flushSoakDiagnostics(): Promise<void> {
-    const nowMs = this.nowFn().getTime();
-    if (nowMs - this.lastSoakPersistAt < SOAK_PERSIST_INTERVAL_MS || this.nakedDirectionalDiagnostics.size === 0) return;
-    if (this.state.database !== "UP" || this.state.journalDegraded || this.overload.hasIntegrityFault) return;
-    await this.commitAuthoritative({
-      operationKey: `soak:${createId("observation")}`, type: "NAKED_DIRECTIONAL_OBSERVATION",
-      aggregateType: "experiment", aggregateId: this.experiment?.id ?? "paper",
-      buildPayload: () => {
-        const diagnostics = [...this.nakedDirectionalDiagnostics.values()]
-          .filter((item) => this.ledger.positions.has(item.marketId)
-            && item.revision > (this.soakPersistedRevisions.get(item.marketId) ?? -1))
-          .map((item) => compactNakedDirectionalObservation(item, this.soakPersistedObservationCounts.get(item.marketId) ?? 0));
-        return { diagnostics, derivedAudit: [] };
-      },
-      afterApply: async (transition) => {
-        for (const diagnostic of transition.payload.diagnostics as NakedDirectionalDiagnostic[]) {
-          this.soakPersistedRevisions.set(diagnostic.marketId, diagnostic.revision);
-          this.soakPersistedObservationCounts.set(diagnostic.marketId, diagnostic.observationCount);
-        }
-        this.lastSoakPersistAt = nowMs;
-      },
+    // Timer and maintenance share one bounded write. Journal admission owns the
+    // entire flight, including waiting for the durable gate, so shutdown joins it.
+    await this.soakPersistenceFlight.run(async () => {
+      const nowMs = this.nowFn().getTime();
+      if (this.state.draining || nowMs - this.lastSoakPersistAt < SOAK_PERSIST_INTERVAL_MS || this.nakedDirectionalDiagnostics.size === 0) return;
+      if (this.state.database !== "UP" || this.state.journalDegraded || this.overload.hasIntegrityFault) return;
+      if (![...this.nakedDirectionalDiagnostics.values()].some((item) => this.ledger.positions.has(item.marketId)
+        && item.revision > (this.soakPersistedRevisions.get(item.marketId) ?? -1))) return;
+      await this.journalAdmission.run("audit", true, async () => {
+        await this.commitAuthoritative({
+          operationKey: `soak:${createId("observation")}`, type: "NAKED_DIRECTIONAL_OBSERVATION",
+          aggregateType: "experiment", aggregateId: this.experiment?.id ?? "paper",
+          buildPayload: () => {
+            const diagnostics = [...this.nakedDirectionalDiagnostics.values()]
+              .filter((item) => this.ledger.positions.has(item.marketId)
+                && item.revision > (this.soakPersistedRevisions.get(item.marketId) ?? -1))
+              .map((item) => compactNakedDirectionalObservation(item, this.soakPersistedObservationCounts.get(item.marketId) ?? 0));
+            return { diagnostics, derivedAudit: [] };
+          },
+          afterApply: async (transition) => {
+            for (const diagnostic of transition.payload.diagnostics as NakedDirectionalDiagnostic[]) {
+              this.soakPersistedRevisions.set(diagnostic.marketId, diagnostic.revision);
+              this.soakPersistedObservationCounts.set(diagnostic.marketId, diagnostic.observationCount);
+            }
+            this.lastSoakPersistAt = nowMs;
+          },
+        });
+      });
     });
   }
 

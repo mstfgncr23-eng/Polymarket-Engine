@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { calculateFee, createId, d, engineEnvSchema, observeNakedDirectionalPosition, createNakedDirectionalDiagnostic,
-  SOAK_PATH_LIMIT, SOAK_ANOMALY_LIMIT, SOAK_PERSIST_PATH_LIMIT, noteNakedDirectionalAnomaly, type MarketSnapshot, type PaperOrder,
+  SOAK_PATH_LIMIT, SOAK_ANOMALY_LIMIT, SOAK_PERSIST_PATH_LIMIT, SOAK_PERSIST_INTERVAL_MS, noteNakedDirectionalAnomaly, type MarketSnapshot, type PaperOrder,
   type ReferenceTick, type NakedDirectionalDiagnostic, type PaperFill, type TriggerEvent, type ConsensusDecision, type NativeDecision } from "@pm/core";
 import { MemoryEventJournal, isSemanticallyValidCheckpointPayload } from "@pm/db";
 import { EngineService } from "../apps/engine/src/engine.js";
@@ -24,6 +24,8 @@ type Internals = {
   submitPaperOrder(order: PaperOrder, book: MarketSnapshot, key: string, intent: string): Promise<boolean>;
   flushSoakDiagnostics(): Promise<void>;
   observeSoakPosition(marketId: string): void;
+  nakedDirectionalSoakEnabled(): boolean;
+  runMaintenance(): Promise<void>;
   evaluateTrade(trigger: TriggerEvent, consensus: ConsensusDecision, native: NativeDecision): Promise<void>;
   settleMarket(marketId: string, lookup: { marketId: string; slug: string | null; endDate: string; yesMapsTo: Outcome; noMapsTo: Outcome }): Promise<void>;
   activeTriggers: Map<string, TriggerEvent>;
@@ -273,6 +275,106 @@ describe("naked directional PAPER authority", { timeout: 30_000 }, () => {
       expect(restarted.engine.ledger.positions.get(MARKET)?.unpairedQuantity).toBe("5");
       expect(await rows(restarted, "PAPER_FILL")).toHaveLength(1);
     } finally { if (restarted) await restarted.engine.stop(); else await s.engine.stop(); }
+  });
+
+  it.each([
+    ["RUNNING", false], ["ENTRY_CLOSED", false], ["RUNNING", undefined], ["ENTRY_CLOSED", undefined],
+  ] as const)(
+    "keeps a recovered non-soak %s experiment's durable flag %s when the environment enables soak", async (status, flag) => {
+      const s = await start(false, { closePolicy: "mark_to_market" }); let restarted: Scenario | undefined;
+      try {
+        await seed(s);
+        if (status === "ENTRY_CLOSED") await s.engine.closeExperimentEntries();
+        // Simulate a pre-feature manifest in the verified shutdown checkpoint.
+        if (flag === undefined) delete s.engine.experimentManifest()!.riskConfiguration.nakedDirectionalSoakEnabled;
+        await s.engine.stop();
+        restarted = await start(true, { journal: s.journal, clock: s.clock });
+        expect(restarted.engine.experimentManifest()).toMatchObject({ status, closePolicy: "mark_to_market" });
+        expect(restarted.engine.experimentManifest()!.riskConfiguration.nakedDirectionalSoakEnabled).toBe(flag);
+        expect(internal(restarted.engine).nakedDirectionalSoakEnabled()).toBe(false);
+        // A real first-leg continuation must not acquire diagnostic identity on restart.
+        await restarted.engine.applyObservedFill(paperFill(MARKET, "UP", "0.80", {
+          quantity: "1", timestamp: new Date(s.clock.ms).toISOString(), feeUsd: "0", feeSchedule,
+        }), "OPEN_FIRST_LEG");
+        expect(internal(restarted.engine).nakedDirectionalDiagnostics.size).toBe(0);
+        await drive(restarted, "0.10");
+        expect((await rows(restarted, "PAPER_FILL")).filter((row) => row.payload.intent === "HEDGE_SECOND_LEG")).toHaveLength(1);
+        await restarted.engine.tickMaintenance();
+        expect(restarted.engine.experimentManifest()?.closePolicy).toBe("mark_to_market");
+      } finally { if (restarted) await restarted.engine.stop(); else await s.engine.stop(); }
+    });
+
+  it("persists on the actual five-second timer independently of maintenance and stops scheduling on shutdown", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    let s: Scenario | undefined;
+    try {
+      s = await start(); await seed(s);
+      const maintenance = vi.spyOn(internal(s.engine), "runMaintenance");
+      const commit = vi.spyOn(s.journal, "commitDurableTransition");
+      await s.market.emitSnapshot(book(s, "UP", "0.12345678"));
+      s.market.emitGap([`${MARKET}-down`], "count_limit");
+      await vi.advanceTimersByTimeAsync(SOAK_PERSIST_INTERVAL_MS - 1);
+      expect(commit.mock.calls.filter(([input]) => input.type === "NAKED_DIRECTIONAL_OBSERVATION")).toHaveLength(0);
+      await vi.advanceTimersByTimeAsync(1);
+      const batches = await s.journal.queryDurableTransitions({ types: ["NAKED_DIRECTIONAL_OBSERVATION"], limit: 100 });
+      expect(batches).toHaveLength(1);
+      expect((batches[0]!.payload.diagnostics as NakedDirectionalDiagnostic[])[0]).toMatchObject({
+        minDirectionalPnl: { value: "-3.3827161" }, anomalyCounts: { SLOW_CONSUMER: 1 },
+      });
+      expect(maintenance).not.toHaveBeenCalled();
+      s.clock.ms += SOAK_PERSIST_INTERVAL_MS;
+      await s.market.emitSnapshot(book(s, "UP", "0.91"));
+      await vi.advanceTimersByTimeAsync(SOAK_PERSIST_INTERVAL_MS);
+      expect(await s.journal.queryDurableTransitions({ types: ["NAKED_DIRECTIONAL_OBSERVATION"], limit: 100 })).toHaveLength(2);
+      await s.engine.stop();
+      const commitsAfterStop = commit.mock.calls.length;
+      s.clock.ms += SOAK_PERSIST_INTERVAL_MS * 2;
+      await vi.advanceTimersByTimeAsync(SOAK_PERSIST_INTERVAL_MS * 2);
+      expect(commit).toHaveBeenCalledTimes(commitsAfterStop);
+    } finally { if (s) await s.engine.stop(); vi.restoreAllMocks(); vi.useRealTimers(); }
+  });
+
+  it("coalesces delayed timer and maintenance writes and joins pending diagnostic persistence on shutdown", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    let s: Scenario | undefined; let release = () => {};
+    try {
+      s = await start(); await seed(s);
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      const read = s.journal.readDurableByOperationKey.bind(s.journal);
+      const spy = vi.spyOn(s.journal, "readDurableByOperationKey").mockImplementation(async (key) => {
+        if (key.startsWith("soak:")) await held;
+        return read(key);
+      });
+      const close = vi.spyOn(s.journal, "close");
+      await vi.advanceTimersByTimeAsync(SOAK_PERSIST_INTERVAL_MS);
+      s.clock.ms += SOAK_PERSIST_INTERVAL_MS * 2;
+      await vi.advanceTimersByTimeAsync(SOAK_PERSIST_INTERVAL_MS * 2);
+      const maintenanceFlush = internal(s.engine).flushSoakDiagnostics();
+      expect(spy.mock.calls.filter(([key]) => key.startsWith("soak:"))).toHaveLength(1);
+      const stopping = s.engine.stop();
+      await Promise.resolve();
+      expect(close).not.toHaveBeenCalled();
+      release(); await maintenanceFlush; await stopping;
+      expect(await s.journal.queryDurableTransitions({ types: ["NAKED_DIRECTIONAL_OBSERVATION"], limit: 100 })).toHaveLength(1);
+      expect(close).toHaveBeenCalledTimes(1);
+      expect(s.engine.recoveryFailClosedForTest()).toBe(false);
+    } finally { release(); if (s) await s.engine.stop(); vi.restoreAllMocks(); vi.useRealTimers(); }
+  });
+
+  it("retains fail-closed integrity when a scheduled diagnostic commit fails", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    let s: Scenario | undefined;
+    try {
+      s = await start(); await seed(s);
+      const commit = s.journal.commitDurableTransition.bind(s.journal);
+      vi.spyOn(s.journal, "commitDurableTransition").mockImplementation(async (input, cursor) => {
+        if (input.type === "NAKED_DIRECTIONAL_OBSERVATION") throw new Error("DIAGNOSTIC_WRITE_FAILED");
+        return commit(input, cursor);
+      });
+      await vi.advanceTimersByTimeAsync(SOAK_PERSIST_INTERVAL_MS);
+      expect(s.engine.state.overloadState).toBe("FAIL_CLOSED");
+      expect(await s.journal.queryDurableTransitions({ types: ["NAKED_DIRECTIONAL_OBSERVATION"], limit: 100 })).toHaveLength(0);
+    } finally { if (s) await s.engine.stop(); vi.restoreAllMocks(); vi.useRealTimers(); }
   });
 
   it("preserves checkpoint diagnostics, rejects malformed snapshots, and keeps hard integrity fences", async () => {
