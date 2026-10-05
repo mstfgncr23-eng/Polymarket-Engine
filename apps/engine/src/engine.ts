@@ -90,26 +90,6 @@ import {
   type NativeReferenceFeatures,
   type NativeDecisionConfig,
   NATIVE_DETERMINISTIC_MODEL_VERSION,
-  NativeV2ShadowFeatureExtractor,
-  evaluateNativeV2ShadowFairProbability,
-  LearningSampleStore,
-  tryObserveLearningSample,
-  LearningRuntime,
-  type LearnedV2ShadowEvaluation,
-  NativeV2CounterfactualStore,
-  counterfactualDataDir,
-  nativeV2CounterfactualActionKey,
-  NATIVE_V2_COUNTERFACTUAL_STATE_BASIS,
-  NativeV2ShadowOpportunityRanker,
-  evaluateNativeV2ShadowMarketOpportunity,
-  buildNativeV2ShadowExecutionIntent,
-  NATIVE_V2_SHADOW_EXECUTION_VERSION,
-  type NativeV2ShadowFairProbability,
-  type NativeV2ShadowFeatureVector,
-  type NativeV2ShadowMarketOpportunity,
-  type NativeV2ShadowOpportunityCandidate,
-  type NativeV2ShadowOpportunityRanking,
-  DEFAULT_FIRST_LEG_RISK_CAP_USD,
   rolesForTriggerKind,
   type RiskReductionSelection,
   type RiskReductionSelectionReason,
@@ -147,7 +127,6 @@ import { EngineMetrics, classifyJournalMetricClass } from "./metrics.js";
 import { RestingOrderTokenIndex } from "./resting-order-index.js";
 import { SseHub } from "./server.js";
 import { EngineStateStore } from "./state.js";
-import { NativeV2ShadowStore } from "./native-v2-shadow-store.js";
 import { ensureReportGeneratedAudit, persistCanonicalFinalReport, persistVerifiedAnalyticsRollup, streamExperimentSummary, summaryFromDurableReport } from "./final-report.js";
 import { writeExperimentSummary } from "./report.js";
 import { retentionConfigFromEngineEnv, RetentionManager } from "./retention-manager.js";
@@ -397,45 +376,6 @@ type ProtectiveDeRiskAudit = {
   rescueFailureOrderId?: string | null;
 };
 
-type NativeV2ShadowExecutionCapture = {
-  trigger: TriggerEvent;
-  featureVector: NativeV2ShadowFeatureVector;
-  fair: NativeV2ShadowFairProbability;
-  opportunity: NativeV2ShadowMarketOpportunity;
-  ranking: NativeV2ShadowOpportunityRanking;
-  native: NativeDecision;
-  capturedAt: string;
-  experimentId: string | null;
-  experimentStatus: string | null;
-  gitSha: string | null;
-  asset: string | null;
-  currentSnapshot: MarketSnapshot | null;
-  selected: NativeV2ShadowOpportunityCandidate | null;
-  evidenceIds: string[];
-  preflightBlockers: string[];
-  positions: Position[];
-  assetByMarketEntries: Array<[string, string | null]>;
-  ledger: LedgerState;
-  availableCashUsd: string;
-  marketFeedAt: string | null;
-  referenceFeedAt: string | null;
-  btcFeedAt: string | null;
-  referenceRequired: boolean;
-  databaseAvailable: boolean;
-  timestampDisorder: boolean;
-  referenceProviderBlocked: boolean;
-  marketEntryQualified: boolean;
-  lastStrategyTradeAt: string | null;
-  duplicateTrade: boolean;
-  experimentEntryOpen: boolean;
-  executionErrorsLastHour: number;
-  shuttingDown: boolean;
-  /**
-   * Authoritative YES/NO mapping captured at decision-time reserve.
-   * evaluateNativeV2ShadowExecution must not re-resolve from live marketsById.
-   */
-  settlementLookup: BinarySettlementLookup | null;
-};
 
 export class EngineService {
   readonly metrics = new EngineMetrics();
@@ -448,16 +388,6 @@ export class EngineService {
   private readonly riskLimits;
   private readonly triggerConfig;
   private readonly nativeDecisionConfig: NativeDecisionConfig;
-  private readonly nativeV2Shadow = new NativeV2ShadowFeatureExtractor();
-  private readonly nativeV2OpportunityRanker = new NativeV2ShadowOpportunityRanker();
-  private readonly nativeV2ShadowStore = new NativeV2ShadowStore();
-  private readonly learningStore: LearningSampleStore | null;
-  /** PR5 learned V2 shadow runtime â€” advisory only; never V1 authority. */
-  private readonly learningRuntime: LearningRuntime;
-  /** Isolated V2 shadow portfolio â€” never mutates V1 ledger/cash/positions. */
-  private readonly counterfactualStore: NativeV2CounterfactualStore;
-  private nativeV2ShadowExecutionBusy = false;
-  private lastLearningSettlementPollAt = 0;
   private readonly strategy = new TemporalPairHedgeStrategy();
   private readonly marketAdapter: PolymarketMarketDataAdapter;
   private readonly legacyBtcAdapter: BtcWebSocketAdapter | null;
@@ -581,7 +511,6 @@ export class EngineService {
   private lastShutdownCheckpointed = false;
   private maintenanceHold: Promise<void> | null = null;
   private processTriggerHold: Promise<void> | null = null;
-  private nativeV2ShadowEvalHoldForTest: Promise<void> | null = null;
   private triggerEventPersistHold: Promise<void> | null = null;
   private sourceSealing = false;
   private sourceSealed = false;
@@ -664,53 +593,6 @@ export class EngineService {
       createRestProbe(env.REFERENCE_REST_BASE_URL),
     );
     this.resolutionFetcher = adapters?.resolutionFetcher ?? ((id) => this.marketAdapter.fetchPublicMarket(id));
-    this.learningStore = env.LEARNING_ENABLED
-      ? new LearningSampleStore({
-        enabled: true,
-        dataDir: env.LEARNING_DATA_DIR,
-        maxBytes: env.LEARNING_MAX_BYTES,
-        checkpointSeconds: env.LEARNING_CHECKPOINT_SECONDS,
-        gitSha: process.env.GIT_SHA ?? process.env.FLY_IMAGE_REF ?? null,
-      })
-      : null;
-    try {
-      this.learningStore?.init();
-    } catch {
-      // Learning storage must never block engine startup (V1/V2/risk/execution).
-    }
-    this.learningRuntime = new LearningRuntime({
-      shadowEnabled: env.LEARNING_SHADOW_ENABLED,
-      learningDataDir: env.LEARNING_DATA_DIR,
-      modelArtifactPath: env.LEARNING_SHADOW_MODEL_PATH ?? null,
-      modelId: env.LEARNING_SHADOW_MODEL_ID ?? null,
-      paperAuthority: {
-        paperAuthorityEnabled: env.LEARNING_PAPER_AUTHORITY_ENABLED,
-        approvedModelId: env.LEARNING_PAPER_AUTHORITY_MODEL_ID ?? null,
-      },
-    });
-    // Defense in depth: LearningRuntime.init() is fail-soft, and the engine
-    // boundary also refuses to let optional learned state block V1 startup.
-    try {
-      this.learningRuntime.init();
-    } catch {
-      // Learned shadow remains unavailable; V1/V2/risk/execution continue.
-    }
-    // V2 counterfactual portfolio: durable under LEARNING_DATA_DIR/counterfactual.
-    // Always constructed for Phase-4 shadow statefulness; isolated from V1.
-    this.counterfactualStore = new NativeV2CounterfactualStore({
-      enabled: true,
-      durable: true,
-      dataDir: counterfactualDataDir(env.LEARNING_DATA_DIR),
-      startingBalance: env.PAPER_START_BALANCE,
-      // CF has its own bounded log under LEARNING_DATA_DIR/counterfactual (always durable).
-      // Cap matches the learning volume contract; CF failures never affect V1 authority.
-      maxBytes: env.LEARNING_MAX_BYTES,
-    });
-    try {
-      this.counterfactualStore.init();
-    } catch {
-      // Counterfactual storage must never block engine startup (V1/V2/risk/execution).
-    }
     this.hotResearchCache = new HotResearchCache({
       now: this.nowFn,
       maxEntries: env.XAI_SCOUT_CACHE_MAX_ENTRIES,
@@ -1139,7 +1021,6 @@ export class EngineService {
         // START_VALIDATED is durable, later feed loss is ordinary runtime
         // feed-loss semantics; there is no compensating transition to race
         // with recovery.
-        this.nativeV2ShadowStore.reset();
         this.crashInjector.maybeCrash("AFTER_START_VALIDATED_BEFORE_RUNTIME_ADMISSION", `experiment:${next.id}:start_validated`);
         this.syncExperimentWindow();
         try {
@@ -1580,8 +1461,6 @@ export class EngineService {
       this.earlyCatastrophicVetoFingerprint.delete(marketId);
       this.snapshots.delete(marketId);
       this.triggerEngine.dropMarket(marketId);
-      this.nativeV2Shadow.dropMarket(marketId);
-      this.nativeV2OpportunityRanker.dropMarket(marketId);
       this.assetIndex.removeMarket(marketId);
       for (const [tokenId, snapshot] of [...this.state.marketSnapshots.entries()]) {
         if (snapshot.marketId === marketId) {
@@ -1592,7 +1471,6 @@ export class EngineService {
     }
     for (const asset of removedAssets) {
       this.triggerEngine.dropAsset(asset);
-      this.nativeV2Shadow.dropAsset(asset);
       this.assetIndex.dropAsset(asset);
       this.referenceUnreliable.delete(asset);
       this.referenceEpoch.delete(asset);
@@ -2367,7 +2245,6 @@ export class EngineService {
     this.snapshots.set(snapshot.marketId, pair);
     this.observeSoakPosition(snapshot.marketId);
     this.kickProfitTrailingPair(snapshot.marketId);
-    this.nativeV2Shadow.ingestMarket(snapshot);
     if (snapshot.asset) {
       this.assetByMarket.set(snapshot.marketId, snapshot.asset);
       this.assetIndex.add(snapshot.asset, snapshot.marketId);
@@ -2477,7 +2354,6 @@ export class EngineService {
     const started = performance.now();
     const admission = this.triggerEngine.admitReferenceTick(tick);
     if (admission.overflow) {
-      this.nativeV2Shadow.resetReference(tick.asset);
       this.noteReferenceLogicalLoss(tick.asset);
       this.state.invalidateReferenceContext(tick.asset);
       this.requestReferenceResync(tick.asset);
@@ -2493,7 +2369,6 @@ export class EngineService {
       return;
     }
     const wasUnreliable = this.referenceUnreliable.has(tick.asset);
-    this.nativeV2Shadow.ingestReference(tick);
     this.state.noteReferenceTick(tick.asset, tick.receivedAt, {
       symbol: tick.symbol, venue: tick.venue, price: tick.price,
     });
@@ -2713,82 +2588,13 @@ export class EngineService {
     });
     if (!native) return;
 
-    const shadowV2FeatureVector = this.nativeV2Shadow.extract({
-      marketId: trigger.marketId,
-      asset,
-      now: this.nowFn(),
-      endDate: this.marketsById.get(trigger.marketId)?.endDate ?? null,
-      marketSynchronized: true,
-      referenceFreshness: referenceContext?.freshness ?? "unknown",
-      referenceFreshnessMs: referenceContext?.freshnessMs ?? null,
-    });
-    const shadowV2FairProbability = shadowV2FeatureVector
-      ? evaluateNativeV2ShadowFairProbability(shadowV2FeatureVector)
-      : null;
-    // PR1 learning foundation: durable samples after V2 fair succeeds, before
-    // opportunity/ranking. Fail-soft â€” never throw into the trading path.
-    if (this.learningStore && shadowV2FeatureVector && shadowV2FairProbability) {
-      try {
-        {
-          const discovered = this.marketsById.get(trigger.marketId);
-          tryObserveLearningSample(this.learningStore, {
-            marketId: trigger.marketId,
-            asset,
-            now: this.nowFn(),
-            featureVector: shadowV2FeatureVector,
-            v2FairProbability: shadowV2FairProbability,
-            native,
-            experimentId: this.experiment?.id ?? null,
-            gitSha: process.env.GIT_SHA ?? process.env.FLY_IMAGE_REF ?? null,
-            settlementLookup: discovered ? (this.settlementLookupFromMarket(discovered) ?? undefined) : undefined,
-          });
-        }
-      } catch {
-        // Learning must never affect V1/V2/risk/execution authority.
-      }
-    }
-    // PR5 learned V2 shadow â€” advisory only. Fail-soft; never mutates V1.
-    let learnedV2Shadow: LearnedV2ShadowEvaluation | null = null;
-    try {
-      learnedV2Shadow = this.learningRuntime.evaluateShadow({
-        featureVector: shadowV2FeatureVector,
-        deterministicV2: shadowV2FairProbability,
-        marketId: trigger.marketId,
-        asset,
-        experimentId: this.experiment?.id ?? null,
-        triggerId: trigger.id,
-        traceId: trigger.traceId,
-        now: this.nowFn(),
-      });
-    } catch {
-      learnedV2Shadow = null;
-    }
-    const shadowNow = this.nowFn();
-    const shadowV2MarketOpportunity = shadowV2FairProbability
-      ? evaluateNativeV2ShadowMarketOpportunity({
-        fair: shadowV2FairProbability,
-        snapshots: { UP: pair.UP ?? null, DOWN: pair.DOWN ?? null },
-        now: shadowNow,
-        targetNotionalUsd: Math.min(this.riskLimits.maxOrderSizeUsd, DEFAULT_FIRST_LEG_RISK_CAP_USD),
-        minimumNetEvUsdPerShare: this.riskLimits.minExpectedEdge,
-      })
-      : null;
-    const shadowV2OpportunityRanking = shadowV2MarketOpportunity
-      ? this.nativeV2OpportunityRanker.upsertAndRank(
-        shadowV2MarketOpportunity,
-        shadowNow,
-        this.riskLimits.staleFeedTimeoutMs,
-      )
-      : null;
-    if (!shadowV2MarketOpportunity) this.nativeV2OpportunityRanker.dropMarket(trigger.marketId);
-
     const consensus = this.nativeCompatibilityDecision(trigger, native);
     this.state.latestConsensus = consensus;
     this.record("NATIVE_DECISION_COMPLETE", trigger.traceId, trigger.marketId, {
       authority: NATIVE_DETERMINISTIC_AUTHORITY,
       direction: native.direction, confidence: native.confidence,
       fairProbability: native.fairProbability, marketProbability: native.marketProbability,
-      featureVector: native.featureVector, shadowV2FeatureVector, shadowV2FairProbability, shadowV2OpportunityRanking, learnedV2Shadow, triggerId: trigger.id,
+      featureVector: native.featureVector, triggerId: trigger.id,
     }, asset);
     await this.persistReportInput(createJournalEvent({
       traceId: trigger.traceId, type: "CONSENSUS_DECISION", aggregateType: "consensus", aggregateId: consensus.id,
@@ -2797,7 +2603,7 @@ export class EngineService {
         authority: NATIVE_DETERMINISTIC_AUTHORITY,
         marketId: trigger.marketId, asset,
         fairProbability: native.fairProbability, marketProbability: native.marketProbability,
-        expiresAt: native.expiresAt, featureVector: native.featureVector, shadowV2FeatureVector, shadowV2FairProbability, shadowV2OpportunityRanking, learnedV2Shadow,
+        expiresAt: native.expiresAt, featureVector: native.featureVector,
         reference: reference ? {
           asset: reference.asset, venue: reference.venue, freshness: reference.freshness,
           freshnessMs: reference.freshnessMs, recentMoveBps: reference.recentMoveBps,
@@ -2809,390 +2615,7 @@ export class EngineService {
     }));
     for (const disagreement of this.triggerEngine.ingestConsensus(consensus, trigger.marketId, asset)) this.admitTrigger(disagreement);
 
-    const shadowV2ExecutionCapture = shadowV2FeatureVector && shadowV2FairProbability && shadowV2MarketOpportunity && shadowV2OpportunityRanking
-      ? this.reserveNativeV2ShadowExecution({
-        trigger, native, featureVector: shadowV2FeatureVector, fair: shadowV2FairProbability,
-        opportunity: shadowV2MarketOpportunity, ranking: shadowV2OpportunityRanking,
-      })
-      : null;
-    try {
-      await this.evaluateTrade(trigger, consensus, native);
-    } catch (error) {
-      if (shadowV2ExecutionCapture) this.nativeV2ShadowExecutionBusy = false;
-      throw error;
-    }
-    if (shadowV2ExecutionCapture) this.dispatchNativeV2ShadowExecution(shadowV2ExecutionCapture);
-  }
-
-  private reserveNativeV2ShadowExecution(input: {
-    trigger: TriggerEvent;
-    native: NativeDecision;
-    featureVector: NativeV2ShadowFeatureVector;
-    fair: NativeV2ShadowFairProbability;
-    opportunity: NativeV2ShadowMarketOpportunity;
-    ranking: NativeV2ShadowOpportunityRanking;
-  }): NativeV2ShadowExecutionCapture | null {
-    const selectedAtDecision = input.opportunity.best;
-    if (input.ranking.marketRank !== 1 || !selectedAtDecision?.actionable) return null;
-
-    const now = this.nowFn();
-    // Phase-4 data is scoped to a real entry-capable experiment. Do not fill
-    // the bounded RAM export with idle or post-entry-close observations.
-    if (!experimentAllowsFirstLeg(this.experiment, now)) return null;
-    this.nativeV2ShadowStore.noteObserved();
-    if (this.nativeV2ShadowExecutionBusy) {
-      this.nativeV2ShadowStore.noteDroppedBusy();
-      return null;
-    }
-
-    const marketId = input.opportunity.marketId;
-    const currentPair = this.snapshots.get(marketId);
-    const currentSnapshot = currentPair?.[selectedAtDecision.outcome] ?? null;
-    const targetNotionalUsd = Math.min(this.riskLimits.maxOrderSizeUsd, DEFAULT_FIRST_LEG_RISK_CAP_USD);
-    const refreshedOpportunity = currentPair
-      ? evaluateNativeV2ShadowMarketOpportunity({
-        fair: input.fair,
-        snapshots: { UP: currentPair.UP ?? null, DOWN: currentPair.DOWN ?? null },
-        now,
-        targetNotionalUsd,
-        minimumNetEvUsdPerShare: this.riskLimits.minExpectedEdge,
-      })
-      : null;
-    const selected = refreshedOpportunity?.candidates[selectedAtDecision.outcome] ?? null;
-    const asset = input.trigger.asset ?? this.assetByMarket.get(marketId) ?? currentSnapshot?.asset ?? null;
-    const blockers: string[] = [];
-
-    if (this.env.PAPER_EXECUTION_STYLE !== "TAKER") blockers.push("SHADOW_TAKER_MODEL_REQUIRED");
-    if (this.researchIngressBlocked()) blockers.push("RESEARCH_INGRESS_BLOCKED");
-    if (!this.isTriggerActionable(input.trigger.id)) blockers.push("TRIGGER_NOT_ACTIONABLE");
-    if (this.experimentStartPending) blockers.push("EXPERIMENT_START_PENDING");
-    if (this.overload.state === "FAIL_CLOSED") blockers.push("OVERLOAD_FAIL_CLOSED");
-    if (!experimentAllowsFirstLeg(this.experiment, now)) blockers.push("EXPERIMENT_ENTRY_CLOSED");
-    if (!this.entryQualified.has(marketId)) blockers.push("MARKET_NOT_ENTRY_QUALIFIED");
-    if (!this.isMarketSynchronized(marketId)) blockers.push("MARKET_UNSYNCHRONIZED");
-    if (assetNeedsReliableReference(this.referenceRequired.get(marketId), this.referenceUnreliable, asset)) blockers.push("REFERENCE_PROVIDER_BLOCKED");
-    if (!this.counterfactualStore.isRecoveryReady()) blockers.push("CF_RECOVERY_UNAVAILABLE");
-    if (this.counterfactualStore.hasSettledMarket(marketId)) blockers.push("CF_MARKET_SETTLED");
-    if (this.counterfactualStore.hasOpenPosition(marketId)) blockers.push("EXISTING_OPEN_POSITION");
-    if (!currentSnapshot || !selected) blockers.push("CURRENT_BOOK_NOT_EXECUTABLE");
-    if (currentSnapshot && !this.adapterTokenSynchronized(currentSnapshot.tokenId)) blockers.push("TOKEN_UNSYNCHRONIZED");
-
-    const referenceRequired = this.referenceRequired.get(marketId) === true;
-    const referenceFeedAt = asset ? dateOrNull(this.state.referenceLastMessageAt(asset)) : null;
-    const btcFeedAt = asset === "BTC" ? referenceFeedAt ?? dateOrNull(this.state.lastBtcMessageAt) : now;
-    const marketFeedAt = currentSnapshot
-      ? collectMarketFeedAt(currentPair, selectedAtDecision.outcome, "OPEN_FIRST_LEG", currentSnapshot.receivedAt)
-      : null;
-    const duplicateKey = nativeV2CounterfactualActionKey(marketId, selectedAtDecision.outcome, "OPEN_FIRST_LEG");
-    const cfState = this.counterfactualStore.decisionState();
-    const blocked = asset ? this.referenceBlocked.get(asset) : undefined;
-
-    const discoveredAtDecision = this.marketsById.get(marketId);
-    const settlementLookupAtDecision = discoveredAtDecision
-      ? this.settlementLookupFromMarket(discoveredAtDecision)
-      : null;
-
-    const capture: NativeV2ShadowExecutionCapture = {
-      trigger: structuredClone(input.trigger),
-      featureVector: structuredClone(input.featureVector),
-      fair: structuredClone(input.fair),
-      opportunity: structuredClone(input.opportunity),
-      ranking: structuredClone(input.ranking),
-      native: structuredClone(input.native),
-      capturedAt: now.toISOString(),
-      experimentId: this.experiment?.id ?? null,
-      experimentStatus: this.experiment?.status ?? null,
-      gitSha: process.env.GIT_SHA ?? null,
-      asset,
-      currentSnapshot: currentSnapshot ? structuredClone(currentSnapshot) : null,
-      selected: selected ? structuredClone(selected) : null,
-      settlementLookup: settlementLookupAtDecision ? structuredClone(settlementLookupAtDecision) : null,
-      evidenceIds: [...new Set([
-        ...input.trigger.sourceEventIds,
-        ...(input.trigger.evidenceIds ?? []),
-        currentPair?.UP?.eventId ?? "",
-        currentPair?.DOWN?.eventId ?? "",
-      ].filter(Boolean))],
-      preflightBlockers: [...new Set(blockers)],
-      // V2-only counterfactual portfolio â€” never the authoritative V1 paper ledger.
-      positions: cfState.positions,
-      assetByMarketEntries: [...this.assetByMarket.entries()],
-      ledger: cfState.ledger,
-      availableCashUsd: cfState.availableCashUsd,
-      marketFeedAt: marketFeedAt?.toISOString() ?? null,
-      referenceFeedAt: referenceFeedAt?.toISOString() ?? null,
-      btcFeedAt: btcFeedAt?.toISOString() ?? null,
-      referenceRequired,
-      databaseAvailable: this.state.database === "UP",
-      timestampDisorder: this.timestampDisorder,
-      referenceProviderBlocked: Boolean(blocked),
-      marketEntryQualified: this.entryQualified.has(marketId),
-      lastStrategyTradeAt: cfState.lastStrategyTradeAt,
-      duplicateTrade: this.counterfactualStore.hasAction(duplicateKey),
-      experimentEntryOpen: experimentAllowsFirstLeg(this.experiment, now),
-      executionErrorsLastHour: this.executionErrors.filter((at) => now.getTime() - at < 3_600_000).length,
-      shuttingDown: this.state.draining,
-    };
-    this.nativeV2ShadowExecutionBusy = true;
-    return capture;
-  }
-
-  private dispatchNativeV2ShadowExecution(capture: NativeV2ShadowExecutionCapture): void {
-    const handle = setImmediate(() => {
-      void this.runNativeV2ShadowExecution(capture);
-    });
-    handle.unref?.();
-  }
-
-  private async runNativeV2ShadowExecution(capture: NativeV2ShadowExecutionCapture): Promise<void> {
-    try {
-      if (this.nativeV2ShadowEvalHoldForTest) await this.nativeV2ShadowEvalHoldForTest;
-      try {
-        const execution = this.evaluateNativeV2ShadowExecution(capture);
-        const selectedAtDecision = capture.opportunity.best;
-        if (!selectedAtDecision) return;
-        this.nativeV2ShadowStore.append({
-          recordedAt: this.nowFn().toISOString(),
-          experimentId: capture.experimentId,
-          experimentStatus: capture.experimentStatus,
-          gitSha: capture.gitSha,
-          triggerId: capture.trigger.id,
-          traceId: capture.trigger.traceId,
-          marketId: capture.opportunity.marketId,
-          asset: capture.asset,
-          outcome: selectedAtDecision.outcome,
-          v1: {
-            direction: capture.native.direction,
-            confidence: capture.native.confidence,
-            fairProbability: capture.native.fairProbability,
-            marketProbability: capture.native.marketProbability,
-          },
-          featureVector: capture.featureVector,
-          fairProbability: capture.fair,
-          opportunity: {
-            marketRank: capture.ranking.marketRank ?? 1,
-            rankedMarketCount: capture.ranking.rankedMarketCount,
-            actionableMarketCount: capture.ranking.actionableMarketCount,
-            selected: selectedAtDecision,
-            globalTop: capture.ranking.top,
-          },
-          execution,
-        });
-      } catch (error) {
-        const selectedAtDecision = capture.opportunity.best;
-        this.logger.error({ err: error, marketId: capture.opportunity.marketId }, "native v2 shadow execution evaluation failed");
-        if (selectedAtDecision) {
-          this.nativeV2ShadowStore.append({
-            recordedAt: this.nowFn().toISOString(),
-            experimentId: capture.experimentId, experimentStatus: capture.experimentStatus, gitSha: capture.gitSha,
-            triggerId: capture.trigger.id, traceId: capture.trigger.traceId, marketId: capture.opportunity.marketId,
-            asset: capture.asset, outcome: selectedAtDecision.outcome,
-            v1: {
-              direction: capture.native.direction, confidence: capture.native.confidence,
-              fairProbability: capture.native.fairProbability, marketProbability: capture.native.marketProbability,
-            },
-            featureVector: capture.featureVector, fairProbability: capture.fair,
-            opportunity: {
-              marketRank: capture.ranking.marketRank ?? 1, rankedMarketCount: capture.ranking.rankedMarketCount,
-              actionableMarketCount: capture.ranking.actionableMarketCount, selected: selectedAtDecision, globalTop: capture.ranking.top,
-            },
-            execution: {
-              version: NATIVE_V2_SHADOW_EXECUTION_VERSION, evaluatedAt: capture.capturedAt,
-              preflightBlockers: ["SHADOW_EVALUATION_ERROR"], riskVetoes: [], wouldSubmitOrder: false,
-              error: error instanceof Error ? error.message : String(error),
-            },
-          });
-        }
-      } finally {
-        this.nativeV2ShadowExecutionBusy = false;
-      }
-    } catch (error) {
-      this.nativeV2ShadowExecutionBusy = false;
-      this.logger.error({ err: error, marketId: capture.opportunity.marketId }, "native v2 shadow execution dispatch failed");
-    }
-  }
-
-  private evaluateNativeV2ShadowExecution(input: NativeV2ShadowExecutionCapture): Record<string, unknown> {
-    const selectedAtDecision = input.opportunity.best!;
-    const now = new Date(input.capturedAt);
-    const marketId = input.opportunity.marketId;
-    const selected = input.selected;
-    const compactBase = {
-      version: NATIVE_V2_SHADOW_EXECUTION_VERSION,
-      stateBasis: NATIVE_V2_COUNTERFACTUAL_STATE_BASIS,
-      evaluatedAt: input.capturedAt,
-      marketId,
-      outcome: selectedAtDecision.outcome,
-      marketRank: input.ranking.marketRank,
-      selectedFairProbability: selected?.fairProbability ?? selectedAtDecision.fairProbability,
-      currentExecutableVwap: selected?.executableVwap ?? null,
-      currentGrossEdgeUsdPerShare: selected?.grossEdgeUsdPerShare ?? null,
-      preflightBlockers: input.preflightBlockers,
-    };
-    if (input.preflightBlockers.length > 0 || !input.currentSnapshot || !selected) {
-      return {
-        ...compactBase, executionConfidence: null, evidenceCoverage: null, riskAccepted: null,
-        riskVetoes: [], wouldSubmitOrder: false, order: null, economics: null,
-      };
-    }
-
-    const intent = buildNativeV2ShadowExecutionIntent({
-      triggerId: input.trigger.id,
-      traceId: input.trigger.traceId,
-      expiresAt: input.trigger.expiresAt,
-      evidenceIds: input.evidenceIds,
-      fair: input.fair,
-      selected,
-      snapshot: input.currentSnapshot,
-      now,
-    });
-    if (!intent) {
-      return {
-        ...compactBase, preflightBlockers: ["INVALID_SHADOW_EXECUTION_INTENT"],
-        executionConfidence: null, evidenceCoverage: null, riskAccepted: null,
-        riskVetoes: [], wouldSubmitOrder: false, order: null, economics: null,
-      };
-    }
-
-    const assetByMarket = new Map(input.assetByMarketEntries);
-    const candidate = intent.candidate;
-    const exposure = computePaperExposures(input.positions, marketId, assetByMarket, now.getTime());
-    const projected = projectPaperExposures({
-      current: exposure,
-      positions: projectableLegsFromPositions(input.positions, assetByMarket),
-      candidate: {
-        marketId: candidate.marketId, outcome: candidate.outcome, quantity: candidate.quantity,
-        price: candidate.limitPrice, intent: candidate.intent, asset: input.asset,
-      },
-      nowMs: now.getTime(),
-    });
-    const decision = decidePaperOrder({
-      candidate,
-      consensus: intent.consensus,
-      snapshotAfterDecisionLatency: input.currentSnapshot,
-      limits: this.riskLimits,
-      triggerId: input.trigger.id,
-      signalExpiresAt: new Date(input.trigger.expiresAt),
-      orderType: "TAKER",
-      baseRisk: {
-        now,
-        marketFeedAt: dateOrNull(input.marketFeedAt),
-        btcFeedAt: dateOrNull(input.btcFeedAt),
-        referenceFeedAt: dateOrNull(input.referenceFeedAt),
-        referenceRequired: input.referenceRequired,
-        asset: input.asset,
-        assetExposureUsd: exposure.asset,
-        databaseAvailable: input.databaseAvailable,
-        timestampDisorder: input.timestampDisorder,
-        riskStateAvailable: true,
-        dailyPnlUsd: input.ledger.netTradingPnl,
-        drawdownUsd: input.ledger.drawdown,
-        marketExposureUsd: exposure.market,
-        totalExposureUsd: exposure.total,
-        directionalExposureUsd: exposure.directional,
-        unhedgedExposureUsd: exposure.unhedged,
-        unhedgedDurationMs: exposure.unhedgedDurationMs,
-        intent: candidate.intent,
-        projectedMarketExposureUsd: projected.market,
-        projectedTotalExposureUsd: projected.total,
-        projectedDirectionalExposureUsd: projected.directional,
-        projectedUnhedgedExposureUsd: projected.unhedged,
-        projectedAssetExposureUsd: projected.asset,
-        availableCashUsd: input.availableCashUsd,
-        referenceProviderBlocked: input.referenceProviderBlocked,
-        marketEntryQualified: input.marketEntryQualified,
-        externalSignalsLastMinute: 0,
-        lastStrategyTradeAt: dateOrNull(input.lastStrategyTradeAt),
-        duplicateTrade: input.duplicateTrade,
-        experimentEntryOpen: input.experimentEntryOpen,
-        executionErrorsLastHour: input.executionErrorsLastHour,
-        externalRiskRecommendedVeto: false,
-        shuttingDown: input.shuttingDown,
-      },
-    });
-
-    const wouldSubmitOrder = decision.accepted && decision.order !== null;
-    let counterfactual: Record<string, unknown> | null = null;
-    if (wouldSubmitOrder && decision.order && this.counterfactualStore.isRecoveryReady()) {
-      const actionKey = nativeV2CounterfactualActionKey(marketId, selectedAtDecision.outcome, "OPEN_FIRST_LEG");
-      // Decision-time capture only â€” discovery refresh after reserve must not change historical settlement semantics.
-      const capturedLookup = input.settlementLookup;
-      if (
-        !capturedLookup
-        || capturedLookup.marketId !== marketId
-        || !isAuthoritativeBinaryMapping(capturedLookup.yesMapsTo, capturedLookup.noMapsTo)
-      ) {
-        // Production-shaped qualified actionable CF fill without restart-safe lookup must not durable-accept.
-        counterfactual = {
-          actionKey,
-          applied: false,
-          reason: "MISSING_SETTLEMENT_LOOKUP",
-          fillId: null,
-          summary: this.counterfactualStore.summary(),
-        };
-      } else {
-        const commit = this.counterfactualStore.tryCommitWouldSubmit({
-          actionKey,
-          order: decision.order,
-          snapshot: input.currentSnapshot,
-          measuredLatencyMs: 0,
-          at: now,
-          settlementLookup: structuredClone(capturedLookup),
-        });
-        counterfactual = {
-          actionKey,
-          applied: commit.applied,
-          reason: commit.applied ? null : commit.reason,
-          fillId: commit.applied ? commit.fill.id : null,
-          summary: this.counterfactualStore.summary(),
-        };
-      }
-    }
-
-    return {
-      ...compactBase,
-      executionConfidence: intent.confidence,
-      evidenceCoverage: intent.evidenceCoverage,
-      riskAccepted: decision.risk.accepted,
-      riskVetoes: decision.risk.vetoes,
-      wouldSubmitOrder,
-      order: decision.order ? {
-        orderType: decision.order.orderType, requestedPrice: decision.order.requestedPrice, quantity: decision.order.quantity,
-      } : null,
-      economics: {
-        rawEdgeUsdPerShare: decision.rawEdgeUsdPerShare, feeUsdPerShare: decision.feeUsdPerShare,
-        slippageUsdPerShare: decision.slippageUsdPerShare, costUsdPerShare: decision.costUsdPerShare,
-        netEvUsdPerShare: decision.netEvUsdPerShare, grossEvUsdTotal: decision.grossEvUsdTotal,
-        netEvUsdTotal: decision.netEvUsdTotal, executableNotionalUsd: decision.executableNotionalUsd,
-        expectedROI: decision.expectedROI, bookVwap: decision.bookVwap,
-      },
-      counterfactual,
-    };
-  }
-
-  nativeV2ShadowSnapshot() {
-    return this.nativeV2ShadowStore.snapshot();
-  }
-
-  learningSummary() {
-    return this.learningStore?.summary() ?? { enabled: false };
-  }
-
-  learningRuntimeSummary() {
-    return this.learningRuntime.summary();
-  }
-
-  counterfactualSummary() {
-    return this.counterfactualStore.summary();
-  }
-
-  nativeV2ShadowExport() {
-    return this.nativeV2ShadowStore.export({
-      generatedAt: this.nowFn().toISOString(),
-      experimentId: this.experiment?.id ?? null,
-      experimentStatus: this.experiment?.status ?? null,
-      gitSha: process.env.GIT_SHA ?? null,
-    });
+    await this.evaluateTrade(trigger, consensus, native);
   }
 
   private nativeCompatibilityDecision(trigger: TriggerEvent, native: NativeDecision): NonNullable<EngineStateStore["latestConsensus"]> {
@@ -4944,7 +4367,6 @@ export class EngineService {
         this.noteReferenceLogicalLoss(asset);
         this.state.invalidateReferenceContext(asset);
         this.triggerEngine.resetReferenceAfterReconnect(asset);
-        this.nativeV2Shadow.resetReference(asset);
         if (event.message?.includes("REFERENCE_INGRESS_OVERFLOW")) this.requestReferenceResync(asset);
       } else if (event.state === "DISCONNECTED") {
         this.noteExperimentFeedInvalidation();
@@ -4954,12 +4376,10 @@ export class EngineService {
         this.noteReferenceLogicalLoss(asset);
         this.state.invalidateReferenceContext(asset);
         this.triggerEngine.resetReferenceAfterReconnect(asset);
-        this.nativeV2Shadow.resetReference(asset);
       } else if (event.state === "CONNECTED") {
         this.referenceLogicalGapped.delete(asset);
         if (this.referenceUnreliable.has(asset) || this.triggerEngine.referenceWindowOverflowed(asset)) {
           this.triggerEngine.resetReferenceAfterReconnect(asset);
-          this.nativeV2Shadow.resetReference(asset);
         }
       }
     }
@@ -5345,9 +4765,6 @@ export class EngineService {
   private async maintainExperiment(): Promise<void> {
     for (const marketId of this.nakedDirectionalDiagnostics.keys()) this.observeSoakPosition(marketId);
     await this.flushSoakDiagnostics();
-    // CF + learning settlement obligations are restart-durable and must poll even when
-    // no experiment is active (expired markets may be absent from discovery).
-    await this.pollLearningSettlements();
     if (!this.experiment) return;
     if (this.experiment.status === "RUNNING" || this.experiment.status === "ENTRY_CLOSED") {
       await this.accrueInfrastructureCost(this.nowFn().getTime());
@@ -7941,75 +7358,12 @@ private buildEarlyAudit(
     // keep their existing decision-time lookup precedence.
     const fromEconomic = economic ? this.economicSettlementLookups.get(marketId) : null;
     if (fromEconomic) return fromEconomic;
-    // Prefer decision/accept-time durable captures over live discovery so a later
-    // re-discovery cannot rewrite historical YES/NO settlement semantics.
-    const fromCf = this.counterfactualStore.settlementLookupFor(marketId);
-    if (fromCf) return fromCf;
-    const fromLearning = this.learningStore?.settlementLookupFor(marketId) ?? null;
-    if (fromLearning) return fromLearning;
     const live = this.marketsById.get(marketId);
     if (live) {
       const fromLive = this.settlementLookupFromMarket(live);
       if (fromLive) return fromLive;
     }
     return null;
-  }
-
-  private async pollLearningSettlements(): Promise<void> {
-    const now = this.nowFn();
-    const intervalMs = this.env.LEARNING_SETTLEMENT_POLL_MS ?? this.env.SETTLEMENT_POLL_MS;
-    if (now.getTime() - this.lastLearningSettlementPollAt < intervalMs) return;
-    this.lastLearningSettlementPollAt = now.getTime();
-
-    if (this.learningStore) {
-      for (const marketId of this.learningStore.unresolvedLearningMarketIds()) {
-        const lookup = this.resolveSettlementLookup(marketId);
-        // Without authoritative endDate + YES/NO mapping, do not guess after discovery drops the market.
-        if (!lookup?.endDate || new Date(lookup.endDate).getTime() > now.getTime()) continue;
-        if (!isAuthoritativeBinaryMapping(lookup.yesMapsTo, lookup.noMapsTo)) continue;
-        try {
-          const raw = await this.resolutionFetcher(lookup.marketId)
-            ?? (lookup.slug ? await this.resolutionFetcher(lookup.slug) : null);
-          if (!raw) continue;
-          this.learningStore.labelMarket(marketId, raw, lookup.yesMapsTo, lookup.noMapsTo, now);
-          // CF settlement uses the same authoritative public resolution parse â€” never invents winners.
-          const parsed = parsePublicBinaryResolution(raw, lookup.yesMapsTo, lookup.noMapsTo);
-          if (parsed.status === "resolved" && parsed.upPayoff && parsed.downPayoff
-            && this.counterfactualStore.isRecoveryReady()) {
-            this.counterfactualStore.trySettleMarket(marketId, parsed.upPayoff, parsed.downPayoff, {
-              at: now,
-              source: parsed.source,
-              reason: parsed.reason,
-            });
-          }
-        } catch {
-          // Learning labeling failures must not affect economic settlement.
-        }
-      }
-    }
-
-    // Settle open CF positions even when no learning samples exist for the market.
-    if (!this.counterfactualStore.isRecoveryReady()) return;
-    for (const marketId of this.counterfactualStore.openPositionMarketIds()) {
-      const lookup = this.resolveSettlementLookup(marketId);
-      if (!lookup?.endDate || new Date(lookup.endDate).getTime() > now.getTime()) continue;
-      if (!isAuthoritativeBinaryMapping(lookup.yesMapsTo, lookup.noMapsTo)) continue;
-      try {
-        const raw = await this.resolutionFetcher(lookup.marketId)
-          ?? (lookup.slug ? await this.resolutionFetcher(lookup.slug) : null);
-        if (!raw) continue;
-        const parsed = parsePublicBinaryResolution(raw, lookup.yesMapsTo, lookup.noMapsTo);
-        if (parsed.status === "resolved" && parsed.upPayoff && parsed.downPayoff) {
-          this.counterfactualStore.trySettleMarket(marketId, parsed.upPayoff, parsed.downPayoff, {
-            at: now,
-            source: parsed.source,
-            reason: parsed.reason,
-          });
-        }
-      } catch {
-        // CF settlement failures must not affect V1 economic settlement.
-      }
-    }
   }
 
   private async settleMarket(marketId: string, lookup: BinarySettlementLookup): Promise<void> {
@@ -8856,7 +8210,6 @@ private buildEarlyAudit(
   }
   setMaintenanceHoldForTest(hold: Promise<void> | null): void { this.maintenanceHold = hold; }
   setProcessTriggerHoldForTest(hold: Promise<void> | null): void { this.processTriggerHold = hold; }
-  setNativeV2ShadowEvalHoldForTest(hold: Promise<void> | null): void { this.nativeV2ShadowEvalHoldForTest = hold; }
   /** Test helper: simulate discovery removing a market from live maps after decision-time capture. */
   dropLiveMarketForTest(marketId: string): void {
     this.marketsById.delete(marketId);
@@ -9162,8 +8515,6 @@ private buildEarlyAudit(
 
   private clearMarketPairProjections(marketId: string): void {
     this.triggerEngine.forgetMarketBooks(marketId);
-    this.nativeV2Shadow.dropMarket(marketId);
-    this.nativeV2OpportunityRanker.dropMarket(marketId);
     this.snapshots.delete(marketId);
     for (const [tokenId, snapshot] of [...this.state.marketSnapshots.entries()]) {
       if (snapshot.marketId !== marketId) continue;
