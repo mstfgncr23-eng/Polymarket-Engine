@@ -5566,6 +5566,7 @@ export class EngineService {
         pair: latest.pair,
         now: latestNow,
         databaseAvailable: this.state.database === "UP",
+        profitTrailingLockedPnlUsd: latest.lockedPnl,
       });
       this.record("PROFIT_TRAILING_PAIR_EVALUATION", latestPosition.id, marketId, {
         action: latestEvaluation.action, accepted: decision.accepted, vetoes: decision.risk.vetoes,
@@ -5886,6 +5887,8 @@ export class EngineService {
     assetOverride?: string | null;
     /** Read-only observers set false so test/debug instrumentation is not mutated. */
     instrument?: boolean;
+    /** Only the profit-trailing controller supplies this current-book proof. */
+    profitTrailingLockedPnlUsd?: string;
   }): { decision: ReturnType<typeof decidePaperOrder>; duplicateKey: string } {
     const { candidate, consensus, triggerId, signalExpiresAt, snapshot, pair, now, databaseAvailable, assetOverride } = input;
     const duplicateKey = `${candidate.marketId}:${candidate.outcome}:${candidate.intent}`;
@@ -5922,6 +5925,9 @@ export class EngineService {
         marketExposureUsd: exposure.market, totalExposureUsd: exposure.total, directionalExposureUsd: exposure.directional,
         unhedgedExposureUsd: exposure.unhedged, unhedgedDurationMs: exposure.unhedgedDurationMs,
         intent: candidate.intent,
+        ...(input.profitTrailingLockedPnlUsd !== undefined
+          ? { profitTrailingLockedPnlUsd: input.profitTrailingLockedPnlUsd }
+          : {}),
         ...(candidate.intent === "HEDGE_SECOND_LEG"
           ? {
             hedgePosition: (() => {
