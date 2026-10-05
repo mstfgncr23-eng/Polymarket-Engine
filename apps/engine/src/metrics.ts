@@ -213,13 +213,6 @@ export class EngineMetrics {
     buckets: DURATION_BUCKETS,
     registers: [this.registry],
   });
-  readonly idleActivationBookkeepingDuration = new Histogram({
-    name: "idle_activation_latency_bookkeeping_duration_seconds",
-    help: "IDLE/inactive experiment activation-latency bookkeeping including durable journal write",
-    buckets: DURATION_BUCKETS,
-    registers: [this.registry],
-  });
-
   readonly journalDirectWrites = new Counter({
     name: "journal_direct_writes_total",
     help: "Direct decision-event journal appends (not telemetry batches)",

@@ -78,7 +78,6 @@ function harnessSnapshot(): DashboardSnapshot {
       byAgent: {},
     },
     recentTriggers: [],
-    activations: [],
     activationLatency: [],
     unattributedMcp: { lastAt: null, count: 0, lastTool: null },
     discovery: { qualified: [], rejected: [] },

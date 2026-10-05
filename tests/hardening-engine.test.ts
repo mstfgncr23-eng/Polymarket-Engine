@@ -519,7 +519,7 @@ describe("B/D/R/T settlement, close policy, recovery, accelerated lifecycle", ()
       expect(second.ledger.positions.get("btc-15m")?.upQuantity).toBe("10");
       expect(second.restingOrderCount()).toBe(0);
       expect(second.reservedCash()).toBe("0");
-      expect(second.state.activationLatency.length).toBeGreaterThan(0);
+      expect(second.state.snapshot().activationLatency).toEqual([]);
     } finally {
       await second.stop();
     }

@@ -17,18 +17,6 @@ export interface ConnectionState {
   reconnects: number;
 }
 
-export interface ActivationRecord {
-  triggerId: string;
-  role?: string;
-  provider: string;
-  ok?: boolean;
-  skipped?: boolean;
-  errorCode?: string | null;
-  reason?: string;
-  grokWakeObserved: false;
-  at: string;
-}
-
 export type DiscoveryStatus = "ZERO_QUALIFIED" | "MONITORING" | "RECONCILING";
 
 export interface UnattributedMcpActivity {
@@ -86,7 +74,6 @@ export interface DashboardSnapshot {
   decisionFeed: DecisionFeedItem[];
   grokActivity: { acceptedSignals: number; rejectedSignals: number; duplicates: number; unauthorizedCalls: number; rateLimitedCalls: number; lastSeenAt: string | null; byAgent: Record<string, number> };
   recentTriggers: TriggerEvent[];
-  activations: ActivationRecord[];
   activationLatency: ActivationLatency[];
   unattributedMcp: UnattributedMcpActivity;
   discovery: { qualified: Array<{ marketId: string; slug: string; asset: string | null; tokens: string[] }>; rejected: Array<{ id: string; slug: string; title: string; reasonCodes: QualificationReasonCode[] }> };
@@ -157,7 +144,6 @@ export class EngineStateStore {
   grokActivity = { acceptedSignals: 0, rejectedSignals: 0, duplicates: 0, unauthorizedCalls: 0, rateLimitedCalls: 0, lastSeenAt: null as string | null, byAgent: {} as Record<string, number> };
   private readonly reference = new Map<string, ConnectionState>();
   private discovery: DashboardSnapshot["discovery"] = { qualified: [], rejected: [] };
-  private readonly activations: ActivationRecord[] = [];
   private activationLatency: ActivationLatency[] = [];
   private unattributedMcp: UnattributedMcpActivity = { lastAt: null, count: 0, lastTool: null };
   private readonly referenceContext = new Map<string, {
@@ -186,11 +172,6 @@ export class EngineStateStore {
   addTrigger(trigger: TriggerEvent): void {
     this.recentTriggers.unshift(structuredClone(trigger));
     if (this.recentTriggers.length > 500) this.recentTriggers.length = 500;
-  }
-
-  addActivation(record: ActivationRecord): void {
-    this.activations.unshift(record);
-    if (this.activations.length > 200) this.activations.length = 200;
   }
 
   setActivationLatency(items: ActivationLatency[]): void { this.activationLatency = structuredClone(items); }
@@ -344,7 +325,7 @@ export class EngineStateStore {
         lastMessageAt: snapshot.receivedAt,
       })),
       decisionFeed: structuredClone(this.feed), grokActivity: structuredClone(this.grokActivity), recentTriggers: structuredClone(this.recentTriggers),
-      activations: structuredClone(this.activations), activationLatency: structuredClone(this.activationLatency),
+      activationLatency: structuredClone(this.activationLatency),
       unattributedMcp: structuredClone(this.unattributedMcp), discovery: structuredClone(this.discovery),
       health: {
         engineAlive: alive, discoveryStatus: this.discoveryStatus, discoveryLoopActive: this.discoveryLoopActive,
