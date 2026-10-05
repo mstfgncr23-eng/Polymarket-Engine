@@ -52,8 +52,11 @@ function book(s: Scenario, outcome: "UP" | "DOWN", ask: string, sequence: number
     tokenId: outcome === "UP" ? UP : DOWN,
     outcome,
     asset: "SOL",
-    bids: [{ price: Math.max(0.01, askNumber - 0.01).toFixed(2), quantity: "100" }],
-    asks: [{ price: ask, quantity: "100" }],
+    // Canonical risk keeps minLiquidityUsd as a hard safety gate. Give the
+    // fixture ample book depth so these tests exercise trailing authority,
+    // not an intentionally unrelated liquidity veto.
+    bids: [{ price: Math.max(0.01, askNumber - 0.01).toFixed(2), quantity: "10000" }],
+    asks: [{ price: ask, quantity: "10000" }],
     lastTradePrice: ask,
     sourceTimestamp: new Date(s.clock.ms).toISOString(),
     receivedAt: new Date(s.clock.ms).toISOString(),
