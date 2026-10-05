@@ -44,3 +44,4 @@ export * from "./learning-scorecard.js";
 export * from "./learning-runtime.js";
 export * from "./naked-directional-soak.js";
 export * from "./profit-trailing-pair.js";
+export * from "./reversal-protection.js";

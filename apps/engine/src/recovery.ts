@@ -1,3 +1,4 @@
+import { reversalProtectionStateSchema, sameReversalEpisode, type ReversalProtectionState } from "@pm/core";
 import { createNakedDirectionalDiagnostic, nakedDirectionalDiagnosticSchema, mergeNakedDirectionalObservation,
   profitTrailingPairStateSchema, type NakedDirectionalDiagnostic, type ProfitTrailingPairState } from "@pm/core";
 import {
@@ -143,6 +144,7 @@ export function cloneRecoverableState(state: RecoverableEngineState): Recoverabl
     riskReductionFailures: new Map([...(state.riskReductionFailures ?? [])].map(([market, failure]) => [market, structuredClone(failure)])),
     lastInfrastructureAccrualAt: state.lastInfrastructureAccrualAt,
     nakedDirectionalDiagnostics: new Map([...(state.nakedDirectionalDiagnostics ?? [])].map(([market, diagnostic]) => [market, structuredClone(diagnostic)])),
+    reversalProtectionStates: new Map([...(state.reversalProtectionStates ?? [])].map(([market, value]) => [market, structuredClone(value)])),
     profitTrailingPairStates: new Map([...(state.profitTrailingPairStates ?? [])].map(([market, trailing]) => [market, structuredClone(trailing)])),
   };
 }
@@ -229,6 +231,7 @@ export function durableIdentityConflicts(
 export interface RecoverableEngineState {
   resultAccounting?: ResultAccounting;
   nakedDirectionalDiagnostics?: Map<string, NakedDirectionalDiagnostic>;
+  reversalProtectionStates?: Map<string, ReversalProtectionState>;
   profitTrailingPairStates?: Map<string, ProfitTrailingPairState>;
   ledger: PaperLedger;
   experiment: ExperimentManifest | null;
@@ -404,6 +407,7 @@ export function applyDurableTransition(state: RecoverableEngineState, transition
           state.restingOrders.clear();
           state.makerReservations.clear();
           state.profitTrailingPairStates?.clear();
+          state.reversalProtectionStates?.clear();
           state.lastInfrastructureAccrualAt = at.getTime();
         }
         return;
@@ -429,6 +433,27 @@ export function applyDurableTransition(state: RecoverableEngineState, transition
         if (transition.type === "PAPER_ORDER_CANCELLED" || payload.cancel) {
           state.restingOrders.delete(payload.orderId);
         }
+        return;
+      }
+      case "REVERSAL_PROTECTION_STATE_UPDATED": {
+        const next = reversalProtectionStateSchema.parse(transition.payload.state);
+        const position = state.ledger.positions.get(next.marketId);
+        if (!position?.unpairedOutcome || position.id !== next.positionId
+          || unhedgedEpisode(position) !== next.unhedgedStartedAt || position.unpairedOutcome !== next.heldOutcome
+          || d(position.unpairedQuantity).lte(0) || state.settledMarkets.has(next.marketId)) {
+          throw new RecoveryFailClosedError("invariant", "reversal state does not match durable unpaired episode");
+        }
+        const map = state.reversalProtectionStates ??= new Map<string, ReversalProtectionState>();
+        const previous = map.get(next.marketId);
+        if (sameReversalEpisode(previous, next) && previous
+          && (previous.confirmedAt || next.revision !== previous.revision + 1
+            || !previous.countedConsensusEventIds.every((id, i) => next.countedConsensusEventIds[i] === id))) {
+          throw new RecoveryFailClosedError("invariant", "reversal state regressed");
+        }
+        if ((!previous || !sameReversalEpisode(previous, next)) && next.oppositeCount !== 1) {
+          throw new RecoveryFailClosedError("invariant", "reversal episode did not start at one");
+        }
+        map.set(next.marketId, next);
         return;
       }
       case "PROFIT_TRAILING_PAIR_STATE_UPDATED": {
@@ -469,6 +494,10 @@ export function applyDurableTransition(state: RecoverableEngineState, transition
         state.ledger.applyFill(payload.fill, { positionId: payload.positionId });
         const remaining = state.ledger.positions.get(payload.fill.marketId);
         accountResultFill(state.resultAccounting ??= emptyResultAccounting(), payload.fill, previous, remaining);
+        const reversal = state.reversalProtectionStates?.get(payload.fill.marketId);
+        if (reversal && (!remaining?.unpairedOutcome || remaining.id !== reversal.positionId
+          || unhedgedEpisode(remaining) !== reversal.unhedgedStartedAt || remaining.unpairedOutcome !== reversal.heldOutcome
+          || d(remaining.unpairedQuantity).lte(0))) state.reversalProtectionStates!.delete(payload.fill.marketId);
         const trailing = state.profitTrailingPairStates?.get(payload.fill.marketId);
         if (trailing && (!remaining?.unpairedOutcome || remaining.id !== trailing.positionId
           || unhedgedEpisode(remaining) !== trailing.unhedgedStartedAt || d(remaining.unpairedQuantity).lte(0))) {
@@ -518,6 +547,7 @@ export function applyDurableTransition(state: RecoverableEngineState, transition
         state.riskReductionFailures?.delete(payload.marketId);
         state.nakedDirectionalDiagnostics?.delete(payload.marketId);
         state.profitTrailingPairStates?.delete(payload.marketId);
+        state.reversalProtectionStates?.delete(payload.marketId);
         return;
       }
       case "NAKED_DIRECTIONAL_OBSERVATION": {
@@ -646,6 +676,20 @@ export function validatePostReplayInvariants(
       || risk.profitTrailingPairExecutionStyle !== "TAKER") {
       reasons.push("profit_trailing_pair_config_invalid");
     }
+  }
+  const reversalRisk = state.experiment?.riskConfiguration;
+  if (reversalRisk?.reversalProtectionEnabled === true
+    && (reversalRisk.profitTrailingPairSoakEnabled !== true || reversalRisk.reversalProtectionWindowMs !== 360000
+      || reversalRisk.reversalProtectionOppositeCount !== 3)) {
+    reasons.push("reversal_protection_config_invalid");
+  }
+  for (const [marketId, reversal] of state.reversalProtectionStates ?? []) {
+    const position = state.ledger.positions.get(marketId);
+    if (!reversalProtectionStateSchema.safeParse(reversal).success || reversal.marketId !== marketId
+      || reversalRisk?.reversalProtectionEnabled !== true || !position?.unpairedOutcome
+      || !sameReversalEpisode(reversal, { marketId, positionId: position.id,
+        unhedgedStartedAt: unhedgedEpisode(position), heldOutcome: position.unpairedOutcome })
+      || d(position.unpairedQuantity).lte(0) || state.settledMarkets.has(marketId)) reasons.push("reversal_protection_state_invalid");
   }
   for (const [marketId, trailing] of state.profitTrailingPairStates ?? []) {
     const position = state.ledger.positions.get(marketId);
