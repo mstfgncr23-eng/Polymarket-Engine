@@ -2485,7 +2485,30 @@ export class EngineService {
     }
     this.metrics.triggers.inc({ kind: trigger.kind, severity: String(trigger.severity) });
     this.record(`TRIGGER_LEVEL_${trigger.severity}`, trigger.traceId, trigger.marketId, { triggerId: trigger.id, kind: trigger.kind, asset: trigger.asset ?? null }, trigger.asset ?? null);
-    await this.persistReportInput(createJournalEvent({ traceId: trigger.traceId, type: "TRIGGER_EVENT", aggregateType: "trigger", aggregateId: trigger.id, payload: trigger, sourceEventId: trigger.sourceEventIds[0] ?? null }), signal);
+    const triggerAudit = createJournalEvent({
+      traceId: trigger.traceId,
+      type: "TRIGGER_EVENT",
+      aggregateType: "trigger",
+      aggregateId: trigger.id,
+      payload: trigger,
+      sourceEventId: trigger.sourceEventIds[0] ?? null,
+    });
+    const activationAudit = createJournalEvent({
+      traceId: trigger.traceId,
+      type: "GROK_ACTIVATION_DECISION",
+      aggregateType: "activation",
+      aggregateId: trigger.id,
+      payload: {
+        triggerId: trigger.id,
+        marketId: trigger.marketId,
+        asset: trigger.asset ?? null,
+        reason: "NATIVE_DETERMINISTIC_ONLY",
+        activate: false,
+        authority: NATIVE_DETERMINISTIC_AUTHORITY,
+      },
+    });
+    if (!(await this.persistReportInputsAtomic([triggerAudit, activationAudit], signal))) return;
+
     this.rememberProvenance(trigger.id, provenance);
     this.activeTriggers.set(trigger.id, trigger);
     if (!this.isProvenanceCurrentlyValid(trigger.id, provenance)) {
@@ -2495,16 +2518,15 @@ export class EngineService {
     }
     this.state.addTrigger(trigger);
     await this.experimentBoundaryGate.run(async () => {
+      if (!this.isProvenanceCurrentlyValid(trigger.id, provenance)) {
+        this.markProvenanceInvalid(trigger.id);
+        return;
+      }
       const nativeBookkeepingStarted = performance.now();
+      // Native deterministic authority does not dispatch Grok. Keep the bounded
+      // coordinator record for checkpoint/report compatibility, but do not clone
+      // the full latency working set into dashboard state on every trigger.
       this.activation.ensureLatency(trigger);
-      this.state.setActivationLatency(this.activation.snapshot());
-      await this.persistReportInput(createJournalEvent({
-        traceId: trigger.traceId, type: "GROK_ACTIVATION_DECISION", aggregateType: "activation", aggregateId: trigger.id,
-        payload: {
-          triggerId: trigger.id, marketId: trigger.marketId, asset: trigger.asset ?? null,
-          reason: "NATIVE_DETERMINISTIC_ONLY", activate: false, authority: NATIVE_DETERMINISTIC_AUTHORITY,
-        },
-      }));
       this.state.addActivation({
         triggerId: trigger.id, reason: "NATIVE_DETERMINISTIC_ONLY", at: this.nowFn().toISOString(),
         provider: "native_deterministic", grokWakeObserved: false,
@@ -4618,13 +4640,85 @@ export class EngineService {
       || this.isExperimentWindowOpen();
   }
 
-  async persistReportInput(event: JournalEvent, signal?: AbortSignal, extra?: { deadlineAt?: number }): Promise<void> {
-    if (!this.isReportInputPersistenceAdmitted(event.type)) return;
+  private stampReportInputEvent(event: JournalEvent): JournalEvent | null {
+    if (!this.isReportInputPersistenceAdmitted(event.type)) return null;
     const experimentId = this.experiment?.id;
-    const stamped = this.isExperimentWindowOpen() && experimentId && typeof event.payload.experimentId !== "string"
+    return this.isExperimentWindowOpen() && experimentId && typeof event.payload.experimentId !== "string"
       ? { ...event, payload: { ...event.payload, experimentId } }
       : event;
+  }
+
+  async persistReportInput(event: JournalEvent, signal?: AbortSignal, extra?: { deadlineAt?: number }): Promise<void> {
+    const stamped = this.stampReportInputEvent(event);
+    if (!stamped) return;
     await this.safeAppend(stamped, signal, extra);
+  }
+
+  /**
+   * Persist a small set of pre-economic report inputs with one database
+   * transaction/statement.  JournalAdmission still sees the batch as one
+   * unresolved report-input operation, so source sealing waits for it.  A
+   * noncritical batch failure is fail-safe for the trigger: report-source
+   * integrity is recorded and the caller receives false, preventing any
+   * economic mutation based on an unaudited trigger.
+   */
+  private async persistReportInputsAtomic(
+    events: readonly JournalEvent[],
+    signal?: AbortSignal,
+    extra?: { deadlineAt?: number },
+  ): Promise<boolean> {
+    const stamped = events
+      .map((event) => this.stampReportInputEvent(event))
+      .filter((event): event is JournalEvent => event !== null);
+    if (stamped.length === 0) return true;
+
+    const critical = stamped.some((event) => isCriticalPersistenceType(event.type));
+    const journalClass = classifyJournalMetricClass(stamped[0]!.type);
+    const reportInput = stamped.some((event) => this.isCanonicalWindowAdmission(event.type));
+    try {
+      await this.journalAdmission.run(journalClass, critical, async () => {
+        if (signal?.aborted) throw new JournalAdmissionRejected(journalClass, critical, "JOURNAL_ADMISSION_CLOSED");
+        if (stamped.some((event) => event.type === "TRIGGER_EVENT") && this.triggerEventPersistHold) {
+          await this.triggerEventPersistHold;
+        }
+        await this.metrics.observeDirectJournalBatch(stamped.map((event) => event.type), async () => {
+          await this.journal.appendMany(stamped, { signal, deadlineAt: extra?.deadlineAt });
+          if (critical) this.state.database = "UP";
+        });
+      }, signal, { reportInput });
+      if (!critical) this.state.journalDegraded = false;
+      return true;
+    } catch (error) {
+      if (isJournalAppendAbortedError(error)) throw error;
+      for (const event of stamped) {
+        if (!shouldLatchReportSourceIntegrity(event, this.experiment)) continue;
+        const durableFault = await this.noteReportSourceIntegrityFault(event, error);
+        if (!durableFault) {
+          this.failClosedIntegrity(error);
+          this.syncRuntimeState();
+          throw error;
+        }
+      }
+      if (critical) {
+        this.overload.markIntegrityFault();
+        this.state.overloadState = "FAIL_CLOSED";
+        if (!(error instanceof JournalAdmissionRejected)) this.state.database = "DOWN";
+        this.updateReady();
+        this.syncRuntimeState();
+        this.logger.error(
+          { err: error, types: stamped.map((event) => event.type), admitted: !(error instanceof JournalAdmissionRejected) },
+          error instanceof JournalAdmissionRejected ? "critical journal batch admission rejected" : "critical journal batch append failed",
+        );
+        throw error;
+      }
+      this.notePersistenceOutcome(stamped[0]!.type, false);
+      this.updateReady();
+      this.logger.error(
+        { err: error, types: stamped.map((event) => event.type), admitted: !(error instanceof JournalAdmissionRejected) },
+        error instanceof JournalAdmissionRejected ? "journal batch admission rejected" : "journal batch append failed",
+      );
+      return false;
+    }
   }
 
   private async safeAppend(event: ReturnType<typeof createJournalEvent>, signal?: AbortSignal, extra?: { deadlineAt?: number }): Promise<void> {
