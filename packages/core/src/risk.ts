@@ -185,6 +185,12 @@ export interface RiskInput {
   expectedEdge: number;
   /** Fee/slippage-adjusted expected return divided by executable notional. */
   expectedROI: number;
+  /**
+   * Current-book fee-inclusive terminal PnL for the experiment's profit-trailing
+   * pair lock. This field alone grants no exemption: evaluateRisk additionally
+   * requires verifiedReducingHedge() against the CURRENT durable residual.
+   */
+  profitTrailingLockedPnlUsd?: string;
   spread: number;
   signalConfidence: number;
   signalExpiresAt: Date;
@@ -248,6 +254,10 @@ export function evaluateRisk(input: RiskInput, limits: RiskLimits): RiskEvaluati
     projectedUnhedgedExposureUsd: input.projectedUnhedgedExposureUsd,
     unhedgedExposureUsd: input.unhedgedExposureUsd,
   });
+  const profitLockPnl = input.profitTrailingLockedPnlUsd !== undefined
+    ? d(input.profitTrailingLockedPnlUsd) : null;
+  const verifiedProfitableTrailingHedge = verifiedHedge
+    && profitLockPnl !== null && profitLockPnl.isFinite() && profitLockPnl.gt(0);
   const verifiedRescue = verifiedRescuePairLock({
     rescueIntent: rescue,
     candidate: input.rescueCandidate ?? null,
@@ -310,17 +320,19 @@ export function evaluateRisk(input: RiskInput, limits: RiskLimits): RiskEvaluati
   const firstLegMinExpectedROI = normalFirstLegRegime ? limits.normalFirstLegMinExpectedROI : limits.minExpectedROI;
   // A rescue pair-lock may intentionally lock a small loss; the alpha floors
   // are skipped ONLY for structurally verified rescue candidates.
-  if (!protective && !rescue && input.expectedEdge < firstLegMinExpectedEdge) vetoes.push("MINIMUM_EXPECTED_EDGE");
+  if (!protective && !rescue && !verifiedProfitableTrailingHedge
+    && input.expectedEdge < firstLegMinExpectedEdge) vetoes.push("MINIMUM_EXPECTED_EDGE");
   if (!riskReducingIntent && (!Number.isFinite(input.expectedROI) || input.expectedROI < firstLegMinExpectedROI)) {
     vetoes.push("MINIMUM_EXPECTED_ROI");
   }
-  if (!protective && !rescue && input.spread > limits.maxSpread) vetoes.push("MAXIMUM_SPREAD");
+  if (!protective && !rescue && !verifiedProfitableTrailingHedge
+    && input.spread > limits.maxSpread) vetoes.push("MAXIMUM_SPREAD");
   if (!protective && !verifiedHedge && !verifiedRescue && input.signalConfidence < limits.minSignalConfidence) vetoes.push("MINIMUM_SIGNAL_CONFIDENCE");
   if (!protective && !verifiedHedge && !verifiedRescue && input.signalExpiresAt.getTime() <= input.now.getTime()) vetoes.push("SIGNAL_EXPIRED");
   if (!protective && !rescue && input.externalSignalsLastMinute >= limits.maxExternalSignalsPerMinute) vetoes.push("MAXIMUM_EXTERNAL_SIGNAL_RATE");
   // Cooldown throttles fresh directional entries. It must never trap a risk-reducing action.
   if (!riskReducingIntent && input.lastStrategyTradeAt && input.now.getTime() - input.lastStrategyTradeAt.getTime() < limits.strategyCooldownMs) vetoes.push("STRATEGY_COOLDOWN");
-  if (!protective && !rescue && input.duplicateTrade) vetoes.push("DUPLICATE_TRADE");
+  if (!protective && !rescue && !verifiedProfitableTrailingHedge && input.duplicateTrade) vetoes.push("DUPLICATE_TRADE");
   if (!input.feeScheduleKnown) vetoes.push("UNKNOWN_FEE_SCHEDULE");
   if (!protective && !input.experimentEntryOpen) vetoes.push("EXPERIMENT_ENTRY_CLOSED");
   if (input.marketEntryQualified === false && !riskReducingIntent) vetoes.push("MARKET_NOT_ENTRY_QUALIFIED");
