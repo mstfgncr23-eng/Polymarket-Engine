@@ -1058,6 +1058,7 @@ export class EngineService {
           profitTrailingPairTargetEdge: this.riskLimits.normalHedgeMinLockedPairEdge,
           profitTrailingPairArmEdge: this.env.PROFIT_TRAILING_PAIR_ARM_EDGE,
           profitTrailingPairRetraceEdge: this.env.PROFIT_TRAILING_PAIR_RETRACE_EDGE,
+          profitTrailingPairExecutionStyle: "TAKER",
         },
         modelConfiguration: {
           provider: "native_deterministic", version: NATIVE_DETERMINISTIC_MODEL_VERSION,
@@ -5568,6 +5569,7 @@ export class EngineService {
         pair: latest.pair,
         now: latestNow,
         databaseAvailable: this.state.database === "UP",
+        orderTypeOverride: "TAKER",
         profitTrailingLockedPnlUsd: latest.lockedPnl,
       });
       this.record("PROFIT_TRAILING_PAIR_EVALUATION", latestPosition.id, marketId, {
@@ -5889,6 +5891,8 @@ export class EngineService {
     assetOverride?: string | null;
     /** Read-only observers set false so test/debug instrumentation is not mutated. */
     instrument?: boolean;
+    /** Experiment-scoped execution style override; ordinary paths use env. */
+    orderTypeOverride?: "TAKER" | "MAKER";
     /** Only the profit-trailing controller supplies this current-book proof. */
     profitTrailingLockedPnlUsd?: string;
   }): { decision: ReturnType<typeof decidePaperOrder>; duplicateKey: string } {
@@ -5917,7 +5921,7 @@ export class EngineService {
       limits: this.riskLimits,
       triggerId,
       signalExpiresAt,
-      orderType: this.env.PAPER_EXECUTION_STYLE,
+      orderType: input.orderTypeOverride ?? this.env.PAPER_EXECUTION_STYLE,
       baseRisk: {
         now, marketFeedAt,
         btcFeedAt: asset === "BTC" ? referenceFeedAt ?? dateOrNull(this.state.lastBtcMessageAt) : now,
