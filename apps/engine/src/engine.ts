@@ -4149,8 +4149,14 @@ export class EngineService {
       }
       // Admission-boundary eligibility re-check (post decision latency): a
       // normal hedge must not slip in behind rescue ownership once protective
-      // eligibility became true.
-      if (intent === "HEDGE_SECOND_LEG") {
+      // eligibility became true. The profit-trailing soak is the explicit
+      // exception: PR3/Guardian/deadline authority is disabled for that
+      // experiment, and its own verified pair-lock controller must remain the
+      // sole second-leg authority even after the legacy 300s deadline.
+      const profitTrailingOrder = this.profitTrailingPairSoakEnabled()
+        && intent === "HEDGE_SECOND_LEG"
+        && (order.strategyId === "profit-trailing-pair-target" || order.strategyId === "profit-trailing-pair-trail");
+      if (intent === "HEDGE_SECOND_LEG" && !profitTrailingOrder) {
         const posAtAdmission = this.ledger.positions.get(order.marketId);
         if (posAtAdmission?.unpairedOutcome) {
           const admissionEligibility = this.protectiveDeRiskEligibility(
