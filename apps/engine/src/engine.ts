@@ -1,5 +1,6 @@
 import { nakedDirectionalDiagnosticSchema, observeNakedDirectionalPosition, noteNakedDirectionalAnomaly, compactNakedDirectionalObservation,
-  nakedDirectionalSummary, SOAK_PERSIST_INTERVAL_MS, type NakedDirectionalDiagnostic } from "@pm/core";
+  nakedDirectionalSummary, SOAK_PERSIST_INTERVAL_MS, evaluateProfitTrailingPair, profitTrailingPairStateSchema,
+  type NakedDirectionalDiagnostic, type ProfitTrailingPairState } from "@pm/core";
 import {
   PaperLedger,
   TemporalPairHedgeStrategy,
@@ -479,6 +480,9 @@ export class EngineService {
   private readonly riskReductionInFlight = new Set<string>();
   private readonly riskReductionOwners = new Map<string, RiskReductionOwnership>();
   private readonly nakedDirectionalDiagnostics = new Map<string, NakedDirectionalDiagnostic>();
+  private readonly profitTrailingPairStates = new Map<string, ProfitTrailingPairState>();
+  private readonly profitTrailingPairInFlight = new Set<string>();
+  private readonly profitTrailingPairPending = new Set<string>();
   private readonly soakPersistedRevisions = new Map<string, number>();
   private readonly soakPersistedObservationCounts = new Map<string, number>();
   private lastSoakPersistAt = 0;
@@ -639,6 +643,13 @@ export class EngineService {
       maxExternalSignalsPerMinute: env.GROK_MCP_RATE_LIMIT_PER_MINUTE,
       normalHedgeMinLockedPairEdge: env.NORMAL_HEDGE_MIN_LOCKED_PAIR_EDGE,
     });
+    if (env.PROFIT_TRAILING_PAIR_SOAK_ENABLED
+      && (env.NAKED_DIRECTIONAL_SOAK_ENABLED
+        || env.PAPER_EXECUTION_STYLE !== "TAKER"
+        || env.PROFIT_TRAILING_PAIR_ARM_EDGE >= env.NORMAL_HEDGE_MIN_LOCKED_PAIR_EDGE
+        || env.PROFIT_TRAILING_PAIR_RETRACE_EDGE >= env.NORMAL_HEDGE_MIN_LOCKED_PAIR_EDGE)) {
+      throw new Error("INVALID_PROFIT_TRAILING_PAIR_CONFIG");
+    }
     this.marketAdapter = adapters?.market ?? new PolymarketMarketDataAdapter(undefined, { hydrateMinOrderSizeFromRest: true });
     if (this.marketAdapter instanceof PolymarketMarketDataAdapter) {
       this.marketAdapter.setNormalizeObserver(this.metrics.normalizeObserver());
@@ -1040,14 +1051,23 @@ export class EngineService {
       const now = this.nowFn();
       const next = startExperiment({
         id: undefined, durationHours: this.env.EXPERIMENT_DURATION_HOURS, strategyVersion: this.strategy.version,
-        riskConfiguration: { ...this.riskLimits, nakedDirectionalSoakEnabled: this.env.NAKED_DIRECTIONAL_SOAK_ENABLED },
+        riskConfiguration: {
+          ...this.riskLimits,
+          nakedDirectionalSoakEnabled: this.env.NAKED_DIRECTIONAL_SOAK_ENABLED,
+          profitTrailingPairSoakEnabled: this.env.PROFIT_TRAILING_PAIR_SOAK_ENABLED,
+          profitTrailingPairTargetEdge: this.riskLimits.normalHedgeMinLockedPairEdge,
+          profitTrailingPairArmEdge: this.env.PROFIT_TRAILING_PAIR_ARM_EDGE,
+          profitTrailingPairRetraceEdge: this.env.PROFIT_TRAILING_PAIR_RETRACE_EDGE,
+          profitTrailingPairExecutionStyle: "TAKER",
+        },
         modelConfiguration: {
           provider: "native_deterministic", version: NATIVE_DETERMINISTIC_MODEL_VERSION,
           localExecution: true, externalInference: false, authority: NATIVE_DETERMINISTIC_AUTHORITY,
         },
         startingBalance: this.ledger.snapshot().startingBalance, systemVersion: "0.1.0",
         gitSha: process.env.GIT_SHA ?? process.env.FLY_IMAGE_REF ?? "unknown", now,
-        closePolicy: this.env.NAKED_DIRECTIONAL_SOAK_ENABLED ? "observe_until_settlement" : this.env.EXPERIMENT_CLOSE_POLICY,
+        closePolicy: (this.env.NAKED_DIRECTIONAL_SOAK_ENABLED || this.env.PROFIT_TRAILING_PAIR_SOAK_ENABLED)
+          ? "observe_until_settlement" : this.env.EXPERIMENT_CLOSE_POLICY,
       });
       const startFeedGeneration = this.experimentFeedGeneration;
       this.experimentStartPending = true;
@@ -1754,6 +1774,7 @@ export class EngineService {
       riskReductionOwners: this.riskReductionOwners,
       riskReductionFailures: this.riskReductionFailures,
       nakedDirectionalDiagnostics: this.nakedDirectionalDiagnostics,
+      profitTrailingPairStates: this.profitTrailingPairStates,
     };
   }
 
@@ -2159,6 +2180,14 @@ export class EngineService {
       if (this.nakedDirectionalDiagnostics.has(diagnostic.marketId)) throw new RecoveryFailClosedError("invariant", "duplicate soak diagnostic");
       this.nakedDirectionalDiagnostics.set(diagnostic.marketId, diagnostic);
     }
+    if (payload.profitTrailingPairStates !== undefined && !Array.isArray(payload.profitTrailingPairStates)) {
+      throw new RecoveryFailClosedError("malformed", "profit trailing pair states must be an array");
+    }
+    for (const raw of (payload.profitTrailingPairStates ?? []) as unknown[]) {
+      const trailing = profitTrailingPairStateSchema.parse(raw);
+      if (this.profitTrailingPairStates.has(trailing.marketId)) throw new RecoveryFailClosedError("invariant", "duplicate profit trailing pair state");
+      this.profitTrailingPairStates.set(trailing.marketId, trailing);
+    }
     const triggers = Array.isArray(payload.activeTriggers) ? payload.activeTriggers.map((item) => triggerEventSchema.parse(item)) : [];
     for (const trigger of triggers) {
       this.activeTriggers.set(trigger.id, trigger);
@@ -2337,6 +2366,7 @@ export class EngineService {
     pair[snapshot.outcome] = snapshot;
     this.snapshots.set(snapshot.marketId, pair);
     this.observeSoakPosition(snapshot.marketId);
+    this.kickProfitTrailingPair(snapshot.marketId);
     this.nativeV2Shadow.ingestMarket(snapshot);
     if (snapshot.asset) {
       this.assetByMarket.set(snapshot.marketId, snapshot.asset);
@@ -2431,6 +2461,9 @@ export class EngineService {
       pair[current.outcome] = patched;
       this.snapshots.set(current.marketId, pair);
     }
+    // Hydration can turn the current opposite book into a genuinely executable
+    // full-quantity pair without a new price tick.
+    this.kickProfitTrailingPair(current.marketId);
     // Only economic follow-up hydration may cause: bounded per-market de-risk.
     void this.maybeProtectiveDeRisk(current.marketId).catch((error) => {
       this.logger.error({ err: error, marketId: current.marketId }, "protective de-risk attempt failed");
@@ -3665,6 +3698,9 @@ export class EngineService {
     });
     if (!candidate) return;
     if (candidate.intent === "HEDGE_SECOND_LEG" && this.soakBlocksPostEntry(candidate.marketId)) return;
+    // During the profit-trailing soak, one controller owns ALL second-leg timing
+    // so best-ask normal hedges cannot race the full-executable .12/trailing policy.
+    if (candidate.intent === "HEDGE_SECOND_LEG" && this.profitTrailingPairSoakEnabled()) return;
     if (
       candidate.intent === "OPEN_FIRST_LEG"
       && this.firstLegLifecycleBlocked(candidate.marketId)
@@ -4113,8 +4149,14 @@ export class EngineService {
       }
       // Admission-boundary eligibility re-check (post decision latency): a
       // normal hedge must not slip in behind rescue ownership once protective
-      // eligibility became true.
-      if (intent === "HEDGE_SECOND_LEG") {
+      // eligibility became true. The profit-trailing soak is the explicit
+      // exception: PR3/Guardian/deadline authority is disabled for that
+      // experiment, and its own verified pair-lock controller must remain the
+      // sole second-leg authority even after the legacy 300s deadline.
+      const profitTrailingOrder = this.profitTrailingPairSoakEnabled()
+        && intent === "HEDGE_SECOND_LEG"
+        && (order.strategyId === "profit-trailing-pair-target" || order.strategyId === "profit-trailing-pair-trail");
+      if (intent === "HEDGE_SECOND_LEG" && !profitTrailingOrder) {
         const posAtAdmission = this.ledger.positions.get(order.marketId);
         if (posAtAdmission?.unpairedOutcome) {
           const admissionEligibility = this.protectiveDeRiskEligibility(
@@ -5237,6 +5279,7 @@ export class EngineService {
           riskReductionOwners: [...this.riskReductionOwners.values()],
           riskReductionFailures: [...this.riskReductionFailures.values()],
           nakedDirectionalDiagnostics: [...this.nakedDirectionalDiagnostics.values()],
+          profitTrailingPairStates: [...this.profitTrailingPairStates.values()],
           managedMarkets: [...this.obligationMarketIds()],
           settledMarkets: [...this.settledMarkets],
           settlementLookups: [...this.economicSettlementLookups.values()],
@@ -5363,11 +5406,189 @@ export class EngineService {
 
   private soakLifecycleManifest(manifest: ExperimentManifest): ExperimentManifest {
     return manifest.riskConfiguration.nakedDirectionalSoakEnabled === true
+      || manifest.riskConfiguration.profitTrailingPairSoakEnabled === true
       ? { ...manifest, closePolicy: "observe_until_settlement" } : manifest;
   }
 
   private soakBlocksPostEntry(marketId: string): boolean {
     return this.nakedDirectionalSoakEnabled() || this.nakedDirectionalDiagnostics.has(marketId);
+  }
+
+  private profitTrailingPairSoakEnabled(): boolean {
+    return this.experiment?.riskConfiguration.profitTrailingPairSoakEnabled === true;
+  }
+
+  private profitTrailingPairConfig(): { target: number; arm: number; retrace: number } | null {
+    if (!this.profitTrailingPairSoakEnabled()) return null;
+    const risk = this.experiment!.riskConfiguration;
+    const target = Number(risk.profitTrailingPairTargetEdge ?? risk.normalHedgeMinLockedPairEdge);
+    const arm = Number(risk.profitTrailingPairArmEdge);
+    const retrace = Number(risk.profitTrailingPairRetraceEdge);
+    if (!Number.isFinite(target) || !Number.isFinite(arm) || !Number.isFinite(retrace)
+      || target <= 0 || arm < 0 || retrace <= 0 || arm >= target || retrace >= target) return null;
+    return { target, arm, retrace };
+  }
+
+  private profitTrailingPairOpportunity(marketId: string, position: Position, now: Date): {
+    pair: Record<Outcome, MarketSnapshot>;
+    opposite: MarketSnapshot;
+    grossEdge: string;
+    lockedPnl: string;
+    worstPrice: string;
+  } | null {
+    if (!position.unpairedOutcome || d(position.unpairedQuantity).lte(0)
+      || this.state.connections.polymarket.state !== "CONNECTED") return null;
+    const raw = this.snapshots.get(marketId);
+    const up = this.freshEarlyCatastrophicSnapshot(raw?.UP ?? null, now.getTime());
+    const down = this.freshEarlyCatastrophicSnapshot(raw?.DOWN ?? null, now.getTime());
+    if (!up || !down) return null;
+    const opposite = position.unpairedOutcome === "UP" ? down : up;
+    if (!opposite.feeSchedule || !opposite.minOrderSize) return null;
+    const quantity = d(position.unpairedQuantity);
+    if (quantity.lt(opposite.minOrderSize)) return null;
+    const walk = walkBook(opposite.asks, quantity, "1", "BUY");
+    if (!walk.sufficientDepth || !walk.worstPrice || !d(walk.filledQuantity).eq(quantity)) return null;
+    const firstAverage = position.unpairedOutcome === "UP" ? position.averageUpCost : position.averageDownCost;
+    const grossEdge = d(1).minus(firstAverage).minus(walk.vwap).toFixed();
+    const fee = calculateFee(quantity, walk.vwap, "TAKER", opposite.feeSchedule);
+    const lockedPnl = quantity.mul(grossEdge).minus(position.totalFees).minus(fee).toFixed();
+    return { pair: { UP: up, DOWN: down }, opposite, grossEdge, lockedPnl, worstPrice: walk.worstPrice };
+  }
+
+  private kickProfitTrailingPair(marketId: string): void {
+    if (!this.profitTrailingPairSoakEnabled()) return;
+    if (this.profitTrailingPairInFlight.has(marketId)) {
+      this.profitTrailingPairPending.add(marketId);
+      return;
+    }
+    this.profitTrailingPairInFlight.add(marketId);
+    void this.maybeProfitTrailingPair(marketId)
+      .catch((error) => this.logger.error({ err: error, marketId }, "profit trailing pair attempt failed"))
+      .finally(() => {
+        this.profitTrailingPairInFlight.delete(marketId);
+        if (this.profitTrailingPairPending.delete(marketId)) this.kickProfitTrailingPair(marketId);
+      });
+  }
+
+  private async maybeProfitTrailingPair(marketId: string): Promise<void> {
+    const config = this.profitTrailingPairConfig();
+    if (!config || this.soakBlocksPostEntry(marketId) || !experimentAllowsHedge(this.experiment)
+      || this.state.database !== "UP" || this.state.journalDegraded || this.overload.hasIntegrityFault
+      || this.overload.state === "FAIL_CLOSED" || this.settledMarkets.has(marketId) || this.riskReductionBusy(marketId)) return;
+
+    for (let pass = 0; pass < 3; pass += 1) {
+      const position = this.ledger.positions.get(marketId);
+      if (!position?.unpairedOutcome || d(position.unpairedQuantity).lte(0)) return;
+      const now = this.nowFn();
+      const opportunity = this.profitTrailingPairOpportunity(marketId, position, now);
+      if (!opportunity) return;
+      const evaluation = evaluateProfitTrailingPair({
+        state: this.profitTrailingPairStates.get(marketId) ?? null,
+        marketId,
+        positionId: position.id,
+        unhedgedStartedAt: unhedgedEpisode(position),
+        now,
+        currentGrossEdge: opportunity.grossEdge,
+        currentLockedPnl: opportunity.lockedPnl,
+        targetEdge: config.target,
+        armEdge: config.arm,
+        retraceEdge: config.retrace,
+      });
+
+      if (evaluation.stateChanged && evaluation.nextState) {
+        const trailing = evaluation.nextState;
+        await this.commitAuthoritative({
+          operationKey: `profit-trailing:${trailing.positionId}:${trailing.unhedgedStartedAt}:${trailing.revision}`,
+          type: "PROFIT_TRAILING_PAIR_STATE_UPDATED",
+          aggregateType: "position",
+          aggregateId: trailing.positionId,
+          occurredAt: now,
+          buildPayload: () => ({
+            state: trailing,
+            derivedAudit: [{
+              id: derivedAuditEventId("PROFIT_TRAILING_PAIR_STATE_UPDATED", `${trailing.positionId}:${trailing.unhedgedStartedAt}:${trailing.revision}`),
+              type: "PROFIT_TRAILING_PAIR_STATE_UPDATED",
+              aggregateType: "position",
+              aggregateId: trailing.positionId,
+              traceId: trailing.positionId,
+              payload: {
+                marketId, revision: trailing.revision, highWaterEdge: trailing.highWaterEdge,
+                armedAt: trailing.armedAt, targetEdge: config.target, armEdge: config.arm,
+                retraceEdge: config.retrace, experimentId: this.experiment?.id ?? null,
+              },
+            }],
+          }),
+        });
+        // Re-read both durable position state and the latest books after the DB
+        // boundary. Never act on the snapshot that preceded persistence.
+        continue;
+      }
+
+      if (evaluation.action === "NONE") return;
+      if (this.riskReductionBusy(marketId)) return;
+
+      const latestPosition = this.ledger.positions.get(marketId);
+      if (!latestPosition?.unpairedOutcome || latestPosition.id !== position.id
+        || unhedgedEpisode(latestPosition) !== unhedgedEpisode(position)
+        || !d(latestPosition.unpairedQuantity).eq(position.unpairedQuantity)) continue;
+      const latestNow = this.nowFn();
+      const latest = this.profitTrailingPairOpportunity(marketId, latestPosition, latestNow);
+      if (!latest) return;
+      const latestEvaluation = evaluateProfitTrailingPair({
+        state: this.profitTrailingPairStates.get(marketId) ?? null,
+        marketId,
+        positionId: latestPosition.id,
+        unhedgedStartedAt: unhedgedEpisode(latestPosition),
+        now: latestNow,
+        currentGrossEdge: latest.grossEdge,
+        currentLockedPnl: latest.lockedPnl,
+        targetEdge: config.target,
+        armEdge: config.arm,
+        retraceEdge: config.retrace,
+      });
+      if (latestEvaluation.stateChanged) continue;
+      if (latestEvaluation.action === "NONE") return;
+
+      const baseCandidate = evaluateNormalHedgeCandidate({
+        position: latestPosition,
+        snapshots: latest.pair,
+        maxOrderSizeUsd: this.riskLimits.maxOrderSizeUsd,
+        minimumLockedPairEdge: 0,
+      });
+      if (!baseCandidate || !d(baseCandidate.quantity).eq(latestPosition.unpairedQuantity)) return;
+      const candidate: StrategyCandidate = {
+        ...baseCandidate,
+        strategyId: latestEvaluation.action === "TARGET" ? "profit-trailing-pair-target" : "profit-trailing-pair-trail",
+        strategyVersion: "profit-trailing-pair-v1",
+        limitPrice: latest.worstPrice,
+        rawEdgeUsdPerShare: Number(latest.grossEdge),
+        rawExpectedEdge: Number(latest.grossEdge),
+        reasonCodes: [...baseCandidate.reasonCodes,
+          latestEvaluation.action === "TARGET" ? "PROFIT_PAIR_TARGET" : "PROFIT_PAIR_RETRACE"],
+      };
+      const { decision, duplicateKey } = this.decideWithRuntimeBasis({
+        candidate,
+        consensus: HEDGE_CHECK_CONSENSUS,
+        triggerId: latestEvaluation.action === "TARGET" ? "profit-pair-target" : "profit-pair-retrace",
+        signalExpiresAt: new Date(latestNow.getTime() + 60_000),
+        snapshot: latest.opposite,
+        pair: latest.pair,
+        now: latestNow,
+        databaseAvailable: this.state.database === "UP",
+        orderTypeOverride: "TAKER",
+        profitTrailingLockedPnlUsd: latest.lockedPnl,
+      });
+      this.record("PROFIT_TRAILING_PAIR_EVALUATION", latestPosition.id, marketId, {
+        action: latestEvaluation.action, accepted: decision.accepted, vetoes: decision.risk.vetoes,
+        grossEdge: latest.grossEdge, lockedPnl: latest.lockedPnl,
+        highWaterEdge: this.profitTrailingPairStates.get(marketId)?.highWaterEdge ?? null,
+        targetEdge: config.target, armEdge: config.arm, retraceEdge: config.retrace,
+      }, this.assetByMarket.get(marketId) ?? null);
+      if (!decision.accepted || !decision.order) return;
+      await this.submitPaperOrder(decision.order, latest.opposite, duplicateKey, "HEDGE_SECOND_LEG");
+      return;
+    }
+    this.profitTrailingPairPending.add(marketId);
   }
 
   private observeSoakPosition(marketId: string): void {
@@ -5514,7 +5735,7 @@ export class EngineService {
    * risk-reduction decision (so the old deadline fallback must not also act).
    */
   private async maybeEarlyCatastrophicPairLock(marketId: string): Promise<EarlyPairLockResult> {
-    if (this.soakBlocksPostEntry(marketId)) return { acted: false };
+    if (this.soakBlocksPostEntry(marketId) || this.profitTrailingPairSoakEnabled()) return { acted: false };
     if (!this.earlyAuthority(marketId)) return { acted: false };
     const position = this.ledger.positions.get(marketId);
     if (!position?.unpairedOutcome || d(position.unpairedQuantity).lte(0)) return { acted: false };
@@ -5676,6 +5897,10 @@ export class EngineService {
     assetOverride?: string | null;
     /** Read-only observers set false so test/debug instrumentation is not mutated. */
     instrument?: boolean;
+    /** Experiment-scoped execution style override; ordinary paths use env. */
+    orderTypeOverride?: "TAKER" | "MAKER";
+    /** Only the profit-trailing controller supplies this current-book proof. */
+    profitTrailingLockedPnlUsd?: string;
   }): { decision: ReturnType<typeof decidePaperOrder>; duplicateKey: string } {
     const { candidate, consensus, triggerId, signalExpiresAt, snapshot, pair, now, databaseAvailable, assetOverride } = input;
     const duplicateKey = `${candidate.marketId}:${candidate.outcome}:${candidate.intent}`;
@@ -5702,7 +5927,7 @@ export class EngineService {
       limits: this.riskLimits,
       triggerId,
       signalExpiresAt,
-      orderType: this.env.PAPER_EXECUTION_STYLE,
+      orderType: input.orderTypeOverride ?? this.env.PAPER_EXECUTION_STYLE,
       baseRisk: {
         now, marketFeedAt,
         btcFeedAt: asset === "BTC" ? referenceFeedAt ?? dateOrNull(this.state.lastBtcMessageAt) : now,
@@ -5712,6 +5937,9 @@ export class EngineService {
         marketExposureUsd: exposure.market, totalExposureUsd: exposure.total, directionalExposureUsd: exposure.directional,
         unhedgedExposureUsd: exposure.unhedged, unhedgedDurationMs: exposure.unhedgedDurationMs,
         intent: candidate.intent,
+        ...(input.profitTrailingLockedPnlUsd !== undefined
+          ? { profitTrailingLockedPnlUsd: input.profitTrailingLockedPnlUsd }
+          : {}),
         ...(candidate.intent === "HEDGE_SECOND_LEG"
           ? {
             hedgePosition: (() => {
@@ -6893,7 +7121,7 @@ private buildEarlyAudit(
   }
 
   private async maybeGuardianProtectiveSell(marketId: string): Promise<boolean> {
-    if (this.soakBlocksPostEntry(marketId)) return false;
+    if (this.soakBlocksPostEntry(marketId) || this.profitTrailingPairSoakEnabled()) return false;
     if (this.riskReductionBusy(marketId)) {
       this.record("GUARDIAN_BLOCKED", marketId, marketId, { reason: "RISK_REDUCTION_IN_FLIGHT" });
       return false;
@@ -6933,7 +7161,7 @@ private buildEarlyAudit(
   }
 
   private async maybeProtectiveDeRisk(marketId: string): Promise<void> {
-    if (this.soakBlocksPostEntry(marketId)) return;
+    if (this.soakBlocksPostEntry(marketId) || this.profitTrailingPairSoakEnabled()) return;
     const pending = this.riskReductionOwners.get(marketId);
     if (pending) {
       await this.resumeRiskReduction(pending);

@@ -98,6 +98,45 @@ describe("hedge confidence exemption (verified HEDGE_SECOND_LEG)", () => {
     expect(risk.accepted).toBe(true);
   });
 
+  it("A2: only a structurally verified profitable trailing hedge is reference-independent", () => {
+    const stale = new Date(now.getTime() - limits.staleFeedTimeoutMs - 1);
+
+    const ordinary = evaluateRisk(hedgeRisk({
+      referenceRequired: true,
+      referenceFeedAt: stale,
+      referenceProviderBlocked: true,
+    }), limits);
+    expect(ordinary.vetoes).toContain("REFERENCE_FEED_STALE");
+    expect(ordinary.vetoes).toContain("REFERENCE_PROVIDER_BLOCKED");
+
+    const trailing = evaluateRisk(hedgeRisk({
+      referenceRequired: true,
+      referenceFeedAt: stale,
+      referenceProviderBlocked: true,
+      profitTrailingLockedPnlUsd: "0.01",
+    }), limits);
+    expect(trailing.vetoes).not.toContain("REFERENCE_FEED_STALE");
+    expect(trailing.vetoes).not.toContain("REFERENCE_PROVIDER_BLOCKED");
+
+    const unverified = evaluateRisk(hedgeRisk({
+      referenceRequired: true,
+      referenceFeedAt: stale,
+      referenceProviderBlocked: true,
+      profitTrailingLockedPnlUsd: "0.01",
+      hedgeCandidate: null,
+    }), limits);
+    expect(unverified.vetoes).toContain("REFERENCE_FEED_STALE");
+    expect(unverified.vetoes).toContain("REFERENCE_PROVIDER_BLOCKED");
+
+    const nonPositive = evaluateRisk(hedgeRisk({
+      referenceRequired: true,
+      referenceFeedAt: stale,
+      referenceProviderBlocked: true,
+      profitTrailingLockedPnlUsd: "0",
+    }), limits);
+    expect(nonPositive.vetoes).toContain("REFERENCE_FEED_STALE");
+  });
+
   it("B: the same low confidence still vetoes a fresh OPEN_FIRST_LEG entry", () => {
     const risk = evaluateRisk({
       ...safeRisk({ intent: "OPEN_FIRST_LEG", signalConfidence: LOW_CONFIDENCE }),
