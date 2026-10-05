@@ -108,6 +108,7 @@ export const engineEnvSchema = z.object({
   ).default(false),
   REVERSAL_PROTECTION_WINDOW_MS: z.coerce.number().int().positive().default(360000),
   REVERSAL_PROTECTION_OPPOSITE_COUNT: z.coerce.number().int().positive().default(3),
+  REVERSAL_PROTECTION_MIN_OPPOSITE_SPAN_MS: z.coerce.number().int().nonnegative().default(2000),
   PORT: z.coerce.number().int().positive().default(8080),
   LOG_LEVEL: z.string().default("info"),
   DATABASE_URL: z.string().url().optional(),

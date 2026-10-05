@@ -72,7 +72,10 @@ function event(s: Scenario, id: string, direction: "UP" | "DOWN" | "FLAT" = "DOW
       consensusConfidence: 0.01, estimatedEdge: -0.99, evidenceIds: ["same-evidence"], triggerId: "same-trigger" } });
 }
 const observe = (s: Scenario, id: string, direction: "UP" | "DOWN" | "FLAT" = "DOWN") => s.engine.persistReportInput(event(s, id, direction));
-async function confirm(s: Scenario) { for (let i = 1; i <= 3; i++) await observe(s, `opposite-${i}`); }
+async function confirm(s: Scenario) {
+  await observe(s, "opposite-1"); await observe(s, "opposite-2");
+  s.clock.ms += 2000; await observe(s, "opposite-3");
+}
 async function restart(s: Scenario, env: Record<string, string> = {}) { await s.engine.stop(); return start(s.journal, s.clock, env); }
 async function settle(s: Scenario) {
   await internal(s).commitAuthoritative({ operationKey: `settlement:${MARKET}:test`, type: "POSITION_SETTLED",
@@ -114,9 +117,12 @@ describe("reversal protection real PAPER authority", () => {
   it("RP-ENG-04: same/FLAT ignore, same trigger/source still count, exact row dedupes", async () => {
     const s = await start(); try { await seed(s); await publish(s); await observe(s, "1"); await observe(s, "1");
       await observe(s, "held", "UP"); await observe(s, "flat", "FLAT"); await observe(s, "2");
-      expect(state(s)?.oppositeCount).toBe(2); await observe(s, "3"); expect(await riskFills(s)).toHaveLength(1);
+      expect(state(s)?.oppositeCount).toBe(2); await observe(s, "burst-3");
+      expect(state(s)?.oppositeCount).toBe(2); expect(await riskFills(s)).toHaveLength(0);
+      s.clock.ms += 2000; await observe(s, "3"); expect(await riskFills(s)).toHaveLength(1);
       const counted = await rows(s, "REVERSAL_PROTECTION_STATE_UPDATED"); expect(counted).toHaveLength(3);
-      expect(counted[2]?.payload).toMatchObject({ oppositeCount: 3, requiredOppositeCount: 3, triggerId: "same-trigger", sourceEventId: "same-source", consensusConfidence: 0.01 });
+      expect(counted[2]?.payload).toMatchObject({ oppositeCount: 3, requiredOppositeCount: 3, requiredMinOppositeSpanMs: 2000,
+        triggerId: "same-trigger", sourceEventId: "same-source", consensusConfidence: 0.01 });
     } finally { await s.engine.stop(); }
   });
   it("RP-ENG-10: neither executable retains confirmation; paced book retry needs no new decisions", async () => {
@@ -155,6 +161,7 @@ describe("reversal protection real PAPER authority", () => {
   });
   it("RP-ENG-14: concurrent third decisions and callbacks have one owner/order/fill", async () => {
     const s = await start(); try { await seed(s); await publish(s); await observe(s, "1"); await observe(s, "2");
+      s.clock.ms += 2000;
       await Promise.all([observe(s, "3"), observe(s, "4"), internal(s).maybeReversalProtection(MARKET), publish(s, "0.60", "0.30", "10000", 2)]);
       await waitFor(s, () => residual(s) === "0"); expect(await riskFills(s)).toHaveLength(1);
       expect(await rows(s, "RISK_REDUCTION_ADMITTED")).toHaveLength(1); expect(await rows(s, "PAPER_ORDER_CREATED")).toHaveLength(1);
@@ -164,6 +171,7 @@ describe("reversal protection real PAPER authority", () => {
   it("profit-trailing flight already owns the residual when third opposite confirms", async () => {
     const s = await start(); let release!: () => void;
     try { await seed(s); await observe(s, "1"); await observe(s, "2");
+      s.clock.ms += 2000;
       s.journal.setAppendInFlightHoldForTest(new Promise<void>(r => release = r), ["PAPER_ORDER_CREATED"]);
       await publish(s, "0.79", "0.08");
       await waitFor(s, () => internal(s).riskReductionOwners.size === 1 && s.journal.inFlightAppends > 0);
@@ -219,6 +227,7 @@ describe("reversal protection real PAPER authority", () => {
   it("RP-ENG-15: settlement wins across delayed reversal evaluation", async () => {
     const s = await start(); let release!: () => void;
     try { await seed(s); await publish(s); await observe(s, "1"); await observe(s, "2");
+      s.clock.ms += 2000;
       s.journal.setAppendInFlightHoldForTest(new Promise<void>(r => release = r), ["RISK_EVALUATION"]);
       const pending = observe(s, "3"); await waitFor(s, () => s.journal.inFlightAppends > 0 && !!state(s)?.confirmedAt);
       await settle(s); const cash = s.engine.ledger.snapshot().cash;
@@ -235,6 +244,7 @@ describe("reversal protection real PAPER authority", () => {
   it("RP-ENG-17: depth disappears after admission; local failure, no fill, later retry", async () => {
     const s = await start(); let release!: () => void;
     try { await seed(s); await publish(s); await observe(s, "1"); await observe(s, "2");
+      s.clock.ms += 2000;
       const errors = s.engine.runtimeBookkeepingForTest().executionErrors;
       s.journal.setAppendInFlightHoldForTest(new Promise<void>(r => release = r), ["PAPER_ORDER_CREATED"]);
       const pending = observe(s, "3"); await waitFor(s, () => internal(s).riskReductionOwners.size === 1 && s.journal.inFlightAppends > 0);
@@ -266,17 +276,24 @@ describe("reversal protection real PAPER authority", () => {
 
 describe("reversal protection recovery and crash boundaries", () => {
   it.each([1, 2, 3])("RP-REC-01/02/03/04: count %s survives checkpoint compaction, exact replay and changed env", async count => {
-    let s = await start(); try { await seed(s); for (let i=1; i<=count; i++) await observe(s, `c-${i}`);
+    let s = await start(); try { await seed(s); for (let i=1; i<=count; i++) {
+      if (i === 3) s.clock.ms += 2000; await observe(s, `c-${i}`);
+    }
       await s.engine.checkpointForTest(); await s.journal.compactDurableTransitionsThrough(s.engine.lastAppliedDurableCursorForTest());
-      s = await restart(s, { REVERSAL_PROTECTION_ENABLED: "false", REVERSAL_PROTECTION_WINDOW_MS: "1", REVERSAL_PROTECTION_OPPOSITE_COUNT: "1" });
-      expect(state(s)?.oppositeCount).toBe(count); expect(internal(s).experiment.riskConfiguration).toMatchObject({ reversalProtectionEnabled: true, reversalProtectionWindowMs: 360000, reversalProtectionOppositeCount: 3 });
+      s = await restart(s, { REVERSAL_PROTECTION_ENABLED: "false", REVERSAL_PROTECTION_WINDOW_MS: "1", REVERSAL_PROTECTION_OPPOSITE_COUNT: "1",
+        REVERSAL_PROTECTION_MIN_OPPOSITE_SPAN_MS: "1" });
+      expect(state(s)?.oppositeCount).toBe(count); expect(internal(s).experiment.riskConfiguration).toMatchObject({ reversalProtectionEnabled: true,
+        reversalProtectionWindowMs: 360000, reversalProtectionOppositeCount: 3, reversalProtectionMinOppositeSpanMs: 2000 });
       await observe(s, `c-${count}`); expect(state(s)?.oppositeCount).toBe(count);
-      for (let i=count+1; i<=3; i++) await observe(s, `c-${i}`);
+      for (let i=count+1; i<=3; i++) {
+        if (i === 3) s.clock.ms += 2000; await observe(s, `c-${i}`);
+      }
       s.clock.ms += 5001; await publish(s); await waitFor(s, () => residual(s) === "0"); expect(await riskFills(s)).toHaveLength(1);
     } finally { await s.engine.stop(); }
   });
   it.each([1, 2, 3])("count %s and source row recover after commit-before-apply crash", async count => {
     let s = await start(); try { await seed(s); for(let i=1; i<count; i++) await observe(s, `crash-${i}`);
+      if (count === 3) s.clock.ms += 2000;
       const position = s.engine.ledger.positions.get(MARKET)!;
       const key = `reversal:${position.id}:${position.unhedgedStartedAt ?? position.openedAt}:crash-${count}`;
       s.engine.setCrashInjectionForTest("AFTER_DURABLE_COMMIT_BEFORE_APPLY", { operationKey: key });
@@ -289,6 +306,7 @@ describe("reversal protection recovery and crash boundaries", () => {
   it.each(["admission", "fill"])("RP-REC-05/06: crash after %s resumes original order exactly once", async boundary => {
     let s = await start();
     try { await seed(s); await publish(s); await observe(s, "1"); await observe(s, "2");
+      s.clock.ms += 2000;
       // Arm the real production commit at its canonical operation identity.
       const engine = s.engine as unknown as { admitRiskReduction(owner: RiskReductionOwnership): Promise<boolean> };
       const admit = engine.admitRiskReduction.bind(engine);

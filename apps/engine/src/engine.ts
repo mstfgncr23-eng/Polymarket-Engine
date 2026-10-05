@@ -1,4 +1,4 @@
-import { evaluateReversalProtection, reversalProtectionStateSchema, sameReversalEpisode, type ReversalProtectionState, type ReversalEpisode } from "@pm/core";
+import { evaluateReversalProtection, REVERSAL_PROTECTION_MIN_OPPOSITE_SPAN_MS, reversalProtectionStateSchema, sameReversalEpisode, type ReversalProtectionState, type ReversalEpisode } from "@pm/core";
 import { nakedDirectionalDiagnosticSchema, observeNakedDirectionalPosition, noteNakedDirectionalAnomaly, compactNakedDirectionalObservation,
   nakedDirectionalSummary, SOAK_PERSIST_INTERVAL_MS, evaluateProfitTrailingPair, profitTrailingPairStateSchema,
   type NakedDirectionalDiagnostic, type ProfitTrailingPairState } from "@pm/core";
@@ -943,7 +943,8 @@ export class EngineService {
       const now = this.nowFn();
       if (this.env.REVERSAL_PROTECTION_ENABLED && (!this.env.PROFIT_TRAILING_PAIR_SOAK_ENABLED
         || this.env.TRADING_MODE !== "paper" || this.env.REVERSAL_PROTECTION_WINDOW_MS !== 360000
-        || this.env.REVERSAL_PROTECTION_OPPOSITE_COUNT !== 3)) throw new Error("INVALID_REVERSAL_PROTECTION_V1_CONFIG");
+        || this.env.REVERSAL_PROTECTION_OPPOSITE_COUNT !== 3
+        || this.env.REVERSAL_PROTECTION_MIN_OPPOSITE_SPAN_MS !== REVERSAL_PROTECTION_MIN_OPPOSITE_SPAN_MS)) throw new Error("INVALID_REVERSAL_PROTECTION_V1_CONFIG");
       const next = startExperiment({
         id: undefined, durationHours: this.env.EXPERIMENT_DURATION_HOURS, strategyVersion: this.strategy.version,
         riskConfiguration: {
@@ -957,6 +958,7 @@ export class EngineService {
           reversalProtectionEnabled: this.env.REVERSAL_PROTECTION_ENABLED,
           reversalProtectionWindowMs: this.env.REVERSAL_PROTECTION_WINDOW_MS,
           reversalProtectionOppositeCount: this.env.REVERSAL_PROTECTION_OPPOSITE_COUNT,
+          reversalProtectionMinOppositeSpanMs: this.env.REVERSAL_PROTECTION_MIN_OPPOSITE_SPAN_MS,
         },
         modelConfiguration: {
           provider: "native_deterministic", version: NATIVE_DETERMINISTIC_MODEL_VERSION,
@@ -4871,7 +4873,8 @@ export class EngineService {
     const risk = this.experiment?.riskConfiguration;
     return this.env.TRADING_MODE === "paper" && this.profitTrailingPairSoakEnabled()
       && risk?.reversalProtectionEnabled === true && risk.reversalProtectionWindowMs === 360000
-      && risk.reversalProtectionOppositeCount === 3;
+      && risk.reversalProtectionOppositeCount === 3
+      && risk.reversalProtectionMinOppositeSpanMs === REVERSAL_PROTECTION_MIN_OPPOSITE_SPAN_MS;
   }
 
   private reversalEpisode(position: Position | undefined): ReversalEpisode | null {
@@ -4904,7 +4907,8 @@ export class EngineService {
         triggerId: event.payload.triggerId ?? null, consensusDirection: direction,
         consensusConfidence: event.payload.consensusConfidence ?? null, estimatedEdge: event.payload.estimatedEdge ?? null,
         evidenceIds: event.payload.evidenceIds ?? [], sourceEventId: event.sourceEventId,
-        requiredOppositeCount: 3, confirmed: next.confirmedAt !== null };
+        requiredOppositeCount: 3, requiredMinOppositeSpanMs: REVERSAL_PROTECTION_MIN_OPPOSITE_SPAN_MS,
+        confirmed: next.confirmedAt !== null };
       const audit: DerivedAuditRecord[] = [
         { id: event.id, type: event.type, aggregateType: event.aggregateType, aggregateId: event.aggregateId,
           traceId: event.traceId, payload: event.payload, sourceEventId: event.sourceEventId },
