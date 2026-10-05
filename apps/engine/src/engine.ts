@@ -5469,10 +5469,7 @@ export class EngineService {
 
     for (let pass = 0; pass < 3; pass += 1) {
       const position = this.ledger.positions.get(marketId);
-      if (!position?.unpairedOutcome || d(position.unpairedQuantity).lte(0)) {
-        this.profitTrailingPairStates.delete(marketId);
-        return;
-      }
+      if (!position?.unpairedOutcome || d(position.unpairedQuantity).lte(0)) return;
       const now = this.nowFn();
       const opportunity = this.profitTrailingPairOpportunity(marketId, position, now);
       if (!opportunity) return;
