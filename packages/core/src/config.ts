@@ -94,6 +94,13 @@ export const engineEnvSchema = z.object({
     (value) => value === undefined ? undefined : value === true || value === "true" || value === "1",
     z.boolean().optional(),
   ).default(false),
+  /** PAPER experiment: .12 target with profit high-water trailing protection. */
+  PROFIT_TRAILING_PAIR_SOAK_ENABLED: z.preprocess(
+    (value) => value === undefined ? undefined : value === true || value === "true" || value === "1",
+    z.boolean().optional(),
+  ).default(false),
+  PROFIT_TRAILING_PAIR_ARM_EDGE: z.coerce.number().min(0).max(1).default(0.05),
+  PROFIT_TRAILING_PAIR_RETRACE_EDGE: z.coerce.number().positive().max(1).default(0.02),
   PORT: z.coerce.number().int().positive().default(8080),
   LOG_LEVEL: z.string().default("info"),
   DATABASE_URL: z.string().url().optional(),
