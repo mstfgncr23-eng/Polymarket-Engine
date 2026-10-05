@@ -1,4 +1,5 @@
-import { createNakedDirectionalDiagnostic, nakedDirectionalDiagnosticSchema, mergeNakedDirectionalObservation, type NakedDirectionalDiagnostic } from "@pm/core";
+import { createNakedDirectionalDiagnostic, nakedDirectionalDiagnosticSchema, mergeNakedDirectionalObservation,
+  profitTrailingPairStateSchema, type NakedDirectionalDiagnostic, type ProfitTrailingPairState } from "@pm/core";
 import {
   d,
   experimentManifestSchema,
@@ -142,6 +143,7 @@ export function cloneRecoverableState(state: RecoverableEngineState): Recoverabl
     riskReductionFailures: new Map([...(state.riskReductionFailures ?? [])].map(([market, failure]) => [market, structuredClone(failure)])),
     lastInfrastructureAccrualAt: state.lastInfrastructureAccrualAt,
     nakedDirectionalDiagnostics: new Map([...(state.nakedDirectionalDiagnostics ?? [])].map(([market, diagnostic]) => [market, structuredClone(diagnostic)])),
+    profitTrailingPairStates: new Map([...(state.profitTrailingPairStates ?? [])].map(([market, trailing]) => [market, structuredClone(trailing)])),
   };
 }
 
@@ -227,6 +229,7 @@ export function durableIdentityConflicts(
 export interface RecoverableEngineState {
   resultAccounting?: ResultAccounting;
   nakedDirectionalDiagnostics?: Map<string, NakedDirectionalDiagnostic>;
+  profitTrailingPairStates?: Map<string, ProfitTrailingPairState>;
   ledger: PaperLedger;
   experiment: ExperimentManifest | null;
   restingOrders: Map<string, RestingPaperOrder>;
@@ -400,6 +403,7 @@ export function applyDurableTransition(state: RecoverableEngineState, transition
           state.resultAccounting = emptyResultAccounting();
           state.restingOrders.clear();
           state.makerReservations.clear();
+          state.profitTrailingPairStates?.clear();
           state.lastInfrastructureAccrualAt = at.getTime();
         }
         return;
@@ -427,6 +431,24 @@ export function applyDurableTransition(state: RecoverableEngineState, transition
         }
         return;
       }
+      case "PROFIT_TRAILING_PAIR_STATE_UPDATED": {
+        const trailing = profitTrailingPairStateSchema.parse(transition.payload.state);
+        const position = state.ledger.positions.get(trailing.marketId);
+        if (!position?.unpairedOutcome || position.id !== trailing.positionId
+          || unhedgedEpisode(position) !== trailing.unhedgedStartedAt
+          || d(position.unpairedQuantity).lte(0)) {
+          throw new RecoveryFailClosedError("invariant", "profit trailing state does not match durable unpaired episode");
+        }
+        const map = state.profitTrailingPairStates ??= new Map();
+        const previous = map.get(trailing.marketId);
+        if (previous && previous.positionId === trailing.positionId
+          && previous.unhedgedStartedAt === trailing.unhedgedStartedAt
+          && trailing.revision <= previous.revision) {
+          throw new RecoveryFailClosedError("invariant", "profit trailing revision did not advance");
+        }
+        map.set(trailing.marketId, trailing);
+        return;
+      }
       case "PAPER_FILL": {
         const payload = fillPayloadSchema.parse(transition.payload);
         if (payload.settlementLookup && payload.settlementLookup.marketId !== payload.fill.marketId) {
@@ -447,6 +469,11 @@ export function applyDurableTransition(state: RecoverableEngineState, transition
         state.ledger.applyFill(payload.fill, { positionId: payload.positionId });
         const remaining = state.ledger.positions.get(payload.fill.marketId);
         accountResultFill(state.resultAccounting ??= emptyResultAccounting(), payload.fill, previous, remaining);
+        const trailing = state.profitTrailingPairStates?.get(payload.fill.marketId);
+        if (trailing && (!remaining?.unpairedOutcome || remaining.id !== trailing.positionId
+          || unhedgedEpisode(remaining) !== trailing.unhedgedStartedAt || d(remaining.unpairedQuantity).lte(0))) {
+          state.profitTrailingPairStates!.delete(payload.fill.marketId);
+        }
         if (payload.nakedDirectionalSoak === true && remaining) {
           const diagnostics = state.nakedDirectionalDiagnostics ??= new Map();
           if (!diagnostics.has(payload.fill.marketId)) {
@@ -490,6 +517,7 @@ export function applyDurableTransition(state: RecoverableEngineState, transition
         state.riskReductionOwners?.delete(payload.marketId);
         state.riskReductionFailures?.delete(payload.marketId);
         state.nakedDirectionalDiagnostics?.delete(payload.marketId);
+        state.profitTrailingPairStates?.delete(payload.marketId);
         return;
       }
       case "NAKED_DIRECTIONAL_OBSERVATION": {
@@ -605,6 +633,14 @@ export function validatePostReplayInvariants(
     if (!nakedDirectionalDiagnosticSchema.safeParse(diagnostic).success
       || diagnostic.marketId !== marketId || state.ledger.positions.get(marketId)?.id !== diagnostic.positionId) {
       reasons.push("naked_directional_diagnostic_invalid");
+    }
+  }
+  for (const [marketId, trailing] of state.profitTrailingPairStates ?? []) {
+    const position = state.ledger.positions.get(marketId);
+    if (!profitTrailingPairStateSchema.safeParse(trailing).success || trailing.marketId !== marketId
+      || !position?.unpairedOutcome || position.id !== trailing.positionId
+      || unhedgedEpisode(position) !== trailing.unhedgedStartedAt || d(position.unpairedQuantity).lte(0)) {
+      reasons.push("profit_trailing_pair_state_invalid");
     }
   }
   for (const [marketId, owner] of state.riskReductionOwners ?? []) {
