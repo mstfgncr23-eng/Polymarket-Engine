@@ -127,6 +127,24 @@ describe("profit trailing pair PAPER authority", () => {
     } finally { await s.engine.stop(); }
   });
 
+  it("locks a still-positive .02 gross retrace instead of being trapped by the normal alpha floor", async () => {
+    const s = await start();
+    try {
+      await seedFirstLeg(s);
+      await publish(s, "0.15", 1); // arm at .05 gross
+      await waitFor(() => internal(s.engine).profitTrailingPairStates.get(MARKET)?.highWaterEdge === "0.05");
+
+      s.clock.ms += 1_000;
+      await publish(s, "0.18", 2); // .02 gross: fee-inclusive total lock is still positive
+      await waitFor(() => s.engine.ledger.positions.get(MARKET)?.unpairedQuantity === "0");
+
+      const orders = await s.journal.queryEvents({ types: ["PAPER_ORDER_CREATED"] });
+      expect(orders.some((row) => row.payload.strategyId === "profit-trailing-pair-trail")).toBe(true);
+      const fills = await s.journal.queryEvents({ types: ["PAPER_FILL"] });
+      expect(fills.filter((row) => row.payload.intent === "HEDGE_SECOND_LEG")).toHaveLength(1);
+    } finally { await s.engine.stop(); }
+  });
+
   it("takes the full-executable .12 target without waiting for a retrace", async () => {
     const s = await start();
     try {
