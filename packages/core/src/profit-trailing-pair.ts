@@ -84,7 +84,7 @@ export function evaluateProfitTrailingPair(input: {
     nextState = sameEpisode;
   }
 
-  if (current.gte(target)) {
+  if (current.gte(target) && lockedPnl.gt(0)) {
     return { action: "TARGET", reason: "TARGET_REACHED", nextState, stateChanged };
   }
 
