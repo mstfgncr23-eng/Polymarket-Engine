@@ -1,4 +1,4 @@
-import { reversalProtectionStateSchema, sameReversalEpisode, type ReversalProtectionState } from "@pm/core";
+import { REVERSAL_PROTECTION_MIN_OPPOSITE_SPAN_MS, reversalProtectionStateSchema, sameReversalEpisode, type ReversalProtectionState } from "@pm/core";
 import { createNakedDirectionalDiagnostic, nakedDirectionalDiagnosticSchema, mergeNakedDirectionalObservation,
   profitTrailingPairStateSchema, type NakedDirectionalDiagnostic, type ProfitTrailingPairState } from "@pm/core";
 import {
@@ -680,7 +680,8 @@ export function validatePostReplayInvariants(
   const reversalRisk = state.experiment?.riskConfiguration;
   if (reversalRisk?.reversalProtectionEnabled === true
     && (reversalRisk.profitTrailingPairSoakEnabled !== true || reversalRisk.reversalProtectionWindowMs !== 360000
-      || reversalRisk.reversalProtectionOppositeCount !== 3)) {
+      || reversalRisk.reversalProtectionOppositeCount !== 3
+      || reversalRisk.reversalProtectionMinOppositeSpanMs !== REVERSAL_PROTECTION_MIN_OPPOSITE_SPAN_MS)) {
     reasons.push("reversal_protection_config_invalid");
   }
   for (const [marketId, reversal] of state.reversalProtectionStates ?? []) {
