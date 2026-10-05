@@ -635,6 +635,17 @@ export function validatePostReplayInvariants(
       reasons.push("naked_directional_diagnostic_invalid");
     }
   }
+  if (state.experiment?.riskConfiguration.profitTrailingPairSoakEnabled === true) {
+    const risk = state.experiment.riskConfiguration;
+    const target = Number(risk.profitTrailingPairTargetEdge ?? risk.normalHedgeMinLockedPairEdge);
+    const arm = Number(risk.profitTrailingPairArmEdge);
+    const retrace = Number(risk.profitTrailingPairRetraceEdge);
+    if (!Number.isFinite(target) || !Number.isFinite(arm) || !Number.isFinite(retrace)
+      || target <= 0 || arm < 0 || retrace <= 0 || arm >= target || retrace >= target
+      || risk.nakedDirectionalSoakEnabled === true) {
+      reasons.push("profit_trailing_pair_config_invalid");
+    }
+  }
   for (const [marketId, trailing] of state.profitTrailingPairStates ?? []) {
     const position = state.ledger.positions.get(marketId);
     if (!profitTrailingPairStateSchema.safeParse(trailing).success || trailing.marketId !== marketId
