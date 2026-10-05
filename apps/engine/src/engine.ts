@@ -942,7 +942,7 @@ export class EngineService {
       if (!gatedPreflight.ok) return { ...gatedPreflight, ok: false };
       const now = this.nowFn();
       if (this.env.REVERSAL_PROTECTION_ENABLED && (!this.env.PROFIT_TRAILING_PAIR_SOAK_ENABLED
-        || this.env.TRADING_MODE !== "paper" || this.env.REVERSAL_PROTECTION_WINDOW_MS !== 360000
+        || this.env.TRADING_MODE !== "paper" || this.env.REVERSAL_PROTECTION_WINDOW_MS !== 180000
         || this.env.REVERSAL_PROTECTION_OPPOSITE_COUNT !== 3)) throw new Error("INVALID_REVERSAL_PROTECTION_V1_CONFIG");
       const next = startExperiment({
         id: undefined, durationHours: this.env.EXPERIMENT_DURATION_HOURS, strategyVersion: this.strategy.version,
@@ -4870,7 +4870,7 @@ export class EngineService {
   private reversalProtectionEnabled(): boolean {
     const risk = this.experiment?.riskConfiguration;
     return this.env.TRADING_MODE === "paper" && this.profitTrailingPairSoakEnabled()
-      && risk?.reversalProtectionEnabled === true && risk.reversalProtectionWindowMs === 360000
+      && risk?.reversalProtectionEnabled === true && risk.reversalProtectionWindowMs === 180000
       && risk.reversalProtectionOppositeCount === 3;
   }
 

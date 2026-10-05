@@ -105,9 +105,9 @@ describe("reversal protection real PAPER authority", () => {
       expect(s.engine.ledger.snapshot().cash).not.toBe("996"); expect(s.engine.integrityFault()).toBe(false);
     } finally { await s.engine.stop(); }
   });
-  it("RP-ENG-03: third at 360001ms does not activate or force time exit", async () => {
+  it("RP-ENG-03: third at 180001ms does not activate or force time exit", async () => {
     const s = await start(); try { await seed(s); await observe(s, "1"); await observe(s, "2");
-      s.clock.ms += 360001; await publish(s); await observe(s, "3"); await internal(s).pollFailedHedges();
+      s.clock.ms += 180001; await publish(s); await observe(s, "3"); await internal(s).pollFailedHedges();
       expect(state(s)?.oppositeCount).toBe(2); expect(await riskFills(s)).toHaveLength(0); expect(residual(s)).toBe("5");
     } finally { await s.engine.stop(); }
   });
@@ -180,7 +180,7 @@ describe("reversal protection real PAPER authority", () => {
     const s = await start(); try { await seed(s); await observe(s, "1");
       const spy = vi.spyOn(s.journal, "readDurableByOperationKey");
       await observe(s, "1"); await observe(s, "held", "UP"); await observe(s, "flat", "FLAT");
-      s.clock.ms += 360001; await observe(s, "outside");
+      s.clock.ms += 180001; await observe(s, "outside");
       expect(spy).not.toHaveBeenCalled(); spy.mockRestore(); expect(state(s)?.oppositeCount).toBe(1);
     } finally { await s.engine.stop(); }
   });
@@ -269,7 +269,7 @@ describe("reversal protection recovery and crash boundaries", () => {
     let s = await start(); try { await seed(s); for (let i=1; i<=count; i++) await observe(s, `c-${i}`);
       await s.engine.checkpointForTest(); await s.journal.compactDurableTransitionsThrough(s.engine.lastAppliedDurableCursorForTest());
       s = await restart(s, { REVERSAL_PROTECTION_ENABLED: "false", REVERSAL_PROTECTION_WINDOW_MS: "1", REVERSAL_PROTECTION_OPPOSITE_COUNT: "1" });
-      expect(state(s)?.oppositeCount).toBe(count); expect(internal(s).experiment.riskConfiguration).toMatchObject({ reversalProtectionEnabled: true, reversalProtectionWindowMs: 360000, reversalProtectionOppositeCount: 3 });
+      expect(state(s)?.oppositeCount).toBe(count); expect(internal(s).experiment.riskConfiguration).toMatchObject({ reversalProtectionEnabled: true, reversalProtectionWindowMs: 180000, reversalProtectionOppositeCount: 3 });
       await observe(s, `c-${count}`); expect(state(s)?.oppositeCount).toBe(count);
       for (let i=count+1; i<=3; i++) await observe(s, `c-${i}`);
       s.clock.ms += 5001; await publish(s); await waitFor(s, () => residual(s) === "0"); expect(await riskFills(s)).toHaveLength(1);
