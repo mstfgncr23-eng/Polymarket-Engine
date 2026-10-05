@@ -642,7 +642,8 @@ export function validatePostReplayInvariants(
     const retrace = Number(risk.profitTrailingPairRetraceEdge);
     if (!Number.isFinite(target) || !Number.isFinite(arm) || !Number.isFinite(retrace)
       || target <= 0 || arm < 0 || retrace <= 0 || arm >= target || retrace >= target
-      || risk.nakedDirectionalSoakEnabled === true) {
+      || risk.nakedDirectionalSoakEnabled === true
+      || risk.profitTrailingPairExecutionStyle !== "TAKER") {
       reasons.push("profit_trailing_pair_config_invalid");
     }
   }
