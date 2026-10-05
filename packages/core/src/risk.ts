@@ -279,18 +279,19 @@ export function evaluateRisk(input: RiskInput, limits: RiskLimits): RiskEvaluati
     && d(directionalExposure).lte(input.directionalExposureUsd)
     && d(unhedgedExposure).lt(input.unhedgedExposureUsd);
   if (age(input.marketFeedAt) > limits.staleFeedTimeoutMs) vetoes.push("MARKET_FEED_STALE");
-  // RESCUE_SECOND_LEG safety depends on the executable Polymarket book + binary
-  // pair identity, NOT on directional fair-value prediction: the rescue BUY is
-  // exempt from reference-provider availability/staleness gates (documented
-  // policy). Every other hard safety gate below still applies.
-  const rescueExemptFromReference = !protective && !rescue;
-  if (rescueExemptFromReference && input.referenceProviderBlocked === true) vetoes.push("REFERENCE_PROVIDER_BLOCKED");
-  if (rescueExemptFromReference && input.referenceRequired === true) {
+  // Terminal pair locks depend on the executable Polymarket book + verified
+  // opposite-token residual identity, not on directional reference prediction.
+  // Protective/rescue actions keep their existing exemption. The trailing
+  // exemption is narrower: it is granted only when the HEDGE is structurally
+  // reducing AND the engine proves current-book fee-inclusive locked PnL > 0.
+  const directionalReferenceGated = !protective && !rescue && !verifiedProfitableTrailingHedge;
+  if (directionalReferenceGated && input.referenceProviderBlocked === true) vetoes.push("REFERENCE_PROVIDER_BLOCKED");
+  if (directionalReferenceGated && input.referenceRequired === true) {
     if (age(input.referenceFeedAt ?? null) > limits.staleFeedTimeoutMs) {
       vetoes.push("REFERENCE_FEED_STALE");
       if ((input.asset ?? "BTC") === "BTC") vetoes.push("BTC_FEED_STALE");
     }
-  } else if (rescueExemptFromReference && input.referenceRequired !== false && age(input.btcFeedAt) > limits.staleFeedTimeoutMs) {
+  } else if (directionalReferenceGated && input.referenceRequired !== false && age(input.btcFeedAt) > limits.staleFeedTimeoutMs) {
     vetoes.push("BTC_FEED_STALE");
   }
   if (!input.databaseAvailable) vetoes.push("DATABASE_UNAVAILABLE");
