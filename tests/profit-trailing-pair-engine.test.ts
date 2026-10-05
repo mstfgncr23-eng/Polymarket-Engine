@@ -12,7 +12,9 @@ const UP = "trail-up";
 const DOWN = "trail-down";
 
 type Internals = {
+  experiment: { status: string; riskConfiguration: Record<string, unknown> } | null;
   profitTrailingPairStates: Map<string, ProfitTrailingPairState>;
+  snapshots: Map<string, Partial<Record<"UP" | "DOWN", MarketSnapshot>>>;
   maybeProtectiveDeRisk(marketId: string): Promise<void>;
 };
 const internal = (engine: EngineService) => engine as unknown as Internals;
@@ -20,6 +22,7 @@ const internal = (engine: EngineService) => engine as unknown as Internals;
 async function start(journal = new MemoryEventJournal(), clock = { ms: START }) {
   const market = new ScriptedMarketAdapter();
   market.queue(discoveryReport([qualified(MARKET, "SOL", UP, DOWN, new Date(START + 3_600_000).toISOString())]));
+  const errors: Array<{ detail: unknown; message?: string }> = [];
   const engine = new EngineService(qualifiedPaperEnv({
     DISCOVERY_INTERVAL_MS: "3600000",
     ESTIMATED_INFRA_COST_PER_HOUR_USD: "0",
@@ -29,7 +32,7 @@ async function start(journal = new MemoryEventJournal(), clock = { ms: START }) 
     PROFIT_TRAILING_PAIR_SOAK_ENABLED: "true",
     PROFIT_TRAILING_PAIR_ARM_EDGE: "0.05",
     PROFIT_TRAILING_PAIR_RETRACE_EDGE: "0.02",
-  }), journal, { error: () => undefined }, {
+  }), journal, { error: (detail: unknown, message?: string) => { errors.push({ detail, ...(message ? { message } : {}) }); } }, {
     market: market as never,
     referenceRegistry: new ScriptedReferenceRegistry() as never,
     activation: new NoopGrokActivationBridge(),
@@ -38,7 +41,7 @@ async function start(journal = new MemoryEventJournal(), clock = { ms: START }) 
   });
   await engine.start();
   await market.waitForHandlers();
-  return { engine, journal, market, clock };
+  return { engine, journal, market, clock, errors };
 }
 type Scenario = Awaited<ReturnType<typeof start>>;
 
@@ -75,10 +78,25 @@ async function seedFirstLeg(s: Scenario) {
   }));
 }
 
-async function waitFor(predicate: () => boolean | Promise<boolean>) {
-  const deadline = Date.now() + 5000;
+async function waitFor(s: Scenario, label: string, predicate: () => boolean | Promise<boolean>) {
+  const deadline = Date.now() + 1000;
   while (!(await predicate())) {
-    if (Date.now() > deadline) throw new Error("profit trailing lifecycle did not complete");
+    if (Date.now() > deadline) {
+      const position = s.engine.ledger.positions.get(MARKET) ?? null;
+      const pair = internal(s.engine).snapshots.get(MARKET) ?? null;
+      const trailing = await s.journal.queryDurableTransitions({ types: ["PROFIT_TRAILING_PAIR_STATE_UPDATED"], limit: 20 });
+      throw new Error(`profit trailing lifecycle did not complete: ${label} :: ${JSON.stringify({
+        experiment: internal(s.engine).experiment,
+        database: s.engine.state.database,
+        journalDegraded: s.engine.state.journalDegraded,
+        polymarket: s.engine.state.connections.polymarket,
+        position,
+        pair,
+        trailingState: internal(s.engine).profitTrailingPairStates.get(MARKET) ?? null,
+        durableTrailing: trailing,
+        errors: s.errors,
+      })}`);
+    }
     await new Promise((resolve) => setTimeout(resolve, 2));
   }
 }
@@ -95,11 +113,11 @@ describe("profit trailing pair PAPER authority", () => {
       await seedFirstLeg(s);
 
       await publish(s, "0.15", 1); // full executable gross edge .05 => arm
-      await waitFor(() => internal(s.engine).profitTrailingPairStates.get(MARKET)?.highWaterEdge === "0.05");
+      await waitFor(s, "arm-.05", () => internal(s.engine).profitTrailingPairStates.get(MARKET)?.highWaterEdge === "0.05");
 
       s.clock.ms += 1_000;
       await publish(s, "0.10", 2); // gross edge .10 => high-water
-      await waitFor(() => internal(s.engine).profitTrailingPairStates.get(MARKET)?.highWaterEdge === "0.1");
+      await waitFor(s, "high-water-.10", () => internal(s.engine).profitTrailingPairStates.get(MARKET)?.highWaterEdge === "0.1");
 
       // Cross the old 300s protection deadline. The trailing soak must not let
       // PR3 / Guardian / deadline fallback consume the still-profitable episode.
@@ -116,7 +134,7 @@ describe("profit trailing pair PAPER authority", () => {
 
       s.clock.ms += 1_000;
       await publish(s, "0.12", 3); // current edge .08 => .02 retrace from .10
-      await waitFor(() => s.engine.ledger.positions.get(MARKET)?.unpairedQuantity === "0");
+      await waitFor(s, "pair-complete", () => s.engine.ledger.positions.get(MARKET)?.unpairedQuantity === "0");
       expect(internal(s.engine).profitTrailingPairStates.has(MARKET)).toBe(false);
 
       const fills = await s.journal.queryEvents({ types: ["PAPER_FILL"] });
@@ -132,11 +150,11 @@ describe("profit trailing pair PAPER authority", () => {
     try {
       await seedFirstLeg(s);
       await publish(s, "0.15", 1); // arm at .05 gross
-      await waitFor(() => internal(s.engine).profitTrailingPairStates.get(MARKET)?.highWaterEdge === "0.05");
+      await waitFor(s, "arm-.05", () => internal(s.engine).profitTrailingPairStates.get(MARKET)?.highWaterEdge === "0.05");
 
       s.clock.ms += 1_000;
       await publish(s, "0.18", 2); // .02 gross: fee-inclusive total lock is still positive
-      await waitFor(() => s.engine.ledger.positions.get(MARKET)?.unpairedQuantity === "0");
+      await waitFor(s, "pair-complete", () => s.engine.ledger.positions.get(MARKET)?.unpairedQuantity === "0");
 
       const orders = await s.journal.queryEvents({ types: ["PAPER_ORDER_CREATED"] });
       expect(orders.some((row) => row.payload.strategyId === "profit-trailing-pair-trail")).toBe(true);
@@ -150,7 +168,7 @@ describe("profit trailing pair PAPER authority", () => {
     try {
       await seedFirstLeg(s);
       await publish(s, "0.08", 1); // .80 first leg + .08 opposite = .12 gross pair edge
-      await waitFor(() => s.engine.ledger.positions.get(MARKET)?.unpairedQuantity === "0");
+      await waitFor(s, "pair-complete", () => s.engine.ledger.positions.get(MARKET)?.unpairedQuantity === "0");
       const fills = await s.journal.queryEvents({ types: ["PAPER_FILL"] });
       expect(fills.filter((row) => row.payload.intent === "HEDGE_SECOND_LEG")).toHaveLength(1);
     } finally { await s.engine.stop(); }
