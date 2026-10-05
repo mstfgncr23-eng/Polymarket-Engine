@@ -5421,7 +5421,7 @@ export class EngineService {
   }
 
   private profitTrailingPairOpportunity(marketId: string, position: Position, now: Date): {
-    pair: Record<Outcome, MarketSnapshot | null>;
+    pair: Record<Outcome, MarketSnapshot>;
     opposite: MarketSnapshot;
     grossEdge: string;
     lockedPnl: string;
