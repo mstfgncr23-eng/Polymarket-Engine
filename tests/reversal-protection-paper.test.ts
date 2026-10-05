@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { NATIVE_DETERMINISTIC_AUTHORITY, type MarketSnapshot, type ReversalProtectionState,
-  type JournalEvent, CANONICAL_REPORT_INPUT_EVENT_TYPES, AUDIT_CRITICAL_EVENT_TYPES } from "@pm/core";
+  type JournalEvent, type ExperimentManifest, CANONICAL_REPORT_INPUT_EVENT_TYPES, AUDIT_CRITICAL_EVENT_TYPES } from "@pm/core";
 import { MemoryEventJournal, createJournalEvent } from "@pm/db";
 import { EngineService } from "../apps/engine/src/engine.js";
 import { NoopGrokActivationBridge } from "../apps/engine/src/activation/index.js";
@@ -13,7 +13,7 @@ type Internals = {
   reversalProtectionStates: Map<string, ReversalProtectionState>;
   riskReductionOwners: Map<string, RiskReductionOwnership>;
   snapshots: Map<string, Partial<Record<"UP" | "DOWN", MarketSnapshot>>>;
-  experiment: { status: string; riskConfiguration: Record<string, unknown> };
+  experiment: ExperimentManifest;
   maybeReversalProtection(m: string): Promise<void>;
   maybeProtectiveDeRisk(m: string): Promise<void>;
   pollFailedHedges(): Promise<void>;
@@ -74,6 +74,23 @@ function event(s: Scenario, id: string, direction: "UP" | "DOWN" | "FLAT" = "DOW
 const observe = (s: Scenario, id: string, direction: "UP" | "DOWN" | "FLAT" = "DOWN") => s.engine.persistReportInput(event(s, id, direction));
 async function confirm(s: Scenario) { for (let i = 1; i <= 3; i++) await observe(s, `opposite-${i}`); }
 async function restart(s: Scenario, env: Record<string, string> = {}) { await s.engine.stop(); return start(s.journal, s.clock, env); }
+async function legacy360Manifest(status: "COMPLETED" | "RUNNING"): Promise<ExperimentManifest> {
+  const source = await start();
+  try {
+    const manifest = structuredClone(internal(source).experiment);
+    return {
+      ...manifest,
+      status,
+      riskConfiguration: { ...manifest.riskConfiguration, reversalProtectionEnabled: true,
+        reversalProtectionWindowMs: 360000, reversalProtectionOppositeCount: 3 },
+      startedAt: new Date(START - 60_000).toISOString(),
+      entryClosesAt: new Date(START + 60_000).toISOString(),
+      completedAt: status === "COMPLETED" ? new Date(START - 1_000).toISOString() : null,
+      unresolvedPositionCount: 0,
+      startValidationPending: false,
+    };
+  } finally { await source.engine.stop(); }
+}
 async function settle(s: Scenario) {
   await internal(s).commitAuthoritative({ operationKey: `settlement:${MARKET}:test`, type: "POSITION_SETTLED",
     aggregateType: "position", aggregateId: MARKET, buildPayload: () => ({ marketId: MARKET, upPayoff: "1", downPayoff: "0",
@@ -105,9 +122,9 @@ describe("reversal protection real PAPER authority", () => {
       expect(s.engine.ledger.snapshot().cash).not.toBe("996"); expect(s.engine.integrityFault()).toBe(false);
     } finally { await s.engine.stop(); }
   });
-  it("RP-ENG-03: third at 360001ms does not activate or force time exit", async () => {
+  it("RP-ENG-03: third at 180001ms does not activate or force time exit", async () => {
     const s = await start(); try { await seed(s); await observe(s, "1"); await observe(s, "2");
-      s.clock.ms += 360001; await publish(s); await observe(s, "3"); await internal(s).pollFailedHedges();
+      s.clock.ms += 180001; await publish(s); await observe(s, "3"); await internal(s).pollFailedHedges();
       expect(state(s)?.oppositeCount).toBe(2); expect(await riskFills(s)).toHaveLength(0); expect(residual(s)).toBe("5");
     } finally { await s.engine.stop(); }
   });
@@ -180,7 +197,7 @@ describe("reversal protection real PAPER authority", () => {
     const s = await start(); try { await seed(s); await observe(s, "1");
       const spy = vi.spyOn(s.journal, "readDurableByOperationKey");
       await observe(s, "1"); await observe(s, "held", "UP"); await observe(s, "flat", "FLAT");
-      s.clock.ms += 360001; await observe(s, "outside");
+      s.clock.ms += 180001; await observe(s, "outside");
       expect(spy).not.toHaveBeenCalled(); spy.mockRestore(); expect(state(s)?.oppositeCount).toBe(1);
     } finally { await s.engine.stop(); }
   });
@@ -265,11 +282,27 @@ describe("reversal protection real PAPER authority", () => {
 });
 
 describe("reversal protection recovery and crash boundaries", () => {
+  it("RP-REC-LEGACY-01: completed legacy 360s manifest replays under 180s runtime", async () => {
+    const journal = new MemoryEventJournal(); const manifest = await legacy360Manifest("COMPLETED");
+    await journal.commitDurableTransition({ operationKey: "legacy-360-completed", type: "EXPERIMENT_COMPLETED",
+      aggregateType: "experiment", aggregateId: manifest.id, payload: { ...manifest, derivedAudit: [] }, occurredAt: new Date(manifest.completedAt!) }, 0);
+    const s = await start(journal); try {
+      expect(internal(s).experiment.status).toBe("COMPLETED");
+      expect(internal(s).experiment.riskConfiguration.reversalProtectionWindowMs).toBe(360000);
+      expect(s.engine.integrityFault()).toBe(false);
+    } finally { await s.engine.stop(); }
+  });
+  it("RP-REC-LEGACY-02: running legacy 360s manifest remains fail-closed", async () => {
+    const journal = new MemoryEventJournal(); const manifest = await legacy360Manifest("RUNNING");
+    await journal.commitDurableTransition({ operationKey: "legacy-360-running", type: "EXPERIMENT_STARTED",
+      aggregateType: "experiment", aggregateId: manifest.id, payload: { ...manifest, derivedAudit: [] }, occurredAt: new Date(manifest.startedAt!) }, 0);
+    await expect(start(journal)).rejects.toThrow("reversal_protection_config_invalid");
+  });
   it.each([1, 2, 3])("RP-REC-01/02/03/04: count %s survives checkpoint compaction, exact replay and changed env", async count => {
     let s = await start(); try { await seed(s); for (let i=1; i<=count; i++) await observe(s, `c-${i}`);
       await s.engine.checkpointForTest(); await s.journal.compactDurableTransitionsThrough(s.engine.lastAppliedDurableCursorForTest());
       s = await restart(s, { REVERSAL_PROTECTION_ENABLED: "false", REVERSAL_PROTECTION_WINDOW_MS: "1", REVERSAL_PROTECTION_OPPOSITE_COUNT: "1" });
-      expect(state(s)?.oppositeCount).toBe(count); expect(internal(s).experiment.riskConfiguration).toMatchObject({ reversalProtectionEnabled: true, reversalProtectionWindowMs: 360000, reversalProtectionOppositeCount: 3 });
+      expect(state(s)?.oppositeCount).toBe(count); expect(internal(s).experiment.riskConfiguration).toMatchObject({ reversalProtectionEnabled: true, reversalProtectionWindowMs: 180000, reversalProtectionOppositeCount: 3 });
       await observe(s, `c-${count}`); expect(state(s)?.oppositeCount).toBe(count);
       for (let i=count+1; i<=3; i++) await observe(s, `c-${i}`);
       s.clock.ms += 5001; await publish(s); await waitFor(s, () => residual(s) === "0"); expect(await riskFills(s)).toHaveLength(1);

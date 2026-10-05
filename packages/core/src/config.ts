@@ -106,7 +106,7 @@ export const engineEnvSchema = z.object({
     (value) => value === undefined ? undefined : value === true || value === "true" || value === "1",
     z.boolean().optional(),
   ).default(false),
-  REVERSAL_PROTECTION_WINDOW_MS: z.coerce.number().int().positive().default(360000),
+  REVERSAL_PROTECTION_WINDOW_MS: z.coerce.number().int().positive().default(180000),
   REVERSAL_PROTECTION_OPPOSITE_COUNT: z.coerce.number().int().positive().default(3),
   PORT: z.coerce.number().int().positive().default(8080),
   LOG_LEVEL: z.string().default("info"),

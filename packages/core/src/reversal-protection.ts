@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const REVERSAL_PROTECTION_WINDOW_MS = 360_000;
+export const REVERSAL_PROTECTION_WINDOW_MS = 180_000;
 export const REVERSAL_PROTECTION_OPPOSITE_COUNT = 3;
 const timestamp = z.string().datetime({ offset: true });
 export const reversalProtectionStateSchema = z.object({

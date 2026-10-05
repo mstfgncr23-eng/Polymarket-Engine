@@ -23,11 +23,11 @@ describe("reversal protection pure classifier", () => {
     state = step(state, "DOWN", "3", 46000).nextState;
     expect(state?.confirmedAt).toBe(new Date(START + 46000).toISOString());
   });
-  it.each([360000, 360001])("RP-CORE-06: inclusive boundary at %sms", (ms) => {
+  it.each([180000, 180001])("RP-CORE-06: inclusive boundary at %sms", (ms) => {
     const state = step(step(null, "DOWN", "1").nextState, "DOWN", "2", 2000).nextState;
     const next = step(state, "DOWN", "3", ms);
-    expect(next.stateChanged).toBe(ms === 360000);
-    expect(!!next.nextState?.confirmedAt).toBe(ms === 360000);
+    expect(next.stateChanged).toBe(ms === 180000);
+    expect(!!next.nextState?.confirmedAt).toBe(ms === 180000);
   });
   it("RP-CORE-07: exact event duplicate counts once", () => {
     const state = step(null, "DOWN", "same").nextState;

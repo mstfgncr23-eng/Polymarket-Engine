@@ -678,8 +678,9 @@ export function validatePostReplayInvariants(
     }
   }
   const reversalRisk = state.experiment?.riskConfiguration;
-  if (reversalRisk?.reversalProtectionEnabled === true
-    && (reversalRisk.profitTrailingPairSoakEnabled !== true || reversalRisk.reversalProtectionWindowMs !== 360000
+  const reversalProtectionActive = status === "RUNNING" || status === "ENTRY_CLOSED";
+  if (reversalProtectionActive && reversalRisk?.reversalProtectionEnabled === true
+    && (reversalRisk.profitTrailingPairSoakEnabled !== true || reversalRisk.reversalProtectionWindowMs !== 180000
       || reversalRisk.reversalProtectionOppositeCount !== 3)) {
     reasons.push("reversal_protection_config_invalid");
   }
