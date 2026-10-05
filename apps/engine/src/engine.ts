@@ -749,8 +749,12 @@ export class EngineService {
   }
 
   noteMcpRequest(tool: string | null, triggerId?: string): void {
-    if (triggerId) this.activation.noteMcp([triggerId]);
-    else this.activation.noteUnattributedMcp(tool);
+    if (triggerId) {
+      // Attribute actual inbound research activity, not every Native trigger.
+      const trigger = this.activeTriggers.get(triggerId);
+      if (trigger) this.activation.ensureLatency(trigger);
+      this.activation.noteMcp([triggerId]);
+    } else this.activation.noteUnattributedMcp(tool);
     this.state.setActivationLatency(this.activation.snapshot());
     this.state.setUnattributedMcp(this.activation.unattributedSnapshot());
   }
@@ -2495,21 +2499,6 @@ export class EngineService {
     }
     this.state.addTrigger(trigger);
     await this.experimentBoundaryGate.run(async () => {
-      const nativeBookkeepingStarted = performance.now();
-      this.activation.ensureLatency(trigger);
-      this.state.setActivationLatency(this.activation.snapshot());
-      await this.persistReportInput(createJournalEvent({
-        traceId: trigger.traceId, type: "GROK_ACTIVATION_DECISION", aggregateType: "activation", aggregateId: trigger.id,
-        payload: {
-          triggerId: trigger.id, marketId: trigger.marketId, asset: trigger.asset ?? null,
-          reason: "NATIVE_DETERMINISTIC_ONLY", activate: false, authority: NATIVE_DETERMINISTIC_AUTHORITY,
-        },
-      }));
-      this.state.addActivation({
-        triggerId: trigger.id, reason: "NATIVE_DETERMINISTIC_ONLY", at: this.nowFn().toISOString(),
-        provider: "native_deterministic", grokWakeObserved: false,
-      });
-      this.metrics.idleActivationBookkeepingDuration.observe((performance.now() - nativeBookkeepingStarted) / 1000);
       this.record("NATIVE_DECISION_EVALUATION", trigger.traceId, trigger.marketId, {
         authority: NATIVE_DETERMINISTIC_AUTHORITY, triggerId: trigger.id, expiresAt: trigger.expiresAt,
       }, trigger.asset ?? null);
@@ -2987,6 +2976,7 @@ export class EngineService {
         this.signalsByTrigger.set(trigger.id, byRole);
         this.signalReceivedTimes.push(now.getTime());
         this.state.addGrokSignal(signal);
+        this.activation.ensureLatency(trigger);
         this.activation.noteSignal(trigger.id, now);
         this.state.setActivationLatency(this.activation.snapshot());
         this.metrics.grokSignals.inc({ agent: signal.agentId, status: "accepted" });

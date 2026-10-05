@@ -17,6 +17,8 @@
     }
   },
   "include": [
+    "tests/native-hotpath-fossils.test.ts",
+    "scripts/native-hotpath-bench.ts",
     "tests/protective-min-order-rest-hydration.test.ts",
     "tests/normalization-reference.ts",
     "tests/dashboard-low-impact.test.ts",

@@ -252,7 +252,7 @@ describe("processTrigger and journal in-flight gauges return to zero", () => {
       await pending;
       expect(await metricValue(engine.metrics, "process_trigger_in_flight")).toBe(0);
       expect(await histogramCount(engine.metrics, "process_trigger_duration_seconds")).toBeGreaterThanOrEqual(1);
-      expect(await histogramCount(engine.metrics, "idle_activation_latency_bookkeeping_duration_seconds")).toBeGreaterThanOrEqual(1);
+      expect(engine.metrics.registry.getSingleMetric("idle_activation_latency_bookkeeping_duration_seconds")).toBeUndefined();
 
       journal.append = async () => { throw new Error("JOURNAL_DOWN"); };
       await engine.registerTriggerForResearch(researchTrigger({ id: createId("trigger") }));
