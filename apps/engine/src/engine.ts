@@ -5489,7 +5489,7 @@ export class EngineService {
       if (evaluation.stateChanged && evaluation.nextState) {
         const trailing = evaluation.nextState;
         await this.commitAuthoritative({
-          operationKey: `profit-trailing:${trailing.positionId}:${trailing.revision}`,
+          operationKey: `profit-trailing:${trailing.positionId}:${trailing.unhedgedStartedAt}:${trailing.revision}`,
           type: "PROFIT_TRAILING_PAIR_STATE_UPDATED",
           aggregateType: "position",
           aggregateId: trailing.positionId,
@@ -5497,7 +5497,7 @@ export class EngineService {
           buildPayload: () => ({
             state: trailing,
             derivedAudit: [{
-              id: derivedAuditEventId("PROFIT_TRAILING_PAIR_STATE_UPDATED", `${trailing.positionId}:${trailing.revision}`),
+              id: derivedAuditEventId("PROFIT_TRAILING_PAIR_STATE_UPDATED", `${trailing.positionId}:${trailing.unhedgedStartedAt}:${trailing.revision}`),
               type: "PROFIT_TRAILING_PAIR_STATE_UPDATED",
               aggregateType: "position",
               aggregateId: trailing.positionId,
