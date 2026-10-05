@@ -821,6 +821,26 @@ export class EngineMetrics {
     }
   }
 
+  async observeDirectJournalBatch<T>(types: readonly string[], work: () => Promise<T>): Promise<T> {
+    const classes = types.map((type) => classifyJournalMetricClass(type));
+    this.journalDirectInFlightCount += 1;
+    this.journalDirectInFlight.set(this.journalDirectInFlightCount);
+    const started = performance.now();
+    try {
+      const result = await work();
+      for (const journalClass of classes) this.journalDirectWrites.inc({ class: journalClass });
+      return result;
+    } catch (error) {
+      for (const journalClass of classes) this.journalDirectFailures.inc({ class: journalClass });
+      throw error;
+    } finally {
+      const elapsed = (performance.now() - started) / 1000;
+      for (const journalClass of classes) this.journalDirectLatency.observe({ class: journalClass }, elapsed);
+      this.journalDirectInFlightCount = Math.max(0, this.journalDirectInFlightCount - 1);
+      this.journalDirectInFlight.set(this.journalDirectInFlightCount);
+    }
+  }
+
   runtimeWorkMetrics() {
     return {
       setQueueDepth: (lane: WorkLane, value: number) => this.runtimeWorkQueueDepth.set({ lane }, value),
