@@ -160,7 +160,7 @@ export interface EventJournal {
   initialize(): Promise<void>;
   healthCheck(): Promise<boolean>;
   append(event: JournalEvent, options?: JournalAppendOptions): Promise<void>;
-  appendMany(events: readonly JournalEvent[]): Promise<void>;
+  appendMany(events: readonly JournalEvent[], options?: JournalAppendOptions): Promise<void>;
   readTrace(traceId: string): Promise<JournalEvent[]>;
   readTracePage(traceId: string, input: { after?: JournalKeysetCursor; limit: number }): Promise<{ events: JournalEvent[]; nextCursor: JournalKeysetCursor | null }>;
   readAll(): Promise<JournalEvent[]>;
@@ -359,9 +359,9 @@ export class MemoryEventJournal implements EventJournal {
     this.retainEvent(event);
     this.recordMutation(`commit:${event.type}`);
   }
-  async appendMany(events: readonly JournalEvent[]): Promise<void> {
+  async appendMany(events: readonly JournalEvent[], options: JournalAppendOptions = {}): Promise<void> {
     assertJournalCapability(this.access, "runtime-write", "appendMany");
-    for (const event of events) await this.append(event);
+    for (const event of events) await this.append(event, options);
   }
   async readTrace(traceId: string): Promise<JournalEvent[]> { return structuredClone(this.events.filter((event) => event.traceId === traceId)); }
   async readTracePage(traceId: string, input: { after?: JournalKeysetCursor; limit: number }): Promise<{ events: JournalEvent[]; nextCursor: JournalKeysetCursor | null }> {
@@ -960,13 +960,52 @@ export class PostgresEventJournal implements EventJournal {
       throw error;
     }
   }
-  async appendMany(events: readonly JournalEvent[]): Promise<void> {
+  async appendMany(events: readonly JournalEvent[], options: JournalAppendOptions = {}): Promise<void> {
     assertJournalCapability(this.access, "runtime-write", "appendMany");
     if (events.length === 0) return;
     const values = events.map((raw) => journalEventSchema.parse(raw));
-    await this.db.insert(journalEvents).values(values.map((value) => ({
-      ...value, occurredAt: new Date(value.occurredAt), recordedAt: new Date(value.recordedAt),
-    }))).onConflictDoNothing({ target: journalEvents.id });
+    if (options.signal?.aborted) throw new JournalAppendAbortedError("aborted");
+    if (options.deadlineAt != null && Date.now() >= options.deadlineAt) throw new JournalAppendAbortedError("deadline");
+    let callbackFailed = false;
+    let transactionId: string | undefined;
+    try {
+      await this.db.transaction(async (tx) => {
+        try {
+          // Keep batch semantics identical to append(): recompute the deadline
+          // after pool acquisition and bound the entire transaction.
+          if (options.deadlineAt != null) {
+            const remaining = options.deadlineAt - Date.now();
+            if (remaining <= 0) throw new JournalAppendAbortedError("deadline");
+            await tx.execute(sql`SELECT set_config('statement_timeout', ${String(remaining)}, true)`);
+            const transactionRemaining = options.deadlineAt - Date.now();
+            if (transactionRemaining <= 0) throw new JournalAppendAbortedError("deadline");
+            const rows = await tx.execute(sql`SELECT set_config('transaction_timeout', ${String(transactionRemaining)}, true), pg_current_xact_id()::text AS xid`);
+            transactionId = rows[0]?.xid as string | undefined;
+          }
+          if (options.signal?.aborted) throw new JournalAppendAbortedError("aborted");
+          if (options.deadlineAt != null && Date.now() >= options.deadlineAt) throw new JournalAppendAbortedError("deadline");
+          await tx.insert(journalEvents).values(values.map((value) => ({
+            ...value, occurredAt: new Date(value.occurredAt), recordedAt: new Date(value.recordedAt),
+          }))).onConflictDoNothing({ target: journalEvents.id });
+        } catch (error) {
+          callbackFailed = true;
+          throw error;
+        }
+      });
+    } catch (error) {
+      let status: unknown;
+      if (!callbackFailed && transactionId) {
+        try {
+          const rows = await this.db.execute(sql`SELECT pg_xact_status(${transactionId}::xid8) AS status`);
+          status = rows[0]?.status;
+        } catch { /* Unknown outcome remains an ordinary persist failure. */ }
+        if (status === "committed") return;
+      }
+      if (options.deadlineAt != null && Date.now() >= options.deadlineAt && (callbackFailed || status === "aborted")) {
+        throw new JournalAppendAbortedError("deadline");
+      }
+      throw error;
+    }
   }
   async readTrace(traceId: string): Promise<JournalEvent[]> {
     const rows = await this.db.select().from(journalEvents)
