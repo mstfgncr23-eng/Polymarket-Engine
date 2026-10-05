@@ -3744,8 +3744,10 @@ export class EngineService {
           });
           return false;
         }
-        this.executionErrors.push(Date.now());
         const message = error instanceof Error ? error.message : String(error);
+        // Liquidity disappearance is an expected market condition, not an abnormal engine/exchange failure.
+        // Keep audit and retry/failure semantics, but do not poison the global hourly breaker.
+        if (message !== "INSUFFICIENT_DEPTH") this.executionErrors.push(Date.now());
         const failureDeRisk = deRisk ? { ...deRisk, finalState: "EXECUTION_ERROR" as const } : undefined;
         this.record("PAPER_EXECUTION_ERROR", order.traceId, order.marketId, {
           orderId: order.id, message, intent, ...(failureDeRisk ? { deRisk: failureDeRisk } : {}),
