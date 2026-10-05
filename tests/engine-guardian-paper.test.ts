@@ -146,6 +146,7 @@ describe("Engine Guardian real PAPER authority", () => {
     try {
       await seed(s);
       s.engine.seedRuntimeBookkeepingForTest({ executionErrors: Array(100).fill(s.clock.ms - 1000) });
+      const executionErrorsBefore = s.engine.runtimeBookkeepingForTest().executionErrors;
       s.journal.setAppendInFlightHoldForTest(new Promise<void>((r) => { release = r; }), ["PAPER_ORDER_CREATED"]);
       const pending = internal(s.engine).maybeGuardianProtectiveSell(MARKET);
       await waitFor(() => internal(s.engine).riskReductionOwners.has(MARKET) && s.journal.inFlightAppends > 0);
@@ -161,6 +162,7 @@ describe("Engine Guardian real PAPER authority", () => {
         ownership: { intent: "GUARDIAN_PROTECTIVE_SELL", order: { id: owner.order.id } } });
       expect((await rows(s, "PAPER_EXECUTION_ERROR"))[0]?.payload).toMatchObject({
         intent: "GUARDIAN_PROTECTIVE_SELL", orderId: owner.order.id, message: "INSUFFICIENT_DEPTH" });
+      expect(s.engine.runtimeBookkeepingForTest().executionErrors).toBe(executionErrorsBefore);
       expect(await guardianFills(s)).toHaveLength(0); expect(residual(s)).toBe("5");
       expect(internal(s.engine).riskReductionOwners.size).toBe(0);
     } finally { release?.(); s.journal.setAppendInFlightHoldForTest(null); await s.engine.stop(); }
