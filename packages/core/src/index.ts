@@ -42,4 +42,5 @@ export * from "./learning-paper-authority.js";
 export * from "./learning-shadow-runtime.js";
 export * from "./learning-scorecard.js";
 export * from "./learning-runtime.js";
-export * from "./naked-directional-soak.js";\nexport * from "./profit-trailing-pair.js";
+export * from "./naked-directional-soak.js";
+export * from "./profit-trailing-pair.js";
