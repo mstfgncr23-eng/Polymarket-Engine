@@ -58,7 +58,8 @@ export function refreshExperiment(
     return { ...manifest, status: "ENTRY_CLOSED", unresolvedPositionCount: unresolved };
   }
   if (manifest.status === "ENTRY_CLOSED") {
-    const policy = manifest.closePolicy ?? "observe_until_settlement";
+    const policy = manifest.riskConfiguration.nakedDirectionalSoakEnabled === true
+      ? "observe_until_settlement" : manifest.closePolicy ?? "observe_until_settlement";
     const open = options.openPositions ?? false;
     const unresolved = options.unresolvedCount ?? 0;
     if (policy === "observe_until_settlement" && !open) {
@@ -95,7 +96,14 @@ export function shouldWriteFinalReport(manifest: ExperimentManifest, openPositio
   return (manifest.closePolicy ?? "observe_until_settlement") === "mark_to_market";
 }
 
+export interface GuardianOutcomeCounts {
+  earlyExits: number; lateExits: number; pairedSettlements: number; nakedSettlements: number;
+}
 export interface ExperimentSummary {
+  /** Guardian exits include both SELL and rescue BUY; settlements retain their economic classification. */
+  guardianOutcomes?: GuardianOutcomeCounts;
+  /** Actual diagnostic positions, finalized only by canonical settlement. */
+  nakedDirectionalDiagnostics?: Record<string, unknown>[];
   experimentId: string;
   generatedAt: string;
   status: string;
@@ -202,6 +210,8 @@ Report kind: ${summary.reportKind}
 - Win/loss (gross, fee-exclusive): ${summary.grossWinLossDistribution.wins} / ${summary.grossWinLossDistribution.losses} / ${summary.grossWinLossDistribution.breakeven}
 - Settlement PnL: $${summary.settlementPnlUsd.toFixed(2)}
 - Settlements: ${summary.settlementCount}
+${summary.guardianOutcomes ? `- Guardian EARLY / LATE exits: ${summary.guardianOutcomes.earlyExits} / ${summary.guardianOutcomes.lateExits}
+- Paired / naked settlements: ${summary.guardianOutcomes.pairedSettlements} / ${summary.guardianOutcomes.nakedSettlements}` : ""}
 - Unresolved positions: ${summary.unresolvedPositionCount}
 - AI cost (legacy ledger field, should remain $0 without OpenAI): $${summary.aiCostUsd.toFixed(2)}
 - Estimated infrastructure cost: $${summary.estimatedInfrastructureCostUsd.toFixed(2)}
@@ -235,6 +245,18 @@ Report kind: ${summary.reportKind}
 - OpenAI token cost: $0 (runtime inference is not billed here)
 - Failures: ${JSON.stringify(summary.failureStatistics)}
 
-This report is computed from the append-only decision/accounting journal. Raw high-frequency telemetry is sampled.
+This report is computed from the append-only decision/accounting journal. Raw high-frequency telemetry is sampled.${summary.nakedDirectionalDiagnostics?.length ? `
+
+## Naked directional positions
+
+Each record includes the actual entry, bounded directional/pair path, exact observed extrema, anomalies, and resolution.
+Full position histories are also included in the report JSON.
+
+${summary.nakedDirectionalDiagnostics.map((item) => `### ${item.marketId}
+
+\`\`\`json
+${JSON.stringify(item, null, 2)}
+\`\`\`
+`).join("\n")}` : ""}
 `;
 }

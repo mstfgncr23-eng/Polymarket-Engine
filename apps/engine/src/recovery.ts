@@ -1,8 +1,12 @@
+import { isGuardianV2State, isLockedGuardianV2Config, reversalProtectionStateSchema, sameReversalEpisode, type ReversalProtectionState } from "@pm/core";
+import { createNakedDirectionalDiagnostic, nakedDirectionalDiagnosticSchema, mergeNakedDirectionalObservation,
+  profitTrailingPairStateSchema, type NakedDirectionalDiagnostic, type ProfitTrailingPairState } from "@pm/core";
 import {
   d,
   experimentManifestSchema,
   ledgerStateSchema,
   paperFillSchema,
+  paperOrderSchema,
   PaperLedger,
   positionSchema,
   restingPaperOrderSchema,
@@ -11,6 +15,7 @@ import {
   type PaperFill,
   type Position,
   type RestingPaperOrder,
+  type BinarySettlementLookup,
 } from "@pm/core";
 import {
   CHECKPOINT_SCHEMA_VERSION,
@@ -21,6 +26,7 @@ import {
   type DurableTransition,
 } from "@pm/db";
 import { z, ZodError } from "zod";
+import { accountResultFill, completeResult, emptyResultAccounting, resultAccountingSchema, type ResultAccounting } from "./trading-results.js";
 
 /**
  * MUTATION INVENTORY (Step 2 — replay-authoritative vs derived)
@@ -29,7 +35,8 @@ import { z, ZodError } from "zod";
  *    EXPERIMENT_STARTED, EXPERIMENT_START_VALIDATED, EXPERIMENT_START_ABORTED,
  *    EXPERIMENT_ENTRY_CLOSED, EXPERIMENT_COMPLETED
  *    PAPER_MAKER_RESERVED, PAPER_MAKER_RELEASED, PAPER_ORDER_CANCELLED
- *    PAPER_FILL (taker + maker partial/full)
+ *    RISK_REDUCTION_ADMITTED, RISK_REDUCTION_FAILED (shared taker ownership)
+ *    PAPER_FILL (taker + maker partial/full; releases matching taker ownership)
  *    POSITION_SETTLED (includes resolution payoffs; no provider call on replay)
  *    LEDGER_MARK_TO_MARKET, INFRASTRUCTURE_COST_ACCRUED
  *
@@ -127,11 +134,18 @@ export function cloneRecoverableState(state: RecoverableEngineState): Recoverabl
   ledger.restore(snapshot, [...state.ledger.positions.values()]);
   return {
     ledger,
+    resultAccounting: structuredClone(state.resultAccounting ?? emptyResultAccounting()),
     experiment: state.experiment ? structuredClone(state.experiment) : null,
     restingOrders: new Map([...state.restingOrders.entries()].map(([id, order]) => [id, structuredClone(order)])),
     makerReservations: new Map(state.makerReservations),
     settledMarkets: new Set(state.settledMarkets),
+    settlementLookups: new Map([...(state.settlementLookups ?? [])].map(([id, lookup]) => [id, structuredClone(lookup)])),
+    riskReductionOwners: new Map([...(state.riskReductionOwners ?? [])].map(([market, owner]) => [market, structuredClone(owner)])),
+    riskReductionFailures: new Map([...(state.riskReductionFailures ?? [])].map(([market, failure]) => [market, structuredClone(failure)])),
     lastInfrastructureAccrualAt: state.lastInfrastructureAccrualAt,
+    nakedDirectionalDiagnostics: new Map([...(state.nakedDirectionalDiagnostics ?? [])].map(([market, diagnostic]) => [market, structuredClone(diagnostic)])),
+    reversalProtectionStates: new Map([...(state.reversalProtectionStates ?? [])].map(([market, value]) => [market, structuredClone(value)])),
+    profitTrailingPairStates: new Map([...(state.profitTrailingPairStates ?? [])].map(([market, trailing]) => [market, structuredClone(trailing)])),
   };
 }
 
@@ -215,21 +229,70 @@ export function durableIdentityConflicts(
 }
 
 export interface RecoverableEngineState {
+  resultAccounting?: ResultAccounting;
+  nakedDirectionalDiagnostics?: Map<string, NakedDirectionalDiagnostic>;
+  reversalProtectionStates?: Map<string, ReversalProtectionState>;
+  profitTrailingPairStates?: Map<string, ProfitTrailingPairState>;
   ledger: PaperLedger;
   experiment: ExperimentManifest | null;
   restingOrders: Map<string, RestingPaperOrder>;
   makerReservations: Map<string, string>;
   settledMarkets: Set<string>;
+  /** Fill-time identity, retained only while economic inventory remains. */
+  settlementLookups?: Map<string, BinarySettlementLookup>;
   lastInfrastructureAccrualAt: number;
+  /** Optional only for checkpoints/tests written before durable taker admission. */
+  riskReductionOwners?: Map<string, RiskReductionOwnership>;
+  /** Latest actual execution failure per open episode, shared by all takers. */
+  riskReductionFailures?: Map<string, RiskReductionExecutionFailure>;
 }
 
+export const riskReductionOwnershipSchema = z.object({
+  marketId: z.string().min(1),
+  unhedgedStartedAt: z.string().datetime({ offset: true }),
+  intent: z.enum(["HEDGE_SECOND_LEG", "PROTECTIVE_DE_RISK", "RESCUE_SECOND_LEG", "GUARDIAN_PROTECTIVE_SELL"]),
+  order: paperOrderSchema,
+  admittedResidualQuantity: z.string().refine((v) => d(v).isFinite() && d(v).gt(0)),
+  decisionReceivedAt: z.string().datetime({ offset: true }),
+  state: z.literal("ADMITTED"),
+  deRisk: z.record(z.string(), z.unknown()).optional(),
+}).superRefine((owner, ctx) => {
+  if (owner.order.marketId !== owner.marketId || owner.order.orderType !== "TAKER"
+    || owner.order.status !== "PENDING"
+    || (owner.intent === "GUARDIAN_PROTECTIVE_SELL" && !d(owner.order.quantity).eq(owner.admittedResidualQuantity))
+    || !d(owner.order.quantity).gt(0) || d(owner.order.quantity).gt(owner.admittedResidualQuantity)
+    || owner.order.side !== ((owner.intent === "PROTECTIVE_DE_RISK" || owner.intent === "GUARDIAN_PROTECTIVE_SELL") ? "SELL" : "BUY")) {
+    ctx.addIssue({ code: "custom", message: "invalid risk-reduction taker identity" });
+  }
+});
+export type RiskReductionOwnership = z.infer<typeof riskReductionOwnershipSchema>;
+export const riskReductionExecutionFailureSchema = z.object({
+  ownership: riskReductionOwnershipSchema,
+  reason: z.string().min(1),
+});
+export type RiskReductionExecutionFailure = z.infer<typeof riskReductionExecutionFailureSchema>;
+
+export function unhedgedEpisode(position: Position): string {
+  return position.unhedgedStartedAt ?? position.openedAt;
+}
+
+export const settlementLookupSchema = z.object({
+  marketId: z.string().min(1),
+  slug: z.string().nullable(),
+  endDate: z.string().datetime({ offset: true }),
+  yesMapsTo: z.enum(["UP", "DOWN"]),
+  noMapsTo: z.enum(["UP", "DOWN"]),
+}).refine((lookup) => lookup.yesMapsTo !== lookup.noMapsTo);
+
 const fillPayloadSchema = z.object({
+  nakedDirectionalSoak: z.boolean().optional(),
   fill: paperFillSchema,
   positionId: z.string().min(1),
   reservationAfter: z.string().nullable(),
   restingAfter: restingPaperOrderSchema.nullable().optional(),
-  intent: z.enum(["OPEN_FIRST_LEG", "HEDGE_SECOND_LEG", "PROTECTIVE_DE_RISK", "RESCUE_SECOND_LEG"]).optional(),
+  intent: z.enum(["OPEN_FIRST_LEG", "HEDGE_SECOND_LEG", "PROTECTIVE_DE_RISK", "RESCUE_SECOND_LEG", "GUARDIAN_PROTECTIVE_SELL"]).optional(),
   deRisk: z.record(z.string(), z.unknown()).optional(),
+  settlementLookup: settlementLookupSchema.optional(),
 });
 
 const reservePayloadSchema = z.object({
@@ -277,6 +340,42 @@ export function applyDurableTransition(state: RecoverableEngineState, transition
   }
   try {
     switch (transition.type) {
+      case "RISK_REDUCTION_ADMITTED": {
+        const owner = riskReductionOwnershipSchema.parse(transition.payload.ownership);
+        const owners = state.riskReductionOwners ??= new Map();
+        if (owners.has(owner.marketId)) throw new RecoveryFailClosedError("invariant", "overlapping taker ownership");
+        const position = state.ledger.positions.get(owner.marketId);
+        if (!position?.unpairedOutcome || state.settledMarkets.has(owner.marketId)
+          || unhedgedEpisode(position) !== owner.unhedgedStartedAt
+          || !d(position.unpairedQuantity).eq(owner.admittedResidualQuantity)) {
+          throw new RecoveryFailClosedError("invariant", "admission does not match durable residual");
+        }
+        const failure = state.riskReductionFailures?.get(owner.marketId);
+        if (failure && failure.ownership.unhedgedStartedAt !== owner.unhedgedStartedAt) state.riskReductionFailures!.delete(owner.marketId);
+        owners.set(owner.marketId, owner);
+        return;
+      }
+      case "RISK_REDUCTION_FAILED": {
+        const owner = riskReductionOwnershipSchema.parse(transition.payload.ownership);
+        if (transition.payload.executionFailure !== undefined && typeof transition.payload.executionFailure !== "boolean") {
+          throw new RecoveryFailClosedError("malformed", "invalid execution failure marker");
+        }
+        if (typeof transition.payload.reason !== "string" || !transition.payload.reason) {
+          throw new RecoveryFailClosedError("malformed", "failure missing reason");
+        }
+        const current = state.riskReductionOwners?.get(owner.marketId);
+        if (current?.order.id === owner.order.id && current.unhedgedStartedAt === owner.unhedgedStartedAt) {
+          state.riskReductionOwners!.delete(owner.marketId);
+          const position = state.ledger.positions.get(owner.marketId);
+          if (transition.payload.executionFailure === true && position?.unpairedOutcome
+            && unhedgedEpisode(position) === owner.unhedgedStartedAt
+            && d(position.unpairedQuantity).eq(owner.admittedResidualQuantity)) {
+            (state.riskReductionFailures ??= new Map()).set(owner.marketId,
+              { ownership: owner, reason: transition.payload.reason });
+          }
+        }
+        return;
+      }
     case "EXPERIMENT_STARTED":
     case "EXPERIMENT_START_VALIDATED":
     case "EXPERIMENT_START_ABORTED":
@@ -304,8 +403,11 @@ export function applyDurableTransition(state: RecoverableEngineState, transition
 
           const fresh = new PaperLedger(state.experiment.startingBalance, at);
           state.ledger.restore(fresh.snapshot(), []);
+          state.resultAccounting = emptyResultAccounting();
           state.restingOrders.clear();
           state.makerReservations.clear();
+          state.profitTrailingPairStates?.clear();
+          state.reversalProtectionStates?.clear();
           state.lastInfrastructureAccrualAt = at.getTime();
         }
         return;
@@ -333,10 +435,116 @@ export function applyDurableTransition(state: RecoverableEngineState, transition
         }
         return;
       }
+      case "REVERSAL_PROTECTION_STATE_UPDATED": {
+        const next = reversalProtectionStateSchema.parse(transition.payload.state);
+        const position = state.ledger.positions.get(next.marketId);
+        if (!position?.unpairedOutcome || position.id !== next.positionId
+          || unhedgedEpisode(position) !== next.unhedgedStartedAt || position.unpairedOutcome !== next.heldOutcome
+          || d(position.unpairedQuantity).lte(0) || state.settledMarkets.has(next.marketId)) {
+          throw new RecoveryFailClosedError("invariant", "reversal state does not match durable unpaired episode");
+        }
+        const map = state.reversalProtectionStates ??= new Map<string, ReversalProtectionState>();
+        const previous = map.get(next.marketId);
+        if (previous && isGuardianV2State(previous) && isGuardianV2State(next)) {
+          const wasArmed = previous.phase === "EARLY_RECOVERY_WATCH" || previous.phase === "LATE_CONFIRMATION";
+          const keepsArm = next.phase !== "OBSERVING";
+          if ((wasArmed && keepsArm && (next.sensor !== previous.sensor || next.armedAt !== previous.armedAt
+            || next.deadlineAt !== previous.deadlineAt || next.armRatio !== previous.armRatio
+            || (next.phase !== previous.phase && next.phase !== "PROTECTION_PENDING")))
+            || (previous.lastObservationAt && (!next.lastObservationAt || Date.parse(next.lastObservationAt) < Date.parse(previous.lastObservationAt)))
+            || (previous.lastConsensusAt && (!next.lastConsensusAt || Date.parse(next.lastConsensusAt) < Date.parse(previous.lastConsensusAt)))) {
+            throw new RecoveryFailClosedError("invariant", "Guardian V2 timer or input watermark regressed");
+          }
+        }
+        if (sameReversalEpisode(previous, next) && previous
+          && (previous.confirmedAt || next.revision !== previous.revision + 1
+            || isGuardianV2State(previous) !== isGuardianV2State(next)
+            || (isGuardianV2State(previous) && isGuardianV2State(next)
+              && (next.entryPrice !== previous.entryPrice || Date.parse(next.updatedAt) < Date.parse(previous.updatedAt)))
+            || (!isGuardianV2State(previous) && !isGuardianV2State(next)
+              && !previous.countedConsensusEventIds.every((id, i) => next.countedConsensusEventIds[i] === id)))) {
+          throw new RecoveryFailClosedError("invariant", "reversal state regressed");
+        }
+        if ((!previous || !sameReversalEpisode(previous, next)) && next.revision !== 1) {
+          throw new RecoveryFailClosedError("invariant", "reversal episode did not start at revision one");
+        }
+        map.set(next.marketId, next);
+        return;
+      }
+      case "PROFIT_TRAILING_PAIR_STATE_UPDATED": {
+        const trailing = profitTrailingPairStateSchema.parse(transition.payload.state);
+        const position = state.ledger.positions.get(trailing.marketId);
+        if (!position?.unpairedOutcome || position.id !== trailing.positionId
+          || unhedgedEpisode(position) !== trailing.unhedgedStartedAt
+          || d(position.unpairedQuantity).lte(0)) {
+          throw new RecoveryFailClosedError("invariant", "profit trailing state does not match durable unpaired episode");
+        }
+        const map = state.profitTrailingPairStates ??= new Map();
+        const previous = map.get(trailing.marketId);
+        if (previous && previous.positionId === trailing.positionId
+          && previous.unhedgedStartedAt === trailing.unhedgedStartedAt
+          && trailing.revision <= previous.revision) {
+          throw new RecoveryFailClosedError("invariant", "profit trailing revision did not advance");
+        }
+        map.set(trailing.marketId, trailing);
+        return;
+      }
       case "PAPER_FILL": {
         const payload = fillPayloadSchema.parse(transition.payload);
+        if (payload.settlementLookup && payload.settlementLookup.marketId !== payload.fill.marketId) {
+          throw new RecoveryFailClosedError("invariant", "fill settlement lookup market mismatch");
+        }
+        const owner = state.riskReductionOwners?.get(payload.fill.marketId);
+        if (owner?.order.id === payload.fill.orderId) {
+          const position = state.ledger.positions.get(owner.marketId);
+          if (!position?.unpairedOutcome || unhedgedEpisode(position) !== owner.unhedgedStartedAt
+            || !d(position.unpairedQuantity).eq(owner.admittedResidualQuantity)
+            || payload.fill.tokenId !== owner.order.tokenId || payload.fill.outcome !== owner.order.outcome
+            || payload.fill.side !== owner.order.side || !d(payload.fill.quantity).eq(owner.order.quantity)) {
+            throw new RecoveryFailClosedError("invariant", "fill does not match admitted taker ownership");
+          }
+        }
         applyFillReservation(state, payload.fill, payload.reservationAfter, new Date(transition.occurredAt));
+        const previous = state.ledger.positions.get(payload.fill.marketId);
         state.ledger.applyFill(payload.fill, { positionId: payload.positionId });
+        const remaining = state.ledger.positions.get(payload.fill.marketId);
+        accountResultFill(state.resultAccounting ??= emptyResultAccounting(), payload.fill, previous, remaining);
+        const reversal = state.reversalProtectionStates?.get(payload.fill.marketId);
+        if (reversal && (!remaining?.unpairedOutcome || remaining.id !== reversal.positionId
+          || unhedgedEpisode(remaining) !== reversal.unhedgedStartedAt || remaining.unpairedOutcome !== reversal.heldOutcome
+          || d(remaining.unpairedQuantity).lte(0))) state.reversalProtectionStates!.delete(payload.fill.marketId);
+        const trailing = state.profitTrailingPairStates?.get(payload.fill.marketId);
+        if (trailing && (!remaining?.unpairedOutcome || remaining.id !== trailing.positionId
+          || unhedgedEpisode(remaining) !== trailing.unhedgedStartedAt || d(remaining.unpairedQuantity).lte(0))) {
+          state.profitTrailingPairStates!.delete(payload.fill.marketId);
+        }
+        if (payload.nakedDirectionalSoak === true && remaining) {
+          const diagnostics = state.nakedDirectionalDiagnostics ??= new Map();
+          if (!diagnostics.has(payload.fill.marketId)) {
+            diagnostics.set(payload.fill.marketId, createNakedDirectionalDiagnostic(remaining, payload.fill));
+          }
+          const diagnostic = diagnostics.get(payload.fill.marketId)!;
+          diagnostic.entryPrice = payload.fill.outcome === "UP" ? remaining.averageUpCost : remaining.averageDownCost;
+          diagnostic.entryQuantity = remaining.unpairedQuantity;
+          diagnostic.entryFee = remaining.totalFees;
+        }
+        const lookups = state.settlementLookups ??= new Map();
+        if (remaining && (d(remaining.upQuantity).gt(0) || d(remaining.downQuantity).gt(0))) {
+          // Preserve the original economic mapping across hedges and rediscovery.
+          if (payload.settlementLookup && !lookups.has(payload.fill.marketId)) {
+            lookups.set(payload.fill.marketId, structuredClone(payload.settlementLookup));
+          }
+        } else lookups.delete(payload.fill.marketId);
+        const failure = state.riskReductionFailures?.get(payload.fill.marketId);
+        if (failure && (!remaining?.unpairedOutcome || !d(remaining.unpairedQuantity).gt(0)
+          || unhedgedEpisode(remaining) !== failure.ownership.unhedgedStartedAt
+          || !d(remaining.unpairedQuantity).eq(failure.ownership.admittedResidualQuantity))) {
+          state.riskReductionFailures!.delete(payload.fill.marketId);
+        }
+        // Completion is atomic with the economic fill, never a later release.
+        if (state.riskReductionOwners?.get(payload.fill.marketId)?.order.id === payload.fill.orderId) {
+          state.riskReductionOwners.delete(payload.fill.marketId);
+        }
         if (payload.restingAfter) {
           if (!d(payload.restingAfter.remaining).gt(0)) state.restingOrders.delete(payload.fill.orderId);
           else state.restingOrders.set(payload.fill.orderId, payload.restingAfter);
@@ -347,7 +555,27 @@ export function applyDurableTransition(state: RecoverableEngineState, transition
       }
       case "POSITION_SETTLED": {
         const payload = settlementPayloadSchema.parse(transition.payload);
-        state.ledger.settlePosition(payload.marketId, payload.upPayoff, payload.downPayoff, new Date(payload.settledAt));
+        const settled = state.ledger.settlePosition(payload.marketId, payload.upPayoff, payload.downPayoff, new Date(payload.settledAt));
+        if (settled) completeResult(state.resultAccounting ??= emptyResultAccounting(), payload.marketId, settled.realizedDelta, settled.position.totalFees);
+        state.settlementLookups?.delete(payload.marketId);
+        state.riskReductionOwners?.delete(payload.marketId);
+        state.riskReductionFailures?.delete(payload.marketId);
+        state.nakedDirectionalDiagnostics?.delete(payload.marketId);
+        state.profitTrailingPairStates?.delete(payload.marketId);
+        state.reversalProtectionStates?.delete(payload.marketId);
+        return;
+      }
+      case "NAKED_DIRECTIONAL_OBSERVATION": {
+        const diagnostics = z.array(nakedDirectionalDiagnosticSchema).parse(transition.payload.diagnostics);
+        for (const diagnostic of diagnostics) {
+          const position = state.ledger.positions.get(diagnostic.marketId);
+          if (!position || position.id !== diagnostic.positionId) throw new RecoveryFailClosedError("invariant", "soak observation without real position");
+          const map = state.nakedDirectionalDiagnostics ??= new Map();
+          const previous = map.get(diagnostic.marketId);
+          // Live books may advance while this compact snapshot waits on the
+          // durable gate. Never overwrite newer in-memory extrema.
+          if (!previous || previous.revision < diagnostic.revision) map.set(diagnostic.marketId, mergeNakedDirectionalObservation(previous, diagnostic));
+        }
         return;
       }
       case "LEDGER_MARK_TO_MARKET": {
@@ -399,6 +627,16 @@ export function validatePostReplayInvariants(
   expectedCursor: number,
 ): ReplayInvariantReport {
   const reasons: string[] = [];
+  if (state.resultAccounting && !resultAccountingSchema.safeParse(state.resultAccounting).success) reasons.push("result_accounting_invalid");
+  for (const marketId of Object.keys(state.resultAccounting?.episodes ?? {})) {
+    if (!state.ledger.positions.has(marketId)) reasons.push("result_episode_without_position");
+  }
+  if (state.resultAccounting?.available) {
+    for (const position of state.ledger.positions.values()) {
+      const episode = state.resultAccounting.episodes[position.marketId];
+      if (!episode || !d(episode.fees).eq(position.totalFees)) reasons.push("result_episode_fees_mismatch");
+    }
+  }
   let ledger: LedgerState;
   try {
     ledger = ledgerStateSchema.parse(state.ledger.snapshot());
@@ -436,6 +674,60 @@ export function validatePostReplayInvariants(
     reasons.push(`reserved_cash_mismatch:${reserved.toFixed()}!=${reservationSum.toFixed()}`);
   }
   const status = state.experiment?.status;
+  for (const [marketId, diagnostic] of state.nakedDirectionalDiagnostics ?? []) {
+    if (!nakedDirectionalDiagnosticSchema.safeParse(diagnostic).success
+      || diagnostic.marketId !== marketId || state.ledger.positions.get(marketId)?.id !== diagnostic.positionId) {
+      reasons.push("naked_directional_diagnostic_invalid");
+    }
+  }
+  if (state.experiment?.riskConfiguration.profitTrailingPairSoakEnabled === true) {
+    const risk = state.experiment.riskConfiguration;
+    const target = Number(risk.profitTrailingPairTargetEdge ?? risk.normalHedgeMinLockedPairEdge);
+    const arm = Number(risk.profitTrailingPairArmEdge);
+    const retrace = Number(risk.profitTrailingPairRetraceEdge);
+    if (!Number.isFinite(target) || !Number.isFinite(arm) || !Number.isFinite(retrace)
+      || target <= 0 || arm < 0 || retrace <= 0 || arm >= target || retrace >= target
+      || risk.nakedDirectionalSoakEnabled === true
+      || risk.profitTrailingPairExecutionStyle !== "TAKER") {
+      reasons.push("profit_trailing_pair_config_invalid");
+    }
+  }
+  const reversalRisk = state.experiment?.riskConfiguration;
+  const reversalProtectionActive = status === "RUNNING" || status === "ENTRY_CLOSED";
+  if (reversalProtectionActive && reversalRisk?.reversalProtectionEnabled === true
+    && (reversalRisk.profitTrailingPairSoakEnabled !== true || reversalRisk.reversalProtectionWindowMs !== 180000
+      || reversalRisk.guardianVersion !== 2 || !isLockedGuardianV2Config(reversalRisk.guardianV2Config)
+      || reversalRisk.profitTrailingPairTargetEdge !== 0.12 || reversalRisk.normalHedgeMinLockedPairEdge !== 0.12
+      || reversalRisk.profitTrailingPairArmEdge !== 0.05 || reversalRisk.profitTrailingPairRetraceEdge !== 0.02
+      || reversalRisk.profitTrailingPairExecutionStyle !== "TAKER" || reversalRisk.nakedDirectionalSoakEnabled === true)) {
+    reasons.push("reversal_protection_config_invalid");
+  }
+  for (const [marketId, reversal] of state.reversalProtectionStates ?? []) {
+    const position = state.ledger.positions.get(marketId);
+    if (!reversalProtectionStateSchema.safeParse(reversal).success || reversal.marketId !== marketId
+      || (reversalProtectionActive && !isGuardianV2State(reversal))
+      || reversalRisk?.reversalProtectionEnabled !== true || !position?.unpairedOutcome
+      || !sameReversalEpisode(reversal, { marketId, positionId: position.id,
+        unhedgedStartedAt: unhedgedEpisode(position), heldOutcome: position.unpairedOutcome })
+      || d(position.unpairedQuantity).lte(0) || state.settledMarkets.has(marketId)) reasons.push("reversal_protection_state_invalid");
+  }
+  for (const [marketId, trailing] of state.profitTrailingPairStates ?? []) {
+    const position = state.ledger.positions.get(marketId);
+    if (!profitTrailingPairStateSchema.safeParse(trailing).success || trailing.marketId !== marketId
+      || !position?.unpairedOutcome || position.id !== trailing.positionId
+      || unhedgedEpisode(position) !== trailing.unhedgedStartedAt || d(position.unpairedQuantity).lte(0)) {
+      reasons.push("profit_trailing_pair_state_invalid");
+    }
+  }
+  for (const [marketId, owner] of state.riskReductionOwners ?? []) {
+    if (!riskReductionOwnershipSchema.safeParse(owner).success || marketId !== owner.marketId) reasons.push("risk_reduction_owner_invalid");
+    if (state.settledMarkets.has(marketId)) reasons.push("settled_and_pending_taker");
+  }
+  for (const [marketId, failure] of state.riskReductionFailures ?? []) {
+    if (!riskReductionExecutionFailureSchema.safeParse(failure).success || marketId !== failure.ownership.marketId) {
+      reasons.push("risk_reduction_failure_invalid");
+    }
+  }
   if (status && !["IDLE", "CREATED", "RUNNING", "ENTRY_CLOSED", "COMPLETED", "FAILED", "ABORTED_START"].includes(status)) {
     reasons.push("experiment_status_invalid");
   }
@@ -490,6 +782,7 @@ export function parseCheckpointDerivedAuditCursor(payload: Record<string, unknow
 }
 
 export const CRITICAL_AUDIT_TYPES = [
+  "NAKED_DIRECTIONAL_SUMMARY",
   "PAPER_FILL",
   "PAPER_MAKER_RESERVED",
   "PAPER_MAKER_RELEASED",

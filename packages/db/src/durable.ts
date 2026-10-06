@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
-import { d, experimentManifestSchema, ledgerStateSchema, positionSchema, restingPaperOrderSchema } from "@pm/core";
+import { d, experimentManifestSchema, ledgerStateSchema, positionSchema, restingPaperOrderSchema, nakedDirectionalDiagnosticSchema, profitTrailingPairStateSchema, reversalProtectionStateSchema } from "@pm/core";
 
 /** Closed set of replay-authoritative paper-state transitions. */
 export const DURABLE_TRANSITION_TYPES = [
@@ -12,7 +12,12 @@ export const DURABLE_TRANSITION_TYPES = [
   "PAPER_MAKER_RESERVED",
   "PAPER_MAKER_RELEASED",
   "PAPER_ORDER_CANCELLED",
+  "RISK_REDUCTION_ADMITTED",
+  "RISK_REDUCTION_FAILED",
   "PAPER_FILL",
+  "NAKED_DIRECTIONAL_OBSERVATION",
+  "PROFIT_TRAILING_PAIR_STATE_UPDATED",
+  "REVERSAL_PROTECTION_STATE_UPDATED",
   "POSITION_SETTLED",
   "LEDGER_MARK_TO_MARKET",
   "INFRASTRUCTURE_COST_ACCRUED",
@@ -132,6 +137,18 @@ export function hashCheckpointPayload(payload: Record<string, unknown>): string 
 /** Recovery authority requires structural state invariants in addition to a hash. */
 export function isSemanticallyValidCheckpointPayload(payload: Record<string, unknown>): boolean {
   if (!payload || typeof payload !== "object") return false;
+  if (payload.nakedDirectionalDiagnostics !== undefined) {
+    if (!Array.isArray(payload.nakedDirectionalDiagnostics)) return false;
+    if (!payload.nakedDirectionalDiagnostics.every((item) => nakedDirectionalDiagnosticSchema.safeParse(item).success)) return false;
+  }
+  if (payload.reversalProtectionStates !== undefined) {
+    if (!Array.isArray(payload.reversalProtectionStates)) return false;
+    if (!payload.reversalProtectionStates.every((item) => reversalProtectionStateSchema.safeParse(item).success)) return false;
+  }
+  if (payload.profitTrailingPairStates !== undefined) {
+    if (!Array.isArray(payload.profitTrailingPairStates)) return false;
+    if (!payload.profitTrailingPairStates.every((item) => profitTrailingPairStateSchema.safeParse(item).success)) return false;
+  }
   const cursor = payload.durableCursor;
   if (cursor != null && (typeof cursor !== "number" || !Number.isInteger(cursor) || cursor < 0)) return false;
   const ledger = payload.ledger;

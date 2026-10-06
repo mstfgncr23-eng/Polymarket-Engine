@@ -169,7 +169,7 @@ export interface RiskInput {
   directionalExposureUsd: string;
   unhedgedExposureUsd: string;
   unhedgedDurationMs: number;
-  intent?: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK" | "RESCUE_SECOND_LEG";
+  intent?: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK" | "RESCUE_SECOND_LEG" | "GUARDIAN_PROTECTIVE_SELL";
   projectedMarketExposureUsd?: string;
   projectedTotalExposureUsd?: string;
   projectedDirectionalExposureUsd?: string;
@@ -185,6 +185,12 @@ export interface RiskInput {
   expectedEdge: number;
   /** Fee/slippage-adjusted expected return divided by executable notional. */
   expectedROI: number;
+  /**
+   * Current-book fee-inclusive terminal PnL for the experiment's profit-trailing
+   * pair lock. This field alone grants no exemption: evaluateRisk additionally
+   * requires verifiedReducingHedge() against the CURRENT durable residual.
+   */
+  profitTrailingLockedPnlUsd?: string;
   spread: number;
   signalConfidence: number;
   signalExpiresAt: Date;
@@ -231,7 +237,7 @@ export function evaluateRisk(input: RiskInput, limits: RiskLimits): RiskEvaluati
   const vetoes: RiskReasonCode[] = [];
   const age = (value: Date | null) => value ? input.now.getTime() - value.getTime() : Number.POSITIVE_INFINITY;
   const hedge = input.intent === "HEDGE_SECOND_LEG";
-  const protective = input.intent === "PROTECTIVE_DE_RISK";
+  const protective = input.intent === "PROTECTIVE_DE_RISK" || input.intent === "GUARDIAN_PROTECTIVE_SELL";
   const rescue = input.intent === "RESCUE_SECOND_LEG";
   const riskReducingIntent = hedge || rescue || protective;
   // RESCUE_SECOND_LEG is a risk-only pair-lock: like the protective SELL it
@@ -248,6 +254,10 @@ export function evaluateRisk(input: RiskInput, limits: RiskLimits): RiskEvaluati
     projectedUnhedgedExposureUsd: input.projectedUnhedgedExposureUsd,
     unhedgedExposureUsd: input.unhedgedExposureUsd,
   });
+  const profitLockPnl = input.profitTrailingLockedPnlUsd !== undefined
+    ? d(input.profitTrailingLockedPnlUsd) : null;
+  const verifiedProfitableTrailingHedge = verifiedHedge
+    && profitLockPnl !== null && profitLockPnl.isFinite() && profitLockPnl.gt(0);
   const verifiedRescue = verifiedRescuePairLock({
     rescueIntent: rescue,
     candidate: input.rescueCandidate ?? null,
@@ -269,18 +279,19 @@ export function evaluateRisk(input: RiskInput, limits: RiskLimits): RiskEvaluati
     && d(directionalExposure).lte(input.directionalExposureUsd)
     && d(unhedgedExposure).lt(input.unhedgedExposureUsd);
   if (age(input.marketFeedAt) > limits.staleFeedTimeoutMs) vetoes.push("MARKET_FEED_STALE");
-  // RESCUE_SECOND_LEG safety depends on the executable Polymarket book + binary
-  // pair identity, NOT on directional fair-value prediction: the rescue BUY is
-  // exempt from reference-provider availability/staleness gates (documented
-  // policy). Every other hard safety gate below still applies.
-  const rescueExemptFromReference = !protective && !rescue;
-  if (rescueExemptFromReference && input.referenceProviderBlocked === true) vetoes.push("REFERENCE_PROVIDER_BLOCKED");
-  if (rescueExemptFromReference && input.referenceRequired === true) {
+  // Terminal pair locks depend on the executable Polymarket book + verified
+  // opposite-token residual identity, not on directional reference prediction.
+  // Protective/rescue actions keep their existing exemption. The trailing
+  // exemption is narrower: it is granted only when the HEDGE is structurally
+  // reducing AND the engine proves current-book fee-inclusive locked PnL > 0.
+  const directionalReferenceGated = !protective && !rescue && !verifiedProfitableTrailingHedge;
+  if (directionalReferenceGated && input.referenceProviderBlocked === true) vetoes.push("REFERENCE_PROVIDER_BLOCKED");
+  if (directionalReferenceGated && input.referenceRequired === true) {
     if (age(input.referenceFeedAt ?? null) > limits.staleFeedTimeoutMs) {
       vetoes.push("REFERENCE_FEED_STALE");
       if ((input.asset ?? "BTC") === "BTC") vetoes.push("BTC_FEED_STALE");
     }
-  } else if (rescueExemptFromReference && input.referenceRequired !== false && age(input.btcFeedAt) > limits.staleFeedTimeoutMs) {
+  } else if (directionalReferenceGated && input.referenceRequired !== false && age(input.btcFeedAt) > limits.staleFeedTimeoutMs) {
     vetoes.push("BTC_FEED_STALE");
   }
   if (!input.databaseAvailable) vetoes.push("DATABASE_UNAVAILABLE");
@@ -310,17 +321,19 @@ export function evaluateRisk(input: RiskInput, limits: RiskLimits): RiskEvaluati
   const firstLegMinExpectedROI = normalFirstLegRegime ? limits.normalFirstLegMinExpectedROI : limits.minExpectedROI;
   // A rescue pair-lock may intentionally lock a small loss; the alpha floors
   // are skipped ONLY for structurally verified rescue candidates.
-  if (!protective && !rescue && input.expectedEdge < firstLegMinExpectedEdge) vetoes.push("MINIMUM_EXPECTED_EDGE");
+  if (!protective && !rescue && !verifiedProfitableTrailingHedge
+    && input.expectedEdge < firstLegMinExpectedEdge) vetoes.push("MINIMUM_EXPECTED_EDGE");
   if (!riskReducingIntent && (!Number.isFinite(input.expectedROI) || input.expectedROI < firstLegMinExpectedROI)) {
     vetoes.push("MINIMUM_EXPECTED_ROI");
   }
-  if (!protective && !rescue && input.spread > limits.maxSpread) vetoes.push("MAXIMUM_SPREAD");
+  if (!protective && !rescue && !verifiedProfitableTrailingHedge
+    && input.spread > limits.maxSpread) vetoes.push("MAXIMUM_SPREAD");
   if (!protective && !verifiedHedge && !verifiedRescue && input.signalConfidence < limits.minSignalConfidence) vetoes.push("MINIMUM_SIGNAL_CONFIDENCE");
   if (!protective && !verifiedHedge && !verifiedRescue && input.signalExpiresAt.getTime() <= input.now.getTime()) vetoes.push("SIGNAL_EXPIRED");
   if (!protective && !rescue && input.externalSignalsLastMinute >= limits.maxExternalSignalsPerMinute) vetoes.push("MAXIMUM_EXTERNAL_SIGNAL_RATE");
   // Cooldown throttles fresh directional entries. It must never trap a risk-reducing action.
   if (!riskReducingIntent && input.lastStrategyTradeAt && input.now.getTime() - input.lastStrategyTradeAt.getTime() < limits.strategyCooldownMs) vetoes.push("STRATEGY_COOLDOWN");
-  if (!protective && !rescue && input.duplicateTrade) vetoes.push("DUPLICATE_TRADE");
+  if (!protective && !rescue && !verifiedProfitableTrailingHedge && input.duplicateTrade) vetoes.push("DUPLICATE_TRADE");
   if (!input.feeScheduleKnown) vetoes.push("UNKNOWN_FEE_SCHEDULE");
   if (!protective && !input.experimentEntryOpen) vetoes.push("EXPERIMENT_ENTRY_CLOSED");
   if (input.marketEntryQualified === false && !riskReducingIntent) vetoes.push("MARKET_NOT_ENTRY_QUALIFIED");
@@ -330,7 +343,11 @@ export function evaluateRisk(input: RiskInput, limits: RiskLimits): RiskEvaluati
   if (rescue && !verifiedRescue) vetoes.push("RESCUE_NOT_VERIFIED_REDUCING");
   const requiredCash = input.requiredCashUsd ?? input.orderSizeUsd;
   if (input.availableCashUsd !== undefined && d(input.availableCashUsd).lt(requiredCash)) vetoes.push("INSUFFICIENT_CASH");
-  if (input.executionErrorsLastHour >= limits.maxExecutionErrorsPerHour) vetoes.push("ABNORMAL_EXECUTION_ERRORS");
+  // Guardian's emergency full SELL must not be trapped by unrelated hourly
+  // errors. Its actual execution failures and hard authority fences remain in
+  // the shared durable engine lifecycle; all other intents keep this veto.
+  if (input.intent !== "GUARDIAN_PROTECTIVE_SELL"
+    && input.executionErrorsLastHour >= limits.maxExecutionErrorsPerHour) vetoes.push("ABNORMAL_EXECUTION_ERRORS");
   if (!protective && input.externalRiskRecommendedVeto) vetoes.push("EXTERNAL_RISK_RECOMMENDED_VETO");
   if (input.shuttingDown) vetoes.push("SHUTTING_DOWN");
 

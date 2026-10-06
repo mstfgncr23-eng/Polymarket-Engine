@@ -190,7 +190,7 @@ export function decideProtectivePaperOrder(input: {
   traceId: string;
   triggerId: string;
 }): PaperOrderDecision {
-  if (input.candidate.intent !== "PROTECTIVE_DE_RISK" || input.candidate.side !== "SELL") {
+  if ((input.candidate.intent !== "PROTECTIVE_DE_RISK" && input.candidate.intent !== "GUARDIAN_PROTECTIVE_SELL") || input.candidate.side !== "SELL") {
     throw new Error("INVALID_PROTECTIVE_DE_RISK_CANDIDATE");
   }
 
@@ -224,7 +224,7 @@ export function decideProtectivePaperOrder(input: {
   const risk = evaluateRisk({
     ...input.baseRisk,
     traceId: input.traceId,
-    intent: "PROTECTIVE_DE_RISK",
+    intent: input.candidate.intent,
     availableLiquidityUsd: orderBookLiquidityUsd(snapshot, "SELL"),
     expectedEdge: 0,
     expectedROI: 0,

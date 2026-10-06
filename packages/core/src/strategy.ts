@@ -19,7 +19,7 @@ export interface StrategyCandidate {
   side: "BUY" | "SELL";
   quantity: string;
   limitPrice: string;
-  intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK" | "RESCUE_SECOND_LEG";
+  intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK" | "RESCUE_SECOND_LEG" | "GUARDIAN_PROTECTIVE_SELL";
   /** Raw expected value in USD/share for a $1 binary payout. */
   rawEdgeUsdPerShare?: number;
   /** @deprecated Compatibility alias for rawEdgeUsdPerShare. */

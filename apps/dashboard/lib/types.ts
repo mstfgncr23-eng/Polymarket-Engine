@@ -1,4 +1,17 @@
+export interface CacheMetadata {
+  lastUpstreamSync: string | null;
+  sourceGeneratedAt: string | null;
+  cacheAgeMs: number | null;
+  mode: "LOW_IMPACT" | "IDLE" | "DEGRADED";
+  pollIntervalMs: number;
+  staleAfterMs: number;
+  upstreamReachable: boolean;
+  stale: boolean;
+}
+
 export interface DashboardSnapshot {
+  cache?: CacheMetadata;
+  tradingResults?: { completed: number; wins: number; losses: number; breakeven: number; winRate: number | null } | null;
   paperMode: true;
   generatedAt: string;
   engine: {
@@ -42,7 +55,6 @@ export interface DashboardSnapshot {
   decisionFeed: Array<{ id: string; at: string; type: string; traceId: string; marketId: string | null; asset?: string | null; detail: Record<string, unknown> }>;
   grokActivity: { acceptedSignals: number; rejectedSignals: number; duplicates: number; unauthorizedCalls: number; rateLimitedCalls: number; lastSeenAt: string | null; byAgent: Record<string, number> };
   recentTriggers: Array<{ id: string; traceId?: string; kind: string; severity: number; marketId: string | null; asset?: string | null; createdAt: string; expiresAt: string }>;
-  activations?: Array<{ triggerId: string; role?: string; provider: string; ok?: boolean; skipped?: boolean; errorCode?: string | null; reason?: string; grokWakeObserved: false; at: string }>;
   activationLatency?: Array<{ triggerId: string; triggerCreatedAt: string; activationRequestedAt: string | null; activationSentAt: string | null; firstMcpRequestAt: string | null; firstAcceptedSignalAt: string | null }>;
   unattributedMcp?: { lastAt: string | null; count: number; lastTool: string | null };
   discovery?: { qualified: Array<{ marketId: string; slug: string; asset: string | null; tokens: string[] }>; rejected: Array<{ id: string; slug: string; title: string; reasonCodes: string[] }> };

@@ -116,7 +116,7 @@ describe("native close-vs-entry linearization", () => {
 
       const events = await journal.readAll();
       expect(events.some((event) => event.type === "TRIGGER_EVENT")).toBe(true);
-      expect(events.some((event) => event.type === "GROK_ACTIVATION_DECISION")).toBe(true);
+      expect(events.some((event) => event.type === "GROK_ACTIVATION_DECISION")).toBe(false);
       expect(events.filter((event) => event.type === "PAPER_ORDER_CREATED")).toHaveLength(0);
       expect(events.filter((event) => event.type === "PAPER_FILL")).toHaveLength(0);
       expect(engine.ledger.positions.size).toBe(0);

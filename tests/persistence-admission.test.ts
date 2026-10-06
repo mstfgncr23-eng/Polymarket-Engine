@@ -178,7 +178,7 @@ describe("persistence admission keeps live inputs in memory", () => {
         "TRIGGER_EVENT", "GROK_ACTIVATION_DECISION", "GROK_ACTIVATION_RESULT", "GROK_SIGNAL_ACCEPTED",
       ] });
       expect(events.some((event) => event.type === "TRIGGER_EVENT" && event.payload.experimentId === engine.experimentManifest()?.id)).toBe(true);
-      expect(events.some((event) => event.type === "GROK_ACTIVATION_DECISION")).toBe(true);
+      expect(events.some((event) => event.type === "GROK_ACTIVATION_DECISION")).toBe(false);
       expect(events.some((event) => event.type === "GROK_SIGNAL_ACCEPTED")).toBe(true);
     } finally {
       await engine.stop();

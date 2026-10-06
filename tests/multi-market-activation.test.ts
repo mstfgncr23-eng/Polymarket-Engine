@@ -271,9 +271,7 @@ describe("Grok activation 16-29", () => {
     await engine.registerTriggerForResearch(event);
     engine.noteMcpRequest("get_recent_triggers");
     const latency = engine.activation.snapshot().find((item) => item.triggerId === event.id);
-    expect(latency?.triggerCreatedAt).toBe(event.createdAt);
-    expect(latency?.firstMcpRequestAt).toBeNull();
-    expect(latency?.firstAcceptedSignalAt).toBeNull();
+    expect(latency).toBeUndefined();
     expect(engine.activation.unattributedSnapshot().count).toBe(1);
     expect(engine.activation.unattributedSnapshot().lastTool).toBe("get_recent_triggers");
     expect(engine.state.snapshot().unattributedMcp.count).toBe(1);

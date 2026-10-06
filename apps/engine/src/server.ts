@@ -172,8 +172,7 @@ export async function createApiServer(input: {
   getAlphaResearchContext?(triggerId: string): Record<string, unknown> | null;
   startExperiment?: () => Promise<Record<string, unknown>>;
   closeExperimentEntries?: () => Promise<Record<string, unknown>>;
-  getNativeV2ShadowSnapshot?: () => unknown;
-  exportNativeV2Shadow?: () => unknown;
+  getGuardianShadowState?: () => Record<string, unknown>;
   engineReadToken?: string;
   operatorToken?: string;
   metricsToken?: string;
@@ -318,23 +317,17 @@ export async function createApiServer(input: {
     if (denied) return denied;
     return input.state.snapshot();
   });
-  app.get("/api/native-v2/shadow", async (request, reply) => {
+  // Read-only observation surface for the external two-stage Guardian shadow soak.
+  // The callback is side-effect-free and returns canonical engine authority
+  // facts plus monitored token metadata. It never submits/cancels orders.
+  app.get("/api/shadow/guardian-state", async (request, reply) => {
     const denied = await requireRead(request, reply);
     if (denied) return denied;
-    if (!input.getNativeV2ShadowSnapshot) return reply.code(503).send({ error: "NATIVE_V2_SHADOW_UNAVAILABLE" });
+    if (!input.getGuardianShadowState) return reply.code(503).send({ error: "GUARDIAN_SHADOW_UNAVAILABLE" });
     reply.header("Cache-Control", "no-store");
-    return input.getNativeV2ShadowSnapshot();
+    return input.getGuardianShadowState();
   });
-  app.get("/api/native-v2/shadow/export", async (request, reply) => {
-    const denied = await requireRead(request, reply);
-    if (denied) return denied;
-    if (!input.exportNativeV2Shadow) return reply.code(503).send({ error: "NATIVE_V2_SHADOW_EXPORT_UNAVAILABLE" });
-    const payload = input.exportNativeV2Shadow();
-    const experiment = (input.state.experimentId ?? "idle").replace(/[^A-Za-z0-9._-]/g, "_");
-    reply.header("Cache-Control", "no-store");
-    reply.header("Content-Disposition", `attachment; filename="native-v2-shadow-${experiment}.json"`);
-    return reply.type("application/json; charset=utf-8").send(JSON.stringify(payload));
-  });
+
   app.get("/api/history/equity", async (request, reply) => {
     const denied = await requireRead(request, reply);
     if (denied) return denied;

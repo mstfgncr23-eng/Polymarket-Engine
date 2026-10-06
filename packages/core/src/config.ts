@@ -13,6 +13,8 @@ export const riskLimitsSchema = z.object({
   minLiquidityUsd: z.number().nonnegative().default(100),
   /** Minimum net expected value in USD/share for a $1 binary payout. */
   minExpectedEdge: z.number().min(0).max(1).default(0.015),
+  /** Dedicated gross locked pair edge floor for NORMAL HEDGE_SECOND_LEG only. */
+  normalHedgeMinLockedPairEdge: z.number().min(0).max(1).default(0.015),
   /**
    * Minimum fee/slippage-adjusted expected return on executable first-leg
    * notional. Unlike the absolute edge floor, this stays economically
@@ -87,6 +89,26 @@ export type QualificationConfig = z.infer<typeof qualificationConfigSchema>;
 export const engineEnvSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
   TRADING_MODE: z.literal("paper").default("paper"),
+  /** Explicit PAPER diagnostic authority: actual first legs held to resolution. */
+  NAKED_DIRECTIONAL_SOAK_ENABLED: z.preprocess(
+    (value) => value === undefined ? undefined : value === true || value === "true" || value === "1",
+    z.boolean().optional(),
+  ).default(false),
+  /** PAPER experiment: .12 target with profit high-water trailing protection. */
+  PROFIT_TRAILING_PAIR_SOAK_ENABLED: z.preprocess(
+    (value) => value === undefined ? undefined : value === true || value === "true" || value === "1",
+    z.boolean().optional(),
+  ).default(false),
+  PROFIT_TRAILING_PAIR_ARM_EDGE: z.coerce.number().min(0).max(1).default(0.05),
+  PROFIT_TRAILING_PAIR_RETRACE_EDGE: z.coerce.number().positive().max(1).default(0.02),
+  /** Locked Guardian V2 PAPER profit-trailing authority for new manifests, default OFF. */
+  REVERSAL_PROTECTION_ENABLED: z.preprocess(
+    (value) => value === undefined ? undefined : value === true || value === "true" || value === "1",
+    z.boolean().optional(),
+  ).default(false),
+  /** Legacy manifest compatibility fields. V2 thresholds are sealed constants in guardian-v2.ts. */
+  REVERSAL_PROTECTION_WINDOW_MS: z.coerce.number().int().positive().default(180000),
+  REVERSAL_PROTECTION_OPPOSITE_COUNT: z.coerce.number().int().positive().default(3),
   PORT: z.coerce.number().int().positive().default(8080),
   LOG_LEVEL: z.string().default("info"),
   DATABASE_URL: z.string().url().optional(),
@@ -94,6 +116,8 @@ export const engineEnvSchema = z.object({
   PAPER_START_BALANCE: z.coerce.number().positive().default(1000),
   PAPER_EXECUTION_LATENCY_MS: z.coerce.number().int().nonnegative().default(150),
   PAPER_EXECUTION_STYLE: z.enum(["TAKER", "MAKER"]).default("TAKER"),
+  /** Runtime override for NORMAL HEDGE_SECOND_LEG gross locked pair edge floor. */
+  NORMAL_HEDGE_MIN_LOCKED_PAIR_EDGE: z.coerce.number().min(0).max(1).default(0.015),
   EXPERIMENT_DURATION_HOURS: z.coerce.number().positive().default(48),
   EXPERIMENT_CLOSE_POLICY: z.enum(["observe_until_settlement", "mark_to_market"]).default("observe_until_settlement"),
   ENGINE_REGION: z.string().default("fra"),

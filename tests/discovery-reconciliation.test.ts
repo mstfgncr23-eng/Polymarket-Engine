@@ -368,14 +368,13 @@ describe("per-trigger MCP latency attribution", () => {
 
     engine.noteMcpRequest("get_recent_triggers");
     const afterPoll = engine.activation.snapshot();
-    expect(afterPoll.find((item) => item.triggerId === first.id)?.firstMcpRequestAt).toBeNull();
-    expect(afterPoll.find((item) => item.triggerId === second.id)?.firstMcpRequestAt).toBeNull();
+    expect(afterPoll).toEqual([]);
     expect(engine.activation.unattributedSnapshot().count).toBe(1);
 
     engine.noteMcpRequest("get_recent_triggers", first.id);
     const afterFirst = engine.activation.snapshot();
     expect(afterFirst.find((item) => item.triggerId === first.id)?.firstMcpRequestAt).toBeTruthy();
-    expect(afterFirst.find((item) => item.triggerId === second.id)?.firstMcpRequestAt).toBeNull();
+    expect(afterFirst.find((item) => item.triggerId === second.id)).toBeUndefined();
 
     engine.noteMcpRequest("submit_analysis", second.id);
     const afterSecond = engine.activation.snapshot();
@@ -403,7 +402,7 @@ describe("per-trigger MCP latency attribution", () => {
     expect(result.status).toBe("accepted");
     const latency = engine.activation.snapshot();
     expect(latency.find((item) => item.triggerId === first.id)?.firstAcceptedSignalAt).toBeTruthy();
-    expect(latency.find((item) => item.triggerId === second.id)?.firstAcceptedSignalAt).toBeNull();
+    expect(latency.find((item) => item.triggerId === second.id)).toBeUndefined();
     expect(engine.state.snapshot().activationLatency.find((item) => item.triggerId === first.id)?.firstAcceptedSignalAt).toBeTruthy();
   });
 
@@ -437,7 +436,7 @@ describe("per-trigger MCP latency attribution", () => {
         method: "POST", headers,
         body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "get_recent_triggers", arguments: { limit: 10 } } }),
       });
-      expect(engine.activation.snapshot().find((item) => item.triggerId === event.id)?.firstMcpRequestAt).toBeNull();
+      expect(engine.activation.snapshot()).toEqual([]);
       expect(engine.activation.unattributedSnapshot().lastTool).toBe("get_recent_triggers");
       await fetch(`http://127.0.0.1:${port}/mcp`, {
         method: "POST", headers,

@@ -32,13 +32,14 @@ export default function Dashboard({ initial }: { initial: DashboardSnapshot | nu
     const transport = startEngineLiveTransport({
       onStatus: (status) => { if (!disposed) setStream(status); },
       onSnapshot: (snapshot) => { if (!disposed) setData(snapshot); },
+      onCache: (cache) => { if (!disposed) setData((previous) => previous ? { ...previous, cache } : previous); },
     });
     return () => { disposed = true; transport.close(); };
   }, [initial]);
 
   return <main className="dashboardShell">
     <ExperimentBar snapshot={data} stream={stream} />
-    {!data ? <section className="dashboardEmpty"><EmptyState title="ENGINE SNAPSHOT UNAVAILABLE" detail="The dashboard has no cached values to invent. It will recover when the private engine stream reconnects." /></section> : <>
+    {!data ? <section className="dashboardEmpty"><EmptyState title="ENGINE SNAPSHOT UNAVAILABLE" detail="The dashboard has no cached values to invent. It will recover when the upstream snapshot poll succeeds." /></section> : <>
       <div className="dashboardStage">
         <div className="primaryPlane">
           <aside className="controlRail controlRail--left"><MarketUniverse snapshot={data} /><SystemHealth snapshot={data} /></aside>

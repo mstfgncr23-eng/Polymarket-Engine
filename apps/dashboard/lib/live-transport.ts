@@ -1,4 +1,4 @@
-import type { DashboardSnapshot } from "./types";
+import type { CacheMetadata, DashboardSnapshot } from "./types";
 
 export type StreamStatus = "CONNECTING" | "LIVE" | "DEGRADED";
 
@@ -16,6 +16,7 @@ export interface EngineEventSource {
 export interface LiveTransportHandlers {
   onStatus: (status: StreamStatus) => void;
   onSnapshot: (snapshot: DashboardSnapshot) => void;
+  onCache?: (cache: CacheMetadata) => void;
 }
 
 export interface LiveTransportOptions {
@@ -35,8 +36,7 @@ function asSnapshot(value: unknown): DashboardSnapshot | null {
  * Single EventSource to `/api/engine/events` plus one bounded snapshot recovery per disconnect.
  * Relies on native EventSource reconnect; does not open a second source or poll.
  * Recovery is scoped to a generation so a late response cannot overwrite a newer SSE snapshot.
- * Native EventSource reconnects get a short grace period so planned proxy rotation does not
- * present a transient transport reconnect as an engine degradation.
+ * Native EventSource reconnects get a short grace period for local transport interruptions.
  */
 export function startEngineLiveTransport(
   handlers: LiveTransportHandlers,
@@ -128,6 +128,11 @@ export function startEngineLiveTransport(
     } catch {
       markDegradedNow();
     }
+  });
+  source.addEventListener("cache", (event) => {
+    if (disposed) return;
+    try { handlers.onCache?.(JSON.parse(event.data) as CacheMetadata); }
+    catch { markDegradedNow(); }
   });
 
   return {
