@@ -101,11 +101,12 @@ export const engineEnvSchema = z.object({
   ).default(false),
   PROFIT_TRAILING_PAIR_ARM_EDGE: z.coerce.number().min(0).max(1).default(0.05),
   PROFIT_TRAILING_PAIR_RETRACE_EDGE: z.coerce.number().positive().max(1).default(0.02),
-  /** Explicit PAPER profit-trailing reversal authority, default OFF. */
+  /** Locked Guardian V2 PAPER profit-trailing authority for new manifests, default OFF. */
   REVERSAL_PROTECTION_ENABLED: z.preprocess(
     (value) => value === undefined ? undefined : value === true || value === "true" || value === "1",
     z.boolean().optional(),
   ).default(false),
+  /** Legacy manifest compatibility fields. V2 thresholds are sealed constants in guardian-v2.ts. */
   REVERSAL_PROTECTION_WINDOW_MS: z.coerce.number().int().positive().default(180000),
   REVERSAL_PROTECTION_OPPOSITE_COUNT: z.coerce.number().int().positive().default(3),
   PORT: z.coerce.number().int().positive().default(8080),

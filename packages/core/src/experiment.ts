@@ -96,7 +96,12 @@ export function shouldWriteFinalReport(manifest: ExperimentManifest, openPositio
   return (manifest.closePolicy ?? "observe_until_settlement") === "mark_to_market";
 }
 
+export interface GuardianOutcomeCounts {
+  earlyExits: number; lateExits: number; pairedSettlements: number; nakedSettlements: number;
+}
 export interface ExperimentSummary {
+  /** Guardian exits include both SELL and rescue BUY; settlements retain their economic classification. */
+  guardianOutcomes?: GuardianOutcomeCounts;
   /** Actual diagnostic positions, finalized only by canonical settlement. */
   nakedDirectionalDiagnostics?: Record<string, unknown>[];
   experimentId: string;
@@ -205,6 +210,8 @@ Report kind: ${summary.reportKind}
 - Win/loss (gross, fee-exclusive): ${summary.grossWinLossDistribution.wins} / ${summary.grossWinLossDistribution.losses} / ${summary.grossWinLossDistribution.breakeven}
 - Settlement PnL: $${summary.settlementPnlUsd.toFixed(2)}
 - Settlements: ${summary.settlementCount}
+${summary.guardianOutcomes ? `- Guardian EARLY / LATE exits: ${summary.guardianOutcomes.earlyExits} / ${summary.guardianOutcomes.lateExits}
+- Paired / naked settlements: ${summary.guardianOutcomes.pairedSettlements} / ${summary.guardianOutcomes.nakedSettlements}` : ""}
 - Unresolved positions: ${summary.unresolvedPositionCount}
 - AI cost (legacy ledger field, should remain $0 without OpenAI): $${summary.aiCostUsd.toFixed(2)}
 - Estimated infrastructure cost: $${summary.estimatedInfrastructureCostUsd.toFixed(2)}

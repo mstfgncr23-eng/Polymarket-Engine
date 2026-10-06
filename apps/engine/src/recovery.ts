@@ -1,4 +1,4 @@
-import { reversalProtectionStateSchema, sameReversalEpisode, type ReversalProtectionState } from "@pm/core";
+import { isGuardianV2State, isLockedGuardianV2Config, reversalProtectionStateSchema, sameReversalEpisode, type ReversalProtectionState } from "@pm/core";
 import { createNakedDirectionalDiagnostic, nakedDirectionalDiagnosticSchema, mergeNakedDirectionalObservation,
   profitTrailingPairStateSchema, type NakedDirectionalDiagnostic, type ProfitTrailingPairState } from "@pm/core";
 import {
@@ -445,13 +445,28 @@ export function applyDurableTransition(state: RecoverableEngineState, transition
         }
         const map = state.reversalProtectionStates ??= new Map<string, ReversalProtectionState>();
         const previous = map.get(next.marketId);
+        if (previous && isGuardianV2State(previous) && isGuardianV2State(next)) {
+          const wasArmed = previous.phase === "EARLY_RECOVERY_WATCH" || previous.phase === "LATE_CONFIRMATION";
+          const keepsArm = next.phase !== "OBSERVING";
+          if ((wasArmed && keepsArm && (next.sensor !== previous.sensor || next.armedAt !== previous.armedAt
+            || next.deadlineAt !== previous.deadlineAt || next.armRatio !== previous.armRatio
+            || (next.phase !== previous.phase && next.phase !== "PROTECTION_PENDING")))
+            || (previous.lastObservationAt && (!next.lastObservationAt || Date.parse(next.lastObservationAt) < Date.parse(previous.lastObservationAt)))
+            || (previous.lastConsensusAt && (!next.lastConsensusAt || Date.parse(next.lastConsensusAt) < Date.parse(previous.lastConsensusAt)))) {
+            throw new RecoveryFailClosedError("invariant", "Guardian V2 timer or input watermark regressed");
+          }
+        }
         if (sameReversalEpisode(previous, next) && previous
           && (previous.confirmedAt || next.revision !== previous.revision + 1
-            || !previous.countedConsensusEventIds.every((id, i) => next.countedConsensusEventIds[i] === id))) {
+            || isGuardianV2State(previous) !== isGuardianV2State(next)
+            || (isGuardianV2State(previous) && isGuardianV2State(next)
+              && (next.entryPrice !== previous.entryPrice || Date.parse(next.updatedAt) < Date.parse(previous.updatedAt)))
+            || (!isGuardianV2State(previous) && !isGuardianV2State(next)
+              && !previous.countedConsensusEventIds.every((id, i) => next.countedConsensusEventIds[i] === id)))) {
           throw new RecoveryFailClosedError("invariant", "reversal state regressed");
         }
-        if ((!previous || !sameReversalEpisode(previous, next)) && next.oppositeCount !== 1) {
-          throw new RecoveryFailClosedError("invariant", "reversal episode did not start at one");
+        if ((!previous || !sameReversalEpisode(previous, next)) && next.revision !== 1) {
+          throw new RecoveryFailClosedError("invariant", "reversal episode did not start at revision one");
         }
         map.set(next.marketId, next);
         return;
@@ -681,12 +696,16 @@ export function validatePostReplayInvariants(
   const reversalProtectionActive = status === "RUNNING" || status === "ENTRY_CLOSED";
   if (reversalProtectionActive && reversalRisk?.reversalProtectionEnabled === true
     && (reversalRisk.profitTrailingPairSoakEnabled !== true || reversalRisk.reversalProtectionWindowMs !== 180000
-      || reversalRisk.reversalProtectionOppositeCount !== 3)) {
+      || reversalRisk.guardianVersion !== 2 || !isLockedGuardianV2Config(reversalRisk.guardianV2Config)
+      || reversalRisk.profitTrailingPairTargetEdge !== 0.12 || reversalRisk.normalHedgeMinLockedPairEdge !== 0.12
+      || reversalRisk.profitTrailingPairArmEdge !== 0.05 || reversalRisk.profitTrailingPairRetraceEdge !== 0.02
+      || reversalRisk.profitTrailingPairExecutionStyle !== "TAKER" || reversalRisk.nakedDirectionalSoakEnabled === true)) {
     reasons.push("reversal_protection_config_invalid");
   }
   for (const [marketId, reversal] of state.reversalProtectionStates ?? []) {
     const position = state.ledger.positions.get(marketId);
     if (!reversalProtectionStateSchema.safeParse(reversal).success || reversal.marketId !== marketId
+      || (reversalProtectionActive && !isGuardianV2State(reversal))
       || reversalRisk?.reversalProtectionEnabled !== true || !position?.unpairedOutcome
       || !sameReversalEpisode(reversal, { marketId, positionId: position.id,
         unhedgedStartedAt: unhedgedEpisode(position), heldOutcome: position.unpairedOutcome })
