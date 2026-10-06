@@ -1,4 +1,5 @@
-import { evaluateReversalProtection, reversalProtectionStateSchema, sameReversalEpisode, type ReversalProtectionState, type ReversalEpisode } from "@pm/core";
+import { createHash } from "node:crypto";
+import { evaluateGuardianV2, GUARDIAN_V2_CONFIG, isGuardianV2State, isLockedGuardianV2Config, normalizeOppositeBookPressure, reversalProtectionStateSchema, sameReversalEpisode, type ReversalProtectionState, type ReversalEpisode } from "@pm/core";
 import { nakedDirectionalDiagnosticSchema, observeNakedDirectionalPosition, noteNakedDirectionalAnomaly, compactNakedDirectionalObservation,
   nakedDirectionalSummary, SOAK_PERSIST_INTERVAL_MS, evaluateProfitTrailingPair, profitTrailingPairStateSchema,
   type NakedDirectionalDiagnostic, type ProfitTrailingPairState } from "@pm/core";
@@ -340,6 +341,7 @@ type ProtectiveDeRiskAudit = {
   deRiskReason: RiskReductionUnhedgedReason;
   positionId?: string;
   heldOutcome?: Outcome;
+  guardianSensor?: "EARLY" | "LATE";
   /**
    * Observability improvement (Â§44): distinguishes which deadline bound made
    * the position protective-eligible â€” the hard unhedged duration
@@ -497,6 +499,7 @@ export class EngineService {
   private started = false;
   private bootstrapFailed = false;
   private maintenanceTimer: NodeJS.Timeout | null = null;
+  private guardianDeadlineTimer: NodeJS.Timeout | null = null;
   private soakPersistenceTimer: NodeJS.Timeout | null = null;
   private readonly soakPersistenceFlight = new SharedResultFlight<void>();
   private discoveryTimer: NodeJS.Timeout | null = null;
@@ -689,6 +692,7 @@ export class EngineService {
 
     this.maintenanceTimer = setInterval(() => { void this.runMaintenance(); }, 60_000);
     this.maintenanceTimer.unref();
+    this.scheduleGuardianDeadline();
     this.soakPersistenceTimer = setInterval(() => {
       void this.flushSoakDiagnostics().catch((error) => this.logger.error({ err: error }, "soak diagnostic persistence failed"));
     }, SOAK_PERSIST_INTERVAL_MS);
@@ -717,6 +721,8 @@ export class EngineService {
     this.referenceRetryTimers.clear();
     if (this.maintenanceTimer) clearInterval(this.maintenanceTimer);
     this.maintenanceTimer = null;
+    if (this.guardianDeadlineTimer) clearTimeout(this.guardianDeadlineTimer);
+    this.guardianDeadlineTimer = null;
     if (this.soakPersistenceTimer) clearInterval(this.soakPersistenceTimer);
     this.soakPersistenceTimer = null;
     if (this.discoveryTimer) clearInterval(this.discoveryTimer);
@@ -943,7 +949,9 @@ export class EngineService {
       const now = this.nowFn();
       if (this.env.REVERSAL_PROTECTION_ENABLED && (!this.env.PROFIT_TRAILING_PAIR_SOAK_ENABLED
         || this.env.TRADING_MODE !== "paper" || this.env.REVERSAL_PROTECTION_WINDOW_MS !== 180000
-        || this.env.REVERSAL_PROTECTION_OPPOSITE_COUNT !== 3)) throw new Error("INVALID_REVERSAL_PROTECTION_V1_CONFIG");
+        || this.env.REVERSAL_PROTECTION_OPPOSITE_COUNT !== 3 || this.env.NAKED_DIRECTIONAL_SOAK_ENABLED
+        || this.env.PAPER_EXECUTION_STYLE !== "TAKER" || this.riskLimits.normalHedgeMinLockedPairEdge !== 0.12
+        || this.env.PROFIT_TRAILING_PAIR_ARM_EDGE !== 0.05 || this.env.PROFIT_TRAILING_PAIR_RETRACE_EDGE !== 0.02)) throw new Error("INVALID_REVERSAL_PROTECTION_V2_CONFIG");
       const next = startExperiment({
         id: undefined, durationHours: this.env.EXPERIMENT_DURATION_HOURS, strategyVersion: this.strategy.version,
         riskConfiguration: {
@@ -955,6 +963,7 @@ export class EngineService {
           profitTrailingPairRetraceEdge: this.env.PROFIT_TRAILING_PAIR_RETRACE_EDGE,
           profitTrailingPairExecutionStyle: "TAKER",
           reversalProtectionEnabled: this.env.REVERSAL_PROTECTION_ENABLED,
+          guardianVersion: 2, guardianV2Config: { ...GUARDIAN_V2_CONFIG },
           reversalProtectionWindowMs: this.env.REVERSAL_PROTECTION_WINDOW_MS,
           reversalProtectionOppositeCount: this.env.REVERSAL_PROTECTION_OPPOSITE_COUNT,
         },
@@ -2249,6 +2258,7 @@ export class EngineService {
     this.state.connections.polymarket.lastMessageAt = snapshot.receivedAt;
     const synchronized = this.adapterTokenSynchronized(snapshot.tokenId);
     if (!synchronized) {
+      await this.persistGuardianObservation(snapshot.marketId);
       this.updateReady();
       this.state.eventLatencyMs = performance.now() - started;
       this.metrics.eventLatency.observe((performance.now() - started) / 1000);
@@ -2268,6 +2278,7 @@ export class EngineService {
     const previous = pair[snapshot.outcome];
     pair[snapshot.outcome] = snapshot;
     this.snapshots.set(snapshot.marketId, pair);
+    await this.persistGuardianObservation(snapshot.marketId);
     this.observeSoakPosition(snapshot.marketId);
     this.kickProfitTrailingPair(snapshot.marketId);
     this.kickReversalProtection(snapshot.marketId);
@@ -4273,6 +4284,13 @@ export class EngineService {
       },
       sourceEventId: fill.sourceMarketEventId,
     }];
+    if (deRisk?.guardianSensor && (!position?.unpairedOutcome || d(position.unpairedQuantity).eq(0))) {
+      records.push({ id: derivedAuditEventId("GUARDIAN_EXECUTION_COMPLETED", fill.id), type: "GUARDIAN_EXECUTION_COMPLETED",
+        aggregateType: "position", aggregateId: deRisk.positionId ?? fill.marketId, traceId: fill.traceId,
+        payload: { marketId: fill.marketId, positionId: deRisk.positionId, experimentId,
+          sensor: deRisk.guardianSensor, reason: deRisk.guardianReason, selection: deRisk.selection,
+          unhedgedStartedAt: deRisk.unhedgedStartedAt, orderId: fill.orderId, fillId: fill.id } });
+    }
     if (wasEmpty && fill.side === "BUY" && position) {
       records.push({
         id: derivedAuditEventId("FIRST_LEG_FILLED", fill.id),
@@ -4871,7 +4889,7 @@ export class EngineService {
     const risk = this.experiment?.riskConfiguration;
     return this.env.TRADING_MODE === "paper" && this.profitTrailingPairSoakEnabled()
       && risk?.reversalProtectionEnabled === true && risk.reversalProtectionWindowMs === 180000
-      && risk.reversalProtectionOppositeCount === 3;
+      && risk.guardianVersion === 2 && isLockedGuardianV2Config(risk.guardianV2Config);
   }
 
   private reversalEpisode(position: Position | undefined): ReversalEpisode | null {
@@ -4880,46 +4898,82 @@ export class EngineService {
         unhedgedStartedAt: unhedgedEpisode(position), heldOutcome: position.unpairedOutcome } : null;
   }
 
-  /** The exact source row is recoverable in the same commit as its count.
-   * Ordinary noncounting rows retain the existing report-input path. */
-  private async persistReversalConsensus(event: JournalEvent): Promise<boolean> {
-    if (!this.reversalProtectionEnabled() || event.payload.authority !== NATIVE_DETERMINISTIC_AUTHORITY
-      || typeof event.payload.marketId !== "string") return false;
-    const marketId = event.payload.marketId;
+  /** Fresh, synchronized, current-token books; same UP-positive pressure definition as Native V1. */
+  private guardianObservation(marketId: string, heldOutcome: Outcome, nowMs: number) {
+    if (!this.isMarketSynchronized(marketId)) return null;
+    const pair = this.snapshots.get(marketId);
+    const up = this.freshEarlyCatastrophicSnapshot(pair?.UP ?? null, nowMs);
+    const down = this.freshEarlyCatastrophicSnapshot(pair?.DOWN ?? null, nowMs);
+    if (!up || !down || up.tokenId !== this.currentTokenIdFor(marketId, "UP")
+      || down.tokenId !== this.currentTokenIdFor(marketId, "DOWN")) return null;
+    const top = (snapshot: MarketSnapshot) => {
+      const bid = snapshot.bids[0], ask = snapshot.asks[0];
+      if (!bid || !ask) return null;
+      const bp = d(bid.price), ap = d(ask.price), bq = d(bid.quantity), aq = d(ask.quantity);
+      if (![bp, ap, bq, aq].every(v => v.isFinite()) || bp.lt(0) || ap.gt(1) || bp.gt(ap)
+        || bq.lt(0) || aq.lt(0) || bq.plus(aq).lte(0)) return null;
+      return { mid: bp.plus(ap).div(2), imbalance: bq.minus(aq).div(bq.plus(aq)) };
+    };
+    const u = top(up), v = top(down);
+    if (!u || !v) return null;
+    return { eventId: `${up.eventId}:${down.eventId}`, heldPrice: (heldOutcome === "UP" ? u : v).mid.toFixed(),
+      bookPressure: normalizeOppositeBookPressure(heldOutcome, u.imbalance.minus(v.imbalance).div(2).toFixed()) };
+  }
+
+  private async persistGuardianObservation(marketId: string, event?: JournalEvent): Promise<boolean> {
+    if (!this.reversalProtectionEnabled() || !experimentAllowsHedge(this.experiment) || this.state.draining
+      || this.state.database !== "UP" || this.state.journalDegraded || this.overload.hasIntegrityFault) return false;
     const episode = this.reversalEpisode(this.ledger.positions.get(marketId));
-    const direction = event.payload.consensusDirection;
-    if (!episode || this.settledMarkets.has(marketId) || (direction !== "UP" && direction !== "DOWN" && direction !== "FLAT")) return false;
-    // Noncounting traffic adds neither a mutation-gate wait nor a DB lookup.
-    if (!evaluateReversalProtection({ state: this.reversalProtectionStates.get(marketId) ?? null,
-      episode, consensusEventId: event.id, consensusDirection: direction, now: new Date(event.occurredAt) }).stateChanged) return false;
-    const handled = await this.durableGate.run(async () => {
-      if (!sameReversalEpisode(this.reversalEpisode(this.ledger.positions.get(marketId)), episode)
-        || this.settledMarkets.has(marketId)) return false;
-      const evaluation = evaluateReversalProtection({ state: this.reversalProtectionStates.get(marketId) ?? null,
-        episode, consensusEventId: event.id, consensusDirection: direction, now: new Date(event.occurredAt) });
+    if (!episode || this.settledMarkets.has(marketId)) return false;
+    return this.durableGate.run(async () => {
+      const position = this.ledger.positions.get(marketId);
+      if (!sameReversalEpisode(this.reversalEpisode(position), episode) || !position || this.settledMarkets.has(marketId)) return false;
+      const now = event ? new Date(event.occurredAt) : this.nowFn();
+      if (now.getTime() > this.nowFn().getTime()) return false;
+      const raw = this.reversalProtectionStates.get(marketId);
+      if (raw && !isGuardianV2State(raw)) throw new RecoveryFailClosedError("invariant", "active legacy Guardian state");
+      const observation = this.guardianObservation(marketId, episode.heldOutcome, now.getTime());
+      // A restart first rebuilds the pair from its two subscriptions. Missing books
+      // during that bootstrap are not evidence of a price excursion. EARLY's
+      // strict deadline still advances independently of book availability.
+      const pair = this.snapshots.get(marketId);
+      if ((!pair?.UP || !pair.DOWN) && !observation
+        && !(raw?.phase === "EARLY_RECOVERY_WATCH" && now.getTime() >= Date.parse(raw.deadlineAt!))) return false;
+      const direction = event?.payload.consensusDirection;
+      const consensus = event && (direction === "UP" || direction === "DOWN" || direction === "FLAT") ? {
+        eventId: event.id, direction: direction as Direction, confidence: Number(event.payload.consensusConfidence), estimatedEdge: Number(event.payload.estimatedEdge),
+      } : undefined;
+      const evaluation = evaluateGuardianV2({ state: raw ?? null, episode,
+        entryPrice: episode.heldOutcome === "UP" ? position.averageUpCost : position.averageDownCost,
+        now, observation,
+        observationGap: !!raw?.lastObservationAt && now.getTime() - Date.parse(raw.lastObservationAt) > this.riskLimits.staleFeedTimeoutMs,
+        ...(consensus ? { consensus } : {}) });
       if (!evaluation.stateChanged || !evaluation.nextState) return false;
       const next = evaluation.nextState;
-      const key = `${episode.positionId}:${episode.unhedgedStartedAt}:${event.id}`;
-      const payload = { ...next, experimentId: this.experiment!.id, consensusEventId: event.id,
-        triggerId: event.payload.triggerId ?? null, consensusDirection: direction,
-        consensusConfidence: event.payload.consensusConfidence ?? null, estimatedEdge: event.payload.estimatedEdge ?? null,
-        evidenceIds: event.payload.evidenceIds ?? [], sourceEventId: event.sourceEventId,
-        requiredOppositeCount: 3, confirmed: next.confirmedAt !== null };
-      const audit: DerivedAuditRecord[] = [
-        { id: event.id, type: event.type, aggregateType: event.aggregateType, aggregateId: event.aggregateId,
-          traceId: event.traceId, payload: event.payload, sourceEventId: event.sourceEventId },
-        { id: derivedAuditEventId("REVERSAL_PROTECTION_STATE_UPDATED", key), type: "REVERSAL_PROTECTION_STATE_UPDATED",
-          aggregateType: "position", aggregateId: episode.positionId, traceId: event.traceId, payload },
-      ];
-      if (next.confirmedAt) audit.push({ id: derivedAuditEventId("REVERSAL_PROTECTION_CONFIRMED", key),
-        type: "REVERSAL_PROTECTION_CONFIRMED", aggregateType: "position", aggregateId: episode.positionId,
-        traceId: event.traceId, payload });
+      const key = `${episode.positionId}:${episode.unhedgedStartedAt}:v2:${next.revision}`;
+      const auditKey = createHash("sha256").update(key).digest("hex");
+      const payload = { ...next, experimentId: this.experiment!.id, sourceConsensusEventId: event?.id ?? null };
+      const audit: DerivedAuditRecord[] = event ? [{ id: event.id, type: event.type,
+        aggregateType: event.aggregateType, aggregateId: event.aggregateId, traceId: event.traceId,
+        payload: event.payload, sourceEventId: event.sourceEventId }] : [];
+      audit.push({ id: derivedAuditEventId("REVERSAL_PROTECTION_STATE_UPDATED", auditKey), type: "REVERSAL_PROTECTION_STATE_UPDATED",
+        aggregateType: "position", aggregateId: episode.positionId, traceId: episode.positionId, payload });
+      for (const reason of evaluation.events) audit.push({ id: derivedAuditEventId(`GUARDIAN_${reason}`, auditKey), type: `GUARDIAN_${reason}`,
+        aggregateType: "position", aggregateId: episode.positionId, traceId: episode.positionId, payload });
+      if (next.confirmedAt) audit.push({ id: derivedAuditEventId("REVERSAL_PROTECTION_CONFIRMED", auditKey), type: "REVERSAL_PROTECTION_CONFIRMED",
+        aggregateType: "position", aggregateId: episode.positionId, traceId: episode.positionId, payload });
       await this.commitAuthoritative({ operationKey: `reversal:${key}`, type: "REVERSAL_PROTECTION_STATE_UPDATED",
-        aggregateType: "position", aggregateId: episode.positionId, occurredAt: new Date(event.occurredAt),
+        aggregateType: "position", aggregateId: episode.positionId, occurredAt: now,
         buildPayload: () => ({ state: next, derivedAudit: audit }) });
+      this.scheduleGuardianDeadline();
       return true;
     });
-    if (handled) await this.durableGate.outside(() => this.maybeReversalProtection(marketId));
+  }
+
+  private async persistReversalConsensus(event: JournalEvent): Promise<boolean> {
+    if (event.payload.authority !== NATIVE_DETERMINISTIC_AUTHORITY || typeof event.payload.marketId !== "string") return false;
+    const handled = await this.persistGuardianObservation(event.payload.marketId, event);
+    if (handled) await this.durableGate.outside(() => this.maybeReversalProtection(event.payload.marketId as string));
     return handled;
   }
 
@@ -4928,7 +4982,7 @@ export class EngineService {
   } {
     const deadline = this.protectiveDeRiskEligibility(reversal.marketId, reversal.unhedgedStartedAt, nowMs);
     const current = this.reversalProtectionStates.get(reversal.marketId);
-    return { ...deadline, eligible: this.reversalProtectionEnabled() && !!current?.confirmedAt
+    return { ...deadline, eligible: this.reversalProtectionEnabled() && isGuardianV2State(current) && !!current.confirmedAt
       && sameReversalEpisode(current, reversal) && sameReversalEpisode(this.reversalEpisode(position), reversal)
       && !this.settledMarkets.has(reversal.marketId) && (deadline.marketEndMs === null || nowMs < deadline.marketEndMs) };
   }
@@ -4940,7 +4994,7 @@ export class EngineService {
   }
 
   private kickReversalProtection(marketId: string): void {
-    if (!this.reversalProtectionStates.get(marketId)?.confirmedAt) return;
+    if (!this.reversalProtectionEnabled() || !this.reversalEpisode(this.ledger.positions.get(marketId))) return;
     if (this.reversalProtectionInFlight.has(marketId)) { this.reversalProtectionPending.add(marketId); return; }
     this.reversalProtectionInFlight.add(marketId);
     void this.maybeReversalProtection(marketId)
@@ -4951,7 +5005,32 @@ export class EngineService {
       });
   }
 
+  /** One wakeup reconstructed from journal state; snapshots and maintenance use
+   * the same classifier. A timer is a scheduling hint, never economic authority. */
+  private scheduleGuardianDeadline(): void {
+    if (this.guardianDeadlineTimer) clearTimeout(this.guardianDeadlineTimer);
+    this.guardianDeadlineTimer = null;
+    if (this.state.draining || !this.reversalProtectionEnabled()) return;
+    const watches = [...this.reversalProtectionStates.values()].filter(state => isGuardianV2State(state)
+      && !state.confirmedAt && state.deadlineAt && this.reversalEpisode(this.ledger.positions.get(state.marketId)));
+    if (!watches.length) return;
+    const now = this.nowFn().getTime();
+    const next = Math.min(...watches.map(state => Date.parse(isGuardianV2State(state) ? state.deadlineAt! : "")));
+    // An overdue LATE watch may be waiting for subscription bootstrap; avoid a busy loop.
+    this.guardianDeadlineTimer = setTimeout(() => {
+      this.guardianDeadlineTimer = null;
+      const currentNow = this.nowFn().getTime();
+      for (const state of this.reversalProtectionStates.values()) {
+        if (isGuardianV2State(state) && !state.confirmedAt && state.deadlineAt
+          && currentNow >= Date.parse(state.deadlineAt)) this.kickReversalProtection(state.marketId);
+      }
+      this.scheduleGuardianDeadline();
+    }, next > now ? next - now : 1000);
+    this.guardianDeadlineTimer.unref();
+  }
+
   private async maybeReversalProtection(marketId: string): Promise<void> {
+    await this.persistGuardianObservation(marketId);
     const reversal = this.reversalProtectionStates.get(marketId);
     if (!reversal?.confirmedAt || !this.reversalEligibility(reversal, this.ledger.positions.get(marketId), this.nowFn().getTime()).eligible
       || !experimentAllowsHedge(this.experiment) || this.state.draining || this.state.database !== "UP"
@@ -6967,7 +7046,8 @@ private buildEarlyAudit(
             aggregateType: "risk", aggregateId: createId("risk"), occurredAt: now,
             payload: { marketId, accepted: false, vetoes: [rejectionReason], intent: "NONE",
               deRisk: { deRiskReason: reason, positionId: reversal.positionId, unhedgedStartedAt,
-                heldOutcome: reversal.heldOutcome, requestedQty: position.unpairedQuantity, executableQty: "0",
+                heldOutcome: reversal.heldOutcome,
+                ...(isGuardianV2State(reversal) ? { guardianSensor: reversal.sensor, guardianReason: reversal.protectionReason } : {}), requestedQty: position.unpairedQuantity, executableQty: "0",
                 selection: "NONE", selectionReason: "NEITHER_ACCEPTED", tieBreakUsed: false,
                 aAvailable: false, aReason, bAvailable: false, bReason } } }));
         }
@@ -7189,7 +7269,8 @@ private buildEarlyAudit(
         : d(position.unpairedQuantity);
       const audit: ProtectiveDeRiskAudit = {
         deRiskReason: reason,
-        ...(reversal ? { positionId: reversal.positionId, heldOutcome: reversal.heldOutcome } : {}),
+        ...(reversal ? { positionId: reversal.positionId, heldOutcome: reversal.heldOutcome,
+          ...(isGuardianV2State(reversal) ? { guardianSensor: reversal.sensor!, guardianReason: reversal.protectionReason! } : {}) } : {}),
         eligibilityReason,
         unhedgedStartedAt,
         unhedgedDurationMs,

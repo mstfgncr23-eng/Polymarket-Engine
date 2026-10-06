@@ -1,9 +1,10 @@
 import { z } from "zod";
+import { guardianV2StateSchema } from "./guardian-v2.js";
 
 export const REVERSAL_PROTECTION_WINDOW_MS = 180_000;
 export const REVERSAL_PROTECTION_OPPOSITE_COUNT = 3;
 const timestamp = z.string().datetime({ offset: true });
-export const reversalProtectionStateSchema = z.object({
+export const legacyReversalProtectionStateSchema = z.object({
   marketId: z.string().min(1), positionId: z.string().min(1),
   unhedgedStartedAt: timestamp, heldOutcome: z.enum(["UP", "DOWN"]),
   oppositeCount: z.number().int().min(1).max(3),
@@ -14,7 +15,7 @@ export const reversalProtectionStateSchema = z.object({
 }).superRefine((state, ctx) => {
   if (state.oppositeCount !== state.countedConsensusEventIds.length
     || new Set(state.countedConsensusEventIds).size !== state.oppositeCount
-    || Date.parse(state.windowEndsAt) !== Date.parse(state.unhedgedStartedAt) + REVERSAL_PROTECTION_WINDOW_MS
+    || ![180000, 360000].includes(Date.parse(state.windowEndsAt) - Date.parse(state.unhedgedStartedAt))
     || state.revision !== state.oppositeCount
     || (state.oppositeCount === 3) !== (state.confirmedAt !== null)
     || (state.confirmedAt === null) !== (state.confirmedByConsensusEventId === null)
@@ -24,7 +25,9 @@ export const reversalProtectionStateSchema = z.object({
     ctx.addIssue({ code: "custom", message: "invalid reversal protection state" });
   }
 });
+export const reversalProtectionStateSchema = z.union([guardianV2StateSchema, legacyReversalProtectionStateSchema]);
 export type ReversalProtectionState = z.infer<typeof reversalProtectionStateSchema>;
+export type LegacyReversalProtectionState = z.infer<typeof legacyReversalProtectionStateSchema>;
 export type ReversalEpisode = Pick<ReversalProtectionState, "marketId" | "positionId" | "unhedgedStartedAt" | "heldOutcome">;
 
 export function sameReversalEpisode(state: ReversalEpisode | null | undefined, episode: ReversalEpisode): boolean {
@@ -32,11 +35,11 @@ export function sameReversalEpisode(state: ReversalEpisode | null | undefined, e
     && state.unhedgedStartedAt === episode.unhedgedStartedAt && state.heldOutcome === episode.heldOutcome;
 }
 
-/** Raw journal events, cumulative opposites, inclusive 360s boundary. */
+/** Legacy V1 classifier retained for historical replay tests; not runtime V2 authority. */
 export function evaluateReversalProtection(input: {
-  state: ReversalProtectionState | null; episode: ReversalEpisode | null;
+  state: LegacyReversalProtectionState | null; episode: ReversalEpisode | null;
   consensusEventId: string; consensusDirection: "UP" | "DOWN" | "FLAT"; now: Date;
-}): { nextState: ReversalProtectionState | null; stateChanged: boolean } {
+}): { nextState: LegacyReversalProtectionState | null; stateChanged: boolean } {
   const episode = input.episode;
   if (!episode) return { nextState: null, stateChanged: false };
   const previous = sameReversalEpisode(input.state, episode) ? input.state : null;

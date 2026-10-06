@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { evaluateReversalProtection, reversalProtectionStateSchema, type ReversalProtectionState, engineEnvSchema } from "@pm/core";
+import { evaluateReversalProtection, reversalProtectionStateSchema, type LegacyReversalProtectionState as ReversalProtectionState, engineEnvSchema } from "@pm/core";
 
 const START = Date.parse("2026-10-05T00:00:00Z");
 const episode = { marketId: "m", positionId: "p", unhedgedStartedAt: new Date(START).toISOString(), heldOutcome: "UP" as const };

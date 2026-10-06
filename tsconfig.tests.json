@@ -17,6 +17,10 @@
     }
   },
   "include": [
+    "tests/guardian-v2.test.ts",
+    "tests/guardian-v2-report.test.ts",
+    "tests/reversal-protection-paper.test.ts",
+    "tests/reversal-protection.test.ts",
     "tests/native-hotpath-fossils.test.ts",
     "scripts/native-hotpath-bench.ts",
     "tests/protective-min-order-rest-hydration.test.ts",

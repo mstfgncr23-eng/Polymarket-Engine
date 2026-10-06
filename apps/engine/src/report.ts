@@ -1,6 +1,6 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
-import { d, renderExperimentSummaryMarkdown, type ExperimentSummary, type JournalEvent, type LedgerState, type MarketAssetAttribution, type PaperFill, type Position } from "@pm/core";
+import { d, renderExperimentSummaryMarkdown, type ExperimentSummary, type GuardianOutcomeCounts, type JournalEvent, type LedgerState, type MarketAssetAttribution, type PaperFill, type Position } from "@pm/core";
 
 export function includeCurrentExperimentEvent(
   event: JournalEvent,
@@ -29,6 +29,7 @@ export type ExperimentSummaryExtras = Partial<Pick<ExperimentSummary,
 >>;
 
 export interface ExperimentSummaryAccumulatorSnapshot {
+  guardianOutcomes?: GuardianOutcomeCounts;
   nakedDirectionalDiagnostics?: Array<[string, Record<string, unknown>]>;
   schemaVersion: number;
   experimentId: string;
@@ -89,6 +90,7 @@ export interface ExperimentSummaryAccumulatorSnapshot {
 }
 
 export class ExperimentSummaryAccumulator {
+  private guardianOutcomes: GuardianOutcomeCounts = { earlyExits: 0, lateExits: 0, pairedSettlements: 0, nakedSettlements: 0 };
   private readonly nakedDirectionalDiagnostics = new Map<string, Record<string, unknown>>();
   private readonly extras: ExperimentSummaryExtras;
   private readonly experimentId: string;
@@ -168,7 +170,7 @@ export class ExperimentSummaryAccumulator {
   /** JSON-safe bounded rollup state. No raw JournalEvent objects are retained. */
   serialize(): ExperimentSummaryAccumulatorSnapshot {
     return {
-      schemaVersion: 1, experimentId: this.experimentId, extras: structuredClone(this.extras), eventCount: this.eventCount,
+      guardianOutcomes: { ...this.guardianOutcomes }, schemaVersion: 1, experimentId: this.experimentId, extras: structuredClone(this.extras), eventCount: this.eventCount,
       ...(this.nakedDirectionalDiagnostics.size ? { nakedDirectionalDiagnostics: structuredClone([...this.nakedDirectionalDiagnostics]) } : {}),
       earliestOccurredAt: this.earliestOccurredAt, latestOccurredAt: this.latestOccurredAt,
       fillReplay: [...this.fillReplay.entries()].map(([marketId, s]) => ({ marketId, upQty: s.upQty.toString(), downQty: s.downQty.toString(), upCost: s.upCost.toString(), downCost: s.downCost.toString(), realized: s.realized.toString(), fees: s.fees.toString(), slippage: s.slippage.toString(), fills: s.fills })),
@@ -191,6 +193,7 @@ export class ExperimentSummaryAccumulator {
   snapshot(): ExperimentSummaryAccumulatorSnapshot { return this.serialize(); }
   restore(snapshot: ExperimentSummaryAccumulatorSnapshot): void {
     if (snapshot.schemaVersion !== 1 || snapshot.experimentId !== this.experimentId) throw new Error("ANALYTICS_ROLLUP_SCHEMA_MISMATCH");
+    this.guardianOutcomes = { earlyExits: 0, lateExits: 0, pairedSettlements: 0, nakedSettlements: 0, ...snapshot.guardianOutcomes };
     this.nakedDirectionalDiagnostics.clear();
     for (const [id, diagnostic] of snapshot.nakedDirectionalDiagnostics ?? []) this.nakedDirectionalDiagnostics.set(id, structuredClone(diagnostic));
     const assign = (key: keyof ExperimentSummaryAccumulatorSnapshot, fallback: unknown = undefined) => (snapshot[key] ?? fallback) as never;
@@ -215,7 +218,10 @@ export class ExperimentSummaryAccumulator {
     this.bumpCount(event, "marketId", this.eventCountByMarket);
     this.bumpCount(event, "asset", this.eventCountByAsset);
     const type = event.type;
-    if (type === "NAKED_DIRECTIONAL_SUMMARY") {
+    if (type === "GUARDIAN_EXECUTION_COMPLETED") {
+      if (event.payload.sensor === "EARLY") this.guardianOutcomes.earlyExits++;
+      if (event.payload.sensor === "LATE") this.guardianOutcomes.lateExits++;
+    } else if (type === "NAKED_DIRECTIONAL_SUMMARY") {
       this.nakedDirectionalDiagnostics.set(event.aggregateId, structuredClone(event.payload));
     } else if (type === "PAPER_FILL") {
       const fill = event.payload as unknown as PaperFill & { asset?: string | null };
@@ -228,6 +234,9 @@ export class ExperimentSummaryAccumulator {
       const fillAsset = payloadString(fill, "asset");
       if (fill.marketId && fillAsset) this.assetByMarket.set(fill.marketId, fillAsset);
     } else if (type === "POSITION_SETTLED") {
+      const up = d(String(event.payload.upQuantity ?? 0)), down = d(String(event.payload.downQuantity ?? 0));
+      if (up.eq(down) && up.gt(0)) this.guardianOutcomes.pairedSettlements++;
+      else this.guardianOutcomes.nakedSettlements++;
       this.settlementCount += 1;
       this.settlementPnlUsd += Number((event.payload as { realizedDelta?: unknown }).realizedDelta ?? 0);
       this.settledMarketIds.add(payloadString(event.payload, "marketId") ?? event.aggregateId);
@@ -359,7 +368,7 @@ export class ExperimentSummaryAccumulator {
       : { wins: this.grossWins, losses: this.grossLosses, breakeven: this.grossBreakeven };
     this.refreshHighWater();
     return {
-      experimentId: this.experimentId, generatedAt: extras.generatedAt ?? new Date().toISOString(),
+      guardianOutcomes: { ...this.guardianOutcomes }, experimentId: this.experimentId, generatedAt: extras.generatedAt ?? new Date().toISOString(),
       ...(this.nakedDirectionalDiagnostics.size ? { nakedDirectionalDiagnostics: structuredClone([...this.nakedDirectionalDiagnostics.values()]) } : {}),
       status: extras.status ?? String((ledger as { experimentStatus?: unknown } | undefined)?.experimentStatus ?? "unknown"),
       closePolicy: extras.closePolicy ?? "observe_until_settlement",
