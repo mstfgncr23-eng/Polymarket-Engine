@@ -1,0 +1,44 @@
+{
+  "stages": {
+    "00_safe": {
+      "map_sha256": "f29fe8a92072b74c33b2326099a0dc54a0adb1c2157b244051d96bb0c587ad3b",
+      "total_sourcemap_items": 980
+    },
+    "01_step2": {
+      "map_sha256": "1dbd2707fa5000997e162acebdb477ff6270fba0ef9f100f2fd9cc16ff3100e3",
+      "total_sourcemap_items": 980
+    },
+    "02_step3": {
+      "map_sha256": "a3f55802e009502fb19ee2ec32c65f2c339293e5a3b71cff308a2447b0b67520",
+      "total_sourcemap_items": 980
+    },
+    "03_identity": {
+      "map_sha256": "385bd4f9f38c7ab442cacf1d58285ec65ce84cc594a33da562e9082455ebec57",
+      "total_sourcemap_items": 981
+    },
+    "04_mapopt": {
+      "map_sha256": "e0e735daea05ba4eacf478a55d88e4f047b14e534af82a915ce7e49062985e85",
+      "total_sourcemap_items": 981
+    },
+    "05_cpu_v1": {
+      "map_sha256": "294dab7784263d4bb1d1020cf0afe4bce217563151af10f20d9d31a73ef06261",
+      "total_sourcemap_items": 981
+    },
+    "06_cpu_v2": {
+      "map_sha256": "159ac89088e13dc7ee68a87a049e51bdb1c2b794f97395a6fa3cb72746a7f98f",
+      "total_sourcemap_items": 981
+    },
+    "07_cpu_v3": {
+      "map_sha256": "3a05a859e47a1f3ac5269680f3f2849b2c4adec136ab298e68f3f58b2a490266",
+      "total_sourcemap_items": 981
+    },
+    "08_current": {
+      "map_sha256": "19f7c8f7aba201323735b7b14ad6ec705d879e1c6ffd23ef380e5e90acbff180",
+      "total_sourcemap_items": 980
+    }
+  },
+  "branch": "forensic/reverse-regression-isolation",
+  "safe_git": "21a195a6809e6d7eaf8b691dba65cf8ce3edda6f",
+  "production_untouched": true,
+  "test_started": false
+}

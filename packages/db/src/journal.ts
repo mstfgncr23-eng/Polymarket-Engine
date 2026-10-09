@@ -1,3 +1,5 @@
+import { isDeepStrictEqual, types as utilTypes } from "node:util";
+import { QUARANTINE_TRANSITION, quarantineOperationKey, quarantinePayloadSchema, ExperimentQuarantineRejectedError } from "./quarantine.js";
 import { and, asc, desc, eq, gt, gte, inArray, lt, lte, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/postgres-js";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
@@ -28,6 +30,7 @@ import {
   ExperimentReportConflictError,
   hashExperimentReport,
   persistReportConflictSafe,
+  isCanonicalFinalReport,
   type DurableExperimentReport,
   type DurableExperimentReportInput,
   type PersistReportResult,
@@ -86,6 +89,8 @@ export interface JournalArchiveCandidate {
 export interface JournalAppendOptions {
   signal?: AbortSignal;
   deadlineAt?: number;
+  /** Only replay of a verified old record without an ingestion timestamp. */
+  legacyRecordedAt?: boolean;
 }
 
 export class JournalAppendAbortedError extends Error {
@@ -117,24 +122,158 @@ export function isJournalAppendDeadlineError(error: unknown): boolean {
   return reason === "deadline" || message === "JOURNAL_APPEND_DEADLINE";
 }
 
-/** Backend terminate / pool poison after transaction_timeout. Safe to retry once. */
+/** Explicit transport codes only; terminal causes override transport wrappers. */
 export function isTransientJournalError(error: unknown): boolean {
-  if (!error || typeof error !== "object") return false;
-  if (isJournalAppendAbortedError(error)) return false;
-  const code = "code" in error ? String(error.code) : "";
-  const message = error instanceof Error ? error.message : String(error);
-  return code === "CONNECTION_CLOSED"
-    || code === "CONNECTION_DESTROYED"
-    || code === "ECONNRESET"
-    || code === "57P01"
-    || code === "57P02"
-    || code === "57P03"
-    || code === "25P04"
-    || code === "08006"
-    || code === "08003"
-    || /connection (closed|terminated|ended|destroyed)/i.test(message)
-    || /terminating connection/i.test(message)
-    || /Cannot read properties of null/.test(message);
+  const seen = new Set<object>();
+  let current = error;
+  let transient = false;
+  for (let depth = 0; depth < 8 && current && typeof current === "object"; depth++) {
+    if (seen.has(current)) return false;
+    seen.add(current);
+    const item = current as { code?: unknown; name?: unknown; message?: unknown; cause?: unknown };
+    const code = String(item.code ?? "");
+    const name = String(item.name ?? "");
+    if (isJournalAppendAbortedError(current)
+      || ["TypeError", "AssertionError", "ZodError", "IdempotencyConflictError",
+        "DurableCursorBehindError", "RecoveryFailClosedError", "JournalEventConflictError", "PersistenceOutcomeUnknownError"].includes(name)
+      || ["IDEMPOTENCY_CONFLICT", "DURABLE_CURSOR_BEHIND", "JOURNAL_EVENT_ID_CONFLICT", "PERSISTENCE_OUTCOME_UNKNOWN"].includes(code)) return false;
+    if (["CONNECT_TIMEOUT", "CONNECTION_CLOSED", "CONNECTION_DESTROYED", "ECONNRESET",
+      "57P01", "57P02", "57P03", "25P04", "08006", "08003"].includes(code)) transient = true;
+    current = item.cause;
+  }
+  // An overlong chain cannot establish the absence of a terminal inner cause.
+  return transient && !(current && typeof current === "object");
+}
+
+export class JournalEventConflictError extends Error {
+  readonly code = "JOURNAL_EVENT_ID_CONFLICT";
+  constructor(readonly eventId: string) {
+    super(`JOURNAL_EVENT_ID_CONFLICT: ${eventId}`);
+    this.name = "JournalEventConflictError";
+  }
+}
+
+declare const preparedJournalBrand: unique symbol;
+/** Opaque at runtime: only this module can admit an immutable identity. */
+export type PreparedJournalEvent = Readonly<JournalEvent> & { readonly [preparedJournalBrand]: true };
+const preparedJournalEvents = new WeakSet<object>();
+
+/** JSON wire semantics in one owned walk, without serialization round trips. */
+function journalWireValue(input: unknown, key: string, ancestors: Set<object>): unknown {
+  let value = input;
+  if (value != null && (typeof value === "object" || typeof value === "function" || typeof value === "bigint")) {
+    const toJSON = (value as { toJSON?: unknown }).toJSON;
+    if (typeof toJSON === "function") value = toJSON.call(value, key);
+  }
+  if (utilTypes.isBoxedPrimitive(value)) {
+    if (utilTypes.isBigIntObject(value)) throw new TypeError("BigInt is not journal JSON content");
+    if (utilTypes.isNumberObject(value)) value = Number(value);
+    else if (utilTypes.isStringObject(value)) value = String(value);
+    else if (utilTypes.isBooleanObject(value)) value = Boolean.prototype.valueOf.call(value);
+  }
+  if (value === null || typeof value === "string" || typeof value === "boolean") return value;
+  if (typeof value === "number") return Number.isFinite(value) ? (value === 0 ? 0 : value) : null;
+  if (typeof value === "bigint") throw new TypeError("BigInt is not journal JSON content");
+  if (typeof value !== "object") return undefined;
+  if (ancestors.has(value)) throw new TypeError("Circular journal JSON content");
+  ancestors.add(value);
+  try {
+    if (Array.isArray(value)) {
+      const result = Array.from({ length: value.length }, (_, i) => journalWireValue(value[i], String(i), ancestors) ?? null);
+      return Object.freeze(result);
+    }
+    const result: Record<string, unknown> = {};
+    for (const name of Object.keys(value)) {
+      const normalized = journalWireValue((value as Record<string, unknown>)[name], name, ancestors);
+      if (normalized !== undefined) Object.defineProperty(result, name, {
+        value: normalized, enumerable: true, writable: false, configurable: false,
+      });
+    }
+    return Object.freeze(result);
+  } finally { ancestors.delete(value); }
+}
+
+/** Validate, wire-normalize and acquire ownership exactly once per envelope. */
+export function prepareJournalEvent(event: object): PreparedJournalEvent {
+  if (preparedJournalEvents.has(event)) return event as PreparedJournalEvent;
+  const parsed = journalEventSchema.parse(event);
+  const payload = journalWireValue(parsed.payload, "payload", new Set());
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    throw new TypeError("Journal payload must normalize to a JSON object");
+  }
+  parsed.payload = payload as Record<string, unknown>;
+  parsed.occurredAt = new Date(parsed.occurredAt).toISOString();
+  parsed.recordedAt = new Date(parsed.recordedAt).toISOString();
+  const prepared = Object.freeze(parsed) as PreparedJournalEvent;
+  preparedJournalEvents.add(prepared);
+  return prepared;
+}
+
+/** Compare every normalized logical field; commit metadata is not content. */
+export function assertJournalEventIdentity(expected: JournalEvent, actual: JournalEvent | null): void {
+  if (!actual || !isDeepStrictEqual(prepareJournalEvent(expected), prepareJournalEvent(actual))) {
+    throw new JournalEventConflictError(expected.id);
+  }
+}
+
+/** Cancellation after transport loss cannot establish rollback of the first attempt. */
+export class PersistenceOutcomeUnknownError extends Error {
+  readonly code = "PERSISTENCE_OUTCOME_UNKNOWN";
+  constructor(cause: unknown) {
+    super(`PERSISTENCE_OUTCOME_UNKNOWN: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
+    this.name = "PersistenceOutcomeUnknownError";
+  }
+}
+
+export interface PersistenceRetryOptions extends JournalAppendOptions {
+  onRetry?: () => void;
+  onRecovered?: () => void;
+  onExhausted?: () => void;
+}
+
+function assertPersistenceBudget(options: JournalAppendOptions): void {
+  if (options.signal?.aborted) throw new JournalAppendAbortedError("aborted");
+  if (options.deadlineAt != null && Date.now() >= options.deadlineAt) throw new JournalAppendAbortedError("deadline");
+}
+
+/** Persistence stages only. No caller re-planning and no adapter-level nested retry. */
+export async function retryPersistenceTransport<T>(
+  work: () => Promise<T>, options: PersistenceRetryOptions = {},
+): Promise<T> {
+  assertPersistenceBudget(options);
+  try { return await work(); }
+  catch (error) {
+    if (!isTransientJournalError(error)) throw error;
+    const delayMs = 25;
+    if (options.signal?.aborted || (options.deadlineAt != null && options.deadlineAt - Date.now() <= delayMs)) {
+      options.onExhausted?.();
+      throw new PersistenceOutcomeUnknownError(error);
+    }
+    try {
+      await waitForAppendHold(new Promise<void>(resolve => setTimeout(resolve, delayMs)), options);
+      assertPersistenceBudget(options);
+    } catch {
+      options.onExhausted?.();
+      throw new PersistenceOutcomeUnknownError(error);
+    }
+    options.onRetry?.();
+    try {
+      const result = await work();
+      options.onRecovered?.();
+      return result;
+    } catch (retryError) {
+      options.onExhausted?.();
+      if (isTransientJournalError(retryError) || isJournalAppendAbortedError(retryError)) {
+        throw new PersistenceOutcomeUnknownError(retryError);
+      }
+      throw retryError;
+    }
+  }
+}
+
+export interface DurableCommitOptions extends JournalAppendOptions {
+  /** Runs under commit serialization, only for a NEW operation, after receipt lookup. */
+  beforeInsert?: () => void | Promise<void>;
 }
 
 /** Memory's holds precede mutation, so cancellation proves that no commit can follow. */
@@ -190,7 +329,7 @@ export interface EventJournal {
   }): Promise<{ deleted: number }>;
   pruneOldCheckpoints(keepLatest: number, limit?: number): Promise<{ deleted: number; latestSequence: number | null }>;
   listCheckpoints(): Promise<EngineCheckpoint[]>;
-  commitDurableTransition(input: DurableTransitionInput, expectedPreviousSequence: number): Promise<DurableCommitResult>;
+  commitDurableTransition(input: DurableTransitionInput, expectedPreviousSequence: number, options?: DurableCommitOptions): Promise<DurableCommitResult>;
   readDurableTransitionsAfter(sequence: number, limit: number): Promise<DurableTransition[]>;
   queryDurableTransitions(query: { types?: readonly string[]; afterSequence?: number; limit: number }): Promise<DurableTransition[]>;
   readDurableByOperationKey(operationKey: string): Promise<DurableTransition | null>;
@@ -227,7 +366,8 @@ export interface MemoryEventJournalOptions {
 export class MemoryEventJournal implements EventJournal {
   private readonly events: JournalEvent[] = [];
   private readonly eventIds = new Set<string>();
-  private readonly staged = new Map<string, JournalEvent>();
+  private readonly eventById = new Map<string, PreparedJournalEvent>();
+  private readonly staged = new Map<string, PreparedJournalEvent>();
   private readonly commitSeqById = new Map<string, number>();
   private nextCommitSeq = 0;
   private readonly checkpoints: EngineCheckpoint[] = [];
@@ -288,15 +428,17 @@ export class MemoryEventJournal implements EventJournal {
     if (this.mutations.length > this.maxMutations) this.mutations.splice(0, this.mutations.length - this.maxMutations);
   }
 
-  private retainEvent(event: JournalEvent): void {
+  private retainEvent(event: PreparedJournalEvent): void {
     this.eventIds.add(event.id);
     this.events.push(event);
+    this.eventById.set(event.id, event);
     this.nextCommitSeq += 1;
     this.commitSeqById.set(event.id, this.nextCommitSeq);
     if (this.events.length <= this.maxEvents) return;
     const evicted = this.events.splice(0, this.events.length - this.maxEvents);
     for (const old of evicted) {
       this.eventIds.delete(old.id);
+      this.eventById.delete(old.id);
       this.commitSeqById.delete(old.id);
     }
   }
@@ -324,9 +466,13 @@ export class MemoryEventJournal implements EventJournal {
   async append(event: JournalEvent, options: JournalAppendOptions = {}): Promise<void> {
     assertJournalCapability(this.access, "runtime-write", "append");
     if (!this.available) throw new Error("DATABASE_UNAVAILABLE");
-    const parsed = journalEventSchema.parse(event);
+    const parsed = prepareJournalEvent(event);
     if (this.failAppendTypes.has(parsed.type)) throw new Error("JOURNAL_APPEND_FAILED");
-    if (this.eventIds.has(parsed.id) || this.staged.has(parsed.id)) return;
+    if (this.eventIds.has(parsed.id) || this.staged.has(parsed.id)) {
+      const existing = this.eventById.get(parsed.id) ?? this.staged.get(parsed.id) ?? null;
+      assertJournalEventIdentity(options.legacyRecordedAt && this.eventById.has(parsed.id) && existing ? { ...parsed, recordedAt: existing.recordedAt } : parsed, existing);
+      return;
+    }
     this.inFlightAppends += 1;
     try {
       const acquireApplies = !this.appendAcquireHoldTypes || this.appendAcquireHoldTypes.includes(parsed.type);
@@ -339,8 +485,12 @@ export class MemoryEventJournal implements EventJournal {
       if (this.failAppendTypes.has(parsed.type)) throw new Error("JOURNAL_APPEND_FAILED");
       if (options.signal?.aborted) throw new JournalAppendAbortedError("aborted");
       if (options.deadlineAt != null && Date.now() >= options.deadlineAt) throw new JournalAppendAbortedError("deadline");
-      if (this.eventIds.has(parsed.id) || this.staged.has(parsed.id)) return;
-      this.retainEvent(structuredClone(parsed));
+      if (this.eventIds.has(parsed.id) || this.staged.has(parsed.id)) {
+        const existing = this.eventById.get(parsed.id) ?? this.staged.get(parsed.id) ?? null;
+      assertJournalEventIdentity(options.legacyRecordedAt && this.eventById.has(parsed.id) && existing ? { ...parsed, recordedAt: existing.recordedAt } : parsed, existing);
+        return;
+      }
+      this.retainEvent(parsed);
       this.recordMutation(`append:${parsed.type}`);
     } finally {
       this.inFlightAppends = Math.max(0, this.inFlightAppends - 1);
@@ -348,8 +498,8 @@ export class MemoryEventJournal implements EventJournal {
   }
   /** Assign recordedAt now but keep the row invisible until commitStaged (commit-stability tests). */
   stageUncommitted(event: JournalEvent): void {
-    const parsed = journalEventSchema.parse(event);
-    this.staged.set(parsed.id, structuredClone(parsed));
+    const parsed = prepareJournalEvent(event);
+    this.staged.set(parsed.id, parsed);
   }
   commitStaged(id: string): void {
     const event = this.staged.get(id);
@@ -436,7 +586,11 @@ export class MemoryEventJournal implements EventJournal {
   }
   async persistExperimentReport(input: DurableExperimentReportInput): Promise<PersistReportResult> {
     assertJournalCapability(this.access, "report-write", "persistExperimentReport");
-    return this.withPersistLock(() => persistReportConflictSafe(input, {
+    return this.withDurableLock(() => {
+      if (this.durableByKey.get(quarantineOperationKey(input.experimentId))?.type === QUARANTINE_TRANSITION) {
+        throw new ExperimentQuarantineRejectedError("EXPERIMENT_QUARANTINED_NON_FINAL");
+      }
+      return this.withPersistLock(() => persistReportConflictSafe(input, {
       insert: async (stored) => {
         const key = `${stored.experimentId}:${stored.reportKind}`;
         if (this.reports.has(key)) return "conflict";
@@ -449,6 +603,7 @@ export class MemoryEventJournal implements EventJournal {
         return existing ? structuredClone(existing) : null;
       },
     }));
+    });
   }
   async loadExperimentReport(experimentId: string, reportKind: "final" = "final"): Promise<DurableExperimentReport | null> {
     const existing = this.reports.get(`${experimentId}:${reportKind}`);
@@ -473,29 +628,36 @@ export class MemoryEventJournal implements EventJournal {
     }
     return candidates.sort((a, b) => a.report.persistedAt.localeCompare(b.report.persistedAt)).slice(0, cap);
   }
+  private quarantinePinsEvent(event: JournalEvent): boolean {
+    const experimentId = typeof event.payload.experimentId === "string" ? event.payload.experimentId : event.aggregateId;
+    return this.durableByKey.get(quarantineOperationKey(experimentId))?.type === QUARANTINE_TRANSITION;
+  }
   async deleteJournalEventsBounded(input: { types: readonly string[]; occurredBefore: Date; limit: number }): Promise<{ deleted: number }> {
     assertJournalCapability(this.access, "maintenance", "deleteJournalEventsBounded");
     if (input.types.some((type) => isProtectedJournalType(type))) {
       throw new Error("RETENTION_REFUSED_PROTECTED_TYPES");
     }
-    const cap = Math.max(0, Math.floor(input.limit));
-    if (cap <= 0) return { deleted: 0 };
-    const cutoff = input.occurredBefore.toISOString();
-    const victims = this.events
-      .filter((event) => input.types.includes(event.type) && event.occurredAt < cutoff)
-      .sort(compareJournalEventOrder)
-      .slice(0, cap);
-    const ids = new Set(victims.map((event) => event.id));
-    for (let index = this.events.length - 1; index >= 0; index -= 1) {
-      const id = this.events[index]!.id;
-      if (ids.has(id)) {
-        this.eventIds.delete(id);
-        this.commitSeqById.delete(id);
-        this.events.splice(index, 1);
+    return this.withDurableLock(() => {
+      const cap = Math.max(0, Math.floor(input.limit));
+      if (cap <= 0) return { deleted: 0 };
+      const cutoff = input.occurredBefore.toISOString();
+      const victims = this.events
+        .filter((event) => input.types.includes(event.type) && event.occurredAt < cutoff && !this.quarantinePinsEvent(event))
+        .sort(compareJournalEventOrder)
+        .slice(0, cap);
+      const ids = new Set(victims.map((event) => event.id));
+      for (let index = this.events.length - 1; index >= 0; index -= 1) {
+        const id = this.events[index]!.id;
+        if (ids.has(id)) {
+          this.eventIds.delete(id);
+          this.eventById.delete(id);
+          this.commitSeqById.delete(id);
+          this.events.splice(index, 1);
+        }
       }
-    }
-    this.recordMutation(`deleteJournalEventsBounded:${victims.length}`);
-    return { deleted: victims.length };
+      this.recordMutation(`deleteJournalEventsBounded:${victims.length}`);
+      return { deleted: victims.length };
+    });
   }
   async deleteJournalEventsArchivedRange(input: {
     types: readonly string[];
@@ -510,38 +672,41 @@ export class MemoryEventJournal implements EventJournal {
     if (input.types.some((type) => !(LOCAL_ARCHIVE_PURGE_SAFE_EVENT_TYPES as readonly string[]).includes(type))) {
       throw new Error("ARCHIVE_PURGE_REFUSED_UNSAFE_TYPES");
     }
-    const cap = Math.max(0, Math.floor(input.limit));
-    if (cap <= 0) return { deleted: 0 };
-    const from = input.occurredFrom.getTime();
-    const before = input.occurredBefore.getTime();
-    const recordedTo = input.recordedAtTo.getTime();
-    const victims = this.events
-      .filter((event) => input.types.includes(event.type))
-      .filter((event) => !input.unattributedOnly
-        || !((event.payload as { experimentId?: unknown }).experimentId))
-      .filter((event) => {
-        const occurred = Date.parse(event.occurredAt);
-        const recorded = Date.parse(event.recordedAt);
-        return occurred >= from && occurred < before && recorded <= recordedTo
-          && (this.commitSeqById.get(event.id) ?? Number.POSITIVE_INFINITY) <= input.commitSeqTo;
-      })
-      .sort(compareJournalEventOrder)
-      .slice(0, cap);
-    const ids = new Set(victims.map((event) => event.id));
-    for (let index = this.events.length - 1; index >= 0; index -= 1) {
-      const row = this.events[index]!;
-      if (!ids.has(row.id)) continue;
-      this.eventIds.delete(row.id);
-      this.commitSeqById.delete(row.id);
-      this.events.splice(index, 1);
-    }
-    this.recordMutation(`deleteJournalEventsArchivedRange:${victims.length}`);
-    return { deleted: victims.length };
+    return this.withDurableLock(() => {
+      const cap = Math.max(0, Math.floor(input.limit));
+      if (cap <= 0) return { deleted: 0 };
+      const from = input.occurredFrom.getTime();
+      const before = input.occurredBefore.getTime();
+      const recordedTo = input.recordedAtTo.getTime();
+      const victims = this.events
+        .filter((event) => input.types.includes(event.type) && !this.quarantinePinsEvent(event))
+        .filter((event) => !input.unattributedOnly
+          || !((event.payload as { experimentId?: unknown }).experimentId))
+        .filter((event) => {
+          const occurred = Date.parse(event.occurredAt);
+          const recorded = Date.parse(event.recordedAt);
+          return occurred >= from && occurred < before && recorded <= recordedTo
+            && (this.commitSeqById.get(event.id) ?? Number.POSITIVE_INFINITY) <= input.commitSeqTo;
+        })
+        .sort(compareJournalEventOrder)
+        .slice(0, cap);
+      const ids = new Set(victims.map((event) => event.id));
+      for (let index = this.events.length - 1; index >= 0; index -= 1) {
+        const row = this.events[index]!;
+        if (!ids.has(row.id)) continue;
+        this.eventIds.delete(row.id);
+        this.eventById.delete(row.id);
+        this.commitSeqById.delete(row.id);
+        this.events.splice(index, 1);
+      }
+      this.recordMutation(`deleteJournalEventsArchivedRange:${victims.length}`);
+      return { deleted: victims.length };
+    });
   }
   async countEligible(types: readonly string[], occurredBefore: Date, options: { unattributedOnly?: boolean } = {}): Promise<{ count: number; oldestOccurredAt: string | null }> {
     const cutoff = occurredBefore.toISOString();
     const rows = this.events
-      .filter((event) => types.includes(event.type) && event.occurredAt < cutoff)
+      .filter((event) => types.includes(event.type) && event.occurredAt < cutoff && !this.quarantinePinsEvent(event))
       .filter((event) => !options.unattributedOnly
         || !((event.payload as { experimentId?: unknown }).experimentId))
       .sort(compareJournalEventOrder);
@@ -595,9 +760,9 @@ export class MemoryEventJournal implements EventJournal {
     return filterKeysetRows(this.events, this.commitSeqById, query);
   }
 
-  async commitDurableTransition(input: DurableTransitionInput, expectedPreviousSequence: number): Promise<DurableCommitResult> {
+  async commitDurableTransition(input: DurableTransitionInput, expectedPreviousSequence: number, options: DurableCommitOptions = {}): Promise<DurableCommitResult> {
     assertJournalCapability(this.access, "runtime-write", "commitDurableTransition");
-    return this.withDurableLock(() => this.commitDurableTransitionUnlocked(input, expectedPreviousSequence));
+    return this.withDurableLock(() => this.commitDurableTransitionUnlocked(input, expectedPreviousSequence, options));
   }
   async readDurableTransitionsAfter(sequence: number, limit: number): Promise<DurableTransition[]> {
     const cap = Math.max(1, Math.min(limit, 10_000));
@@ -621,7 +786,7 @@ export class MemoryEventJournal implements EventJournal {
       .slice(0, cap));
   }
   async readJournalEventById(id: string): Promise<JournalEvent | null> {
-    const event = this.events.find((row) => row.id === id);
+    const event = this.eventById.get(id);
     return event ? structuredClone(event) : null;
   }
   async latestDurableSequence(): Promise<number> {
@@ -662,7 +827,10 @@ export class MemoryEventJournal implements EventJournal {
     if ((options.maxBatches ?? 1) <= 0 || (options.budgetMs ?? 1) <= 0) return { deleted: 0, cursor: target, highWater: this.durableHighWater, compactedOperationKeys: this.compactedByKey.size };
     const rowCap = Math.max(0, Math.min(options.maxRows ?? Number.MAX_SAFE_INTEGER, options.batchSize ?? Number.MAX_SAFE_INTEGER));
     if (rowCap <= 0) return { deleted: 0, cursor: target, highWater: this.durableHighWater, compactedOperationKeys: this.compactedByKey.size };
-    const victims = this.durableRows.filter((row) => row.sequence <= target).slice(0, rowCap);
+    const quarantined = new Set(this.durableRows.filter(row => row.type === QUARANTINE_TRANSITION).map(row => row.aggregateId));
+    const victims = this.durableRows.filter((row) => row.sequence <= target
+      && row.type !== QUARANTINE_TRANSITION
+      && !((row.type === "REPORT_SOURCE_INTEGRITY_FAULT" || row.type === "REPORT_SOURCE_INTEGRITY_REPAIRED") && quarantined.has(row.aggregateId))).slice(0, rowCap);
     const now = Date.now();
     for (const row of victims) {
       if (maxKeys > 0) this.compactedByKey.set(row.operationKey, { operationKey: row.operationKey, type: row.type, aggregateType: row.aggregateType, aggregateId: row.aggregateId, scopeId: replayScopeId(row), payloadHash: row.payloadHash, sequence: row.sequence, occurredAt: row.occurredAt, recordedAt: row.recordedAt, expiresAt: new Date(now + ttl).toISOString(), lifecycleState: replayLifecycleState(row) });
@@ -698,7 +866,8 @@ export class MemoryEventJournal implements EventJournal {
       if (row.lifecycleState !== "open" && Date.parse(row.expiresAt) <= now) this.compactedByKey.delete(key);
     }
     if (victims.length > 0) {
-      this.durableRows.splice(0, victims.length);
+      const keys = new Set(victims.map(row => row.operationKey));
+      for (let i = this.durableRows.length - 1; i >= 0; i--) if (keys.has(this.durableRows[i]!.operationKey)) this.durableRows.splice(i, 1);
       this.recordMutation(`compactDurableTransitionsThrough:${victims.length}`);
     }
     return { deleted: victims.length, cursor: target, highWater: this.durableHighWater, compactedOperationKeys: this.compactedByKey.size };
@@ -731,21 +900,26 @@ export class MemoryEventJournal implements EventJournal {
   }
   async deleteCanonicalEventsThrough(input: { experimentId: string; occurredBefore?: Date; limit: number; sourceCursor: number; sourceCommitSeq?: number; sourceRecordedAt?: Date }): Promise<{ deleted: number }> {
     assertJournalCapability(this.access, "maintenance", "deleteCanonicalEventsThrough");
-    const cap = Math.max(0, Math.floor(input.limit));
-    const before = input.occurredBefore?.getTime() ?? Number.POSITIVE_INFINITY;
-    const victims = this.events.filter((event) => CANONICAL_REPORT_INPUT_EVENT_TYPES.includes(event.type as (typeof CANONICAL_REPORT_INPUT_EVENT_TYPES)[number]))
-      .filter((event) => (event.payload as { experimentId?: unknown }).experimentId === input.experimentId && Date.parse(event.occurredAt) < before)
-      .filter((event) => input.sourceCommitSeq == null || (this.commitSeqById.get(event.id) ?? Number.POSITIVE_INFINITY) <= input.sourceCommitSeq)
-      .filter((event) => input.sourceRecordedAt == null || Date.parse(event.recordedAt) <= input.sourceRecordedAt.getTime())
-      .slice(0, cap);
-    const ids = new Set(victims.map((event) => event.id));
-    for (let i = this.events.length - 1; i >= 0; i -= 1) if (ids.has(this.events[i]!.id)) {
-      this.eventIds.delete(this.events[i]!.id);
-      this.commitSeqById.delete(this.events[i]!.id);
-      this.events.splice(i, 1);
-    }
-    this.recordMutation(`deleteCanonicalEventsThrough:${victims.length}`);
-    return { deleted: victims.length };
+    if ((await this.readDurableByOperationKey(quarantineOperationKey(input.experimentId)))?.type === QUARANTINE_TRANSITION) return { deleted: 0 };
+    return this.withDurableLock(() => {
+      if (this.durableByKey.get(quarantineOperationKey(input.experimentId))?.type === QUARANTINE_TRANSITION) return { deleted: 0 };
+      const cap = Math.max(0, Math.floor(input.limit));
+      const before = input.occurredBefore?.getTime() ?? Number.POSITIVE_INFINITY;
+      const victims = this.events.filter((event) => CANONICAL_REPORT_INPUT_EVENT_TYPES.includes(event.type as (typeof CANONICAL_REPORT_INPUT_EVENT_TYPES)[number]))
+        .filter((event) => (event.payload as { experimentId?: unknown }).experimentId === input.experimentId && Date.parse(event.occurredAt) < before)
+        .filter((event) => input.sourceCommitSeq == null || (this.commitSeqById.get(event.id) ?? Number.POSITIVE_INFINITY) <= input.sourceCommitSeq)
+        .filter((event) => input.sourceRecordedAt == null || Date.parse(event.recordedAt) <= input.sourceRecordedAt.getTime())
+        .slice(0, cap);
+      const ids = new Set(victims.map((event) => event.id));
+      for (let i = this.events.length - 1; i >= 0; i -= 1) if (ids.has(this.events[i]!.id)) {
+        this.eventIds.delete(this.events[i]!.id);
+        this.eventById.delete(this.events[i]!.id);
+        this.commitSeqById.delete(this.events[i]!.id);
+        this.events.splice(i, 1);
+      }
+      this.recordMutation(`deleteCanonicalEventsThrough:${victims.length}`);
+      return { deleted: victims.length };
+    });
   }
   async countCanonicalEventsThrough(input: { experimentId: string; occurredBefore: Date; sourceCommitSeq: number; sourceRecordedAt: Date }): Promise<{ count: number; oldestOccurredAt: string | null }> {
     const rows = this.events
@@ -780,7 +954,7 @@ export class MemoryEventJournal implements EventJournal {
     }
   }
 
-  private commitDurableTransitionUnlocked(input: DurableTransitionInput, expectedPreviousSequence: number): DurableCommitResult {
+  private async commitDurableTransitionUnlocked(input: DurableTransitionInput, expectedPreviousSequence: number, options: DurableCommitOptions): Promise<DurableCommitResult> {
     const parsed = durableTransitionInputSchema.parse(input);
     const payloadHash = hashDurablePayload(parsed.payload);
     const existing = this.durableByKey.get(parsed.operationKey);
@@ -807,6 +981,18 @@ export class MemoryEventJournal implements EventJournal {
     if (latest !== expectedPreviousSequence) {
       throw new DurableCursorBehindError(expectedPreviousSequence, latest);
     }
+    if (parsed.type === QUARANTINE_TRANSITION) {
+      const evidence = quarantinePayloadSchema.parse(parsed.payload);
+      if (parsed.operationKey !== quarantineOperationKey(parsed.aggregateId) || parsed.aggregateType !== "experiment"
+        || evidence.experimentId !== parsed.aggregateId || evidence.durableCursorBefore !== latest) {
+        throw new ExperimentQuarantineRejectedError("QUARANTINE_INVALID_AUTHORITY");
+      }
+      const report = this.reports.get(`${parsed.aggregateId}:final`);
+      if (report && isCanonicalFinalReport(report)) throw new ExperimentQuarantineRejectedError("QUARANTINE_CANONICAL_FINAL_PRESENT");
+    }
+    assertPersistenceBudget(options);
+    await options.beforeInsert?.();
+    assertPersistenceBudget(options);
     if (this.failNextDurableInsert) {
       this.failNextDurableInsert = false;
       throw new Error("DURABLE_INSERT_FAILED");
@@ -908,7 +1094,7 @@ export class PostgresEventJournal implements EventJournal {
   }
   async append(event: JournalEvent, options: JournalAppendOptions = {}): Promise<void> {
     assertJournalCapability(this.access, "runtime-write", "append");
-    const value = journalEventSchema.parse(event);
+    const value = prepareJournalEvent(event);
     if (options.signal?.aborted) throw new JournalAppendAbortedError("aborted");
     if (options.deadlineAt != null && Date.now() >= options.deadlineAt) throw new JournalAppendAbortedError("deadline");
     let callbackFailed = false;
@@ -932,9 +1118,16 @@ export class PostgresEventJournal implements EventJournal {
           }
           if (options.signal?.aborted) throw new JournalAppendAbortedError("aborted");
           if (options.deadlineAt != null && Date.now() >= options.deadlineAt) throw new JournalAppendAbortedError("deadline");
-          await tx.insert(journalEvents).values({
+          const inserted = await tx.insert(journalEvents).values({
             ...value, occurredAt: new Date(value.occurredAt), recordedAt: new Date(value.recordedAt),
-          }).onConflictDoNothing({ target: journalEvents.id });
+          }).onConflictDoNothing({ target: journalEvents.id }).returning({ id: journalEvents.id });
+          if (inserted.length === 0) {
+            // INSERT's unique check serializes against an earlier in-flight insert.
+            // Only now can an existing row establish the ambiguous outcome.
+            const rows = await tx.select().from(journalEvents).where(eq(journalEvents.id, value.id)).limit(1);
+            const existing = rows[0] ? prepareJournalEvent({ ...rows[0], occurredAt: rows[0].occurredAt.toISOString(), recordedAt: rows[0].recordedAt.toISOString() }) : null;
+            assertJournalEventIdentity(options.legacyRecordedAt && existing ? { ...value, recordedAt: existing.recordedAt } : value, existing);
+          }
         } catch (error) {
           callbackFailed = true;
           throw error;
@@ -1104,9 +1297,14 @@ export class PostgresEventJournal implements EventJournal {
       renderedMarkdown: input.renderedMarkdown,
       contentHash: hash,
     };
-    const persistOnce = () => persistReportConflictSafe({ ...input, contentHash: hash }, {
+    const persistOnce = () => this.db.transaction(async (tx) => {
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(${DURABLE_MUTATION_LOCK_ID})`);
+      const quarantined = await tx.select({ type: durableTransitions.type }).from(durableTransitions)
+        .where(eq(durableTransitions.operationKey, quarantineOperationKey(input.experimentId))).limit(1);
+      if (quarantined[0]?.type === QUARANTINE_TRANSITION) throw new ExperimentQuarantineRejectedError("EXPERIMENT_QUARANTINED_NON_FINAL");
+      return persistReportConflictSafe({ ...input, contentHash: hash }, {
       insert: async (stored) => {
-        const inserted = await this.db.insert(experimentReports).values({
+        const inserted = await tx.insert(experimentReports).values({
           ...values,
           persistedAt: new Date(stored.persistedAt),
         }).onConflictDoNothing({
@@ -1116,11 +1314,12 @@ export class PostgresEventJournal implements EventJournal {
         return row ? toExperimentReport(row) : "conflict";
       },
       load: async () => {
-        const rows = await this.db.select().from(experimentReports)
+        const rows = await tx.select().from(experimentReports)
           .where(and(eq(experimentReports.experimentId, input.experimentId), eq(experimentReports.reportKind, input.reportKind)))
           .limit(1);
         return rows[0] ? toExperimentReport(rows[0]) : null;
       },
+    });
     });
     try {
       return await persistOnce();
@@ -1186,17 +1385,21 @@ export class PostgresEventJournal implements EventJournal {
     const requested = Math.max(0, Math.floor(input.limit));
     if (requested <= 0) return { deleted: 0 };
     const cap = Math.min(requested, 500);
-    const result = await this.client`
+    return this.client.begin(async tx => {
+      await tx`SELECT pg_advisory_xact_lock(${DURABLE_MUTATION_LOCK_ID})`;
+      const result = await tx`
       DELETE FROM journal_events
       WHERE (occurred_at, id) IN (
         SELECT occurred_at, id FROM journal_events
         WHERE type = ANY(${input.types as string[]})
           AND occurred_at < ${input.occurredBefore.toISOString()}
+          AND NOT EXISTS (SELECT 1 FROM durable_transitions q WHERE q.type = 'EXPERIMENT_NON_FINAL_QUARANTINED' AND q.operation_key IN ('experiment-quarantine:' || (journal_events.payload->>'experimentId'), 'experiment-quarantine:' || journal_events.aggregate_id))
         ORDER BY occurred_at ASC, id ASC
         LIMIT ${cap}
       )
     `;
-    return { deleted: result.count ?? 0 };
+      return { deleted: result.count ?? 0 };
+    });
   }
   async deleteJournalEventsArchivedRange(input: {
     types: readonly string[];
@@ -1214,7 +1417,9 @@ export class PostgresEventJournal implements EventJournal {
     }
     const cap = Math.max(0, Math.min(500, Math.floor(input.limit)));
     if (cap <= 0) return { deleted: 0 };
-    const result = await this.client`
+    return this.client.begin(async tx => {
+      await tx`SELECT pg_advisory_xact_lock(${DURABLE_MUTATION_LOCK_ID})`;
+      const result = await tx`
       DELETE FROM journal_events
       WHERE id IN (
         SELECT id FROM journal_events
@@ -1224,11 +1429,13 @@ export class PostgresEventJournal implements EventJournal {
           AND commit_seq <= ${input.commitSeqTo}
           AND recorded_at <= ${input.recordedAtTo.toISOString()}
           AND (${!input.unattributedOnly} OR COALESCE(payload->>'experimentId', '') = '')
+          AND NOT EXISTS (SELECT 1 FROM durable_transitions q WHERE q.type = 'EXPERIMENT_NON_FINAL_QUARANTINED' AND q.operation_key IN ('experiment-quarantine:' || (journal_events.payload->>'experimentId'), 'experiment-quarantine:' || journal_events.aggregate_id))
         ORDER BY occurred_at ASC, id ASC
         LIMIT ${cap}
       )
     `;
-    return { deleted: result.count ?? 0 };
+      return { deleted: result.count ?? 0 };
+    });
   }
   async pruneOldCheckpoints(keepLatest: number, limit?: number): Promise<{ deleted: number; latestSequence: number | null }> {
     assertJournalCapability(this.access, "maintenance", "pruneOldCheckpoints");
@@ -1275,7 +1482,7 @@ export class PostgresEventJournal implements EventJournal {
     return rows.filter((row) => row.verified && row.contentHash && isSemanticallyValidCheckpointPayload(row.payload)
       && (typeof row.payload.durableCursor !== "number" || row.payload.durableCursor <= highWater)).sort((a, b) => b.sequence - a.sequence);
   }
-  async commitDurableTransition(input: DurableTransitionInput, expectedPreviousSequence: number): Promise<DurableCommitResult> {
+  async commitDurableTransition(input: DurableTransitionInput, expectedPreviousSequence: number, options: DurableCommitOptions = {}): Promise<DurableCommitResult> {
     assertJournalCapability(this.access, "runtime-write", "commitDurableTransition");
     const parsed = durableTransitionInputSchema.parse(input);
     const payloadHash = hashDurablePayload(parsed.payload);
@@ -1317,6 +1524,19 @@ export class PostgresEventJournal implements EventJournal {
       if (latest !== expectedPreviousSequence) {
         throw new DurableCursorBehindError(expectedPreviousSequence, latest);
       }
+      if (parsed.type === QUARANTINE_TRANSITION) {
+        const evidence = quarantinePayloadSchema.parse(parsed.payload);
+        if (parsed.operationKey !== quarantineOperationKey(parsed.aggregateId) || parsed.aggregateType !== "experiment"
+          || evidence.experimentId !== parsed.aggregateId || evidence.durableCursorBefore !== latest) {
+          throw new ExperimentQuarantineRejectedError("QUARANTINE_INVALID_AUTHORITY");
+        }
+        const reports = await tx.select().from(experimentReports)
+          .where(and(eq(experimentReports.experimentId, parsed.aggregateId), eq(experimentReports.reportKind, "final"))).limit(1);
+        if (reports[0] && isCanonicalFinalReport(toExperimentReport(reports[0]))) throw new ExperimentQuarantineRejectedError("QUARANTINE_CANONICAL_FINAL_PRESENT");
+      }
+      assertPersistenceBudget(options);
+      await options.beforeInsert?.();
+      assertPersistenceBudget(options);
       const inserted = await tx.insert(durableTransitions).values({
         sequence: latest + 1,
         operationKey: parsed.operationKey,
@@ -1397,7 +1617,9 @@ export class PostgresEventJournal implements EventJournal {
       if (target > highWater) throw new CheckpointFenceError(target, highWater);
       const rowCap = Math.max(0, Math.min(options.maxRows ?? Number.MAX_SAFE_INTEGER, options.batchSize ?? Number.MAX_SAFE_INTEGER));
       if (rowCap <= 0) return { deleted: 0, cursor: target, highWater, compactedOperationKeys: 0 };
-      const rows = await tx.select().from(durableTransitions).where(lte(durableTransitions.sequence, target)).orderBy(asc(durableTransitions.sequence)).limit(Math.min(rowCap, 10_000));
+      const rows = await tx.select().from(durableTransitions).where(and(lte(durableTransitions.sequence, target),
+        sql`type <> 'EXPERIMENT_NON_FINAL_QUARANTINED' AND NOT (type IN ('REPORT_SOURCE_INTEGRITY_FAULT', 'REPORT_SOURCE_INTEGRITY_REPAIRED') AND EXISTS (SELECT 1 FROM durable_transitions q WHERE q.type = 'EXPERIMENT_NON_FINAL_QUARANTINED' AND q.operation_key = 'experiment-quarantine:' || durable_transitions.aggregate_id))`
+      )).orderBy(asc(durableTransitions.sequence)).limit(Math.min(rowCap, 10_000));
       const expiresAt = new Date(Date.now() + ttl).toISOString();
       if (Date.now() >= deadline) throw new Error("RETENTION_CYCLE_BUDGET_EXCEEDED");
       if (rows.length > 0) {
@@ -1498,24 +1720,31 @@ export class PostgresEventJournal implements EventJournal {
   }
   async deleteCanonicalEventsThrough(input: { experimentId: string; occurredBefore?: Date; limit: number; sourceCursor: number; sourceCommitSeq?: number; sourceRecordedAt?: Date }): Promise<{ deleted: number }> {
     assertJournalCapability(this.access, "maintenance", "deleteCanonicalEventsThrough");
+    if ((await this.readDurableByOperationKey(quarantineOperationKey(input.experimentId)))?.type === QUARANTINE_TRANSITION) return { deleted: 0 };
     const cap = Math.max(0, Math.min(500, Math.floor(input.limit)));
     if (cap <= 0) return { deleted: 0 };
     // A cleanup-authoritative rollup must prove both the durable commit fence
     // and the recorded-at fence. recorded_at alone is not commit authority.
     if (input.sourceCommitSeq == null) return { deleted: 0 };
+    const sourceCommitSeq = input.sourceCommitSeq;
     const before = input.occurredBefore ?? new Date();
     const types = [...CANONICAL_REPORT_INPUT_EVENT_TYPES] as string[];
-    const result = await this.client`
+    return this.client.begin(async tx => {
+      await tx`SELECT pg_advisory_xact_lock(${DURABLE_MUTATION_LOCK_ID})`;
+      const receipt = await tx`SELECT type FROM durable_transitions WHERE operation_key = ${quarantineOperationKey(input.experimentId)}`;
+      if (receipt[0]?.type === QUARANTINE_TRANSITION) return { deleted: 0 };
+      const result = await tx`
       DELETE FROM journal_events
       WHERE id IN (
         SELECT id FROM journal_events
         WHERE type = ANY(${types}) AND (payload->>'experimentId') = ${input.experimentId}
           AND occurred_at < ${before.toISOString()}
-          AND commit_seq <= ${input.sourceCommitSeq}
+          AND commit_seq <= ${sourceCommitSeq}
           AND (${input.sourceRecordedAt == null} OR recorded_at <= ${(input.sourceRecordedAt ?? new Date()).toISOString()})
         ORDER BY occurred_at ASC, id ASC LIMIT ${cap}
       )`;
-    return { deleted: result.count ?? 0 };
+      return { deleted: result.count ?? 0 };
+    });
   }
   async countCanonicalEventsThrough(input: { experimentId: string; occurredBefore: Date; sourceCommitSeq: number; sourceRecordedAt: Date }): Promise<{ count: number; oldestOccurredAt: string | null }> {
     const types = [...CANONICAL_REPORT_INPUT_EVENT_TYPES] as string[];
@@ -1581,6 +1810,8 @@ export class PostgresEventJournal implements EventJournal {
     const predicates = [
       inArray(journalEvents.type, [...types]),
       lt(journalEvents.occurredAt, occurredBefore),
+      sql`NOT EXISTS (SELECT 1 FROM durable_transitions q WHERE q.type = 'EXPERIMENT_NON_FINAL_QUARANTINED'
+        AND q.operation_key IN ('experiment-quarantine:' || (${journalEvents.payload}->>'experimentId'), 'experiment-quarantine:' || ${journalEvents.aggregateId}))`,
     ];
     if (options.unattributedOnly) {
       predicates.push(sql`coalesce(${journalEvents.payload}->>'experimentId', '') = ''`);

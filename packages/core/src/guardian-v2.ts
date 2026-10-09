@@ -7,7 +7,7 @@ export const GUARDIAN_V2_CONFIG = Object.freeze({
   EARLY_WINDOW_MS: 180000, EARLY_HELD_RATIO_MAX: 0.70,
   EARLY_DROP_LOOKBACK_MS: 10000, EARLY_MIN_DROP_RATIO: 0.05,
   EARLY_BAD_REGION_PERSIST_MS: 5000, EARLY_OPPOSITE_BOOK_PRESSURE_MIN: 0.20,
-  EARLY_RECOVERY_WATCH_MS: 60000, EARLY_TRUE_RECOVERY_RATIO: 0.95, EARLY_EMERGENCY_RATIO: 0.15,
+  EARLY_RECOVERY_WATCH_MS: 65000, EARLY_TRUE_RECOVERY_RATIO: 0.95, EARLY_EMERGENCY_RATIO: 0.15,
   LATE_WINDOW_START_MS: 180000, LATE_WINDOW_END_MS: 600000,
   LATE_MIN_CONFIDENCE: 0.65, LATE_MIN_EDGE: 0.015, LATE_MIN_HELD_RATIO: 0.20, LATE_MAX_HELD_RATIO: 0.60,
   LATE_CONFIRM_MS: 30000, LATE_REQUIRED_RATIO_DETERIORATION: 0.026,
@@ -17,7 +17,7 @@ const C = GUARDIAN_V2_CONFIG;
 const timestamp = z.string().datetime({ offset: true });
 const ratio = z.string().refine(v => { try { return d(v).isFinite() && d(v).gte(0); } catch { return false; } });
 export const guardianV2StateSchema = z.object({
-  version: z.literal(2), marketId: z.string().min(1), positionId: z.string().min(1),
+  version: z.literal(2), formatGeneration: z.literal(3).optional(), marketId: z.string().min(1), positionId: z.string().min(1),
   unhedgedStartedAt: timestamp, heldOutcome: z.enum(["UP", "DOWN"]),
   entryPrice: ratio.refine(v => d(v).gt(0) && d(v).lte(1)),
   phase: z.enum(["OBSERVING", "EARLY_RECOVERY_WATCH", "LATE_CONFIRMATION", "PROTECTION_PENDING"]),
@@ -44,7 +44,10 @@ export const guardianV2StateSchema = z.object({
     || ((s.lastConsensusAt === null) !== (s.lastConsensusEventId === null));
   if (s.armedAt && s.deadlineAt) {
     const arm = Date.parse(s.armedAt), age = arm - start;
-    invalid ||= arm > updated || Date.parse(s.deadlineAt) !== arm + (s.sensor === "EARLY" ? C.EARLY_RECOVERY_WATCH_MS : C.LATE_CONFIRM_MS)
+    const expectedDeadline = s.sensor === "EARLY"
+      ? (s.badRegionSince ? Date.parse(s.badRegionSince) + C.EARLY_RECOVERY_WATCH_MS : s.formatGeneration == null ? arm + 60000 : Number.NaN)
+      : arm + C.LATE_CONFIRM_MS;
+    invalid ||= arm > updated || Date.parse(s.deadlineAt) !== expectedDeadline
       || (s.sensor === "EARLY" ? age < 0 || age > C.EARLY_WINDOW_MS : age <= C.LATE_WINDOW_START_MS || age > C.LATE_WINDOW_END_MS);
   }
   if (s.protectionReason) {
@@ -75,7 +78,24 @@ export function isGuardianV2State(state: unknown): state is GuardianV2State {
 export function isLockedGuardianV2Config(value: unknown): boolean {
   if (!value || typeof value !== "object") return false;
   const config = value as Record<string, unknown>;
-  return Object.keys(config).length === Object.keys(C).length && Object.entries(C).every(([key, v]) => config[key] === v);
+  return Object.keys(config).length === Object.keys(C).length && Object.entries(C).every(([key, v]) =>
+    config[key] === v || (key === "EARLY_RECOVERY_WATCH_MS" && config[key] === 60000));
+}
+/** Bounded readers: HEAD arm+60s, frozen unmarked bad-region+65s, explicit new format. */
+export type GuardianGeneration = "HEAD_V2" | "FROZEN_V2" | "BAD_REGION_V3";
+export function lockedGuardianGeneration(risk: Record<string, unknown>): GuardianGeneration | null {
+  if (risk.guardianVersion !== 2 || !isLockedGuardianV2Config(risk.guardianV2Config)) return null;
+  const watch = (risk.guardianV2Config as Record<string, unknown>).EARLY_RECOVERY_WATCH_MS;
+  if (risk.guardianFormatGeneration === 3) return watch === 65000 ? "BAD_REGION_V3" : null;
+  if (risk.guardianFormatGeneration != null) return null;
+  return watch === 60000 ? "HEAD_V2" : "FROZEN_V2";
+}
+export function guardianStateMatchesGeneration(state: GuardianV2State, generation: GuardianGeneration | null): boolean {
+  if (!generation || (state.formatGeneration === 3) !== (generation === "BAD_REGION_V3")) return false;
+  if (state.sensor !== "EARLY") return true;
+  return generation === "HEAD_V2"
+    ? state.badRegionSince === null && Date.parse(state.deadlineAt!) === Date.parse(state.armedAt!) + 60000
+    : state.badRegionSince !== null && Date.parse(state.deadlineAt!) === Date.parse(state.badRegionSince) + 65000;
 }
 export function normalizeOppositeBookPressure(held: "UP" | "DOWN", upPressure: string | number): string {
   return d(upPressure).times(held === "UP" ? -1 : 1).toFixed();
@@ -83,13 +103,15 @@ export function normalizeOppositeBookPressure(held: "UP" | "DOWN", upPressure: s
 
 /** Only observed values are used. No interpolation or extrapolated recovery. Latest sample <= t-10s is the anchor. */
 export function evaluateGuardianV2(input: {
-  state: GuardianV2State | null; episode: ReversalEpisode | null; entryPrice: string; now: Date;
+  generation?: GuardianGeneration; state: GuardianV2State | null; episode: ReversalEpisode | null; entryPrice: string; now: Date;
   observation?: { eventId: string; heldPrice: string; bookPressure: string } | null;
   observationGap?: boolean;
   consensus?: { eventId: string; direction: "UP" | "DOWN" | "FLAT"; confidence: number; estimatedEdge: number };
 }): { nextState: GuardianV2State | null; stateChanged: boolean; events: GuardianV2Event[] } {
   const episode = input.episode, nowMs = input.now.getTime();
   const previous = input.state;
+  const generation = input.generation ?? (previous && previous.formatGeneration == null
+    ? previous.sensor === "EARLY" && previous.badRegionSince === null ? "HEAD_V2" : "FROZEN_V2" : "BAD_REGION_V3");
   const noop = { nextState: previous, stateChanged: false, events: [] as GuardianV2Event[] };
   if (!episode || !Number.isFinite(nowMs) || nowMs < Date.parse(episode.unhedgedStartedAt)) return noop;
   if (previous && (previous.positionId !== episode.positionId || previous.unhedgedStartedAt !== episode.unhedgedStartedAt
@@ -98,7 +120,7 @@ export function evaluateGuardianV2(input: {
   const entry = d(previous?.entryPrice ?? input.entryPrice);
   if (!entry.isFinite() || entry.lte(0) || entry.gt(1)) return noop;
   const s: GuardianV2State = previous ? structuredClone(previous) : {
-    ...episode, version: 2, entryPrice: entry.toFixed(), phase: "OBSERVING", sensor: null,
+    ...episode, version: 2, ...(generation === "BAD_REGION_V3" ? { formatGeneration: 3 as const } : {}), entryPrice: entry.toFixed(), phase: "OBSERVING", sensor: null,
     armedAt: null, deadlineAt: null, armRatio: null, badRegionSince: null, history: [],
     lastObservationAt: null, lastObservationEventId: null, lastConsensusAt: null, lastConsensusEventId: null,
     confirmedAt: null, protectionReason: null, revision: 0, updatedAt: input.now.toISOString(),
@@ -124,8 +146,10 @@ export function evaluateGuardianV2(input: {
   const arm = (sensor: "EARLY" | "LATE") => {
     s.phase = sensor === "EARLY" ? "EARLY_RECOVERY_WATCH" : "LATE_CONFIRMATION";
     s.sensor = sensor; s.armedAt = at; s.armRatio = heldRatio!.toFixed();
-    s.deadlineAt = new Date(nowMs + (sensor === "EARLY" ? C.EARLY_RECOVERY_WATCH_MS : C.LATE_CONFIRM_MS)).toISOString();
-    s.history = []; s.badRegionSince = null;
+    const deadlineBaseMs = sensor === "EARLY" && generation !== "HEAD_V2" ? Date.parse(s.badRegionSince!) : nowMs;
+    s.deadlineAt = new Date(deadlineBaseMs + (sensor === "EARLY" ? generation === "HEAD_V2" ? 60000 : C.EARLY_RECOVERY_WATCH_MS : C.LATE_CONFIRM_MS)).toISOString();
+    s.history = [];
+    if (sensor === "LATE" || generation === "HEAD_V2") s.badRegionSince = null;
     events.push(sensor === "EARLY" ? "EARLY_DETERIORATION_ARMED" : "LATE_SEVERITY_ARMED");
   };
   // STRICT deadline is first: a .95 observation at/after EARLY expiry cannot rescue the position.
@@ -149,7 +173,8 @@ export function evaluateGuardianV2(input: {
       && s.badRegionSince && nowMs - Date.parse(s.badRegionSince) >= C.EARLY_BAD_REGION_PERSIST_MS
       && pressure!.gte(C.EARLY_OPPOSITE_BOOK_PRESSURE_MIN)) {
       arm("EARLY");
-      if (heldRatio!.lte(C.EARLY_EMERGENCY_RATIO)) protect("EARLY_EMERGENCY", "EARLY_EMERGENCY_PROTECT");
+      if (nowMs >= Date.parse(s.deadlineAt!)) protect("EARLY_TIMEOUT", "EARLY_TIMEOUT_PROTECT");
+      else if (heldRatio!.lte(C.EARLY_EMERGENCY_RATIO)) protect("EARLY_EMERGENCY", "EARLY_EMERGENCY_PROTECT");
     }
   } else if (s.phase === "OBSERVING" && age > C.LATE_WINDOW_START_MS && age <= C.LATE_WINDOW_END_MS
     && valid && input.consensus && input.consensus.eventId !== s.lastConsensusEventId

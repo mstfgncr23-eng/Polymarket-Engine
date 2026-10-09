@@ -1,0 +1,5 @@
+maps/
+evidence/private/
+runs/
+*.pyc
+__pycache__/

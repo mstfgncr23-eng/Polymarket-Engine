@@ -25,7 +25,6 @@ import {
   type ExperimentSummaryAccumulatorSnapshot,
   type ExperimentSummaryExtras,
 } from "./report.js";
-import { loadSourceSeal } from "./source-seal.js";
 import { loadUnresolvedReportSourceIntegrity } from "./report-source-integrity.js";
 import { createHash } from "node:crypto";
 
@@ -178,7 +177,6 @@ export async function persistCanonicalFinalReport(
   if (!isCanonicalFinalReport({ reportKind: "final", complete: input.summary.complete, truncated: input.summary.truncated })) {
     return null;
   }
-  if (!(await loadSourceSeal(journal, input.summary.experimentId))) return null;
   let unresolved: Awaited<ReturnType<typeof loadUnresolvedReportSourceIntegrity>>;
   try {
     unresolved = await loadUnresolvedReportSourceIntegrity(journal, input.summary.experimentId);

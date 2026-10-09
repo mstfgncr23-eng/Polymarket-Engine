@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { evaluateGuardianV2, GUARDIAN_V2_CONFIG, isGuardianV2State, isLockedGuardianV2Config, normalizeOppositeBookPressure, reversalProtectionStateSchema, sameReversalEpisode, type ReversalProtectionState, type ReversalEpisode } from "@pm/core";
+import { evaluateGuardianV2, lockedGuardianGeneration, GUARDIAN_V2_CONFIG, isGuardianV2State, normalizeOppositeBookPressure, reversalProtectionStateSchema, sameReversalEpisode, type GuardianV2Event, type ReversalProtectionState, type ReversalEpisode } from "@pm/core";
 import { nakedDirectionalDiagnosticSchema, observeNakedDirectionalPosition, noteNakedDirectionalAnomaly, compactNakedDirectionalObservation,
   nakedDirectionalSummary, SOAK_PERSIST_INTERVAL_MS, evaluateProfitTrailingPair, profitTrailingPairStateSchema,
   type NakedDirectionalDiagnostic, type ProfitTrailingPairState } from "@pm/core";
@@ -32,6 +32,7 @@ import {
   executePaperTaker,
   experimentManifestSchema,
   qualificationConfigSchema,
+  type QualificationConfig,
   refreshExperiment,
   riskLimitsSchema,
   startExperiment,
@@ -98,16 +99,22 @@ import {
   type HedgePositionFacts,
 } from "@pm/core";
 import {
+  assertJournalEventIdentity,
+  JournalEventConflictError,
+  PersistenceOutcomeUnknownError,
+  retryPersistenceTransport,
+  type JournalAppendOptions,
+  QUARANTINE_TRANSITION, quarantineOperationKey, quarantinePayloadSchema, quarantineReceiptSchema,
+  ExperimentQuarantineRejectedError, type QuarantineReceipt,
   CHECKPOINT_SCHEMA_VERSION,
   CheckpointFenceError,
   createJournalEvent,
+  prepareJournalEvent,
   derivedAuditEventId,
   DurableCursorBehindError,
   IdempotencyConflictError,
   isCanonicalFinalReport,
-  JournalAppendAbortedError,
   isJournalAppendAbortedError,
-  isJournalAppendDeadlineError,
   hashCheckpointPayload,
   hashDurablePayload,
   type DurableCommitResult,
@@ -132,13 +139,13 @@ import { EngineStateStore } from "./state.js";
 import { ensureReportGeneratedAudit, persistCanonicalFinalReport, persistVerifiedAnalyticsRollup, streamExperimentSummary, summaryFromDurableReport } from "./final-report.js";
 import { writeExperimentSummary } from "./report.js";
 import { retentionConfigFromEngineEnv, RetentionManager } from "./retention-manager.js";
-import { createSourceSealEvent, loadSourceSeal, remainingSealMs, SOURCE_SEAL_TIMEOUT_MS, isSourceSealExemptType } from "./source-seal.js";
 import {
   boundIntegrityFaults,
   createIntegrityFaultEvent,
   createIntegrityRepairEvent,
   integrityDurableOperationKey,
   INTEGRITY_OVERFLOW_EVENT_ID,
+  isReportInputBoundaryType,
   loadIntegrityRepairIds,
   loadUnresolvedReportSourceIntegrity,
   overflowIntegrityFault,
@@ -212,6 +219,12 @@ class FirstLegLifecycleGuardRejectedError extends Error {
   }
 }
 
+class GuardianPersistenceGuardRejectedError extends Error {
+  constructor(readonly marketId: string, readonly reason: "EPISODE_CHANGED" | "SUPERSEDED") {
+    super(`GUARDIAN_PERSISTENCE_REJECTED:${marketId}:${reason}`);
+  }
+}
+
 class RiskReductionLifecycleGuardRejectedError extends Error {
   constructor(
     readonly marketId: string,
@@ -265,13 +278,27 @@ export class MakerReservationCashCommitGuardRejectedError extends Error {
   }
 }
 
-function isJournalAdmissionRejectedError(error: unknown): boolean {
-  return error instanceof JournalAdmissionRejected
-    || (Boolean(error) && typeof error === "object" && (error as { name?: string }).name === "JournalAdmissionRejected");
-}
-
 const IDLE_GROK_IDEMPOTENCY_MAX = 4_096;
 const IDLE_GROK_IDEMPOTENCY_TTL_MS = 5 * 60_000;
+
+const GUARDIAN_OBSERVATION_CHECKPOINT_MS = 500;
+
+export const GUARDIAN_PERSISTENCE_BOUNDS = Object.freeze({ perMarket: 64, total: 256, bytes: 4 * 1024 * 1024 });
+export type GuardianPersistenceOutcome =
+  | { status: "PERSISTED" | "SKIPPED_SUPERSEDED" | "SKIPPED_EPISODE_CHANGED"; sourceEventId: string | null }
+  | { status: "FAILED"; error: unknown; sourceEventId: string | null };
+type GuardianPersistenceRequest = {
+  experimentId: string;
+  generation: number;
+  kind: "critical" | "checkpoint";
+  state: ReversalProtectionState;
+  events: GuardianV2Event[];
+  sourceEvent?: JournalEvent;
+  bytes: number;
+  done: Promise<GuardianPersistenceOutcome>;
+  resolve: (outcome: GuardianPersistenceOutcome) => void;
+};
+
 const SCOUT_REFRESH_STATE_TTL_MS = 60_000;
 const SCOUT_REFRESH_CONTEXT_MAX = 128;
 const SCOUT_REFRESH_RETRY_GAP_MS = 1_000;
@@ -328,7 +355,7 @@ type RetainedBookkeepingCounts = {
 };
 type RetainedCleanupCycle = { atMs: number; before: RetainedBookkeepingCounts; after: RetainedBookkeepingCounts };
 type GrokSubmissionResult = {
-  status: "accepted" | "duplicate" | "stale" | "unsupported_evidence" | "unknown_trigger" | "trace_mismatch" | "market_mismatch" | "asset_mismatch" | "replay_rejected" | "malformed" | "identity_mismatch" | "source_sealed";
+  status: "accepted" | "duplicate" | "stale" | "unsupported_evidence" | "unknown_trigger" | "trace_mismatch" | "market_mismatch" | "asset_mismatch" | "replay_rejected" | "malformed" | "identity_mismatch";
   signalId?: string;
 };
 
@@ -392,6 +419,7 @@ export class EngineService {
   private readonly triggerEngine;
   private readonly riskLimits;
   private readonly triggerConfig;
+  private readonly qualificationConfig: QualificationConfig;
   private readonly nativeDecisionConfig: NativeDecisionConfig;
   private readonly strategy = new TemporalPairHedgeStrategy();
   private readonly marketAdapter: PolymarketMarketDataAdapter;
@@ -416,8 +444,17 @@ export class EngineService {
   private readonly riskReductionOwners = new Map<string, RiskReductionOwnership>();
   private readonly nakedDirectionalDiagnostics = new Map<string, NakedDirectionalDiagnostic>();
   private readonly reversalProtectionStates = new Map<string, ReversalProtectionState>();
+  /** Per-tick Guardian sensor state. Raw market observations stay off the durable ingress path. */
+  private readonly guardianRuntimeStates = new Map<string, ReversalProtectionState>();
+  /** At most one coalescible ordinary checkpoint plus rare ordered critical transitions per market. */
+  private readonly guardianPersistenceQueues = new Map<string, GuardianPersistenceRequest[]>();
+  private guardianPersistenceBytes = 0;
+  private readonly guardianShutdownAbort = new AbortController();
+  private readonly guardianPersistenceWorkers = new Map<string, Promise<void>>();
+  private readonly guardianCheckpointQueuedAt = new Map<string, number>();
   private readonly reversalProtectionInFlight = new Set<string>();
   private readonly reversalProtectionPending = new Set<string>();
+  private readonly reversalProtectionSnapshotScheduled = new Set<string>();
   private readonly profitTrailingPairStates = new Map<string, ProfitTrailingPairState>();
   private readonly profitTrailingPairInFlight = new Set<string>();
   private readonly profitTrailingPairPending = new Set<string>();
@@ -516,22 +553,15 @@ export class EngineService {
   private readonly retention: RetentionManager;
   private readonly shutdownJoinDeadlineMs: number;
   private lastShutdown: JoinResult | null = null;
+  private lastGuardianShutdown: JoinResult | null = null;
   private lastJournalShutdown: JoinResult | null = null;
   private lastShutdownCheckpointed = false;
   private maintenanceHold: Promise<void> | null = null;
   private processTriggerHold: Promise<void> | null = null;
   private triggerEventPersistHold: Promise<void> | null = null;
-  private sourceSealing = false;
-  private sourceSealed = false;
-  private sourceSealTimeoutMs = SOURCE_SEAL_TIMEOUT_MS;
-  private sourceSealGeneration = 0;
-  private sourceSealDeadlineAt = 0;
-  private sourceSealPersistCancelled = false;
-  private sourceSealPersistAttempt = 0;
-  private sourceSealPersistHold: Promise<void> | null = null;
-  private sourceSealAbort: AbortController | null = null;
-  private sourceSealPersistInFlight = false;
-  private sourceSealFlight: Promise<{ sealed: boolean; reason: string | null }> | null = null;
+  private reportQuarantine: QuarantineReceipt | null = null;
+  private finalReportWrites = 0;
+  private researchIngressGeneration = 0;
   private researchIngressInFlight = 0;
   private grokClaimHold: Promise<void> | null = null;
   private idleGrokAcceptanceHoldForTest: Promise<void> | null = null;
@@ -572,6 +602,7 @@ export class EngineService {
     this.ledger = new PaperLedger(env.PAPER_START_BALANCE, this.nowFn());
     this.state = new EngineStateStore(this.ledger.snapshot(), this.ledger.positions);
     this.triggerConfig = triggerConfigSchema.parse({ scheduledReviewIntervalMs: env.SCHEDULED_REVIEW_INTERVAL_MS });
+    this.qualificationConfig = qualificationConfigSchema.parse({ maxQualifiedMarkets: env.MAX_QUALIFIED_MARKETS });
     this.triggerEngine = new TriggerEngine(this.triggerConfig, this.nowFn, this.metrics.triggerObserver());
     this.nativeDecisionConfig = {
       ...defaultNativeDecisionConfig,
@@ -663,7 +694,6 @@ export class EngineService {
     this.started = true;
     await this.initializeJournalWithRetry();
     await this.restoreAndRecover();
-    await this.restoreSourceSealState();
     await this.restoreReportSourceIntegrity();
     this.state.recoveryComplete = true;
     this.noteSoakAnomaly("RECOVERY_OBSERVATION_GAP", { reason: "No observations are fabricated during downtime" });
@@ -733,14 +763,21 @@ export class EngineService {
     const deadline = this.shutdownJoinDeadlineMs;
     const started = Date.now();
     this.lastShutdown = await this.supervisor.join(deadline);
+    this.flushGuardianRuntimeForShutdown();
+    let remaining = Math.max(0, deadline - (Date.now() - started));
+    this.lastGuardianShutdown = await this.joinGuardianPersistence(remaining);
+    if (!this.lastGuardianShutdown.drained) this.guardianShutdownAbort.abort("GUARDIAN_SHUTDOWN_UNRESOLVED");
     this.journalAdmission.closeAdmission();
-    const remaining = Math.max(0, deadline - (Date.now() - started));
+    remaining = Math.max(0, deadline - (Date.now() - started));
     this.lastJournalShutdown = await this.journalAdmission.join(remaining);
-    const latestDurable = await this.journal.latestDurableSequence();
+    const latestDurable = this.lastGuardianShutdown.drained && this.lastShutdown.drained && this.lastJournalShutdown.drained
+      ? await this.journal.latestDurableSequence() : null;
     const cleanDrain = Boolean(
       this.lastShutdown.drained
+      && this.lastGuardianShutdown.drained
       && this.lastJournalShutdown.drained
       && !this.lastShutdown.timedOut
+      && !this.lastGuardianShutdown.timedOut
       && !this.lastJournalShutdown.timedOut
       && this.state.database === "UP"
       && !this.overload.hasIntegrityFault
@@ -754,8 +791,10 @@ export class EngineService {
     await this.journal.close();
     this.clearResearchActivationState();
     this.record("ENGINE_STOPPED", this.experiment?.id ?? "engine", null, {
-      unresolvedOwnedWork: (this.lastShutdown.unresolved ?? 0) + (this.lastJournalShutdown.unresolved ?? 0),
-      shutdownTimedOut: this.lastShutdown.timedOut || this.lastJournalShutdown.timedOut,
+      unresolvedOwnedWork: (this.lastShutdown.unresolved ?? 0)
+        + (this.lastGuardianShutdown.unresolved ?? 0)
+        + (this.lastJournalShutdown.unresolved ?? 0),
+      shutdownTimedOut: this.lastShutdown.timedOut || this.lastGuardianShutdown.timedOut || this.lastJournalShutdown.timedOut,
       checkpointed: this.lastShutdownCheckpointed,
     });
   }
@@ -899,6 +938,150 @@ export class EngineService {
     return this.overload.hasIntegrityFault && this.overload.state === "FAIL_CLOSED";
   }
 
+  private async readVerifiedQuarantine(experimentId: string): Promise<QuarantineReceipt | null> {
+    try {
+      return await retryPersistenceTransport(async () => {
+        const row = await this.journal.readDurableByOperationKey(quarantineOperationKey(experimentId));
+        if (!row) return null;
+        const receipt = quarantineReceiptSchema.parse({ ...quarantinePayloadSchema.parse(row.payload), sequence: row.sequence });
+        const highWater = await this.journal.latestDurableSequence();
+        if (row.sequence > this.lastAppliedDurableCursor || row.sequence > highWater
+          || row.type !== QUARANTINE_TRANSITION || row.aggregateType !== "experiment" || row.aggregateId !== experimentId
+          || receipt.experimentId !== experimentId || receipt.durableCursorBefore + 1 !== row.sequence
+          || row.payloadHash !== hashDurablePayload(row.payload)
+          || Date.parse(row.occurredAt) !== Date.parse(receipt.quarantinedAt)) {
+          throw new RecoveryFailClosedError("invariant", "invalid durable quarantine receipt");
+        }
+        if (isCanonicalFinalReport((await this.journal.loadExperimentReport(experimentId, "final")) ?? { reportKind: "final", complete: false, truncated: false })) {
+          throw new RecoveryFailClosedError("invariant", "canonical report conflicts with quarantine");
+        }
+        return receipt;
+      }, this.persistenceRetryOptions("integrity"));
+    } catch (error) {
+      this.failClosedIntegrity(error);
+      throw error;
+    }
+  }
+
+  experimentReportDisposition(): Record<string, unknown> {
+    return { experimentId: this.experiment?.id ?? null, status: this.experiment?.status ?? null,
+      reportDisposition: this.reportQuarantine?.disposition ?? null, canonical: this.reportQuarantine ? false : this.reportGenerated,
+      integrityFaultPresent: Boolean(this.reportQuarantine || (this.experiment && this.unresolvedReportSourceIntegrity(this.experiment.id).length)),
+      receipt: this.reportQuarantine ? structuredClone(this.reportQuarantine) : null };
+  }
+
+  private quarantineRuntimeDiagnostics() {
+    const supervisor = this.supervisor.snapshot();
+    let guardianQueued = 0;
+    for (const queue of this.guardianPersistenceQueues.values()) guardianQueued += queue.length;
+    return {
+      supervisorUnresolved: supervisor.unresolved,
+      guardianQueued,
+      guardianWorkers: this.guardianPersistenceWorkers.size,
+      reversalProtectionInFlight: this.reversalProtectionInFlight.size,
+      reversalProtectionPending: this.reversalProtectionPending.size,
+      reversalProtectionSnapshotScheduled: this.reversalProtectionSnapshotScheduled.size,
+      journalActive: this.journalAdmission.activeCount,
+      journalWaiting: this.journalAdmission.waitingCount,
+      researchIngressInFlight: this.researchIngressInFlight,
+      finalReportWrites: this.finalReportWrites,
+      retentionInFlight: this.retention.inFlight,
+    };
+  }
+
+  private quarantineRuntimeBlocker(): string | null {
+    if (this.ledger.positions.size || this.restingOrders.size || this.makerReservations.size
+      || !d(this.ledger.snapshot().reservedCash).eq(0) || this.riskReductionOwners.size
+      || this.pendingFirstLegMarkets.size || this.riskReductionInFlight.size
+      || this.profitTrailingPairInFlight.size || this.profitTrailingPairPending.size
+      || this.reversalProtectionInFlight.size || this.reversalProtectionPending.size) return "QUARANTINE_ECONOMIC_AUTHORITY";
+    if (this.supervisor.snapshot().unresolved || this.guardianPersistenceUnresolved()
+      || this.journalAdmission.activeCount || this.journalAdmission.waitingCount
+      || this.researchIngressInFlight || this.finalReportWrites || this.retention.inFlight) return "QUARANTINE_RUNTIME_NOT_DRAINED";
+    return null;
+  }
+
+  private async assertQuarantineReady(experimentId: string): Promise<ReportSourceIntegrityFault[]> {
+    if (this.experiment?.id !== experimentId) throw new ExperimentQuarantineRejectedError("QUARANTINE_EXPERIMENT_MISMATCH");
+    if (this.experiment.status !== "COMPLETED") throw new ExperimentQuarantineRejectedError("QUARANTINE_COMPLETED_REQUIRED");
+    const blocker = this.quarantineRuntimeBlocker();
+    if (blocker) throw new ExperimentQuarantineRejectedError(blocker);
+    const latest = await this.journal.latestDurableSequence();
+    const invariant = validatePostReplayInvariants(this.recoverableBag(), this.lastAppliedDurableCursor, latest);
+    if (!invariant.ok) throw new RecoveryFailClosedError("invariant", invariant.reasons.join(","));
+    if (this.env.TRADING_MODE !== "paper" || this.state.database !== "UP" || this.state.journalDegraded
+      || !this.state.recoveryComplete || this.overload.hasIntegrityFault) {
+      throw new ExperimentQuarantineRejectedError("QUARANTINE_DATABASE_NOT_HEALTHY");
+    }
+    const canonical = await this.journal.loadExperimentReport(experimentId, "final");
+    if (canonical && isCanonicalFinalReport(canonical)) throw new ExperimentQuarantineRejectedError("QUARANTINE_CANONICAL_FINAL_PRESENT");
+    const faults = await loadUnresolvedReportSourceIntegrity(this.journal, experimentId);
+    if (!faults.length) throw new ExperimentQuarantineRejectedError("QUARANTINE_UNRESOLVED_SOURCE_REQUIRED");
+    // The loader can conservatively return an overflow sentinel. Accept only
+    // evidence with a physically persisted fault marker, never a RAM-only fault.
+    for (const fault of faults) {
+      const key = integrityDurableOperationKey("fault", experimentId, fault.eventId);
+      const event = await this.journal.readJournalEventById(key);
+      const durable = event ? null : await this.journal.readDurableByOperationKey(key);
+      const record = event ?? durable;
+      if (!record || record.type !== "REPORT_SOURCE_INTEGRITY_FAULT"
+        || record.payload.experimentId !== experimentId || record.payload.eventId !== fault.eventId) {
+        throw new ExperimentQuarantineRejectedError("QUARANTINE_UNRESOLVED_SOURCE_REQUIRED");
+      }
+    }
+    const raced = this.quarantineRuntimeBlocker();
+    if (raced) throw new ExperimentQuarantineRejectedError(raced);
+    return faults;
+  }
+
+  async quarantineExperiment(input: { experimentId: string; requestId: string; operatorId: string }): Promise<Record<string, unknown>> {
+    return this.experimentBoundaryGate.run(() => this.durableGate.run(async () => {
+      try {
+        if (![input.experimentId, input.requestId, input.operatorId].every(v => typeof v === "string" && v.length > 0)
+          || input.experimentId.length > 120 || input.requestId.length > 80 || input.operatorId.length > 80) {
+          throw new ExperimentQuarantineRejectedError("QUARANTINE_INVALID_REQUEST");
+        }
+        const existing = await this.readVerifiedQuarantine(input.experimentId);
+        if (existing) return { ok: true, existing: true, receipt: existing };
+        const faults = await retryPersistenceTransport(
+          () => this.assertQuarantineReady(input.experimentId), this.persistenceRetryOptions("integrity"),
+        );
+        const at = this.nowFn();
+        const payload = quarantinePayloadSchema.parse({
+          experimentId: input.experimentId, experimentStatus: "COMPLETED", disposition: "QUARANTINED_NON_FINAL",
+          quarantinedAt: at.toISOString(), operatorId: input.operatorId, requestId: input.requestId,
+          reasonCode: "CANONICAL_SOURCE_INTEGRITY_UNRESOLVED", canonicalFinalReportPresent: false,
+          integrityFaultCount: faults.length,
+          faultReferences: faults.map(f => ({ ...f, reason: f.reason.slice(0, 512) })).sort((a, b) => a.eventId.localeCompare(b.eventId)),
+          durableCursorBefore: this.lastAppliedDurableCursor, validationAuthority: "DURABLE_REPLAY_VALID",
+          economicTerminality: { openPositions: 0, restingOrders: 0, reservations: 0, reservedCash: "0", riskReductionOwners: 0, pendingEconomicWork: 0 },
+        });
+        const result = await this.commitAuthoritative({
+          operationKey: quarantineOperationKey(input.experimentId), type: QUARANTINE_TRANSITION,
+          aggregateType: "experiment", aggregateId: input.experimentId, occurredAt: at,
+          buildPayload: () => ({ ...payload, derivedAudit: [{
+            id: quarantineOperationKey(input.experimentId), type: QUARANTINE_TRANSITION,
+            aggregateType: "experiment", aggregateId: input.experimentId, traceId: input.requestId,
+            correlationId: input.requestId, occurredAt: at.toISOString(), recordedAt: at.toISOString(),
+            payload: { ...payload, canonical: false },
+          }] }),
+          // commitAuthoritative already owns transport recovery here; do not nest retries.
+          beforeCommit: async () => { await this.assertQuarantineReady(input.experimentId); },
+          checkpoint: true,
+        });
+        return { ok: true, existing: result.existing, receipt: this.reportQuarantine };
+      } catch (error) {
+        if (error instanceof ExperimentQuarantineRejectedError) {
+          return error.blocker === "QUARANTINE_RUNTIME_NOT_DRAINED"
+            ? { ok: false, blockers: [error.blocker], runtimeDiagnostics: this.quarantineRuntimeDiagnostics() }
+            : { ok: false, blockers: [error.blocker] };
+        }
+        this.failClosedIntegrity(error);
+        throw error;
+      }
+    }));
+  }
+
   async beginExperiment(): Promise<Record<string, unknown>> {
     return this.experimentBoundaryGate.run(async () => {
       if (this.experiment?.status === "RUNNING" || this.experiment?.status === "ENTRY_CLOSED") {
@@ -911,7 +1094,8 @@ export class EngineService {
         const previousReport = await this.journal
           .loadExperimentReport(this.experiment.id, "final")
           .catch(() => null);
-        if (!previousReport || !isCanonicalFinalReport(previousReport)) {
+        if ((!previousReport || !isCanonicalFinalReport(previousReport))
+          && !(await this.readVerifiedQuarantine(this.experiment.id))) {
           return {
             ok: false,
             blockers: ["PREVIOUS_EXPERIMENT_REPORT_NOT_FINALIZED"],
@@ -963,7 +1147,7 @@ export class EngineService {
           profitTrailingPairRetraceEdge: this.env.PROFIT_TRAILING_PAIR_RETRACE_EDGE,
           profitTrailingPairExecutionStyle: "TAKER",
           reversalProtectionEnabled: this.env.REVERSAL_PROTECTION_ENABLED,
-          guardianVersion: 2, guardianV2Config: { ...GUARDIAN_V2_CONFIG },
+          guardianVersion: 2, guardianFormatGeneration: 3, guardianV2Config: { ...GUARDIAN_V2_CONFIG },
           reversalProtectionWindowMs: this.env.REVERSAL_PROTECTION_WINDOW_MS,
           reversalProtectionOppositeCount: this.env.REVERSAL_PROTECTION_OPPOSITE_COUNT,
         },
@@ -1002,9 +1186,7 @@ export class EngineService {
             this.protectiveDeRiskVetoFingerprint.clear();
             this.protectiveDeRiskLastWaitingAt.clear();
             this.protectiveDeRiskLastSuppressEmitAt.clear();
-            this.abortSourceSealPersist();
-            this.sourceSealed = false;
-            this.sourceSealing = false;
+            this.researchIngressGeneration += 1;
             this.clearReportSourceIntegrity(next.id);
             this.record("EXPERIMENT_STARTED", next.id, null, { status: next.status });
           },
@@ -1228,6 +1410,11 @@ export class EngineService {
   private async runMaintenance(): Promise<void> {
     await this.maintenanceFlight.trigger(async () => {
       if (this.maintenanceHold) await this.maintenanceHold;
+      // Hot-path gauges are O(1) snapshots of bounded state; publish them on the
+      // existing maintenance cadence instead of mutating prom-client on every
+      // market tick.
+      this.metrics.triggerDedupeEntries.set(this.triggerEngine.dedupeEntryCount());
+      this.metrics.assetMarketIndexEntries.set(this.assetIndex.entryCount());
       await this.maintainExperiment();
       await this.retention.runCycle({
         experiment: this.experiment,
@@ -1248,7 +1435,7 @@ export class EngineService {
     const report = await this.marketAdapter.discoverCryptoMarkets(
       splitList(this.env.POLYMARKET_MARKET_SLUGS),
       this.env.MAX_QUALIFIED_MARKETS,
-      qualificationConfigSchema.parse({ maxQualifiedMarkets: this.env.MAX_QUALIFIED_MARKETS }),
+      this.qualificationConfig,
     );
     if (generation < this.discoveryGenerationApplied) return;
     const previousMarketIds = new Set(this.marketsById.keys());
@@ -1404,6 +1591,24 @@ export class EngineService {
       || this.ledger.positions.has(marketId)
       || this.hasOutstandingFirstLegMaker(marketId)
       || (!ignoreOwnPending && this.pendingFirstLegMarkets.has(marketId));
+  }
+
+  private firstLegExpiryAdmission(marketId: string, now = this.nowFn()): {
+    eligible: boolean;
+    endDate: string | null;
+    remainingDurationMs: number | null;
+    minRemainingDurationMs: number;
+  } {
+    const endDate = this.marketsById.get(marketId)?.endDate ?? null;
+    const marketEndMs = endDate ? Date.parse(endDate) : Number.NaN;
+    const remainingDurationMs = Number.isFinite(marketEndMs) ? marketEndMs - now.getTime() : null;
+    const minRemainingDurationMs = this.qualificationConfig.minRemainingDurationMs;
+    return {
+      eligible: remainingDurationMs !== null && remainingDurationMs >= minRemainingDurationMs,
+      endDate,
+      remainingDurationMs,
+      minRemainingDurationMs,
+    };
   }
 
   private tryReserveFirstLegAdmission(marketId: string): boolean {
@@ -1669,6 +1874,7 @@ export class EngineService {
       ledger: this.ledger,
       resultAccounting: this.state.resultAccounting,
       experiment: this.experiment,
+      reportQuarantine: this.reportQuarantine,
       restingOrders: this.restingOrders,
       makerReservations: this.makerReservations,
       settledMarkets: this.settledMarkets,
@@ -1685,11 +1891,19 @@ export class EngineService {
   private adoptRecoveredBag(bag: RecoverableEngineState): void {
     this.state.resultAccounting = bag.resultAccounting ?? emptyResultAccounting();
     this.experiment = bag.experiment;
+    this.reportQuarantine = bag.reportQuarantine ?? null;
     this.lastInfrastructureAccrualAt = bag.lastInfrastructureAccrualAt;
     this.syncRecoveredProjection();
   }
 
   private syncRecoveredProjection(): void {
+    for (const [marketId, runtime] of this.guardianRuntimeStates) {
+      const episode = this.reversalEpisode(this.ledger.positions.get(marketId));
+      if (!episode || !sameReversalEpisode(runtime, episode)) {
+        this.guardianRuntimeStates.delete(marketId);
+        this.guardianCheckpointQueuedAt.delete(marketId);
+      }
+    }
     this.state.setLedger(this.ledger.snapshot());
     this.syncExperimentWindow();
     this.metrics.openPositions.set(this.ledger.positions.size);
@@ -1732,27 +1946,49 @@ export class EngineService {
     beforeCommit?: () => void | Promise<void>;
     afterApply?: (transition: DurableTransition) => Promise<void>;
     checkpoint?: boolean;
+    signal?: AbortSignal;
+    deadlineAt?: number;
   }): Promise<DurableCommitResult> {
+    input = { ...input, occurredAt: input.occurredAt ? new Date(input.occurredAt.getTime()) : undefined };
     return this.durableGate.run(async () => {
       const occurredAt = input.occurredAt ?? this.nowFn();
       this.crashInjector.maybeCrash("BEFORE_DURABLE_COMMIT", input.operationKey);
       let commit: DurableCommitResult;
       try {
-        const payload = await this.resolveDurablePayload(input, occurredAt);
-        await input.beforeCommit?.();
-        commit = await this.journal.commitDurableTransition({
-          operationKey: input.operationKey,
-          type: input.type,
-          aggregateType: input.aggregateType,
-          aggregateId: input.aggregateId,
-          payload,
-          occurredAt,
-        }, this.lastAppliedDurableCursor);
+        // Build once before the first lookup. Both attempts retain the same
+        // revision, audit records and authoritative business plan.
+        const built = input.buildPayload(occurredAt);
+        const recordedAt = new Date().toISOString();
+        // Complete current identities once, before either durable retry attempt.
+        if (Array.isArray(built.derivedAudit)) built.derivedAudit = (built.derivedAudit as DerivedAuditRecord[]).map(r => ({
+          ...r, identityGeneration: 1, occurredAt: r.occurredAt ?? occurredAt.toISOString(),
+          recordedAt: r.recordedAt ?? recordedAt, sourceEventId: r.sourceEventId ?? null,
+          correlationId: r.correlationId ?? r.traceId,
+        }));
+        const computed = structuredClone(built);
+        let payload: Record<string, unknown> | undefined;
+        const expectedPreviousSequence = this.lastAppliedDurableCursor;
+        commit = await retryPersistenceTransport(async () => {
+          payload ??= await this.resolveDurablePayload(input, occurredAt, computed);
+          return this.journal.commitDurableTransition({
+            operationKey: input.operationKey,
+            type: input.type,
+            aggregateType: input.aggregateType,
+            aggregateId: input.aggregateId,
+            payload,
+            occurredAt,
+          }, expectedPreviousSequence, {
+            signal: input.signal, deadlineAt: input.deadlineAt,
+            beforeInsert: input.beforeCommit,
+          });
+        }, { ...this.persistenceRetryOptions("durable"), signal: input.signal, deadlineAt: input.deadlineAt });
         this.metrics.noteDurableCommit(input.type, commit.inserted);
       } catch (error) {
         if (error instanceof CrashInjectedError) throw error;
         if (error instanceof ExperimentStartGuardRejectedError) throw error;
+        if (error instanceof ExperimentQuarantineRejectedError) throw error;
         if (error instanceof FirstLegLifecycleGuardRejectedError) throw error;
+        if (error instanceof GuardianPersistenceGuardRejectedError) throw error;
         if (error instanceof SettlementObligationChangedError) throw error;
         // A stale/raced hedge-vs-protective fill is an expected lifecycle
         // rejection, not durability corruption. It must rethrow as a normal
@@ -1782,10 +2018,16 @@ export class EngineService {
         }
       }
       this.crashInjector.maybeCrash("AFTER_DURABLE_COMMIT_BEFORE_APPLY", input.operationKey);
-      if (commit.transition.sequence > this.lastAppliedDurableCursor + 1) {
-        await this.replayDurableTail(this.lastAppliedDurableCursor);
+      let applied: boolean;
+      try {
+        if (commit.transition.sequence > this.lastAppliedDurableCursor + 1) {
+          await this.replayDurableTail(this.lastAppliedDurableCursor);
+        }
+        applied = this.applyCommitted(commit.transition);
+      } catch (error) {
+        if (!(error instanceof CrashInjectedError)) this.failClosedIntegrity(error);
+        throw error;
       }
-      const applied = this.applyCommitted(commit.transition);
       this.syncRestingIndexFromOrders();
       this.crashInjector.maybeCrash("AFTER_APPLY_BEFORE_DERIVED_AUDIT", input.operationKey);
       // Compacted replay identities intentionally carry no payload/derived
@@ -1843,8 +2085,8 @@ export class EngineService {
       buildPayload: (occurredAt: Date) => Record<string, unknown>;
     },
     occurredAt: Date,
+    computed: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
-    const computed = input.buildPayload(occurredAt);
     const existing = await this.journal.readDurableByOperationKey(input.operationKey);
     if (!existing) return computed;
     if (
@@ -1942,6 +2184,13 @@ export class EngineService {
         const report = validatePostReplayInvariants(this.recoverableBag(), this.lastAppliedDurableCursor, latest);
         if (!report.ok) throw new RecoveryFailClosedError("invariant", report.reasons.join(","));
         this.syncRecoveredProjection();
+      }
+      if (this.experiment?.id) {
+        const verified = await this.readVerifiedQuarantine(this.experiment.id);
+        if (this.reportQuarantine && (!verified || JSON.stringify(verified) !== JSON.stringify(this.reportQuarantine))) {
+          throw new RecoveryFailClosedError("invariant", "checkpoint quarantine differs from durable receipt");
+        }
+        this.reportQuarantine = verified;
       }
       // A recovered order whose durable residual is already gone/changed
       // must terminate even if that market no longer receives book callbacks.
@@ -2147,6 +2396,7 @@ export class EngineService {
     if (typeof payload.derivedAuditCursor === "number") {
       this.derivedAuditCursor = parseCheckpointDerivedAuditCursor(payload);
     }
+    this.reportQuarantine = payload.reportQuarantine == null ? null : quarantineReceiptSchema.parse(payload.reportQuarantine);
     for (const fault of parseCheckpointIntegrityFaults(payload)) {
       this.reportSourceIntegrity.set(`${fault.experimentId}:${fault.eventId}`, fault);
     }
@@ -2186,11 +2436,52 @@ export class EngineService {
     this.syncRestingIndexFromOrders();
   }
 
+  /** HEAD's verified maker producer omitted only direct experiment/deRisk/timestamps.
+   * Missing canonical authority cannot be reconstructed from that reservation. */
+  private async historicalMakerEvent(row: DurableTransition, record: DerivedAuditRecord): Promise<JournalEvent | null> {
+    if (row.type !== "PAPER_MAKER_RESERVED" || record.type !== "PAPER_ORDER_CREATED"
+      || record.identityGeneration != null || record.recordedAt != null || record.occurredAt != null
+      || Object.hasOwn(record.payload, "experimentId") || Object.hasOwn(record.payload, "deRisk")) return null;
+    const id = row.payload.orderId;
+    const resting = row.payload.resting as { order?: Record<string, unknown> } | undefined;
+    const order = resting?.order;
+    const companion = parseDerivedAudit(row.payload).find(r => r.type === "PAPER_MAKER_RESERVED");
+    const actual = await retryPersistenceTransport(() => this.journal.readJournalEventById(record.id), this.persistenceRetryOptions("audit"));
+    const bad = () => { throw new JournalEventConflictError(record.id); };
+    if (typeof id !== "string" || row.operationKey !== `maker:${id}:reserve`
+      || row.aggregateType !== "paper_order" || row.aggregateId !== id
+      || record.id !== derivedAuditEventId("PAPER_ORDER_CREATED", id)
+      || record.aggregateType !== "paper_order" || record.aggregateId !== id
+      || !order || order.id !== id || order.orderType !== "MAKER" || order.status !== "RESTING"
+      || record.traceId !== order.traceId || record.sourceEventId != null || record.correlationId != null
+      || !companion || companion.id !== derivedAuditEventId("PAPER_MAKER_RESERVED", id)
+      || companion.aggregateType !== "paper_order" || companion.aggregateId !== id
+      || companion.traceId !== order.traceId || companion.payload.orderId !== id
+      || companion.payload.reserved !== row.payload.reserved
+      || typeof companion.payload.experimentId !== "string" || !actual
+      || actual.payload.experimentId !== companion.payload.experimentId
+      || !d(String(order.quantity)).times(String(order.requestedPrice)).eq(String(row.payload.reserved))) return bad();
+    const expectedPayload = { ...order, status: "PENDING", intent: row.payload.intent };
+    // Check every old encoded field against the actual reservation order first.
+    assertJournalEventIdentity({ ...actual, payload: expectedPayload }, { ...actual, payload: record.payload });
+    const payload = { ...record.payload, experimentId: companion.payload.experimentId,
+      ...(Object.hasOwn(actual.payload, "deRisk") ? { deRisk: actual.payload.deRisk } : {}) };
+    assertJournalEventIdentity({ ...actual, id: record.id, type: record.type, aggregateType: record.aggregateType,
+      aggregateId: record.aggregateId, traceId: record.traceId, sourceEventId: null,
+      correlationId: record.traceId, payload }, actual);
+    return actual;
+  }
+
   private async emitStoredDerivedAudit(row: DurableTransition): Promise<void> {
-    const records = parseDerivedAudit(row.payload);
+    let records: DerivedAuditRecord[];
+    try { records = parseDerivedAudit(row.payload); }
+    catch (error) { this.failClosedIntegrity(error); throw error; }
     const occurredAt = new Date(row.occurredAt);
     for (const record of records) {
-      await this.appendAcknowledged(createJournalEvent({
+      const historical = row.type === "PAPER_MAKER_RESERVED" && record.type === "PAPER_ORDER_CREATED"
+        && record.identityGeneration == null ? await this.historicalMakerEvent(row, record) : null;
+      if (historical) { await this.appendAcknowledged(historical, undefined, false, true); continue; }
+      const event = createJournalEvent({
         id: record.id,
         traceId: record.traceId,
         type: record.type,
@@ -2198,19 +2489,43 @@ export class EngineService {
         aggregateId: record.aggregateId,
         payload: record.payload,
         sourceEventId: record.sourceEventId,
-        occurredAt,
-      }));
+        correlationId: record.correlationId,
+        occurredAt: record.occurredAt ? new Date(record.occurredAt) : occurredAt,
+      });
+      if (record.recordedAt) event.recordedAt = record.recordedAt;
+      await this.appendAcknowledged(event, undefined, record.identityGeneration == null && record.recordedAt == null, true);
     }
     this.derivedAuditCursor = Math.max(this.derivedAuditCursor, row.sequence);
   }
 
-  private async appendAcknowledged(event: ReturnType<typeof createJournalEvent>, signal?: AbortSignal): Promise<void> {
+  private persistenceRetryOptions(operationClass: "append" | "durable" | "audit" | "integrity") {
+    const labels = { operation_class: operationClass };
+    return {
+      onRetry: () => this.metrics.journalTransientRetry.inc(labels),
+      onRecovered: () => this.metrics.journalTransientRetryRecovered.inc(labels),
+      onExhausted: () => this.metrics.journalTransientRetryExhausted.inc(labels),
+    };
+  }
+
+  private async appendWithTransportRecovery(
+    event: JournalEvent, options: JournalAppendOptions = {},
+    operationClass: "append" | "audit" | "integrity" = "append",
+    allowStoredRecordedAt = false,
+  ): Promise<void> {
+    const frozen = prepareJournalEvent(event);
+    await retryPersistenceTransport(() => this.journal.append(frozen, {
+      ...options, ...(allowStoredRecordedAt ? { legacyRecordedAt: true } : {}),
+    }), { ...this.persistenceRetryOptions(operationClass), ...options });
+  }
+
+  private async appendAcknowledged(event: ReturnType<typeof createJournalEvent>, signal?: AbortSignal, allowStoredRecordedAt = false, _ownedIdentity = false): Promise<void> {
+    event = prepareJournalEvent(event);
     const journalClass = classifyJournalMetricClass(event.type);
     try {
       await this.journalAdmission.run(journalClass, true, async () => {
         if (signal?.aborted) throw new JournalAdmissionRejected(journalClass, true, "JOURNAL_ADMISSION_CLOSED");
         await this.metrics.observeDirectJournal(event.type, async () => {
-          await this.journal.append(event);
+          await this.appendWithTransportRecovery(event, { signal }, "audit", allowStoredRecordedAt);
           this.state.database = "UP";
         });
       }, signal, { reportInput: this.isCanonicalWindowAdmission(event.type) });
@@ -2258,7 +2573,7 @@ export class EngineService {
     this.state.connections.polymarket.lastMessageAt = snapshot.receivedAt;
     const synchronized = this.adapterTokenSynchronized(snapshot.tokenId);
     if (!synchronized) {
-      await this.persistGuardianObservation(snapshot.marketId);
+      this.observeGuardianSnapshot(snapshot.marketId);
       this.updateReady();
       this.state.eventLatencyMs = performance.now() - started;
       this.metrics.eventLatency.observe((performance.now() - started) / 1000);
@@ -2278,11 +2593,11 @@ export class EngineService {
     const previous = pair[snapshot.outcome];
     pair[snapshot.outcome] = snapshot;
     this.snapshots.set(snapshot.marketId, pair);
-    await this.persistGuardianObservation(snapshot.marketId);
+    this.observeGuardianSnapshot(snapshot.marketId);
     this.observeSoakPosition(snapshot.marketId);
     this.kickProfitTrailingPair(snapshot.marketId);
-    this.kickReversalProtection(snapshot.marketId);
-    if (snapshot.asset) {
+    this.scheduleSnapshotReversalProtection(snapshot.marketId);
+    if (snapshot.asset && this.assetByMarket.get(snapshot.marketId) !== snapshot.asset) {
       this.assetByMarket.set(snapshot.marketId, snapshot.asset);
       this.assetIndex.add(snapshot.asset, snapshot.marketId);
       this.metrics.assetMarketIndexEntries.set(this.assetIndex.entryCount());
@@ -2343,9 +2658,6 @@ export class EngineService {
         this.logger.error({ err: error, marketId: snapshot.marketId }, "protective de-risk attempt failed");
       });
     }
-    const window = this.marketsById.get(snapshot.marketId);
-    if (window?.endDate) this.triggerEngine.noteMarketWindow(snapshot.marketId, snapshot.asset ?? window.asset, window.endDate);
-    this.metrics.triggerDedupeEntries.set(this.triggerEngine.dedupeEntryCount());
     this.state.eventLatencyMs = performance.now() - started;
     this.metrics.eventLatency.observe((performance.now() - started) / 1000);
   }
@@ -2436,9 +2748,6 @@ export class EngineService {
   private admitTrigger(trigger: TriggerEvent, provenance?: TriggerProvenance): AdmitResult {
     if (this.started && !this.state.recoveryComplete) {
       return { admitted: false, reason: "fail_closed", done: Promise.resolve() };
-    }
-    if (this.sourceSealBlocksAdmission()) {
-      return { admitted: false, reason: "source_sealed", done: Promise.resolve() };
     }
     const resolved = provenance ?? this.captureProvenance(trigger);
     const lane = triggerWorkLane(trigger.kind);
@@ -2828,14 +3137,14 @@ export class EngineService {
       this.metrics.grokSignals.inc({ agent: submission.agentId, status: "identity_mismatch" });
       return { status: "identity_mismatch" };
     }
-    const rejectSealed = (): { status: "source_sealed" } => {
+    const rejectCompleted = (): { status: "stale" } => {
       this.state.recordGrokRejection("rejected");
-      this.metrics.grokSignals.inc({ agent: submission.agentId, status: "source_sealed" });
-      return { status: "source_sealed" };
+      this.metrics.grokSignals.inc({ agent: submission.agentId, status: "stale" });
+      return { status: "stale" };
     };
     const ingress = this.beginResearchIngress();
     try {
-      if (this.researchIngressStale(ingress.generation)) return rejectSealed();
+      if (this.researchIngressStale(ingress.generation)) return rejectCompleted();
       const now = this.nowFn();
       const trigger = this.activeTriggers.get(submission.triggerId)
         ?? (researchRefresh ? this.scoutRefreshContexts.get(submission.triggerId) : undefined);
@@ -2877,9 +3186,9 @@ export class EngineService {
           return { status: alphaAdmission };
         }
       }
-      if (this.researchIngressStale(ingress.generation)) return rejectSealed();
+      if (this.researchIngressStale(ingress.generation)) return rejectCompleted();
       if (this.grokClaimHold) await this.grokClaimHold;
-      if (this.researchIngressStale(ingress.generation)) return rejectSealed();
+      if (this.researchIngressStale(ingress.generation)) return rejectCompleted();
       const idempotencyKey = `${clientId}:${submission.submissionId}`;
       const idleAdmission = !this.isExperimentWindowOpen();
       let idleReservation = false;
@@ -2948,18 +3257,17 @@ export class EngineService {
 
         try {
         if (promotedToActive) {
-          // beginExperiment aborts any stale source-seal persistence and bumps
-          // that generation. The promoted submission is now an active ingress;
-          // continue from the post-transition generation under the boundary
-          // gate, while completion/source-seal fences still reject it.
-          ingress.generation = this.sourceSealGeneration;
+          // beginExperiment advances the research-ingress generation. The promoted
+          // submission is now active ingress for the new experiment; completion
+          // and generation fences still reject stale work.
+          ingress.generation = this.researchIngressGeneration;
         }
         // Recheck the experiment-scoped fence immediately before irreversible accept.
         if (this.researchIngressStale(ingress.generation) || (!researchRefresh && !this.isTriggerActionable(trigger.id))) {
           if (idleReservation) this.releaseIdleGrokSubmission(idempotencyKey);
           this.state.recordGrokRejection("rejected");
-          this.metrics.grokSignals.inc({ agent: submission.agentId, status: this.researchIngressStale(ingress.generation) ? "source_sealed" : "stale" });
-          return { status: this.researchIngressStale(ingress.generation) ? "source_sealed" : "stale" };
+          this.metrics.grokSignals.inc({ agent: submission.agentId, status: "stale" });
+          return { status: "stale" };
         }
 
         const signal: GrokSignalEnvelope = grokSignalEnvelopeSchema.parse({
@@ -2971,7 +3279,7 @@ export class EngineService {
         });
         if (this.researchIngressStale(ingress.generation)) {
           if (idleReservation) this.releaseIdleGrokSubmission(idempotencyKey);
-          return rejectSealed();
+          return rejectCompleted();
         }
         // This is the final admission linearization point for role-bound
         // research.  Once the canonical event is appended, a later feed loss
@@ -3471,6 +3779,18 @@ export class EngineService {
             || owner.order.tokenId !== this.currentTokenIdFor(owner.marketId, owner.order.outcome)) {
             throw new RiskReductionLifecycleGuardRejectedError(owner.marketId, owner.intent, "ADMISSION_RESIDUAL_CHANGED");
           }
+          const profitTrailingOwner = this.profitTrailingPairSoakEnabled()
+            && owner.intent === "HEDGE_SECOND_LEG"
+            && (owner.order.strategyId === "profit-trailing-pair-target"
+              || owner.order.strategyId === "profit-trailing-pair-trail");
+          if (profitTrailingOwner
+            && !this.profitTrailingRetainsAuthority(owner.marketId, position, this.nowFn().getTime())) {
+            throw new RiskReductionLifecycleGuardRejectedError(
+              owner.marketId,
+              owner.intent,
+              "PROFIT_TRAILING_AUTHORITY_EXPIRED",
+            );
+          }
           if (owner.deRisk?.deRiskReason === "REVERSAL_CONFIRMED"
             && (!this.reversalOrderEligible(owner.deRisk, position, this.nowFn().getTime())
               || !d(owner.order.quantity).eq(position.unpairedQuantity))) {
@@ -3599,30 +3919,37 @@ export class EngineService {
         }, decisionSnapshot.asset ?? null);
         return false;
       }
-      // Admission-boundary eligibility re-check (post decision latency): a
-      // normal hedge must not slip in behind rescue ownership once protective
-      // eligibility became true. The profit-trailing soak is the explicit
-      // exception: PR3/Guardian/deadline authority is disabled for that
-      // experiment, and its own verified pair-lock controller must remain the
-      // sole second-leg authority even after the legacy 300s deadline.
+      // Admission-boundary authority re-check after decision latency. Profit
+      // trailing may bypass rescue exclusivity only while it still owns the
+      // pre-deadline episode. Once the protective deadline is reached, stale
+      // trailing orders are rejected and generic A/B protection owns.
       const profitTrailingOrder = this.profitTrailingPairSoakEnabled()
         && intent === "HEDGE_SECOND_LEG"
         && (order.strategyId === "profit-trailing-pair-target" || order.strategyId === "profit-trailing-pair-trail");
-      if (intent === "HEDGE_SECOND_LEG" && !profitTrailingOrder) {
-        const posAtAdmission = this.ledger.positions.get(order.marketId);
-        if (posAtAdmission?.unpairedOutcome) {
-          const admissionEligibility = this.protectiveDeRiskEligibility(
-            order.marketId,
-            posAtAdmission.unhedgedStartedAt ?? posAtAdmission.openedAt,
-            this.nowFn().getTime(),
-          );
-          if (admissionEligibility.eligible) {
-            this.record("HEDGE_SUPPRESSED_RESCUE_EXCLUSIVE", order.traceId, order.marketId, {
-              unpairedOutcome: posAtAdmission.unpairedOutcome,
-              reason: "ELIGIBILITY_REACHED_BEFORE_ADMISSION",
-            }, decisionSnapshot.asset ?? null);
-            return false;
-          }
+      const posAtAdmission = intent === "HEDGE_SECOND_LEG"
+        ? this.ledger.positions.get(order.marketId)
+        : undefined;
+      const profitTrailingStillOwns = profitTrailingOrder
+        && this.profitTrailingRetainsAuthority(order.marketId, posAtAdmission, this.nowFn().getTime());
+      if (profitTrailingOrder && !profitTrailingStillOwns) {
+        this.record("HEDGE_SUPPRESSED_RESCUE_EXCLUSIVE", order.traceId, order.marketId, {
+          unpairedOutcome: posAtAdmission?.unpairedOutcome ?? null,
+          reason: "PROFIT_TRAILING_AUTHORITY_EXPIRED",
+        }, decisionSnapshot.asset ?? null);
+        return false;
+      }
+      if (intent === "HEDGE_SECOND_LEG" && !profitTrailingOrder && posAtAdmission?.unpairedOutcome) {
+        const admissionEligibility = this.protectiveDeRiskEligibility(
+          order.marketId,
+          posAtAdmission.unhedgedStartedAt ?? posAtAdmission.openedAt,
+          this.nowFn().getTime(),
+        );
+        if (admissionEligibility.eligible) {
+          this.record("HEDGE_SUPPRESSED_RESCUE_EXCLUSIVE", order.traceId, order.marketId, {
+            unpairedOutcome: posAtAdmission.unpairedOutcome,
+            reason: "ELIGIBILITY_REACHED_BEFORE_ADMISSION",
+          }, decisionSnapshot.asset ?? null);
+          return false;
         }
       }
       this.riskReductionInFlight.add(order.marketId);
@@ -3639,6 +3966,19 @@ export class EngineService {
       // close-entries and the native decision path are serialized by the same
       // experimentBoundaryGate, while deadline expiry closes durably here.
       if (intent === "OPEN_FIRST_LEG" && !(await this.ensureFirstLegEntryOpen())) return false;
+      if (intent === "OPEN_FIRST_LEG") {
+        const expiry = this.firstLegExpiryAdmission(order.marketId);
+        if (!expiry.eligible) {
+          this.record("FIRST_LEG_REVALIDATION_REJECTED", order.traceId, order.marketId, {
+            orderId: order.id,
+            reason: "DURATION_OUT_OF_RANGE",
+            endDate: expiry.endDate,
+            remainingDurationMs: expiry.remainingDurationMs,
+            minRemainingDurationMs: expiry.minRemainingDurationMs,
+          }, decisionSnapshot.asset ?? null);
+          return false;
+        }
+      }
       if (
         intent === "OPEN_FIRST_LEG"
         && this.firstLegLifecycleBlocked(order.marketId, true)
@@ -3693,11 +4033,21 @@ export class EngineService {
       if (!options?.resume) this.record("PAPER_ORDER_CREATED", order.traceId, order.marketId, {
         orderId: order.id, type: order.orderType, intent, ...(deRisk ? { deRisk } : {}),
       }, decisionSnapshot.asset ?? null);
-      if (!durableOwner) await this.persistReportInput(createJournalEvent({
-        id: derivedAuditEventId("PAPER_ORDER_CREATED", order.id),
-        traceId: order.traceId, type: "PAPER_ORDER_CREATED", aggregateType: "paper_order", aggregateId: order.id,
-        payload: { ...order, intent, ...(deRisk ? { deRisk } : {}) },
-      }));
+      let orderCreatedEvent: JournalEvent | undefined;
+      if (!durableOwner) {
+        const makerExperimentId = order.orderType === "MAKER" && this.isExperimentWindowOpen()
+          ? this.experiment?.id : undefined;
+        orderCreatedEvent = createJournalEvent({
+          id: derivedAuditEventId("PAPER_ORDER_CREATED", order.id),
+          traceId: order.traceId, type: "PAPER_ORDER_CREATED", aggregateType: "paper_order", aggregateId: order.id,
+          payload: { ...order, intent, ...(deRisk ? { deRisk } : {}),
+            ...(makerExperimentId ? { experimentId: makerExperimentId } : {}) },
+        });
+        // Freeze the final stamped maker event before the direct append can
+        // await. Reservation repair must carry this identity, not recreate it.
+        if (order.orderType === "MAKER") orderCreatedEvent = structuredClone(orderCreatedEvent);
+        await this.persistReportInput(orderCreatedEvent);
+      }
       this.recentTrades.set(duplicateKey, Date.now());
       try {
         if (order.orderType === "MAKER") {
@@ -3705,7 +4055,7 @@ export class EngineService {
           if (intent === "RESCUE_SECOND_LEG") throw new Error("RESCUE_SECOND_LEG_REQUIRES_TAKER");
           // Resting makers are only ever first-leg or hedge orders; rescue is
           // enforced TAKER-only above, so the cast is a pure TS narrowing aid.
-          await this.reserveMaker(order, decisionSnapshot, intent === "OPEN_FIRST_LEG" ? "OPEN_FIRST_LEG" : "HEDGE_SECOND_LEG");
+          await this.reserveMaker(order, decisionSnapshot, intent === "OPEN_FIRST_LEG" ? "OPEN_FIRST_LEG" : "HEDGE_SECOND_LEG", orderCreatedEvent);
           return true;
         }
         await delay(this.env.PAPER_EXECUTION_LATENCY_MS);
@@ -3815,6 +4165,7 @@ export class EngineService {
     order: PaperOrder,
     snapshot: MarketSnapshot,
     intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" = "OPEN_FIRST_LEG",
+    orderCreatedEvent?: JournalEvent,
   ): Promise<void> {
     if (this.soakBlocksPostEntry(order.marketId) && (intent !== "OPEN_FIRST_LEG" || order.side !== "BUY"
       || (this.ledger.positions.get(order.marketId)?.unpairedOutcome
@@ -3864,7 +4215,7 @@ export class EngineService {
       buildPayload: (occurredAt) => ({
         ...auth,
         derivedAudit: [
-          {
+          orderCreatedEvent ? orderCreatedEvent : {
             id: derivedAuditEventId("PAPER_ORDER_CREATED", order.id),
             type: "PAPER_ORDER_CREATED",
             aggregateType: "paper_order",
@@ -4481,12 +4832,18 @@ export class EngineService {
   }
 
   private record(type: string, traceId: string, marketId: string | null, detail: Record<string, unknown>, asset: string | null = null): void {
-    const item = { id: createId("feed"), at: new Date().toISOString(), type, traceId, marketId, asset, detail };
     const telemetry = type === "MARKET_EVENT" || type === "REFERENCE_TICK";
-    if (!telemetry) {
-      this.state.record(item);
-      this.sse.publish("decision", item);
+    if (telemetry) {
+      // Raw feed observations are intentionally not retained. Avoid allocating
+      // an ID/timestamp/feed item, and do not churn the zero-subscriber SSE
+      // counter millions of times. A connected SSE client still gets the same
+      // coalesced authoritative snapshot.
+      if (this.sse.hasSubscribers()) this.sse.publish("snapshot", () => this.state.snapshot());
+      return;
     }
+    const item = { id: createId("feed"), at: new Date().toISOString(), type, traceId, marketId, asset, detail };
+    this.state.record(item);
+    this.sse.publish("decision", item);
     this.sse.publish("snapshot", () => this.state.snapshot());
   }
 
@@ -4644,7 +5001,7 @@ export class EngineService {
   }
 
   private isCanonicalWindowAdmission(type: string): boolean {
-    return isReportInputEventType(type) && !isSourceSealExemptType(type) && this.isExperimentWindowOpen();
+    return isReportInputEventType(type) && !isReportInputBoundaryType(type) && this.isExperimentWindowOpen();
   }
 
   /**
@@ -4662,7 +5019,7 @@ export class EngineService {
     // durable for authenticated and rejected calls while the engine monitors.
     return type === "MCP_INTERACTION"
       || !isReportInputEventType(type)
-      || isSourceSealExemptType(type)
+      || isReportInputBoundaryType(type)
       || this.isExperimentWindowOpen();
   }
 
@@ -4672,7 +5029,16 @@ export class EngineService {
     const stamped = this.isExperimentWindowOpen() && experimentId && typeof event.payload.experimentId !== "string"
       ? { ...event, payload: { ...event.payload, experimentId } }
       : event;
-    if (stamped.type === "CONSENSUS_DECISION" && await this.persistReversalConsensus(stamped)) return;
+    if (stamped.type === "CONSENSUS_DECISION") {
+      try {
+        if (await this.persistReversalConsensus(stamped)) return;
+      } catch (error) {
+        if (error instanceof CrashInjectedError) throw error;
+        if (shouldLatchReportSourceIntegrity(stamped, this.experiment)) await this.noteReportSourceIntegrityFault(stamped, error);
+        this.failClosedIntegrity(error);
+        throw error;
+      }
+    }
     await this.safeAppend(stamped, signal, extra);
   }
 
@@ -4685,7 +5051,7 @@ export class EngineService {
         if (signal?.aborted) throw new JournalAdmissionRejected(journalClass, critical, "JOURNAL_ADMISSION_CLOSED");
         if (event.type === "TRIGGER_EVENT" && this.triggerEventPersistHold) await this.triggerEventPersistHold;
         await this.metrics.observeDirectJournal(event.type, async () => {
-          await this.journal.append(event, { signal, deadlineAt: extra?.deadlineAt });
+          await this.appendWithTransportRecovery(event, { signal, deadlineAt: extra?.deadlineAt });
           if (critical) this.state.database = "UP";
         });
       }, signal, { reportInput });
@@ -4700,7 +5066,7 @@ export class EngineService {
           throw error;
         }
       }
-      if (critical) {
+      if (critical || error instanceof JournalEventConflictError || (reportInput && error instanceof PersistenceOutcomeUnknownError)) {
         this.overload.markIntegrityFault();
         this.state.overloadState = "FAIL_CLOSED";
         if (!(error instanceof JournalAdmissionRejected)) this.state.database = "DOWN";
@@ -4756,6 +5122,7 @@ export class EngineService {
           marketMetadata: [...this.marketsById.values()].map((market) => ({ ...market, raw: {} })),
           lastInfrastructureAccrualAt: this.lastInfrastructureAccrualAt,
           derivedAuditCursor: this.derivedAuditCursor,
+          reportQuarantine: this.reportQuarantine,
           reportSourceIntegrity: boundIntegrityFaults(
             [...this.reportSourceIntegrity.values()].filter((fault) => fault.experimentId === this.experiment!.id),
             this.experiment.id,
@@ -4889,7 +5256,7 @@ export class EngineService {
     const risk = this.experiment?.riskConfiguration;
     return this.env.TRADING_MODE === "paper" && this.profitTrailingPairSoakEnabled()
       && risk?.reversalProtectionEnabled === true && risk.reversalProtectionWindowMs === 180000
-      && risk.guardianVersion === 2 && isLockedGuardianV2Config(risk.guardianV2Config);
+      && lockedGuardianGeneration(risk) !== null;
   }
 
   private reversalEpisode(position: Position | undefined): ReversalEpisode | null {
@@ -4920,53 +5287,338 @@ export class EngineService {
       bookPressure: normalizeOppositeBookPressure(heldOutcome, u.imbalance.minus(v.imbalance).div(2).toFixed()) };
   }
 
-  private async persistGuardianObservation(marketId: string, event?: JournalEvent): Promise<boolean> {
+  private evaluateGuardianRuntime(marketId: string, event?: JournalEvent): {
+    previous: ReversalProtectionState | null;
+    nextState: ReversalProtectionState;
+    events: GuardianV2Event[];
+  } | null {
     if (!this.reversalProtectionEnabled() || !experimentAllowsHedge(this.experiment) || this.state.draining
-      || this.state.database !== "UP" || this.state.journalDegraded || this.overload.hasIntegrityFault) return false;
+      || this.state.database !== "UP" || this.state.journalDegraded || this.overload.hasIntegrityFault) return null;
     const episode = this.reversalEpisode(this.ledger.positions.get(marketId));
-    if (!episode || this.settledMarkets.has(marketId)) return false;
-    return this.durableGate.run(async () => {
-      const position = this.ledger.positions.get(marketId);
-      if (!sameReversalEpisode(this.reversalEpisode(position), episode) || !position || this.settledMarkets.has(marketId)) return false;
-      const now = event ? new Date(event.occurredAt) : this.nowFn();
-      if (now.getTime() > this.nowFn().getTime()) return false;
-      const raw = this.reversalProtectionStates.get(marketId);
-      if (raw && !isGuardianV2State(raw)) throw new RecoveryFailClosedError("invariant", "active legacy Guardian state");
-      const observation = this.guardianObservation(marketId, episode.heldOutcome, now.getTime());
-      // A restart first rebuilds the pair from its two subscriptions. Missing books
-      // during that bootstrap are not evidence of a price excursion. EARLY's
-      // strict deadline still advances independently of book availability.
-      const pair = this.snapshots.get(marketId);
-      if ((!pair?.UP || !pair.DOWN) && !observation
-        && !(raw?.phase === "EARLY_RECOVERY_WATCH" && now.getTime() >= Date.parse(raw.deadlineAt!))) return false;
-      const direction = event?.payload.consensusDirection;
-      const consensus = event && (direction === "UP" || direction === "DOWN" || direction === "FLAT") ? {
-        eventId: event.id, direction: direction as Direction, confidence: Number(event.payload.consensusConfidence), estimatedEdge: Number(event.payload.estimatedEdge),
-      } : undefined;
-      const evaluation = evaluateGuardianV2({ state: raw ?? null, episode,
-        entryPrice: episode.heldOutcome === "UP" ? position.averageUpCost : position.averageDownCost,
-        now, observation,
-        observationGap: !!raw?.lastObservationAt && now.getTime() - Date.parse(raw.lastObservationAt) > this.riskLimits.staleFeedTimeoutMs,
-        ...(consensus ? { consensus } : {}) });
-      if (!evaluation.stateChanged || !evaluation.nextState) return false;
-      const next = evaluation.nextState;
-      const key = `${episode.positionId}:${episode.unhedgedStartedAt}:v2:${next.revision}`;
-      const auditKey = createHash("sha256").update(key).digest("hex");
-      const payload = { ...next, experimentId: this.experiment!.id, sourceConsensusEventId: event?.id ?? null };
-      const audit: DerivedAuditRecord[] = event ? [{ id: event.id, type: event.type,
-        aggregateType: event.aggregateType, aggregateId: event.aggregateId, traceId: event.traceId,
-        payload: event.payload, sourceEventId: event.sourceEventId }] : [];
-      audit.push({ id: derivedAuditEventId("REVERSAL_PROTECTION_STATE_UPDATED", auditKey), type: "REVERSAL_PROTECTION_STATE_UPDATED",
-        aggregateType: "position", aggregateId: episode.positionId, traceId: episode.positionId, payload });
-      for (const reason of evaluation.events) audit.push({ id: derivedAuditEventId(`GUARDIAN_${reason}`, auditKey), type: `GUARDIAN_${reason}`,
-        aggregateType: "position", aggregateId: episode.positionId, traceId: episode.positionId, payload });
-      if (next.confirmedAt) audit.push({ id: derivedAuditEventId("REVERSAL_PROTECTION_CONFIRMED", auditKey), type: "REVERSAL_PROTECTION_CONFIRMED",
-        aggregateType: "position", aggregateId: episode.positionId, traceId: episode.positionId, payload });
-      await this.commitAuthoritative({ operationKey: `reversal:${key}`, type: "REVERSAL_PROTECTION_STATE_UPDATED",
-        aggregateType: "position", aggregateId: episode.positionId, occurredAt: now,
-        buildPayload: () => ({ state: next, derivedAudit: audit }) });
-      this.scheduleGuardianDeadline();
-      return true;
+    if (!episode || this.settledMarkets.has(marketId)) {
+      this.guardianRuntimeStates.delete(marketId);
+      this.guardianCheckpointQueuedAt.delete(marketId);
+      return null;
+    }
+    const position = this.ledger.positions.get(marketId);
+    if (!position || !sameReversalEpisode(this.reversalEpisode(position), episode)) return null;
+    const now = event ? new Date(event.occurredAt) : this.nowFn();
+    if (now.getTime() > this.nowFn().getTime()) return null;
+
+    let raw = this.guardianRuntimeStates.get(marketId) ?? null;
+    if (raw && !sameReversalEpisode(raw, episode)) {
+      this.guardianRuntimeStates.delete(marketId);
+      raw = null;
+    }
+    if (!raw) {
+      const durable = this.reversalProtectionStates.get(marketId) ?? null;
+      if (durable && !isGuardianV2State(durable)) throw new RecoveryFailClosedError("invariant", "active legacy Guardian state");
+      if (durable && sameReversalEpisode(durable, episode)) {
+        raw = structuredClone(durable);
+        this.guardianRuntimeStates.set(marketId, raw);
+      }
+    }
+    if (raw && !isGuardianV2State(raw)) throw new RecoveryFailClosedError("invariant", "active legacy Guardian runtime state");
+
+    const observation = this.guardianObservation(marketId, episode.heldOutcome, now.getTime());
+    // A restart first rebuilds the pair from its two subscriptions. Missing books
+    // during that bootstrap are not evidence of a price excursion. EARLY's
+    // strict deadline still advances independently of book availability.
+    const pair = this.snapshots.get(marketId);
+    if ((!pair?.UP || !pair.DOWN) && !observation
+      && !(raw?.phase === "EARLY_RECOVERY_WATCH" && now.getTime() >= Date.parse(raw.deadlineAt!))) return null;
+    const direction = event?.payload.consensusDirection;
+    const consensus = event && (direction === "UP" || direction === "DOWN" || direction === "FLAT") ? {
+      eventId: event.id,
+      direction: direction as Direction,
+      confidence: Number(event.payload.consensusConfidence),
+      estimatedEdge: Number(event.payload.estimatedEdge),
+    } : undefined;
+    const evaluation = evaluateGuardianV2({
+      generation: lockedGuardianGeneration(this.experiment!.riskConfiguration)!,
+      state: raw ?? null,
+      episode,
+      entryPrice: episode.heldOutcome === "UP" ? position.averageUpCost : position.averageDownCost,
+      now,
+      observation,
+      observationGap: !!raw?.lastObservationAt
+        && now.getTime() - Date.parse(raw.lastObservationAt) > this.riskLimits.staleFeedTimeoutMs,
+      ...(consensus ? { consensus } : {}),
+    });
+    if (!evaluation.stateChanged || !evaluation.nextState) return null;
+    this.guardianRuntimeStates.set(marketId, evaluation.nextState);
+    return { previous: raw, nextState: evaluation.nextState, events: evaluation.events };
+  }
+
+  private guardianPersistenceKind(
+    marketId: string,
+    previous: ReversalProtectionState | null,
+    next: ReversalProtectionState,
+    events: GuardianV2Event[],
+    sourceEvent?: JournalEvent,
+  ): "critical" | "checkpoint" | null {
+    if (sourceEvent || events.length > 0) return "critical";
+    if (previous && isGuardianV2State(previous) && isGuardianV2State(next)) {
+      const semanticStateChanged = previous.phase !== next.phase
+        || previous.sensor !== next.sensor
+        || previous.armedAt !== next.armedAt
+        || previous.deadlineAt !== next.deadlineAt
+        || previous.confirmedAt !== next.confirmedAt
+        || previous.protectionReason !== next.protectionReason;
+      const observationGapReset = previous.phase === "OBSERVING" && next.phase === "OBSERVING"
+        && ((previous.badRegionSince !== null && next.badRegionSince === null)
+          || (previous.history.length > 0 && next.history.length === 0));
+      if (semanticStateChanged || observationGapReset) return "critical";
+    }
+    const nowMs = Date.parse(next.updatedAt);
+    const durable = this.reversalProtectionStates.get(marketId);
+    const lastQueuedAt = this.guardianCheckpointQueuedAt.get(marketId)
+      ?? (durable && isGuardianV2State(durable) ? Date.parse(durable.updatedAt) : Number.NEGATIVE_INFINITY);
+    return nowMs - lastQueuedAt >= GUARDIAN_OBSERVATION_CHECKPOINT_MS ? "checkpoint" : null;
+  }
+
+  private enqueueGuardianPersistence(
+    state: ReversalProtectionState, events: GuardianV2Event[], kind: "critical" | "checkpoint",
+    sourceEvent?: JournalEvent, shutdownFlush = false,
+  ): Promise<GuardianPersistenceOutcome> {
+    if (this.state.draining && !shutdownFlush) return Promise.reject(new Error("GUARDIAN_ADMISSION_CLOSED"));
+    const marketId = state.marketId, experimentId = this.experiment!.id;
+    const generation = isGuardianV2State(state) ? state.formatGeneration ?? 2 : 1;
+    const queue = this.guardianPersistenceQueues.get(marketId) ?? [];
+    const last = queue.at(-1);
+    // Initial durable revision is an authority boundary, never replaceable.
+    const replace = kind === "checkpoint" && last?.kind === "checkpoint" && !last.sourceEvent && !sourceEvent
+      && last.state.revision !== 1 && state.revision !== 1
+      && last.experimentId === experimentId && last.generation === generation
+      && sameReversalEpisode(last.state, state) && last.state.revision < state.revision;
+    const bytes = Buffer.byteLength(JSON.stringify({ state, events, sourceEvent }));
+    const pending = [...this.guardianPersistenceQueues.values()].reduce((n, q) => n + q.length, 0)
+      + this.guardianPersistenceWorkers.size;
+    if ((queue.length + (this.guardianPersistenceWorkers.has(marketId) ? 1 : 0) >= GUARDIAN_PERSISTENCE_BOUNDS.perMarket && !replace)
+      || (pending >= GUARDIAN_PERSISTENCE_BOUNDS.total && !replace)
+      || this.guardianPersistenceBytes - (replace ? last.bytes : 0) + bytes > GUARDIAN_PERSISTENCE_BOUNDS.bytes) {
+      const error = new Error("GUARDIAN_CRITICAL_BACKPRESSURE");
+      this.failClosedIntegrity(error);
+      return Promise.resolve({ status: "FAILED", error, sourceEventId: sourceEvent?.id ?? null });
+    }
+    if (replace) {
+      queue.pop();
+      this.guardianPersistenceBytes -= last.bytes;
+      last.resolve({ status: "SKIPPED_SUPERSEDED", sourceEventId: null });
+    }
+    let resolve!: (outcome: GuardianPersistenceOutcome) => void;
+    const done = new Promise<GuardianPersistenceOutcome>(res => { resolve = res; });
+    queue.push({ experimentId, generation, kind, state: structuredClone(state), events: [...events],
+      ...(sourceEvent ? { sourceEvent: structuredClone(sourceEvent) } : {}), bytes, done, resolve });
+    this.guardianPersistenceBytes += bytes;
+    this.guardianPersistenceQueues.set(marketId, queue);
+    this.guardianCheckpointQueuedAt.set(marketId, Date.parse(state.updatedAt));
+    this.startGuardianPersistenceWorker(marketId);
+    return done;
+  }
+
+  private startGuardianPersistenceWorker(marketId: string): void {
+    if (this.guardianPersistenceWorkers.has(marketId)) return;
+    const worker = this.durableGate.outside(async () => {
+      while (true) {
+        const queue = this.guardianPersistenceQueues.get(marketId);
+        const request = queue?.shift();
+        if (!request) break;
+        try {
+          request.resolve(await this.persistGuardianState(request));
+        } catch (error) {
+          request.resolve({ status: "FAILED", error, sourceEventId: request.sourceEvent?.id ?? null });
+          for (const pending of queue ?? []) {
+            this.guardianPersistenceBytes -= pending.bytes;
+            pending.resolve({ status: "FAILED", error, sourceEventId: pending.sourceEvent?.id ?? null });
+          }
+          queue?.splice(0);
+          // This worker owns authoritative durable mutations. A post-commit
+          // crash/fault cannot be reduced to logging: the durable cursor may
+          // already be ahead of in-memory state. Latch fail-closed so no later
+          // economic mutation or clean checkpoint can cross that boundary.
+          this.failClosedIntegrity(error);
+          throw error;
+        } finally {
+          this.guardianPersistenceBytes -= request.bytes;
+        }
+      }
+    });
+    this.guardianPersistenceWorkers.set(marketId, worker);
+    void worker.catch((error) => {
+      this.logger.error({ err: error, marketId }, "guardian persistence worker failed");
+    }).finally(() => {
+      if (this.guardianPersistenceWorkers.get(marketId) === worker) this.guardianPersistenceWorkers.delete(marketId);
+      const queue = this.guardianPersistenceQueues.get(marketId);
+      if (queue?.length) this.startGuardianPersistenceWorker(marketId);
+      else this.guardianPersistenceQueues.delete(marketId);
+    });
+  }
+
+  private flushGuardianRuntimeForShutdown(): void {
+    for (const runtime of this.guardianRuntimeStates.values()) {
+      const durable = this.reversalProtectionStates.get(runtime.marketId);
+      if (durable && isGuardianV2State(durable) && durable.revision >= runtime.revision) continue;
+      void this.enqueueGuardianPersistence(runtime, [], "checkpoint", undefined, true).then(outcome => {
+        if (outcome.status === "FAILED") throw outcome.error;
+      }).catch((error) => {
+        this.logger.error({ err: error, marketId: runtime.marketId }, "guardian shutdown flush failed");
+      });
+    }
+  }
+
+  private async awaitGuardianPersistence(marketId: string): Promise<void> {
+    while (true) {
+      const worker = this.guardianPersistenceWorkers.get(marketId);
+      if (!worker) return;
+      await worker;
+    }
+  }
+
+  private guardianPersistenceUnresolved(): number {
+    let queued = 0;
+    for (const queue of this.guardianPersistenceQueues.values()) queued += queue.length;
+    return queued
+      + this.guardianPersistenceWorkers.size
+      + this.reversalProtectionInFlight.size
+      + this.reversalProtectionPending.size
+      + this.reversalProtectionSnapshotScheduled.size;
+  }
+
+  private async joinGuardianPersistence(deadlineMs: number): Promise<JoinResult> {
+    const started = Date.now();
+    while (this.guardianPersistenceUnresolved() > 0) {
+      if (Date.now() - started >= deadlineMs) {
+        return { drained: false, unresolved: this.guardianPersistenceUnresolved(), timedOut: true };
+      }
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    return { drained: true, unresolved: 0, timedOut: false };
+  }
+
+  private async persistGuardianState(request: GuardianPersistenceRequest): Promise<GuardianPersistenceOutcome> {
+    const next = request.state;
+    const key = `${next.positionId}:${next.unhedgedStartedAt}:v2${request.generation === 3 ? "g3" : ""}:${next.revision}`;
+    const auditKey = createHash("sha256").update(key).digest("hex");
+    const payload = {
+      ...next,
+      experimentId: request.experimentId,
+      sourceConsensusEventId: request.sourceEvent?.id ?? null,
+    };
+    const audit: DerivedAuditRecord[] = request.sourceEvent ? [{
+      id: request.sourceEvent.id,
+      type: request.sourceEvent.type,
+      aggregateType: request.sourceEvent.aggregateType,
+      aggregateId: request.sourceEvent.aggregateId,
+      traceId: request.sourceEvent.traceId,
+      payload: request.sourceEvent.payload,
+      sourceEventId: request.sourceEvent.sourceEventId,
+      correlationId: request.sourceEvent.correlationId,
+      occurredAt: request.sourceEvent.occurredAt,
+      recordedAt: request.sourceEvent.recordedAt,
+    }] : [];
+    audit.push({
+      id: derivedAuditEventId("REVERSAL_PROTECTION_STATE_UPDATED", auditKey),
+      type: "REVERSAL_PROTECTION_STATE_UPDATED",
+      aggregateType: "position",
+      aggregateId: next.positionId,
+      traceId: next.positionId,
+      payload,
+    });
+    for (const reason of request.events) {
+      audit.push({
+        id: derivedAuditEventId(`GUARDIAN_${reason}`, auditKey),
+        type: `GUARDIAN_${reason}`,
+        aggregateType: "position",
+        aggregateId: next.positionId,
+        traceId: next.positionId,
+        payload,
+      });
+    }
+    if (next.confirmedAt) {
+      audit.push({
+        id: derivedAuditEventId("REVERSAL_PROTECTION_CONFIRMED", auditKey),
+        type: "REVERSAL_PROTECTION_CONFIRMED",
+        aggregateType: "position",
+        aggregateId: next.positionId,
+        traceId: next.positionId,
+        payload,
+      });
+    }
+
+    try {
+      const receipt = await this.commitAuthoritative({
+        operationKey: `reversal:${key}`,
+        type: "REVERSAL_PROTECTION_STATE_UPDATED",
+        aggregateType: "position",
+        aggregateId: next.positionId,
+        occurredAt: new Date(next.updatedAt),
+        signal: this.guardianShutdownAbort.signal,
+        beforeCommit: () => {
+          const position = this.ledger.positions.get(next.marketId);
+          if (this.experiment?.id !== request.experimentId || !position || this.settledMarkets.has(next.marketId)
+            || !sameReversalEpisode(this.reversalEpisode(position), next)) {
+            throw new GuardianPersistenceGuardRejectedError(next.marketId, "EPISODE_CHANGED");
+          }
+          const current = this.reversalProtectionStates.get(next.marketId);
+          if (current && !isGuardianV2State(current)) {
+            throw new RecoveryFailClosedError("invariant", "active legacy Guardian state");
+          }
+          if (current && sameReversalEpisode(current, next) && current.revision >= next.revision) {
+            throw new GuardianPersistenceGuardRejectedError(next.marketId, "SUPERSEDED");
+          }
+        },
+        buildPayload: () => ({ state: next, derivedAudit: audit }),
+      });
+      if (request.sourceEvent) {
+        const owned = parseDerivedAudit(receipt.transition.payload).find(r => r.id === request.sourceEvent!.id);
+        if (!owned) return { status: "SKIPPED_SUPERSEDED", sourceEventId: null };
+        assertJournalEventIdentity(request.sourceEvent, {
+          ...request.sourceEvent, ...owned, occurredAt: owned.occurredAt ?? receipt.transition.occurredAt,
+          recordedAt: owned.recordedAt ?? receipt.transition.recordedAt,
+        });
+      }
+    } catch (error) {
+      if (error instanceof GuardianPersistenceGuardRejectedError) return {
+        status: error.reason === "SUPERSEDED" ? "SKIPPED_SUPERSEDED" : "SKIPPED_EPISODE_CHANGED",
+        sourceEventId: null,
+      };
+      throw error;
+    }
+    this.scheduleGuardianDeadline();
+    return { status: "PERSISTED", sourceEventId: request.sourceEvent?.id ?? null };
+  }
+
+  private async persistGuardianObservation(marketId: string, event?: JournalEvent): Promise<boolean> {
+    const evaluation = this.evaluateGuardianRuntime(marketId, event);
+    if (!evaluation) return false;
+    const kind = this.guardianPersistenceKind(
+      marketId,
+      evaluation.previous,
+      evaluation.nextState,
+      evaluation.events,
+      event,
+    );
+    if (!kind) return false;
+    const outcome = await this.enqueueGuardianPersistence(evaluation.nextState, evaluation.events, kind, event);
+    if (outcome.status === "FAILED") throw outcome.error;
+    return outcome.status === "PERSISTED";
+  }
+
+  private observeGuardianSnapshot(marketId: string): void {
+    const evaluation = this.evaluateGuardianRuntime(marketId);
+    if (!evaluation) return;
+    const kind = this.guardianPersistenceKind(
+      marketId,
+      evaluation.previous,
+      evaluation.nextState,
+      evaluation.events,
+    );
+    if (!kind) return;
+    void this.enqueueGuardianPersistence(evaluation.nextState, evaluation.events, kind).then(outcome => {
+      if (outcome.status === "FAILED") throw outcome.error;
+    }).catch((error) => {
+      this.logger.error({ err: error, marketId }, "guardian snapshot persistence failed");
     });
   }
 
@@ -4991,6 +5643,23 @@ export class EngineService {
     const current = position && this.reversalProtectionStates.get(position.marketId);
     return !!current && current.positionId === audit.positionId && current.heldOutcome === audit.heldOutcome
       && current.unhedgedStartedAt === audit.unhedgedStartedAt && this.reversalEligibility(current, position, nowMs).eligible;
+  }
+
+  /**
+   * Coalesce all normalized snapshots from the current transport/event-loop turn
+   * before risk-reduction arbitration. This replaces the accidental pair
+   * coalescing that used to come from awaiting Guardian DB writes in the socket
+   * hot path.
+   */
+  private scheduleSnapshotReversalProtection(marketId: string): void {
+    if (this.experiment?.status === "COMPLETED") return;
+    if (this.reversalProtectionSnapshotScheduled.has(marketId)) return;
+    this.reversalProtectionSnapshotScheduled.add(marketId);
+    const immediate = setImmediate(() => {
+      this.reversalProtectionSnapshotScheduled.delete(marketId);
+      if (!this.state.draining) this.kickReversalProtection(marketId);
+    });
+    immediate.unref();
   }
 
   private kickReversalProtection(marketId: string): void {
@@ -5031,6 +5700,9 @@ export class EngineService {
 
   private async maybeReversalProtection(marketId: string): Promise<void> {
     await this.persistGuardianObservation(marketId);
+    // Economic execution is allowed to wait; the WebSocket ingress path is not.
+    // This guarantees arm/release/protect state is durable before arbitration.
+    await this.awaitGuardianPersistence(marketId);
     const reversal = this.reversalProtectionStates.get(marketId);
     if (!reversal?.confirmedAt || !this.reversalEligibility(reversal, this.ledger.positions.get(marketId), this.nowFn().getTime()).eligible
       || !experimentAllowsHedge(this.experiment) || this.state.draining || this.state.database !== "UP"
@@ -5089,7 +5761,13 @@ export class EngineService {
       .catch((error) => this.logger.error({ err: error, marketId }, "profit trailing pair attempt failed"))
       .finally(() => {
         this.profitTrailingPairInFlight.delete(marketId);
-        if (this.profitTrailingPairPending.delete(marketId)) this.kickProfitTrailingPair(marketId);
+        if (this.profitTrailingPairPending.delete(marketId)) {
+          this.kickProfitTrailingPair(marketId);
+        } else if (!this.profitTrailingRetainsAuthority(marketId)) {
+          void this.maybeProtectiveDeRisk(marketId).catch((error) => {
+            this.logger.error({ err: error, marketId }, "protective de-risk handoff failed");
+          });
+        }
       });
   }
 
@@ -5103,6 +5781,7 @@ export class EngineService {
       const position = this.ledger.positions.get(marketId);
       if (!position?.unpairedOutcome || d(position.unpairedQuantity).lte(0)) return;
       const now = this.nowFn();
+      if (!this.profitTrailingRetainsAuthority(marketId, position, now.getTime())) return;
       const opportunity = this.profitTrailingPairOpportunity(marketId, position, now);
       if (!opportunity) return;
       const evaluation = evaluateProfitTrailingPair({
@@ -5342,6 +6021,27 @@ export class EngineService {
       effectiveDeadlineMs: durationDeadlineMs,
       marketEndMs: null,
     };
+  }
+
+  /**
+   * Profit trailing is the sole second-leg authority only before the existing
+   * protective deadline. Once that deadline is reached, authority hands to the
+   * generic A/B protective controller. No price/ratio policy is introduced here.
+   */
+  private profitTrailingRetainsAuthority(
+    marketId: string,
+    position: Position | null | undefined = this.ledger.positions.get(marketId),
+    nowMs = this.nowFn().getTime(),
+  ): boolean {
+    if (!this.profitTrailingPairSoakEnabled()) return false;
+    if (!position?.unpairedOutcome || d(position.unpairedQuantity).lte(0)) return false;
+    const eligibility = this.protectiveDeRiskEligibility(
+      marketId,
+      position.unhedgedStartedAt ?? position.openedAt,
+      nowMs,
+    );
+    if (eligibility.marketEndMs != null && nowMs >= eligibility.marketEndMs) return false;
+    return !eligibility.eligible;
   }
 
   /**
@@ -6785,7 +7485,7 @@ private buildEarlyAudit(
   }
 
   private async maybeProtectiveDeRisk(marketId: string): Promise<void> {
-    if (this.soakBlocksPostEntry(marketId) || this.profitTrailingPairSoakEnabled()) return;
+    if (this.soakBlocksPostEntry(marketId)) return;
     const pending = this.riskReductionOwners.get(marketId);
     if (pending) {
       await this.resumeRiskReduction(pending);
@@ -6803,6 +7503,7 @@ private buildEarlyAudit(
       this.clearProtectiveDeRiskState(marketId);
       return;
     }
+    if (this.profitTrailingRetainsAuthority(marketId, initial, this.nowFn().getTime())) return;
     if (!experimentAllowsHedge(this.experiment)) {
       this.recordProtectiveDeRiskSuppressed(marketId, "GATE_HEDGE_UNAVAILABLE", "HEDGE_UNAVAILABLE", { position: initial });
       return;
@@ -7451,7 +8152,7 @@ private buildEarlyAudit(
    * emission is one structured log line, one SSE/decision-feed record, and one
    * durable journal_events row of type PROTECTIVE_DE_RISK_SUPPRESSED
    * (operational report class, monitor_control journal class: not canonical,
-   * not hashed, not source-sealed, no integrity effect).
+   * not hashed and has no canonical integrity effect).
    */
   private recordProtectiveDeRiskSuppressed(
     marketId: string,
@@ -7907,27 +8608,18 @@ private buildEarlyAudit(
       checkpoint: true,
     });
     if (next.status === "COMPLETED") {
-      this.freezeExperimentResearchIngress();
+      this.researchIngressGeneration += 1;
       this.clearResearchActivationState();
     }
   }
 
-  private sourceSealBlocksAdmission(): boolean {
-    return this.sourceSealing && !this.sourceSealed;
-  }
-
   private researchIngressBlocked(): boolean {
-    return this.sourceSealing || this.sourceSealed || this.experiment?.status === "COMPLETED";
-  }
-
-  private freezeExperimentResearchIngress(): void {
-    this.sourceSealing = true;
-    this.sourceSealGeneration += 1;
+    return this.experiment?.status === "COMPLETED";
   }
 
   private beginResearchIngress(): { generation: number } {
     this.researchIngressInFlight += 1;
-    return { generation: this.sourceSealGeneration };
+    return { generation: this.researchIngressGeneration };
   }
 
   private endResearchIngress(): void {
@@ -7935,30 +8627,7 @@ private buildEarlyAudit(
   }
 
   private researchIngressStale(generation: number): boolean {
-    return this.researchIngressBlocked() || generation !== this.sourceSealGeneration;
-  }
-
-  private async waitResearchIngress(deadlineMs: number): Promise<JoinResult> {
-    const started = Date.now();
-    while (this.researchIngressInFlight > 0) {
-      if (Date.now() - started >= deadlineMs) {
-        return { drained: false, unresolved: this.researchIngressInFlight, timedOut: true };
-      }
-      await new Promise((resolve) => setTimeout(resolve, 5));
-    }
-    return { drained: true, unresolved: 0, timedOut: false };
-  }
-
-  private async restoreSourceSealState(): Promise<void> {
-    const experiment = this.experiment;
-    if (!experiment || experiment.status !== "COMPLETED") return;
-    const existing = await loadSourceSeal(this.journal, experiment.id);
-    if (existing) {
-      this.sourceSealed = true;
-      this.sourceSealing = false;
-      return;
-    }
-    this.sourceSealing = true;
+    return this.researchIngressBlocked() || generation !== this.researchIngressGeneration;
   }
 
   private installIntegrityFault(fault: ReportSourceIntegrityFault): void {
@@ -8024,7 +8693,7 @@ private buildEarlyAudit(
   private async persistIntegrityFaultMarker(fault: ReportSourceIntegrityFault): Promise<boolean> {
     if (this.persistedIntegrityFaults.has(fault)) return true;
     try {
-      await this.journal.append(createIntegrityFaultEvent(fault));
+      await this.appendWithTransportRecovery(createIntegrityFaultEvent(fault), {}, "integrity");
     } catch {
       try {
         await this.commitAuthoritative({
@@ -8092,166 +8761,49 @@ private buildEarlyAudit(
     return true;
   }
 
-  ensureSourceSeal(experiment: { id: string; startedAt?: string | null; completedAt?: string | null } = this.experiment!): Promise<{ sealed: boolean; reason: string | null }> {
-    // Keep concurrent callers/retries on the same transaction outcome.
-    if (this.sourceSealFlight) return this.sourceSealFlight;
-    this.sourceSealFlight = this.ensureSourceSealAttempt(experiment).finally(() => { this.sourceSealFlight = null; });
-    return this.sourceSealFlight;
-  }
-
-  private async ensureSourceSealAttempt(experiment: { id: string; startedAt?: string | null; completedAt?: string | null }): Promise<{ sealed: boolean; reason: string | null }> {
-    if (this.unresolvedReportSourceIntegrity(experiment.id).length > 0) {
-      return { sealed: false, reason: "REPORT_SOURCE_INTEGRITY_UNRESOLVED" };
-    }
-    const existing = await loadSourceSeal(this.journal, experiment.id);
-    if (existing) {
-      this.sourceSealed = true;
-      this.sourceSealing = false;
-      return { sealed: true, reason: null };
-    }
-    this.freezeExperimentResearchIngress();
-    this.sourceSealPersistCancelled = false;
-    this.sourceSealDeadlineAt = Date.now() + this.sourceSealTimeoutMs;
-    this.sourceSealAbort = new AbortController();
-    const generation = this.sourceSealGeneration;
-    const persistAttempt = ++this.sourceSealPersistAttempt;
-    const remaining = () => remainingSealMs(this.sourceSealDeadlineAt);
-    const work = await this.supervisor.waitUnresolved(remaining());
-    const research = await this.waitResearchIngress(remaining());
-    const journal = await this.journalAdmission.waitReportInput(remaining());
-    if (!work.drained || !research.drained || !journal.drained || work.timedOut || research.timedOut || journal.timedOut || remaining() <= 0) {
-      return { sealed: false, reason: "SOURCE_SEAL_TIMEOUT" };
-    }
-    if (this.unresolvedReportSourceIntegrity(experiment.id).length > 0) {
-      return { sealed: false, reason: "REPORT_SOURCE_INTEGRITY_UNRESOLVED" };
-    }
-    const persist = this.persistSourceSeal(experiment, generation, persistAttempt, this.sourceSealAbort.signal);
-    let timeoutId: ReturnType<typeof setTimeout> | undefined;
-    const outcome = await Promise.race([
-      persist.then((ok) => ({ kind: "done" as const, ok }), (error) =>
-        isJournalAppendDeadlineError(error)
-          ? { kind: "deadline" as const }
-          : { kind: "failed" as const, error }),
-      new Promise<{ kind: "timeout" }>((resolve) => {
-        timeoutId = setTimeout(() => {
-          this.sourceSealAbort?.abort();
-          this.abortSourceSealPersist();
-          resolve({ kind: "timeout" });
-        }, remaining() || 0);
-      }),
-    ]);
-    if (timeoutId) clearTimeout(timeoutId);
-    const sealedIfPresent = async (): Promise<{ sealed: true; reason: null } | null> => {
-      const already = await loadSourceSeal(this.journal, experiment.id);
-      if (!already) return null;
-      this.sourceSealed = true;
-      this.sourceSealing = false;
-      return { sealed: true, reason: null };
+  private finalReportRuntimeUnresolved() {
+    return {
+      reportInput: this.journalAdmission.reportInputUnresolved,
+      researchIngress: this.researchIngressInFlight,
+      guardianPersistence: this.guardianPersistenceUnresolved(),
     };
-    const abortedWithoutCommit = (error: unknown) => (
-      isJournalAppendAbortedError(error)
-      || isJournalAdmissionRejectedError(error)
-    );
-    if (outcome.kind === "timeout") {
-      this.sourceSealAbort?.abort();
-      this.abortSourceSealPersist();
-      if (this.sourceSealPersistInFlight) {
-        // Abort requests do not establish a transaction outcome. PG17 disables
-        // transaction_timeout in the irreversible commit phase: await COMMIT or
-        // confirmed abort, even when the wall-clock budget has already elapsed.
-        try { await persist; }
-        catch (error) {
-          const committed = await sealedIfPresent();
-          if (committed) return committed;
-          if (abortedWithoutCommit(error)) return { sealed: false, reason: "SOURCE_SEAL_TIMEOUT" };
-          return { sealed: false, reason: "SOURCE_SEAL_PERSIST_FAILED" };
-        }
-      }
-      return (await sealedIfPresent()) ?? { sealed: false, reason: "SOURCE_SEAL_TIMEOUT" };
-    }
-    if (outcome.kind === "deadline") {
-      return (await sealedIfPresent()) ?? { sealed: false, reason: "SOURCE_SEAL_TIMEOUT" };
-    }
-    if (outcome.kind === "failed") {
-      const committed = await sealedIfPresent();
-      if (committed) return committed;
-      if (abortedWithoutCommit(outcome.error)) return { sealed: false, reason: "SOURCE_SEAL_TIMEOUT" };
-      return { sealed: false, reason: "SOURCE_SEAL_PERSIST_FAILED" };
-    }
-    if (!outcome.ok) {
-      return (await sealedIfPresent()) ?? {
-        sealed: false,
-        reason: remaining() <= 0 || this.sourceSealPersistCancelled ? "SOURCE_SEAL_TIMEOUT" : "SOURCE_SEAL_PERSIST_FAILED",
-      };
-    }
-    const persisted = await loadSourceSeal(this.journal, experiment.id);
-    if (!persisted) return { sealed: false, reason: "SOURCE_SEAL_PERSIST_FAILED" };
-    this.sourceSealed = true;
-    this.sourceSealing = false;
-    return { sealed: true, reason: null };
   }
 
-  private abortSourceSealPersist(): void {
-    this.sourceSealPersistCancelled = true;
-    this.sourceSealPersistAttempt += 1;
-    this.sourceSealGeneration += 1;
-  }
-
-  private sourceSealPersistStillValid(generation: number, persistAttempt: number): boolean {
-    return !this.sourceSealPersistCancelled
-      && generation === this.sourceSealGeneration
-      && persistAttempt === this.sourceSealPersistAttempt;
-  }
-
-  private async persistSourceSeal(
-    experiment: { id: string; startedAt?: string | null; completedAt?: string | null },
-    generation: number,
-    persistAttempt: number,
-    signal?: AbortSignal,
-  ): Promise<boolean> {
-    if (this.sourceSealPersistHold) await this.sourceSealPersistHold;
-    if (!this.sourceSealPersistStillValid(generation, persistAttempt) || signal?.aborted) return false;
-    if (remainingSealMs(this.sourceSealDeadlineAt) <= 0) {
-      this.abortSourceSealPersist();
-      return false;
-    }
-    if (!this.sourceSealPersistStillValid(generation, persistAttempt) || signal?.aborted) return false;
-    if (this.unresolvedReportSourceIntegrity(experiment.id).length > 0) return false;
-    const event = createSourceSealEvent({
-      experimentId: experiment.id,
-      startedAt: experiment.startedAt,
-      completedAt: experiment.completedAt,
-      persistAttempt,
-    });
-    this.sourceSealPersistInFlight = true;
-    try {
-      await this.journalAdmission.run("audit", true, async () => {
-        if (signal?.aborted) throw new JournalAppendAbortedError("aborted");
-        await this.journal.append(event, { signal, deadlineAt: this.sourceSealDeadlineAt });
-      }, signal, { reportInput: false });
-    } catch (error) {
-      if (isJournalAppendDeadlineError(error)) throw error;
-      if (isJournalAppendAbortedError(error) || isJournalAdmissionRejectedError(error)) return false;
-      throw error;
-    } finally {
-      this.sourceSealPersistInFlight = false;
-    }
-    if (!this.sourceSealPersistStillValid(generation, persistAttempt) || signal?.aborted) return false;
-    return Boolean(await loadSourceSeal(this.journal, experiment.id));
+  private finalReportRuntimeDrained(): boolean {
+    const unresolved = this.finalReportRuntimeUnresolved();
+    return unresolved.reportInput === 0
+      && unresolved.researchIngress === 0
+      && unresolved.guardianPersistence === 0;
   }
 
   private async writeFinalReport(): Promise<void> {
+    this.finalReportWrites += 1;
+    try { await this.writeFinalReportAttempt(); }
+    finally { this.finalReportWrites -= 1; }
+  }
+
+  private async writeFinalReportAttempt(): Promise<void> {
     if (!this.experiment || this.reportGenerated) return;
     const experiment = this.experiment;
     try {
+      if (await this.readVerifiedQuarantine(experiment.id)) return;
       if (experiment.status === "COMPLETED") {
-        if (this.unresolvedReportSourceIntegrity(experiment.id).length > 0) {
+        if (!this.finalReportRuntimeDrained()) {
           this.reportGenerated = false;
+          this.logger.error({
+            experimentId: experiment.id,
+            unresolved: this.finalReportRuntimeUnresolved(),
+          }, "final experiment report deferred: canonical runtime work still in flight");
           return;
         }
-        const seal = await this.ensureSourceSeal(experiment);
-        if (!seal.sealed) {
+        const integrityFaults = this.unresolvedReportSourceIntegrity(experiment.id);
+        if (integrityFaults.length > 0) {
           this.reportGenerated = false;
+          this.logger.error({
+            experimentId: experiment.id,
+            integrityFaultCount: integrityFaults.length,
+            integrityFaults: integrityFaults.slice(0, 8),
+          }, "final experiment report blocked by unresolved source integrity");
           return;
         }
       }
@@ -8288,12 +8840,22 @@ private buildEarlyAudit(
         return;
       }
       if (experiment.status === "COMPLETED") {
-        if (this.unresolvedReportSourceIntegrity(experiment.id).length > 0) {
+        if (!this.finalReportRuntimeDrained()) {
           this.reportGenerated = false;
+          this.logger.error({
+            experimentId: experiment.id,
+            unresolved: this.finalReportRuntimeUnresolved(),
+          }, "final experiment report deferred: canonical runtime work changed during scan");
           return;
         }
-        if (!(await loadSourceSeal(this.journal, experiment.id))) {
+        const integrityFaults = this.unresolvedReportSourceIntegrity(experiment.id);
+        if (integrityFaults.length > 0) {
           this.reportGenerated = false;
+          this.logger.error({
+            experimentId: experiment.id,
+            integrityFaultCount: integrityFaults.length,
+            integrityFaults: integrityFaults.slice(0, 8),
+          }, "final experiment report blocked by source integrity change during scan");
           return;
         }
       }
@@ -8323,6 +8885,12 @@ private buildEarlyAudit(
       }
       if (!persisted) {
         this.reportGenerated = false;
+        this.logger.error({
+          experimentId: experiment.id,
+          scanComplete: streamed.scan.complete,
+          scanInterrupted: streamed.scan.interrupted,
+          scanFenceStable: streamed.scan.fence.stable,
+        }, "canonical final report persist refused");
         return;
       }
       try {
@@ -8470,15 +9038,11 @@ private buildEarlyAudit(
     this.assetByMarket.delete(marketId);
   }
   setTriggerEventPersistHoldForTest(hold: Promise<void> | null): void { this.triggerEventPersistHold = hold; }
-  setSourceSealTimeoutForTest(ms: number): void { this.sourceSealTimeoutMs = Math.max(1, ms); }
-  setSourceSealPersistHoldForTest(hold: Promise<void> | null): void { this.sourceSealPersistHold = hold; }
-  sourceSealPersistInFlightForTest() { return this.sourceSealPersistInFlight; }
   setGrokClaimHoldForTest(hold: Promise<void> | null): void { this.grokClaimHold = hold; }
   setIdleGrokAcceptanceHoldForTest(hold: Promise<void> | null): void { this.idleGrokAcceptanceHoldForTest = hold; }
   setStartPostCommitValidationHoldForTest(hold: Promise<void> | null): void { this.startPostCommitValidationHoldForTest = hold; }
   researchIngressInFlightForTest() { return this.researchIngressInFlight; }
   idleGrokSubmissionCountForTest(): number { return this.idleGrokSubmissions.size; }
-  sourceSealStateForTest() { return { sealing: this.sourceSealing, sealed: this.sourceSealed, generation: this.sourceSealGeneration }; }
   async completeExperimentForTest(): Promise<void> {
     await this.experimentBoundaryGate.run(async () => {
       if (!this.experiment) throw new Error("NO_EXPERIMENT");
@@ -8488,10 +9052,6 @@ private buildEarlyAudit(
         completedAt: this.nowFn().toISOString(),
       });
     });
-  }
-  async ensureSourceSealForTest() {
-    if (!this.experiment) throw new Error("NO_EXPERIMENT");
-    return this.ensureSourceSeal(this.experiment);
   }
   setReferenceTelemetryHoldForTest(hold: Promise<void> | null): void { this.referenceTelemetryHoldForTest = hold; }
   isTriggerActionable(triggerId: string): boolean {

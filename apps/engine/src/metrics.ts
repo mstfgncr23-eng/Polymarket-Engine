@@ -287,6 +287,11 @@ export class EngineMetrics {
     help: "High-water event count of the owned market ingress queue",
     registers: [this.registry],
   });
+  readonly marketIngressHighWaterBytes = new Gauge({
+    name: "market_ingress_high_water_bytes",
+    help: "High-water approximate bytes of the owned market ingress queue",
+    registers: [this.registry],
+  });
   readonly marketIngressGap = new Counter({
     name: "market_ingress_gap_total",
     help: "Market ingress gaps that invalidate incremental books (finite reasons)",
@@ -632,6 +637,19 @@ export class EngineMetrics {
     registers: [this.registry],
   });
 
+  readonly journalTransientRetry = new Counter({
+    name: "journal_transient_retry_total", help: "Bounded persistence transport second attempts",
+    labelNames: ["operation_class"], registers: [this.registry],
+  });
+  readonly journalTransientRetryRecovered = new Counter({
+    name: "journal_transient_retry_recovered_total", help: "Second attempts resolved successfully",
+    labelNames: ["operation_class"], registers: [this.registry],
+  });
+  readonly journalTransientRetryExhausted = new Counter({
+    name: "journal_transient_retry_exhausted_total", help: "Unresolved or cancelled transport recovery",
+    labelNames: ["operation_class"], registers: [this.registry],
+  });
+
   private eventLoopUtilizationPrevious = performance.eventLoopUtilization();
   private processTriggerInFlightCount = 0;
   private processTriggerPeakCount = 0;
@@ -737,10 +755,11 @@ export class EngineMetrics {
     };
   }
 
-  noteIngressSnapshot(input: { depth: number; bytes: number; highWaterEvents: number }): void {
+  noteIngressSnapshot(input: { depth: number; bytes: number; highWaterEvents: number; highWaterBytes: number }): void {
     this.marketIngressQueueDepth.set(input.depth);
     this.marketIngressQueueBytes.set(input.bytes);
     this.marketIngressHighWater.set(input.highWaterEvents);
+    this.marketIngressHighWaterBytes.set(input.highWaterBytes);
   }
 
   noteIngressGap(reason: string): void {

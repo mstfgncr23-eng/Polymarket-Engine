@@ -1,0 +1,64 @@
+# PolyMarket reverse regression | LOCAL ONLY
+
+## Explicit safety boundary
+No rollback, production DB writes, production service changes, trading-mode changes,
+VPS instrumentation or running test are approved. This preparation uses a persistent Windows
+Desktop git worktree. Stage maps were copied READ-ONLY from preexisting image source maps.
+
+Git base: 21a195a6809e6d7eaf8b691dba65cf8ce3edda6f
+Safe compiled image: sha256:1206d8352a36a361bb07451904225dc4c44c6501243b67a182e2bb9ccea589c5
+Current compiled image: sha256:dbd6ee9e3e4af56575bd39de9b9572e99d8058f7525120fa23dbce15a00d5cd3
+
+NOTE: Git base and compiled safe image are not interchangeable. Nine actual
+image source maps are locally preserved in maps/ and NOT committed/pushed.
+
+## Stage sequence
+python research/reverse_regression/stage.py --list
+python research/reverse_regression/stage.py --stage 08_current --verify
+python research/reverse_regression/stage.py --stage 07_cpu_v3 --apply
+python research/reverse_regression/stage.py --stage 07_cpu_v3 --verify
+
+Default walk:
+08_current -> 07_cpu_v3 -> 06_cpu_v2 -> 05_cpu_v1 ->
+03_identity -> 02_step3 -> 01_step2 -> 00_safe
+
+SKIP 04_mapopt by default. It briefly appeared, was rejected, and was later
+removed. Restoring it while 'reversing' later work would confound isolation.
+
+Each snapshot reconstitutes 74-75 image-included project source files, changing
+only that known source set. It does not alter DB, configuration or tests.
+
+## Failure-trigger observer
+Offline regression proof, no engine launched:
+cd research/reverse_regression
+python -m unittest -v test_fault_watch
+python fault_watch.py --fixture fixtures/reference_mass.jsonl --out runs/smoke
+
+Conditions:
+- >=7 distinct reference closes within 1s, abort=false;
+- CLOB stale within 20ms of that mass close, if received before stopping;
+- PostgreSQL journal CONNECT_TIMEOUT;
+- a critically logged FAIL_CLOSED.
+
+Output: incident.json and summary.txt, plus bounded preceding 120s event excerpts.
+Exit code 10: fault detected. Exit code 2: no target fault, INCONCLUSIVE.
+NO FAILURE does not imply regression fixed. Synthetic detector tests do not prove
+real market/WebSocket/DB fault reproduction.
+
+Live tests require independent PAPER mode, isolated DB/volumes, no wallet,
+explicit run command and CPU/RAM/time limits; user approval is required before
+starting. Example syntax after all gates:
+PM_FORENSIC_ENV=isolated-paper
+python fault_watch.py --confirm-isolated-paper --max-seconds 7200 -- <LOCAL_PAPER_COMMAND>
+
+## Experimental gates
+1. Reproduce the specific fault in current stage under controlled conditions.
+2. Change one minimal independent component, retain identical input/seed/rate.
+3. If fault vanishes, reintroduce the removed component and prove it returns.
+4. Test Guardian ownership, async ordering, durable idempotency, fail-closed and
+   shutdown/recovery semantics at each stage.
+5. If historical real feed raw messages are missing, do not assert that a clean
+   run proves the bug fixed. Capture new input only with permission.
+
+Not to be included in PR: maps/*.json (10MB each), private logs, DB exports,
+tokens or runtime run output. Current branch remains local, not pushed.

@@ -5,3 +5,4 @@ export * from "./reports.js";
 export * from "./scan.js";
 export * from "./schema.js";
 export * from "./schema-verify.js";
+export * from "./quarantine.js";

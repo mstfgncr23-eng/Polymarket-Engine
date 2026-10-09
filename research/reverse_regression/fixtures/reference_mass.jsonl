@@ -1,0 +1,8 @@
+{"time":1760000000000,"msg":"market feed error","err":{"message":"CLOB_MARKET_WS_STALE"}}
+{"time":1760000000001,"feed":"reference:BTC","msg":"market feed error","err":{"message":"REFERENCE_CLOSE:kind=stale_feed:code=4000:wasClean=false:abort=false:reason=stale feed"}}
+{"time":1760000000002,"feed":"reference:ETH","msg":"market feed error","err":{"message":"REFERENCE_CLOSE:kind=stale_feed:code=4000:wasClean=false:abort=false:reason=stale feed"}}
+{"time":1760000000003,"feed":"reference:SOL","msg":"market feed error","err":{"message":"REFERENCE_CLOSE:kind=stale_feed:code=4000:wasClean=false:abort=false:reason=stale feed"}}
+{"time":1760000000004,"feed":"reference:BNB","msg":"market feed error","err":{"message":"REFERENCE_CLOSE:kind=stale_feed:code=4000:wasClean=false:abort=false:reason=stale feed"}}
+{"time":1760000000005,"feed":"reference:XRP","msg":"market feed error","err":{"message":"REFERENCE_CLOSE:kind=stale_feed:code=4000:wasClean=false:abort=false:reason=stale feed"}}
+{"time":1760000000006,"feed":"reference:DOGE","msg":"market feed error","err":{"message":"REFERENCE_CLOSE:kind=stale_feed:code=4000:wasClean=false:abort=false:reason=stale feed"}}
+{"time":1760000000007,"feed":"reference:ADA","msg":"market feed error","err":{"message":"REFERENCE_CLOSE:kind=stale_feed:code=4000:wasClean=false:abort=false:reason=stale feed"}}

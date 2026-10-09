@@ -1,6 +1,5 @@
 import { isReportInputEventType, isTelemetryEventType, type JournalEvent } from "@pm/core";
 import { createJournalEvent, type DurableTransition, type EventJournal } from "@pm/db";
-import { isSourceSealExemptType } from "./source-seal.js";
 
 export const REPORT_SOURCE_INTEGRITY_FAULT = "REPORT_SOURCE_INTEGRITY_FAULT";
 export const REPORT_SOURCE_INTEGRITY_REPAIRED = "REPORT_SOURCE_INTEGRITY_REPAIRED";
@@ -8,6 +7,20 @@ export const REPORT_SOURCE_INTEGRITY_REPAIRED = "REPORT_SOURCE_INTEGRITY_REPAIRE
 /** Hard cap on retained per-experiment fault identities. One overflow sentinel is enough to refuse finality. */
 export const REPORT_SOURCE_INTEGRITY_HARD_CAP = 64;
 export const INTEGRITY_OVERFLOW_EVENT_ID = "integrity-overflow";
+
+const REPORT_INPUT_BOUNDARY_TYPES = new Set<string>([
+  "EXPERIMENT_REPORT_GENERATED",
+  "EXPERIMENT_COMPLETED",
+  "EXPERIMENT_START_ABORTED",
+  "EXPERIMENT_START_VALIDATED",
+  "EXPERIMENT_ENTRY_CLOSED",
+  "EXPERIMENT_STARTED",
+  "EXPERIMENT_PREFLIGHT",
+]);
+
+export function isReportInputBoundaryType(type: string): boolean {
+  return REPORT_INPUT_BOUNDARY_TYPES.has(type);
+}
 
 export interface ReportSourceIntegrityFault {
   experimentId: string;
@@ -25,7 +38,7 @@ export function shouldLatchReportSourceIntegrity(
   if (experiment.status === "IDLE") return false;
   if (!isReportInputEventType(event.type)) return false;
   if (isTelemetryEventType(event.type)) return false;
-  if (isSourceSealExemptType(event.type)) return false;
+  if (isReportInputBoundaryType(event.type)) return false;
   const windowOpen = experiment.status === "RUNNING" || experiment.status === "ENTRY_CLOSED";
   if (windowOpen) return true;
   const stamped = typeof event.payload?.experimentId === "string" ? event.payload.experimentId : undefined;

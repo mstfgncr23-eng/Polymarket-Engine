@@ -1,4 +1,4 @@
-import { isGuardianV2State, isLockedGuardianV2Config, reversalProtectionStateSchema, sameReversalEpisode, type ReversalProtectionState } from "@pm/core";
+import { lockedGuardianGeneration, guardianStateMatchesGeneration, isGuardianV2State, reversalProtectionStateSchema, sameReversalEpisode, type ReversalProtectionState } from "@pm/core";
 import { createNakedDirectionalDiagnostic, nakedDirectionalDiagnosticSchema, mergeNakedDirectionalObservation,
   profitTrailingPairStateSchema, type NakedDirectionalDiagnostic, type ProfitTrailingPairState } from "@pm/core";
 import {
@@ -23,6 +23,7 @@ import {
   hashDurablePayload,
   IdempotencyConflictError,
   isDurableTransitionType,
+  quarantinePayloadSchema, quarantineReceiptSchema, type QuarantineReceipt,
   type DurableTransition,
 } from "@pm/db";
 import { z, ZodError } from "zod";
@@ -98,6 +99,7 @@ export function normalizeRecoveryError(error: unknown): RecoveryFailClosedError 
 }
 
 export interface DerivedAuditRecord {
+  identityGeneration?: 1;
   id: string;
   type: string;
   aggregateType: string;
@@ -105,9 +107,13 @@ export interface DerivedAuditRecord {
   traceId: string;
   payload: Record<string, unknown>;
   sourceEventId?: string | null;
+  correlationId?: string;
+  occurredAt?: string;
+  recordedAt?: string;
 }
 
 const derivedAuditRecordSchema = z.object({
+  identityGeneration: z.literal(1).optional(),
   id: z.string().min(1).max(160),
   type: z.string().min(1).max(80),
   aggregateType: z.string().min(1).max(80),
@@ -115,6 +121,14 @@ const derivedAuditRecordSchema = z.object({
   traceId: z.string().min(1).max(160),
   payload: z.record(z.string(), z.unknown()),
   sourceEventId: z.string().max(160).nullable().optional(),
+  correlationId: z.string().max(160).optional(),
+  occurredAt: z.string().datetime({ offset: true }).optional(),
+  recordedAt: z.string().datetime({ offset: true }).optional(),
+}).superRefine((record, ctx) => {
+  if (record.identityGeneration === 1 && (record.occurredAt === undefined || record.recordedAt === undefined
+    || record.correlationId === undefined || record.sourceEventId === undefined)) {
+    ctx.addIssue({ code: "custom", message: "current derivedAudit identity must be complete" });
+  }
 });
 
 export function parseDerivedAudit(payload: Record<string, unknown>): DerivedAuditRecord[] {
@@ -136,6 +150,7 @@ export function cloneRecoverableState(state: RecoverableEngineState): Recoverabl
     ledger,
     resultAccounting: structuredClone(state.resultAccounting ?? emptyResultAccounting()),
     experiment: state.experiment ? structuredClone(state.experiment) : null,
+    reportQuarantine: state.reportQuarantine ? structuredClone(state.reportQuarantine) : null,
     restingOrders: new Map([...state.restingOrders.entries()].map(([id, order]) => [id, structuredClone(order)])),
     makerReservations: new Map(state.makerReservations),
     settledMarkets: new Set(state.settledMarkets),
@@ -235,6 +250,7 @@ export interface RecoverableEngineState {
   profitTrailingPairStates?: Map<string, ProfitTrailingPairState>;
   ledger: PaperLedger;
   experiment: ExperimentManifest | null;
+  reportQuarantine?: QuarantineReceipt | null;
   restingOrders: Map<string, RestingPaperOrder>;
   makerReservations: Map<string, string>;
   settledMarkets: Set<string>;
@@ -340,6 +356,17 @@ export function applyDurableTransition(state: RecoverableEngineState, transition
   }
   try {
     switch (transition.type) {
+      case "EXPERIMENT_NON_FINAL_QUARANTINED": {
+        const receipt = quarantineReceiptSchema.parse({ ...quarantinePayloadSchema.parse(transition.payload), sequence: transition.sequence });
+        if (state.experiment?.id !== receipt.experimentId || state.experiment.status !== "COMPLETED"
+          || receipt.durableCursorBefore + 1 !== transition.sequence
+          || state.ledger.positions.size || state.restingOrders.size || state.makerReservations.size
+          || !d(state.ledger.snapshot().reservedCash).eq(0) || state.riskReductionOwners?.size) {
+          throw new RecoveryFailClosedError("invariant", "invalid quarantine recovery authority");
+        }
+        state.reportQuarantine = receipt;
+        return;
+      }
       case "RISK_REDUCTION_ADMITTED": {
         const owner = riskReductionOwnershipSchema.parse(transition.payload.ownership);
         const owners = state.riskReductionOwners ??= new Map();
@@ -383,6 +410,7 @@ export function applyDurableTransition(state: RecoverableEngineState, transition
     case "EXPERIMENT_COMPLETED":
         state.experiment = experimentManifestSchema.parse(transition.payload.experiment ?? transition.payload);
         if (transition.type === "EXPERIMENT_STARTED") {
+          state.reportQuarantine = null;
           const at = state.experiment.startedAt ? new Date(state.experiment.startedAt) : new Date(transition.occurredAt);
           const ledger = state.ledger.snapshot();
           const openPosition = [...state.ledger.positions.values()].some(
@@ -457,10 +485,10 @@ export function applyDurableTransition(state: RecoverableEngineState, transition
           }
         }
         if (sameReversalEpisode(previous, next) && previous
-          && (previous.confirmedAt || next.revision !== previous.revision + 1
+          && (previous.confirmedAt || next.revision <= previous.revision
             || isGuardianV2State(previous) !== isGuardianV2State(next)
             || (isGuardianV2State(previous) && isGuardianV2State(next)
-              && (next.entryPrice !== previous.entryPrice || Date.parse(next.updatedAt) < Date.parse(previous.updatedAt)))
+              && (next.formatGeneration !== previous.formatGeneration || next.entryPrice !== previous.entryPrice || Date.parse(next.updatedAt) < Date.parse(previous.updatedAt)))
             || (!isGuardianV2State(previous) && !isGuardianV2State(next)
               && !previous.countedConsensusEventIds.every((id, i) => next.countedConsensusEventIds[i] === id)))) {
           throw new RecoveryFailClosedError("invariant", "reversal state regressed");
@@ -627,6 +655,9 @@ export function validatePostReplayInvariants(
   expectedCursor: number,
 ): ReplayInvariantReport {
   const reasons: string[] = [];
+  if (state.reportQuarantine && (!quarantineReceiptSchema.safeParse(state.reportQuarantine).success
+    || state.reportQuarantine.experimentId !== state.experiment?.id || state.experiment.status !== "COMPLETED"
+    || state.reportQuarantine.sequence > lastApplied)) reasons.push("quarantine_authority_invalid");
   if (state.resultAccounting && !resultAccountingSchema.safeParse(state.resultAccounting).success) reasons.push("result_accounting_invalid");
   for (const marketId of Object.keys(state.resultAccounting?.episodes ?? {})) {
     if (!state.ledger.positions.has(marketId)) reasons.push("result_episode_without_position");
@@ -696,7 +727,7 @@ export function validatePostReplayInvariants(
   const reversalProtectionActive = status === "RUNNING" || status === "ENTRY_CLOSED";
   if (reversalProtectionActive && reversalRisk?.reversalProtectionEnabled === true
     && (reversalRisk.profitTrailingPairSoakEnabled !== true || reversalRisk.reversalProtectionWindowMs !== 180000
-      || reversalRisk.guardianVersion !== 2 || !isLockedGuardianV2Config(reversalRisk.guardianV2Config)
+      || lockedGuardianGeneration(reversalRisk) === null
       || reversalRisk.profitTrailingPairTargetEdge !== 0.12 || reversalRisk.normalHedgeMinLockedPairEdge !== 0.12
       || reversalRisk.profitTrailingPairArmEdge !== 0.05 || reversalRisk.profitTrailingPairRetraceEdge !== 0.02
       || reversalRisk.profitTrailingPairExecutionStyle !== "TAKER" || reversalRisk.nakedDirectionalSoakEnabled === true)) {
@@ -705,7 +736,8 @@ export function validatePostReplayInvariants(
   for (const [marketId, reversal] of state.reversalProtectionStates ?? []) {
     const position = state.ledger.positions.get(marketId);
     if (!reversalProtectionStateSchema.safeParse(reversal).success || reversal.marketId !== marketId
-      || (reversalProtectionActive && !isGuardianV2State(reversal))
+      || (reversalProtectionActive && (!isGuardianV2State(reversal)
+        || !guardianStateMatchesGeneration(reversal, lockedGuardianGeneration(reversalRisk ?? {}))))
       || reversalRisk?.reversalProtectionEnabled !== true || !position?.unpairedOutcome
       || !sameReversalEpisode(reversal, { marketId, positionId: position.id,
         unhedgedStartedAt: unhedgedEpisode(position), heldOutcome: position.unpairedOutcome })

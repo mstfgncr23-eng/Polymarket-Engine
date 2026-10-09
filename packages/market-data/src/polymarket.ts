@@ -251,6 +251,13 @@ export class PolymarketMarketDataAdapter {
   private readonly client: PublicClient;
   private readonly marketsByToken = new Map<string, DiscoveredMarket>();
   private readonly books = new Map<string, BookState>();
+  /**
+   * Token metadata cache intentionally outlives book/stream epochs. A stream
+   * gap invalidates price/depth trust, but it does not change token identity.
+   * Full books may omit min_order_size, so deleting BookState must not erase a
+   * value already learned authoritatively from WS or REST for the same token.
+   */
+  private readonly minOrderSizeByToken = new Map<string, string>();
   private readonly minOrderSizeFetcher: MinOrderSizeFetcher | null;
   private readonly minOrderSizeClock: () => number;
   private readonly minOrderSizeRetryIntervalMs: number;
@@ -511,6 +518,7 @@ export class PolymarketMarketDataAdapter {
       for (const tokenId of previous) {
         if (next.includes(tokenId)) continue;
         this.books.delete(tokenId);
+        this.minOrderSizeByToken.delete(tokenId);
         this.lastTimestampByToken.delete(tokenId);
         this.anomalySampler.forget(tokenId);
         this.sync.drop(tokenId);
@@ -799,7 +807,7 @@ export class PolymarketMarketDataAdapter {
       // Preserve the last known authoritative value across full books that
       // omit min_order_size (WS field is optional), so a committed REST-hydrated
       // or previously-supplied value is not lost until a book actively changes it.
-      minOrderSize: nullableString(payload.minOrderSize) ?? this.books.get(tokenId)?.minOrderSize ?? null,
+      minOrderSize: nullableString(payload.minOrderSize) ?? this.books.get(tokenId)?.minOrderSize ?? this.minOrderSizeByToken.get(tokenId) ?? null,
       timestamp: new Date(sourceMs).toISOString(),
       hash: nullableString(payload.hash),
     };
@@ -818,6 +826,7 @@ export class PolymarketMarketDataAdapter {
     staged.levelsValid = true;
     this.lastTimestampByToken.set(tokenId, sourceMs);
     this.books.set(tokenId, staged);
+    if (staged.minOrderSize != null) this.minOrderSizeByToken.set(tokenId, staged.minOrderSize);
     const synced = this.sync.markSyncedFromBook(tokenId);
     if (staged.minOrderSize == null) this.requestMinOrderSizeHydration(tokenId);
     if (this.firstTrustedBookAtMs === 0) this.firstTrustedBookAtMs = Date.now();
@@ -1113,6 +1122,7 @@ export class PolymarketMarketDataAdapter {
     const book = this.books.get(tokenId);
     if (!book || book.minOrderSize != null) return;
     book.minOrderSize = value;
+    this.minOrderSizeByToken.set(tokenId, value);
     this.minOrderSizeHydrationObserver?.onHydrationApplied?.();
     this.emitMinOrderSizeHydrated(tokenId, value, identity.epoch);
   }

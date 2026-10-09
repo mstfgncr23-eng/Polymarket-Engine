@@ -48,7 +48,6 @@ export const REJECTION_REASONS = [
   "overload_shed",
   "fail_closed",
   "reserved_capacity",
-  "source_sealed",
 ] as const;
 export type RejectionReason = (typeof REJECTION_REASONS)[number];
 
@@ -367,7 +366,7 @@ export class RuntimeSupervisor {
     return { drained: true, unresolved: 0, timedOut: false };
   }
 
-  /** Wait for in-flight/queued work without cancelling on timeout (source seal). */
+  /** Wait for in-flight/queued work without cancelling on timeout. */
   async waitUnresolved(deadlineMs: number): Promise<JoinResult> {
     const started = Date.now();
     while (this.unresolved() > 0) {

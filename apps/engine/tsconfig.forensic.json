@@ -1,0 +1,5 @@
+{
+  "extends": "./tsconfig.json",
+  "include": ["src/main.ts"],
+  "exclude": ["src/cli.ts", "src/operator-report.ts"]
+}

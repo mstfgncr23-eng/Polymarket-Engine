@@ -59,7 +59,7 @@ export interface PolymarketMarketShardObserver {
  *
  * The facade preserves the Engine-facing contract:
  * - both outcomes of a discovered market stay on the same shard;
- * - snapshots remain serialized at the Engine boundary;
+ * - snapshots remain serialized within each owned shard; independent shards may overlap across async Engine awaits;
  * - one global facade sequence is assigned in dispatch order;
  * - connection and ingress telemetry are aggregated;
  * - no raw market event is dropped, coalesced, or sampled.
@@ -90,7 +90,8 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
   private connectionReconnects: number[];
   private lastConnectionSignature = "";
   private connectionTail: Promise<void> = Promise.resolve();
-  private snapshotTail: Promise<void> = Promise.resolve();
+  /** One ordered callback lane per owned socket. Cross-shard async work must not head-of-line block healthy shards. */
+  private snapshotTails: Promise<void>[] = [];
 
   constructor(client?: SingleClient, options: ShardedPolymarketAdapterOptions = {}) {
     const { transports, ...singleOptions } = options;
@@ -105,6 +106,7 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
 
     this.shardCount = transports?.length ?? DEFAULT_POLYMARKET_MARKET_SHARD_COUNT;
     this.shardTokenIds = this.emptyShardTokenIds();
+    this.snapshotTails = Array.from({ length: this.shardCount }, () => Promise.resolve());
     this.connectionStates = this.stoppedConnectionStates();
     this.connectionReconnects = this.zeroReconnectCounts();
 
@@ -266,7 +268,7 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
     this.connectionReconnects = this.zeroReconnectCounts();
     this.lastConnectionSignature = "";
     this.connectionTail = Promise.resolve();
-    this.snapshotTail = Promise.resolve();
+    this.snapshotTails = Array.from({ length: this.shardCount }, () => Promise.resolve());
     this.publishShardSnapshots();
 
     await Promise.all(this.shards.map((shard, shardIndex) => shard.run(
@@ -408,7 +410,7 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
 
   private handlersForShard(shardIndex: number, handlers: PolymarketFeedHandlers): PolymarketFeedHandlers {
     const result: PolymarketFeedHandlers = {
-      onSnapshot: (snapshot) => this.dispatchSnapshot(snapshot, handlers),
+      onSnapshot: (snapshot) => this.dispatchSnapshot(shardIndex, snapshot, handlers),
       onConnection: (event) => this.reportShardConnection(shardIndex, event, handlers),
       onError: (error) => {
         this.notifyShardObserver((observer) => observer.onError?.({ shard: shardIndex + 1, error }));
@@ -418,7 +420,7 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
     // Metadata-only channel: forwarded WITHOUT dispatchSnapshot/globalSequence so
     // hydration never manufactures a market observation or advances market sequence.
     if (handlers.onMinOrderSizeHydrated) {
-      result.onMinOrderSizeHydrated = (event) => this.dispatchMinOrderSizeHydrated(event, handlers);
+      result.onMinOrderSizeHydrated = (event) => this.dispatchMinOrderSizeHydrated(shardIndex, event, handlers);
     }
     if (handlers.onAnomaly) result.onAnomaly = handlers.onAnomaly;
     if (handlers.onGap) result.onGap = (event: MarketIngressGapEvent) => {
@@ -439,33 +441,47 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
     return result;
   }
 
-  private dispatchSnapshot(snapshot: MarketSnapshot, handlers: PolymarketFeedHandlers): Promise<void> {
-    const work = this.snapshotTail.then(async () => {
-      const market = super.getMarket(snapshot.tokenId);
-      const token = market?.tokens.find((item) => item.tokenId === snapshot.tokenId);
-      const patched: MarketSnapshot = {
-        ...snapshot,
-        sequence: ++this.globalSequence,
-        marketId: market?.id ?? snapshot.marketId,
-        outcome: token?.outcome ?? snapshot.outcome,
-        asset: market?.asset ?? snapshot.asset,
-        feeSchedule: market ? market.feeSchedule : snapshot.feeSchedule,
-      };
+  private dispatchSnapshot(
+    shardIndex: number,
+    snapshot: MarketSnapshot,
+    handlers: PolymarketFeedHandlers,
+  ): Promise<void> {
+    const market = super.getMarket(snapshot.tokenId);
+    const token = market?.tokens.find((item) => item.tokenId === snapshot.tokenId);
+    // Assignment is synchronous on the owning JS thread, so sequence remains
+    // globally unique/monotonic by facade dispatch even though different shard
+    // callbacks may overlap across awaits.
+    const patched: MarketSnapshot = {
+      ...snapshot,
+      sequence: ++this.globalSequence,
+      marketId: market?.id ?? snapshot.marketId,
+      outcome: token?.outcome ?? snapshot.outcome,
+      asset: market?.asset ?? snapshot.asset,
+      feeSchedule: market ? market.feeSchedule : snapshot.feeSchedule,
+    };
+    const previous = this.snapshotTails[shardIndex] ?? Promise.resolve();
+    const work = previous.then(async () => {
       await handlers.onSnapshot(patched);
     });
-    this.snapshotTail = work.then(() => undefined, () => undefined);
+    this.snapshotTails[shardIndex] = work.then(() => undefined, () => undefined);
     return work;
   }
 
   /**
-   * Forward a minOrderSize hydration metadata notification without touching
-   * dispatchSnapshot() or globalSequence — it is not a market event.
+   * Metadata for a token shares its shard callback lane with price snapshots,
+   * preserving token/epoch ordering without globally blocking the other three
+   * independent sockets. It never advances globalSequence.
    */
-  private dispatchMinOrderSizeHydrated(event: MinOrderSizeHydratedEvent, handlers: PolymarketFeedHandlers): Promise<void> {
-    const work = this.snapshotTail.then(async () => {
+  private dispatchMinOrderSizeHydrated(
+    shardIndex: number,
+    event: MinOrderSizeHydratedEvent,
+    handlers: PolymarketFeedHandlers,
+  ): Promise<void> {
+    const previous = this.snapshotTails[shardIndex] ?? Promise.resolve();
+    const work = previous.then(async () => {
       await handlers.onMinOrderSizeHydrated?.(event);
     });
-    this.snapshotTail = work.then(() => undefined, () => undefined);
+    this.snapshotTails[shardIndex] = work.then(() => undefined, () => undefined);
     return work;
   }
 

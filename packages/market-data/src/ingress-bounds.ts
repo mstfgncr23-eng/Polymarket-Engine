@@ -16,7 +16,11 @@ export const INGRESS_GAP_REASONS = [
 export type IngressGapReason = (typeof INGRESS_GAP_REASONS)[number];
 
 export const MARKET_INGRESS_BOUNDS = {
-  maxEvents: 4_096,
+  // Production four-shard high-water reached 15,216 / 16,384 aggregate
+  // events with count-limit gaps while byte-limit gaps stayed at zero.
+  // Add 50% small-event burst headroom without increasing the 4 MiB/shard
+  // hard memory budget; large frames still hit maxBytes first.
+  maxEvents: 6_144,
   maxBytes: 4 * 1024 * 1024,
   /** Hard raw-frame cap enforced before JSON.parse. */
   maxRawFrameBytes: 256 * 1024,

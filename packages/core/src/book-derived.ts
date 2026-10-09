@@ -39,6 +39,49 @@ export function totalDepthCombinedReference(
   return [...snapshot.bids, ...snapshot.asks].slice(0, limit).reduce((sum, level) => sum + Number(level.quantity), 0);
 }
 
+function sameQuantityPrefix(
+  left: readonly { quantity: string }[],
+  right: readonly { quantity: string }[],
+  limit: number,
+): boolean {
+  const leftCount = Math.min(limit, left.length);
+  const rightCount = Math.min(limit, right.length);
+  if (leftCount != rightCount) return false;
+  for (let i = 0; i < leftCount; i += 1) {
+    if (left[i]!.quantity !== right[i]!.quantity) return false;
+  }
+  return true;
+}
+
+function combinedQuantityAt(snapshot: Pick<MarketSnapshot, "bids" | "asks">, index: number): string | undefined {
+  if (index < snapshot.bids.length) return snapshot.bids[index]?.quantity;
+  return snapshot.asks[index - snapshot.bids.length]?.quantity;
+}
+
+/**
+ * Exact input-equivalence predicate for deriveBook().
+ * It deliberately compares only the fields deriveBook reads:
+ * best bid/ask prices, first-5 side quantities, and first-10 combined quantities.
+ */
+export function sameDerivedBookInputs(
+  left: Pick<MarketSnapshot, "bids" | "asks">,
+  right: Pick<MarketSnapshot, "bids" | "asks">,
+): boolean {
+  if ((left.bids[0]?.price ?? null) !== (right.bids[0]?.price ?? null)) return false;
+  if ((left.asks[0]?.price ?? null) !== (right.asks[0]?.price ?? null)) return false;
+  if (!sameQuantityPrefix(left.bids, right.bids, 5)) return false;
+  if (!sameQuantityPrefix(left.asks, right.asks, 5)) return false;
+
+  const limit = TRIGGER_STABILITY_BOUNDS.totalDepthCombinedLevels;
+  const leftCount = Math.min(limit, left.bids.length + left.asks.length);
+  const rightCount = Math.min(limit, right.bids.length + right.asks.length);
+  if (leftCount !== rightCount) return false;
+  for (let i = 0; i < leftCount; i += 1) {
+    if (combinedQuantityAt(left, i) !== combinedQuantityAt(right, i)) return false;
+  }
+  return true;
+}
+
 export function deriveBook(snapshot: MarketSnapshot): BookDerived {
   const spreadText = spread(snapshot);
   const imbalance = bookImbalance(snapshot);

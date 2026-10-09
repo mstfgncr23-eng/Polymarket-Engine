@@ -87,6 +87,8 @@ export class SseHub {
     this.frame(type, data);
   }
 
+  hasSubscribers(): boolean { return this.subscribers.size > 0; }
+
   snapshotBroadcastCount(): number { return this.snapshotBroadcasts; }
 
   close(): void {
@@ -172,6 +174,8 @@ export async function createApiServer(input: {
   getAlphaResearchContext?(triggerId: string): Record<string, unknown> | null;
   startExperiment?: () => Promise<Record<string, unknown>>;
   closeExperimentEntries?: () => Promise<Record<string, unknown>>;
+  quarantineExperiment?: (input: { experimentId: string; requestId: string; operatorId: string }) => Promise<Record<string, unknown>>;
+  getExperimentReportDisposition?: () => Record<string, unknown>;
   getGuardianShadowState?: () => Record<string, unknown>;
   engineReadToken?: string;
   operatorToken?: string;
@@ -380,6 +384,25 @@ export async function createApiServer(input: {
     const result = await input.closeExperimentEntries();
     if (result.ok === false) return reply.code(409).send(result);
     return result;
+  });
+  app.post("/api/operator/experiment/quarantine-non-final", async (request, reply) => {
+    if (!input.operatorToken || !protect(request, input.operatorToken, true).ok) {
+      return reply.code(401).send({ error: "ENGINE_OPERATOR_UNAUTHORIZED" });
+    }
+    if (!input.quarantineExperiment) return reply.code(503).send({ error: "EXPERIMENT_QUARANTINE_UNAVAILABLE" });
+    const body = request.body as { experimentId?: unknown; requestId?: unknown } | null;
+    if (!body || typeof body.experimentId !== "string" || !body.experimentId || body.experimentId.length > 120
+      || typeof body.requestId !== "string" || !body.requestId || body.requestId.length > 80) {
+      return reply.code(400).send({ error: "QUARANTINE_INVALID_REQUEST" });
+    }
+    const result = await input.quarantineExperiment({ experimentId: body.experimentId, requestId: body.requestId, operatorId: "engine-operator" });
+    return reply.code(result.ok === false ? 409 : 200).send(result);
+  });
+  app.get("/api/experiment/report-disposition", async (request, reply) => {
+    const denied = await requireRead(request, reply);
+    if (denied) return denied;
+    if (!input.getExperimentReportDisposition) return reply.code(503).send({ error: "EXPERIMENT_DISPOSITION_UNAVAILABLE" });
+    return input.getExperimentReportDisposition();
   });
   app.get("/events", async (request, reply) => {
     const denied = await requireRead(request, reply);
