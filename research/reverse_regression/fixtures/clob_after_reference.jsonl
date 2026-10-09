@@ -1,0 +1,9 @@
+{"time":1760000000000,"feed":"reference:A0","msg":"market feed error","err":{"message":"REFERENCE_CLOSE:kind=stale_feed:code=4000:wasClean=false:abort=false:reason=stale feed"}}
+{"time":1760000000001,"feed":"reference:A1","msg":"market feed error","err":{"message":"REFERENCE_CLOSE:kind=stale_feed:code=4000:wasClean=false:abort=false:reason=stale feed"}}
+{"time":1760000000002,"feed":"reference:A2","msg":"market feed error","err":{"message":"REFERENCE_CLOSE:kind=stale_feed:code=4000:wasClean=false:abort=false:reason=stale feed"}}
+{"time":1760000000003,"feed":"reference:A3","msg":"market feed error","err":{"message":"REFERENCE_CLOSE:kind=stale_feed:code=4000:wasClean=false:abort=false:reason=stale feed"}}
+{"time":1760000000004,"feed":"reference:A4","msg":"market feed error","err":{"message":"REFERENCE_CLOSE:kind=stale_feed:code=4000:wasClean=false:abort=false:reason=stale feed"}}
+{"time":1760000000005,"feed":"reference:A5","msg":"market feed error","err":{"message":"REFERENCE_CLOSE:kind=stale_feed:code=4000:wasClean=false:abort=false:reason=stale feed"}}
+{"time":1760000000006,"feed":"reference:A6","msg":"market feed error","err":{"message":"REFERENCE_CLOSE:kind=stale_feed:code=4000:wasClean=false:abort=false:reason=stale feed"}}
+{"time":1760000000007,"msg":"market feed error","err":{"message":"CLOB_MARKET_WS_STALE"}}
+{"time":1760000000007,"feed":"reference:A7","msg":"market feed error","err":{"message":"REFERENCE_CLOSE:kind=stale_feed:code=4000:wasClean=false:abort=false:reason=stale feed"}}

@@ -2,6 +2,15 @@ import { describe, expect, it } from "vitest";
 import { evaluateGuardianV2, guardianV2StateSchema, GUARDIAN_V2_CONFIG, isLockedGuardianV2Config,
   normalizeOppositeBookPressure, type GuardianV2State } from "@pm/core";
 
+// Stage-pinned forensic assertion: fails closed when stage is not specified.
+function stageExpectedGuardianWatchMs(): number {
+  const stage = process.env.PM_FORENSIC_STAGE;
+  if (!stage || !/^0[0-8]_/.test(stage)) throw new Error("UNKNOWN_OR_MISSING_FORENSIC_STAGE:" + stage);
+  // Verified against all nine compiled-image source maps. Guardian config is
+  // already 65s in the SAFE compiled image, not introduced by later images.
+  return 65000;
+}
+
 const START = Date.parse("2026-10-06T00:00:00Z");
 const episode = { marketId: "m", positionId: "p", heldOutcome: "UP" as const, unhedgedStartedAt: new Date(START).toISOString() };
 function step(state: GuardianV2State | null, ms: number, heldRatio: string | null, bookPressure = "0.20", consensus?: {
@@ -23,7 +32,7 @@ describe("locked Guardian V2 sensors", () => {
   it("uses exactly the specified locked values", () => {
     expect(GUARDIAN_V2_CONFIG).toEqual({ EARLY_WINDOW_MS: 180000, EARLY_HELD_RATIO_MAX: .70,
       EARLY_DROP_LOOKBACK_MS: 10000, EARLY_MIN_DROP_RATIO: .05, EARLY_BAD_REGION_PERSIST_MS: 5000,
-      EARLY_OPPOSITE_BOOK_PRESSURE_MIN: .20, EARLY_RECOVERY_WATCH_MS: 60000, EARLY_TRUE_RECOVERY_RATIO: .95,
+      EARLY_OPPOSITE_BOOK_PRESSURE_MIN: .20, EARLY_RECOVERY_WATCH_MS: stageExpectedGuardianWatchMs(), EARLY_TRUE_RECOVERY_RATIO: .95,
       EARLY_EMERGENCY_RATIO: .15, LATE_WINDOW_START_MS: 180000, LATE_WINDOW_END_MS: 600000,
       LATE_MIN_CONFIDENCE: .65, LATE_MIN_EDGE: .015, LATE_MIN_HELD_RATIO: .20, LATE_MAX_HELD_RATIO: .60,
       LATE_CONFIRM_MS: 30000, LATE_REQUIRED_RATIO_DETERIORATION: .026,

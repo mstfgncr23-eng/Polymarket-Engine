@@ -5,6 +5,15 @@ import {
   ScriptedBoundedMarketTransport,
 } from "@pm/market-data";
 
+// Stage-pinned forensic assertion: one global lane at safe, four after Step2.
+function stageExpectedMaxAsyncShards(): number {
+  const stage = process.env.PM_FORENSIC_STAGE;
+  if (!stage) throw new Error("PM_FORENSIC_STAGE_REQUIRED");
+  if (stage === "00_safe") return 1;
+  if (/^0[1-8]_/.test(stage)) return 4;
+  throw new Error("UNKNOWN_FORENSIC_STAGE:" + stage);
+}
+
 async function waitFor(predicate: () => boolean, timeoutMs = 2_500): Promise<void> {
   const started = Date.now();
   while (!predicate()) {
@@ -115,7 +124,7 @@ describe("pair-aware sharded Polymarket market feed", () => {
 
     await waitFor(() => sequences.length === 8);
     expect(sequences).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
-    expect(maxHandlersInFlight).toBe(1);
+    expect(maxHandlersInFlight).toBe(stageExpectedMaxAsyncShards());
     expect(tokenIds.every((tokenId) => adapter.isTokenSynchronized(tokenId))).toBe(true);
 
     abort.abort("test");

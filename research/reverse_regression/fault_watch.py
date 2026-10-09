@@ -165,9 +165,12 @@ def main():
         if args.command:
             ap.error("Fixture mode cannot execute a command")
         for line in args.fixture.open("r", encoding="utf-8"):
-            report = observer.note(line)
-            if report:
-                break
+            if report is None:
+                report = observer.note(line)
+            else:
+                observer.note(line)
+                if observer.last_ms > report["trigger_at_ms"] + 250:
+                    break
         if report is None:
             report = {"status": "INCONCLUSIVE_NO_TARGET", "reason": None,
                       "description": "No watched fault in supplied finite fixture.",
@@ -179,6 +182,13 @@ def main():
             ap.error("Live mode requires an explicit command after --; NO automatic production command")
         if os.environ.get("PM_FORENSIC_ENV", "") != "isolated-paper":
             ap.error("Set PM_FORENSIC_ENV=isolated-paper after verifying independent DB, data and PAPER execution")
+        from urllib.parse import urlparse
+        pg = urlparse(os.environ.get("DATABASE_URL", ""))
+        if (pg.hostname != "127.0.0.1" or pg.path != "/forensic"
+                or pg.username != "forensic" or not pg.port):
+            ap.error("LIVE_RUN_REFUSED: only isolated 127.0.0.1/forensic PostgreSQL allowed")
+        if os.environ.get("TRADING_MODE") != "paper" or os.environ.get("NODE_ENV") != "development":
+            ap.error("LIVE_RUN_REFUSED: TRADING_MODE=paper and NODE_ENV=development required")
         proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, encoding="utf-8", errors="replace", bufsize=1)
         messages = queue.Queue(maxsize=10000)
@@ -203,6 +213,16 @@ def main():
                 break
             report = observer.note(line)
             if report:
+                # Preserve up to 250ms of trailing provider/CLOB evidence.
+                until = time.monotonic() + 0.25
+                while time.monotonic() < until:
+                    try:
+                        extra = messages.get(timeout=max(0.005,until-time.monotonic()))
+                    except queue.Empty:
+                        continue
+                    if extra is None:
+                        break
+                    observer.note(extra)
                 break
         if report is None:
             report = {"status": "INCONCLUSIVE_NO_TARGET", "reason": None,
@@ -216,6 +236,20 @@ def main():
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait(timeout=3)
+    if report.get("status") == "FAULT_DETECTED":
+        t = report["trigger_at_ms"]
+        if report["reason"] in ("REF_MASS", "REF_AND_CLOB"):
+            clob_delta = min((abs(x-t) for x in observer.clob), default=None)
+            if clob_delta is not None and clob_delta <= 20:
+                report["reason"] = "REF_AND_CLOB"
+                report["description"] = descriptions("REF_AND_CLOB")
+                report["detail"]["clob_stale_delta_ms"] = clob_delta
+            assets = {x[1] for x in observer.references if abs(x[0]-t) <= 1000 and x[1] != "?"}
+            report["detail"]["reference_assets"] = sorted(assets)
+            report["detail"]["reference_closures"] = len(assets)
+        report["evidence"] = [x for x in observer.events if x["at_ms"] >= t - MAX_TIME_WINDOW_MS and x["at_ms"] <= t + 250]
+        report["observed_lines"] = observer.lines_observed
+        report["bounded_evidence_overwrites"] = observer.evidence_dropped
     persist(report, args.out)
     print("TEST_STATUS",report["status"],"TRIGGER",report.get("reason"), flush=True)
     return 10 if report["status"] == "FAULT_DETECTED" else 2
