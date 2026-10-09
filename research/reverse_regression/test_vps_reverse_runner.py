@@ -1,5 +1,8 @@
 import json
 import unittest
+from unittest.mock import patch
+import sys
+import vps_reverse_runner
 from vps_reverse_runner import IMAGES, container_arguments, find_reference_cluster, parse_events
 
 def log(at, asset, abort="false"):
@@ -41,6 +44,20 @@ class ForensicStageRunnerTest(unittest.TestCase):
     def test_outside_window_not_mass(self):
         sample="\n".join(log(1000+i*2000,f"A{i}") for i in range(8))
         self.assertIsNone(find_reference_cluster(parse_events(sample)))
+
+    def test_host_load_guard_stops_sequential_walk(self):
+        with patch.object(vps_reverse_runner, "run", return_value="HOST_LOAD_GUARD"):
+            with patch.object(sys, "argv", ["runner", "--stage", "cpu1", "--seconds", "90", "--execute-isolated-paper"]):
+                with self.assertRaises(SystemExit) as err:
+                    vps_reverse_runner.main()
+                self.assertEqual(err.exception.code, 3)
+
+    def test_test_container_exited_stops_sequential_walk(self):
+        with patch.object(vps_reverse_runner, "run", return_value="CONTAINER_EXITED"):
+            with patch.object(sys, "argv", ["runner", "--stage", "safe", "--seconds", "90", "--execute-isolated-paper"]):
+                with self.assertRaises(SystemExit) as err:
+                    vps_reverse_runner.main()
+                self.assertEqual(err.exception.code, 3)
 
     def test_clob_stale(self):
         sample=json.dumps({"time":1000,"err":{"message":"CLOB_MARKET_WS_STALE"}})

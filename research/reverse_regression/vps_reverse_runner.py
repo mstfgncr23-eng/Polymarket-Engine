@@ -157,6 +157,7 @@ def run(stage, seconds, outdir):
             "reference_errors": result.get("reference_errors"),
             "trigger": result.get("trigger"), "evidence_path": str(path)
         }, ensure_ascii=False), flush=True)
+    return result["status"]
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -172,7 +173,11 @@ def main():
                           "image": IMAGES[args.stage],
                           "run_command": container_arguments(args.stage, "pmf-reg-preview")}))
         return
-    run(args.stage, args.seconds, args.outdir)
+    status = run(args.stage, args.seconds, args.outdir)
+    # Any host-load guard, unexpected process death or early termination
+    # invalidates this stage AND must stop a sequential reverse walk.
+    if status not in ("FAULT_DETECTED", "INCONCLUSIVE_NO_TARGET"):
+        raise SystemExit(3)
 
 if __name__ == "__main__":
     main()
