@@ -106,3 +106,38 @@ python3 -m unittest -q test_fault_watch test_vps_reverse_runner
 16 tests passed on 2026-10-09. Full real production equivalence is NOT
 achieved until isolated PostgreSQL, active PAPER Guardian state and matching
 traffic are included. The staging PostgreSQL container remains STOPPED.
+
+## Recorded public WebSocket replay (Round 5, 2026-10-09)
+
+Approval scope: same captured public messages fed into eight historical engine
+source snapshots. NO production modifications. Real captured WS frames are stored
+in fixtures/public_market_capture_four_markets_20261009.jsonl and are public
+market data, not private conversation/production data.
+
+Dataset SHA256:
+7ea27f0c585d2da70ee7f9a64b2203c7b5df3e741b905d1faf4818766466ed19
+
+- Eight Binance reference assets; four Polymarket market pairs, eight tokens.
+- 231 reference and 63 CLOB wire frames; the CLOB adapter emits 132 snapshots.
+- Replay is deterministic about input bytes, ordering, and relative capture
+  offsets. Scheduling latency may still vary between independent OS runs.
+- Test waits for all bounded input queues to drain before evaluating.
+- One callback lane on Guardian65, four simultaneous lanes after Step2.
+- The capture had NO synchronized 7/8 reference close. Replay did not isolate
+  the historical production incident; no causal claim is justified.
+- The test covers feed adapters, not full Guardian/durable PostgreSQL.
+
+Run from the repository root (Windows PowerShell):
+    python research/reverse_regression/run_public_replay.py
+
+The runner opts in to the long test, swaps compiled-source stages one by one,
+and restores 08_current even on failure. Test outputs remain ignored under
+runs/public_capture_replay. A normal Vitest run skips the 20-second replay.
+
+Evidence summary:
+    evidence/ROUND_5_PUBLIC_RECORDED_REPLAY_20261009.md
+
+Captured with capture_public_market.mjs on the VPS in a temporary isolated
+unprivileged container; capture terminates by a strict time/size/rows bound.
+New capture may be substituted ONLY after recording and updating the fixture
+digest and clearly distinguishing it from the original historical incident.
