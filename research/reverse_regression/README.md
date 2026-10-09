@@ -62,3 +62,47 @@ python fault_watch.py --confirm-isolated-paper --max-seconds 7200 -- <LOCAL_PAPE
 
 Not to be included in PR: maps/*.json (10MB each), private logs, DB exports,
 tokens or runtime run output. Current branch remains local, not pushed.
+
+
+## VPS real-market tests (2026-10-09 update)
+
+Result summary: `evidence/ROUND_3_VPS_REAL_FEED_20261009.md`.
+The real VPS regression experiments produced a crucial test-harness constraint:
+**0.30 vCPU hard quota triggered 7+/8 synchronous reference closures in BOTH current
+and Guardian65 image**. These deliberately CPU-starved staging incidents are NOT
+evidence of a post-Guardian65 code regression. Under CPU1 pin + low relative
+scheduler weight (no hard quota), current ran about 241s with only 3 individual
+reference errors and no 7+ synchronized cluster; this remains INCONCLUSIVE,
+not a proven fix.
+
+Production's pre-existing critical `PERSISTENCE_OUTCOME_UNKNOWN` / Postgres
+`CONNECT_TIMEOUT` was logged at 2026-10-09 07:30:31 UTC, roughly 11 hours
+BEFORE the isolated VPS tests. `overloadState=FAIL_CLOSED` must not be
+cleared/restarted by this forensic work.
+
+VPS-only bounded runner copied to:
+`/home/ubuntu/pm-forensic-20261009/vps_reverse_runner.py`
+
+Commands (dry-run by default; no production DB):
+```bash
+python3 /home/ubuntu/pm-forensic-20261009/vps_reverse_runner.py --stage current --seconds 240
+# Deliberate PAPER-only launch:
+python3 /home/ubuntu/pm-forensic-20261009/vps_reverse_runner.py --stage current --seconds 240 --execute-isolated-paper
+```
+
+For stage comparisons, choose `safe`, `step2`, `step3`, `identity`,
+`cpu1`, `cpu2`, `cpu3`, or `current`. Only attempt A/B when
+the target fault reproduces with realistic CPU policy and comparable input.
+The runner uses `--cpuset-cpus 1 --cpu-shares 128`, no hard CPU quota,
+private forensic Docker network, fixed 512MiB RAM, `JOURNAL_MODE=memory`,
+PAPER-only authority, and no production mounts or host ports.
+It stops the forensic container on 7+ reference mass-close, host overload,
+explicit timeout or unexpected exit, and writes its evidence file.
+
+Tests:
+```bash
+python3 -m unittest -q test_fault_watch test_vps_reverse_runner
+```
+16 tests passed on 2026-10-09. Full real production equivalence is NOT
+achieved until isolated PostgreSQL, active PAPER Guardian state and matching
+traffic are included. The staging PostgreSQL container remains STOPPED.
