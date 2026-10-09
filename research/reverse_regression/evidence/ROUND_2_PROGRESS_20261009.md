@@ -101,3 +101,6 @@ G?zlemci hata ?ncesi 120 saniyeye kadar s?n?rl? kan?t tutar. Hata sonras? 250ms 
 - `research/reverse_regression/runs/pace_summary.json` (Git-ignore, yerel)
 - `research/reverse_regression/runs/branch_comparison.json` (Git-ignore, yerel)
 - `research/reverse_regression/runs/current-runtime-smoke/incident.json` (Git-ignore, yerel)
+
+### Ek ag dogrulamasi (Docker Linux)
+Bagimsiz Docker Linux containerinda gamma-api.polymarket.com IPv4 adresi 195.175.254.2 olarak cozuldu. Gercek Polymarket API sunucusuyla guvenilir TLS oturumu kurulamadigi icin bu agda canli WS regresyon testi gecersizdir. Bu sadece yerel ag icin kanittir; OVH VPS'teki tarihsel reference kopmasinin nedeni oldugu iddia edilmez. TLS dogrulamasi kapatilmadi.
