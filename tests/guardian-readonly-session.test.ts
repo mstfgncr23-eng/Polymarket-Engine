@@ -257,26 +257,37 @@ describe("G2H ACK binds all risk and maker economic state",()=>{
 
 describe("G2H complete observational handoff has no execution authority",()=>{
   it("G2H-VIEW-01 returns complete pinned open episodes only at signed highwater and copies values",async()=>{
-    const ack=await setup();
-    const session=await start(ack,signed(20));
-    const view=session.readVerifiedView(NOW);
+    const pristineAck=await setup();
+    const pristine=await start(pristineAck,signed(20),source(20,[]));
+    expect(()=>pristine.readVerifiedView(NOW)).toThrowError(
+      expect.objectContaining({reason:"SOURCE_REPLAY_FAILED"}));
+    expect((await pristine.poll(signed(20,2),NOW)).caughtUp).toBe(true);
+    const view=pristine.readVerifiedView(NOW);
     expect(view).toMatchObject({mode:"PAPER",authorityId:"writer-epoch-7",
       writerEpoch:7,cursor:20,highWater:20,open:[{residualQty:"5"}]});
     expect(view.economicStateHash).toMatch(/^[a-f0-9]{64}$/);
     view.open[0]!.residualQty="999";
-    expect(session.readVerifiedView(NOW).open[0]?.residualQty).toBe("5");
-    await session.poll(signed(22,2),NOW);
+    expect(pristine.readVerifiedView(NOW).open[0]?.residualQty).toBe("5");
+    const ack=await setup();
+    const session=await start(ack,signed(20),source(22));
+    expect((await session.poll(signed(20,2),NOW)).caughtUp).toBe(false);
     expect(()=>session.readVerifiedView(NOW)).toThrowError(
       expect.objectContaining({reason:"SOURCE_REPLAY_FAILED"}));
-    await session.poll(signed(22,3),NOW);
+    expect((await session.poll(signed(22,3),NOW)).caughtUp).toBe(false);
+    expect(()=>session.readVerifiedView(NOW)).toThrowError(
+      expect.objectContaining({reason:"SOURCE_REPLAY_FAILED"}));
+    expect((await session.poll(signed(22,4),NOW)).caughtUp).toBe(true);
     expect(session.readVerifiedView(NOW).open).toEqual([]);
     expect(session.readVerifiedView(NOW).settledMarkets).toEqual([MARKET]);
   });
   it("G2H-VIEW-02 expired producer heartbeat blocks even an already ACKed, unchanged cursor",async()=>{
     const ack=await setup();
-    const session=await start(ack);
+    const session=await start(ack,signed(20),source(20,[]));
+    await session.poll(signed(20,2),NOW);
     expect(()=>session.readVerifiedView(NOW+5000)).toThrowError(
       expect.objectContaining({reason:"SOURCE_REPLAY_FAILED"}));
-    expect(()=>session.readVerifiedView(NOW+4999)).not.toThrow();
+    expect(()=>session.readVerifiedView(NOW+1001)).toThrowError(
+      expect.objectContaining({reason:"SOURCE_REPLAY_FAILED"}));
+    expect(()=>session.readVerifiedView(NOW+1000)).not.toThrow();
   });
 });

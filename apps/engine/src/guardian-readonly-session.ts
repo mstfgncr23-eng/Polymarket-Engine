@@ -70,6 +70,8 @@ const receiptFor=(state:GuardianOfflineState,manifest:GuardianWriterManifest):Gu
 export class GuardianReadonlySession {
   private stopped: string|null=null;
   private inFlight=false;
+  private observedSourceHighWater:number|null=null;
+  private lastVerifiedPollAtMs:number|null=null;
   private constructor(
     private readonly source:GuardianG2HJournal,
     private readonly ackStore:GuardianConsumerAckStore,
@@ -94,6 +96,9 @@ export class GuardianReadonlySession {
   readVerifiedView(nowMs:number) {
     if (this.stopped!==null || this.inFlight || !Number.isSafeInteger(nowMs)
       || nowMs<this.signed.issuedAtMs-5_000 || nowMs>=this.signed.expiresAtMs
+      || this.lastVerifiedPollAtMs===null || nowMs<this.lastVerifiedPollAtMs
+      || nowMs-this.lastVerifiedPollAtMs>1_000
+      || this.observedSourceHighWater!==this.signed.durableHighWater
       || this.current.projection.cursor!==this.signed.durableHighWater)
       return halt("SOURCE_REPLAY_FAILED");
     const state=this.current,p=state.projection,r=state.recovery;
@@ -224,8 +229,13 @@ export class GuardianReadonlySession {
       this.current=result.state;
       this.receipt=next;
       this.signed=manifest;
+      // An issuer may sign highwater H while PostgreSQL already exposes H+N.
+      // This is useful bounded replay progress, NOT a current decision view.
+      this.observedSourceHighWater=visible;
+      this.lastVerifiedPollAtMs=nowMs;
       return {cursor:this.current.projection.cursor,highWater:manifest.durableHighWater,
-        caughtUp:this.current.projection.cursor===manifest.durableHighWater};
+        caughtUp:this.current.projection.cursor===manifest.durableHighWater
+          && visible===manifest.durableHighWater};
     } catch(error) {
       this.stopped=error instanceof Error?error.message:"UNKNOWN_SOURCE_OR_ACK_COMMIT";
       throw error;
