@@ -1495,13 +1495,18 @@ export class PostgresEventJournal implements EventJournal {
     database:string;schema:string;role:string;experimentId:string;
     /** null means: select most recent verified checkpoint within THIS snapshot. */
     afterSequence:number|null;limit:number;
+    /** Exact receipt checkpoint, fetched under SAME snapshot even past newest 64. */
+    pinnedCheckpointId?:string;
   }):Promise<GuardianConsistentPgPage> {
     if (this.access!=="readonly") throw Error("G2H_PG_REQUIRES_READONLY_JOURNAL");
     if (!input || ![input.database,input.schema,input.role,input.experimentId].every(
       x=>typeof x==="string"&&x.length>0&&x.length<=128,
     ) || (input.afterSequence!==null
         && (!Number.isSafeInteger(input.afterSequence)||input.afterSequence<0))
-      || !Number.isSafeInteger(input.limit)||input.limit<1||input.limit>512)
+      || !Number.isSafeInteger(input.limit)||input.limit<1||input.limit>512
+      || (input.pinnedCheckpointId!==undefined
+        && (typeof input.pinnedCheckpointId!=="string"
+          || input.pinnedCheckpointId.length<1||input.pinnedCheckpointId.length>256)))
       throw Error("G2H_PG_INVALID_SCOPE_OR_BOUNDS");
     return this.client.begin("isolation level repeatable read read only",async tx=>{
       const identity=(await tx`
@@ -1549,6 +1554,17 @@ export class PostgresEventJournal implements EventJournal {
         FROM engine_checkpoints WHERE experiment_id=${input.experimentId}
         ORDER BY sequence DESC LIMIT 64
       `;
+      if(input.pinnedCheckpointId!==undefined
+        && !raw.some(cp=>cp.id===input.pinnedCheckpointId)){
+        const pinned=await tx`
+          SELECT id,experiment_id,sequence,payload,created_at
+          FROM engine_checkpoints
+          WHERE experiment_id=${input.experimentId}
+            AND id=${input.pinnedCheckpointId} LIMIT 1
+        `;
+        if(pinned.length!==1)throw Error("G2H_PG_PINNED_CHECKPOINT_UNAVAILABLE");
+        raw.push(pinned[0]!);
+      }
       const checkpoints:EngineCheckpoint[]=[];
       for(const cp of raw){
         const payload=cp.payload as Record<string,unknown>;

@@ -60,6 +60,10 @@ extending the gate with optional features.
 - Status: **OPEN / UNKNOWN actual cost**.
 - Evidence: `guardian-paired-book-channel.ts` copies normalized
   depth on ingress and copies both outcomes again on `readGuardianPairedBook`.
+  H3 added `guardian-standalone-book-observer.ts`, which also caches
+  at most TWO epoch-checked normalized snapshots per market (necessary
+  for both outcomes arriving with different token sync timing).
+  This is bounded by the 40-market registration limit.
 - Opportunity: measure depth/heap for realistic 40-market normalizer
   traffic. Consider immutable snapshot ownership or bounded transfer
   only if it preserves no mutable sharing and freshness/epoch fences.
@@ -125,8 +129,12 @@ extending the gate with optional features.
 ### GI-009 | Source transport simplicity and socket resource cost
 - Stage: G2I.
 - Status: **OPEN / ARCHITECTURE TRADEOFF, UNKNOWN measurements**.
-- Evidence: current normalized book bridge is a pure callback consumer;
-  the target Guardian must keep working when Engine stalls.
+- Evidence: the H3 `GuardianStandaloneBookObserver` now owns
+  `PolymarketMarketDataAdapter.run()` without Engine callbacks.
+  A scripted single-shard 8/8 reconnect test passes. Target
+  four-shard behavior remains unmeasured and may over-invalidate
+  all markets when a transport connection callback lacks shard identity.
+  **Proving sustained required H-04 readiness is NOT deferred here**.
 - Opportunity: evaluate the cost of the single Guardian-owned
   `PolymarketMarketDataAdapter` connection versus a genuinely
   independent market-data service. Prefer existing normalization.

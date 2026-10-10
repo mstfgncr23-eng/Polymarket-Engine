@@ -28,9 +28,18 @@ is NEVER permission to expand H1-H4 or implement a deferred change.
 |---|---|---|---|
 | H-01 trusted DB/role | `PostgresEventJournal.readGuardianConsistentPage`, isolated PostgreSQL 17 tests | Real isolated SELECT-only role + RLS proof PASS; production DB identity/credential/TLS and provisioning unverified | PARTIAL |
 | H-02 consistent checkpoint/replay | Non-signed `guardian-trusted-pg-bootstrap.ts`; one-snapshot `readGuardianConsistentPage`, canonical reducer | First-page checkpoint+tail + real gap/tamper/concurrent-commit tested; repeated pages, checkpoint rotation and ACK resume not yet integrated | PARTIAL |
-| H-03 restart/ACK | New `guardian-pg-ack-store.ts`, `guardian-trusted-pg-session.ts`; v2 no-sign receipt; 26 offline + 2 real PostgreSQL restart/rebase tests PASS | Old signer ACK is explicitly rejected; checkpoint rebase and 8,200-row continuation PASS; **actual producer checkpoint cadence/retention, compaction/failover and target FS power-loss proof remain blockers** | PARTIAL |
-| H-04 independent paired books | `guardian-paired-book-channel.ts`, `guardian-normalized-book-bridge.ts`; normalized `PolymarketMarketDataAdapter` supports tokenEpoch and isTokenSynchronized | No independent ingress contract/runnable fixture with Engine stopped, backlog/both-side reconnect source pipeline and 8/8 parity unproved | PARTIAL |
+| H-03 restart/ACK | V2 no-sign ACK/replay, 26 offline tests; real PostgreSQL retained-CP lookup beyond newest 64, compaction/restart, pinned-deletion HALT | Safe parity rebase and 8,200-row progression PASS; **producer CP cadence/lease, target FS crash durability, source failover remain blockers** | PARTIAL |
+| H-04 independent paired books | `guardian-standalone-book-observer.ts` directly runs `PolymarketMarketDataAdapter`; scripted bounded transport 8/8, 7/8, reconnect, epoch/stale tests PASS | No independent process supervisor (G2I); **4-shard/40-market reconnect recovery and sustained book age/load not yet proved** | PARTIAL |
 | H-05 bounded health/capacity | 100/1000/8192 synthetic row tests; 313/313 regression at baseline | Synthetic event timestamps are NOT paced; no local Postgres CPU/lag/heap envelope, no full paired-book replay workload, operation-key retention hard halts | PARTIAL |
+
+## H2/H3 follow-on evidence (2026-10-11)
+
+- `G2H_H2_RETENTION_H3_STANDALONE_EVIDENCE_20261011.md`: pinned CP
+  lookup beyond newest 64 and real compacted PostgreSQL restart safety;
+  standalone normalized adapter 8/8 pairs without any EngineService
+  callback, and strict 7/8/reconnect/epoch invalidation.
+- These are new local proofs only. Source lease under maintenance
+  compaction, 4-shard availability and H4 measured capacity remain open.
 
 ## H2 local implementation evidence (2026-10-11)
 

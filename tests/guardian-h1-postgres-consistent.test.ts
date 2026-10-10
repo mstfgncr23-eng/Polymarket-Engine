@@ -299,10 +299,75 @@ noDb("G2H-H1 real isolated PostgreSQL: repeatable read + actual SELECT-only role
       expect((await ack.load())?.economicHash).toBe(adopted.economicHash);
     }finally{await rm(dir,{recursive:true,force:true});}
   });
+  it("H2-REAL-PG-03 reopens pinned ACK checkpoint beyond newest 64",async()=>{
+    const dir=await mkdtemp(join(tmpdir(),"g2h-h2-retained-"));
+    try{
+      const ack=new GuardianPgFileAckStore(join(dir,"retained.guardian-pg-ack.json"));
+      const input={
+        source:reader,ack,scope:{database:EXPECT.database,schema:EXPECT.schema,role:EXPECT.role},
+        experimentId:EXPECT.experimentId,authorityId:"canonical-paper-db-reader",
+        pageSize:1,maxBacklogRows:100,
+      };
+      const s=await GuardianTrustedPgSession.open(input);
+      const saved=await ack.load();
+      expect(saved?.cursor).toBe(3);
+      const chosen=(await reader.readGuardianConsistentPage({...EXPECT,afterSequence:3}))
+        .checkpoints[0]!;
+      await sql`
+        INSERT INTO engine_checkpoints(id,experiment_id,sequence,payload)
+        SELECT 'h2_many_'||n, ${EXPECT.experimentId}, n+100,
+          ${sql.json(chosen.payload)}
+        FROM generate_series(1,70) n
+      `;
+      const defaultPage=await reader.readGuardianConsistentPage({...EXPECT,afterSequence:3});
+      expect(defaultPage.checkpoints).toHaveLength(64);
+      expect(defaultPage.checkpoints.some(x=>x.id===saved!.checkpointId)).toBe(false);
+      const pinned=await reader.readGuardianConsistentPage({
+        ...EXPECT,afterSequence:3,pinnedCheckpointId:saved!.checkpointId,
+      });
+      expect(pinned.checkpoints).toHaveLength(65);
+      expect(pinned.checkpoints.find(x=>x.id===saved!.checkpointId)?.contentHash)
+        .toBe(saved!.checkpointHash);
+      const resumed=await GuardianTrustedPgSession.open(input);
+      expect(resumed.cursor).toBe(3);
+      expect(await resumed.poll(3000)).toEqual({cursor:3,highWater:3,caughtUp:true});
+    }finally{await rm(dir,{recursive:true,force:true});}
+  });
   it("H1-10 catches a physically missing global durable transition",async()=>{
-    // Last test intentionally mutates only the disposable database.
+    // Destructive: disposable database only.
     await sql`DELETE FROM durable_transitions WHERE sequence=2`;
     await expect(reader.readGuardianConsistentPage(EXPECT))
       .rejects.toThrow("G2H_PG_DURABLE_ROW_GAP_OR_CORRUPT");
+  });
+  it("H2-REAL-PG-04 compaction skips no rows and a deleted pinned CP HALTS",async()=>{
+    const dir=await mkdtemp(join(tmpdir(),"g2h-compacted-"));
+    try{
+      const ack=new GuardianPgFileAckStore(join(dir,"compacted.guardian-pg-ack.json"));
+      const input={
+        source:reader,ack,scope:{database:EXPECT.database,schema:EXPECT.schema,role:EXPECT.role},
+        experimentId:EXPECT.experimentId,authorityId:"canonical-paper-db-reader",
+        pageSize:1,maxBacklogRows:100,
+      };
+      const s=await GuardianTrustedPgSession.open(input);
+      expect(s.cursor).toBe(3);
+      const pinnedId=(await ack.load())!.checkpointId;
+      const result=await admin.compactDurableTransitionsThrough(3,{
+        maxRows:20,batchSize:20,maxBatches:1,budgetMs:30000,
+        maxReplayKeys:50,
+      });
+      expect(result.deleted).toBeGreaterThan(0);
+      expect((await s.poll(4000)).caughtUp).toBe(true);
+      const reopened=await GuardianTrustedPgSession.open(input);
+      expect(reopened.cursor).toBe(3);
+      await expect(reader.readGuardianConsistentPage({...EXPECT,afterSequence:0}))
+        .rejects.toThrow("G2H_PG_DURABLE_REPLAY_GAP");
+      await sql`DELETE FROM engine_checkpoints WHERE id=${pinnedId}`;
+      await expect(reopened.poll(4010))
+        .rejects.toThrow("G2H_PG_PINNED_CHECKPOINT_UNAVAILABLE");
+      expect(reopened.status).toBe("HALTED");
+      await expect(GuardianTrustedPgSession.open(input))
+        .rejects.toThrow("G2H_PG_PINNED_CHECKPOINT_UNAVAILABLE");
+      expect((await ack.load())?.cursor).toBe(3);
+    }finally{await rm(dir,{recursive:true,force:true});}
   });
 });

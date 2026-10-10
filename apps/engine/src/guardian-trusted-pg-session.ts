@@ -58,6 +58,7 @@ export class GuardianTrustedPgSession {
   private async page(afterSequence:number|null,limit=this.pageSize){
     const data=await this.source.readGuardianConsistentPage({
       ...this.scope,experimentId:this.experimentId,afterSequence,limit,
+      pinnedCheckpointId:this.checkpoint.id,
     });
     if(!sameScope(data.source,this.scope))return fail("SOURCE_IDENTITY_CHANGED");
     return data;
@@ -88,6 +89,7 @@ export class GuardianTrustedPgSession {
     const first=await input.source.readGuardianConsistentPage({
       ...input.scope,experimentId:input.experimentId,
       afterSequence:null,limit:input.pageSize,
+      ...(old?{pinnedCheckpointId:old.checkpointId}:{}),
     });
     if(!sameScope(first.source,input.scope))return fail("SOURCE_IDENTITY_CHANGED");
     if(old&&first.highWater<old.observedHighWater)
@@ -117,6 +119,7 @@ export class GuardianTrustedPgSession {
           ...input.scope,experimentId:input.experimentId,
           afterSequence:state.projection.cursor,
           limit:Math.min(input.pageSize,old.cursor-state.projection.cursor),
+          pinnedCheckpointId:anchor.id,
         });
         if(!sameScope(page.source,input.scope)
           ||!equalCheckpoint(page,{...anchor,contentHash:anchor.hash})
