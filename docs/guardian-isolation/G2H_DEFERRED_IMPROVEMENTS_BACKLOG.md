@@ -305,6 +305,33 @@ extending the gate with optional features.
   CPU ms per 1,000 durable rows, at the same source load and byte
   distribution. No architecture decision without measurements.
 
+### GI-019 | Reusable independent economic parity oracle fixture catalog
+- Stage: optional testing ergonomics after H2/H4 acceptance.
+- Status: **OPEN / KNOWN manual fixture duplication, UNKNOWN benefit**.
+- Found during: H4 genuine PG replay of risk reduction admit/fail,
+  partial SELL and settlement, 2026-10-11.
+- Evidence: `guardian-h4-semantic-pg-oracle.test.ts` performs a
+  genuine canonical SQL replay and compares every recovered ledger
+  snapshot against an independently executed `PaperLedger` plus
+  literal $999.04/$1002.04 cash and $0.24/$2.04 PnL assertions.
+  Existing `guardian-offline-durable-source.test.ts` has related
+  state/owner fixtures. Rewriting these by hand risks divergent
+  prices, fees, dates and canonical operation keys.
+- Opportunity: a reusable, deterministic fixture catalog of valid
+  economic event sequences, with explicit externally calculated
+  cash/PnL expectations and negative mutations. Shared test data
+  can reduce maintenance duplication without sharing the actual
+  production economic implementation with the oracle.
+- Failure modes: a generated oracle calling the SAME reducer being
+  tested creates false confidence; combinatorial cost masks root
+  cause; fixtures can be accidentally treated as production traffic.
+- Validation: compare independent hard-coded arithmetic oracle to
+  canonical ledger for at least buy/sell, hedging, settlement,
+  maker reservation and owner-failure sequences.
+- Boundary: genuine economic parity and fail-closed ownership remain
+  **mandatory H-02/H-05 requirements**, never deferred by this entry.
+  Only refactoring common test fixture scaffolding is optional.
+
 ## NOT optional backlog items: current required work (cross-reference only)
 
 Do **not** defer the following because they determine whether the planned

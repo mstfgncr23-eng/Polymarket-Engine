@@ -30,7 +30,20 @@ is NEVER permission to expand H1-H4 or implement a deferred change.
 | H-02 consistent checkpoint/replay | Non-signed `guardian-trusted-pg-bootstrap.ts`; one-snapshot `readGuardianConsistentPage`, canonical reducer | First-page checkpoint+tail + real gap/tamper/concurrent-commit tested; repeated pages, checkpoint rotation and ACK resume not yet integrated | PARTIAL |
 | H-03 restart/ACK | V2 no-sign ACK/replay, 26 offline tests; real PostgreSQL retained-CP lookup beyond newest 64, compaction/restart, pinned-deletion HALT | Safe parity rebase and 8,200-row progression PASS; **producer CP cadence/lease, target FS crash durability, source failover remain blockers** | PARTIAL |
 | H-04 independent paired books | Standalone adapter H3 tests: 40/40 pairs in four bounded shards; 30 stay READY when one shard's 10 are BLOCKED, scoped reconnect, slow fourth-shard startup, silent sync/epoch loss | Offline four-shard functional tests PASS; **real sustained book age, overflow, paced traffic and latency under H4 load not yet proved**. Independent process supervisor belongs G2I, not H-04 | PARTIAL |
-| H-05 bounded health/capacity | Historical JSONL 1,779 records size/rate counted; H4 2-CPU-capped PG with archive-shaped row size histograms (200 records), ACK p99 152-157ms; 40 markets, 32-level UP/DOWN, 80 books/s, 0 gaps; all four H4 tests PASS | **Economic semantics still only mark-to-market**, not real fills/settlements; short runs, synthetic book depth, 0 queue highwater, laptop CPU != target 2vCPU VPS, no sustained PG CPU/heap/failover or operator lag budget | PARTIAL |
+| H-05 bounded health/capacity | 1,779 real archived row size/rate samples; 2-CPU-capped shaped-PG 20/s and 40 markets x 32-level book tests; **new real PG economic replay and independent PaperLedger oracle for UP fill, owner admission/failure, partial SELL, settlement, ACK/restart plus HALT faults 3/3 PASS** | Economic semantic coverage still one market/episode, not historical 1,779-row event mix; short duration, synthetic book depth, zero queue-highwater, no long-running 2-vCPU target/failover benchmark or operator lag budget | PARTIAL |
+
+## H4 true economic semantics and independent PostgreSQL oracle (2026-10-11)
+
+- `G2H_H4_SEMANTIC_PG_ECONOMIC_ORACLE_20261011.md`: actual
+  SELECT-only PostgreSQL checkpoint+ACK integration with real
+  `RISK_REDUCTION_ADMITTED`, `RISK_REDUCTION_FAILED`,
+  `PAPER_FILL` (partial SELL) and `POSITION_SETTLED`;
+  independent cash/PnL assertions and complete restart digest
+  agreement at each sequence. 3/3 semantic/negative tests PASS.
+- ACK-economics-changing historical mutation (with valid updated
+  hash) is REJECTED on restart. Admission with no residual HALTS,
+  with last valid ACK unchanged. This validates one actual economic
+  scenario, not complete historical distribution or multi-hour capacity.
 
 ## H4 two-CPU, archive-shaped bytes and 32-level books (2026-10-11)
 
