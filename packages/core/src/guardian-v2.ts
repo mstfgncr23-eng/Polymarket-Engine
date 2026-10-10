@@ -119,7 +119,9 @@ export function evaluateGuardianV2(input: {
   if (previous?.confirmedAt || (previous && nowMs < Date.parse(previous.updatedAt))) return noop;
   const entry = d(previous?.entryPrice ?? input.entryPrice);
   if (!entry.isFinite() || entry.lte(0) || entry.gt(1)) return noop;
-  const s: GuardianV2State = previous ? structuredClone(previous) : {
+  // No nested Guardian field is modified in place: history is replaced on every change.
+  // Avoid deep-copying hundreds of EARLY samples on each market tick.
+  const s: GuardianV2State = previous ? { ...previous } : {
     ...episode, version: 2, ...(generation === "BAD_REGION_V3" ? { formatGeneration: 3 as const } : {}), entryPrice: entry.toFixed(), phase: "OBSERVING", sensor: null,
     armedAt: null, deadlineAt: null, armRatio: null, badRegionSince: null, history: [],
     lastObservationAt: null, lastObservationEventId: null, lastConsensusAt: null, lastConsensusEventId: null,
@@ -166,8 +168,13 @@ export function evaluateGuardianV2(input: {
     }
   } else if (age <= C.EARLY_WINDOW_MS && fresh && valid) {
     const cutoff = nowMs - C.EARLY_DROP_LOOKBACK_MS;
-    const anchor = s.history.filter(sample => Date.parse(sample.at) <= cutoff).at(-1);
-    s.history = [...(anchor ? [anchor] : []), ...s.history.filter(sample => Date.parse(sample.at) > cutoff), { at, heldRatio: heldRatio!.toFixed() }];
+    // History is already timestamp-ordered by the schema. One backward scan
+    // finds the most recent anchor <= cutoff, preserving exactly one anchor
+    // and every newer sample without filtering the entire array twice.
+    let lastAnchorIndex = s.history.length - 1;
+    while (lastAnchorIndex >= 0 && Date.parse(s.history[lastAnchorIndex]!.at) > cutoff) lastAnchorIndex--;
+    const anchor = lastAnchorIndex >= 0 ? s.history[lastAnchorIndex]! : null;
+    s.history = [...(anchor ? [anchor] : []), ...s.history.slice(lastAnchorIndex + 1), { at, heldRatio: heldRatio!.toFixed() }];
     s.badRegionSince = heldRatio!.lte(C.EARLY_HELD_RATIO_MAX) ? s.badRegionSince ?? at : null;
     if (heldRatio!.lte(C.EARLY_HELD_RATIO_MAX) && anchor && d(anchor.heldRatio).minus(heldRatio!).gte(C.EARLY_MIN_DROP_RATIO)
       && s.badRegionSince && nowMs - Date.parse(s.badRegionSince) >= C.EARLY_BAD_REGION_PERSIST_MS
