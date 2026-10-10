@@ -86,6 +86,36 @@ export class GuardianReadonlySession {
   /** NO ledger or mutable projection escapes this class. */
   get openPositionCount():number {return this.current.projection.open.size;}
 
+  /**
+   * Complete, signed-highwater-aligned observational handoff for a future
+   * single Guardian process. Never exposes live mutable Map/Set references
+   * or any method that can submit, cancel or reserve economic orders.
+   */
+  readVerifiedView(nowMs:number) {
+    if (this.stopped!==null || this.inFlight || !Number.isSafeInteger(nowMs)
+      || nowMs<this.signed.issuedAtMs-5_000 || nowMs>=this.signed.expiresAtMs
+      || this.current.projection.cursor!==this.signed.durableHighWater)
+      return halt("SOURCE_REPLAY_FAILED");
+    const state=this.current,p=state.projection,r=state.recovery;
+    return {
+      version:1 as const,mode:"PAPER" as const,authorityId:p.authorityId,
+      experimentId:p.experimentId,writerEpoch:this.signed.writerEpoch,
+      manifestSequence:this.signed.manifestSequence,
+      checkpointId:this.signed.checkpointId,
+      cursor:p.cursor,highWater:this.signed.durableHighWater,
+      economicStateHash:hashGuardianRecoverableState(state),
+      open:structuredClone([...p.open.values()].sort((a,b)=>a.episode.marketId.localeCompare(b.episode.marketId))),
+      settledMarkets:[...p.settledMarkets].sort(),
+      restingOrders:structuredClone([...r.restingOrders.values()]),
+      makerReservations:structuredClone([...r.makerReservations.entries()]),
+      riskReductionOwners:structuredClone([...(r.riskReductionOwners??new Map()).values()]),
+      riskReductionFailures:structuredClone([...(r.riskReductionFailures??new Map()).values()]),
+      reversalProtectionStates:structuredClone([...(r.reversalProtectionStates??new Map()).values()]),
+      profitTrailingPairStates:structuredClone([...(r.profitTrailingPairStates??new Map()).values()]),
+      settlementLookups:structuredClone([...(r.settlementLookups??new Map()).values()]),
+    };
+  }
+
   static async open(input:{
     source:GuardianG2HJournal;ackStore:GuardianConsumerAckStore;
     trust:GuardianWriterTrust;manifest:unknown;

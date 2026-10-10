@@ -254,3 +254,29 @@ describe("G2H ACK binds all risk and maker economic state",()=>{
     expect(hashGuardianRecoverableState(existingKeys)).not.toBe(baseline);
   });
 });
+
+describe("G2H complete observational handoff has no execution authority",()=>{
+  it("G2H-VIEW-01 returns complete pinned open episodes only at signed highwater and copies values",async()=>{
+    const ack=await setup();
+    const session=await start(ack,signed(20));
+    const view=session.readVerifiedView(NOW);
+    expect(view).toMatchObject({mode:"PAPER",authorityId:"writer-epoch-7",
+      writerEpoch:7,cursor:20,highWater:20,open:[{residualQty:"5"}]});
+    expect(view.economicStateHash).toMatch(/^[a-f0-9]{64}$/);
+    view.open[0]!.residualQty="999";
+    expect(session.readVerifiedView(NOW).open[0]?.residualQty).toBe("5");
+    await session.poll(signed(22,2),NOW);
+    expect(()=>session.readVerifiedView(NOW)).toThrowError(
+      expect.objectContaining({reason:"SOURCE_REPLAY_FAILED"}));
+    await session.poll(signed(22,3),NOW);
+    expect(session.readVerifiedView(NOW).open).toEqual([]);
+    expect(session.readVerifiedView(NOW).settledMarkets).toEqual([MARKET]);
+  });
+  it("G2H-VIEW-02 expired producer heartbeat blocks even an already ACKed, unchanged cursor",async()=>{
+    const ack=await setup();
+    const session=await start(ack);
+    expect(()=>session.readVerifiedView(NOW+5000)).toThrowError(
+      expect.objectContaining({reason:"SOURCE_REPLAY_FAILED"}));
+    expect(()=>session.readVerifiedView(NOW+4999)).not.toThrow();
+  });
+});
