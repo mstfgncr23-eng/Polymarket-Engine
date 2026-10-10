@@ -234,6 +234,28 @@ extending the gate with optional features.
 - Boundary: A provably safe checkpoint rebase and continuous progress
   are H-03/H-05 REQUIRED. Only optional CPU improvements go here.
 
+### GI-016 | Per-shard Guardian operator metrics instead of aggregate red status
+- Stage: G2I/G5 dashboards, post-H3 nonblocking observability polish.
+- Status: **OPEN / KNOWN aggregate ambiguity, UNKNOWN operator utility**.
+- Found during: H3 four-shard/40-market functional tests, 2026-10-11.
+- Evidence: `ShardedPolymarketMarketDataAdapter.aggregateConnectionState()`
+  returns `DISCONNECTED` when any active shard disconnects; a Guardian
+  may still safely have 30/40 market pairs READY. The source exposes
+  `shardSnapshots()` and a read-only shard observer with per-shard
+  connection state / reconnect counters / ingress queue stats.
+- Opportunity: display per-shard healthy/failing market count, epoch
+  reset and reconnect time next to aggregate status to avoid an operator
+  mistaking a 10-market outage for a 40-market outage. Reuse existing
+  metrics rather than inventing a new event stream or broker.
+- Failure modes: telemetry and business readiness diverging, high
+  label cardinality, accidental trust in a dashboard instead of the
+  actual normalized token sync state.
+- Validation: local simulation for 30 READY + 10 BLOCKED and bounded
+  counts with 40 markets; no order authority or production side effect.
+- Boundary: **correct shard-isolated book readiness is H-04 mandatory**
+  and was fixed in the scoped H3 code, not deferred. This entry is
+  only additional operator-facing observability.
+
 ## NOT optional backlog items: current required work (cross-reference only)
 
 Do **not** defer the following because they determine whether the planned

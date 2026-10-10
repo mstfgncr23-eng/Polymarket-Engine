@@ -18,7 +18,7 @@ is NEVER permission to expand H1-H4 or implement a deferred change.
 | Current offline recovery covers positions + owners | KNOWN for tested fixtures | `guardian-offline-durable-source.ts`, G2G tests; not live PostgreSQL integration |
 | Existing G2H consumer can run without Ed25519 | FALSE | `GuardianReadonlySession.open/poll` always require signed manifest, signed row pages, key/floors |
 | Restart receipt is independent of signer epoch | FALSE | v1 `GuardianConsumerReceipt` contains writerEpoch/manifestSequence |
-| G2H paired books work without Engine's running feed | NOT PROVEN | `GuardianNormalizedBookBridge` consumes callback snapshots, no process/socket |
+| G2H paired books work without Engine's running feed | KNOWN in offline adapter-owned tests; production process UNKNOWN | `GuardianStandaloneBookObserver` directly runs existing sharded `PolymarketMarketDataAdapter.run()` with scripted bounded transports; G2I process supervision not built |
 | Guardian has economic write/submit access | FALSE in G2H modules | G2H adapters expose reads/views; G3 arbitration is currently inside Engine |
 | "Position still open" is guaranteed during future order submission | NOT PROVEN, G3 | Snapshot is stale as soon as executor can admit a different intent |
 
@@ -29,8 +29,16 @@ is NEVER permission to expand H1-H4 or implement a deferred change.
 | H-01 trusted DB/role | `PostgresEventJournal.readGuardianConsistentPage`, isolated PostgreSQL 17 tests | Real isolated SELECT-only role + RLS proof PASS; production DB identity/credential/TLS and provisioning unverified | PARTIAL |
 | H-02 consistent checkpoint/replay | Non-signed `guardian-trusted-pg-bootstrap.ts`; one-snapshot `readGuardianConsistentPage`, canonical reducer | First-page checkpoint+tail + real gap/tamper/concurrent-commit tested; repeated pages, checkpoint rotation and ACK resume not yet integrated | PARTIAL |
 | H-03 restart/ACK | V2 no-sign ACK/replay, 26 offline tests; real PostgreSQL retained-CP lookup beyond newest 64, compaction/restart, pinned-deletion HALT | Safe parity rebase and 8,200-row progression PASS; **producer CP cadence/lease, target FS crash durability, source failover remain blockers** | PARTIAL |
-| H-04 independent paired books | `guardian-standalone-book-observer.ts` directly runs `PolymarketMarketDataAdapter`; scripted bounded transport 8/8, 7/8, reconnect, epoch/stale tests PASS | No independent process supervisor (G2I); **4-shard/40-market reconnect recovery and sustained book age/load not yet proved** | PARTIAL |
+| H-04 independent paired books | Standalone adapter H3 tests: 40/40 pairs in four bounded shards; 30 stay READY when one shard's 10 are BLOCKED, scoped reconnect, slow fourth-shard startup, silent sync/epoch loss | Offline four-shard functional tests PASS; **real sustained book age, overflow, paced traffic and latency under H4 load not yet proved**. Independent process supervisor belongs G2I, not H-04 | PARTIAL |
 | H-05 bounded health/capacity | 100/1000/8192 synthetic row tests; 313/313 regression at baseline | Synthetic event timestamps are NOT paced; no local Postgres CPU/lag/heap envelope, no full paired-book replay workload, operation-key retention hard halts | PARTIAL |
+
+## H3 four-shard/40-market functional evidence (2026-10-11)
+
+- `G2H_H3_FOUR_SHARD_40_MARKET_ACCEPTANCE_20261011.md`:
+  source audit of aggregate connection semantics; six four-shard
+  offline cases including 40/40 READY, one-shard 10 BLOCKED / 30 READY,
+  delayed fourth-shard CONNECTING readiness, silent sync/epoch fences.
+  H4 paced load and production target resource envelope remain OPEN.
 
 ## H2/H3 follow-on evidence (2026-10-11)
 

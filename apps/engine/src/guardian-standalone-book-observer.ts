@@ -17,6 +17,7 @@ const deny=(reason:string):never=>{throw Error("G2H_STANDALONE_BOOK_"+reason);};
 export class GuardianStandaloneBookObserver {
   private readonly bridges=new Map<string,GuardianNormalizedBookBridge>();
   private readonly byToken=new Map<string,string>();
+  private readonly tokenPairs=new Map<string,{UP:string;DOWN:string}>();
   /** At most TWO current-epoch normalized books per market. */
   private readonly pending=new Map<string,Partial<Record<Outcome,{
     snapshot:MarketSnapshot;epoch:number;
@@ -42,6 +43,7 @@ export class GuardianStandaloneBookObserver {
         epoch:this.adapter.tokenEpoch(tokenId),
       })});
       this.bridges.set(m.marketId,bridge);
+      this.tokenPairs.set(m.marketId,{UP:m.upTokenId,DOWN:m.downTokenId});
       this.byToken.set(m.upTokenId,m.marketId);
       this.byToken.set(m.downTokenId,m.marketId);
       this.tokens.push(m.upTokenId,m.downTokenId);
@@ -55,15 +57,38 @@ export class GuardianStandaloneBookObserver {
     for(const bridge of this.bridges.values())bridge.invalidate(reason);
     if(reason==="DISCONNECT"||reason==="OVERLOAD")this.connected=false;
   }
+  /** An aggregate shard disconnect is not a global book disconnect. */
+  private invalidateUnsynchronized():number{
+    let affected=0;
+    for(const [marketId,bridge] of this.bridges){
+      const {UP,DOWN}=this.tokenPairs.get(marketId)!;
+      if(!this.adapter.isTokenSynchronized(UP)
+        ||!this.adapter.isTokenSynchronized(DOWN)){
+        this.pending.delete(marketId);
+        bridge.invalidate("SOURCE_GAP");
+        affected++;
+      }
+    }
+    return affected;
+  }
   private onConnection(event:FeedConnectionEvent){
     if(event.feed!=="polymarket")return;
-    if(event.state==="CONNECTED"){
+    if(event.state==="CONNECTING"||event.state==="CONNECTED"){
+      // Sharded facade reports aggregate CONNECTING until the last socket
+      // connects. Other shards can already send verified normalized books.
+      // Starting this read-only bridge does NOT declare any book READY.
       if(!this.connected){
         this.connected=true;
         this.pending.clear();
         for(const bridge of this.bridges.values())bridge.onConnected();
       }
-    }else if(event.state!=="CONNECTING"){
+    }else if(event.state==="DISCONNECTED"||event.state==="STALE"){
+      // Sharded facade emits aggregate DISCONNECTED for ONE failed socket.
+      // Per-token sync is already fenced by the real adapter's gap handler.
+      // If no scoped invalidation evidence exists, fail closed globally.
+      if(!this.connected||this.invalidateUnsynchronized()===0)
+        this.invalidateAll("SOURCE_GAP");
+    }else if(event.state==="STOPPED"){
       this.invalidateAll("DISCONNECT");
     }
   }
@@ -126,7 +151,12 @@ export class GuardianStandaloneBookObserver {
           this.onSnapshot(frame);
         },
         onConnection:event=>this.onConnection(event),
-        onError:()=>this.invalidateAll("DISCONNECT"),
+        onError:()=>{
+          // If the source supplies a token-scoped gap, keep healthy shards.
+          // Unknown/unattributable faults must still block every market.
+          if(!this.connected||this.invalidateUnsynchronized()===0)
+            this.invalidateAll("SOURCE_GAP");
+        },
         onGap:event=>this.onGap(event),
       },signal);
     }finally{
@@ -137,6 +167,24 @@ export class GuardianStandaloneBookObserver {
   observe(marketId:string,limits:GuardianBookFreshness){
     const bridge=this.bridges.get(marketId);
     if(!bridge)return deny("UNKNOWN_MARKET");
+    const {UP,DOWN}=this.tokenPairs.get(marketId)!;
+    // Callback delivery is not a security boundary. Even if a gap or
+    // epoch notification is delayed/lost, an unsynchronized token cannot
+    // leave a cached previously READY book trusted.
+    const held=this.pending.get(marketId);
+    if(held&&(held.UP&&this.adapter.tokenEpoch(UP)!==held.UP.epoch
+      ||held.DOWN&&this.adapter.tokenEpoch(DOWN)!==held.DOWN.epoch)){
+      this.pending.delete(marketId);
+      bridge.invalidate("TOKEN_ROTATION");
+    }else if((!this.adapter.isTokenSynchronized(UP)
+      ||!this.adapter.isTokenSynchronized(DOWN))
+      &&bridge.status==="ACTIVE"){
+      // An ACTIVE pair cannot remain READY if either source loses sync.
+      // AWAITING/DISCONNECTED may already hold one FRESH synced side:
+      // retain that side until its counterpart arrives after reconnect.
+      this.pending.delete(marketId);
+      bridge.invalidate("UNSYNC");
+    }
     return bridge.observe(limits);
   }
   get isRunning():boolean{return this.running;}
