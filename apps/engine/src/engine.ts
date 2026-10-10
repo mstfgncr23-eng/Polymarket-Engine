@@ -458,6 +458,10 @@ export class EngineService {
   private readonly profitTrailingPairStates = new Map<string, ProfitTrailingPairState>();
   private readonly profitTrailingPairInFlight = new Set<string>();
   private readonly profitTrailingPairPending = new Set<string>();
+  /** Only snapshot-originated legacy de-risk after duration; pair books get one event-loop turn to coalesce. */
+  private readonly profitTrailingDeRiskSnapshotScheduled = new Set<string>();
+  /** Vetoed post-duration PAIR evidence cannot suppress protective A/B on retry. */
+  private readonly profitTrailingRejectedEvidence = new Map<string, string>();
   private readonly soakPersistedRevisions = new Map<string, number>();
   private readonly soakPersistedObservationCounts = new Map<string, number>();
   private lastSoakPersistAt = 0;
@@ -2654,9 +2658,7 @@ export class EngineService {
       // Risk exits run outside the websocket consumer await-chain. The per-market
       // flight below prevents duplicate unwind orders while a prior attempt is
       // persisting or waiting through paper execution latency.
-      void this.maybeProtectiveDeRisk(snapshot.marketId).catch((error) => {
-        this.logger.error({ err: error, marketId: snapshot.marketId }, "protective de-risk attempt failed");
-      });
+      this.scheduleSnapshotProtectiveDeRisk(snapshot.marketId);
     }
     this.state.eventLatencyMs = performance.now() - started;
     this.metrics.eventLatency.observe((performance.now() - started) / 1000);
@@ -2692,9 +2694,7 @@ export class EngineService {
     this.kickProfitTrailingPair(current.marketId);
     this.kickReversalProtection(current.marketId);
     // Only economic follow-up hydration may cause: bounded per-market de-risk.
-    void this.maybeProtectiveDeRisk(current.marketId).catch((error) => {
-      this.logger.error({ err: error, marketId: current.marketId }, "protective de-risk attempt failed");
-    });
+    this.scheduleSnapshotProtectiveDeRisk(current.marketId);
   }
 
   private async onReferenceTick(tick: ReferenceTick): Promise<void> {
@@ -5753,9 +5753,7 @@ export class EngineService {
         if (this.profitTrailingPairPending.delete(marketId)) {
           this.kickProfitTrailingPair(marketId);
         } else if (!this.profitTrailingRetainsAuthority(marketId)) {
-          void this.maybeProtectiveDeRisk(marketId).catch((error) => {
-            this.logger.error({ err: error, marketId }, "protective de-risk handoff failed");
-          });
+          this.scheduleSnapshotProtectiveDeRisk(marketId);
         }
       });
   }
@@ -5846,7 +5844,10 @@ export class EngineService {
         maxOrderSizeUsd: this.riskLimits.maxOrderSizeUsd,
         minimumLockedPairEdge: 0,
       });
-      if (!baseCandidate || !d(baseCandidate.quantity).eq(latestPosition.unpairedQuantity)) return;
+      if (!baseCandidate || !d(baseCandidate.quantity).eq(latestPosition.unpairedQuantity)) {
+        this.noteProfitTrailingRejectedEvidence(marketId, latestPosition, latestNow.getTime());
+        return;
+      }
       const candidate: StrategyCandidate = {
         ...baseCandidate,
         strategyId: latestEvaluation.action === "TARGET" ? "profit-trailing-pair-target" : "profit-trailing-pair-trail",
@@ -5875,8 +5876,13 @@ export class EngineService {
         highWaterEdge: this.profitTrailingPairStates.get(marketId)?.highWaterEdge ?? null,
         targetEdge: config.target, armEdge: config.arm, retraceEdge: config.retrace,
       }, this.assetByMarket.get(marketId) ?? null);
-      if (!decision.accepted || !decision.order) return;
-      await this.submitPaperOrder(decision.order, latest.opposite, duplicateKey, "HEDGE_SECOND_LEG");
+      if (!decision.accepted || !decision.order) {
+        this.noteProfitTrailingRejectedEvidence(marketId, latestPosition, latestNow.getTime());
+        return;
+      }
+      const submitted = await this.submitPaperOrder(decision.order, latest.opposite, duplicateKey, "HEDGE_SECOND_LEG");
+      if (!submitted) this.noteProfitTrailingRejectedEvidence(marketId, latestPosition, this.nowFn().getTime());
+      else this.profitTrailingRejectedEvidence.delete(marketId);
       return;
     }
     this.profitTrailingPairPending.add(marketId);
@@ -6012,10 +6018,24 @@ export class EngineService {
     };
   }
 
+  /** Stable episode + two-side source evidence; a rejected order cannot monopolize a later deadline attempt. */
+  private profitTrailingEvidenceKey(marketId: string, position: Position): string {
+    const pair = this.snapshots.get(marketId);
+    return JSON.stringify([position.id, unhedgedEpisode(position), pair?.UP?.eventId ?? null, pair?.DOWN?.eventId ?? null]);
+  }
+
+  private noteProfitTrailingRejectedEvidence(marketId: string, position: Position, nowMs: number): void {
+    const deadline = this.protectiveDeRiskEligibility(
+      marketId, position.unhedgedStartedAt ?? position.openedAt, nowMs,
+    );
+    if (deadline.eligible) this.profitTrailingRejectedEvidence.set(marketId, this.profitTrailingEvidenceKey(marketId, position));
+  }
+
   /**
-   * Profit trailing is the sole second-leg authority only before the existing
-   * protective deadline. Once that deadline is reached, authority hands to the
-   * generic A/B protective controller. No price/ratio policy is introduced here.
+   * Only the duration deadline may yield to an *immediately actionable*,
+   * fee-positive full PAIR. A non-actionable or stale book goes straight to
+   * the existing protective A/B fallback. Market end - 80s never yields.
+   * This guard is re-evaluated at durable admission and fill boundaries.
    */
   private profitTrailingRetainsAuthority(
     marketId: string,
@@ -6029,8 +6049,64 @@ export class EngineService {
       position.unhedgedStartedAt ?? position.openedAt,
       nowMs,
     );
-    if (eligibility.marketEndMs != null && nowMs >= eligibility.marketEndMs) return false;
-    return !eligibility.eligible;
+    if (eligibility.marketEndMs != null
+      && nowMs >= eligibility.marketEndMs - PROTECTIVE_DE_RISK_PRE_EXPIRY_SAFETY_MS) return false;
+    if (!eligibility.eligible) return true;
+    if (this.profitTrailingRejectedEvidence.get(marketId) === this.profitTrailingEvidenceKey(marketId, position)) return false;
+
+    const config = this.profitTrailingPairConfig();
+    if (!config) return false;
+    const now = new Date(nowMs);
+    const opportunity = this.profitTrailingPairOpportunity(marketId, position, now);
+    if (!opportunity || d(opportunity.lockedPnl).lte(0)) return false;
+    const evaluation = evaluateProfitTrailingPair({
+      state: this.profitTrailingPairStates.get(marketId) ?? null,
+      marketId,
+      positionId: position.id,
+      unhedgedStartedAt: unhedgedEpisode(position),
+      now,
+      currentGrossEdge: opportunity.grossEdge,
+      currentLockedPnl: opportunity.lockedPnl,
+      targetEdge: config.target,
+      armEdge: config.arm,
+      retraceEdge: config.retrace,
+    });
+    return evaluation.action !== "NONE";
+  }
+
+  /**
+   * Only snapshot/hydration-originated duration fallback is deferred by ONE
+   * event-loop turn, so a paired UP/DOWN update can be evaluated together.
+   * No timer grace is added to the 300s limit; maintenance fallback is unchanged.
+   * Pre-expiry protection also remains immediate.
+   */
+  private scheduleSnapshotProtectiveDeRisk(marketId: string): void {
+    const run = () => {
+      if (!this.state.draining) void this.maybeProtectiveDeRisk(marketId).catch((error) => {
+        this.logger.error({ err: error, marketId }, "protective de-risk attempt failed");
+      });
+    };
+    const position = this.ledger.positions.get(marketId);
+    if (!this.profitTrailingPairSoakEnabled() || !position?.unpairedOutcome) {
+      run();
+      return;
+    }
+    const nowMs = this.nowFn().getTime();
+    const deadline = this.protectiveDeRiskEligibility(
+      marketId, position.unhedgedStartedAt ?? position.openedAt, nowMs,
+    );
+    if (!deadline.eligible || (deadline.marketEndMs != null
+      && nowMs >= deadline.marketEndMs - PROTECTIVE_DE_RISK_PRE_EXPIRY_SAFETY_MS)) {
+      run();
+      return;
+    }
+    if (this.profitTrailingDeRiskSnapshotScheduled.has(marketId)) return;
+    this.profitTrailingDeRiskSnapshotScheduled.add(marketId);
+    const immediate = setImmediate(() => {
+      this.profitTrailingDeRiskSnapshotScheduled.delete(marketId);
+      run();
+    });
+    immediate.unref();
   }
 
   /**
@@ -8238,6 +8314,7 @@ private buildEarlyAudit(
   }
 
   private clearProtectiveDeRiskState(marketId: string): void {
+    this.profitTrailingRejectedEvidence.delete(marketId);
     this.protectiveDeRiskAttempts.delete(marketId);
     this.protectiveDeRiskNextAttemptAt.delete(marketId);
     this.protectiveDeRiskVetoFingerprint.delete(marketId);

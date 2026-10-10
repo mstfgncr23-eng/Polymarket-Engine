@@ -148,6 +148,112 @@ describe("profit trailing pair PAPER authority", () => {
     } finally { await s.engine.stop(); }
   });
 
+  it("duration fallback still exits when no profitable or actionable PAIR exists", async () => {
+    const s = await start();
+    try {
+      await seedFirstLeg(s);
+      await publish(s, "0.15", 1); // .05 arm
+      await waitFor(s, "arm", () => internal(s.engine).profitTrailingPairStates.get(MARKET)?.revision === 1);
+
+      s.clock.ms += 303_000;
+      await publish(s, "0.30", 2); // negative gross pair edge, not executable profit
+      await waitFor(s, "deadline-fallback", () => !s.engine.ledger.positions.has(MARKET));
+      const fills = await s.journal.queryEvents({ types: ["PAPER_FILL"] });
+      expect(fills.filter(row => row.payload.intent === "PROTECTIVE_DE_RISK")).toHaveLength(1);
+      expect(fills.filter(row => row.payload.intent === "HEDGE_SECOND_LEG")).toHaveLength(0);
+    } finally { await s.engine.stop(); }
+  });
+
+  it("positive edge without TARGET or retrace does not suspend the duration fallback", async () => {
+    const s = await start();
+    try {
+      await seedFirstLeg(s);
+      await publish(s, "0.15", 1); // initial .05 arm
+      await waitFor(s, "arm", () => internal(s.engine).profitTrailingPairStates.get(MARKET)?.revision === 1);
+
+      s.clock.ms += 303_000;
+      await publish(s, "0.14", 2); // .06 is positive but NEW high-water, not a .02 retrace
+      await waitFor(s, "non-actionable-fallback",
+        () => !s.engine.ledger.positions.has(MARKET)
+          || s.engine.ledger.positions.get(MARKET)?.unpairedQuantity === "0");
+      const fills = await s.journal.queryEvents({ types: ["PAPER_FILL"] });
+      // The protective A/B arbiter may select a SELL or a rescue PAIR;
+      // neither is a Profit-trailing HEDGE_SECOND_LEG.
+      expect(fills.filter(row => row.payload.intent === "PROTECTIVE_DE_RISK"
+        || row.payload.intent === "RESCUE_SECOND_LEG")).toHaveLength(1);
+      expect(fills.filter(row => row.payload.intent === "HEDGE_SECOND_LEG")).toHaveLength(0);
+    } finally { await s.engine.stop(); }
+  });
+
+  it("an economic veto cannot leave actionable trailing holding the deadline hostage", async () => {
+    const s = await start();
+    try {
+      await seedFirstLeg(s);
+      await publish(s, "0.15", 1);
+      await waitFor(s, "arm", () => internal(s.engine).profitTrailingPairStates.get(MARKET)?.highWaterEdge === "0.05");
+      s.clock.ms += 1_000;
+      await publish(s, "0.10", 2);
+      await waitFor(s, "high-water", () => internal(s.engine).profitTrailingPairStates.get(MARKET)?.highWaterEdge === "0.1");
+
+      const handler = s.engine as unknown as {
+        decideWithRuntimeBasis(input: { candidate: { strategyId: string } }): {
+          decision: { accepted: boolean; order: unknown; risk: { vetoes: string[] } }; duplicateKey: string;
+        };
+      };
+      const original = handler.decideWithRuntimeBasis.bind(handler);
+      handler.decideWithRuntimeBasis = input =>
+        input.candidate.strategyId === "profit-trailing-pair-trail"
+          ? { decision: { accepted: false, order: null, risk: { vetoes: ["TEST_RISK_VETO"] } }, duplicateKey: "veto" }
+          : original(input);
+
+      s.clock.ms += 302_000;
+      await publish(s, "0.12", 3); // executable and actionable .02 retrace, but vetoed at risk admission
+      await waitFor(s, "veto-fallback", () => !s.engine.ledger.positions.has(MARKET)
+        || s.engine.ledger.positions.get(MARKET)?.unpairedQuantity === "0");
+      const fills = await s.journal.queryEvents({ types: ["PAPER_FILL"] });
+      expect(fills.filter(row => row.payload.intent === "HEDGE_SECOND_LEG")).toHaveLength(0);
+      expect(fills.filter(row => row.payload.intent === "PROTECTIVE_DE_RISK"
+        || row.payload.intent === "RESCUE_SECOND_LEG")).toHaveLength(1);
+    } finally { await s.engine.stop(); }
+  });
+
+  it("missing opposite book does not disable the deadline after one event-loop turn", async () => {
+    const s = await start();
+    try {
+      await seedFirstLeg(s);
+      await publish(s, "0.15", 1);
+      await waitFor(s, "arm", () => internal(s.engine).profitTrailingPairStates.get(MARKET)?.revision === 1);
+
+      s.clock.ms += 303_000;
+      await s.market.emitSnapshot(book(s, "UP", "0.81", 2)); // DOWN remains stale
+      await waitFor(s, "single-book-fallback", () => !s.engine.ledger.positions.has(MARKET));
+      const fills = await s.journal.queryEvents({ types: ["PAPER_FILL"] });
+      expect(fills.filter(row => row.payload.intent === "PROTECTIVE_DE_RISK")).toHaveLength(1);
+      expect(fills.filter(row => row.payload.intent === "HEDGE_SECOND_LEG")).toHaveLength(0);
+    } finally { await s.engine.stop(); }
+  });
+
+  it("the 80s pre-expiry safety always outranks a fresh profitable trailing retrace", async () => {
+    const s = await start();
+    try {
+      await seedFirstLeg(s);
+      await publish(s, "0.15", 1);
+      await waitFor(s, "arm", () => internal(s.engine).profitTrailingPairStates.get(MARKET)?.highWaterEdge === "0.05");
+      s.clock.ms += 1_000;
+      await publish(s, "0.10", 2);
+      await waitFor(s, "peak", () => internal(s.engine).profitTrailingPairStates.get(MARKET)?.highWaterEdge === "0.1");
+
+      // Market endDate is START + 1h; at the exact 80s safety boundary.
+      s.clock.ms = START + 3_600_000 - 80_000;
+      await publish(s, "0.12", 3);
+      await waitFor(s, "pre-expiry-protection", () => !s.engine.ledger.positions.has(MARKET));
+      const fills = await s.journal.queryEvents({ types: ["PAPER_FILL"] });
+      expect(fills.filter(row => row.payload.intent === "HEDGE_SECOND_LEG")).toHaveLength(0);
+      expect(fills.filter(row => row.payload.intent === "PROTECTIVE_DE_RISK"
+        || row.payload.intent === "RESCUE_SECOND_LEG")).toHaveLength(1);
+    } finally { await s.engine.stop(); }
+  });
+
   it("locks a still-positive .02 gross retrace instead of being trapped by the normal alpha floor", async () => {
     const s = await start();
     try {
