@@ -14,6 +14,7 @@ import {
 import { plannedDurableTransition } from "../apps/engine/src/recovery.js";
 import { accountResultFill, emptyResultAccounting } from "../apps/engine/src/trading-results.js";
 import { paperFill } from "./paper-engine-testkit.js";
+import { pullGuardianDurablePage, type GuardianDurableReadSource } from "../apps/engine/src/guardian-readonly-durable-feed.js";
 
 const AT="2026-10-10T10:00:00.000Z";
 const AT2="2026-10-10T10:00:05.000Z";
@@ -319,5 +320,71 @@ describe("G2G closeout: soak diagnostics and unresolved integrity",()=>{
       "CHECKPOINT_HAS_UNMODELED_AUTHORITY");
     fail(()=>boot({...checkpoint,reportQuarantine:{unsafe:true}}),"CHECKPOINT_HAS_UNMODELED_AUTHORITY");
     fail(()=>boot({...checkpoint,nakedDirectionalDiagnostics:"not-an-array"}),"CHECKPOINT_UNSUPPORTED");
+  });
+});
+
+describe("G2H canonical read-only durable page feed: closed fixtures, NO SHADOW",()=>{
+  const source=(rows:ReturnType<typeof fillRow>[],highWater=22):GuardianDurableReadSource=>({
+    latestDurableSequence:async()=>highWater,
+    readDurableTransitionsAfter:async(cursor,limit)=>rows.filter(r=>r.sequence>cursor).slice(0,limit),
+  });
+  const pull=(s:GuardianDurableReadSource,opts:Record<string,number>={})=>
+    pullGuardianDurablePage({source:s,state:boot(),pageSize:opts.pageSize??1,
+      maxBacklogRows:opts.maxBacklogRows??100});
+  const blocked=async(action:()=>Promise<unknown>,reason:string)=>
+    expect(action()).rejects.toMatchObject({name:"Error",reason});
+  it("G2H-01 consumes contiguous source rows one page at a time",async()=>{
+    const s=source([fillRow(21),settleRow(22)],22);
+    const one=await pull(s);
+    expect(one.readCount).toBe(1);
+    expect(one.state.projection.cursor).toBe(21);
+    expect(one.state.projection.open.get(MARKET)?.residualQty).toBe("3");
+    const two=await pullGuardianDurablePage({
+      source:s,state:one.state,pageSize:1,maxBacklogRows:100,
+    });
+    expect(two.state.projection.cursor).toBe(22);
+    expect(two.state.projection.open.size).toBe(0);
+    expect(two.state.projection.settledMarkets.has(MARKET)).toBe(true);
+    const idle=await pullGuardianDurablePage({source:s,state:two.state,
+      pageSize:1,maxBacklogRows:100});
+    expect(idle.readCount).toBe(0);
+    expect(idle.state).toBe(two.state);
+  });
+  it("G2H-02 refuses a compacted missing row even if high-water advanced",async()=>{
+    await blocked(()=>pull(source([settleRow(22)],22)),"DURABLE_SOURCE_GAP");
+    await blocked(()=>pull(source([],22)),"DURABLE_PAGE_INVALID");
+    await blocked(()=>pull(source([fillRow(21)],21))
+      .then(({state})=>pullGuardianDurablePage({
+        source:source([],22),state,pageSize:1,maxBacklogRows:100,
+      })), "DURABLE_PAGE_INVALID");
+  });
+  it("G2H-03 refuses source regression, excessive lag and unbounded consumer settings",async()=>{
+    await blocked(()=>pull(source([],19)),"SOURCE_CURSOR_REGRESSION");
+    await blocked(()=>pull(source([],22),{pageSize:1,maxBacklogRows:1}),"BACKLOG_EXCEEDED");
+    await blocked(()=>pull(source([],22),{pageSize:0}),"INVALID_LIMITS");
+    await blocked(()=>pull(source([],22),{pageSize:513,maxBacklogRows:1000}),"INVALID_LIMITS");
+  });
+  it("G2H-04 fails closed on unavailable source, never returns cached position as current",async()=>{
+    await blocked(()=>pull({
+      latestDurableSequence:async()=>{throw Error("DB_CONNECT_TIMEOUT")},
+      readDurableTransitionsAfter:async()=>[],
+    }),"SOURCE_UNAVAILABLE");
+    await blocked(()=>pull({
+      latestDurableSequence:async()=>21,
+      readDurableTransitionsAfter:async()=>{throw Error("QUERY_TIMEOUT")},
+    }),"SOURCE_UNAVAILABLE");
+  });
+  it("G2H-05 fails closed on invalid, out-of-order or future durable rows",async()=>{
+    await blocked(()=>pull({
+      latestDurableSequence:async()=>21,
+      readDurableTransitionsAfter:async()=>[fillRow(21),settleRow(22)],
+    },{pageSize:2}),"DURABLE_PAGE_INVALID");
+    await blocked(()=>pull(source([fillRow(22)],22)),"DURABLE_SOURCE_GAP");
+    await blocked(()=>pull(source([fillRow(21),fillRow(21)],22),{pageSize:2}),"DURABLE_SOURCE_GAP");
+  });
+  it("G2H-06 compacted/modified economic record cannot masquerade as a valid empty heartbeat",async()=>{
+    const full=fillRow(21);
+    await blocked(()=>pull(source([{...full,payload:{}}],21)),"DURABLE_REPLAY_FAILED");
+    await blocked(()=>pull(source([{...full,payloadHash:"0".repeat(64)}],21)),"DURABLE_REPLAY_FAILED");
   });
 });
