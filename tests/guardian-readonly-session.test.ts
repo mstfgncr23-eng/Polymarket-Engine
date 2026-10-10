@@ -9,6 +9,7 @@ import { GuardianFileAckStore, type GuardianConsumerAckStore } from "../apps/eng
 import { GuardianReadonlySession, hashGuardianRecoverableState, type GuardianG2HJournal } from "../apps/engine/src/guardian-readonly-session.js";
 import { bootstrapGuardianOfflineSource } from "../apps/engine/src/guardian-offline-durable-source.js";
 import { guardianWriterManifestBytes, type GuardianWriterManifest, type GuardianWriterTrust } from "../apps/engine/src/guardian-signed-writer-manifest.js";
+import { signGuardianDurablePage } from "../apps/engine/src/guardian-signed-durable-page.js";
 import { plannedDurableTransition } from "../apps/engine/src/recovery.js";
 import { accountResultFill, emptyResultAccounting } from "../apps/engine/src/trading-results.js";
 import { paperFill } from "./paper-engine-testkit.js";
@@ -70,7 +71,14 @@ const signed=(highWater:number,manifestSequence=1,writerEpoch=7,expiresAtMs=NOW+
 const source=(highWater=22,events=rows):GuardianG2HJournal=>({
   listVerifiedCheckpoints:async()=>[checkpoint],
   latestDurableSequence:async()=>highWater,
-  readDurableTransitionsAfter:async(cursor,limit)=>events.filter(x=>x.sequence>cursor).slice(0,limit),
+  readSignedDurablePageAfter:async(cursor,limit,manifest)=>{
+    const page=events.filter(x=>x.sequence>cursor).slice(0,limit);
+    const certificate=page.length?signGuardianDurablePage({
+      rows:page,fromCursor:cursor,manifest,
+      privateKeyPem:privateKey.export({type:"pkcs8",format:"pem"}).toString(),nowMs:NOW,
+    }):null;
+    return {rows:page,certificate};
+  },
 });
 const setup=async()=>{
   const dir=await mkdtemp(join(tmpdir(),"pm-g2h-session-"));dirs.push(dir);
@@ -145,14 +153,14 @@ describe("G2H read-only authenticated journal session, no shadow or orders",()=>
   it("G2H-SESSION-06 missing/compacted row, reader failure and signed highwater ahead halt",async()=>{
     const ack=await setup();
     const bad=await start(ack,signed(20),source(22,[rows[1]!]));
-    await rejected(bad.poll(signed(22,2),NOW),"DURABLE_SOURCE_GAP");
+    await rejected(bad.poll(signed(22,2),NOW),"SOURCE_UNAVAILABLE");
     expect(bad.status).toBe("HALTED");
     const ack2=await setup();
     const delayed=await start(ack2,signed(20),source(21,[rows[0]!]));
     await rejected(delayed.poll(signed(22,2),NOW),"SIGNED_HIGHWATER_NOT_VISIBLE");
     const ack3=await setup();
     const unavailable=await start(ack3,signed(20),{
-      ...source(),readDurableTransitionsAfter:async()=>{throw Error("DB_TIMEOUT");},
+      ...source(),readSignedDurablePageAfter:async()=>{throw Error("DB_TIMEOUT");},
     });
     await rejected(unavailable.poll(signed(22,2),NOW),"SOURCE_UNAVAILABLE");
     expect(unavailable.status).toBe("HALTED");
@@ -289,5 +297,40 @@ describe("G2H complete observational handoff has no execution authority",()=>{
     expect(()=>session.readVerifiedView(NOW+1001)).toThrowError(
       expect.objectContaining({reason:"SOURCE_REPLAY_FAILED"}));
     expect(()=>session.readVerifiedView(NOW+1000)).not.toThrow();
+  });
+});
+
+describe("G2H no unsigned or self-hashed durable rows reach the source supervisor",()=>{
+  it("G2H-SESSION-13 a self-hashed DB mutation after independent signing HALTS and cannot ACK",async()=>{
+    const ack=await setup();
+    const producer=source();
+    const evil:GuardianG2HJournal={
+      ...producer,
+      readSignedDurablePageAfter:async(cursor,limit,manifest)=>{
+        const authentic=await producer.readSignedDurablePageAfter(cursor,limit,manifest);
+        const mutated=structuredClone(authentic.rows);
+        mutated[0]!.payload={...mutated[0]!.payload,positionId:"ATTACKER-CONTROLLED"};
+        mutated[0]!.payloadHash=hashDurablePayload(mutated[0]!.payload);
+        return {rows:mutated,certificate:authentic.certificate};
+      },
+    };
+    const session=await start(ack,signed(20),evil);
+    await rejected(session.poll(signed(22,2),NOW),"SOURCE_UNAVAILABLE");
+    expect(session.status).toBe("HALTED");
+    expect((await ack.load())?.cursor).toBe(20);
+  });
+  it("G2H-SESSION-14 no writer page certificate HALTS; a raw journal page is insufficient",async()=>{
+    const ack=await setup();
+    const sourceOnly:GuardianG2HJournal={
+      ...source(),
+      readSignedDurablePageAfter:async(cursor,limit)=>({
+        rows:rows.filter(r=>r.sequence>cursor).slice(0,limit),
+        certificate:null,
+      }),
+    };
+    const session=await start(ack,signed(20),sourceOnly);
+    await rejected(session.poll(signed(22,2),NOW),"SOURCE_UNAVAILABLE");
+    expect(session.status).toBe("HALTED");
+    expect((await ack.load())?.cursor).toBe(20);
   });
 });

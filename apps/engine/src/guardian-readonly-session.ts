@@ -11,6 +11,9 @@ import {
 } from "./guardian-signed-writer-manifest.js";
 import type { GuardianCheckpointReadSource } from "./guardian-readonly-checkpoint.js";
 import type { GuardianOfflineState } from "./guardian-offline-durable-source.js";
+import {
+  verifyGuardianSignedPage, type GuardianSignedPageSource,
+} from "./guardian-signed-durable-page.js";
 
 export type GuardianSessionHaltReason =
   | "SOURCE_AUTHORITY_CHANGED" | "ACK_AHEAD_OF_SOURCE" | "ACK_STATE_DIVERGENCE"
@@ -23,7 +26,23 @@ export class GuardianReadonlySessionHalted extends Error {
   }
 }
 const halt=(reason:GuardianSessionHaltReason):never=>{throw new GuardianReadonlySessionHalted(reason);};
-export type GuardianG2HJournal=GuardianCheckpointReadSource & GuardianDurableReadSource;
+export type GuardianG2HJournal=GuardianCheckpointReadSource
+  & Pick<GuardianDurableReadSource,"latestDurableSequence">
+  & GuardianSignedPageSource;
+/**
+ * Authenticate each actual durable row page against the operator-trusted
+ * Ed25519 producer and the exact signed checkpoint/epoch before replay.
+ */
+const certifiedRead=async(
+  source:GuardianG2HJournal,manifest:GuardianWriterManifest,
+  trust:GuardianWriterTrust,nowMs:number,cursor:number,limit:number,
+)=>{
+  const signed=await source.readSignedDurablePageAfter(cursor,limit,manifest);
+  return verifyGuardianSignedPage({
+    rows:signed?.rows,certificate:signed?.certificate,
+    manifest,trust,nowMs,fromCursor:cursor,maximumRows:limit,
+  });
+};
 const sortedRows=(map:ReadonlyMap<string,unknown>|undefined)=>
   [...(map??new Map())].sort(([a],[b])=>a.localeCompare(b));
 /**
@@ -156,7 +175,8 @@ export class GuardianReadonlySession {
           const result=await pullGuardianDurablePage({
             source:{
               latestDurableSequence:async()=>prior.cursor,
-              readDurableTransitionsAfter:(cursor,count)=>source.readDurableTransitionsAfter(cursor,count),
+              readDurableTransitionsAfter:(cursor,count)=>certifiedRead(
+                source,manifest,input.trust,input.trust.nowMs,cursor,count),
             },
             state,pageSize,maxBacklogRows,
           });
@@ -218,7 +238,8 @@ export class GuardianReadonlySession {
       const result=await pullGuardianDurablePage({
         source:{
           latestDurableSequence:async()=>manifest.durableHighWater,
-          readDurableTransitionsAfter:(cursor,count)=>this.source.readDurableTransitionsAfter(cursor,count),
+          readDurableTransitionsAfter:(cursor,count)=>certifiedRead(
+            this.source,manifest,this.trust,nowMs,cursor,count),
         },
         state:this.current,pageSize:this.pageSize,maxBacklogRows:this.maxBacklogRows,
       });

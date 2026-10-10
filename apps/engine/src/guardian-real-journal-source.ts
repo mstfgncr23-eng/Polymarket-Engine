@@ -1,5 +1,6 @@
 import type { EventJournal, JournalAccessMode } from "@pm/db";
-import type { GuardianG2HJournal } from "./guardian-readonly-session.js";
+import type { GuardianCheckpointReadSource } from "./guardian-readonly-checkpoint.js";
+import type { GuardianDurableReadSource } from "./guardian-readonly-durable-feed.js";
 
 /**
  * G2H actual EventJournal API bridge, never a second writer.
@@ -15,7 +16,7 @@ export function guardianReadOnlyJournalSource(
   journal: Pick<EventJournal, "listVerifiedCheckpoints" | "latestDurableSequence" | "readDurableTransitionsAfter"> & {
     readonly access: JournalAccessMode;
   },
-): GuardianG2HJournal {
+): GuardianCheckpointReadSource & GuardianDurableReadSource {
   const guard=():void=>{
     if (journal.access!=="readonly") throw new Error("GUARDIAN_SOURCE_REQUIRES_READONLY_JOURNAL");
   };

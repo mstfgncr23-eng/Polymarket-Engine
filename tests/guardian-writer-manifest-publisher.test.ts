@@ -10,6 +10,7 @@ import { guardianReadOnlyJournalSource } from "../apps/engine/src/guardian-real-
 import { GuardianReadonlySession } from "../apps/engine/src/guardian-readonly-session.js";
 import { GuardianFileAckStore } from "../apps/engine/src/guardian-consumer-ack-store.js";
 import { verifyGuardianWriterManifest } from "../apps/engine/src/guardian-signed-writer-manifest.js";
+import { signGuardianDurablePage } from "../apps/engine/src/guardian-signed-durable-page.js";
 import { emptyResultAccounting } from "../apps/engine/src/trading-results.js";
 
 const NOW=Date.parse("2026-10-10T10:00:00Z");
@@ -69,7 +70,17 @@ describe("G2H producer signer -> canonical real Journal -> read-only consumer",(
     });
     expect(manifest.durableHighWater).toBe(1);
     await journal.connectWithoutMigrate("readonly");
-    const source=guardianReadOnlyJournalSource(journal);
+    const canonical=guardianReadOnlyJournalSource(journal);
+    // Closed fixture: a canonical fenced producer would issue signed pages
+    // over a distinct authenticated channel, not from this read-only role.
+    const source={...canonical,readSignedDurablePageAfter:async(
+      cursor:number,limit:number,proof:typeof manifest,
+    )=>{
+      const rows=await canonical.readDurableTransitionsAfter(cursor,limit);
+      return {rows,certificate:signGuardianDurablePage({
+        rows,fromCursor:cursor,manifest:proof,privateKeyPem:key,nowMs:NOW,
+      })};
+    }};
     const dir=await mkdtemp(join(tmpdir(),"guardian-issuer-e2e-"));dirs.push(dir);
     const ack=new GuardianFileAckStore(join(dir,"cursor.guardian-ack.json"));
     const session=await GuardianReadonlySession.open({
