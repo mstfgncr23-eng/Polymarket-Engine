@@ -5,6 +5,10 @@ G2H atom notes remain historical evidence, not product requirements.
 Change discipline: amend this freeze only for an independently reproducible
 business-correctness fault or explicitly approved threat-model change.
 Never add a new requirement because its implementation would be interesting.
+**Permanent discovery rule:** while implementing H1-H4, append any optional
+improvement to `G2H_DEFERRED_IMPROVEMENTS_BACKLOG.md` and commit it in the
+same scoped task; do not implement it or move the G2H finish line. Actual
+violations of H-01..H-05 stay in the active gap audit and block acceptance.
 
 ## 1. Product outcome and hard scope
 

@@ -3,6 +3,10 @@ Date: 2026-10-11 | repo baseline `refactor/guardian-isolation-atomic@aab85cb`
 Authority: `G2H_REQUIREMENTS_FROZEN_20261011.md`.
 Status: **Requirements frozen; code still NOT accepted.**
 This is a code-level audit, NOT new user-requested features.
+**Deferred improvements:** all useful nonblocking observations discovered
+while performing H1-H4 must be recorded and committed in
+`G2H_DEFERRED_IMPROVEMENTS_BACKLOG.md` in the same task. That separate file
+is NEVER permission to expand H1-H4 or implement a deferred change.
 
 ## 1. Fact/assumption register
 
