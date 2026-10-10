@@ -7,6 +7,7 @@ import {CHECKPOINT_SCHEMA_VERSION,hashCheckpointPayload,hashDurablePayload,
   type DurableTransition,type GuardianConsistentPgPage} from "@pm/db";
 import {emptyResultAccounting} from "../apps/engine/src/trading-results.js";
 import {plannedDurableTransition} from "../apps/engine/src/recovery.js";
+import {bootstrapGuardianOfflineSource,advanceGuardianOfflineSource} from "../apps/engine/src/guardian-offline-durable-source.js";
 import {GuardianPgFileAckStore,parseGuardianPgReceipt,
   type GuardianPgAckStore,type GuardianPgReceipt} from "../apps/engine/src/guardian-pg-ack-store.js";
 import {GuardianTrustedPgSession,type GuardianPgPageSource} from "../apps/engine/src/guardian-trusted-pg-session.js";
@@ -56,6 +57,30 @@ class FakePg implements GuardianPgPageSource {
       checkpoints:structuredClone(this.checkpoints),rows};
   }
 }
+const checkpointAt=(seq:number,overrideAccrual?:number)=>{
+  let state=bootstrapGuardianOfflineSource({
+    payload:cp.payload,externallyVerifiedContentHash:cp.contentHash,
+    authorityId:"paper-reader-1",
+  });
+  for(let i=1;i<=seq;i++)state=advanceGuardianOfflineSource(state,row(i));
+  const r=state.recovery;
+  const nextBody={...body,durableCursor:seq,experiment:r.experiment,
+    ledger:r.ledger.snapshot(),positions:[...r.ledger.positions.values()],
+    resultAccounting:r.resultAccounting,restingOrders:[...r.restingOrders.values()],
+    makerReservations:Object.fromEntries(r.makerReservations),
+    riskReductionOwners:[...(r.riskReductionOwners??new Map()).values()],
+    riskReductionFailures:[...(r.riskReductionFailures??new Map()).values()],
+    reversalProtectionStates:[...(r.reversalProtectionStates??new Map()).values()],
+    profitTrailingPairStates:[...(r.profitTrailingPairStates??new Map()).values()],
+    settlementLookups:[...(r.settlementLookups??new Map()).values()],
+    settledMarkets:[...r.settledMarkets],
+    nakedDirectionalDiagnostics:[...(r.nakedDirectionalDiagnostics??new Map()).values()],
+    lastInfrastructureAccrualAt:overrideAccrual??r.lastInfrastructureAccrualAt,
+  };
+  const h=hashCheckpointPayload(nextBody);
+  return {...cp,id:"cp-"+seq,sequence:seq+1,contentHash:h,
+    payload:{...nextBody,checkpointContentHash:h}};
+};
 const dirs:string[]=[];
 afterEach(async()=>{for(const dir of dirs.splice(0))await rm(dir,{recursive:true,force:true});});
 async function setup(){
@@ -219,6 +244,78 @@ describe("H2 non-signing PostgreSQL ACK/restart, NO executable authority",()=>{
     i.source.checkpoints=[];
     await expect(open(i)).rejects.toThrow("CHECKPOINT_NOT_RECOVERABLE");
     expect((await i.ack.load())?.cursor).toBe(2);
+  });
+
+
+  it("H2-25 safely continues past 8192 rows by parity-rebasing at a real checkpoint",{
+    timeout:60000,
+  },async()=>{
+    const i=await setup();
+    i.source.highWater=8200;
+    i.source.rows=Array.from({length:8200},(_,index)=>row(index+1));
+    const s=await open(i,9000,512);
+    i.source.checkpoints.unshift(checkpointAt(4000));
+    for(let count=0;count<25&&!s.caughtUp;count++)
+      await s.poll(1000+count);
+    expect(s.cursor).toBe(8200);
+    expect(s.caughtUp).toBe(true);
+    expect((await i.ack.load())?.checkpointId).toBe("cp-4000");
+    const resumed=await open(i,9000,512);
+    expect(resumed.cursor).toBe(8200);
+    expect(resumed.caughtUp).toBe(true);
+  });
+  it("H2-26 without a parity-proven new checkpoint refuses silent key eviction",{
+    timeout:60000,
+  },async()=>{
+    const i=await setup();
+    i.source.highWater=8193;
+    i.source.rows=Array.from({length:8193},(_,index)=>row(index+1));
+    const s=await open(i,9000,512);
+    for(let count=0;count<16;count++)await s.poll(1000+count);
+    expect(s.cursor).toBe(8192);
+    await expect(s.poll(1020)).rejects.toThrow("REPLAY_OPERATION_KEY_BUDGET_EXCEEDED");
+    expect(s.status).toBe("HALTED");
+    expect((await i.ack.load())?.cursor).toBe(8192);
+  });
+  it("H2-22 rebases exact economic state at new checkpoint, then restart no longer needs old CP",async()=>{
+    const i=await setup();
+    const s=await open(i);
+    expect(s.cursor).toBe(0);
+    i.source.checkpoints.unshift(checkpointAt(4));
+    expect(await s.poll(1000)).toEqual({cursor:2,highWater:5,caughtUp:false});
+    const p=await s.poll(1010);
+    expect(p).toEqual({cursor:4,highWater:5,caughtUp:false});
+    expect((await i.ack.load())?.checkpointId).toBe("cp-4");
+    expect((await i.ack.load())?.cursor).toBe(4);
+    await s.poll(1020);
+    expect((await i.ack.load())?.cursor).toBe(5);
+    i.source.checkpoints=[i.source.checkpoints[0]!];
+    const restarted=await open(i);
+    expect(restarted.cursor).toBe(5);
+    expect(restarted.readVerifiedView).toBeDefined();
+    expect((await i.ack.load())?.checkpointId).toBe("cp-4");
+  });
+  it("H2-23 valid-hash checkpoint with DIFFERENT economics never rebases",async()=>{
+    const i=await setup();const s=await open(i);
+    i.source.checkpoints.unshift(checkpointAt(4,9876543));
+    await s.poll(1000);
+    await expect(s.poll(1010)).rejects.toThrow("REBASE_ECONOMIC_PARITY_MISMATCH");
+    expect(s.status).toBe("HALTED");
+    expect((await i.ack.load())?.checkpointId).toBe("local-cp");
+    expect((await i.ack.load())?.cursor).toBe(4);
+  });
+  it("H2-24 a checkpoint with no old economic receipt parity proof is refused",async()=>{
+    const i=await setup();const s=await open(i);
+    i.source.checkpoints.unshift(checkpointAt(4));
+    await s.poll(1000);
+    await s.poll(1010);
+    const old=(await i.ack.load())!;
+    await expect(i.ack.commit(old,{...old,checkpointId:"forged-checkpoint",
+      checkpointHash:"f".repeat(64)},
+      {kind:"VERIFIED_CHECKPOINT_REBASE",previousEconomicHash:"e".repeat(64),
+       fromCheckpointId:old.checkpointId,
+       fromCheckpointHash:old.checkpointHash,newCheckpointCursor:4}))
+      .rejects.toThrow("REGRESSION_OR_CHECKPOINT_ROTATION_UNPROVEN");
   });
   it("H2-21 concurrency during ACK fsync preserves old volatile cursor and reconciles",async()=>{
     const i=await setup();await open(i);

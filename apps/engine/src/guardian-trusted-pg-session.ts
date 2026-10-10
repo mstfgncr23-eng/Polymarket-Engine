@@ -1,6 +1,6 @@
 import type {PostgresEventJournal, GuardianConsistentPgPage} from "@pm/db";
 import {bootstrapGuardianOfflineSource,advanceGuardianOfflineSource,
-  type GuardianOfflineState} from "./guardian-offline-durable-source.js";
+  GUARDIAN_REPLAY_KEY_BUDGET,type GuardianOfflineState} from "./guardian-offline-durable-source.js";
 import {hashGuardianRecoverableState} from "./guardian-readonly-session.js";
 import {type GuardianPgAckStore,type GuardianPgReceipt} from "./guardian-pg-ack-store.js";
 
@@ -28,8 +28,9 @@ const mkReceipt=(s:GuardianOfflineState,scope:Scope,cp:{
  * NO signatures and NO economic submission. Every new page is its own
  * committed snapshot; checkpoint identity and global cursor fence it.
  *
- * H2's checkpoint-rotation/rebase beyond the replay key budget still
- * needs separate proof. No automatic operator-less adoption of a new CP.
+ * Checkpoint rebase requires parity of the ENTIRE recovered economic
+ * state at the SAME committed cursor before an atomic v2 receipt transition.
+ * A missing checkpoint or unverifiable parity HALTS; never skip ACK history.
  */
 export class GuardianTrustedPgSession {
   private stopped:string|null=null;
@@ -43,7 +44,7 @@ export class GuardianTrustedPgSession {
     private readonly experimentId:string,
     private readonly pageSize:number,
     private readonly maxBacklogRows:number,
-    private readonly checkpoint:{id:string;hash:string;cursor:number},
+    private checkpoint:{id:string;hash:string;cursor:number},
     private state:GuardianOfflineState,
     private receipt:GuardianPgReceipt,
     highWater:number,
@@ -135,6 +136,68 @@ export class GuardianTrustedPgSession {
       input.experimentId,input.pageSize,input.maxBacklogRows,
       anchor,state,receipt,first.highWater);
   }
+  /**
+   * Rebase ONLY after the old pinned checkpoint has been replayed up to
+   * the same cursor. Compare every recovered economic field by normalizing
+   * the metadata (checkpoint hash + seen-since-checkpoint operation keys)
+   * that necessarily changes when the new canonical checkpoint begins.
+   */
+  private async rebaseIfProven(page:GuardianConsistentPgPage):Promise<void>{
+    const nextCp=page.checkpoints.find(cp=>{
+      const cursor=Number(cp.payload.durableCursor);
+      return cp.verified&&!!cp.contentHash&&cp.id!==this.checkpoint.id
+        &&cp.experimentId===this.experimentId
+        &&Number.isSafeInteger(cursor)&&cursor>this.checkpoint.cursor
+        &&cursor<=this.state.projection.cursor;
+    });
+    if(!nextCp?.contentHash)return;
+    const cursor=Number(nextCp.payload.durableCursor);
+    const remaining=this.state.projection.cursor-cursor;
+    if(remaining>GUARDIAN_REPLAY_KEY_BUDGET||remaining>this.maxBacklogRows)
+      return fail("REBASE_TAIL_EXCEEDS_BUDGET");
+    let fresh=bootstrapGuardianOfflineSource({
+      payload:nextCp.payload,externallyVerifiedContentHash:nextCp.contentHash,
+      authorityId:this.state.projection.authorityId,
+    });
+    const target=this.state.projection.cursor;
+    while(fresh.projection.cursor<target){
+      const next=await this.page(fresh.projection.cursor,
+        Math.min(this.pageSize,target-fresh.projection.cursor));
+      if(!equalCheckpoint(next,{
+        id:nextCp.id,contentHash:nextCp.contentHash,cursor,
+      })||next.highWater<target||next.highWater<this.readHighWater
+        ||!next.rows.length)return fail("REBASE_SOURCE_OR_CHECKPOINT_CHANGED");
+      for(const row of next.rows){
+        if(row.sequence>target)return fail("REBASE_CURSOR_OVERRUN");
+        fresh=advanceGuardianOfflineSource(fresh,row);
+      }
+    }
+    const normalized:GuardianOfflineState={
+      ...fresh,
+      projection:{...fresh.projection,
+        checkpointHash:this.state.projection.checkpointHash},
+      seenOperationKeys:this.state.seenOperationKeys,
+    };
+    if(hashGuardianRecoverableState(normalized)!==
+      hashGuardianRecoverableState(this.state))
+      return fail("REBASE_ECONOMIC_PARITY_MISMATCH");
+    const anchor={id:nextCp.id,hash:nextCp.contentHash,cursor};
+    const receipt=mkReceipt(fresh,this.scope,anchor,
+      Math.max(this.readHighWater,page.highWater));
+    if(this.stopped!==null)return fail("HALTED_BEFORE_REBASE");
+    await this.ack.commit(this.receipt,receipt,{
+      kind:"VERIFIED_CHECKPOINT_REBASE",
+      previousEconomicHash:this.receipt.economicHash,
+      fromCheckpointId:this.checkpoint.id,
+      fromCheckpointHash:this.checkpoint.hash,
+      newCheckpointCursor:cursor,
+    });
+    if(this.stopped!==null)return fail("HALTED_AFTER_REBASE_ACK");
+    this.checkpoint=anchor;
+    this.receipt=receipt;
+    this.state=fresh;
+  }
+
   /** One bounded page per call; committed observation ACK after full replay. */
   async poll(nowMs:number):Promise<{cursor:number;highWater:number;caughtUp:boolean}> {
     if(this.stopped!==null)return fail("HALTED");
@@ -147,8 +210,19 @@ export class GuardianTrustedPgSession {
       if(this.stopped!==null)return fail("HALTED_AFTER_CONCURRENT_POLL");
       if(page.highWater-this.state.projection.cursor>this.maxBacklogRows)
         return fail("BACKLOG_EXCEEDED");
+      // When a proven newer checkpoint lies INSIDE this page, stop at
+      // its cursor, commit that exact prefix, then attempt an economic-parity
+      // rebase. Later rows remain for the next poll, never silently skipped.
+      const forward=page.checkpoints
+        .map(cp=>({cp,cursor:Number(cp.payload.durableCursor)}))
+        .filter(({cp,cursor})=>cp.verified&&cp.contentHash
+          &&cp.id!==this.checkpoint.id
+          &&cursor>this.state.projection.cursor
+          &&cursor<=Number(page.rows[page.rows.length-1]?.sequence??0))
+        .sort((a,b)=>a.cursor-b.cursor)[0];
+      const rows=forward?page.rows.filter(row=>row.sequence<=forward.cursor):page.rows;
       let next=this.state;
-      for(const row of page.rows)next=advanceGuardianOfflineSource(next,row);
+      for(const row of rows)next=advanceGuardianOfflineSource(next,row);
       // If the ACK is lost/unknown, we do NOT advance volatile state.
       if(this.stopped!==null)return fail("HALTED_AFTER_CONCURRENT_POLL");
       if(next.projection.cursor!==this.state.projection.cursor){
@@ -162,6 +236,8 @@ export class GuardianTrustedPgSession {
         this.state=next;
       }
       this.readHighWater=page.highWater;
+      await this.rebaseIfProven(page);
+      if(this.stopped!==null)return fail("HALTED_AFTER_REBASE");
       this.verifiedAtMs=nowMs;
       return {cursor:this.cursor,highWater:page.highWater,caughtUp:this.caughtUp};
     }catch(e){

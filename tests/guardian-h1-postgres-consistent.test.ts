@@ -7,11 +7,12 @@ import { createRequire } from "node:module";
 const postgres=createRequire(new URL("../packages/db/package.json",import.meta.url))("postgres");
 import { beforeAll, afterAll, describe, expect, it } from "vitest";
 import { createIdleExperiment, PaperLedger } from "@pm/core";
-import { CHECKPOINT_SCHEMA_VERSION, PostgresEventJournal } from "@pm/db";
+import { CHECKPOINT_SCHEMA_VERSION,hashCheckpointPayload, PostgresEventJournal } from "@pm/db";
 import { emptyResultAccounting } from "../apps/engine/src/trading-results.js";
 import { bootstrapGuardianTrustedPg } from "../apps/engine/src/guardian-trusted-pg-bootstrap.js";
 import { GuardianTrustedPgSession } from "../apps/engine/src/guardian-trusted-pg-session.js";
 import { GuardianPgFileAckStore } from "../apps/engine/src/guardian-pg-ack-store.js";
+import {bootstrapGuardianOfflineSource,advanceGuardianOfflineSource} from "../apps/engine/src/guardian-offline-durable-source.js";
 
 /**
  * Only a disposable, loopback PostgreSQL container is allowed.
@@ -243,6 +244,59 @@ noDb("G2H-H1 real isolated PostgreSQL: repeatable read + actual SELECT-only role
       expect(await resumed.poll(1010)).toEqual({cursor:3,highWater:3,caughtUp:true});
       expect((await ack.load())?.cursor).toBe(3);
       expect(resumed.readVerifiedView(1011).open).toEqual([]);
+    }finally{await rm(dir,{recursive:true,force:true});}
+  });
+  it("H2-REAL-PG-02 replays, rebases through a new actual SQL checkpoint and restarts",async()=>{
+    const dir=await mkdtemp(join(tmpdir(),"g2h-h2-rebase-"));
+    try{
+      const ack=new GuardianPgFileAckStore(join(dir,"rebase.guardian-pg-ack.json"));
+      const input={
+        source:reader,ack,scope:{database:EXPECT.database,schema:EXPECT.schema,role:EXPECT.role},
+        experimentId:EXPECT.experimentId,authorityId:"canonical-paper-db-reader",
+        pageSize:1,maxBacklogRows:100,
+      };
+      const session=await GuardianTrustedPgSession.open(input);
+      const oldCpId=(await ack.load())!.checkpointId;
+      await session.poll(2000);
+      await session.poll(2010);
+      expect(session.cursor).toBe(3);
+      const current=await reader.readGuardianConsistentPage(EXPECT);
+      const oldCp=current.checkpoints.find(item=>item.id===oldCpId)!;
+      let economic=bootstrapGuardianOfflineSource({
+        payload:oldCp.payload,externallyVerifiedContentHash:oldCp.contentHash!,
+        authorityId:input.authorityId,
+      });
+      for(const item of current.rows)economic=advanceGuardianOfflineSource(economic,item);
+      expect(economic.projection.cursor).toBe(3);
+      const r=economic.recovery;
+      const body={...oldCp.payload,durableCursor:3,
+        ledger:r.ledger.snapshot(),positions:[...r.ledger.positions.values()],
+        experiment:r.experiment,resultAccounting:r.resultAccounting,
+        restingOrders:[...r.restingOrders.values()],
+        makerReservations:Object.fromEntries(r.makerReservations),
+        riskReductionOwners:[...(r.riskReductionOwners??new Map()).values()],
+        riskReductionFailures:[...(r.riskReductionFailures??new Map()).values()],
+        reversalProtectionStates:[...(r.reversalProtectionStates??new Map()).values()],
+        profitTrailingPairStates:[...(r.profitTrailingPairStates??new Map()).values()],
+        settlementLookups:[...(r.settlementLookups??new Map()).values()],
+        settledMarkets:[...r.settledMarkets],
+        nakedDirectionalDiagnostics:[...(r.nakedDirectionalDiagnostics??new Map()).values()],
+        lastInfrastructureAccrualAt:r.lastInfrastructureAccrualAt,
+      };
+      delete (body as Record<string,unknown>).checkpointContentHash;
+      const expectedHash=hashCheckpointPayload(body);
+      const created=await admin.saveCheckpoint({
+        experimentId:EXPECT.experimentId,sequence:2,payload:body,
+      });
+      expect(created.contentHash).toBe(expectedHash);
+      await session.poll(2020);
+      const adopted=(await ack.load())!;
+      expect(adopted.checkpointId).not.toBe(oldCpId);
+      expect(adopted.checkpointHash).toBe(expectedHash);
+      expect(adopted.cursor).toBe(3);
+      const restarted=await GuardianTrustedPgSession.open(input);
+      expect(restarted.cursor).toBe(3);
+      expect((await ack.load())?.economicHash).toBe(adopted.economicHash);
     }finally{await rm(dir,{recursive:true,force:true});}
   });
   it("H1-10 catches a physically missing global durable transition",async()=>{

@@ -28,7 +28,7 @@ is NEVER permission to expand H1-H4 or implement a deferred change.
 |---|---|---|---|
 | H-01 trusted DB/role | `PostgresEventJournal.readGuardianConsistentPage`, isolated PostgreSQL 17 tests | Real isolated SELECT-only role + RLS proof PASS; production DB identity/credential/TLS and provisioning unverified | PARTIAL |
 | H-02 consistent checkpoint/replay | Non-signed `guardian-trusted-pg-bootstrap.ts`; one-snapshot `readGuardianConsistentPage`, canonical reducer | First-page checkpoint+tail + real gap/tamper/concurrent-commit tested; repeated pages, checkpoint rotation and ACK resume not yet integrated | PARTIAL |
-| H-03 restart/ACK | New `guardian-pg-ack-store.ts`, `guardian-trusted-pg-session.ts`; v2 no-sign receipt; 21 offline + 1 real PostgreSQL restart tests PASS | Old signer ACK is explicitly rejected; **safe checkpoint rotation past 8,192 rows, compaction/failover and target FS power-loss proof remain blockers** | PARTIAL |
+| H-03 restart/ACK | New `guardian-pg-ack-store.ts`, `guardian-trusted-pg-session.ts`; v2 no-sign receipt; 26 offline + 2 real PostgreSQL restart/rebase tests PASS | Old signer ACK is explicitly rejected; checkpoint rebase and 8,200-row continuation PASS; **actual producer checkpoint cadence/retention, compaction/failover and target FS power-loss proof remain blockers** | PARTIAL |
 | H-04 independent paired books | `guardian-paired-book-channel.ts`, `guardian-normalized-book-bridge.ts`; normalized `PolymarketMarketDataAdapter` supports tokenEpoch and isTokenSynchronized | No independent ingress contract/runnable fixture with Engine stopped, backlog/both-side reconnect source pipeline and 8/8 parity unproved | PARTIAL |
 | H-05 bounded health/capacity | 100/1000/8192 synthetic row tests; 313/313 regression at baseline | Synthetic event timestamps are NOT paced; no local Postgres CPU/lag/heap envelope, no full paired-book replay workload, operation-key retention hard halts | PARTIAL |
 
@@ -37,7 +37,7 @@ is NEVER permission to expand H1-H4 or implement a deferred change.
 - `G2H_H2_ACK_RESTART_PARTIAL_20261011.md` documents the v2
   signer-independent ACK, bounded multi-page poll, replay-before-ACK
   crash/restart recovery and named unresolved acceptance blockers.
-- 21/21 closed fault tests plus one disposable PostgreSQL 17 end-to-end
+- 26/26 closed fault tests plus two disposable PostgreSQL 17 end-to-end
   multi-page/restart test PASS. **H2 is still NOT ACCEPTED**, especially
   rotation/compaction and operation-key lifetime requirements.
 

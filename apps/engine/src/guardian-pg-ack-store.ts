@@ -15,9 +15,18 @@ export interface GuardianPgReceipt {
   readonly observedHighWater:number;
   readonly economicHash:string;
 }
+/** Only the trusted consumer may supply a parity-proven rebase transition. */
+export interface GuardianPgVerifiedRebase {
+  kind:"VERIFIED_CHECKPOINT_REBASE";
+  previousEconomicHash:string;
+  fromCheckpointId:string;
+  fromCheckpointHash:string;
+  newCheckpointCursor:number;
+}
 export interface GuardianPgAckStore {
   load():Promise<GuardianPgReceipt|null>;
-  commit(expected:GuardianPgReceipt|null,next:GuardianPgReceipt):Promise<void>;
+  commit(expected:GuardianPgReceipt|null,next:GuardianPgReceipt,
+    rebase?:GuardianPgVerifiedRebase):Promise<void>;
 }
 const error=(reason:string):never=>{throw Error("G2H_PG_ACK_"+reason);};
 const ident=(s:unknown):s is string=>typeof s==="string"&&s.length>0&&s.length<=256;
@@ -41,17 +50,30 @@ export function parseGuardianPgReceipt(x:unknown):GuardianPgReceipt {
 }
 const same=(a:GuardianPgReceipt|null,b:GuardianPgReceipt|null)=>
   JSON.stringify(a)===JSON.stringify(b);
-function checkAdvance(previous:GuardianPgReceipt|null,next:GuardianPgReceipt):void {
+function checkAdvance(previous:GuardianPgReceipt|null,next:GuardianPgReceipt,
+  rebase?:GuardianPgVerifiedRebase):void {
   if(!previous)return;
   if(previous.authorityId!==next.authorityId
     ||previous.experimentId!==next.experimentId
     ||JSON.stringify(previous.source)!==JSON.stringify(next.source)
-    ||previous.checkpointId!==next.checkpointId
-    ||previous.checkpointHash!==next.checkpointHash
     ||next.cursor<previous.cursor
-    ||next.observedHighWater<previous.observedHighWater
-    ||(next.cursor===previous.cursor&&!same(previous,next)))
+    ||next.observedHighWater<previous.observedHighWater)
     error("REGRESSION_OR_CHECKPOINT_ROTATION_UNPROVEN");
+  const changed=previous.checkpointId!==next.checkpointId
+    ||previous.checkpointHash!==next.checkpointHash;
+  if(changed){
+    if(!rebase||rebase.kind!=="VERIFIED_CHECKPOINT_REBASE"
+      ||rebase.fromCheckpointId!==previous.checkpointId
+      ||rebase.fromCheckpointHash!==previous.checkpointHash
+      ||rebase.previousEconomicHash!==previous.economicHash
+      ||!Number.isSafeInteger(rebase.newCheckpointCursor)
+      ||rebase.newCheckpointCursor<0
+      ||rebase.newCheckpointCursor>previous.cursor
+      ||next.cursor!==previous.cursor)
+      error("REGRESSION_OR_CHECKPOINT_ROTATION_UNPROVEN");
+  }else if(rebase||(next.cursor===previous.cursor&&!same(previous,next))){
+    error("REGRESSION_OR_CHECKPOINT_ROTATION_UNPROVEN");
+  }
 }
 /** Single-reader local CAS; stale lock and uncertain fsync need operator reconcile. */
 export class GuardianPgFileAckStore implements GuardianPgAckStore {
@@ -69,7 +91,8 @@ export class GuardianPgFileAckStore implements GuardianPgAckStore {
       return error("UNAVAILABLE_OR_CORRUPT");
     }
   }
-  async commit(expected:GuardianPgReceipt|null,next:GuardianPgReceipt):Promise<void>{
+  async commit(expected:GuardianPgReceipt|null,next:GuardianPgReceipt,
+    rebase?:GuardianPgVerifiedRebase):Promise<void>{
     parseGuardianPgReceipt(next);
     const dir=dirname(this.path);
     try{await mkdir(dir,{recursive:true});}
@@ -85,7 +108,7 @@ export class GuardianPgFileAckStore implements GuardianPgAckStore {
     try{
       const current=await this.load();
       if(!same(current,expected))return error("CAS_MISMATCH");
-      checkAdvance(current,next);
+      checkAdvance(current,next,rebase);
       const handle=await open(temp,"wx",0o600);
       try{await handle.writeFile(JSON.stringify(next)+"\n","utf8");await handle.sync();}
       finally{await handle.close();}

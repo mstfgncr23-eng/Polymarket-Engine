@@ -209,6 +209,23 @@ extending the gate with optional features.
   RLS changes or altered session identity.
 - Boundary: Current fail-closed least privilege is H-01 mandatory.
 
+### GI-015 | Profile verified checkpoint-rebase replay amplification
+- Stage: H4 workload measurements, post-H2 optional tuning.
+- Status: **OPEN / KNOWN extra replay, UNKNOWN deployment impact**.
+- Found during: H2 parity-proven CP rotation (2026-10-11).
+- Evidence: `GuardianTrustedPgSession.rebaseIfProven` verifies a newer
+  checkpoint by reconstructing its economic state and replaying every
+  post-checkpoint durable row through the already ACKed cursor, then
+  compares the full recoverable economic digest. A one-run 8,200-row
+  closed fixture with checkpoint at 4,000 completed and passed exact
+  restart parity. These tests do NOT establish production CPU/heap p99.
+- Opportunity: profile checkpoint frequency and rebase CPU/GC vs
+  canonical journal throughput before considering a streaming parity
+  digest or adjusting checkpoint cadence. Do not cache away economic
+  state without proving every ledger/owner/reversal/trailing mutation.
+- Boundary: A provably safe checkpoint rebase and continuous progress
+  are H-03/H-05 REQUIRED. Only optional CPU improvements go here.
+
 ## NOT optional backlog items: current required work (cross-reference only)
 
 Do **not** defer the following because they determine whether the planned
