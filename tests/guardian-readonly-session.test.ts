@@ -211,3 +211,25 @@ describe("G2H closed concurrency and bounded page stress",()=>{
     expect(Date.now()-begin).toBeGreaterThanOrEqual(0);
   });
 });
+
+describe("G2H strict receipt-to-checkpoint cursor proof",()=>{
+  it("G2H-SESSION-10 rejects replacing an ACKed projection at same cursor even with newer signer sequence",async()=>{
+    const ack=await setup();
+    await start(ack);
+    const current=(await ack.load())!;
+    await ack.commit(current,{...current,manifestSequence:2,projectionHash:"e".repeat(64)});
+    await rejected(start(ack,signed(22,3)),"ACK_STATE_DIVERGENCE");
+  });
+  it("G2H-SESSION-11 refuses to jump past a receipt when a checkpoint begins ahead",async()=>{
+    const original=await setup();
+    await start(original);
+    const current=(await original.load())!;
+    let writes=0;
+    const old:GuardianConsumerAckStore={
+      load:async()=>({...current,cursor:19,projectionHash:"d".repeat(64)}),
+      commit:async()=>{writes++;},
+    };
+    await rejected(start(old,signed(22,3)),"STALE_CHECKPOINT_REPLAY");
+    expect(writes).toBe(0);
+  });
+});

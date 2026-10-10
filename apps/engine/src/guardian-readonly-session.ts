@@ -110,18 +110,16 @@ export class GuardianReadonlySession {
       }
       if (projectionHash(state)!==prior.projectionHash) return halt("ACK_STATE_DIVERGENCE");
     }
-    if (prior && state.projection.cursor===prior.cursor) {
-      if (projectionHash(state)!==prior.projectionHash) {
-        // A different checkpoint identity/epoch can yield the same economic
-        // view, but only a newer operator-attested manifest may replace it.
-        if (manifest.writerEpoch===prior.writerEpoch
-          && manifest.manifestSequence<=prior.manifestSequence)
-          return halt("ACK_STATE_DIVERGENCE");
-      }
-    } else if (prior && state.projection.cursor>prior.cursor) {
-      if (manifest.writerEpoch===prior.writerEpoch
-        && manifest.manifestSequence<=prior.manifestSequence)
-        return halt("STALE_CHECKPOINT_REPLAY");
+    if (prior && state.projection.cursor===prior.cursor
+      && projectionHash(state)!==prior.projectionHash) {
+      // A newer manifest sequence is not permission to rewrite history
+      // already ACKed by an independently stored consumer receipt.
+      return halt("ACK_STATE_DIVERGENCE");
+    }
+    if (prior && state.projection.cursor>prior.cursor) {
+      // Never skip the previously ACKed cursor via a newer checkpoint.
+      // Reconcile against an earlier independently pinned checkpoint first.
+      return halt("STALE_CHECKPOINT_REPLAY");
     }
     const next=receiptFor(state,manifest);
     try {
