@@ -1,6 +1,6 @@
 import {
   bootstrapGuardianPositionProjection, applyGuardianPositionFrame,
-  d, ledgerStateSchema, positionSchema, experimentManifestSchema, PaperLedger,
+  d, ledgerStateSchema, positionSchema, experimentManifestSchema, restingPaperOrderSchema, PaperLedger,
   type GuardianOpenResidual, type GuardianPositionProjection, type Position,
 } from "@pm/core";
 import {
@@ -9,6 +9,7 @@ import {
 } from "@pm/db";
 import {
   applyDurableTransition, cloneRecoverableState, parseCheckpointDurableCursor,
+  riskReductionOwnershipSchema, riskReductionExecutionFailureSchema, validatePostReplayInvariants,
   type RecoverableEngineState,
 } from "./recovery.js";
 import { resultAccountingSchema } from "./trading-results.js";
@@ -47,12 +48,45 @@ function sourceShape(payload: Record<string, unknown>): RecoverableEngineState {
   const positions = (payload.positions as unknown[]).map(item => positionSchema.parse(item));
   const stateLedger = new PaperLedger(ledger.startingBalance, new Date(ledger.updatedAt));
   stateLedger.restore(ledger,positions);
+  const resting = (payload.restingOrders as unknown[]).map(row=>restingPaperOrderSchema.parse(row));
+  const makerReservations = payload.makerReservations as Record<string,string>;
+  const owners = (payload.riskReductionOwners as unknown[]).map(row=>riskReductionOwnershipSchema.parse(row));
+  const failures = (payload.riskReductionFailures as unknown[]).map(row=>riskReductionExecutionFailureSchema.parse(row));
+  const keyed = <T>(rows:T[], getKey:(value:T)=>string):Map<string,T> => {
+    const map = new Map<string,T>();
+    for(const row of rows) {
+      const key=getKey(row);
+      if(map.has(key)) fail("DUPLICATE_ECONOMIC_OWNER");
+      map.set(key,row);
+    }
+    return map;
+  };
+  const restingOrders=keyed(resting,row=>row.order.id);
+  const ownerMap=keyed(owners,row=>row.marketId);
+  const failureMap=keyed(failures,row=>row.ownership.marketId);
+  for(const owner of owners) {
+    const position=stateLedger.positions.get(owner.marketId);
+    if(!position?.unpairedOutcome || (position.unhedgedStartedAt??position.openedAt)!==owner.unhedgedStartedAt
+      || !d(position.unpairedQuantity).eq(owner.admittedResidualQuantity)
+      || (payload.settledMarkets as string[]).includes(owner.marketId)) fail("OWNER_EPISODE_MISMATCH");
+  }
+  for(const failure of failures) {
+    const owner=failure.ownership;
+    const position=stateLedger.positions.get(owner.marketId);
+    if(!position?.unpairedOutcome || (position.unhedgedStartedAt??position.openedAt)!==owner.unhedgedStartedAt
+      || !d(position.unpairedQuantity).eq(owner.admittedResidualQuantity)
+      || ownerMap.has(owner.marketId) || (payload.settledMarkets as string[]).includes(owner.marketId)) {
+      fail("FAILURE_EPISODE_MISMATCH");
+    }
+  }
   return {
     ledger:stateLedger,
     experiment:experimentManifestSchema.parse(payload.experiment),
     resultAccounting:resultAccountingSchema.parse(payload.resultAccounting),
-    restingOrders:new Map(),
-    makerReservations:new Map(),
+    restingOrders,
+    makerReservations:new Map(Object.entries(makerReservations)),
+    riskReductionOwners:ownerMap,
+    riskReductionFailures:failureMap,
     settledMarkets:new Set(payload.settledMarkets as string[]),
     lastInfrastructureAccrualAt:Number(payload.lastInfrastructureAccrualAt ?? 0),
   };
@@ -76,12 +110,13 @@ export function bootstrapGuardianOfflineSource(input: {
     || !Array.isArray(payload.positions) || !Array.isArray(payload.settledMarkets)
     || !Array.isArray(payload.restingOrders) || !Array.isArray(payload.activeTriggers)
     || !Array.isArray(payload.grokSignals) || !payload.resultAccounting) fail("CHECKPOINT_UNSUPPORTED");
-  // This first adapter intentionally has no live order/resting maker support.
-  // Never pretend a truncated ownership state is a trusted replay authority.
-  if (payload.restingOrders.length || Object.keys(payload.makerReservations ?? {}).length
-    || (Array.isArray(payload.riskReductionOwners) && payload.riskReductionOwners.length)
-    || (Array.isArray(payload.riskReductionFailures) && payload.riskReductionFailures.length)
-    || (Array.isArray(payload.reversalProtectionStates) && payload.reversalProtectionStates.length)
+  // Offline maker and taker authority can now be hydrated, but NO orders are
+  // submitted and runtime protection authority is still forbidden. Reject
+  // unresolved Guardian/trailing/integrity state until its full replay is proved.
+  if (!payload.makerReservations || typeof payload.makerReservations!=="object"
+    || Array.isArray(payload.makerReservations)
+    || !Array.isArray(payload.riskReductionOwners) || !Array.isArray(payload.riskReductionFailures)) fail("CHECKPOINT_UNSUPPORTED");
+  if ((Array.isArray(payload.reversalProtectionStates) && payload.reversalProtectionStates.length)
     || (Array.isArray(payload.profitTrailingPairStates) && payload.profitTrailingPairStates.length)
     || (Array.isArray(payload.nakedDirectionalDiagnostics) && payload.nakedDirectionalDiagnostics.length)
     || (Array.isArray(payload.settlementLookups) && payload.settlementLookups.length)
@@ -91,6 +126,8 @@ export function bootstrapGuardianOfflineSource(input: {
   try {
     const recovery=sourceShape(payload);
     if (!recovery.experiment || !recovery.experiment.startedAt) fail("EXPERIMENT_UNVERIFIED");
+    const invariants=validatePostReplayInvariants(recovery,parseCheckpointDurableCursor(payload)!,parseCheckpointDurableCursor(payload)!);
+    if(!invariants.ok) fail("CHECKPOINT_INVARIANT_VIOLATION:"+invariants.reasons.join(","));
     const result=bootstrapGuardianPositionProjection({
       version:1,mode:"PAPER",authorityId,experimentId:recovery.experiment.id,
       checkpointContentHash:externallyVerifiedContentHash,
@@ -116,6 +153,8 @@ export function advanceGuardianOfflineSource(current: GuardianOfflineState, row:
   try { applyDurableTransition(next,row); }
   catch { return fail("DURABLE_REPLAY_REJECTED"); }
   if (next.experiment?.id!==current.projection.experimentId) fail("EXPERIMENT_CHANGED");
+  const invariants=validatePostReplayInvariants(next,row.sequence,row.sequence);
+  if(!invariants.ok) fail("REPLAY_INVARIANT_VIOLATION:"+invariants.reasons.join(","));
   const base = {
     version:1 as const, mode:"PAPER" as const,
     authorityId:current.projection.authorityId,

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createIdleExperiment, PaperLedger } from "@pm/core";
+import { order } from "./fixtures.js";
 import {
   CHECKPOINT_SCHEMA_VERSION, hashCheckpointPayload,
   hashDurablePayload, type DurableTransition,
@@ -9,7 +10,7 @@ import {
   GuardianOfflineSourceRejected,
 } from "../apps/engine/src/guardian-offline-durable-source.js";
 import { plannedDurableTransition } from "../apps/engine/src/recovery.js";
-import { emptyResultAccounting } from "../apps/engine/src/trading-results.js";
+import { accountResultFill, emptyResultAccounting } from "../apps/engine/src/trading-results.js";
 import { paperFill } from "./paper-engine-testkit.js";
 
 const AT="2026-10-10T10:00:00.000Z";
@@ -33,10 +34,12 @@ const first=() => paperFill(MARKET,"UP","0.40",{id:"g2f-buy",quantity:"5",timest
 const makePayload=()=>{
   const ledger=new PaperLedger("1000",new Date(AT));
   ledger.applyFill(first(),{positionId:POS});
+  const resultAccounting=emptyResultAccounting();
+  accountResultFill(resultAccounting,first(),null,ledger.positions.get(MARKET));
   return {
     schemaVersion:CHECKPOINT_SCHEMA_VERSION,durableCursor:20,
     experiment:experiment(),ledger:ledger.snapshot(),positions:[...ledger.positions.values()],
-    resultAccounting:emptyResultAccounting(),restingOrders:[],makerReservations:{},
+    resultAccounting,restingOrders:[],makerReservations:{},
     activeTriggers:[],grokSignals:[],settledMarkets:[],riskReductionOwners:[],
     riskReductionFailures:[],reversalProtectionStates:[],profitTrailingPairStates:[],
     lastInfrastructureAccrualAt:0,
@@ -93,7 +96,7 @@ describe("G2F offline adapter: checkpoint + REAL durable replay logic, no shadow
       payload,externallyVerifiedContentHash:"0".repeat(64),authorityId:"writer",
     }),"CHECKPOINT_HASH_MISMATCH");
     fail(()=>boot({...payload,schemaVersion:1}),"CHECKPOINT_UNSUPPORTED");
-    fail(()=>boot({...payload,riskReductionOwners:[{fake:"pending"}]}),"CHECKPOINT_HAS_UNMODELED_AUTHORITY");
+    fail(()=>boot({...payload,riskReductionOwners:[{fake:"pending"}]}),"CHECKPOINT_RECOVERY_INVALID");
   });
   it("G2F-05 missing/out-of-order durable row cannot be converted to NOOP",()=>{
     fail(()=>advanceGuardianOfflineSource(boot(),fillRow(22)),"DURABLE_CURSOR_GAP");
@@ -126,7 +129,81 @@ describe("G2F offline adapter: checkpoint + REAL durable replay logic, no shadow
       ...src,type:"REPORT_SOURCE_INTEGRITY_FAULT",
       payloadHash:hashDurablePayload(src.payload),
     }),"FRAME_INVALID_FRAME");
-    const noInventory=boot({...makePayload(),positions:[]});
+    const noInventory=boot({...makePayload(),positions:[],ledger:new PaperLedger("1000",new Date(AT)).snapshot(),resultAccounting:emptyResultAccounting()});
     fail(()=>advanceGuardianOfflineSource(noInventory,settleRow(21)),"SETTLEMENT_SOURCE_MISSING");
+  });
+});
+
+describe("G2G-1 full economic owner hydration, offline only",()=>{
+  const owner=()=>{
+    const pending=order("TAKER",{id:"g2g-owner",traceId:"g2g-trace",triggerId:"g2g-trigger",marketId:MARKET,tokenId:"up",
+      outcome:"UP",side:"SELL",requestedPrice:"0.5",quantity:"5",createdAt:AT});
+    return {marketId:MARKET,unhedgedStartedAt:AT,intent:"PROTECTIVE_DE_RISK",
+      order:pending,admittedResidualQuantity:"5",decisionReceivedAt:AT,state:"ADMITTED"};
+  };
+  it("G2G-01 restores a valid pending taker and retains it through an unrelated MTM",()=>{
+    const payload={...makePayload(),riskReductionOwners:[owner()]};
+    const base=boot(payload);
+    expect(base.recovery.riskReductionOwners?.get(MARKET)).toEqual(owner());
+    const next=advanceGuardianOfflineSource(base,row("LEDGER_MARK_TO_MARKET",21,{
+      prices:{[MARKET]:{up:"0.46",down:"0.54"}},markedAt:AT2,
+    },"mtm:g2g:21"));
+    expect(next.recovery.riskReductionOwners?.get(MARKET)).toEqual(owner());
+    expect(next.projection.open.get(MARKET)?.residualQty).toBe("5");
+  });
+  it("G2G-02 committed execution failure releases pending ownership and records failure",()=>{
+    const active=boot({...makePayload(),riskReductionOwners:[owner()]});
+    const release=row("RISK_REDUCTION_FAILED",21,{
+      ownership:owner(),reason:"INSUFFICIENT_DEPTH",executionFailure:true,
+    },"risk:g2g-owner:failed");
+    const after=advanceGuardianOfflineSource(active,release);
+    expect(after.recovery.riskReductionOwners?.size).toBe(0);
+    expect(after.recovery.riskReductionFailures?.get(MARKET)?.reason).toBe("INSUFFICIENT_DEPTH");
+    expect(after.projection.open.get(MARKET)?.residualQty).toBe("5");
+  });
+  it("G2G-03 wrong episode, duplicate pending takers, and owner/failure collision fail closed",()=>{
+    const own=owner();
+    fail(()=>boot({...makePayload(),riskReductionOwners:[{...own,unhedgedStartedAt:AT2}]}),
+      "OWNER_EPISODE_MISMATCH");
+    fail(()=>boot({...makePayload(),riskReductionOwners:[own,own]}),
+      "DUPLICATE_ECONOMIC_OWNER");
+    fail(()=>boot({...makePayload(),riskReductionOwners:[own],
+      riskReductionFailures:[{ownership:own,reason:"STALE"}]}),"FAILURE_EPISODE_MISMATCH");
+  });
+  it("G2G-04 restores a real reserved maker intent without losing reserved cash",()=>{
+    const payload=makePayload();
+    const ledger=new PaperLedger("1000",new Date(AT));
+    ledger.restore(payload.ledger as ReturnType<PaperLedger["snapshot"]>,payload.positions as never);
+    ledger.reserve("0.5",new Date(AT2));
+    const maker=order("MAKER",{id:"g2g-maker",marketId:MARKET,tokenId:"down",
+      outcome:"DOWN",side:"BUY",quantity:"1",requestedPrice:"0.5",createdAt:AT});
+    const resting={order:{...maker,status:"RESTING"},queueAhead:"0",
+      remaining:"1",observedAt:AT2,intent:"HEDGE_SECOND_LEG"};
+    const hydrated=boot({...payload,ledger:ledger.snapshot(),
+      restingOrders:[resting],makerReservations:{"g2g-maker":"0.5"}});
+    expect(hydrated.recovery.restingOrders.get("g2g-maker")).toEqual(resting);
+    expect(hydrated.recovery.makerReservations.get("g2g-maker")).toBe("0.5");
+    expect(hydrated.recovery.ledger.snapshot().reservedCash).toBe("0.5");
+    const cancelled=advanceGuardianOfflineSource(hydrated,row("PAPER_ORDER_CANCELLED",21,
+      {orderId:"g2g-maker",cancel:true,reason:"TEST_CANCEL"},"maker:g2g-maker:cancel"));
+    expect(cancelled.recovery.restingOrders.size).toBe(0);
+    expect(cancelled.recovery.makerReservations.size).toBe(0);
+    expect(cancelled.recovery.ledger.snapshot().reservedCash).toBe("0");
+    expect(cancelled.projection.open.get(MARKET)?.residualQty).toBe("5");
+    fail(()=>boot({...payload,ledger:ledger.snapshot(),
+      restingOrders:[resting],makerReservations:{"g2g-maker":"0.4"}}),"CHECKPOINT_UNSUPPORTED");
+    fail(()=>boot({...payload,ledger:ledger.snapshot(),
+      restingOrders:[resting,resting],makerReservations:{"g2g-maker":"0.5"}}),"DUPLICATE_ECONOMIC_OWNER");
+  });
+  it("G2G-05 restores a prior execution failure without claiming an active owner",()=>{
+    const prior=owner();
+    const result=boot({...makePayload(),riskReductionFailures:[{
+      ownership:prior,reason:"INSUFFICIENT_DEPTH",
+    }]});
+    expect(result.recovery.riskReductionOwners?.size).toBe(0);
+    expect(result.recovery.riskReductionFailures?.get(MARKET)?.reason).toBe("INSUFFICIENT_DEPTH");
+    fail(()=>boot({...makePayload(),riskReductionFailures:[{
+      ownership:{...prior,unhedgedStartedAt:AT3},reason:"INVALID_EPISODE",
+    }]}),"FAILURE_EPISODE_MISMATCH");
   });
 });
