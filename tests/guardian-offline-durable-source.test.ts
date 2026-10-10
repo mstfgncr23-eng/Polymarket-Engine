@@ -469,3 +469,24 @@ describe("G2H bounded duplicate operation-key retention",()=>{
       fillRow(21)),"DUPLICATE_OPERATION_KEY");
   });
 });
+
+describe("G2H safe single-clone replay of prior and next economic state",()=>{
+  it("G2H-14 retains previous recovery and operation-key state exactly after MTM and PAPER_FILL",()=>{
+    const base=boot();
+    const before=structuredClone(base.recovery.ledger.snapshot());
+    const mtm=row("LEDGER_MARK_TO_MARKET",21,{
+      prices:{[MARKET]:{up:"0.45",down:"0.55"}},markedAt:AT2,
+    },"mtm:g2h:21");
+    const next=advanceGuardianOfflineSource(base,mtm);
+    expect(base.recovery.ledger.snapshot()).toEqual(before);
+    expect(base.seenOperationKeys.size).toBe(0);
+    expect(next.recovery).not.toBe(base.recovery);
+    const beforeNext=structuredClone(next.recovery.ledger.snapshot());
+    const fill=fillRow(22);
+    const after=advanceGuardianOfflineSource(next,fill);
+    expect(next.recovery.ledger.snapshot()).toEqual(beforeNext);
+    expect(after.recovery.ledger.positions.get(MARKET)?.unpairedQuantity).toBe("3");
+    expect(after.seenOperationKeys.size).toBe(2);
+    expect(next.seenOperationKeys.size).toBe(1);
+  });
+});

@@ -334,3 +334,46 @@ describe("G2H no unsigned or self-hashed durable rows reach the source superviso
     expect((await ack.load())?.cursor).toBe(20);
   });
 });
+
+describe("G2H local synthetic source consumer workload, NO VPS / NO SHADOW",()=>{
+  it("G2H-LOAD-01 1000/8192 committed synthetic 100Hz rows remain bounded",async()=>{
+    const ack=await setup();
+    const total=process.env.PM_G2H_STRESS==="1"?8192:1000;
+    const pageSize=total===8192?512:64;
+    const events:DurableTransition[]=[];
+    for(let i=21;i<21+total;i++){
+      const at=new Date(NOW+(i-20)*10).toISOString();
+      events.push(transition(i,"LEDGER_MARK_TO_MARKET",{
+        prices:{[MARKET]:{up:"0.46",down:"0.54"}},markedAt:at,
+      },`mtm:load:${i}`));
+    }
+    const journal=source(20+total,events);
+    const session=await start(ack,signed(20),journal,pageSize,total+100);
+    const beforeCpu=process.cpuUsage();
+    const beforeHeap=process.memoryUsage().heapUsed;
+    const started=performance.now();
+    const times:number[]=[];
+    for(let seq=2;seq<60;seq++){
+      const before=performance.now();
+      const outcome=await session.poll(signed(20+total,seq),NOW);
+      times.push(performance.now()-before);
+      if(outcome.caughtUp)break;
+    }
+    const ms=performance.now()-started;
+    const cpu=process.cpuUsage(beforeCpu);
+    const ranked=[...times].sort((a,b)=>a-b);
+    const p95=ranked[Math.max(0,Math.ceil(ranked.length*0.95)-1)]!;
+    const p99=ranked[Math.max(0,Math.ceil(ranked.length*0.99)-1)]!;
+    const heapDelta=process.memoryUsage().heapUsed-beforeHeap;
+    const summary={rows:total,elapsedMs:+ms.toFixed(1),
+      throughputRowsPerSec:+(total*1000/ms).toFixed(1),
+      cpuMs:+((cpu.user+cpu.system)/1000).toFixed(1),
+      pollP95Ms:+p95.toFixed(1),pollP99Ms:+p99.toFixed(1),
+      heapDeltaBytes:heapDelta,pages:times.length};
+    console.info("G2H_OFFLINE_LOCAL_LOAD",JSON.stringify(summary));
+    expect(session.cursor).toBe(20+total);
+    expect(times.length).toBe(Math.ceil(total/pageSize));
+    expect(session.readVerifiedView(NOW).open).toHaveLength(1);
+    expect((await ack.load())?.cursor).toBe(20+total);
+  },120000);
+});

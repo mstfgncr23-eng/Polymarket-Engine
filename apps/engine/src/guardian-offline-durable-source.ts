@@ -179,7 +179,9 @@ export function advanceGuardianOfflineSource(current: GuardianOfflineState, row:
   if (row.payloadHash!==hashDurablePayload(row.payload) || Object.keys(row.payload).length===0) {
     fail("DURABLE_PAYLOAD_UNVERIFIED");
   }
-  const previous=cloneRecoverableState(current.recovery);
+  // Only NEXT state can be mutated by replay; PREVIOUS is read for episode
+  // parity and settlement ownership. Avoid duplicating full economic state.
+  const previous=current.recovery;
   const next=cloneRecoverableState(current.recovery);
   try { applyDurableTransition(next,row); }
   catch { return fail("DURABLE_REPLAY_REJECTED"); }
