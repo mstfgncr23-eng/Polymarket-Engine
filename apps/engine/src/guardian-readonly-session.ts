@@ -24,21 +24,42 @@ export class GuardianReadonlySessionHalted extends Error {
 }
 const halt=(reason:GuardianSessionHaltReason):never=>{throw new GuardianReadonlySessionHalted(reason);};
 export type GuardianG2HJournal=GuardianCheckpointReadSource & GuardianDurableReadSource;
-const projectionHash=(state:GuardianOfflineState):string=>{
-  const projection=state.projection;
+const sortedRows=(map:ReadonlyMap<string,unknown>|undefined)=>
+  [...(map??new Map())].sort(([a],[b])=>a.localeCompare(b));
+/**
+ * Consumer ACK must bind ALL recovered economic decision authority, not only
+ * the open-position projection. A changed maker owner or protection phase at
+ * an unchanged cursor is a divergent recovery and MUST halt.
+ */
+export const hashGuardianRecoverableState=(state:GuardianOfflineState):string=>{
+  const projection=state.projection,recovery=state.recovery;
   const content=JSON.stringify({
     authorityId:projection.authorityId,experimentId:projection.experimentId,
     checkpointHash:projection.checkpointHash,cursor:projection.cursor,
-    open:[...projection.open.entries()].sort(([a],[b])=>a.localeCompare(b)),
+    open:sortedRows(projection.open),
     settledMarkets:[...projection.settledMarkets.values()].sort(),
+    ledger:recovery.ledger.snapshot(),
+    positions:[...recovery.ledger.positions.entries()].sort(([a],[b])=>a.localeCompare(b)),
+    experiment:recovery.experiment,resultAccounting:recovery.resultAccounting,
+    restingOrders:sortedRows(recovery.restingOrders),
+    makerReservations:sortedRows(recovery.makerReservations),
+    riskReductionOwners:sortedRows(recovery.riskReductionOwners),
+    riskReductionFailures:sortedRows(recovery.riskReductionFailures),
+    reversalProtectionStates:sortedRows(recovery.reversalProtectionStates),
+    profitTrailingPairStates:sortedRows(recovery.profitTrailingPairStates),
+    settlementLookups:sortedRows(recovery.settlementLookups),
+    nakedDirectionalDiagnostics:sortedRows(recovery.nakedDirectionalDiagnostics),
+    settledRecovery:[...recovery.settledMarkets].sort(),
+    lastInfrastructureAccrualAt:recovery.lastInfrastructureAccrualAt,
+    seenOperationKeys:[...state.seenOperationKeys].sort(),
   });
-  return createHash("sha256").update("pm-guardian-consumer-projection-v1\n"+content).digest("hex");
+  return createHash("sha256").update("pm-guardian-consumer-economics-v2\n"+content).digest("hex");
 };
 const receiptFor=(state:GuardianOfflineState,manifest:GuardianWriterManifest):GuardianConsumerReceipt=>({
   version:1,authorityId:manifest.authorityId,experimentId:manifest.experimentId,
   writerEpoch:manifest.writerEpoch,manifestSequence:manifest.manifestSequence,
   checkpointId:manifest.checkpointId,checkpointHash:manifest.checkpointHash,
-  cursor:state.projection.cursor,projectionHash:projectionHash(state),
+  cursor:state.projection.cursor,projectionHash:hashGuardianRecoverableState(state),
 });
 
 /**
@@ -108,10 +129,10 @@ export class GuardianReadonlySession {
           state=result.state;
         } catch {return halt("SOURCE_REPLAY_FAILED");}
       }
-      if (projectionHash(state)!==prior.projectionHash) return halt("ACK_STATE_DIVERGENCE");
+      if (hashGuardianRecoverableState(state)!==prior.projectionHash) return halt("ACK_STATE_DIVERGENCE");
     }
     if (prior && state.projection.cursor===prior.cursor
-      && projectionHash(state)!==prior.projectionHash) {
+      && hashGuardianRecoverableState(state)!==prior.projectionHash) {
       // A newer manifest sequence is not permission to rewrite history
       // already ACKed by an independently stored consumer receipt.
       return halt("ACK_STATE_DIVERGENCE");

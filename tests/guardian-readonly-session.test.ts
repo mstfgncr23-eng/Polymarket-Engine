@@ -6,7 +6,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createIdleExperiment, PaperLedger } from "@pm/core";
 import { CHECKPOINT_SCHEMA_VERSION, hashCheckpointPayload, hashDurablePayload, type DurableTransition } from "@pm/db";
 import { GuardianFileAckStore, type GuardianConsumerAckStore } from "../apps/engine/src/guardian-consumer-ack-store.js";
-import { GuardianReadonlySession, type GuardianG2HJournal } from "../apps/engine/src/guardian-readonly-session.js";
+import { GuardianReadonlySession, hashGuardianRecoverableState, type GuardianG2HJournal } from "../apps/engine/src/guardian-readonly-session.js";
+import { bootstrapGuardianOfflineSource } from "../apps/engine/src/guardian-offline-durable-source.js";
 import { guardianWriterManifestBytes, type GuardianWriterManifest, type GuardianWriterTrust } from "../apps/engine/src/guardian-signed-writer-manifest.js";
 import { plannedDurableTransition } from "../apps/engine/src/recovery.js";
 import { accountResultFill, emptyResultAccounting } from "../apps/engine/src/trading-results.js";
@@ -231,5 +232,25 @@ describe("G2H strict receipt-to-checkpoint cursor proof",()=>{
     };
     await rejected(start(old,signed(22,3)),"STALE_CHECKPOINT_REPLAY");
     expect(writes).toBe(0);
+  });
+});
+
+describe("G2H ACK binds all risk and maker economic state",()=>{
+  it("G2H-SESSION-12 changing maker reservations without changing open positions changes ACK digest",()=>{
+    const base=bootstrapGuardianOfflineSource({
+      payload:checkpoint.payload,
+      externallyVerifiedContentHash:checkpoint.contentHash,
+      authorityId:"canonical-epoch",
+    });
+    const baseline=hashGuardianRecoverableState(base);
+    const manipulated={...base,recovery:{...base.recovery,
+      makerReservations:new Map([["maker-order","100"]])}};
+    expect([...manipulated.projection.open]).toEqual([...base.projection.open]);
+    expect(hashGuardianRecoverableState(manipulated)).not.toBe(baseline);
+    const other={...base,recovery:{...base.recovery,
+      profitTrailingPairStates:new Map([["unexpected",{} as never]])}};
+    expect(hashGuardianRecoverableState(other)).not.toBe(baseline);
+    const existingKeys={...base,seenOperationKeys:new Set(["previous-commit-key"])};
+    expect(hashGuardianRecoverableState(existingKeys)).not.toBe(baseline);
   });
 });
