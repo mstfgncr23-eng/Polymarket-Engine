@@ -156,6 +156,28 @@ extending the gate with optional features.
   observation-to-request age before suggesting future scheduling changes.
   Do not conflate transport CPU, DB throughput and trade latency.
 
+### GI-012 | Automated, least-privilege reader provisioning and RLS audits
+- Stage: G4 operator deployment checklist / later tooling polish.
+- Status: **OPEN / KNOWN local proof, UNKNOWN production role setup**.
+- Found during: H1 isolated PostgreSQL 17 integration tests (2026-10-11).
+- Evidence: the existing migration enables RLS on
+  `durable_sequence_metadata`, `engine_checkpoints`, and
+  `durable_transitions` with no reader SELECT policy. An ordinary
+  `GRANT SELECT` alone returns zero rows. The disposable H1 test
+  demonstrated role-specific SELECT policies plus three-table grants
+  unlock legitimate data and prevent INSERT/UPDATE/DELETE/DDL.
+- Opportunity: create a separately reviewed, idempotent, operator-run
+  role/RLS provisioning audit and permission drift check so reconnects,
+  migrations and disaster recovery do not silently revoke the
+  independent Guardian's observation ability.
+- Cost/failure modes: policy drift, excessive cross-schema SELECT grants,
+  privileged role inheritance and dangerously automated production DDL.
+- Suggested validation: dedicated isolated PG role-grant/revoke matrix;
+  compare restored backup/schema role grants. No automatic prod migration.
+- Boundary: **working SELECT-only ACL and RLS visibility ARE H-01
+  mandatory**. This optional entry is only later provisioning automation
+  and runbook quality, NOT permission to defer H-01.
+
 ## NOT optional backlog items: current required work (cross-reference only)
 
 Do **not** defer the following because they determine whether the planned

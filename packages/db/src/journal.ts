@@ -1048,6 +1048,14 @@ function filterKeysetRows(
   return rows;
 }
 
+export interface GuardianConsistentPgPage {
+  readonly source: { database: string; schema: string; role: string };
+  readonly highWater: number;
+  readonly fromCursor: number;
+  readonly checkpoints: EngineCheckpoint[];
+  readonly rows: DurableTransition[];
+}
+
 export class PostgresEventJournal implements EventJournal {
   private readonly client: ReturnType<typeof postgres>;
   private readonly db: ReturnType<typeof drizzle>;
@@ -1482,6 +1490,114 @@ export class PostgresEventJournal implements EventJournal {
     return rows.filter((row) => row.verified && row.contentHash && isSemanticallyValidCheckpointPayload(row.payload)
       && (typeof row.payload.durableCursor !== "number" || row.payload.durableCursor <= highWater)).sort((a, b) => b.sequence - a.sequence);
   }
+  /** G2H one committed read snapshot, not executable order authority. */
+  async readGuardianConsistentPage(input:{
+    database:string;schema:string;role:string;experimentId:string;
+    /** null means: select most recent verified checkpoint within THIS snapshot. */
+    afterSequence:number|null;limit:number;
+  }):Promise<GuardianConsistentPgPage> {
+    if (this.access!=="readonly") throw Error("G2H_PG_REQUIRES_READONLY_JOURNAL");
+    if (!input || ![input.database,input.schema,input.role,input.experimentId].every(
+      x=>typeof x==="string"&&x.length>0&&x.length<=128,
+    ) || (input.afterSequence!==null
+        && (!Number.isSafeInteger(input.afterSequence)||input.afterSequence<0))
+      || !Number.isSafeInteger(input.limit)||input.limit<1||input.limit>512)
+      throw Error("G2H_PG_INVALID_SCOPE_OR_BOUNDS");
+    return this.client.begin("isolation level repeatable read read only",async tx=>{
+      const identity=(await tx`
+        SELECT current_database() AS database,current_schema() AS schema,
+        current_user AS role,session_user AS login_role,
+        current_setting('transaction_isolation') AS isolation,
+        current_setting('transaction_read_only') AS read_only
+      `)[0];
+      if(!identity||identity.database!==input.database||identity.schema!==input.schema
+        ||identity.role!==input.role||identity.login_role!==input.role
+        ||identity.isolation!=="repeatable read"||identity.read_only!=="on")
+        throw Error("G2H_PG_SOURCE_IDENTITY_OR_SNAPSHOT_UNTRUSTED");
+      const acl=(await tx`
+        SELECT
+          (SELECT rolsuper OR rolcreaterole OR rolcreatedb OR rolbypassrls
+           FROM pg_roles WHERE rolname=current_user) AS privileged,
+          has_schema_privilege(current_user,${input.schema},'USAGE') AS can_use_schema,
+          has_schema_privilege(current_user,${input.schema},'CREATE') AS can_create_schema,
+          has_database_privilege(current_user,current_database(),'CREATE') AS can_create_database,
+          has_table_privilege(current_user,'engine_checkpoints','SELECT')
+            AND has_table_privilege(current_user,'durable_transitions','SELECT')
+            AND has_table_privilege(current_user,'durable_sequence_metadata','SELECT') AS can_read,
+          EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+            WHERE n.nspname=${input.schema} AND c.relkind IN ('r','p')
+            AND (has_table_privilege(current_user,c.oid,'INSERT')
+              OR has_table_privilege(current_user,c.oid,'UPDATE')
+              OR has_table_privilege(current_user,c.oid,'DELETE')
+              OR has_table_privilege(current_user,c.oid,'TRUNCATE')
+              OR has_table_privilege(current_user,c.oid,'TRIGGER'))) AS table_write,
+          EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+            WHERE n.nspname=${input.schema} AND c.relkind='S'
+            AND (has_sequence_privilege(current_user,c.oid,'UPDATE')
+              OR has_sequence_privilege(current_user,c.oid,'USAGE'))) AS sequence_write
+      `)[0];
+      if(!acl||acl.privileged||!acl.can_use_schema||acl.can_create_schema
+        ||acl.can_create_database||!acl.can_read||acl.table_write||acl.sequence_write)
+        throw Error("G2H_PG_ROLE_NOT_SELECT_ONLY");
+      const metadata=await tx`SELECT high_water FROM durable_sequence_metadata WHERE id=1`;
+      if(metadata.length!==1)throw Error("G2H_PG_MISSING_SEQUENCE_METADATA");
+      const highWater=Number(metadata[0]!.high_water);
+      if(!Number.isSafeInteger(highWater)||highWater<0)
+        throw Error("G2H_PG_SOURCE_CURSOR_REGRESSION");
+      const raw=await tx`
+        SELECT id,experiment_id,sequence,payload,created_at
+        FROM engine_checkpoints WHERE experiment_id=${input.experimentId}
+        ORDER BY sequence DESC LIMIT 64
+      `;
+      const checkpoints:EngineCheckpoint[]=[];
+      for(const cp of raw){
+        const payload=cp.payload as Record<string,unknown>;
+        const contentHash=typeof payload?.checkpointContentHash==="string"
+          ? payload.checkpointContentHash:"";
+        let valid=false;
+        try{valid=!!contentHash&&hashCheckpointPayload(payload)===contentHash
+          &&isSemanticallyValidCheckpointPayload(payload)
+          &&Number(payload.durableCursor)<=highWater;}
+        catch{valid=false;}
+        if(!valid)throw Error("G2H_PG_CHECKPOINT_INTEGRITY_OR_WATERMARK");
+        checkpoints.push({id:String(cp.id),experimentId:String(cp.experiment_id),
+          sequence:Number(cp.sequence),payload,
+          createdAt:new Date(cp.created_at).toISOString(),contentHash,verified:true});
+      }
+      if(checkpoints.length===0)throw Error("G2H_PG_NO_VERIFIED_CHECKPOINT");
+      const fromCursor=input.afterSequence===null
+        ? Number(checkpoints[0]!.payload.durableCursor) : input.afterSequence;
+      if(!Number.isSafeInteger(fromCursor)||fromCursor<0||highWater<fromCursor)
+        throw Error("G2H_PG_SOURCE_CURSOR_REGRESSION");
+      const rawRows=await tx`
+        SELECT sequence,operation_key,type,aggregate_type,aggregate_id,
+          payload_hash,payload,occurred_at,recorded_at
+        FROM durable_transitions
+        WHERE sequence>${fromCursor} AND sequence<=${highWater}
+        ORDER BY sequence ASC LIMIT ${input.limit}
+      `;
+      const rows:DurableTransition[]=rawRows.map(row=>({
+        sequence:Number(row.sequence),operationKey:String(row.operation_key),
+        type:String(row.type),aggregateType:String(row.aggregate_type),
+        aggregateId:String(row.aggregate_id),payloadHash:String(row.payload_hash),
+        payload:row.payload as Record<string,unknown>,
+        occurredAt:new Date(row.occurred_at).toISOString(),
+        recordedAt:new Date(row.recorded_at).toISOString(),
+      }));
+      if(highWater>fromCursor&&rows.length===0)
+        throw Error("G2H_PG_DURABLE_REPLAY_GAP");
+      for(let i=0;i<rows.length;i++){
+        const row=rows[i]!;
+        if(row.sequence!==fromCursor+i+1
+          ||row.payloadHash!==hashDurablePayload(row.payload)
+          ||Object.keys(row.payload).length===0)
+          throw Error("G2H_PG_DURABLE_ROW_GAP_OR_CORRUPT");
+      }
+      return {source:{database:input.database,schema:input.schema,role:input.role},
+        fromCursor,highWater,checkpoints,rows};
+    });
+  }
+
   async commitDurableTransition(input: DurableTransitionInput, expectedPreviousSequence: number, options: DurableCommitOptions = {}): Promise<DurableCommitResult> {
     assertJournalCapability(this.access, "runtime-write", "commitDurableTransition");
     const parsed = durableTransitionInputSchema.parse(input);

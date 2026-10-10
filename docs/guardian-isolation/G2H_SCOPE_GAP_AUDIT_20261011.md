@@ -26,11 +26,21 @@ is NEVER permission to expand H1-H4 or implement a deferred change.
 
 | Frozen requirement | Reusable source/tests | Proof gap | Status |
 |---|---|---|---|
-| H-01 trusted DB/role | `packages/db/src/access.ts`; `guardian-real-journal-source.ts` | No real Postgres integration, actual least-privilege credential/grant proof or source identity gate | BLOCKED |
-| H-02 consistent checkpoint/replay | `guardian-readonly-checkpoint.ts`; `guardian-offline-durable-source.ts`; `guardian-readonly-durable-feed.ts`; full economic digest | Pin and per-page certificates require experimental signing path; real `listVerifiedCheckpoints/latest/read` are separate default READ COMMITTED queries, not guaranteed one MVCC snapshot; compaction/rotation not integrated | BLOCKED |
+| H-01 trusted DB/role | `PostgresEventJournal.readGuardianConsistentPage`, isolated PostgreSQL 17 tests | Real isolated SELECT-only role + RLS proof PASS; production DB identity/credential/TLS and provisioning unverified | PARTIAL |
+| H-02 consistent checkpoint/replay | Non-signed `guardian-trusted-pg-bootstrap.ts`; one-snapshot `readGuardianConsistentPage`, canonical reducer | First-page checkpoint+tail + real gap/tamper/concurrent-commit tested; repeated pages, checkpoint rotation and ACK resume not yet integrated | PARTIAL |
 | H-03 restart/ACK | `guardian-consumer-ack-store.ts`; `guardian-readonly-session.ts`; 8,192-key fail-close; 16 session tests | v1 ACK embeds signature epoch; cannot naively relabel receipt after migration; durability on actual target FS, restart+checkpoint rotation and practical sustained operation unproved | PARTIAL |
 | H-04 independent paired books | `guardian-paired-book-channel.ts`, `guardian-normalized-book-bridge.ts`; normalized `PolymarketMarketDataAdapter` supports tokenEpoch and isTokenSynchronized | No independent ingress contract/runnable fixture with Engine stopped, backlog/both-side reconnect source pipeline and 8/8 parity unproved | PARTIAL |
 | H-05 bounded health/capacity | 100/1000/8192 synthetic row tests; 313/313 regression at baseline | Synthetic event timestamps are NOT paced; no local Postgres CPU/lag/heap envelope, no full paired-book replay workload, operation-key retention hard halts | PARTIAL |
+
+## H1 local implementation evidence (2026-10-11)
+
+- `G2H_H1_REAL_POSTGRES_READER_EVIDENCE_20261011.md`: disposable PostgreSQL 17,
+  10/10 end-to-end tests; source identity, real least-privilege role, RLS
+  SELECT policies, repeatable-read snapshot, page replay and no-sign bootstrap.
+- Previously the signer-only `GuardianReadonlySession` was a required code
+  dependency. New non-signed first-page path now exists separately; H2 still
+  has to supply durable consumer ACK and continuous catch-up. Real production
+  ACL/TLS and writer-scoped deployment are NOT authorized or verified.
 
 ## 3. Required implementation work. Exactly FOUR delivery packages.
 
