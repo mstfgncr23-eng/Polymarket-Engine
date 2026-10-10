@@ -41,7 +41,7 @@ UNKNOWN, cannot be asserted as done:
 
 ### G2 finish line: exactly three remaining deliverables, not an endless alphabet
 
-**G2G (finishing state correctness)**: G2G-1 `cd7c81a` and G2G-2 `06c446f` DONE. Needs a final explicit exclusion/authority verification of remaining legitimate checkpoint states: naked directional diagnostics, resolution lookups, report integrity/quarantine and unknown DB commit; separate tests as needed. No broad rewrite just to obtain a green test. G2G closes only when no legitimate active protection state is silently lost.
+**G2G (finishing state correctness)**: DONE in the offline read-only adapter. G2G-1 `cd7c81a` (maker/taker ownership), G2G-2 `06c446f` (Guardian/trailing/settlement), plus final `G2G_STATE_COVERAGE_CLOSEOUT_20261010.md` (naked diagnostics and explicit integrity/quarantine halt). This proves schema/episode/invariant coverage for eligible verified fixtures, **not** a trusted real-source feed or a resolution of an unknown DB commit. Those are required G2H producer checks.
 
 **G2H (trusted data path)**: Choose the actual producer/consumer mechanism based on current code and production implementation evidence, then implement a narrow source protocol. Require verified checkpoint hash against trusted store, writer epoch, global durable sequence including unrelated transitions, compacted retention gap detection, heartbeat, backpressure, bounded queue, strictly fresh paired market books, feed reconnect epoch and consumer fail-closed on unknown state. Test partial packet, duplicated record, gap, source failover, DB latency and disconnection. **No hidden shadow feed or second live Guardian**.
 

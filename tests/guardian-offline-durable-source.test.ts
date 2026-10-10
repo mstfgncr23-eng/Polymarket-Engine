@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createIdleExperiment, PaperLedger, GUARDIAN_V2_CONFIG,
+  createNakedDirectionalDiagnostic,
   evaluateGuardianV2, evaluateProfitTrailingPair } from "@pm/core";
 import { order } from "./fixtures.js";
 import {
@@ -43,7 +44,7 @@ const makePayload=()=>{
     resultAccounting,restingOrders:[],makerReservations:{},
     activeTriggers:[],grokSignals:[],settledMarkets:[],riskReductionOwners:[],
     riskReductionFailures:[],reversalProtectionStates:[],profitTrailingPairStates:[],
-    settlementLookups:[],
+    settlementLookups:[],nakedDirectionalDiagnostics:[],
     lastInfrastructureAccrualAt:0,
   };
 };
@@ -279,5 +280,44 @@ describe("G2G-2 Guardian/trailing/settlement state hydration, read-only",()=>{
     expect(next.recovery.reversalProtectionStates?.has(MARKET)).toBe(false);
     expect(next.recovery.profitTrailingPairStates?.has(MARKET)).toBe(false);
     expect(next.recovery.settlementLookups?.has(MARKET)).toBe(false);
+  });
+});
+
+describe("G2G closeout: soak diagnostics and unresolved integrity",()=>{
+  const diagnostic=()=>{
+    const payload=makePayload();
+    const position=payload.positions[0]!;
+    return createNakedDirectionalDiagnostic(position,first());
+  };
+  it("G2G-01 restores valid soak diagnostics without granting trade authority",()=>{
+    const original=diagnostic();
+    const base=boot({...makePayload(),nakedDirectionalDiagnostics:[original]});
+    expect(base.recovery.nakedDirectionalDiagnostics?.get(MARKET)).toEqual(original);
+    expect(base.projection.open.get(MARKET)?.residualQty).toBe("5");
+    const next=advanceGuardianOfflineSource(base,row("LEDGER_MARK_TO_MARKET",21,{
+      prices:{[MARKET]:{up:"0.45",down:"0.55"}},markedAt:AT2,
+    },"mtm:g2g:21"));
+    expect(next.recovery.nakedDirectionalDiagnostics?.get(MARKET)).toEqual(original);
+  });
+  it("G2G-02 rejects duplicate, cross-market or orphaned diagnostic identity",()=>{
+    const orig=diagnostic();
+    fail(()=>boot({...makePayload(),nakedDirectionalDiagnostics:[orig,orig]}),"DUPLICATE_ECONOMIC_OWNER");
+    fail(()=>boot({...makePayload(),nakedDirectionalDiagnostics:[{...orig,positionId:"obsolete"}]}),
+      "CHECKPOINT_INVARIANT_VIOLATION:naked_directional_diagnostic_invalid");
+    fail(()=>boot({...makePayload(),nakedDirectionalDiagnostics:[{...orig,marketId:"other"}]}),
+      "CHECKPOINT_INVARIANT_VIOLATION:naked_directional_diagnostic_invalid");
+  });
+  it("G2G-03 releases diagnostics after committed settlement",()=>{
+    const before=boot({...makePayload(),nakedDirectionalDiagnostics:[diagnostic()]});
+    const after=advanceGuardianOfflineSource(before,settleRow(21));
+    expect(after.recovery.nakedDirectionalDiagnostics?.has(MARKET)).toBe(false);
+    expect(after.projection.open.has(MARKET)).toBe(false);
+  });
+  it("G2G-04 halts on unresolved report integrity and quarantine without fabricating recovery",()=>{
+    const checkpoint=makePayload();
+    fail(()=>boot({...checkpoint,reportSourceIntegrity:[{experimentId:"g2f-experiment",eventId:"fault"}]}),
+      "CHECKPOINT_HAS_UNMODELED_AUTHORITY");
+    fail(()=>boot({...checkpoint,reportQuarantine:{unsafe:true}}),"CHECKPOINT_HAS_UNMODELED_AUTHORITY");
+    fail(()=>boot({...checkpoint,nakedDirectionalDiagnostics:"not-an-array"}),"CHECKPOINT_UNSUPPORTED");
   });
 });

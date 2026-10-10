@@ -1,7 +1,8 @@
 import {
   bootstrapGuardianPositionProjection, applyGuardianPositionFrame,
   d, ledgerStateSchema, positionSchema, experimentManifestSchema, restingPaperOrderSchema,
-  reversalProtectionStateSchema, profitTrailingPairStateSchema, PaperLedger,
+  reversalProtectionStateSchema, profitTrailingPairStateSchema,
+  nakedDirectionalDiagnosticSchema, PaperLedger,
   type GuardianOpenResidual, type GuardianPositionProjection, type Position,
 } from "@pm/core";
 import {
@@ -69,10 +70,13 @@ function sourceShape(payload: Record<string, unknown>): RecoverableEngineState {
     .map(row=>profitTrailingPairStateSchema.parse(row));
   const settlementLookups=(payload.settlementLookups as unknown[])
     .map(row=>settlementLookupSchema.parse(row));
+  const diagnostics=(payload.nakedDirectionalDiagnostics as unknown[])
+    .map(row=>nakedDirectionalDiagnosticSchema.parse(row));
   const restingOrders=keyed(resting,row=>row.order.id);
   const reversalMap=keyed(reversalStates,row=>row.marketId);
   const trailingMap=keyed(trailingStates,row=>row.marketId);
   const lookupMap=keyed(settlementLookups,row=>row.marketId);
+  const diagnosticMap=keyed(diagnostics,row=>row.marketId);
   for(const lookup of settlementLookups){
     const pos=stateLedger.positions.get(lookup.marketId);
     if(!pos || (!d(pos.upQuantity).gt(0) && !d(pos.downQuantity).gt(0))
@@ -108,6 +112,7 @@ function sourceShape(payload: Record<string, unknown>): RecoverableEngineState {
     reversalProtectionStates:reversalMap,
     profitTrailingPairStates:trailingMap,
     settlementLookups:lookupMap,
+    nakedDirectionalDiagnostics:diagnosticMap,
     settledMarkets:new Set(payload.settledMarkets as string[]),
     lastInfrastructureAccrualAt:Number(payload.lastInfrastructureAccrualAt ?? 0),
   };
@@ -138,8 +143,9 @@ export function bootstrapGuardianOfflineSource(input: {
     || !Array.isArray(payload.riskReductionOwners) || !Array.isArray(payload.riskReductionFailures)) fail("CHECKPOINT_UNSUPPORTED");
   if (!Array.isArray(payload.reversalProtectionStates) || !Array.isArray(payload.profitTrailingPairStates)
     || !Array.isArray(payload.settlementLookups)) fail("CHECKPOINT_UNSUPPORTED");
-  if ((Array.isArray(payload.nakedDirectionalDiagnostics) && payload.nakedDirectionalDiagnostics.length)
-    || (Array.isArray(payload.reportSourceIntegrity) && payload.reportSourceIntegrity.length)
+  if (!Array.isArray(payload.nakedDirectionalDiagnostics)) fail("CHECKPOINT_UNSUPPORTED");
+  // Unresolved integrity faults/commit ambiguity MUST still block adoption.
+  if ((Array.isArray(payload.reportSourceIntegrity) && payload.reportSourceIntegrity.length)
     || payload.reportQuarantine != null) fail("CHECKPOINT_HAS_UNMODELED_AUTHORITY");
   if (hashCheckpointPayload(payload)!==externallyVerifiedContentHash) fail("CHECKPOINT_HASH_MISMATCH");
   try {
