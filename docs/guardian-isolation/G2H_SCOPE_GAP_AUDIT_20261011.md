@@ -27,10 +27,23 @@ is NEVER permission to expand H1-H4 or implement a deferred change.
 | Frozen requirement | Reusable source/tests | Proof gap | Status |
 |---|---|---|---|
 | H-01 trusted DB/role | `PostgresEventJournal.readGuardianConsistentPage`, isolated PostgreSQL 17 tests | Real isolated SELECT-only role + RLS proof PASS; production DB identity/credential/TLS and provisioning unverified | PARTIAL |
-| H-02 consistent checkpoint/replay | Non-signed `guardian-trusted-pg-bootstrap.ts`; one-snapshot `readGuardianConsistentPage`, canonical reducer | First-page checkpoint+tail + real gap/tamper/concurrent-commit tested; repeated pages, checkpoint rotation and ACK resume not yet integrated | PARTIAL |
+| H-02 consistent checkpoint/replay | Non-signed consistent SQL page reader, v2 receipt/pinned checkpoint replay and parity-proven rebase; existing PG compaction/restart tests plus 3-market/12-cursor economic checkpoint rotation test | Durable producer checkpoint cadence and compaction retention coordination, target-fs crash recovery, stale lease/reconciliation and sustained rotation remain unproved | PARTIAL |
 | H-03 restart/ACK | V2 no-sign ACK/replay, 26 offline tests; real PostgreSQL retained-CP lookup beyond newest 64, compaction/restart, pinned-deletion HALT | Safe parity rebase and 8,200-row progression PASS; **producer CP cadence/lease, target FS crash durability, source failover remain blockers** | PARTIAL |
 | H-04 independent paired books | Standalone adapter H3 tests: 40/40 pairs in four bounded shards; 30 stay READY when one shard's 10 are BLOCKED, scoped reconnect, slow fourth-shard startup, silent sync/epoch loss | Offline four-shard functional tests PASS; **real sustained book age, overflow, paced traffic and latency under H4 load not yet proved**. Independent process supervisor belongs G2I, not H-04 | PARTIAL |
-| H-05 bounded health/capacity | 1,779 real archived row size/rate samples; 2-CPU-capped shaped-PG 20/s and 40 markets x 32-level book tests; **new real PG economic replay and independent PaperLedger oracle for UP fill, owner admission/failure, partial SELL, settlement, ACK/restart plus HALT faults 3/3 PASS** | Economic semantic coverage still one market/episode, not historical 1,779-row event mix; short duration, synthetic book depth, zero queue-highwater, no long-running 2-vCPU target/failover benchmark or operator lag budget | PARTIAL |
+| H-05 bounded health/capacity | Historical 1,779-row byte/rate distribution; 2-CPU 20/s shaped PG and 40-market 32-level books; real PG economic cases: single-market fault tests 3/3 and multi-market 12-cursor owned-maker checkpoint rebase/rollback parity PASS | Semantic fixture coverage still only a few scripted markets, not historical complete event mix; 4-6s paced repeats, zero queue-highwater, not target-like long soak or actual two-vCPU deployment lag budget | PARTIAL |
+
+## H4 interleaved multi-market economics and checkpoint rebase (2026-10-11)
+
+- `G2H_H4_MULTIMARKET_PG_ECONOMIC_REBASE_20261011.md`:
+  three genuine SQL PAPER_FILL buys, two overlapping risk owner
+  records for different markets, maker reserve/release, failure,
+  two SELLS and settlement, checkpoint rebase at cursor 9 and
+  restart continuation through cursor 12; every cursor's economy
+  checked against an independent `PaperLedger` and receipt.
+- Single-writer canonical global commit order preserved; tests
+  do NOT authorize concurrent economic writers or prove G3 races.
+- This expands H2/H5 semantic breadth, but does not establish
+  hardware, multi-hour heap, compaction retention or live feed safety.
 
 ## H4 true economic semantics and independent PostgreSQL oracle (2026-10-11)
 

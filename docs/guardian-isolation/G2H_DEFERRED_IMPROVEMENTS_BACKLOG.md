@@ -314,9 +314,17 @@ extending the gate with optional features.
   genuine canonical SQL replay and compares every recovered ledger
   snapshot against an independently executed `PaperLedger` plus
   literal $999.04/$1002.04 cash and $0.24/$2.04 PnL assertions.
+  `guardian-h4-multimarket-pg-parity.test.ts` now adds three
+  canonical SQL PAPER_FILL buys, two simultaneous active owners,
+  maker reserve/cancel, two SELLS, settlement and a parity-proven
+  checkpoint rebase at cursor 9 with final cursor 12.
   Existing `guardian-offline-durable-source.test.ts` has related
   state/owner fixtures. Rewriting these by hand risks divergent
-  prices, fees, dates and canonical operation keys.
+  prices, fees, dates and canonical operation keys; the new
+  multi-market test initially caught a mistaken *hand-written*
+  cash expectation ($1000.62 vs the independently measured $1001.50)
+  before correcting the fixture calculation. This is test-oracle
+  rigor, not a production reducer bug.
 - Opportunity: a reusable, deterministic fixture catalog of valid
   economic event sequences, with explicit externally calculated
   cash/PnL expectations and negative mutations. Shared test data
