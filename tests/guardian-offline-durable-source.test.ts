@@ -15,6 +15,7 @@ import { plannedDurableTransition } from "../apps/engine/src/recovery.js";
 import { accountResultFill, emptyResultAccounting } from "../apps/engine/src/trading-results.js";
 import { paperFill } from "./paper-engine-testkit.js";
 import { pullGuardianDurablePage, type GuardianDurableReadSource } from "../apps/engine/src/guardian-readonly-durable-feed.js";
+import { bootstrapGuardianPinnedCheckpoint, type GuardianCheckpointReadSource } from "../apps/engine/src/guardian-readonly-checkpoint.js";
 
 const AT="2026-10-10T10:00:00.000Z";
 const AT2="2026-10-10T10:00:05.000Z";
@@ -386,5 +387,68 @@ describe("G2H canonical read-only durable page feed: closed fixtures, NO SHADOW"
     const full=fillRow(21);
     await blocked(()=>pull(source([{...full,payload:{}}],21)),"DURABLE_REPLAY_FAILED");
     await blocked(()=>pull(source([{...full,payloadHash:"0".repeat(64)}],21)),"DURABLE_REPLAY_FAILED");
+  });
+});
+
+describe("G2H pinned read-only checkpoint adoption: CLOSED source fixtures",()=>{
+  const original=makePayload();
+  const digest=hashCheckpointPayload(original);
+  const checkpointPayload={...original,checkpointContentHash:digest};
+  const record={
+    id:"checkpoint-g2h",experimentId:"g2f-experiment",sequence:3,createdAt:AT,
+    verified:true,contentHash:digest,payload:checkpointPayload,
+  };
+  const pin={checkpointId:record.id,experimentId:"g2f-experiment",
+    authorityId:"out-of-band-writer-epoch",contentHash:digest};
+  const source=(entries=[record],highWater=22):GuardianCheckpointReadSource=>({
+    listVerifiedCheckpoints:async()=>entries,
+    latestDurableSequence:async()=>highWater,
+  });
+  const acquire=(s:GuardianCheckpointReadSource=source(),p=pin,maxBacklogRows=100)=>
+    bootstrapGuardianPinnedCheckpoint({source:s,pin:p,maxBacklogRows});
+  const stopped=async(work:()=>Promise<unknown>,reason:string)=>
+    expect(work()).rejects.toMatchObject({reason});
+  it("G2H-07 binds independently pinned digest, experiment and durable cursor",async()=>{
+    const {state,checkpointId,highWater}=await acquire();
+    expect(checkpointId).toBe(record.id);
+    expect(highWater).toBe(22);
+    expect(state.projection.cursor).toBe(20);
+    expect(state.projection.authorityId).toBe(pin.authorityId);
+    expect(state.projection.open.get(MARKET)?.residualQty).toBe("5");
+  });
+  it("G2H-08 refuses missing, duplicate and unverified checkpoint records",async()=>{
+    await stopped(()=>acquire(source([])),"CHECKPOINT_NOT_FOUND");
+    await stopped(()=>acquire(source([record,record])),"CHECKPOINT_AMBIGUOUS");
+    await stopped(()=>acquire(source([{...record,verified:false}])),"CHECKPOINT_MISMATCH");
+    await stopped(()=>acquire(source([{...record,experimentId:"unrelated"}])),"CHECKPOINT_MISMATCH");
+  });
+  it("G2H-09 a self-consistent but rehashed DB record cannot replace the external pin",async()=>{
+    const tampered={...makePayload(),durableCursor:19};
+    const alteredHash=hashCheckpointPayload(tampered);
+    const replaced={...record,contentHash:alteredHash,
+      payload:{...tampered,checkpointContentHash:alteredHash}};
+    await stopped(()=>acquire(source([replaced])),"CHECKPOINT_MISMATCH");
+    await stopped(()=>acquire(source(),{...pin,contentHash:"0".repeat(64)}),"CHECKPOINT_MISMATCH");
+    await stopped(()=>acquire(source(),{...pin,checkpointId:"absent"}),"CHECKPOINT_NOT_FOUND");
+  });
+  it("G2H-10 fences stale/invalid source high-water, lag, pin and upstream failure",async()=>{
+    await stopped(()=>acquire(source([record],19)),"SOURCE_CURSOR_REGRESSION");
+    await stopped(()=>acquire(source([record],122)),"BACKLOG_EXCEEDED");
+    await stopped(()=>acquire(source(),{...pin,authorityId:""}),"INVALID_PIN");
+    await stopped(()=>acquire({
+      listVerifiedCheckpoints:async()=>{throw Error("CONNECT_TIMEOUT")},
+      latestDurableSequence:async()=>22,
+    }),"SOURCE_UNAVAILABLE");
+  });
+  it("G2H-11 malformed source payload is a typed halt, not an uncaught exception",async()=>{
+    const malformed={...record,payload:null as unknown as typeof checkpointPayload};
+    await stopped(()=>acquire(source([malformed])),"CHECKPOINT_MISMATCH");
+  });
+  it("G2H-12 unresolved integrity in a correctly pinned checkpoint remains fatal",async()=>{
+    const payload={...makePayload(),reportSourceIntegrity:[{eventId:"unknown"}]};
+    const hash=hashCheckpointPayload(payload);
+    await stopped(()=>acquire(source([{...record,contentHash:hash,
+      payload:{...payload,checkpointContentHash:hash}}]),
+      {...pin,contentHash:hash}),"CHECKPOINT_RECOVERY_REJECTED");
   });
 });
