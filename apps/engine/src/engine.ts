@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { evaluateGuardianV2, lockedGuardianGeneration, GUARDIAN_V2_CONFIG, isGuardianV2State, normalizeOppositeBookPressure, reversalProtectionStateSchema, sameReversalEpisode, type GuardianV2Event, type ReversalProtectionState, type ReversalEpisode } from "@pm/core";
+import { evaluateGuardianV2, lockedGuardianGeneration, GUARDIAN_V2_CONFIG, isGuardianV2State, projectGuardianBookSignal, reversalProtectionStateSchema, sameReversalEpisode, type GuardianV2Event, type ReversalProtectionState, type ReversalEpisode } from "@pm/core";
 import { nakedDirectionalDiagnosticSchema, observeNakedDirectionalPosition, noteNakedDirectionalAnomaly, compactNakedDirectionalObservation,
   nakedDirectionalSummary, SOAK_PERSIST_INTERVAL_MS, evaluateProfitTrailingPair, profitTrailingPairStateSchema,
   type NakedDirectionalDiagnostic, type ProfitTrailingPairState } from "@pm/core";
@@ -5273,18 +5273,7 @@ export class EngineService {
     const down = this.freshEarlyCatastrophicSnapshot(pair?.DOWN ?? null, nowMs);
     if (!up || !down || up.tokenId !== this.currentTokenIdFor(marketId, "UP")
       || down.tokenId !== this.currentTokenIdFor(marketId, "DOWN")) return null;
-    const top = (snapshot: MarketSnapshot) => {
-      const bid = snapshot.bids[0], ask = snapshot.asks[0];
-      if (!bid || !ask) return null;
-      const bp = d(bid.price), ap = d(ask.price), bq = d(bid.quantity), aq = d(ask.quantity);
-      if (![bp, ap, bq, aq].every(v => v.isFinite()) || bp.lt(0) || ap.gt(1) || bp.gt(ap)
-        || bq.lt(0) || aq.lt(0) || bq.plus(aq).lte(0)) return null;
-      return { mid: bp.plus(ap).div(2), imbalance: bq.minus(aq).div(bq.plus(aq)) };
-    };
-    const u = top(up), v = top(down);
-    if (!u || !v) return null;
-    return { eventId: `${up.eventId}:${down.eventId}`, heldPrice: (heldOutcome === "UP" ? u : v).mid.toFixed(),
-      bookPressure: normalizeOppositeBookPressure(heldOutcome, u.imbalance.minus(v.imbalance).div(2).toFixed()) };
+    return projectGuardianBookSignal(up, down, heldOutcome);
   }
 
   private evaluateGuardianRuntime(marketId: string, event?: JournalEvent): {
