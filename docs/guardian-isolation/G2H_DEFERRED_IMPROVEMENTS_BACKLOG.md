@@ -178,6 +178,37 @@ extending the gate with optional features.
   mandatory**. This optional entry is only later provisioning automation
   and runbook quality, NOT permission to defer H-01.
 
+### GI-013 | Reuse one tested receipt-file CAS primitive across v1 and v2
+- Stage: post-H2 acceptance cleanup; nonblocking unless persistence defect proven.
+- Status: **OPEN / KNOWN duplicated implementation**.
+- Found during: H2 commit, 2026-10-11.
+- Evidence: `guardian-consumer-ack-store.ts` and new
+  `guardian-pg-ack-store.ts` separately implement O_EXCL lock,
+  fsync, atomic rename and CAS. Different receipt schemas are
+  intentional and v1 MUST NOT silently convert to v2.
+- Opportunity: share a generic, separately tested durable file-CAS
+  primitive without merging authority formats. Measurable benefit is
+  fewer independently maintained filesystem edge cases.
+- Failure modes: accidental acceptance of signer receipt as PG v2,
+  unsafe lock cleanup, changed on-disk encoding or ACK regression.
+- Validation: existing signed and PG receipt fault suites green,
+  power-loss/fsync tests on target FS if available.
+- Boundary: H-03 durable correctness and stale lock remain REQUIRED;
+  only reuse/refactor is deferred.
+
+### GI-014 | Profile source ACL catalog validation on every journal page
+- Stage: H4 measured capacity and later tuning, not a new feature.
+- Status: **OPEN / UNKNOWN overhead**.
+- Found during: H2 coherent PostgreSQL polling.
+- Evidence: `PostgresEventJournal.readGuardianConsistentPage`
+  checks live effective schema/table/sequence privileges via
+  catalog queries inside each REPEATABLE READ READ ONLY transaction.
+- Opportunity: measure DB wall/CPU and p95 at realistic 40-market
+  journal rates before evaluating an independently fenced role-policy
+  validation cache. No caching that silently masks privilege revocation,
+  RLS changes or altered session identity.
+- Boundary: Current fail-closed least privilege is H-01 mandatory.
+
 ## NOT optional backlog items: current required work (cross-reference only)
 
 Do **not** defer the following because they determine whether the planned

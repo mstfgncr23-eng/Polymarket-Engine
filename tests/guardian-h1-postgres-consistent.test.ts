@@ -1,4 +1,7 @@
 import { fileURLToPath } from "node:url";
+import {mkdtemp,rm} from "node:fs/promises";
+import {tmpdir} from "node:os";
+import {join} from "node:path";
 import { createRequire } from "node:module";
 // Reuse the exact postgres.js already owned by @pm/db; do not add packages.
 const postgres=createRequire(new URL("../packages/db/package.json",import.meta.url))("postgres");
@@ -7,6 +10,8 @@ import { createIdleExperiment, PaperLedger } from "@pm/core";
 import { CHECKPOINT_SCHEMA_VERSION, PostgresEventJournal } from "@pm/db";
 import { emptyResultAccounting } from "../apps/engine/src/trading-results.js";
 import { bootstrapGuardianTrustedPg } from "../apps/engine/src/guardian-trusted-pg-bootstrap.js";
+import { GuardianTrustedPgSession } from "../apps/engine/src/guardian-trusted-pg-session.js";
+import { GuardianPgFileAckStore } from "../apps/engine/src/guardian-pg-ack-store.js";
 
 /**
  * Only a disposable, loopback PostgreSQL container is allowed.
@@ -218,6 +223,27 @@ noDb("G2H-H1 real isolated PostgreSQL: repeatable read + actual SELECT-only role
       experimentId:EXPECT.experimentId,authorityId:"operator-pinned-paper-db",
       pageSize:1,maxBacklogRows:1,
     })).rejects.toThrow("G2H_PG_BACKLOG_LIMIT");
+  });
+  it("H2-REAL-PG-01 reads multiple live PG pages and reconstructs ACK after restart",async()=>{
+    const dir=await mkdtemp(join(tmpdir(),"g2h-h2-pg-"));
+    const ack=new GuardianPgFileAckStore(join(dir,"consumer.guardian-pg-ack.json"));
+    try{
+      const input={
+        source:reader,ack,scope:{database:EXPECT.database,schema:EXPECT.schema,role:EXPECT.role},
+        experimentId:EXPECT.experimentId,authorityId:"canonical-paper-db-reader",
+        pageSize:1,maxBacklogRows:100,
+      };
+      const s=await GuardianTrustedPgSession.open(input);
+      expect(s.cursor).toBe(1);
+      expect((await ack.load())?.cursor).toBe(1);
+      expect(await s.poll(1000)).toEqual({cursor:2,highWater:3,caughtUp:false});
+      expect((await ack.load())?.cursor).toBe(2);
+      const resumed=await GuardianTrustedPgSession.open(input);
+      expect(resumed.cursor).toBe(2);
+      expect(await resumed.poll(1010)).toEqual({cursor:3,highWater:3,caughtUp:true});
+      expect((await ack.load())?.cursor).toBe(3);
+      expect(resumed.readVerifiedView(1011).open).toEqual([]);
+    }finally{await rm(dir,{recursive:true,force:true});}
   });
   it("H1-10 catches a physically missing global durable transition",async()=>{
     // Last test intentionally mutates only the disposable database.
