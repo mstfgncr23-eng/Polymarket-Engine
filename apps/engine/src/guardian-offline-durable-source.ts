@@ -1,6 +1,7 @@
 import {
   bootstrapGuardianPositionProjection, applyGuardianPositionFrame,
-  d, ledgerStateSchema, positionSchema, experimentManifestSchema, restingPaperOrderSchema, PaperLedger,
+  d, ledgerStateSchema, positionSchema, experimentManifestSchema, restingPaperOrderSchema,
+  reversalProtectionStateSchema, profitTrailingPairStateSchema, PaperLedger,
   type GuardianOpenResidual, type GuardianPositionProjection, type Position,
 } from "@pm/core";
 import {
@@ -9,7 +10,8 @@ import {
 } from "@pm/db";
 import {
   applyDurableTransition, cloneRecoverableState, parseCheckpointDurableCursor,
-  riskReductionOwnershipSchema, riskReductionExecutionFailureSchema, validatePostReplayInvariants,
+  riskReductionOwnershipSchema, riskReductionExecutionFailureSchema, settlementLookupSchema,
+  validatePostReplayInvariants,
   type RecoverableEngineState,
 } from "./recovery.js";
 import { resultAccountingSchema } from "./trading-results.js";
@@ -61,7 +63,23 @@ function sourceShape(payload: Record<string, unknown>): RecoverableEngineState {
     }
     return map;
   };
+  const reversalStates=(payload.reversalProtectionStates as unknown[])
+    .map(row=>reversalProtectionStateSchema.parse(row));
+  const trailingStates=(payload.profitTrailingPairStates as unknown[])
+    .map(row=>profitTrailingPairStateSchema.parse(row));
+  const settlementLookups=(payload.settlementLookups as unknown[])
+    .map(row=>settlementLookupSchema.parse(row));
   const restingOrders=keyed(resting,row=>row.order.id);
+  const reversalMap=keyed(reversalStates,row=>row.marketId);
+  const trailingMap=keyed(trailingStates,row=>row.marketId);
+  const lookupMap=keyed(settlementLookups,row=>row.marketId);
+  for(const lookup of settlementLookups){
+    const pos=stateLedger.positions.get(lookup.marketId);
+    if(!pos || (!d(pos.upQuantity).gt(0) && !d(pos.downQuantity).gt(0))
+      || (payload.settledMarkets as string[]).includes(lookup.marketId)){
+      fail("SETTLEMENT_LOOKUP_WITHOUT_INVENTORY");
+    }
+  }
   const ownerMap=keyed(owners,row=>row.marketId);
   const failureMap=keyed(failures,row=>row.ownership.marketId);
   for(const owner of owners) {
@@ -87,6 +105,9 @@ function sourceShape(payload: Record<string, unknown>): RecoverableEngineState {
     makerReservations:new Map(Object.entries(makerReservations)),
     riskReductionOwners:ownerMap,
     riskReductionFailures:failureMap,
+    reversalProtectionStates:reversalMap,
+    profitTrailingPairStates:trailingMap,
+    settlementLookups:lookupMap,
     settledMarkets:new Set(payload.settledMarkets as string[]),
     lastInfrastructureAccrualAt:Number(payload.lastInfrastructureAccrualAt ?? 0),
   };
@@ -110,16 +131,14 @@ export function bootstrapGuardianOfflineSource(input: {
     || !Array.isArray(payload.positions) || !Array.isArray(payload.settledMarkets)
     || !Array.isArray(payload.restingOrders) || !Array.isArray(payload.activeTriggers)
     || !Array.isArray(payload.grokSignals) || !payload.resultAccounting) fail("CHECKPOINT_UNSUPPORTED");
-  // Offline maker and taker authority can now be hydrated, but NO orders are
-  // submitted and runtime protection authority is still forbidden. Reject
-  // unresolved Guardian/trailing/integrity state until its full replay is proved.
+  // All hydrated state is OFFLINE and read-only. Unknown telemetry and source
+  // integrity fields remain forbidden until a complete recovery proof exists.
   if (!payload.makerReservations || typeof payload.makerReservations!=="object"
     || Array.isArray(payload.makerReservations)
     || !Array.isArray(payload.riskReductionOwners) || !Array.isArray(payload.riskReductionFailures)) fail("CHECKPOINT_UNSUPPORTED");
-  if ((Array.isArray(payload.reversalProtectionStates) && payload.reversalProtectionStates.length)
-    || (Array.isArray(payload.profitTrailingPairStates) && payload.profitTrailingPairStates.length)
-    || (Array.isArray(payload.nakedDirectionalDiagnostics) && payload.nakedDirectionalDiagnostics.length)
-    || (Array.isArray(payload.settlementLookups) && payload.settlementLookups.length)
+  if (!Array.isArray(payload.reversalProtectionStates) || !Array.isArray(payload.profitTrailingPairStates)
+    || !Array.isArray(payload.settlementLookups)) fail("CHECKPOINT_UNSUPPORTED");
+  if ((Array.isArray(payload.nakedDirectionalDiagnostics) && payload.nakedDirectionalDiagnostics.length)
     || (Array.isArray(payload.reportSourceIntegrity) && payload.reportSourceIntegrity.length)
     || payload.reportQuarantine != null) fail("CHECKPOINT_HAS_UNMODELED_AUTHORITY");
   if (hashCheckpointPayload(payload)!==externallyVerifiedContentHash) fail("CHECKPOINT_HASH_MISMATCH");

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { createIdleExperiment, PaperLedger } from "@pm/core";
+import { createIdleExperiment, PaperLedger, GUARDIAN_V2_CONFIG,
+  evaluateGuardianV2, evaluateProfitTrailingPair } from "@pm/core";
 import { order } from "./fixtures.js";
 import {
   CHECKPOINT_SCHEMA_VERSION, hashCheckpointPayload,
@@ -42,6 +43,7 @@ const makePayload=()=>{
     resultAccounting,restingOrders:[],makerReservations:{},
     activeTriggers:[],grokSignals:[],settledMarkets:[],riskReductionOwners:[],
     riskReductionFailures:[],reversalProtectionStates:[],profitTrailingPairStates:[],
+    settlementLookups:[],
     lastInfrastructureAccrualAt:0,
   };
 };
@@ -205,5 +207,77 @@ describe("G2G-1 full economic owner hydration, offline only",()=>{
     fail(()=>boot({...makePayload(),riskReductionFailures:[{
       ownership:{...prior,unhedgedStartedAt:AT3},reason:"INVALID_EPISODE",
     }]}),"FAILURE_EPISODE_MISMATCH");
+  });
+});
+
+describe("G2G-2 Guardian/trailing/settlement state hydration, read-only",()=>{
+  function configured(){
+    const base=makePayload();
+    const risk={
+      ...base.experiment.riskConfiguration,
+      reversalProtectionEnabled:true,reversalProtectionWindowMs:180000,
+      guardianVersion:2,guardianFormatGeneration:3,guardianV2Config:GUARDIAN_V2_CONFIG,
+      profitTrailingPairSoakEnabled:true,profitTrailingPairTargetEdge:0.12,
+      normalHedgeMinLockedPairEdge:0.12,profitTrailingPairArmEdge:0.05,
+      profitTrailingPairRetraceEdge:0.02,profitTrailingPairExecutionStyle:"TAKER",
+      nakedDirectionalSoakEnabled:false,
+    };
+    const episode={marketId:MARKET,positionId:POS,unhedgedStartedAt:AT,heldOutcome:"UP" as const};
+    const guardian=evaluateGuardianV2({
+      generation:"BAD_REGION_V3",state:null,episode,entryPrice:"0.4",
+      now:new Date(AT),observation:{eventId:"g2g-observation",heldPrice:"0.4",bookPressure:"0.2"},
+    }).nextState!;
+    const trailing=evaluateProfitTrailingPair({
+      state:null,marketId:MARKET,positionId:POS,unhedgedStartedAt:AT,now:new Date(AT2),
+      currentGrossEdge:"0.08",currentLockedPnl:"0.1",targetEdge:0.12,armEdge:0.05,retraceEdge:0.02,
+    }).nextState!;
+    const lookup={marketId:MARKET,slug:"g2g-market",endDate:"2026-10-10T11:00:00.000Z",
+      yesMapsTo:"UP",noMapsTo:"DOWN"};
+    return {payload:{...base,experiment:{...base.experiment,riskConfiguration:risk},
+      reversalProtectionStates:[guardian],profitTrailingPairStates:[trailing],settlementLookups:[lookup]},
+      guardian,trailing,lookup};
+  }
+  it("G2G2-01 recovers complete episode-bound Guardian V2 and trailing high water",()=>{
+    const {payload,guardian,trailing,lookup}=configured();
+    const base=boot(payload);
+    expect(base.recovery.reversalProtectionStates?.get(MARKET)).toEqual(guardian);
+    expect(base.recovery.profitTrailingPairStates?.get(MARKET)).toEqual(trailing);
+    expect(base.recovery.settlementLookups?.get(MARKET)).toEqual(lookup);
+    const after=advanceGuardianOfflineSource(base,row("LEDGER_MARK_TO_MARKET",21,{
+      prices:{[MARKET]:{up:"0.46",down:"0.54"}},markedAt:AT2,
+    },"mtm:g2g2:21"));
+    expect(after.recovery.reversalProtectionStates?.get(MARKET)).toEqual(guardian);
+    expect(after.recovery.profitTrailingPairStates?.get(MARKET)).toEqual(trailing);
+  });
+  it("G2G2-02 rejects same market state duplicated or attached to another episode",()=>{
+    const {payload,guardian,trailing,lookup}=configured();
+    fail(()=>boot({...payload,reversalProtectionStates:[guardian,guardian]}),"DUPLICATE_ECONOMIC_OWNER");
+    fail(()=>boot({...payload,profitTrailingPairStates:[trailing,trailing]}),"DUPLICATE_ECONOMIC_OWNER");
+    fail(()=>boot({...payload,settlementLookups:[lookup,lookup]}),"DUPLICATE_ECONOMIC_OWNER");
+    fail(()=>boot({...payload,reversalProtectionStates:[{...guardian,unhedgedStartedAt:AT2}]}),
+      "CHECKPOINT_UNSUPPORTED");
+    fail(()=>boot({...payload,profitTrailingPairStates:[{...trailing,unhedgedStartedAt:AT3}]}),
+      "CHECKPOINT_INVARIANT_VIOLATION:profit_trailing_pair_state_invalid");
+  });
+  it("G2G2-03 rejects checkpoint source policy inconsistent with saved Guardian generation",()=>{
+    const {payload}=configured();
+    const experiment=payload.experiment;
+    fail(()=>boot({...payload,experiment:{...experiment,
+      riskConfiguration:{...experiment.riskConfiguration,reversalProtectionEnabled:false}}}),
+      "CHECKPOINT_INVARIANT_VIOLATION:reversal_protection_state_invalid");
+  });
+  it("G2G2-04 complete committed close clears both policies and settlement mapping",()=>{
+    const {payload}=configured();
+    const before=boot(payload);
+    const closing=paperFill(MARKET,"UP","0.52",{
+      id:"g2g-close",quantity:"5",side:"SELL",timestamp:AT2,feeUsd:"0",
+    });
+    const next=advanceGuardianOfflineSource(before,row("PAPER_FILL",21,{
+      fill:closing,positionId:POS,reservationAfter:null,
+    },`fill:${closing.id}`));
+    expect(next.projection.open.has(MARKET)).toBe(false);
+    expect(next.recovery.reversalProtectionStates?.has(MARKET)).toBe(false);
+    expect(next.recovery.profitTrailingPairStates?.has(MARKET)).toBe(false);
+    expect(next.recovery.settlementLookups?.has(MARKET)).toBe(false);
   });
 });
