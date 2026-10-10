@@ -9,7 +9,7 @@ import {
 } from "@pm/db";
 import {
   bootstrapGuardianOfflineSource, advanceGuardianOfflineSource,
-  GuardianOfflineSourceRejected,
+  GuardianOfflineSourceRejected, GUARDIAN_REPLAY_KEY_BUDGET,
 } from "../apps/engine/src/guardian-offline-durable-source.js";
 import { plannedDurableTransition } from "../apps/engine/src/recovery.js";
 import { accountResultFill, emptyResultAccounting } from "../apps/engine/src/trading-results.js";
@@ -450,5 +450,22 @@ describe("G2H pinned read-only checkpoint adoption: CLOSED source fixtures",()=>
     await stopped(()=>acquire(source([{...record,contentHash:hash,
       payload:{...payload,checkpointContentHash:hash}}]),
       {...pin,contentHash:hash}),"CHECKPOINT_RECOVERY_REJECTED");
+  });
+});
+
+describe("G2H bounded duplicate operation-key retention",()=>{
+  it("G2H-13 halts at the key budget without evicting previously authenticated keys",()=>{
+    const state=boot();
+    const makeKeys=(n:number)=>new Set(Array.from({length:n},(_,i)=>`prior-verified-key:${i}`));
+    fail(()=>advanceGuardianOfflineSource({
+      ...state,seenOperationKeys:makeKeys(GUARDIAN_REPLAY_KEY_BUDGET),
+    },fillRow(21)),"REPLAY_OPERATION_KEY_BUDGET_EXCEEDED");
+    const nearlyFull=makeKeys(GUARDIAN_REPLAY_KEY_BUDGET-1);
+    const next=advanceGuardianOfflineSource({...state,seenOperationKeys:nearlyFull},fillRow(21));
+    expect(next.seenOperationKeys.size).toBe(GUARDIAN_REPLAY_KEY_BUDGET);
+    expect(state.seenOperationKeys.size).toBe(0);
+    expect(nearlyFull.size).toBe(GUARDIAN_REPLAY_KEY_BUDGET-1);
+    fail(()=>advanceGuardianOfflineSource({...state,seenOperationKeys:new Set([fillRow(21).operationKey])},
+      fillRow(21)),"DUPLICATE_OPERATION_KEY");
   });
 });

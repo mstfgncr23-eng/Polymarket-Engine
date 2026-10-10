@@ -117,6 +117,7 @@ function sourceShape(payload: Record<string, unknown>): RecoverableEngineState {
     lastInfrastructureAccrualAt:Number(payload.lastInfrastructureAccrualAt ?? 0),
   };
 }
+export const GUARDIAN_REPLAY_KEY_BUDGET = 8192;
 export interface GuardianOfflineState {
   readonly projection: GuardianPositionProjection;
   readonly recovery: RecoverableEngineState;
@@ -171,6 +172,10 @@ export function advanceGuardianOfflineSource(current: GuardianOfflineState, row:
   const nextCursor=current.projection.cursor+1;
   if (row.sequence!==nextCursor) fail("DURABLE_CURSOR_GAP");
   if (current.seenOperationKeys.has(row.operationKey)) fail("DUPLICATE_OPERATION_KEY");
+  // Do NOT evict older keys and thereby silently weaken duplicate detection.
+  // A newer independently attested checkpoint is mandatory at this budget.
+  if (current.seenOperationKeys.size>=GUARDIAN_REPLAY_KEY_BUDGET)
+    fail("REPLAY_OPERATION_KEY_BUDGET_EXCEEDED");
   if (row.payloadHash!==hashDurablePayload(row.payload) || Object.keys(row.payload).length===0) {
     fail("DURABLE_PAYLOAD_UNVERIFIED");
   }
