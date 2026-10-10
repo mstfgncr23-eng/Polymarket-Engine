@@ -48,3 +48,4 @@ export * from "./reversal-protection.js";
 export * from "./guardian-v2.js";
 export * from "./guardian-boundary-contract.js";
 export * from "./guardian-book-signal.js";
+export * from "./guardian-position-projection.js";
