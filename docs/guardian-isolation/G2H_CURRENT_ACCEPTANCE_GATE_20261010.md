@@ -1,12 +1,20 @@
-# G2H Current Authority | Acceptance Gate (2026-10-10)
+# G2H Historical Acceptance Evidence | 2026-10-10
 
-**Status: NOT ACCEPTED, still in progress.** Do not advance G2I,
+> **SUPERSEDED AS SCOPE AUTHORITY on 2026-10-11.** The user explicitly
+> removed mandatory Ed25519 signing and requested a finite business-correctness
+> G2H. The binding scope/acceptance authority is now
+> `G2H_REQUIREMENTS_FROZEN_20261011.md`; the code/gap audit and four work
+> packages are in `G2H_SCOPE_GAP_AUDIT_20261011.md`.
+> All signature-related requirements below are historical prior design
+> evidence, NOT current blockers or work authorization.
+
+**Historical status: NOT ACCEPTED, still in progress.** Do not advance G2I,
 publish a PR, merge, deploy, start a second Guardian, shadow, or authorize
 live PAPER/VPS source reads from these tests.
 
 Branch: `refactor/guardian-isolation-atomic`.
-This is the authoritative status summary for G2H atoms after
-`b348075`. Earlier atom acceptance notes are evidence, not gate signoff.
+This was the former G2H status summary after `b348075`.
+It remains test history only; the 2026-10-11 requirements freeze takes precedence.
 
 ## Latest local G2H evidence after `a2d5e6f`
 
