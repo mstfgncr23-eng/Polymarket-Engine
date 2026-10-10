@@ -262,7 +262,11 @@ extending the gate with optional features.
 - Found during: H4 historical-rate and repeated paced benchmark,
   `G2H_H4_HISTORICAL_RATES_AND_PACED_LOCAL_BENCH_20261011.md`.
 - Evidence: the H4 `vitest` harness emits structured
-  `G2H_H4_PG_PROFILE` and `G2H_H4_BOOK_PROFILE` lines.
+  `G2H_H4_PG_PROFILE`, `G2H_H4_BOOK_PROFILE`,
+  `G2H_H4_SHAPED_PG_PROFILE`, `G2H_H4_SHAPED_ROW_JSON_SIZE`,
+  and `G2H_H4_DEPTH_BOOK_PROFILE` lines. A two-CPU local
+  controlled run was reproduced, but the 4-6 second windows are
+  deliberately NOT a claim of sustainable multi-hour capacity.
   Readiness/parity assertions are automated but comparison of percentiles
   between different laptop runs remains a manual step.
 - Opportunity: after target workload/resource gate is settled, archive
@@ -285,7 +289,11 @@ extending the gate with optional features.
 - Found during: H4 benchmark when `process.cpuUsage()` necessarily
   included synthetic PostgreSQL writer and Guardian reader/ACK work
   in the SAME Node/Vitest process. DB Docker CPU was only sampled
-  once, separately.
+  once, separately. A subsequent H4 atom restricted Node's affinity to
+  2 logical CPUs (availableParallelism=2) and PostgreSQL to 2 CPUs
+  / 1.5GB with Docker limits, but still DID NOT isolate pure
+  reader CPU from synthetic writer+test-framework CPU. See
+  `G2H_H4_TWO_CPU_ARCHIVE_SHAPED_EVIDENCE_20261011.md`.
 - Opportunity: run writer and read-only Guardian profiler in
   separate local processes or cgroups with controlled CPU quotas to
   isolate the actual replay/rebase CPU vs writer and Vitest overhead.

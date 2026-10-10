@@ -30,7 +30,19 @@ is NEVER permission to expand H1-H4 or implement a deferred change.
 | H-02 consistent checkpoint/replay | Non-signed `guardian-trusted-pg-bootstrap.ts`; one-snapshot `readGuardianConsistentPage`, canonical reducer | First-page checkpoint+tail + real gap/tamper/concurrent-commit tested; repeated pages, checkpoint rotation and ACK resume not yet integrated | PARTIAL |
 | H-03 restart/ACK | V2 no-sign ACK/replay, 26 offline tests; real PostgreSQL retained-CP lookup beyond newest 64, compaction/restart, pinned-deletion HALT | Safe parity rebase and 8,200-row progression PASS; **producer CP cadence/lease, target FS crash durability, source failover remain blockers** | PARTIAL |
 | H-04 independent paired books | Standalone adapter H3 tests: 40/40 pairs in four bounded shards; 30 stay READY when one shard's 10 are BLOCKED, scoped reconnect, slow fourth-shard startup, silent sync/epoch loss | Offline four-shard functional tests PASS; **real sustained book age, overflow, paced traffic and latency under H4 load not yet proved**. Independent process supervisor belongs G2I, not H-04 | PARTIAL |
-| H-05 bounded health/capacity | Verified two real soak exports: 0.026/0.035 durable rows/s average, peaks 4/5 rows per second; separate local paced 5/s and 20/s PostgreSQL runs 2x each, 40-market 4-shard 80 full-book/s runs 2x each | Synthetic event payloads/books smaller than real source, only 6s runs; queue high-water seam zero, local laptop not target VPS, no continuous DB CPU or long-run heap envelope, no target lag budget | PARTIAL |
+| H-05 bounded health/capacity | Historical JSONL 1,779 records size/rate counted; H4 2-CPU-capped PG with archive-shaped row size histograms (200 records), ACK p99 152-157ms; 40 markets, 32-level UP/DOWN, 80 books/s, 0 gaps; all four H4 tests PASS | **Economic semantics still only mark-to-market**, not real fills/settlements; short runs, synthetic book depth, 0 queue highwater, laptop CPU != target 2vCPU VPS, no sustained PG CPU/heap/failover or operator lag budget | PARTIAL |
+
+## H4 two-CPU, archive-shaped bytes and 32-level books (2026-10-11)
+
+- `G2H_H4_TWO_CPU_ARCHIVE_SHAPED_EVIDENCE_20261011.md`:
+  2-CPU/1500MiB disposable PostgreSQL, local Node availableParallelism=2,
+  full source JSONL row-size p50/p95/p99/max reproduced within
+  tens of bytes, SELECT-only Guardian durable ACK under 20/s.
+- 40 markets/four shards at 80 full books/s with 32 bid and ask
+  levels per token, 40/40 READY, zero scripted ingress gap.
+- H-05 remains partial: no real PAPER_FILL/settlement economics replay
+  in this size-envelope profile, only ~4-6 second runs per repetition,
+  no queue overflow workload or target-hardware long-run envelope.
 
 ## H4 measured historical rates + local paced capacity (2026-10-11)
 

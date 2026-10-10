@@ -4,6 +4,7 @@ import {mkdtemp,rm} from "node:fs/promises";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
 import {performance} from "node:perf_hooks";
+import {availableParallelism} from "node:os";
 import {afterAll,beforeAll,describe,expect,it} from "vitest";
 import {createIdleExperiment,PaperLedger} from "@pm/core";
 import {PostgresEventJournal,CHECKPOINT_SCHEMA_VERSION} from "@pm/db";
@@ -184,6 +185,133 @@ describe.skipIf(!URL_STRING)("H4 paced READ-ONLY canonical PostgreSQL + ACK loca
       expect(result.maxBacklogRows).toBeLessThanOrEqual(512);
     }
   });
+  it("H4-SHAPE-PG paced archive-size-envelope mix with durable ACK and measured 2-CPU cap",{
+    timeout:110000,
+  },async()=>{
+    if(process.env.G2H_H4_REQUIRE_TWO_CPU==="1")
+      expect(availableParallelism()).toBe(2);
+    const ack=new GuardianPgFileAckStore(join(tmp,"shaped.guardian-pg-ack.json"));
+    const s=await GuardianTrustedPgSession.open({
+      source:reader,ack,scope,experimentId:EXPERIMENT,
+      authorityId:"g2h-h4-shaped-only",pageSize:128,maxBacklogRows:1024,
+    });
+    // Existing fixture's canonical cursor may be ahead of the latest CP.
+    while(!s.caughtUp)await s.poll(Date.now());
+    const kinds=[
+      {kind:"INFRASTRUCTURE_COST_ACCRUED",weight:59,bytes:1084},
+      {kind:"PAPER_FILL",weight:26,bytes:4571},
+      {kind:"POSITION_SETTLED",weight:11,bytes:3396},
+      {kind:"RISK_REDUCTION_ADMITTED",weight:4,bytes:2618},
+    ];
+    // 1,779 exported durable rows => 59.08%,25.63%,11.19%,3.60%.
+    // These are NOT real PAPER_FILL semantics: use only the valid
+    // canonical mark-to-market reducer with a synthetic size envelope.
+    let highWater=s.cursor;
+    for(const repeat of [1,2]){
+      const n=100,rate=20,durationMs=5000;
+      const startCursor=highWater,t0=performance.now();
+      const ackLatency:number[]=[],pollMs:number[]=[],sizes:number[]=[];
+      const started=new Map<number,number>();
+      const heap0=process.memoryUsage().heapUsed;
+      let maxHeap=heap0,finished=false,error:unknown=null;
+      const cpu0=process.cpuUsage();
+      const poller=(async()=>{
+        while(!finished||s.cursor<highWater){
+          try{
+            const before=s.cursor,t=performance.now();
+            const out=await s.poll(Date.now());
+            pollMs.push(performance.now()-t);
+            for(let j=before+1;j<=out.cursor;j++){
+              const at=started.get(j);
+              if(at!==undefined){
+                ackLatency.push(performance.now()-at);
+                started.delete(j);
+              }
+            }
+            maxHeap=Math.max(maxHeap,process.memoryUsage().heapUsed);
+            await wait(120);
+          }catch(e){error=e;break;}
+        }
+      })();
+      try{
+        for(let i=0;i<n;i++){
+          await wait(t0+i*1000/rate-performance.now());
+          if(error)throw error;
+          const selector=(i*37)%100;
+          let acc=0;
+          const kind=kinds.find(x=>(acc+=x.weight)>selector)!;
+          const fillIndex=selector-59;
+          const targetBytes=kind.kind==="PAPER_FILL"
+            ?fillIndex<19?4571:fillIndex<23?5401:fillIndex<25?7483:8311
+            :kind.bytes;
+          const base={prices:{},markedAt:new Date().toISOString(),
+            benchKind:kind.kind,benchEnvelope:""};
+          const rough=JSON.stringify({
+            sequence:highWater+1,operation_key:"h4:shape:"+repeat+":"+i,
+            aggregate_type:"position",aggregate_id:"h4-sized",
+            type:"LEDGER_MARK_TO_MARKET",payload:base,
+          }).length+160; // room for hashes and timestamps in DB JSONL
+          const payload={...base,benchEnvelope:"x".repeat(Math.max(0,targetBytes-rough))};
+          const result=await admin.commitDurableTransition({
+            operationKey:`h4:shape:${repeat}:${i}`,
+            type:"LEDGER_MARK_TO_MARKET",aggregateType:"position",
+            aggregateId:"h4-shaped",payload,
+          },highWater);
+          highWater++;
+          if(result.sequence!==highWater)throw Error("H4_SHAPED_SEQUENCE_MISMATCH");
+          started.set(highWater,performance.now());
+          sizes.push(JSON.stringify(payload).length);
+          maxHeap=Math.max(maxHeap,process.memoryUsage().heapUsed);
+        }
+      }finally{finished=true;await poller;}
+      if(error)throw error;
+      expect(s.cursor).toBe(highWater);
+      expect((await ack.load())?.cursor).toBe(highWater);
+      expect(s.status).toBe("READY");
+      expect(started.size).toBe(0);
+      const elapsedMs=performance.now()-t0;
+      const cpu=process.cpuUsage(cpu0);
+      console.log("G2H_H4_SHAPED_PG_PROFILE "+JSON.stringify({
+        repeat,targetRowsPerSecond:rate,
+        actualRowsPerSecond:round(n*1000/elapsedMs),
+        rows:n,payloadSizeP50Bytes:percentile(sizes,.5),
+        payloadSizeP95Bytes:percentile(sizes,.95),
+        payloadSizeMaxBytes:Math.max(...sizes),
+        nodeCpuMs:round((cpu.user+cpu.system)/1000),
+        nodeCpuRatio:round((cpu.user+cpu.system)/1000/elapsedMs),
+        heapDeltaMaxMiB:round((maxHeap-heap0)/1048576),
+        ackLagP95Ms:percentile(ackLatency,.95),
+        ackLagP99Ms:percentile(ackLatency,.99),
+        pollP99Ms:percentile(pollMs,.99),
+        availableParallelism:availableParallelism(),lastCursor:s.cursor,
+        observerWriterPrivilege:false,
+      }));
+      expect(s.cursor-startCursor).toBe(n);
+    }
+    const sizeRows=await sql`
+      SELECT count(*)::int AS rows,
+        percentile_cont(0.5) WITHIN GROUP
+          (ORDER BY octet_length(row_to_json(t)::text)) AS p50,
+        percentile_cont(0.95) WITHIN GROUP
+          (ORDER BY octet_length(row_to_json(t)::text)) AS p95,
+        percentile_cont(0.99) WITHIN GROUP
+          (ORDER BY octet_length(row_to_json(t)::text)) AS p99,
+        max(octet_length(row_to_json(t)::text)) AS max_bytes
+      FROM durable_transitions t
+      WHERE operation_key LIKE 'h4:shape:%'
+    `;
+    const size=sizeRows[0]!;
+    console.log("G2H_H4_SHAPED_ROW_JSON_SIZE "+JSON.stringify({
+      rows:Number(size.rows),p50Bytes:Number(size.p50),
+      p95Bytes:Number(size.p95),p99Bytes:Number(size.p99),
+      maxBytes:Number(size.max_bytes),
+    }));
+    expect(Number(size.rows)).toBe(200);
+    expect(Number(size.p50)).toBeGreaterThan(1000);
+    expect(Number(size.p95)).toBeGreaterThan(5000);
+    expect(Number(size.p99)).toBeGreaterThan(7000);
+    expect(Number(size.max_bytes)).toBeGreaterThan(8000);
+  });
 });
 type BookMarket={marketId:string;upTokenId:string;downTokenId:string;asset:string};
 class RecordingTransport extends ScriptedBoundedMarketTransport {
@@ -304,5 +432,81 @@ describe("H4 paced OFFLINE 40-market / 4-shard normalized book load",()=>{
       abort.abort("offline");
       await running;
     }
+  });
+
+  it("H4-DEPTH 40 markets / 4 shards / 32 levels per side, two paced runs",{
+    timeout:30000,
+  },async()=>{
+    if(process.env.G2H_H4_REQUIRE_TWO_CPU==="1")
+      expect(availableParallelism()).toBe(2);
+    const transports=Array.from({length:4},()=>new RecordingTransport());
+    const adapter=new PolymarketMarketDataAdapter(undefined,{transports,stableAfterMs:0});
+    const observer=new GuardianStandaloneBookObserver(adapter,marketList);
+    const abort=new AbortController(),running=observer.run(abort.signal);
+    const tokenOwner=(token:string)=>transports.find(t=>t.tokenSets.at(-1)?.includes(token));
+    const book=(token:string,market:string,timestamp:number)=>({
+      type:"book",payload:{tokenId:token,market,timestamp,
+        bids:Array.from({length:32},(_,i)=>({
+          price:(.47-i*.001).toFixed(3),size:(10+i*.1).toFixed(2),
+        })),
+        asks:Array.from({length:32},(_,i)=>({
+          price:(.48+i*.001).toFixed(3),size:(10+i*.1).toFixed(2),
+        })),lastTradePrice:"0.475"},
+    });
+    try{
+      await until(()=>transports.every(t=>t.subscribeCalls===1));
+      for(const repeat of [1,2]){
+        const cpu0=process.cpuUsage(),heap0=process.memoryUsage().heapUsed;
+        let maxHeap=heap0;
+        const durations:number[]=[],ages:number[]=[];
+        const started=performance.now();
+        for(let tick=0;tick<4;tick++){
+          await wait(started+tick*1000-performance.now());
+          const stamp=Date.now();
+          for(const market of marketList){
+            tokenOwner(market.upTokenId)!.push(book(market.upTokenId,market.marketId,stamp));
+            tokenOwner(market.downTokenId)!.push(book(market.downTokenId,market.marketId,stamp));
+          }
+          const begun=performance.now();
+          await until(()=>marketList.every(m=>{
+            const v=observer.observe(m.marketId,{
+              nowMs:Date.now(),maxAgeMs:3000,maxSkewMs:1000,
+            });
+            return v.status==="READY"
+              &&Date.parse(v.up.sourceTimestamp)>=stamp
+              &&Date.parse(v.down.sourceTimestamp)>=stamp
+              &&v.up.bids.length===32&&v.down.asks.length===32;
+          }));
+          durations.push(performance.now()-begun);
+          const now=Date.now();
+          for(const m of marketList){
+            const v=observer.observe(m.marketId,{
+              nowMs:now,maxAgeMs:3000,maxSkewMs:1000,
+            });
+            if(v.status!=="READY")throw Error("H4_DEEP_BOOK_NOT_READY");
+            ages.push(now-Math.min(Date.parse(v.up.sourceTimestamp),
+              Date.parse(v.down.sourceTimestamp)));
+          }
+          maxHeap=Math.max(maxHeap,process.memoryUsage().heapUsed);
+        }
+        await wait(started+4000-performance.now());
+        const elapsedMs=performance.now()-started;
+        const cpu=process.cpuUsage(cpu0),ingress=adapter.ingressSnapshot();
+        const result={
+          profile:"depth32-repetition-"+repeat,
+          rateBooksPerSecond:round(320*1000/elapsedMs),
+          depthLevelsPerSide:32,sourceAgeP99Ms:percentile(ages,.99),
+          settleP99Ms:percentile(durations,.99),
+          readyMarkets:marketList.length,ingressGapTotal:ingress.gapTotal,
+          ingressHighWaterEvents:ingress.highWaterEvents,
+          nodeCpuMs:round((cpu.user+cpu.system)/1000),
+          maxHeapDeltaMiB:round((maxHeap-heap0)/1048576),
+          availableParallelism:availableParallelism(),
+        };
+        console.log("G2H_H4_DEPTH_BOOK_PROFILE "+JSON.stringify(result));
+        expect(ingress.gapTotal).toBe(0);
+        expect(result.readyMarkets).toBe(40);
+      }
+    }finally{abort.abort("offline");await running;}
   });
 });
