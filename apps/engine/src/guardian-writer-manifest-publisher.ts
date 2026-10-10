@@ -27,6 +27,7 @@ export class GuardianManifestPublishHalted extends Error {
 const fail=(reason:string):never=>{throw new GuardianManifestPublishHalted(reason);};
 export class GuardianWriterManifestPublisher {
   private sequence:number;
+  private issuing=false;
   constructor(private readonly input:{
     issuerKeyId:string;authorityId:string;writerEpoch:number;
     lastDurablyIssuedSequence:number;privateKeyPem:string;maxCheckpointLagRows:number;
@@ -41,6 +42,16 @@ export class GuardianWriterManifestPublisher {
     this.sequence=cfg.lastDurablyIssuedSequence;
   }
   async issue(input:{
+    journal:GuardianManifestReadJournal;
+    witness:GuardianCanonicalWriterWitness;
+    nowMs:number;
+  }):Promise<GuardianWriterManifest> {
+    if (this.issuing) return fail("CONCURRENT_SIGNING_NOT_FENCED");
+    this.issuing=true;
+    try { return await this.issueWithinFence(input); }
+    finally { this.issuing=false; }
+  }
+  private async issueWithinFence(input:{
     journal:GuardianManifestReadJournal;
     witness:GuardianCanonicalWriterWitness;
     nowMs:number;
@@ -70,9 +81,25 @@ export class GuardianWriterManifestPublisher {
     });
     if (!eligible.length) return fail("NO_TRUSTED_RECENT_CHECKPOINT");
     const cp=eligible[0]!;
-    if (!cp.contentHash || cp.payload.checkpointContentHash!==cp.contentHash
-      || hashCheckpointPayload(cp.payload)!==cp.contentHash)
+    const chosenCursor=parseCheckpointDurableCursor(cp.payload);
+    // Conflicting valid self-hashed snapshots at the same durable cursor
+    // have no unique business ordering proof; never choose one arbitrarily.
+    if (eligible.some(other=>other.id!==cp.id
+      && parseCheckpointDurableCursor(other.payload)===chosenCursor
+      && other.contentHash!==cp.contentHash))
+      return fail("CHECKPOINT_ECONOMIC_AMBIGUITY");
+    if ((Array.isArray(cp.payload.reportSourceIntegrity)
+        && cp.payload.reportSourceIntegrity.length>0)
+      || cp.payload.reportQuarantine!=null)
+      return fail("UNRESOLVED_CANONICAL_SOURCE_INTEGRITY");
+    try {
+      if (!cp.contentHash || cp.payload.checkpointContentHash!==cp.contentHash
+        || hashCheckpointPayload(cp.payload)!==cp.contentHash)
+        return fail("CHECKPOINT_INTEGRITY_FAILURE");
+    }catch(error){
+      if (error instanceof GuardianManifestPublishHalted) throw error;
       return fail("CHECKPOINT_INTEGRITY_FAILURE");
+    }
     const meta={
       version:1 as const,issuerKeyId:this.input.issuerKeyId,
       authorityId:this.input.authorityId,writerEpoch:this.input.writerEpoch,

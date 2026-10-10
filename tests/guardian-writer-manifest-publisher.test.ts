@@ -97,3 +97,46 @@ describe("G2H producer signer -> canonical real Journal -> read-only consumer",(
       .rejects.toMatchObject({code:"JOURNAL_MUTATE_FORBIDDEN"});
   });
 });
+
+describe("G2H issuer self-fencing before publication",()=>{
+  it("G2H-PUBLISH-04 unresolved canonical source integrity or quarantine suppresses writer signature",async()=>{
+    const {journal,issuer,witness}=await make();
+    const checkpoints=await journal.listVerifiedCheckpoints(),baseline=checkpoints[0]!;
+    const dirty={...baseline,payload:{...baseline.payload,reportSourceIntegrity:[{eventId:"unresolved"}]}};
+    await expect(issuer.issue({journal:{
+      latestDurableSequence:()=>journal.latestDurableSequence(),
+      listVerifiedCheckpoints:async()=>[dirty],
+    },witness,nowMs:NOW})).rejects.toMatchObject({reason:"UNRESOLVED_CANONICAL_SOURCE_INTEGRITY"});
+    const quarantined={...baseline,payload:{...baseline.payload,reportQuarantine:{disposition:"QUARANTINED_NON_FINAL"}}};
+    await expect(issuer.issue({journal:{
+      latestDurableSequence:()=>journal.latestDurableSequence(),
+      listVerifiedCheckpoints:async()=>[quarantined],
+    },witness,nowMs:NOW})).rejects.toMatchObject({reason:"UNRESOLVED_CANONICAL_SOURCE_INTEGRITY"});
+  });
+  it("G2H-PUBLISH-05 conflicting source snapshots at exact same durable cursor require reconcile",async()=>{
+    const {journal,issuer,witness}=await make();
+    const checkpoints=await journal.listVerifiedCheckpoints(),first=checkpoints[0]!;
+    const fork={...first,id:"competing-checkpoint",contentHash:"f".repeat(64)};
+    await expect(issuer.issue({journal:{
+      latestDurableSequence:()=>journal.latestDurableSequence(),
+      listVerifiedCheckpoints:async()=>[first,fork],
+    },witness,nowMs:NOW})).rejects.toMatchObject({reason:"CHECKPOINT_ECONOMIC_AMBIGUITY"});
+  });
+  it("G2H-PUBLISH-06 concurrent attestations never reuse the same sequence in one process",async()=>{
+    const {journal,issuer,witness}=await make();
+    let unblock:()=>void=()=>{};
+    const hold=new Promise<void>(resolve=>unblock=resolve);
+    const delayed={
+      latestDurableSequence:async()=>{await hold;return journal.latestDurableSequence();},
+      listVerifiedCheckpoints:()=>journal.listVerifiedCheckpoints(),
+    };
+    const first=issuer.issue({journal:delayed,witness,nowMs:NOW});
+    await expect(issuer.issue({journal:delayed,witness,nowMs:NOW}))
+      .rejects.toMatchObject({reason:"CONCURRENT_SIGNING_NOT_FENCED"});
+    unblock();
+    const accepted=await first;
+    expect(accepted.manifestSequence).toBe(91);
+    const next=await issuer.issue({journal,witness,nowMs:NOW+1});
+    expect(next.manifestSequence).toBe(92);
+  });
+});
