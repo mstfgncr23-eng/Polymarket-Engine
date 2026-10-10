@@ -256,6 +256,47 @@ extending the gate with optional features.
   and was fixed in the scoped H3 code, not deferred. This entry is
   only additional operator-facing observability.
 
+### GI-017 | Reproducible performance baseline reports in CI and dashboards
+- Stage: after H4 capacity acceptance, optional developer ergonomics.
+- Status: **OPEN / KNOWN manual result collection**.
+- Found during: H4 historical-rate and repeated paced benchmark,
+  `G2H_H4_HISTORICAL_RATES_AND_PACED_LOCAL_BENCH_20261011.md`.
+- Evidence: the H4 `vitest` harness emits structured
+  `G2H_H4_PG_PROFILE` and `G2H_H4_BOOK_PROFILE` lines.
+  Readiness/parity assertions are automated but comparison of percentiles
+  between different laptop runs remains a manual step.
+- Opportunity: after target workload/resource gate is settled, archive
+  machine-readable normalized run profiles and make opt-in trend
+  comparisons. Normalize CPU core count, schema/fixtures and sampling
+  windows rather than assuming raw p99 latency is portable.
+- Failure modes: noisy CI machines cause false regressions, short 6s
+  samples masquerade as multi-hour stability, benchmark fixture becomes
+  an unintended production credential loader.
+- Suggested validation: run same pinned disposable fixture on two
+  isolated target-equivalent machines and quantify variance. No
+  scheduled production monitoring, new service, or remote DB access.
+- Boundary: H-05 still MANDATES real load-shape, duration and resource
+  measurements. This entry defers only optional ongoing automation.
+
+### GI-018 | Separate Guardian-only CPU from combined load-generator process
+- Stage: post-H4 profiling refinement after correctness gate; if H4
+  cannot identify a throughput bottleneck, this becomes blocking there.
+- Status: **OPEN / KNOWN mixed CPU measurement**.
+- Found during: H4 benchmark when `process.cpuUsage()` necessarily
+  included synthetic PostgreSQL writer and Guardian reader/ACK work
+  in the SAME Node/Vitest process. DB Docker CPU was only sampled
+  once, separately.
+- Opportunity: run writer and read-only Guardian profiler in
+  separate local processes or cgroups with controlled CPU quotas to
+  isolate the actual replay/rebase CPU vs writer and Vitest overhead.
+  Keep exact same PostgreSQL global ordering and read-only role.
+- Failure modes: extra test-process complexity, timing artifacts and
+  false bottleneck attribution. Do not introduce IPC into production
+  merely to make benchmarks convenient.
+- Suggested validation: compare idle/reader-only/write-only/combined
+  CPU ms per 1,000 durable rows, at the same source load and byte
+  distribution. No architecture decision without measurements.
+
 ## NOT optional backlog items: current required work (cross-reference only)
 
 Do **not** defer the following because they determine whether the planned

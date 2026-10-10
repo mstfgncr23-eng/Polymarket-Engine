@@ -30,7 +30,20 @@ is NEVER permission to expand H1-H4 or implement a deferred change.
 | H-02 consistent checkpoint/replay | Non-signed `guardian-trusted-pg-bootstrap.ts`; one-snapshot `readGuardianConsistentPage`, canonical reducer | First-page checkpoint+tail + real gap/tamper/concurrent-commit tested; repeated pages, checkpoint rotation and ACK resume not yet integrated | PARTIAL |
 | H-03 restart/ACK | V2 no-sign ACK/replay, 26 offline tests; real PostgreSQL retained-CP lookup beyond newest 64, compaction/restart, pinned-deletion HALT | Safe parity rebase and 8,200-row progression PASS; **producer CP cadence/lease, target FS crash durability, source failover remain blockers** | PARTIAL |
 | H-04 independent paired books | Standalone adapter H3 tests: 40/40 pairs in four bounded shards; 30 stay READY when one shard's 10 are BLOCKED, scoped reconnect, slow fourth-shard startup, silent sync/epoch loss | Offline four-shard functional tests PASS; **real sustained book age, overflow, paced traffic and latency under H4 load not yet proved**. Independent process supervisor belongs G2I, not H-04 | PARTIAL |
-| H-05 bounded health/capacity | 100/1000/8192 synthetic row tests; 313/313 regression at baseline | Synthetic event timestamps are NOT paced; no local Postgres CPU/lag/heap envelope, no full paired-book replay workload, operation-key retention hard halts | PARTIAL |
+| H-05 bounded health/capacity | Verified two real soak exports: 0.026/0.035 durable rows/s average, peaks 4/5 rows per second; separate local paced 5/s and 20/s PostgreSQL runs 2x each, 40-market 4-shard 80 full-book/s runs 2x each | Synthetic event payloads/books smaller than real source, only 6s runs; queue high-water seam zero, local laptop not target VPS, no continuous DB CPU or long-run heap envelope, no target lag budget | PARTIAL |
+
+## H4 measured historical rates + local paced capacity (2026-10-11)
+
+- `G2H_H4_HISTORICAL_RATES_AND_PACED_LOCAL_BENCH_20261011.md`
+  has checksum-confirmed aggregate durable rates from both actual soak
+  exports, measured local 5/s and 20/s PostgreSQL ACK profiles (two
+  repeats each), and 80/s four-shard full-book source-age profiles.
+- The real observed durable average is just 0.026/0.035 rows/s,
+  NOT the earlier 100/s synthetic stress scenario. The new H4 suite
+  intentionally has a separate guarded local database/port from H1.
+- H-05 remains PARTIAL: actual 5KB business-event shapes, true
+  book depth/rate, queue saturation, target 2-vCPU limits and multi-hour
+  resource/fault evidence remain unverified.
 
 ## H3 four-shard/40-market functional evidence (2026-10-11)
 
