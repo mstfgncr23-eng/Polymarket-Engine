@@ -159,7 +159,8 @@ export function bootstrapGuardianOfflineSource(input: {
       cursor:parseCheckpointDurableCursor(payload),open:visible(recovery),
       settledMarkets:[...recovery.settledMarkets],
     });
-    if (result.status!=="APPLIED") fail("BOOTSTRAP_"+result.reason);
+    if (result.status==="REJECTED") fail("BOOTSTRAP_"+result.reason);
+    if (result.status==="DUPLICATE") fail("BOOTSTRAP_UNEXPECTED_DUPLICATE");
     return {projection:result.projection,recovery,seenOperationKeys:new Set()};
   } catch(error) {
     if (error instanceof GuardianOfflineSourceRejected) throw error;
