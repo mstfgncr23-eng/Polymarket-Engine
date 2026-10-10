@@ -21,6 +21,7 @@ type Internals = {
   commitAuthoritative(input: Record<string, unknown>): Promise<unknown>;
   admitRiskReduction(owner: RiskReductionOwnership): Promise<boolean>;
   durableGate: { run<T>(callback: () => Promise<T>): Promise<T> };
+  awaitGuardianPersistence(marketId: string): Promise<void>;
   onMinOrderSizeHydrated(event: { tokenId: string; minOrderSize: string; tokenEpoch: number }): void;
   applyFill(...args: unknown[]): Promise<boolean>;
 };
@@ -107,6 +108,9 @@ async function publishSensor(s: Scenario, ratio: string, pressure = true, quanti
   down.bids[0]!.quantity = pressure ? String(Number(quantity) * 3) : quantity;
   down.asks[0]!.quantity = pressure ? quantity : String(Number(quantity) * 3);
   await s.market.emitSnapshot(up); await s.market.emitSnapshot(down);
+  // Asynchronous snapshot ingestion schedules Guardian persistence; wait for the
+  // durable projection, not just the in-memory observation, in PAPER tests.
+  await internal(s).awaitGuardianPersistence(MARKET);
 }
 async function armEarly(s: Scenario) {
   await publishSensor(s, ".75");
@@ -305,7 +309,10 @@ describe("Guardian V2 durable recovery and crash boundaries", () => {
     } finally { await s.engine.stop(); }
   });
   it("duplicate late event id and old observation cannot rearm after release/restart", async () => {
-    let s = await start(); try { await seed(s); await armLate(s); const original = event(s, "late-arm");
+    let s = await start(); try { await seed(s); await armLate(s);
+      // Re-deliver the exact persisted event; same ID with a different recordedAt
+      // is an identity conflict, not an idempotent duplicate.
+      const original = (await rows(s, "CONSENSUS_DECISION")).find(row => row.id === "late-arm")!;
       await s.engine.persistReportInput(original); const revision = state(s)?.revision;
       await s.engine.persistReportInput(original); expect(state(s)?.revision).toBe(revision);
       s.clock.ms += 30000; await publishSensor(s, ".60", false); expect(state(s)?.phase).toBe("OBSERVING");
@@ -316,12 +323,15 @@ describe("Guardian V2 durable recovery and crash boundaries", () => {
   it("late arm recovers source row after commit-before-apply crash", async () => {
     let s = await start(); try { await seed(s); s.clock.ms = START + 200000; await publishSensor(s, ".60");
       const position = s.engine.ledger.positions.get(MARKET)!;
-      const key = `reversal:${position.id}:${position.unhedgedStartedAt ?? position.openedAt}:v2:1`;
+      // The running V2 experiment uses formatGeneration=3, whose durable key
+      // includes the g3 suffix. A legacy key would never trigger this fault.
+      const key = `reversal:${position.id}:${position.unhedgedStartedAt ?? position.openedAt}:v2g3:1`;
       s.engine.setCrashInjectionForTest("AFTER_DURABLE_COMMIT_BEFORE_APPLY", { operationKey: key });
-      await expect(observe(s, "crash-late")).rejects.toThrow("CRASH_INJECTED");
+      const original = event(s, "crash-late");
+      await expect(s.engine.persistReportInput(original)).rejects.toThrow("CRASH_INJECTED");
       s = await restart(s); expect(state(s)?.phase).toBe("LATE_CONFIRMATION");
       expect((await rows(s, "CONSENSUS_DECISION")).filter(r => r.id === "crash-late")).toHaveLength(1);
-      await observe(s, "crash-late"); expect(state(s)?.revision).toBe(1);
+      await s.engine.persistReportInput(original); expect(state(s)?.revision).toBe(1);
     } finally { await s.engine.stop(); }
   });
   it.each(["admission", "fill"])("crash after %s resumes original order exactly once", async boundary => {
