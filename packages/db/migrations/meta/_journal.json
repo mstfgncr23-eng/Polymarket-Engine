@@ -71,6 +71,13 @@
       "when": 1788715629600,
       "tag": "0009_replay_scope",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1791720000000,
+      "tag": "0010_guardian_recovery_registry",
+      "breakpoints": true
     }
   ]
 }

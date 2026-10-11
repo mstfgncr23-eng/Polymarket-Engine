@@ -27,10 +27,28 @@ is NEVER permission to expand H1-H4 or implement a deferred change.
 | Frozen requirement | Reusable source/tests | Proof gap | Status |
 |---|---|---|---|
 | H-01 trusted DB/role | `PostgresEventJournal.readGuardianConsistentPage`, isolated PostgreSQL 17 tests | Real isolated SELECT-only role + RLS proof PASS; production DB identity/credential/TLS and provisioning unverified | PARTIAL |
-| H-02 consistent checkpoint/replay | Real isolated PG compaction/reader HALT; default-true automatic recovery HOLD; **new standalone PostgreSQL advisory-lock protocol fixture tests sealed roster, two pinned readers, epoch-fenced rebase, registration race and rollback (not wired to Engine)** | Actual durable pin/receipt registry, RLS supervisor, journal compactor + checkpoint-pruner integration and crash/failover/long-run retention still missing | PARTIAL |
+| H-02 consistent checkpoint/replay | Safe replay/rebase, default recovery HOLD, atomic SQL protocol fixture; **new additive 0010 real PG RLS sealed roster and FK-pinned checkpoint registration, maintenance-only API and SQL pruner refusal when pinned** | No independent trusted enrollment/supervisor completeness proof, no durable DB receipt advance, no atomic real durable compactor+checkpoint pruner coordination, no crash/failover/long-run validation; HOLD remains ON | PARTIAL |
 | H-03 restart/ACK | V2 read-only ACK/replay and long replay-key tests; **real isolated PG injection before/after ACK rename, cursor1 vs durable ACK3 and restart to5 without skipping; safe restart after deletion** | Simulated crash only, no actual target-fs/power-cut durability or coordinated consumer lease; source failover unverified | PARTIAL |
 | H-04 independent paired books | Standalone adapter H3 tests: 40/40 pairs in four bounded shards; 30 stay READY when one shard's 10 are BLOCKED, scoped reconnect, slow fourth-shard startup, silent sync/epoch loss | Offline four-shard functional tests PASS; **real sustained book age, overflow, paced traffic and latency under H4 load not yet proved**. Independent process supervisor belongs G2I, not H-04 | PARTIAL |
 | H-05 bounded health/capacity | Historical 1,779-row byte/rate distribution; 2-CPU 20/s shaped PG and 40-market 32-level books; real PG economic cases: single-market fault tests 3/3 and multi-market 12-cursor owned-maker checkpoint rebase/rollback parity PASS | Semantic fixture coverage still only a few scripted markets, not historical complete event mix; 4-6s paced repeats, zero queue-highwater, not target-like long soak or actual two-vCPU deployment lag budget | PARTIAL |
+
+## H2 real persistent recovery-roster registry, still NO cleanup authority (2026-10-11)
+
+- `G2H_H2_DURABLE_ROSTER_REGISTRY_20261011.md`:
+  new migration `0010_guardian_recovery_registry.sql` and
+  `@pm/db` `PostgresGuardianRecoveryRegistry` store a sealed,
+  nonempty explicit required-consumer roster with real verified
+  checkpoint/hash/experiment checks, under global SQL mutation
+  lock. Read-only observer role cannot alter roster.
+- A DB foreign key now refuses deletion of an ACTUALLY PINNED
+  `engine_checkpoints` row even via direct existing pruner.
+  This does NOT prevent direct durable-transition compaction.
+  No production migrations applied, no Guardian ACK publication
+  or automatic pin progression introduced.
+- Mandatory H2 remains: trusted coordinator and DB-authoritative
+  receipt safety under local ACK rollback, authenticated membership,
+  bounded serial atomic compactor AND checkpoint-pruner fence.
+  `guardianRecoveryHold` unchanged and TRUE.
 
 ## H2 atomic pin-fence protocol research and isolated SQL race proof (2026-10-11)
 

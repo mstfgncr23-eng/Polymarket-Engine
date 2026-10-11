@@ -1,6 +1,7 @@
 export * from "./access.js";
 export * from "./durable.js";
 export * from "./journal.js";
+export * from "./guardian-recovery-registry.js";
 export * from "./reports.js";
 export * from "./scan.js";
 export * from "./schema.js";

@@ -364,6 +364,11 @@ extending the gate with optional features.
   serialization and rollback, but is NOT wired into production
   compactor or receipt authority. Completion of those gates
   is mandatory H2 and **not** this optional metrics backlog.
+  `G2H_H2_DURABLE_ROSTER_REGISTRY_20261011.md` now includes
+  an actual PostgreSQL additive registration schema and
+  foreign-key checkpoint safety, but deliberately still has
+  no authenticated receipt advancement or compaction authority.
+  The remaining H2 coordination is STILL MANDATORY.
 - Failure modes: treating a stale metric as proof of ACK progress,
   accidentally enabling cleanup, treating dashboard visibility
   as a coordination protocol, extra CPU/db read costs.
