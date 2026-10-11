@@ -340,6 +340,28 @@ extending the gate with optional features.
   **mandatory H-02/H-05 requirements**, never deferred by this entry.
   Only refactoring common test fixture scaffolding is optional.
 
+### GI-020 | Retention observability for pinned consumer checkpoints
+- Stage: optional operations ergonomics **after H-02 retention safety
+  and consumer-pin coordination are already demonstrated**.
+- Status: OPEN / KNOWN telemetry visibility gap.
+- Found during: `G2H_H2_RETENTION_CRASH_LOCAL_PG_20261011.md`,
+  true PostgreSQL compaction and two distinct consumer receipts.
+- Evidence: current RetentionManager uses the second newest verified
+  checkpoint as the compaction cursor, while a lagging Guardian
+  may still be pinned to an older checkpoint. Tests prove that it
+  HALTs without skipping; they do NOT prove retention liveness.
+- Opportunity: once the mandatory retention fence exists, expose
+  its oldest protected checkpoint/cursor, age of stale consumers,
+  blocked deletion count and explicit reconciliation status in
+  existing telemetry, without creating a second economic authority.
+- Failure modes: treating a stale metric as proof of ACK progress,
+  accidentally enabling cleanup, treating dashboard visibility
+  as a coordination protocol, extra CPU/db read costs.
+- Validation: show state after compaction waits for a pinned
+  consumer and after the consumer performs a parity-proven rebase.
+- BOUNDARY: **H-02 producer/consumer retention coordination is
+  NOT DEFERRED.** Only a nice-to-have UI and metrics are optional.
+
 ## NOT optional backlog items: current required work (cross-reference only)
 
 Do **not** defer the following because they determine whether the planned
