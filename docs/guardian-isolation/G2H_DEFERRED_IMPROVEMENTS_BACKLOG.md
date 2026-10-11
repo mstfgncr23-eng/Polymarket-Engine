@@ -358,6 +358,12 @@ extending the gate with optional features.
   `guardianRecoveryHeld` in `RetentionCycleResult` and prevents
   recovery-table automatic deletion by default; this boolean is
   **not** a consumer pin/lease protocol.
+  A separate 2026-10-11 real PostgreSQL SQL-protocol fixture
+  (`G2H_H2_ATOMIC_RETENTION_PIN_PROTOCOL_20261011.md`) validates
+  sealed roster, epoch/CAS, required checkpoint pins, registration
+  serialization and rollback, but is NOT wired into production
+  compactor or receipt authority. Completion of those gates
+  is mandatory H2 and **not** this optional metrics backlog.
 - Failure modes: treating a stale metric as proof of ACK progress,
   accidentally enabling cleanup, treating dashboard visibility
   as a coordination protocol, extra CPU/db read costs.
