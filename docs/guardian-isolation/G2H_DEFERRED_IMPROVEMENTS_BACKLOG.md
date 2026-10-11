@@ -354,6 +354,10 @@ extending the gate with optional features.
   its oldest protected checkpoint/cursor, age of stale consumers,
   blocked deletion count and explicit reconciliation status in
   existing telemetry, without creating a second economic authority.
+  The temporary mandatory safety fix now exposes
+  `guardianRecoveryHeld` in `RetentionCycleResult` and prevents
+  recovery-table automatic deletion by default; this boolean is
+  **not** a consumer pin/lease protocol.
 - Failure modes: treating a stale metric as proof of ACK progress,
   accidentally enabling cleanup, treating dashboard visibility
   as a coordination protocol, extra CPU/db read costs.

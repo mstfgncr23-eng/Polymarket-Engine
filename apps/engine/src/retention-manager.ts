@@ -20,6 +20,11 @@ export interface RetentionConfig {
   completedGraceMs: number;
   mcpIdempotencyTtlMs: number;
   checkpointKeep: number;
+  /** G2H temporary safety: never destroy checkpoints or durable prefix
+   * without a proven coordinator of every Guardian's pinned receipt.
+   * Conservative hold, NOT a consumer-pin lease or completed liveness fix.
+   */
+  guardianRecoveryHold: boolean;
   batchSize: number;
   cycleBudgetMs: number;
   maxBatchesPerCycle: number;
@@ -55,6 +60,8 @@ export interface RetentionCycleResult {
   transientEligible: boolean;
   monitorOnlyEligible: boolean;
   durableTransitionsPruned: boolean;
+  /** True when checkpoint deletion and durable compaction are withheld. */
+  guardianRecoveryHeld: boolean;
   durableCompaction?: { deleted: number; cursor: number; highWater: number; compactedOperationKeys: number };
   eligibleBacklog: number;
 }
@@ -85,6 +92,7 @@ export function retentionConfigFromEngineEnv(env: RetentionEnv): RetentionConfig
     completedGraceMs: env.RETENTION_COMPLETED_GRACE_MS,
     mcpIdempotencyTtlMs: env.RETENTION_MCP_IDEMPOTENCY_TTL_MS,
     checkpointKeep: env.RETENTION_CHECKPOINT_KEEP,
+    guardianRecoveryHold: true,
     batchSize: env.RETENTION_BATCH_SIZE,
     cycleBudgetMs: env.RETENTION_CYCLE_BUDGET_MS,
     maxBatchesPerCycle: env.RETENTION_MAX_BATCHES_PER_CYCLE,
@@ -109,6 +117,11 @@ export function defaultRetentionConfig(overrides: Partial<RetentionConfig> = {})
     completedGraceMs: overrides.completedGraceMs ?? RETENTION_DEFAULTS.completedGraceMs,
     mcpIdempotencyTtlMs: overrides.mcpIdempotencyTtlMs ?? RETENTION_DEFAULTS.mcpIdempotencyTtlMs,
     checkpointKeep: overrides.checkpointKeep ?? RETENTION_DEFAULTS.checkpointKeep,
+    // Fail closed even for future manually constructed managers:
+    // ONLY explicitly scoped legacy/maintenance tests opt out.
+    // This temporary hold is not a substitute for a certified
+    // consumer-aware pin/lease retention protocol.
+    guardianRecoveryHold: overrides.guardianRecoveryHold ?? true,
     batchSize: clampRetentionBatchSize(overrides.batchSize ?? RETENTION_DEFAULTS.batchSize),
     cycleBudgetMs: overrides.cycleBudgetMs ?? RETENTION_DEFAULTS.cycleBudgetMs,
     maxBatchesPerCycle: overrides.maxBatchesPerCycle ?? RETENTION_DEFAULTS.maxBatchesPerCycle,
@@ -224,7 +237,8 @@ export class RetentionManager {
     const empty: RetentionCycleResult = {
       skipped: true, skipReason: null, deletedByClass, failures: 0, durationMs: 0,
       batchCount: 0, lastBatchSize: 0, lastBatchDurationMs: 0, transientEligible: false,
-      monitorOnlyEligible: false, durableTransitionsPruned: false, eligibleBacklog: 0,
+      monitorOnlyEligible: false, durableTransitionsPruned: false,
+      guardianRecoveryHeld: this.config.guardianRecoveryHold, eligibleBacklog: 0,
     };
     if (!this.config.enabled) return { ...empty, skipReason: "disabled" };
     if (!context.databaseUp) return { ...empty, skipReason: "database_down" };
@@ -402,11 +416,11 @@ export class RetentionManager {
             limit,
           ),
         },
-        {
+        ...(!this.config.guardianRecoveryHold ? [{
           cls: "checkpoint",
           exhausted: false,
-          work: (limit) => this.journal.pruneOldCheckpoints(this.config.checkpointKeep, limit),
-        },
+          work: (limit: number) => this.journal.pruneOldCheckpoints(this.config.checkpointKeep, limit),
+        }] : []),
       ];
 
       let progressed = true;
@@ -477,6 +491,7 @@ export class RetentionManager {
       let durableCompaction: RetentionCycleResult["durableCompaction"];
       if (
         this.config.compactionEnabled
+        && !this.config.guardianRecoveryHold
         && this.journal.compactDurableTransitionsThrough
         && this.journal.listVerifiedCheckpoints
       ) {
@@ -520,6 +535,7 @@ export class RetentionManager {
         transientEligible,
         monitorOnlyEligible,
         durableTransitionsPruned: Boolean(durableCompaction?.deleted),
+        guardianRecoveryHeld: this.config.guardianRecoveryHold,
         durableCompaction,
         eligibleBacklog: telemetryEligible.count + monitorEligible.count + operationalEligible.count + canonicalBacklog,
       };
@@ -539,6 +555,7 @@ export class RetentionManager {
         transientEligible: false,
         monitorOnlyEligible: false,
         durableTransitionsPruned: false,
+        guardianRecoveryHeld: this.config.guardianRecoveryHold,
         eligibleBacklog: 0,
       };
     } finally {

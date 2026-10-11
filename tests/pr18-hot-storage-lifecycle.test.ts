@@ -764,7 +764,9 @@ describe("PR18 hot operational storage lifecycle", () => {
     }
     await journal.saveCheckpoint({ experimentId: "exp-pr18", sequence: 1, payload: checkpointPayload(cursor) });
     await journal.saveCheckpoint({ experimentId: "exp-pr18", sequence: 2, payload: checkpointPayload(cursor) });
-    const manager = new RetentionManager(journal, defaultRetentionConfig({ enabled: true, compactionEnabled: true, checkpointKeep: 4 }));
+    const manager = new RetentionManager(journal, defaultRetentionConfig({ enabled: true, compactionEnabled: true, checkpointKeep: 4,
+      // Explicit legacy maintenance semantics only; production defaults HOLD.
+      guardianRecoveryHold: false }));
     const result = await manager.runCycle({ experiment: null, now: new Date("2026-01-01T00:00:00.000Z"), degraded: false, failClosed: false, databaseUp: true });
     expect(result.durableTransitionsPruned).toBe(true);
     expect(result.durableCompaction?.deleted).toBe(3);

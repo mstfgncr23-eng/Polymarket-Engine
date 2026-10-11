@@ -1225,7 +1225,8 @@ describe("Step-4 residual: checkpoint prune honors remaining cycle rows", () => 
     const journal = new MemoryEventJournal();
     await seedCheckpoints(journal, 220);
     const manager = new RetentionManager(journal, defaultRetentionConfig({
-      enabled: true, checkpointKeep: 1, batchSize: 200, maxRowsPerCycle: 50,
+      enabled: true, checkpointKeep: 1, guardianRecoveryHold: false,
+      batchSize: 200, maxRowsPerCycle: 50,
       maxBatchesPerCycle: 8, cycleBudgetMs: 10_000, telemetryTtlMs: 1, monitorTtlMs: 1,
     }));
     const result = await manager.runCycle({
@@ -1246,7 +1247,8 @@ describe("Step-4 residual: checkpoint prune honors remaining cycle rows", () => 
     }
     await seedCheckpoints(journal, 220);
     const manager = new RetentionManager(journal, await localArchiveRetentionConfig({
-      enabled: true, checkpointKeep: 1, batchSize: 200, maxRowsPerCycle: 50,
+      enabled: true, checkpointKeep: 1, guardianRecoveryHold: false,
+      batchSize: 200, maxRowsPerCycle: 50,
       maxBatchesPerCycle: 8, cycleBudgetMs: 10_000, telemetryTtlMs: 1, monitorTtlMs: 1,
     }));
     const result = await manager.runCycle({

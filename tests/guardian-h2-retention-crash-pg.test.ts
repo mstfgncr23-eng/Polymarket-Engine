@@ -13,7 +13,9 @@ import {bootstrapGuardianOfflineSource,advanceGuardianOfflineSource}
   from "../apps/engine/src/guardian-offline-durable-source.js";
 import {hashGuardianRecoverableState} from "../apps/engine/src/guardian-readonly-session.js";
 import {emptyResultAccounting} from "../apps/engine/src/trading-results.js";
-import {paperFill} from "./paper-engine-testkit.js";
+import {paperFill,qualifiedPaperEnv} from "./paper-engine-testkit.js";
+import {RetentionManager,retentionConfigFromEngineEnv,defaultRetentionConfig}
+  from "../apps/engine/src/retention-manager.js";
 
 const pg=createRequire(new URL("../packages/db/package.json",import.meta.url))("postgres");
 const migrations=fileURLToPath(new URL("../packages/db/migrations",import.meta.url));
@@ -213,6 +215,37 @@ describe.skipIf(!RAW)("H2 local PG retention and ambiguous ACK outcome",()=>{
     const cp3=await admin.saveCheckpoint({
       experimentId:E,sequence:3,payload:body(5,recovered.recovery),
     });
+    // The real Engine and CLI derive their retention configuration from
+    // EngineEnv. Even if operator enables retention + compaction and
+    // sets checkpointKeep=1, G2H must HOLD all destructive recovery
+    // cleanup until consumer pin coordination exists.
+    const livePolicy=retentionConfigFromEngineEnv(qualifiedPaperEnv({
+      RETENTION_ENABLED:"true",
+      RETENTION_COMPACTION_ENABLED:"true",
+      RETENTION_CHECKPOINT_KEEP:"1",
+    }));
+    expect(livePolicy.guardianRecoveryHold).toBe(true);
+    expect(defaultRetentionConfig().guardianRecoveryHold).toBe(true);
+    // Holding both cleanup paths must be the default even when a future
+    // caller constructs a manager without EngineEnv.
+    const managed=new RetentionManager(admin,{
+      ...livePolicy,enabled:true,compactionEnabled:true,checkpointKeep:1,
+      localArchiveEnabled:false,analyticsRollupEnabled:false,
+      cycleBudgetMs:10000,maxRowsPerCycle:100,maxBatchesPerCycle:5,
+    },undefined,null);
+    const automated=await managed.runCycle({
+      experiment:{id:E,status:"RUNNING",startedAt:T},
+      now:new Date(),degraded:false,failClosed:false,databaseUp:true,
+    });
+    expect(automated.failures).toBe(0);
+    expect(automated.guardianRecoveryHeld).toBe(true);
+    expect(automated.deletedByClass.checkpoint).toBe(0);
+    expect(automated.deletedByClass.durable_transition).toBe(0);
+    expect(automated.durableTransitionsPruned).toBe(false);
+    expect((await sql`SELECT count(*)::int AS total FROM engine_checkpoints`)[0]?.total).toBe(3);
+    expect((await sql`SELECT count(*)::int AS total FROM durable_transitions`)[0]?.total).toBe(5);
+    // The next direct maintenance calls deliberately BYPASS RetentionManager
+    // to show exactly what would strand an uncoordinated consumer.
     await healthy.poll(Date.now());
     const adopted=await primaryAck.load();
     expect([cp2.id,cp3.id]).toContain(adopted?.checkpointId);

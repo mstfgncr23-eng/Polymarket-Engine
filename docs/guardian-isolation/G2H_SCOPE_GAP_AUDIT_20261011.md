@@ -27,10 +27,26 @@ is NEVER permission to expand H1-H4 or implement a deferred change.
 | Frozen requirement | Reusable source/tests | Proof gap | Status |
 |---|---|---|---|
 | H-01 trusted DB/role | `PostgresEventJournal.readGuardianConsistentPage`, isolated PostgreSQL 17 tests | Real isolated SELECT-only role + RLS proof PASS; production DB identity/credential/TLS and provisioning unverified | PARTIAL |
-| H-02 consistent checkpoint/replay | Canonical consistent SQL reader and parity rebase, 3-market 12-cursor lifecycle; **real isolated PG compaction deleted 5, kept 5 replay identities, pruned oldest CP, healthy cursor advanced to 6 while stale reader HALTed** | RetentionManager does NOT account for every consumer's pinned CP; stale reader liveness, CP cadence and target-fs crash remain unproved | PARTIAL |
+| H-02 consistent checkpoint/replay | Real isolated PG SQL compaction and old-reader HALT; **new automatic RetentionManager G2H recovery HOLD defaults true, withholding both checkpoint pruning and durable compaction under unknown reader pins** | Temporary safety HOLD preserves correctness but blocks automatic economic cleanup; actual per-consumer atomic pin/lease coordination, cadence, target-fs crash and storage bounds unproved | PARTIAL |
 | H-03 restart/ACK | V2 read-only ACK/replay and long replay-key tests; **real isolated PG injection before/after ACK rename, cursor1 vs durable ACK3 and restart to5 without skipping; safe restart after deletion** | Simulated crash only, no actual target-fs/power-cut durability or coordinated consumer lease; source failover unverified | PARTIAL |
 | H-04 independent paired books | Standalone adapter H3 tests: 40/40 pairs in four bounded shards; 30 stay READY when one shard's 10 are BLOCKED, scoped reconnect, slow fourth-shard startup, silent sync/epoch loss | Offline four-shard functional tests PASS; **real sustained book age, overflow, paced traffic and latency under H4 load not yet proved**. Independent process supervisor belongs G2I, not H-04 | PARTIAL |
 | H-05 bounded health/capacity | Historical 1,779-row byte/rate distribution; 2-CPU 20/s shaped PG and 40-market 32-level books; real PG economic cases: single-market fault tests 3/3 and multi-market 12-cursor owned-maker checkpoint rebase/rollback parity PASS | Semantic fixture coverage still only a few scripted markets, not historical complete event mix; 4-6s paced repeats, zero queue-highwater, not target-like long soak or actual two-vCPU deployment lag budget | PARTIAL |
+
+## H2 temporary fail-closed retention safety policy (2026-10-11)
+
+- `G2H_H2_TEMPORARY_RETENTION_HOLD_20261011.md`:
+  `RetentionConfig.guardianRecoveryHold` TRUE by default and always
+  TRUE in real Engine/CLI env-derived retention policy. Both
+  checkpoint pruning and durable compaction held while consumer
+  registration/pins cannot be authoritatively proven.
+- The real PG regression exercises an **enabled automatic cleanup
+  run** with `compactionEnabled=true`, `checkpointKeep=1`:
+  3/3 checkpoints retained, 5/5 durable rows retained, no failure,
+  old Guardian receipt unchanged. Deliberate direct admin calls
+  still demonstrate HALT, and are OUTSIDE this automatic hold.
+- Actual coordinated retention progress is **still mandatory H2**,
+  not an optional backlog item. This hold may grow PostgreSQL storage
+  and cannot be declared complete liveness or economic cleanup.
 
 ## H2 real PostgreSQL retention and ambiguous receipt (2026-10-11)
 
