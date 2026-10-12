@@ -21,12 +21,15 @@ Guardian restart reloads all currently open positions and persisted policy
 states. Missing, future, invalid or unsynchronized books block only their market.
 No absolute UP/DOWN timestamp-skew gate is used. Reconnect and blocked reasons,
 cycle duration, CPU and event-loop p99 are logged every five seconds. Engine's
-existing metrics provide its separate event-loop measurements. A request ACK
-means durable state persistence; actual PAPER execution is proven by its fills.
+existing metrics provide its separate event-loop measurements. `QUEUED` admits
+an ordinary observation checkpoint to the existing bounded/coalescing lane;
+`PERSISTED` acknowledges durable state. Critical transitions and protection
+requests still wait for persistence. Actual PAPER execution is proven by fills.
 
 The runtime does not use the historical checkpoint issuer, manifest signatures,
 HMAC, roster registry, child supervisor, entry attestations, or acceptance gates.
-Historical modules and database records are left intact. Retention stays off.
+Historical modules and database records are left intact. Retention uses the
+existing local archive and existing second OVH upload/readback channel.
 In this mode a completed experiment's missing historical report does not block
 starting a new PAPER experiment; open economic obligations and journal integrity
 still do. Historical reports are never rewritten or presented as current.
@@ -63,3 +66,45 @@ experiment is not restarted implicitly: use the existing experiment-start API
 after verifying fresh feeds. Existing open experiments recover without reset.
 Keep old containers stopped for rollback; do not delete PG rows or volumes.
 Six-hour soak evidence must be reported separately from the targeted E2E tests.
+
+## Verified retention and the existing second OVH
+
+Compose enables retention, compaction and local archival. Keep the existing
+`/opt/polymarket-g4-private` upload key, verify key and known-hosts files; override
+`ARCHIVE_PRIVATE_DIR` only if these existing files live elsewhere. Only Engine
+mounts them. No key, account or PostgreSQL migration is created.
+
+The existing `g4archive@141.95.162.252` restricted rsync root is
+`/data/polymarket-archive/g4-independent-paper/archive`. Current `polymarket`
+bundles go under its `simple-engine` subdirectory. Install the compatible
+`ovh-retention-verify.py` at the existing forced-command path
+`/usr/local/libexec/g4-ovh-retention-verify.py`, preserving the prior file as a
+backup. Existing G4 source/probe readback remains compatible. Historical archive
+directories are neither overwritten nor deleted; rsync uses `--ignore-existing`.
+
+The existing defaults remain: telemetry 6h; monitor/operational 24h; canonical
+completed-report grace 7d; MCP idempotency 24h; latest 8 checkpoints; DML batch
+200, budget 250ms, at most 20 batches/4,000 rows. Every journal purge requires
+local manifest/hash verification and remote byte/hash/event-scope verification.
+Canonical data additionally requires its complete final report and stable rollup.
+An unavailable archive records `retention deferred` and leaves trading running.
+
+Active experiment rows are fenced by its start. Compaction is bounded by two
+valid retained checkpoints and their durable/audit repair cursors; unresolved
+positions and orders hold their economic transitions hot. Exact checkpoint
+purge candidates and the bounded compaction prefix are backed up with the
+required replay tail before deletion. Open and unexpired operation keys survive
+the soft replay-key capacity limit. No archive-file deletion policy is introduced.
+
+`dist/archive-maintenance.js export-recovery` and `export-bucket` generate bounded
+read-only PostgreSQL evidence using the same transfer implementation. The former
+also checks actual Engine replay parity. `verify-recovery <directory>` checks a
+downloaded remote bundle offline, without starting Engine or connecting to a DB.
+The existing verify channel accepts `readFile` for an allowed bundle filename
+only after verifying the entire bundle; it streams the file for restore evidence.
+
+Validate and transfer/recover evidence before a controlled deployment. Let an
+ongoing PAPER window finish before replacing its Engine just to change settings.
+Report every interruption; elapsed six hours with restarts is not an uninterrupted
+soak. The deployed latency logs contain each sampled cycle's view/evaluation/
+update durations and the Engine socket wait/handler times, without secrets.

@@ -199,6 +199,9 @@ export interface RetentionReplicaVerifier {
 
 export class RetentionManager {
   private running = false;
+  // Three retention classes only. Reuse a sealed bucket across bounded drains;
+  // a moving global commit fence must not re-export all remaining rows each cycle.
+  private readonly sealedBuckets = new Map<string, JournalBucketArchiveManifest>();
   private readonly lastSuccessAt = { value: null as string | null };
   private readonly archive: LocalJournalArchive | null;
   runs = 0;
@@ -362,22 +365,27 @@ export class RetentionManager {
           // and must use wall clock so deterministic/test nowFn values cannot
           // exclude rows that are already committed.
           const recordedAtTo = new Date(Math.max(Date.now(), context.now.getTime()));
+          const cached = this.sealedBuckets.get(cls);
+          const reuse = cached?.occurredFrom === bucket.from.toISOString()
+            && cached.occurredBefore === bucket.before.toISOString();
           const archived = await this.archive!.ensureJournalBucket(this.journal, {
             retentionClass: cls,
             eventTypes: types,
             occurredFrom: bucket.from,
             occurredBefore: bucket.before,
-            commitSeqTo,
-            recordedAtTo,
+            commitSeqTo: reuse ? cached.commitSeqTo : commitSeqTo,
+            recordedAtTo: reuse ? new Date(cached.recordedAtTo) : recordedAtTo,
             unattributedOnly,
           });
           if (!archived.verified || !archived.manifest) throw new Error(`LOCAL_ARCHIVE_${cls.toUpperCase()}_VERIFY_FAILED`);
           const manifest = archived.manifest;
           if (this.config.offsiteReplicaRequired) await this.replicaVerifier!.verifyJournalBucket({ directory: archived.directory, manifest });
+          this.sealedBuckets.set(cls, manifest);
           journalDrains.push({
             cls,
             exhausted: false,
-            work: (limit) => this.journal.deleteJournalEventsArchivedRange({
+            work: async (limit) => {
+              const result = await this.journal.deleteJournalEventsArchivedRange({
               types,
               occurredFrom: new Date(manifest.occurredFrom),
               occurredBefore: new Date(manifest.occurredBefore),
@@ -385,7 +393,10 @@ export class RetentionManager {
               recordedAtTo: new Date(manifest.recordedAtTo),
               unattributedOnly: manifest.unattributedOnly,
               limit,
-            }),
+              });
+              if (result.deleted < limit) this.sealedBuckets.delete(cls);
+              return result;
+            },
           });
         };
 
