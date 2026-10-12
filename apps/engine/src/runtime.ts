@@ -41,7 +41,7 @@ export async function startRuntime(envInput: NodeJS.ProcessEnv = process.env): P
   const guardian = env.GUARDIAN_SEPARATE_ENABLED ? await startGuardianSocket(envInput.GUARDIAN_SOCKET_PATH!, async input => {
     const kind = (input as { kind?: unknown } | null)?.kind;
     if (kind === "VIEW") return engine.guardianView();
-    if (kind === "UPDATE") return engine.acceptGuardianUpdate(input);
+    if (kind === "UPDATE") return engine.acceptGuardianUpdate(input, false);
     throw new Error("INVALID_GUARDIAN_MESSAGE");
   }) : null;
   const server = await createApiServer({

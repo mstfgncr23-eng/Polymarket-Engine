@@ -590,7 +590,7 @@ export class EngineService {
   constructor(
     readonly env: EngineEnv,
     private readonly journal: EventJournal,
-    private readonly logger: { error(bindings: object, message: string): void },
+    private readonly logger: { error(bindings: object, message: string): void; info?(bindings: object, message: string): void },
     adapters?: {
       market?: PolymarketMarketDataAdapter;
       btc?: BtcWebSocketAdapter;
@@ -1960,7 +1960,10 @@ export class EngineService {
     deadlineAt?: number;
   }): Promise<DurableCommitResult> {
     input = { ...input, occurredAt: input.occurredAt ? new Date(input.occurredAt.getTime()) : undefined };
+    const requestedAt = performance.now();
     return this.durableGate.run(async () => {
+      const gateWaitMs = performance.now() - requestedAt;
+      let resolveMs = 0, postgresMs = 0;
       const occurredAt = input.occurredAt ?? this.nowFn();
       this.crashInjector.maybeCrash("BEFORE_DURABLE_COMMIT", input.operationKey);
       let commit: DurableCommitResult;
@@ -1979,8 +1982,11 @@ export class EngineService {
         let payload: Record<string, unknown> | undefined;
         const expectedPreviousSequence = this.lastAppliedDurableCursor;
         commit = await retryPersistenceTransport(async () => {
+          const resolvingAt = performance.now();
           payload ??= await this.resolveDurablePayload(input, occurredAt, computed);
-          return this.journal.commitDurableTransition({
+          resolveMs += performance.now() - resolvingAt;
+          const postgresAt = performance.now();
+          try { return await this.journal.commitDurableTransition({
             operationKey: input.operationKey,
             type: input.type,
             aggregateType: input.aggregateType,
@@ -1990,7 +1996,7 @@ export class EngineService {
           }, expectedPreviousSequence, {
             signal: input.signal, deadlineAt: input.deadlineAt,
             beforeInsert: input.beforeCommit,
-          });
+          }); } finally { postgresMs += performance.now() - postgresAt; }
         }, { ...this.persistenceRetryOptions("durable"), signal: input.signal, deadlineAt: input.deadlineAt });
         this.metrics.noteDurableCommit(input.type, commit.inserted);
       } catch (error) {
@@ -2028,6 +2034,7 @@ export class EngineService {
         }
       }
       this.crashInjector.maybeCrash("AFTER_DURABLE_COMMIT_BEFORE_APPLY", input.operationKey);
+      const auditAt = performance.now();
       let applied: boolean;
       try {
         if (commit.transition.sequence > this.lastAppliedDurableCursor + 1) {
@@ -2050,6 +2057,11 @@ export class EngineService {
       this.crashInjector.maybeCrash("AFTER_DERIVED_AUDIT_BEFORE_CHECKPOINT", input.operationKey);
       if (input.checkpoint) await this.checkpointInsideGate();
       this.crashInjector.maybeCrash("AFTER_CHECKPOINT", input.operationKey);
+      const totalMs = performance.now() - requestedAt;
+      if (this.env.GUARDIAN_SEPARATE_ENABLED && totalMs >= 1000) this.logger.info?.({
+        type: input.type, aggregateId: input.aggregateId, sequence: commit.sequence,
+        gateWaitMs, resolveMs, postgresMs, applyAuditMs: performance.now() - auditAt, totalMs,
+      }, "durable phase timing");
       return commit;
     });
   }
@@ -5750,7 +5762,7 @@ export class EngineService {
 
   /** Persist through the existing revision/episode/idempotency boundary, then
    * use the existing PR3/hedge/SELL arbitration. Only Engine writes orders. */
-  async acceptGuardianUpdate(input: unknown): Promise<{ status: string; reason?: string }> {
+  async acceptGuardianUpdate(input: unknown, waitForCheckpoint = true): Promise<{ status: string; reason?: string }> {
     const raw = input as { experimentId?: unknown; state?: unknown; events?: unknown } | null;
     const parsed = guardianV2StateSchema.safeParse(raw?.state);
     if (!parsed.success || !Array.isArray(raw?.events)) return { status: "REJECTED", reason: "INVALID_STATE" };
@@ -5776,7 +5788,19 @@ export class EngineService {
       return { status: "REJECTED", reason: "STATE_STALE_OR_FUTURE" };
     if (!this.guardianObservation(next.marketId, next.heldOutcome, now))
       return { status: "REJECTED", reason: "BOOK_UNAVAILABLE" };
-    const outcome = await this.enqueueGuardianPersistence(next, raw.events, raw.events.length || next.confirmedAt ? "critical" : "checkpoint");
+    const critical = next.revision === 1 || raw.events.length > 0 || !!next.confirmedAt
+      || (!!current && isGuardianV2State(current) && (current.phase !== next.phase || (current.badRegionSince !== null && next.badRegionSince === null)));
+    const persistence = this.enqueueGuardianPersistence(next, raw.events, critical ? "critical" : "checkpoint");
+    // Routine observation checkpoints already have a bounded, coalescing Engine
+    // persistence lane. Do not stall independent monitoring behind its durable
+    // gate. QUEUED is admission only; critical watches/decisions still await commit.
+    if (!critical && !waitForCheckpoint) {
+      void persistence.then(outcome => {
+        if (outcome.status === "FAILED") this.logger.error({ err: outcome.error, marketId: next.marketId }, "guardian checkpoint failed");
+      });
+      return { status: "QUEUED" };
+    }
+    const outcome = await persistence;
     if (outcome.status === "FAILED") throw outcome.error;
     if (next.confirmedAt && outcome.status === "PERSISTED") this.kickReversalProtection(next.marketId);
     return { status: outcome.status === "PERSISTED" ? "PERSISTED" : "REPLAY" };

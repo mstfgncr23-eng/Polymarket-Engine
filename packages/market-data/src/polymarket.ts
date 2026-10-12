@@ -600,6 +600,10 @@ export class PolymarketMarketDataAdapter {
                   if (resubscribed || generation !== this.streamGeneration) break;
                   await handlers.onSnapshot(snapshot);
                 }
+                // A buffered async iterator otherwise drains via microtasks and
+                // can starve local socket reads and PostgreSQL reply processing.
+                // Yield once per source frame; preserve every event and ordering.
+                await new Promise<void>(resolve => setImmediate(resolve));
               } catch (error) {
                 const normalized = error instanceof Error ? error : new Error(String(error));
                 if (normalized instanceof IngressOverflowError) {

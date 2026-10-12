@@ -79,27 +79,33 @@ export async function runGuardian(path: string, signal: AbortSignal): Promise<vo
   const monitor = new GuardianMonitor();
   const loop = monitorEventLoopDelay({ resolution: 20 }); loop.enable();
   let cycles = 0, errors = 0, lastLog = 0, lastCpu = process.cpuUsage(), lastAt = performance.now();
+  const samples: Array<{ cycleMs: number; viewMs: number; evaluateMs: number; updateMs: number; engineWaitMs: number | null; handlerMs: number | null }> = [];
   const log = (x: object) => console.log(JSON.stringify({ service: "guardian", at: new Date().toISOString(), pid: process.pid, ...x }));
   log({ event: "STARTED", socket: path, mode: "paper" });
   while (!signal.aborted) {
     const started = performance.now();
     try {
-      const view = await guardianRpc<GuardianView>(path, { kind: "VIEW" });
+      const view = await guardianRpc<GuardianView & { timing?: { engineWaitMs: number; handlerMs: number } }>(path, { kind: "VIEW" });
+      const viewMs = performance.now() - started;
       if (view.mode !== "paper" || Date.parse(view.now) > Date.now() + 1000) throw new Error("INVALID_ENGINE_VIEW");
+      const evaluationAt = performance.now();
       const result = monitor.evaluate(view);
+      const evaluateMs = performance.now() - evaluationAt, updatesAt = performance.now();
       for (const update of result.updates) {
         const reply = await guardianRpc<{ status: string; reason?: string }>(path, { kind: "UPDATE", ...update });
-        if (reply.status === "PERSISTED" || reply.status === "REPLAY") monitor.acknowledged(update.state.marketId, Date.now());
+        if (reply.status === "PERSISTED" || reply.status === "REPLAY" || reply.status === "QUEUED") monitor.acknowledged(update.state.marketId, Date.now());
         if (update.state.confirmedAt || reply.status === "REJECTED") log({ event: "REQUEST_RESULT", marketId: update.state.marketId,
           revision: update.state.revision, protectionReason: update.state.protectionReason, ...reply });
       }
       cycles++;
+      samples.push({ cycleMs: performance.now() - started, viewMs, evaluateMs, updateMs: performance.now() - updatesAt,
+        engineWaitMs: view.timing?.engineWaitMs ?? null, handlerMs: view.timing?.handlerMs ?? null });
       if (Date.now() - lastLog >= 5000) {
         const cpu = process.cpuUsage(), at = performance.now();
         log({ event: "CYCLE", cycles, errors, enginePid: view.enginePid, experimentId: view.experimentId,
           feed: view.feed, markets: result.markets, cycleMs: performance.now() - started,
           cpuPercent: (cpu.user + cpu.system - lastCpu.user - lastCpu.system) / ((at - lastAt) * 10),
-          eventLoopP99Ms: loop.percentile(99) / 1e6 });
+          eventLoopP99Ms: loop.percentile(99) / 1e6, timingSamples: samples.splice(0) });
         lastCpu = cpu; lastAt = at; lastLog = Date.now(); loop.reset();
       }
     } catch (error) {

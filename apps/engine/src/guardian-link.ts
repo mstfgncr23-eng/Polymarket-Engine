@@ -39,7 +39,7 @@ export function guardianRpc<T>(path: string, request: unknown): Promise<T> {
     socket.setTimeout(5000, () => fail(new Error("GUARDIAN_SOCKET_TIMEOUT")));
     socket.on("error", fail);
     socket.on("close", () => { if (!complete) fail(new Error("GUARDIAN_SOCKET_CLOSED")); });
-    socket.on("connect", () => socket.write(JSON.stringify(request) + "\n"));
+    socket.on("connect", () => socket.write(JSON.stringify({ ...(request as object), sentAtMs: Date.now() }) + "\n"));
     socket.setEncoding("utf8");
     socket.on("data", chunk => {
       buffer += chunk;
@@ -82,7 +82,13 @@ export async function startGuardianSocket(path: string, handler: (input: unknown
       if (!buffer.includes("\n")) return;
       handled = true;
       void (async () => {
-        try { socket.end(JSON.stringify(await handler(JSON.parse(buffer.slice(0, buffer.indexOf("\n"))))) + "\n"); }
+        try {
+          const input = JSON.parse(buffer.slice(0, buffer.indexOf("\n")));
+          const started = performance.now();
+          const engineWaitMs = typeof input.sentAtMs === "number" ? Math.max(0, Date.now() - input.sentAtMs) : null;
+          const reply = await handler(input);
+          socket.end(JSON.stringify({ ...(reply as object), timing: { engineWaitMs, handlerMs: performance.now() - started } }) + "\n");
+        }
         catch (error) { socket.end(JSON.stringify({ error: (error as Error).message }) + "\n"); }
       })();
     });

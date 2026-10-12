@@ -46,6 +46,24 @@ async function waitFor(check: () => boolean | Promise<boolean>, ms = 4000) {
 }
 
 describe("simple independent Guardian", () => {
+  it("acknowledges routine checkpoint admission without claiming durability or waiting behind a held write", async () => {
+    const s = await setup(); let release = () => undefined;
+    try {
+      expect((await s.engine.beginExperiment()).ok).toBe(true); await seed(s, "first"); books(s, "first");
+      const monitor = new GuardianMonitor();
+      await s.engine.acceptGuardianUpdate(monitor.evaluate(s.engine.guardianView(), s.clock.ms).updates[0]!);
+      const hold = new Promise<void>(resolve => { release = resolve; });
+      const original = s.journal.commitDurableTransition.bind(s.journal);
+      s.journal.commitDurableTransition = async (input, cursor, options) => { await hold; return original(input, cursor, options); };
+      s.clock.ms += 1000; books(s, "first", .76);
+      const update = monitor.evaluate(s.engine.guardianView(), s.clock.ms).updates[0]!;
+      expect((await s.engine.acceptGuardianUpdate(update, false)).status).toBe("QUEUED");
+      expect(s.engine.guardianView().markets[0]!.state!.revision).toBe(1);
+      release();
+      await waitFor(() => s.engine.guardianView().markets[0]!.state!.revision === update.state.revision);
+      expect(s.engine.integrityFault()).toBe(false);
+    } finally { release(); await s.engine.stop(); }
+  });
   it("discovers the second position dynamically; one bad/future/gapped book leaves the other monitoring", async () => {
     const s = await setup();
     try {
