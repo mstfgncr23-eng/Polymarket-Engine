@@ -1097,7 +1097,10 @@ export class EngineService {
       if (this.experiment?.status === "FAILED") {
         return { ok: false, blockers: ["EXPERIMENT_ALREADY_COMPLETED"], experiment: this.experiment };
       }
-      if (this.experiment?.status === "COMPLETED") {
+      // Historical report finalization is independent of this continuous PAPER
+      // runtime. Keep old records intact; economic residue/integrity below still
+      // prevents a new experiment from abandoning obligations or corrupt state.
+      if (this.experiment?.status === "COMPLETED" && !this.env.GUARDIAN_SEPARATE_ENABLED) {
         const previousReport = await this.journal
           .loadExperimentReport(this.experiment.id, "final")
           .catch(() => null);

@@ -24,6 +24,9 @@ means durable state persistence; actual PAPER execution is proven by its fills.
 The runtime does not use the historical checkpoint issuer, manifest signatures,
 HMAC, roster registry, child supervisor, entry attestations, or acceptance gates.
 Historical modules and database records are left intact. Retention stays off.
+In this mode a completed experiment's missing historical report does not block
+starting a new PAPER experiment; open economic obligations and journal integrity
+still do. Historical reports are never rewritten or presented as current.
 
 Set the following Compose variables to the **existing** deployment:
 
