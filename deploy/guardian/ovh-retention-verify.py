@@ -130,7 +130,8 @@ def verify_engine_scope(folder, kind, files):
                 deny("EXPERIMENT_MANIFEST_SCOPE")
             def check(row):
                 if (row["payload"].get("experimentId") != exp or row["occurredAt"] >= manifest["sourceFenceOccurredAt"]
-                    or row.get("commitSeq", 0) > manifest["sourceCommitSeq"]):
+                    or row.get("commitSeq", 0) > manifest["sourceCommitSeq"]
+                    or row["recordedAt"] > manifest["sourceRecordedAt"]):
                     deny("EXPERIMENT_EVENT_SCOPE")
         else:
             if folder.parent.name != manifest["retentionClass"]:
@@ -139,6 +140,7 @@ def verify_engine_scope(folder, kind, files):
                 if (row["type"] not in manifest["eventTypes"]
                     or not manifest["occurredFrom"] <= row["occurredAt"] < manifest["occurredBefore"]
                     or row.get("commitSeq", 0) > manifest["commitSeqTo"]
+                    or row["recordedAt"] > manifest["recordedAtTo"]
                     or (manifest["unattributedOnly"] and row["payload"].get("experimentId"))):
                     deny("BUCKET_EVENT_SCOPE")
         if check_lines(folder / raw["file"], check) != raw["eventCount"]:

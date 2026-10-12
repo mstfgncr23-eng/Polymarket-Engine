@@ -11,10 +11,10 @@ class Verification(unittest.TestCase):
         self.root = pathlib.Path(self.tmp.name)
         self.folder = self.root / "simple-engine/journal/raw_telemetry/bucket_20261005"
         self.folder.mkdir(parents=True)
-        self.event = {"type":"MARKET_SNAPSHOT","occurredAt":"2026-10-05T10:30:00.000Z","commitSeq":2,"payload":{}}
+        self.event = {"type":"MARKET_SNAPSHOT","occurredAt":"2026-10-05T10:30:00.000Z","recordedAt":"2026-10-05T10:30:00.000Z","commitSeq":2,"payload":{}}
         self.manifest = {"kind":"journal_bucket","retentionClass":"raw_telemetry", "eventTypes":["MARKET_SNAPSHOT"],
             "occurredFrom":"2026-10-05T10:00:00.000Z","occurredBefore":"2026-10-05T11:00:00.000Z",
-            "commitSeqTo":2,"unattributedOnly":True}
+            "commitSeqTo":2,"recordedAtTo":"2026-10-05T11:00:00.000Z","unattributedOnly":True}
     def tearDown(self): self.tmp.cleanup()
     def write(self, name, value):
         data = value if isinstance(value, bytes) else (json.dumps(value)+"\n").encode()
@@ -50,6 +50,8 @@ class Verification(unittest.TestCase):
         self.denied(self.request("journal_bucket",("manifest.json","events.jsonl")))
     def test_row_cursor_outside_fence(self):
         self.event["commitSeq"]=3;self.denied(self.proof())
+    def test_row_recorded_at_outside_fence(self):
+        self.event["recordedAt"]="2026-10-06T10:00:00.000Z";self.denied(self.proof())
     def test_active_attributed_rows_not_in_unattributed_bucket(self):
         self.event["payload"]["experimentId"]="experiment_active";self.denied(self.proof())
     def test_engine_scope_cannot_alias_legacy_folder(self):
