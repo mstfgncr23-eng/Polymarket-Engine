@@ -13,6 +13,8 @@ keys and invokes its existing normal-hedge / PR3 / protective-SELL arbitration.
 Thus existing `positions`, `durable_transitions`, `journal_events`, `paper_orders`
 and `paper_fills` remain the data sources, without a new migration or database.
 No duplicate market feed subscription is created.
+The existing Engine Dockerfile builds both entrypoints into one image; Compose
+runs the two independent containers with different commands.
 
 Guardian restart reloads all currently open positions and persisted policy
 states. Missing, future, invalid or unsynchronized books block only their market.

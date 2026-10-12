@@ -43,11 +43,8 @@ services:
       retries: 6
       start_period: 20s
   guardian:
-    image: polymarket-simple-guardian:${RELEASE_TAG:?release_tag_required}
-    build:
-      context: ../..
-      dockerfile: Dockerfile.engine
-      target: guardian
+    image: polymarket-simple-engine:${RELEASE_TAG:?release_tag_required}
+    command: ["node", "dist/guardian-main.js"]
     container_name: polymarket-paper-guardian
     user: "999:999"
     init: true

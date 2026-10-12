@@ -28,6 +28,3 @@ COPY --from=build --chown=engine:engine /workspace/packages/db/migrations ./pack
 USER engine
 EXPOSE 8080
 CMD ["node", "dist/main.js"]
-
-FROM runtime AS guardian
-CMD ["node", "dist/guardian-main.js"]
