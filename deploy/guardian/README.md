@@ -10,8 +10,9 @@ cycle discovers the current residual positions from Engine's PG-recovered
 projection, plus the existing normalized top books and native consensus.
 Engine persists Guardian state with the existing durable revision operation
 keys and invokes its existing normal-hedge / PR3 / protective-SELL arbitration.
-Thus existing `positions`, `durable_transitions`, `journal_events`, `paper_orders`
-and `paper_fills` remain the data sources, without a new migration or database.
+The canonical positions come from the existing `engine_checkpoints` and
+`durable_transitions`; PAPER orders, fills and policy audit events are recorded
+in the existing `journal_events`. No new migration or database is needed.
 No duplicate market feed subscription is created.
 The existing Engine Dockerfile builds both entrypoints into one image; Compose
 runs the two independent containers with different commands.

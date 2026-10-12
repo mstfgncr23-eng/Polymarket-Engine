@@ -12,14 +12,14 @@ import { ScriptedMarketAdapter, ScriptedReferenceRegistry, discoveryReport, qual
 import { snapshot } from "./fixtures.js";
 
 const START = Date.parse("2026-10-05T00:00:00Z");
-async function setup(journal = new MemoryEventJournal(), clock = { ms: START }) {
+async function setup(journal = new MemoryEventJournal(), clock: { ms: number; live?: boolean } = { ms: START }) {
   const market = new ScriptedMarketAdapter();
-  market.queue(discoveryReport(["first", "second"].map(id => qualified(id, "SOL", id + "-up", id + "-down", new Date(START + 3600000).toISOString()))));
+  market.queue(discoveryReport(["first", "second"].map(id => qualified(id, "SOL", id + "-up", id + "-down", new Date(clock.ms + 3600000).toISOString()))));
   const engine = new EngineService(qualifiedPaperEnv({ DISCOVERY_INTERVAL_MS: "3600000", ESTIMATED_INFRA_COST_PER_HOUR_USD: "0",
     PAPER_EXECUTION_STYLE: "TAKER", PAPER_EXECUTION_LATENCY_MS: "0", NORMAL_HEDGE_MIN_LOCKED_PAIR_EDGE: "0.12",
     PROFIT_TRAILING_PAIR_SOAK_ENABLED: "true", REVERSAL_PROTECTION_ENABLED: "true", GUARDIAN_SEPARATE_ENABLED: "true" }),
     journal, { error: () => undefined }, { market: market as never, referenceRegistry: new ScriptedReferenceRegistry() as never,
-      activation: new NoopGrokActivationBridge(), now: () => new Date(clock.ms), resolutionFetcher: async () => null });
+      activation: new NoopGrokActivationBridge(), now: () => new Date(clock.live ? Date.now() : clock.ms), resolutionFetcher: async () => null });
   await engine.start(); await market.waitForHandlers();
   return { engine, journal, clock, market };
 }
@@ -130,6 +130,52 @@ describe("simple independent Guardian", () => {
     } finally {
       child.kill(); await server.stop();
       await new Promise<void>(resolve => { if (child.exitCode !== null) resolve(); else child.once("close", () => resolve()); });
+    }
+  }, 15000);
+
+  it("production Guardian PID requests a real Engine PAPER fill over the socket and retry cannot produce another order", async () => {
+    const entered = Date.now() - 70000;
+    const s = await setup(new MemoryEventJournal(), { ms: entered });
+    const path = process.platform === "win32" ? "\\\\.\\pipe\\guardian-e2e-" + randomUUID() : join(tmpdir(), "guardian-e2e-" + randomUUID() + ".sock");
+    let child: ReturnType<typeof spawn> | undefined;
+    let server: Awaited<ReturnType<typeof startGuardianSocket>> | undefined;
+    let protection: unknown;
+    try {
+      expect((await s.engine.beginExperiment()).ok).toBe(true);
+      await seed(s, "first");
+      // Restore an actual policy watch from its prior observations; no fabricated
+      // confirmation. The production worker must itself expire it and request execution.
+      const monitor = new GuardianMonitor();
+      for (const [age, ratio] of [[0, .75], [5000, .70], [10000, .70]] as const) {
+        s.clock.ms = entered + age; books(s, "first", ratio);
+        expect((await s.engine.acceptGuardianUpdate(monitor.evaluate(s.engine.guardianView(), s.clock.ms).updates[0]!)).status).toBe("PERSISTED");
+      }
+      s.clock.ms = Date.now(); books(s, "first", .7); s.clock.live = true;
+      s.engine.state.noteReferenceTick("SOL", new Date().toISOString());
+      server = await startGuardianSocket(path, async input => {
+        const message = input as { kind: string; state?: { confirmedAt?: string } };
+        if (message.kind === "VIEW") return s.engine.guardianView();
+        if (message.state?.confirmedAt) protection = input;
+        return s.engine.acceptGuardianUpdate(input);
+      });
+      child = spawn(process.execPath, ["apps/engine/dist/guardian-main.js"], {
+        env: { ...process.env, TRADING_MODE: "paper", GUARDIAN_SOCKET_PATH: path }, stdio: ["ignore", "pipe", "pipe"] });
+      let output = ""; child.stdout!.on("data", chunk => { output += chunk; });
+      await waitFor(async () => (await s.journal.queryEvents({ types: ["PAPER_FILL"] })).some(e => e.payload.intent === "PROTECTIVE_DE_RISK"));
+      expect(protection).toBeTruthy();
+      expect((await guardianRpc<{ status: string; reason: string }>(path, protection)).reason).toBe("EPISODE_CHANGED");
+      const fills = (await s.journal.queryEvents({ types: ["PAPER_FILL"] })).filter(e => e.payload.intent === "PROTECTIVE_DE_RISK");
+      const orders = (await s.journal.queryEvents({ types: ["PAPER_ORDER_CREATED"] })).filter(e => e.payload.intent === "PROTECTIVE_DE_RISK");
+      expect(fills).toHaveLength(1); expect(orders).toHaveLength(1); expect(child.pid).not.toBe(process.pid);
+      console.log(JSON.stringify({ evidence: "CONTROLLED_PAPER_SOCKET_PROTECTION", enginePid: process.pid, guardianPid: child.pid,
+        orderId: fills[0]!.payload.orderId, intent: fills[0]!.payload.intent, side: fills[0]!.payload.side,
+        quantity: fills[0]!.payload.quantity, fillPrice: fills[0]!.payload.fillPrice,
+        guardianReason: (fills[0]!.payload.deRisk as { guardianReason?: string })?.guardianReason,
+        orderCount: orders.length, fillCount: fills.length, retry: "EPISODE_CHANGED", guardianLog: output.trim() }));
+    } finally {
+      child?.kill(); await server?.stop();
+      if (child && child.exitCode === null) await new Promise<void>(resolve => child!.once("close", () => resolve()));
+      await s.engine.stop();
     }
   }, 15000);
 });
