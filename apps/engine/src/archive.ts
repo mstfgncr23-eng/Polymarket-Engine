@@ -294,6 +294,7 @@ export class LocalJournalArchive {
     const manifestPath = resolve(directory, "raw-manifest.json");
     const existing = await this.verifyExperimentManifest(manifestPath, candidate);
     if (existing.verified) return { ...existing, directory };
+    if (await stat(manifestPath).catch(() => null)) throw new Error("ARCHIVE_EXISTING_CANONICAL_INVALID");
 
     await mkdir(directory, { recursive: true });
     const rawPath = resolve(directory, "canonical-events.jsonl");
@@ -365,6 +366,7 @@ export class LocalJournalArchive {
     const manifestPath = resolve(directory, "manifest.json");
     const existing = await this.verifyBucketManifest(manifestPath, input);
     if (existing.verified) return { ...existing, directory };
+    if (await stat(manifestPath).catch(() => null)) throw new Error("ARCHIVE_EXISTING_BUCKET_INVALID");
 
     await mkdir(directory, { recursive: true });
     const rawPath = resolve(directory, "events.jsonl");
@@ -459,7 +461,7 @@ export class LocalJournalArchive {
         || manifest.occurredFrom !== input.occurredFrom.toISOString()
         || manifest.occurredBefore !== input.occurredBefore.toISOString()
         || manifest.commitSeqTo !== input.commitSeqTo
-        || manifest.recordedAtTo !== input.recordedAtTo.toISOString()
+        || Date.parse(manifest.recordedAtTo) > input.recordedAtTo.getTime()
         || manifest.unattributedOnly !== (input.unattributedOnly === true)
         || JSON.stringify(manifest.eventTypes) !== JSON.stringify([...input.eventTypes].sort())
       ) return { verified: false, manifest: null, directory };

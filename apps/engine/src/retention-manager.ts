@@ -379,8 +379,8 @@ export class RetentionManager {
           });
           if (!archived.verified || !archived.manifest) throw new Error(`LOCAL_ARCHIVE_${cls.toUpperCase()}_VERIFY_FAILED`);
           const manifest = archived.manifest;
-          if (this.config.offsiteReplicaRequired) await this.replicaVerifier!.verifyJournalBucket({ directory: archived.directory, manifest });
           this.sealedBuckets.set(cls, manifest);
+          if (this.config.offsiteReplicaRequired) await this.replicaVerifier!.verifyJournalBucket({ directory: archived.directory, manifest });
           journalDrains.push({
             cls,
             exhausted: false,

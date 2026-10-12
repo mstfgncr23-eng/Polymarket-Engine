@@ -13,6 +13,16 @@ async function main(){
     if(!directory)throw Error("RESTORE_DIRECTORY_REQUIRED");
     console.log(JSON.stringify(await verifyRecoveryDirectory(directory)));return;
   }
+  if(action==="verify-replica"){
+    if(!directory)throw Error("ARCHIVE_DIRECTORY_REQUIRED");
+    const manifest=JSON.parse(await readFile(directory+"/manifest.json","utf8"));
+    const replica=OvhArchiveReplicaVerifier.forEngine(process.env.ARCHIVE_REMOTE_HOST??"g4archive@141.95.162.252");
+    if(manifest.kind==="engine_recovery") {
+      await verifyRecoveryDirectory(directory);await replica.verifyRecovery({directory,manifest});
+    }else if(manifest.kind==="journal_bucket")await replica.verifyJournalBucket({directory,manifest});
+    else throw Error("ARCHIVE_KIND_UNSUPPORTED");
+    console.log(JSON.stringify({status:"PASSED",action,localDirectory:directory,manifest,postgresMutations:0}));return;
+  }
   if(!["export-recovery","export-bucket"].includes(action??""))throw Error("ARCHIVE_ACTION_INVALID");
   const file=process.env.DATABASE_URL_FILE;if(!file)throw Error("DATABASE_URL_FILE_REQUIRED");
   const journal=new PostgresEventJournal((await readFile(file,"utf8")).trim(),"unused",{access:"readonly"});

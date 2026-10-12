@@ -1,5 +1,5 @@
 import {describe,it,expect,vi} from "vitest";
-import {mkdtemp,writeFile,rm} from "node:fs/promises";
+import {mkdtemp,writeFile,readFile,rm} from "node:fs/promises";
 import {join} from "node:path";
 import {tmpdir} from "node:os";
 import {MemoryEventJournal} from "@pm/db";
@@ -20,6 +20,14 @@ describe("simple retention bounded archive invariants",()=>{
       const context={experiment:null,now,degraded:false,failClosed:false,databaseUp:true};
       expect((await manager.runCycle(context)).deletedByClass.raw_telemetry).toBe(200);
       await journal.append({id:"unrelated",type:"ENGINE_STARTED",aggregateType:"engine",aggregateId:"engine",traceId:"trace",correlationId:"trace",sourceEventId:"unrelated",occurredAt:now.toISOString(),recordedAt:now.toISOString(),payload:{}});
+      const rawPath=join(directories[0]!,"events.jsonl"), original=await readFile(rawPath);
+      const manifestBefore=await readFile(join(directories[0]!,"manifest.json"));
+      await writeFile(rawPath,"corrupt");
+      expect((await manager.runCycle(context)).skipReason).toBe("ARCHIVE_EXISTING_BUCKET_INVALID");
+      expect(await readFile(rawPath,"utf8")).toBe("corrupt");
+      expect(await readFile(join(directories[0]!,"manifest.json"))).toEqual(manifestBefore);
+      expect((await journal.queryEvents({types:["MARKET_SNAPSHOT"]})).length).toBe(250);
+      await writeFile(rawPath,original);
       expect((await manager.runCycle(context)).deletedByClass.raw_telemetry).toBe(200);
       expect((await manager.runCycle(context)).deletedByClass.raw_telemetry).toBe(50);
       expect(new Set(directories).size).toBe(1);expect(new Set(hashes).size).toBe(1);

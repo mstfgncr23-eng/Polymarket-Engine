@@ -81,6 +81,8 @@ bundles go under its `simple-engine` subdirectory. Install the compatible
 `/usr/local/libexec/g4-ovh-retention-verify.py`, preserving the prior file as a
 backup. Existing G4 source/probe readback remains compatible. Historical archive
 directories are neither overwritten nor deleted; rsync uses `--ignore-existing`.
+An invalid existing manifest/bundle is preserved and defers pruning; it cannot
+be reconstructed from a partially purged hot source and overwrite the archive.
 
 The existing defaults remain: telemetry 6h; monitor/operational 24h; canonical
 completed-report grace 7d; MCP idempotency 24h; latest 8 checkpoints; DML batch
