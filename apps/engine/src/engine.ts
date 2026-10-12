@@ -141,6 +141,7 @@ import { EngineStateStore } from "./state.js";
 import { ensureReportGeneratedAudit, persistCanonicalFinalReport, persistVerifiedAnalyticsRollup, streamExperimentSummary, summaryFromDurableReport } from "./final-report.js";
 import { writeExperimentSummary } from "./report.js";
 import { retentionConfigFromEngineEnv, RetentionManager } from "./retention-manager.js";
+import { OvhArchiveReplicaVerifier } from "./ovh-archive-replica.js";
 import {
   boundIntegrityFaults,
   createIntegrityFaultEvent,
@@ -679,7 +680,7 @@ export class EngineService {
         this.metrics.retentionBatchSize.observe(size);
         this.metrics.retentionBatchDuration.observe(durationMs / 1000);
       },
-    });
+    }, undefined, env.ARCHIVE_REMOTE_HOST ? OvhArchiveReplicaVerifier.forEngine(env.ARCHIVE_REMOTE_HOST) : undefined);
     this.activation = new GrokActivationCoordinator(
       adapters?.activation ?? createGrokActivationBridge(env, adapters?.activationFetch ?? fetch, {
         contextProvider: (request, role) => this.grokRoleContext(request, role, env.XAI_ALLOW_PORTFOLIO_CONTEXT),
@@ -1426,13 +1427,16 @@ export class EngineService {
       this.metrics.triggerDedupeEntries.set(this.triggerEngine.dedupeEntryCount());
       this.metrics.assetMarketIndexEntries.set(this.assetIndex.entryCount());
       await this.maintainExperiment();
-      await this.retention.runCycle({
+      const retentionResult = await this.retention.runCycle({
         experiment: this.experiment,
         now: this.nowFn(),
         degraded: this.state.journalDegraded || this.overload.state === "DEGRADED" || this.state.telemetryDegraded,
         failClosed: this.overload.state === "FAIL_CLOSED",
         databaseUp: this.state.database === "UP",
+        hasEconomicObligations: [...this.ledger.positions.values()].some(p => d(p.upQuantity).gt(0) || d(p.downQuantity).gt(0))
+          || this.restingOrders.size > 0 || this.riskReductionOwners.size > 0,
       });
+      if (retentionResult.failures) this.logger.error({ reason: retentionResult.skipReason }, "retention deferred");
     });
   }
 

@@ -2,7 +2,7 @@ import { build } from "esbuild";
 import { fileURLToPath } from "node:url";
 
 await build({
-  entryPoints: [fileURLToPath(new URL("./src/main.ts", import.meta.url)), fileURLToPath(new URL("./src/guardian-main.ts", import.meta.url))],
+  entryPoints: ["main", "guardian-main", "archive-maintenance"].map(name => fileURLToPath(new URL(`./src/${name}.ts`, import.meta.url))),
   bundle: true,
   platform: "node",
   target: "node22",

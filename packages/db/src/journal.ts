@@ -327,7 +327,8 @@ export interface EventJournal {
     unattributedOnly?: boolean;
     limit: number;
   }): Promise<{ deleted: number }>;
-  pruneOldCheckpoints(keepLatest: number, limit?: number): Promise<{ deleted: number; latestSequence: number | null }>;
+  pruneOldCheckpoints(keepLatest: number, limit?: number, archivedIds?: readonly string[]): Promise<{ deleted: number; latestSequence: number | null }>;
+  listCheckpointPurgeCandidates?(keepLatest: number, limit: number): Promise<EngineCheckpoint[]>;
   listCheckpoints(): Promise<EngineCheckpoint[]>;
   commitDurableTransition(input: DurableTransitionInput, expectedPreviousSequence: number, options?: DurableCommitOptions): Promise<DurableCommitResult>;
   readDurableTransitionsAfter(sequence: number, limit: number): Promise<DurableTransition[]>;
@@ -734,7 +735,12 @@ export class MemoryEventJournal implements EventJournal {
     };
     return { value: await work(snap), stable: true };
   }
-  async pruneOldCheckpoints(keepLatest: number, limit?: number): Promise<{ deleted: number; latestSequence: number | null }> {
+  async listCheckpointPurgeCandidates(keepLatest: number, limit: number): Promise<EngineCheckpoint[]> {
+    const ordered = [...this.checkpoints].sort((a, b) => b.sequence - a.sequence);
+    const retained = new Set(ordered.slice(0, Math.max(1, keepLatest)).map(row => row.id));
+    return structuredClone(ordered.filter(row => !retained.has(row.id)).sort((a,b) => a.sequence-b.sequence).slice(0, Math.max(0, limit)));
+  }
+  async pruneOldCheckpoints(keepLatest: number, limit?: number, archivedIds?: readonly string[]): Promise<{ deleted: number; latestSequence: number | null }> {
     assertJournalCapability(this.access, "maintenance", "pruneOldCheckpoints");
     const keep = Math.max(1, keepLatest);
     const ordered = [...this.checkpoints].sort((a, b) => b.sequence - a.sequence);
@@ -742,7 +748,7 @@ export class MemoryEventJournal implements EventJournal {
     if (limit != null && limit <= 0) return { deleted: 0, latestSequence: latest };
     const retained = new Set(ordered.slice(0, keep).map((row) => row.id));
     const victims = this.checkpoints
-      .filter((row) => !retained.has(row.id) && row.sequence !== latest)
+      .filter((row) => !retained.has(row.id) && row.sequence !== latest && (!archivedIds || archivedIds.includes(row.id)))
       .sort((a, b) => a.sequence - b.sequence);
     const capped = limit == null ? victims : victims.slice(0, Math.floor(limit));
     const remove = new Set(capped.map((row) => row.id));
@@ -833,7 +839,7 @@ export class MemoryEventJournal implements EventJournal {
       && !((row.type === "REPORT_SOURCE_INTEGRITY_FAULT" || row.type === "REPORT_SOURCE_INTEGRITY_REPAIRED") && quarantined.has(row.aggregateId))).slice(0, rowCap);
     const now = Date.now();
     for (const row of victims) {
-      if (maxKeys > 0) this.compactedByKey.set(row.operationKey, { operationKey: row.operationKey, type: row.type, aggregateType: row.aggregateType, aggregateId: row.aggregateId, scopeId: replayScopeId(row), payloadHash: row.payloadHash, sequence: row.sequence, occurredAt: row.occurredAt, recordedAt: row.recordedAt, expiresAt: new Date(now + ttl).toISOString(), lifecycleState: replayLifecycleState(row) });
+      this.compactedByKey.set(row.operationKey, { operationKey: row.operationKey, type: row.type, aggregateType: row.aggregateType, aggregateId: row.aggregateId, scopeId: replayScopeId(row), payloadHash: row.payloadHash, sequence: row.sequence, occurredAt: row.occurredAt, recordedAt: row.recordedAt, expiresAt: new Date(now + ttl).toISOString(), lifecycleState: replayLifecycleState(row) });
       this.durableByKey.delete(row.operationKey);
     }
     const closedOrders = new Set(victims.filter((row) => row.type === "PAPER_MAKER_RELEASED" || row.type === "PAPER_ORDER_CANCELLED").map((row) => row.aggregateId));
@@ -858,7 +864,7 @@ export class MemoryEventJournal implements EventJournal {
       if (row.type === "PAPER_FILL" && row.lifecycleState === "open" && row.scopeId && settledScopes.has(row.scopeId)) row.lifecycleState = "closed";
     }
     while (this.compactedByKey.size > maxKeys) {
-      const oldest = [...this.compactedByKey.values()].filter((row) => row.lifecycleState !== "open").sort((a, b) => a.sequence - b.sequence)[0];
+      const oldest = [...this.compactedByKey.values()].filter((row) => row.lifecycleState !== "open" && Date.parse(row.expiresAt) <= now).sort((a, b) => a.sequence - b.sequence)[0];
       if (!oldest) break;
       this.compactedByKey.delete(oldest.operationKey);
     }
@@ -1445,7 +1451,14 @@ export class PostgresEventJournal implements EventJournal {
       return { deleted: result.count ?? 0 };
     });
   }
-  async pruneOldCheckpoints(keepLatest: number, limit?: number): Promise<{ deleted: number; latestSequence: number | null }> {
+  async listCheckpointPurgeCandidates(keepLatest: number, limit: number): Promise<EngineCheckpoint[]> {
+    const rows = await this.client`SELECT * FROM engine_checkpoints
+      WHERE sequence NOT IN (SELECT sequence FROM engine_checkpoints ORDER BY sequence DESC LIMIT ${Math.max(1, keepLatest)})
+      ORDER BY sequence ASC LIMIT ${Math.max(0, Math.min(500, limit))}`;
+    return rows.map(row => ({ id: String(row.id), experimentId: row.experiment_id as string | null,
+      sequence: Number(row.sequence), payload: row.payload as Record<string, unknown>, createdAt: new Date(row.created_at).toISOString() }));
+  }
+  async pruneOldCheckpoints(keepLatest: number, limit?: number, archivedIds?: readonly string[]): Promise<{ deleted: number; latestSequence: number | null }> {
     assertJournalCapability(this.access, "maintenance", "pruneOldCheckpoints");
     const keep = Math.max(1, keepLatest);
     const latestRows = await this.db.select({
@@ -1460,6 +1473,7 @@ export class PostgresEventJournal implements EventJournal {
       WHERE id IN (
         SELECT id FROM engine_checkpoints
         WHERE sequence < ${latest}
+          AND (${archivedIds == null} OR id = ANY(${[...(archivedIds ?? [])]}))
           AND sequence NOT IN (
             SELECT sequence FROM engine_checkpoints
             ORDER BY sequence DESC
@@ -1786,9 +1800,9 @@ export class PostgresEventJournal implements EventJournal {
         await tx.update(durableReplayKeys).set({ lifecycleState: "closed" }).where(and(eq(durableReplayKeys.type, "PAPER_FILL"), eq(durableReplayKeys.lifecycleState, "open"), inArray(durableReplayKeys.scopeId, settledScopes)));
       }
       if (maxKeys > 0) {
-        await tx.execute(sql`DELETE FROM durable_replay_keys WHERE operation_key IN (SELECT operation_key FROM durable_replay_keys WHERE lifecycle_state <> 'open' ORDER BY (expires_at <= now()) DESC, sequence ASC LIMIT GREATEST(0, (SELECT count(*) FROM durable_replay_keys WHERE lifecycle_state <> 'open') - ${maxKeys}))`);
+        await tx.execute(sql`DELETE FROM durable_replay_keys WHERE operation_key IN (SELECT operation_key FROM durable_replay_keys WHERE lifecycle_state <> 'open' AND expires_at <= now() ORDER BY sequence ASC LIMIT GREATEST(0, (SELECT count(*) FROM durable_replay_keys WHERE lifecycle_state <> 'open') - ${maxKeys}))`);
       } else {
-        await tx.delete(durableReplayKeys).where(sql`expires_at <= now()`);
+        await tx.delete(durableReplayKeys).where(sql`expires_at <= now() AND lifecycle_state <> 'open'`);
       }
       if (rows.length > 0) {
         await tx.delete(durableTransitions).where(inArray(durableTransitions.operationKey, rows.map((row) => row.operationKey)));

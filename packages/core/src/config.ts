@@ -220,6 +220,7 @@ export const engineEnvSchema = z.object({
     z.boolean().optional(),
   ).default(false),
   LOCAL_ARCHIVE_DIR: z.string().min(1).default("/data/archive"),
+  ARCHIVE_REMOTE_HOST: z.string().default(""),
   LOCAL_ARCHIVE_BUCKET_MS: z.coerce.number().int().min(60_000).default(60 * 60_000),
   /**
    * Durable Native V2 learning memory. Default false so production OVH/Fly is

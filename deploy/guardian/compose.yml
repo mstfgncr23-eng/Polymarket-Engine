@@ -23,15 +23,20 @@ services:
       NORMAL_HEDGE_MIN_LOCKED_PAIR_EDGE: "0.12"
       PROFIT_TRAILING_PAIR_ARM_EDGE: "0.05"
       PROFIT_TRAILING_PAIR_RETRACE_EDGE: "0.02"
-      RETENTION_ENABLED: "false"
-      RETENTION_COMPACTION_ENABLED: "false"
-      LOCAL_ARCHIVE_ENABLED: "false"
+      RETENTION_ENABLED: "true"
+      RETENTION_COMPACTION_ENABLED: "true"
+      LOCAL_ARCHIVE_ENABLED: "true"
+      LOCAL_ARCHIVE_DIR: /data/archive
+      ARCHIVE_REMOTE_HOST: g4archive@141.95.162.252
       REPORT_DIRECTORY: /data/archive/simple-engine-reports
       LEARNING_DATA_DIR: /data/learning
       GIT_SHA: ${RELEASE_TAG}
     volumes:
       - ${SOCKET_DIRECTORY:?socket_directory_required}:/run/polymarket
       - ${DATABASE_URL_FILE:?existing_database_url_file_required}:/run/private/engine-db-url:ro
+      - ${ARCHIVE_PRIVATE_DIR:-/opt/polymarket-g4-private}/g4-archive-upload-key:/run/private/g4-archive-upload-key:ro
+      - ${ARCHIVE_PRIVATE_DIR:-/opt/polymarket-g4-private}/g4-archive-verify-key:/run/private/g4-archive-verify-key:ro
+      - ${ARCHIVE_PRIVATE_DIR:-/opt/polymarket-g4-private}/g4-archive-known-hosts:/run/private/g4-archive-known-hosts:ro
       - /data/archive:/data/archive
       - /data/learning:/data/learning
     networks: [existing_pg]

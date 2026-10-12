@@ -21,7 +21,9 @@ ENV DB_MIGRATIONS_DIR=/app/packages/db/migrations
 # Ephemeral local reports; canonical state is PostgreSQL. Regenerable via `pnpm report`.
 ENV REPORT_DIRECTORY=/app/reports
 WORKDIR /app
-RUN groupadd --system engine && useradd --system --gid engine --home /app engine \
+RUN apt-get update && apt-get install -y --no-install-recommends openssh-client rsync \
+  && rm -rf /var/lib/apt/lists/* \
+  && groupadd --system engine && useradd --system --gid engine --home /app engine \
   && mkdir -p /app/reports && chown engine:engine /app/reports
 COPY --from=build --chown=engine:engine /workspace/apps/engine/dist ./dist
 COPY --from=build --chown=engine:engine /workspace/packages/db/migrations ./packages/db/migrations

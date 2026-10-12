@@ -10,7 +10,7 @@ import {
   type EngineEnv,
 } from "@pm/core";
 import { isCanonicalFinalReport, type EventJournal } from "@pm/db";
-import { LocalJournalArchive } from "./archive.js";
+import { LocalJournalArchive, type ExperimentRawArchiveManifest, type JournalBucketArchiveManifest, type RecoveryArchiveManifest } from "./archive.js";
 import { persistVerifiedAnalyticsRollup, streamExperimentSummary } from "./final-report.js";
 
 export interface RetentionConfig {
@@ -20,11 +20,9 @@ export interface RetentionConfig {
   completedGraceMs: number;
   mcpIdempotencyTtlMs: number;
   checkpointKeep: number;
-  /** G2H temporary safety: never destroy checkpoints or durable prefix
-   * without a proven coordinator of every Guardian's pinned receipt.
-   * Conservative hold, NOT a consumer-pin lease or completed liveness fix.
-   */
+  /** Legacy direct readers retain their hold. Socket Guardian uses Engine's recovery boundary. */
   guardianRecoveryHold: boolean;
+  offsiteReplicaRequired: boolean;
   batchSize: number;
   cycleBudgetMs: number;
   maxBatchesPerCycle: number;
@@ -46,6 +44,7 @@ export interface RetentionContext {
   degraded: boolean;
   failClosed: boolean;
   databaseUp: boolean;
+  hasEconomicObligations?: boolean;
 }
 
 export interface RetentionCycleResult {
@@ -84,7 +83,7 @@ type RetentionEnv = Pick<EngineEnv,
   | "LOCAL_ARCHIVE_BUCKET_MS"
 >;
 
-export function retentionConfigFromEngineEnv(env: RetentionEnv): RetentionConfig {
+export function retentionConfigFromEngineEnv(env: RetentionEnv & Partial<Pick<EngineEnv, "GUARDIAN_SEPARATE_ENABLED" | "ARCHIVE_REMOTE_HOST">>): RetentionConfig {
   return defaultRetentionConfig({
     enabled: env.RETENTION_ENABLED,
     telemetryTtlMs: env.RETENTION_TELEMETRY_TTL_MS,
@@ -92,7 +91,8 @@ export function retentionConfigFromEngineEnv(env: RetentionEnv): RetentionConfig
     completedGraceMs: env.RETENTION_COMPLETED_GRACE_MS,
     mcpIdempotencyTtlMs: env.RETENTION_MCP_IDEMPOTENCY_TTL_MS,
     checkpointKeep: env.RETENTION_CHECKPOINT_KEEP,
-    guardianRecoveryHold: true,
+    guardianRecoveryHold: !env.GUARDIAN_SEPARATE_ENABLED,
+    offsiteReplicaRequired: !!env.GUARDIAN_SEPARATE_ENABLED || !!env.ARCHIVE_REMOTE_HOST,
     batchSize: env.RETENTION_BATCH_SIZE,
     cycleBudgetMs: env.RETENTION_CYCLE_BUDGET_MS,
     maxBatchesPerCycle: env.RETENTION_MAX_BATCHES_PER_CYCLE,
@@ -117,11 +117,8 @@ export function defaultRetentionConfig(overrides: Partial<RetentionConfig> = {})
     completedGraceMs: overrides.completedGraceMs ?? RETENTION_DEFAULTS.completedGraceMs,
     mcpIdempotencyTtlMs: overrides.mcpIdempotencyTtlMs ?? RETENTION_DEFAULTS.mcpIdempotencyTtlMs,
     checkpointKeep: overrides.checkpointKeep ?? RETENTION_DEFAULTS.checkpointKeep,
-    // Fail closed even for future manually constructed managers:
-    // ONLY explicitly scoped legacy/maintenance tests opt out.
-    // This temporary hold is not a substitute for a certified
-    // consumer-aware pin/lease retention protocol.
     guardianRecoveryHold: overrides.guardianRecoveryHold ?? true,
+    offsiteReplicaRequired: overrides.offsiteReplicaRequired ?? false,
     batchSize: clampRetentionBatchSize(overrides.batchSize ?? RETENTION_DEFAULTS.batchSize),
     cycleBudgetMs: overrides.cycleBudgetMs ?? RETENTION_DEFAULTS.cycleBudgetMs,
     maxBatchesPerCycle: overrides.maxBatchesPerCycle ?? RETENTION_DEFAULTS.maxBatchesPerCycle,
@@ -194,6 +191,12 @@ function fullArchiveBucket(
   return { from: new Date(fromMs), before: new Date(beforeMs) };
 }
 
+export interface RetentionReplicaVerifier {
+  verifyCanonical(input: { directory: string; manifest: ExperimentRawArchiveManifest }): Promise<void>;
+  verifyJournalBucket(input: { directory: string; manifest: JournalBucketArchiveManifest }): Promise<void>;
+  verifyRecovery(input: { directory: string; manifest: RecoveryArchiveManifest }): Promise<void>;
+}
+
 export class RetentionManager {
   private running = false;
   private readonly lastSuccessAt = { value: null as string | null };
@@ -212,6 +215,7 @@ export class RetentionManager {
       noteBatch?(size: number, durationMs: number): void;
     },
     archiveOverride?: LocalJournalArchive | null,
+    private readonly replicaVerifier?: RetentionReplicaVerifier,
   ) {
     assertMcpIdempotencyTtlSafe(config.mcpIdempotencyTtlMs);
     this.archive = archiveOverride !== undefined
@@ -241,6 +245,8 @@ export class RetentionManager {
       guardianRecoveryHeld: this.config.guardianRecoveryHold, eligibleBacklog: 0,
     };
     if (!this.config.enabled) return { ...empty, skipReason: "disabled" };
+    if (this.config.offsiteReplicaRequired && (!this.archive || !this.replicaVerifier))
+      return { ...empty, skipReason: "remote_archive_unconfigured" };
     if (!context.databaseUp) return { ...empty, skipReason: "database_down" };
     if (context.failClosed) return { ...empty, skipReason: "fail_closed" };
     if (context.degraded) return { ...empty, skipReason: "degraded" };
@@ -261,7 +267,10 @@ export class RetentionManager {
         this.journal, context.experiment, context.now, this.config.completedGraceMs,
       );
       const monitorOnlyEligible = experimentIsMonitorOnly(context.experiment);
-      const telemetryBefore = new Date(context.now.getTime() - this.config.telemetryTtlMs);
+      const telemetryTtlBefore = context.now.getTime() - this.config.telemetryTtlMs;
+      const telemetryBefore = new Date(experimentIsActive(context.experiment)
+        ? Math.min(telemetryTtlBefore, context.experiment?.startedAt ? Date.parse(context.experiment.startedAt) : 0)
+        : telemetryTtlBefore);
       const monitorBefore = monitorCutoff({
         now: context.now,
         monitorTtlMs: this.config.monitorTtlMs,
@@ -301,6 +310,7 @@ export class RetentionManager {
         let canonicalDrainPrepared = false;
         const candidates = await this.journal.listArchiveCandidates(32);
         for (const candidate of candidates) {
+          if (candidate.report.experimentId === context.experiment?.id && experimentIsActive(context.experiment)) continue;
           if (context.now.getTime() - Date.parse(candidate.report.persistedAt) < this.config.completedGraceMs) continue;
           if (!candidate.rollup.sourceFenceOccurredAt || !candidate.rollup.sourceCommitSeq || !candidate.rollup.sourceRecordedAt) continue;
           const backlog = await this.journal.countCanonicalEventsThrough({
@@ -314,6 +324,13 @@ export class RetentionManager {
           const archived = await this.archive.ensureExperimentCanonical(this.journal, candidate);
           if (!archived.verified || !archived.manifest) throw new Error("LOCAL_ARCHIVE_CANONICAL_VERIFY_FAILED");
           const manifest = archived.manifest;
+          if (manifest.rawEvents.eventCount !== candidate.report.sourceEventCount || manifest.rawEvents.eventCount < backlog.count)
+            throw new Error("RETENTION_CANONICAL_ARCHIVE_INCOMPLETE");
+          if (this.config.offsiteReplicaRequired) await this.replicaVerifier!.verifyCanonical({ directory: archived.directory, manifest });
+          const unchanged = await this.journal.countCanonicalEventsThrough({ experimentId: candidate.report.experimentId,
+            occurredBefore: new Date(manifest.sourceFenceOccurredAt), sourceCommitSeq: manifest.sourceCommitSeq,
+            sourceRecordedAt: new Date(manifest.sourceRecordedAt) });
+          if (unchanged.count !== backlog.count) throw new Error("RETENTION_CANONICAL_SOURCE_CHANGED");
           journalDrains.push({
             cls: "canonical_report_input",
             exhausted: false,
@@ -356,6 +373,7 @@ export class RetentionManager {
           });
           if (!archived.verified || !archived.manifest) throw new Error(`LOCAL_ARCHIVE_${cls.toUpperCase()}_VERIFY_FAILED`);
           const manifest = archived.manifest;
+          if (this.config.offsiteReplicaRequired) await this.replicaVerifier!.verifyJournalBucket({ directory: archived.directory, manifest });
           journalDrains.push({
             cls,
             exhausted: false,
@@ -378,6 +396,41 @@ export class RetentionManager {
         if (!canonicalDrainPrepared) {
           await prepareBucket("monitor_control", MONITOR_CONTROL_EVENT_TYPES, monitorEligible, monitorBefore, true);
           await prepareBucket("operational_audit", LOCAL_ARCHIVE_OPERATIONAL_EVENT_TYPES, operationalEligible, operationalBefore);
+        }
+      }
+
+      let checkpointKeep = this.config.checkpointKeep, archivedCheckpointIds: string[] = [], compactCursor = 0;
+      if (!this.config.guardianRecoveryHold && this.journal.listVerifiedCheckpoints && this.archive) {
+        const verified = await this.journal.listVerifiedCheckpoints();
+        const retained = verified.slice(0, 2);
+        if (retained.length === 2) {
+          const all = (await this.journal.listCheckpoints()).sort((a,b) => b.sequence-a.sequence);
+          checkpointKeep = Math.max(checkpointKeep, all.findIndex(c => c.id === retained[1]!.id) + 1);
+          const candidates = await this.journal.listCheckpointPurgeCandidates?.(checkpointKeep, this.config.batchSize) ?? [];
+          compactCursor = Number(retained[1]!.payload.durableCursor) || 0;
+          // Derived audit repair reads the same durable tail on restart.
+          compactCursor = Math.min(compactCursor, ...retained.map(c => Number(c.payload.derivedAuditCursor) || 0));
+          // Current experiment transitions, and any unresolved economic obligation
+          // outside it, remain hot. Two kept snapshots must precede the safe prefix.
+          if (experimentIsActive(context.experiment)) {
+            const start = await this.journal.readDurableByOperationKey(`experiment:${context.experiment!.id}:started`);
+            compactCursor = start ? Math.min(compactCursor, start.sequence - 1) : 0;
+          }
+          // Includes paired positions awaiting settlement and unresolved orders.
+          // Keep their original economic transitions hot until obligations close.
+          if (context.hasEconomicObligations) compactCursor = 0;
+          const prefix = this.config.compactionEnabled && compactCursor > 0
+            ? (await this.journal.queryDurableTransitions({ afterSequence: 0, limit: this.config.batchSize })).filter(row => row.sequence <= compactCursor)
+            : [];
+          const compactable = prefix.some(row => row.type !== "EXPERIMENT_NON_FINAL_QUARANTINED");
+          if (candidates.length || compactable) {
+            const recovery = await this.archive.ensureRecoveryBundle(this.journal, {
+              retained, candidates, prefixCursor: compactable ? compactCursor : 0, maxPrefixRows: this.config.batchSize });
+            if (!recovery.verified || !recovery.manifest) throw new Error("RECOVERY_ARCHIVE_NOT_VERIFIED");
+            if (this.config.offsiteReplicaRequired) await this.replicaVerifier!.verifyRecovery({ directory: recovery.directory, manifest: recovery.manifest });
+            archivedCheckpointIds = candidates.map(c => c.id);
+            compactCursor = this.config.compactionEnabled ? Math.min(compactCursor, recovery.manifest.prefixThroughCursor) : 0;
+          } else compactCursor = 0;
         }
       }
 
@@ -416,10 +469,10 @@ export class RetentionManager {
             limit,
           ),
         },
-        ...(!this.config.guardianRecoveryHold ? [{
+        ...(!this.config.guardianRecoveryHold && archivedCheckpointIds.length ? [{
           cls: "checkpoint",
           exhausted: false,
-          work: (limit: number) => this.journal.pruneOldCheckpoints(this.config.checkpointKeep, limit),
+          work: (limit: number) => this.journal.pruneOldCheckpoints(checkpointKeep, limit, archivedCheckpointIds),
         }] : []),
       ];
 
@@ -495,10 +548,7 @@ export class RetentionManager {
         && this.journal.compactDurableTransitionsThrough
         && this.journal.listVerifiedCheckpoints
       ) {
-        const verified = await this.journal.listVerifiedCheckpoints();
-        const compactionCheckpoint = verified[1];
-        const cursorValue = compactionCheckpoint?.payload.durableCursor;
-        const cursor = typeof cursorValue === "number" && Number.isInteger(cursorValue) ? cursorValue : null;
+        const cursor = compactCursor;
         if (cursor != null && cursor > 0) {
           const compactionStarted = Date.now();
           durableCompaction = await this.journal.compactDurableTransitionsThrough(cursor, {

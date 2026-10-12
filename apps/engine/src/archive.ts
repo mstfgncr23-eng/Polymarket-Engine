@@ -11,6 +11,8 @@ import {
 } from "@pm/core";
 import {
   canonicalJson,
+  hashDurablePayload,
+  type EngineCheckpoint,
   isCanonicalFinalReport,
   type EventJournal,
   type JournalArchiveCandidate,
@@ -68,6 +70,17 @@ export interface JournalBucketArchiveManifest {
   unattributedOnly: boolean;
   eventTypes: string[];
   rawEvents: VerifiedArchiveFile & { eventCount: number };
+}
+
+export interface RecoveryArchiveManifest {
+  archiveSchemaVersion: 1;
+  kind: "engine_recovery";
+  createdAt: string;
+  replayFromCursor: number;
+  throughCursor: number;
+  prefixThroughCursor: number;
+  checkpoints: VerifiedArchiveFile;
+  durableTransitions: VerifiedArchiveFile & { eventCount: number };
 }
 
 export interface ArchiveVerification<T> {
@@ -209,6 +222,65 @@ export class LocalJournalArchive {
 
   experimentDirectory(experimentId: string): string {
     return resolve(this.rootDir, "experiments", safePathComponent(experimentId));
+  }
+
+  /** Back up exact checkpoint purge candidates, two usable recovery snapshots,
+   * the bounded compaction prefix and their immutable replay tail before DML. */
+  async ensureRecoveryBundle(journal: EventJournal, input: {
+    retained: EngineCheckpoint[]; candidates: EngineCheckpoint[]; prefixCursor: number; maxPrefixRows: number;
+  }): Promise<ArchiveVerification<RecoveryArchiveManifest>> {
+    await this.verifyDurableRoot();
+    if (input.retained.length < 2) throw new Error("RECOVERY_ARCHIVE_TWO_CHECKPOINTS_REQUIRED");
+    const cursors = input.retained.map(c => Number(c.payload.durableCursor));
+    if (cursors.some(c => !Number.isSafeInteger(c) || c < 0)) throw new Error("RECOVERY_ARCHIVE_CURSOR_INVALID");
+    const replayFromCursor = Math.min(...cursors), throughCursor = await journal.latestDurableSequence();
+    if (Math.max(...cursors) > throughCursor) throw new Error("RECOVERY_ARCHIVE_CHECKPOINT_AHEAD");
+    const prefix = (await journal.queryDurableTransitions({ afterSequence: 0, limit: input.maxPrefixRows }))
+      .filter(row => row.sequence <= Math.min(input.prefixCursor, replayFromCursor));
+    const prefixThroughCursor = prefix.at(-1)?.sequence ?? 0;
+    const snapshots = [...new Map([...input.retained, ...input.candidates].map(c => [c.id, c])).values()];
+    const snapshotHash = sha256(canonicalJson(snapshots)).slice(0, 16);
+    const directory = resolve(this.rootDir, "recovery", `c${replayFromCursor}_h${throughCursor}_p${prefixThroughCursor}_${snapshotHash}`);
+    const existing = await readFile(resolve(directory, "manifest.json"), "utf8").catch(() => null);
+    if (existing) {
+      const manifest = JSON.parse(existing) as RecoveryArchiveManifest;
+      if (manifest.kind !== "engine_recovery" || manifest.replayFromCursor !== replayFromCursor
+        || manifest.throughCursor !== throughCursor || manifest.prefixThroughCursor !== prefixThroughCursor
+        || !await verifyFile(directory, manifest.checkpoints) || !await verifyFile(directory, manifest.durableTransitions))
+        throw new Error("RECOVERY_ARCHIVE_EXISTING_INVALID");
+      return { directory, manifest, verified: true };
+    }
+    await mkdir(directory, { recursive: true });
+    const checkpoints = await writeJsonArchiveFile(directory, "checkpoints.json", snapshots);
+    const path = resolve(directory, "durable-transitions.jsonl"), temp = path + ".tmp";
+    const stream = createWriteStream(temp), digest = createHash("sha256"); let bytes = 0, count = 0;
+    const write = async (row: Awaited<ReturnType<EventJournal["queryDurableTransitions"]>>[number]) => {
+      if (row.payloadHash !== hashDurablePayload(row.payload)) throw new Error("RECOVERY_ARCHIVE_DURABLE_HASH");
+      const line = Buffer.from(JSON.stringify(row) + "\n"); digest.update(line); bytes += line.length; count++;
+      if (!stream.write(line)) await once(stream, "drain");
+    };
+    try {
+      for (const row of prefix) await write(row);
+      let cursor = replayFromCursor;
+      while (cursor < throughCursor) {
+        const rows = await journal.readDurableTransitionsAfter(cursor, Math.min(EVENT_PAGE_SIZE, throughCursor - cursor));
+        if (!rows.length) throw new Error("RECOVERY_ARCHIVE_REPLAY_GAP");
+        for (const row of rows) {
+          if (row.sequence > throughCursor) break;
+          if (row.sequence !== cursor + 1) throw new Error("RECOVERY_ARCHIVE_REPLAY_GAP");
+          await write(row); cursor = row.sequence;
+        }
+        await new Promise<void>(resolve => setImmediate(resolve));
+      }
+      stream.end(); await finished(stream); await rename(temp, path);
+    } catch (error) { stream.destroy(); await rm(temp, { force: true }); throw error; }
+    const manifest: RecoveryArchiveManifest = { archiveSchemaVersion: 1, kind: "engine_recovery", createdAt: new Date().toISOString(),
+      replayFromCursor, throughCursor, prefixThroughCursor, checkpoints,
+      durableTransitions: { file: "durable-transitions.jsonl", bytes, sha256: digest.digest("hex"), eventCount: count } };
+    await writeAtomic(resolve(directory, "manifest.json"), JSON.stringify(manifest, null, 2) + "\n");
+    if (!await verifyFile(directory, checkpoints) || !await verifyFile(directory, manifest.durableTransitions))
+      throw new Error("RECOVERY_ARCHIVE_FILE_VERIFY");
+    return { directory, manifest, verified: true };
   }
 
   async ensureExperimentCanonical(
