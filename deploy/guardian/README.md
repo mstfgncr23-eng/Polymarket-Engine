@@ -97,6 +97,9 @@ positions and orders hold their economic transitions hot. Exact checkpoint
 purge candidates and the bounded compaction prefix are backed up with the
 required replay tail before deletion. Open and unexpired operation keys survive
 the soft replay-key capacity limit. No archive-file deletion policy is introduced.
+At a retention/compaction-enabled startup, Engine writes its existing checkpoint
+after recovery, before opening feeds. Together with the shutdown snapshot this
+keeps the fallback current and avoids repeatedly exporting a multi-hour tail.
 
 `dist/archive-maintenance.js export-recovery` and `export-bucket` generate bounded
 read-only PostgreSQL evidence using the same transfer implementation. The former

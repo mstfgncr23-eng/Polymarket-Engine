@@ -703,6 +703,10 @@ export class EngineService {
     await this.initializeJournalWithRetry();
     await this.restoreAndRecover();
     await this.restoreReportSourceIntegrity();
+    // Pair the shutdown/recovered snapshot with a current Engine snapshot. This
+    // avoids copying a multi-hour fallback replay tail for each small purge batch.
+    if (this.env.GUARDIAN_SEPARATE_ENABLED && this.env.RETENTION_ENABLED && this.env.RETENTION_COMPACTION_ENABLED)
+      await this.checkpoint();
     this.state.recoveryComplete = true;
     this.noteSoakAnomaly("RECOVERY_OBSERVATION_GAP", { reason: "No observations are fabricated during downtime" });
     const configuredTokens = splitList(this.env.POLYMARKET_TOKEN_IDS);

@@ -16,6 +16,25 @@ import {guardianRpc,startGuardianSocket,type GuardianUpdate} from "../apps/engin
 
 const START=Date.parse("2026-10-05T00:00:00Z");
 describe.skipIf(process.env.SIMPLE_RETENTION_POSTGRES_TEST!=="1")("simple Engine retention on existing isolated PostgreSQL",()=>{
+  it("uses the existing startup checkpoint to keep both fallback cursors current without a new economic transition",async()=>{
+    const f=await isolatedPostgres();let engine:EngineService|undefined;
+    const start=async()=>{
+      const market=new ScriptedMarketAdapter();market.queue(discoveryReport([qualified("first","SOL","first-up","first-down",new Date(START+3600000).toISOString())]));
+      engine=new EngineService(qualifiedPaperEnv({GUARDIAN_SEPARATE_ENABLED:"true",RETENTION_ENABLED:"true",RETENTION_COMPACTION_ENABLED:"true",DISCOVERY_INTERVAL_MS:"3600000",ESTIMATED_INFRA_COST_PER_HOUR_USD:"0"}),f.journal,{error:()=>undefined},
+        {market:market as never,referenceRegistry:new ScriptedReferenceRegistry() as never,activation:new NoopGrokActivationBridge(),now:()=>new Date(START),resolutionFetcher:async()=>null});
+      await engine.start();await market.waitForHandlers();return engine;
+    };
+    try{
+      let e=await start();await e.beginExperiment();
+      await e.applyObservedFill(paperFill("first","UP","0.80",{tokenId:"first-up",quantity:"5",timestamp:new Date(START).toISOString()}));
+      const cash=e.ledger.snapshot().cash,cursor=await f.journal.latestDurableSequence();
+      await e.stop();e=await start();
+      expect(e.ledger.snapshot().cash).toBe(cash);expect(await f.journal.latestDurableSequence()).toBe(cursor);
+      expect((await f.journal.listVerifiedCheckpoints()).slice(0,2).map(c=>c.payload.durableCursor)).toEqual([cursor,cursor]);
+      expect((await f.journal.queryDurableTransitions({types:["PAPER_FILL"],limit:100}))).toHaveLength(1);
+      expect(e.integrityFault()).toBe(false);
+    }finally{await engine?.stop();await f.close();}
+  },60000);
   it("persists one Guardian socket protective PAPER fill to PostgreSQL and cannot duplicate it on retry or Engine/Guardian restart",async()=>{
     const f=await isolatedPostgres();let engine:EngineService|undefined;let socket:Awaited<ReturnType<typeof startGuardianSocket>>|undefined;
     const clock={ms:START};let market:ScriptedMarketAdapter;
