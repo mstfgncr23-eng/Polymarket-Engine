@@ -28,6 +28,11 @@ describe("simple retention bounded archive invariants",()=>{
       expect(await readFile(join(directories[0]!,"manifest.json"))).toEqual(manifestBefore);
       expect((await journal.queryEvents({types:["MARKET_SNAPSHOT"]})).length).toBe(250);
       await writeFile(rawPath,original);
+      await rm(join(directories[0]!,"manifest.json"));
+      expect((await manager.runCycle(context)).skipReason).toBe("ARCHIVE_EXISTING_BUCKET_INCOMPLETE");
+      expect(await readFile(rawPath)).toEqual(original);
+      expect((await journal.queryEvents({types:["MARKET_SNAPSHOT"]})).length).toBe(250);
+      await writeFile(join(directories[0]!,"manifest.json"),manifestBefore);
       expect((await manager.runCycle(context)).deletedByClass.raw_telemetry).toBe(200);
       expect((await manager.runCycle(context)).deletedByClass.raw_telemetry).toBe(50);
       expect(new Set(directories).size).toBe(1);expect(new Set(hashes).size).toBe(1);

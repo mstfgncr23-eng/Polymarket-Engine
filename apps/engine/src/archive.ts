@@ -295,6 +295,8 @@ export class LocalJournalArchive {
     const existing = await this.verifyExperimentManifest(manifestPath, candidate);
     if (existing.verified) return { ...existing, directory };
     if (await stat(manifestPath).catch(() => null)) throw new Error("ARCHIVE_EXISTING_CANONICAL_INVALID");
+    for (const name of ["canonical-events.jsonl", "final-report.json", "canonical-rollup.json"])
+      if (await stat(resolve(directory, name)).catch(() => null)) throw new Error("ARCHIVE_EXISTING_CANONICAL_INCOMPLETE");
 
     await mkdir(directory, { recursive: true });
     const rawPath = resolve(directory, "canonical-events.jsonl");
@@ -367,6 +369,7 @@ export class LocalJournalArchive {
     const existing = await this.verifyBucketManifest(manifestPath, input);
     if (existing.verified) return { ...existing, directory };
     if (await stat(manifestPath).catch(() => null)) throw new Error("ARCHIVE_EXISTING_BUCKET_INVALID");
+    if (await stat(resolve(directory, "events.jsonl")).catch(() => null)) throw new Error("ARCHIVE_EXISTING_BUCKET_INCOMPLETE");
 
     await mkdir(directory, { recursive: true });
     const rawPath = resolve(directory, "events.jsonl");
