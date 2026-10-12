@@ -106,6 +106,11 @@ export const engineEnvSchema = z.object({
     (value) => value === undefined ? undefined : value === true || value === "true" || value === "1",
     z.boolean().optional(),
   ).default(false),
+  /** Run the same policy in an independent Guardian through a local socket. */
+  GUARDIAN_SEPARATE_ENABLED: z.preprocess(
+    (value) => value === undefined ? undefined : value === true || value === "true" || value === "1",
+    z.boolean().optional(),
+  ).default(false),
   /** Legacy manifest compatibility fields. V2 thresholds are sealed constants in guardian-v2.ts. */
   REVERSAL_PROTECTION_WINDOW_MS: z.coerce.number().int().positive().default(180000),
   REVERSAL_PROTECTION_OPPOSITE_COUNT: z.coerce.number().int().positive().default(3),

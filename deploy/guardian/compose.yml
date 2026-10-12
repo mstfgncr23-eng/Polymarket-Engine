@@ -1,0 +1,65 @@
+name: polymarket-paper
+services:
+  engine:
+    image: polymarket-simple-engine:${RELEASE_TAG:?release_tag_required}
+    build:
+      context: ../..
+      dockerfile: Dockerfile.engine
+      target: runtime
+    container_name: polymarket-paper-engine
+    user: "999:999"
+    init: true
+    restart: unless-stopped
+    env_file: ["${ENGINE_ENV_FILE:?existing_engine_env_required}"]
+    environment:
+      TRADING_MODE: paper
+      GUARDIAN_SEPARATE_ENABLED: "true"
+      GUARDIAN_SOCKET_PATH: /run/polymarket/guardian.sock
+      DATABASE_URL_FILE: /run/private/engine-db-url
+      REVERSAL_PROTECTION_ENABLED: "true"
+      PROFIT_TRAILING_PAIR_SOAK_ENABLED: "true"
+      NAKED_DIRECTIONAL_SOAK_ENABLED: "false"
+      PAPER_EXECUTION_STYLE: TAKER
+      NORMAL_HEDGE_MIN_LOCKED_PAIR_EDGE: "0.12"
+      PROFIT_TRAILING_PAIR_ARM_EDGE: "0.05"
+      PROFIT_TRAILING_PAIR_RETRACE_EDGE: "0.02"
+      RETENTION_ENABLED: "false"
+      RETENTION_COMPACTION_ENABLED: "false"
+      LOCAL_ARCHIVE_ENABLED: "false"
+      REPORT_DIRECTORY: /data/archive/simple-engine-reports
+      LEARNING_DATA_DIR: /data/learning
+      GIT_SHA: ${RELEASE_TAG}
+    volumes:
+      - ${SOCKET_DIRECTORY:?socket_directory_required}:/run/polymarket
+      - ${DATABASE_URL_FILE:?existing_database_url_file_required}:/run/private/engine-db-url:ro
+      - /data/archive:/data/archive
+      - /data/learning:/data/learning
+    networks: [existing_pg]
+    ports: ["127.0.0.1:${ENGINE_HTTP_PORT:-18080}:8080"]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/ready').then(r=>r.json()).then(x=>process.exit(x.engineAlive&&x.database==='UP'&&!x.journalDegraded?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 20s
+  guardian:
+    image: polymarket-simple-guardian:${RELEASE_TAG:?release_tag_required}
+    build:
+      context: ../..
+      dockerfile: Dockerfile.engine
+      target: guardian
+    container_name: polymarket-paper-guardian
+    user: "999:999"
+    init: true
+    restart: unless-stopped
+    network_mode: none
+    environment:
+      TRADING_MODE: paper
+      GUARDIAN_SOCKET_PATH: /run/polymarket/guardian.sock
+    volumes:
+      - ${SOCKET_DIRECTORY}:/run/polymarket
+    depends_on: [engine]
+networks:
+  existing_pg:
+    external: true
+    name: ${POSTGRES_NETWORK:?existing_postgres_network_required}

@@ -64,9 +64,9 @@ function holdDurableCommit(journal: MemoryEventJournal, operationKey: string) {
   let entered = false;
   const hold = new Promise<void>((resolve) => { release = resolve; });
   const original = journal.commitDurableTransition.bind(journal);
-  journal.commitDurableTransition = async (input, expected) => {
+  journal.commitDurableTransition = async (input, expected, options) => {
     if (input.operationKey === operationKey) { entered = true; await hold; }
-    return original(input, expected);
+    return original(input, expected, options);
   };
   return {
     release,

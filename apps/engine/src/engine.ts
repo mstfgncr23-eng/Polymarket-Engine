@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import type { GuardianView, GuardianMarket } from "./guardian-link.js";
+import { guardianV2StateSchema, type GuardianV2State } from "@pm/core";
 import { evaluateGuardianV2, lockedGuardianGeneration, GUARDIAN_V2_CONFIG, isGuardianV2State, projectGuardianBookSignal, reversalProtectionStateSchema, sameReversalEpisode, type GuardianV2Event, type ReversalProtectionState, type ReversalEpisode } from "@pm/core";
 import { nakedDirectionalDiagnosticSchema, observeNakedDirectionalPosition, noteNakedDirectionalAnomaly, compactNakedDirectionalObservation,
   nakedDirectionalSummary, SOAK_PERSIST_INTERVAL_MS, evaluateProfitTrailingPair, profitTrailingPairStateSchema,
@@ -446,6 +448,7 @@ export class EngineService {
   private readonly reversalProtectionStates = new Map<string, ReversalProtectionState>();
   /** Per-tick Guardian sensor state. Raw market observations stay off the durable ingress path. */
   private readonly guardianRuntimeStates = new Map<string, ReversalProtectionState>();
+  private readonly guardianConsensus = new Map<string, NonNullable<GuardianMarket["consensus"]>>();
   /** At most one coalescible ordinary checkpoint plus rare ordered critical transitions per market. */
   private readonly guardianPersistenceQueues = new Map<string, GuardianPersistenceRequest[]>();
   private guardianPersistenceBytes = 0;
@@ -5281,6 +5284,7 @@ export class EngineService {
     nextState: ReversalProtectionState;
     events: GuardianV2Event[];
   } | null {
+    if (this.env.GUARDIAN_SEPARATE_ENABLED) return null;
     if (!this.reversalProtectionEnabled() || !experimentAllowsHedge(this.experiment) || this.state.draining
       || this.state.database !== "UP" || this.state.journalDegraded || this.overload.hasIntegrityFault) return null;
     const episode = this.reversalEpisode(this.ledger.positions.get(marketId));
@@ -5613,6 +5617,14 @@ export class EngineService {
 
   private async persistReversalConsensus(event: JournalEvent): Promise<boolean> {
     if (event.payload.authority !== NATIVE_DETERMINISTIC_AUTHORITY || typeof event.payload.marketId !== "string") return false;
+    if (this.env.GUARDIAN_SEPARATE_ENABLED) {
+      const direction = event.payload.consensusDirection;
+      if (direction === "UP" || direction === "DOWN" || direction === "FLAT") {
+        this.guardianConsensus.set(event.payload.marketId, { eventId: event.id, direction,
+          confidence: Number(event.payload.consensusConfidence), estimatedEdge: Number(event.payload.estimatedEdge) });
+      }
+      return false;
+    }
     const handled = await this.persistGuardianObservation(event.payload.marketId, event);
     if (handled) await this.durableGate.outside(() => this.maybeReversalProtection(event.payload.marketId as string));
     return handled;
@@ -5668,6 +5680,7 @@ export class EngineService {
   private scheduleGuardianDeadline(): void {
     if (this.guardianDeadlineTimer) clearTimeout(this.guardianDeadlineTimer);
     this.guardianDeadlineTimer = null;
+    if (this.env.GUARDIAN_SEPARATE_ENABLED) return;
     if (this.state.draining || !this.reversalProtectionEnabled()) return;
     const watches = [...this.reversalProtectionStates.values()].filter(state => isGuardianV2State(state)
       && !state.confirmedAt && state.deadlineAt && this.reversalEpisode(this.ledger.positions.get(state.marketId)));
@@ -5700,6 +5713,70 @@ export class EngineService {
     if (owner) { await this.resumeRiskReduction(owner); return; }
     if (this.riskReductionBusy(marketId)) return;
     await this.executeRiskReductionArbitration(marketId, reversal);
+  }
+
+  /** Current PG-recovered economic projection and Engine's existing public feed.
+   * Guardian never needs a second feed, DB writer, checkpoint issuer or wallet. */
+  guardianView(): GuardianView {
+    const now = this.nowFn();
+    const markets: GuardianMarket[] = [];
+    const open = new Set<string>();
+    for (const position of this.ledger.positions.values()) {
+      if (!this.reversalEpisode(position) || this.settledMarkets.has(position.marketId)) continue;
+      open.add(position.marketId);
+      const pair = this.snapshots.get(position.marketId);
+      const trim = (book: MarketSnapshot | undefined, outcome: Outcome): MarketSnapshot | null =>
+        book && book.tokenId === this.currentTokenIdFor(position.marketId, outcome)
+          ? { ...book, bids: book.bids.slice(0, 1), asks: book.asks.slice(0, 1) } : null;
+      const stored = this.reversalProtectionStates.get(position.marketId);
+      const consensus = this.guardianConsensus.get(position.marketId);
+      markets.push({ position: structuredClone(position),
+        state: stored && isGuardianV2State(stored) ? structuredClone(stored) : null,
+        up: trim(pair?.UP, "UP"), down: trim(pair?.DOWN, "DOWN"),
+        synchronized: this.isMarketSynchronized(position.marketId), ...(consensus ? { consensus } : {}) });
+    }
+    for (const key of this.guardianConsensus.keys()) if (!open.has(key)) this.guardianConsensus.delete(key);
+    return { mode: "paper", enginePid: process.pid, engineStartedAt: this.state.startedAt.toISOString(),
+      experimentId: this.experiment?.id ?? null, now: now.toISOString(),
+      enabled: this.env.GUARDIAN_SEPARATE_ENABLED && this.reversalProtectionEnabled()
+        && experimentAllowsHedge(this.experiment) && this.state.database === "UP" && this.state.recoveryComplete
+        && !this.state.draining && !this.state.journalDegraded && !this.overload.hasIntegrityFault,
+      generation: this.experiment ? lockedGuardianGeneration(this.experiment.riskConfiguration) : null,
+      staleMs: this.riskLimits.staleFeedTimeoutMs, feed: { ...this.state.connections.polymarket }, markets };
+  }
+
+  /** Persist through the existing revision/episode/idempotency boundary, then
+   * use the existing PR3/hedge/SELL arbitration. Only Engine writes orders. */
+  async acceptGuardianUpdate(input: unknown): Promise<{ status: string; reason?: string }> {
+    const raw = input as { experimentId?: unknown; state?: unknown; events?: unknown } | null;
+    const parsed = guardianV2StateSchema.safeParse(raw?.state);
+    if (!parsed.success || !Array.isArray(raw?.events)) return { status: "REJECTED", reason: "INVALID_STATE" };
+    const next = parsed.data;
+    const validEvents: GuardianV2Event[] = ["EARLY_DETERIORATION_ARMED", "EARLY_TRUE_RECOVERY", "EARLY_EMERGENCY_PROTECT",
+      "EARLY_TIMEOUT_PROTECT", "LATE_SEVERITY_ARMED", "LATE_CONFIRMATION_RELEASED", "LATE_CONFIRMATION_ACCEPTED", "LATE_EMERGENCY_PROTECT"];
+    if (raw.events.some(event => !validEvents.includes(event))) return { status: "REJECTED", reason: "INVALID_EVENTS" };
+    const current = this.reversalProtectionStates.get(next.marketId);
+    if (!this.env.GUARDIAN_SEPARATE_ENABLED || raw.experimentId !== this.experiment?.id
+      || !this.reversalProtectionEnabled() || !experimentAllowsHedge(this.experiment)
+      || this.state.draining || this.state.database !== "UP" || this.state.journalDegraded || this.overload.hasIntegrityFault)
+      return { status: "REJECTED", reason: "ENGINE_UNAVAILABLE" };
+    if (!sameReversalEpisode(this.reversalEpisode(this.ledger.positions.get(next.marketId)), next))
+      return { status: "REJECTED", reason: "EPISODE_CHANGED" };
+    if (current && sameReversalEpisode(current, next) && current.revision >= next.revision) {
+      if (current.revision === next.revision && JSON.stringify(current) !== JSON.stringify(next))
+        return { status: "REJECTED", reason: "REVISION_CONFLICT" };
+      if (current.confirmedAt) this.kickReversalProtection(next.marketId);
+      return { status: "REPLAY" };
+    }
+    const now = this.nowFn().getTime();
+    if (Date.parse(next.updatedAt) > now || now - Date.parse(next.updatedAt) > this.riskLimits.staleFeedTimeoutMs)
+      return { status: "REJECTED", reason: "STATE_STALE_OR_FUTURE" };
+    if (!this.guardianObservation(next.marketId, next.heldOutcome, now))
+      return { status: "REJECTED", reason: "BOOK_UNAVAILABLE" };
+    const outcome = await this.enqueueGuardianPersistence(next, raw.events, raw.events.length || next.confirmedAt ? "critical" : "checkpoint");
+    if (outcome.status === "FAILED") throw outcome.error;
+    if (next.confirmedAt && outcome.status === "PERSISTED") this.kickReversalProtection(next.marketId);
+    return { status: outcome.status === "PERSISTED" ? "PERSISTED" : "REPLAY" };
   }
 
   private profitTrailingPairConfig(): { target: number; arm: number; retrace: number } | null {

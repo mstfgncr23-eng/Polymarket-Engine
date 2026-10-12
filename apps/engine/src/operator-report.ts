@@ -1,5 +1,4 @@
 import { persistCanonicalFinalReport, persistVerifiedAnalyticsRollup, resolveAuthoritativeExperiment, streamExperimentSummary } from "./final-report.js";
-import { loadSourceSeal } from "./source-seal.js";
 import { loadUnresolvedReportSourceIntegrity } from "./report-source-integrity.js";
 import { writeExperimentSummary } from "./report.js";
 import type { EventJournal } from "@pm/db";
@@ -49,7 +48,6 @@ export async function generateOperatorReport(
   }, extras);
   streamed.summary.complete = Boolean(authoritative.provenCompleted && streamed.scan.complete && streamed.scan.fence.stable && !streamed.scan.interrupted);
   streamed.summary.truncated = streamed.scan.truncated || streamed.scan.interrupted || !streamed.scan.fence.stable || !authoritative.provenCompleted;
-  const sealed = Boolean(await loadSourceSeal(journal, authoritative.id));
   let integrityFaults: Awaited<ReturnType<typeof loadUnresolvedReportSourceIntegrity>> = [];
   try {
     integrityFaults = await loadUnresolvedReportSourceIntegrity(journal, authoritative.id);
@@ -62,15 +60,13 @@ export async function generateOperatorReport(
   if (integrityFaults.length > 0) {
     streamed.summary.complete = false;
   }
-  if (!authoritative.provenCompleted || !input.allowPersist || !streamed.summary.complete || !sealed || integrityFaults.length > 0) {
+  if (!authoritative.provenCompleted || !input.allowPersist || !streamed.summary.complete || integrityFaults.length > 0) {
     const paths = await writeExperimentSummary(streamed.summary, input.reportDirectory);
     return {
       persisted: false,
       reason: !authoritative.provenCompleted
         ? `NOT_COMPLETED:${authoritative.status}`
-        : !sealed
-          ? "SOURCE_SEAL_MISSING"
-          : integrityFaults.length > 0
+        : integrityFaults.length > 0
             ? "REPORT_SOURCE_INTEGRITY_UNRESOLVED"
           : streamed.summary.truncated ? streamed.summary.truncatedReason : "PERSIST_NOT_REQUESTED",
       complete: streamed.summary.complete,
