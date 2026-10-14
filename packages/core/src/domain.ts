@@ -53,6 +53,8 @@ export const marketSnapshotSchema = z.object({
   feeSchedule: feeScheduleSchema.nullable(),
   sourceTimestamp: timestampSchema,
   receivedAt: timestampSchema,
+  /** Owned WebSocket callback wall clock. Absent for SDK, fixture, and replay transports. */
+  wsCallbackAt: timestampSchema.optional(),
   sequence: z.number().int().nonnegative(),
   hash: z.string().nullable(),
 });

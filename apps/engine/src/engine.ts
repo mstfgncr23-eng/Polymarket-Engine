@@ -3643,6 +3643,7 @@ export class EngineService {
         hash: snapshot.hash,
         sourceTimestamp: snapshot.sourceTimestamp,
         receivedAt: snapshot.receivedAt,
+        wsCallbackAt: snapshot.wsCallbackAt ?? null,
       });
       fairProvenance = {
         revalidated: true,
@@ -6686,6 +6687,7 @@ export class EngineService {
               : null,
           sourceTimestamp: snapshot?.sourceTimestamp ?? null,
           receivedAt: snapshot?.receivedAt ?? null,
+          wsCallbackAt: snapshot?.wsCallbackAt ?? null,
         });
       }
     }

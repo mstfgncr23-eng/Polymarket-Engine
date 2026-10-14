@@ -1268,6 +1268,9 @@ export class PolymarketMarketDataAdapter {
       feeSchedule,
       sourceTimestamp: state.timestamp,
       receivedAt: new Date().toISOString(),
+      ...(typeof raw.__wsCallbackAt === "string" && Number.isFinite(Date.parse(raw.__wsCallbackAt))
+        ? { wsCallbackAt: raw.__wsCallbackAt }
+        : {}),
       sequence: ++this.sequence,
       hash: state.hash,
     };

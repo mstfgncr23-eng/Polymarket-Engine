@@ -304,7 +304,7 @@ export class BoundedClobMarketTransport implements MarketStreamTransport {
       finalize(abortError());
     };
 
-    const enqueueFrame = (raw: string) => {
+    const enqueueFrame = (raw: string, wsCallbackAt: string) => {
       if (finalized || generation !== this.generation) return;
       if (raw.length > this.maxRawFrameBytes) {
         queue.noteOverflow("byte_limit");
@@ -329,7 +329,13 @@ export class BoundedClobMarketTransport implements MarketStreamTransport {
         if (finalized || generation !== this.generation) return;
         const share = i === n - 1 ? remaining : Math.floor(raw.length / n);
         remaining -= share;
-        const result = queue.tryEnqueueWeighted(normalizeRawClobMarketEvent(events[i]), share);
+        // Record only the owned WS callback time, NOT the exchange message time.
+        // The event remains immutable after queue admission; add metadata before enqueue.
+        const normalized = normalizeRawClobMarketEvent(events[i]);
+        const value = record(normalized);
+        const payload = record(value?.payload);
+        if (payload) payload.__wsCallbackAt = wsCallbackAt;
+        const result = queue.tryEnqueueWeighted(normalized, share);
         if (!result.ok) {
           finalize(new IngressOverflowError(result.reason));
           return;
@@ -346,7 +352,7 @@ export class BoundedClobMarketTransport implements MarketStreamTransport {
         lastPong = Date.now();
         return;
       }
-      enqueueFrame(raw);
+      enqueueFrame(raw, new Date().toISOString());
     };
 
     const startPing = () => {
