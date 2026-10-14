@@ -350,7 +350,20 @@ describe("deployment foundation", () => {
     expect(step4).not.toMatch(/FORCE ROW LEVEL SECURITY/);
     expect(step4).not.toMatch(/CREATE POLICY/i);
     expect(journal.entries.map((entry) => entry.tag)).toEqual([
-      "0000_initial", "0001_grok_mcp", "0002_journal_query", "0003_rls_lockdown", "0004_critical_replay", "0005_step4_reports_retention", "0006_hot_storage_lifecycle", "0007_storage_correctness", "0008_journal_commit_fence", "0009_replay_scope",
+      "0000_initial", "0001_grok_mcp", "0002_journal_query", "0003_rls_lockdown", "0004_critical_replay", "0005_step4_reports_retention", "0006_hot_storage_lifecycle", "0007_storage_correctness", "0008_journal_commit_fence", "0009_replay_scope", "0010_guardian_recovery_registry",
     ]);
+    expect(readdirSync(dir).filter(name => /^\d{4}_.*\.sql$/.test(name)).sort()).toEqual(journal.entries.map(entry => `${entry.tag}.sql`));
+    const registry = readFileSync(join(dir, "0010_guardian_recovery_registry.sql"), "utf8");
+    expect(registry).toMatch(/CREATE TABLE IF NOT EXISTS guardian_recovery_roster/);
+    expect(registry).toMatch(/CREATE TABLE IF NOT EXISTS guardian_recovery_pins/);
+    expect(registry).toMatch(/REFERENCES engine_checkpoints\(id\) ON DELETE RESTRICT/);
+    expect(registry).toMatch(/CREATE INDEX IF NOT EXISTS guardian_recovery_pins_checkpoint_idx/);
+    expect(registry).toMatch(/REVOKE ALL ON guardian_recovery_roster FROM PUBLIC/);
+    expect(registry).toMatch(/REVOKE ALL ON guardian_recovery_pins FROM PUBLIC/);
+    for (const entry of journal.entries) {
+      const migration = readFileSync(join(dir, `${entry.tag}.sql`), "utf8");
+      expect(migration).not.toMatch(/\b(?:DROP\s+(?:TABLE|SCHEMA|DATABASE)|TRUNCATE|DELETE\s+FROM)\b/i);
+    }
   });
+
 });

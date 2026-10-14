@@ -1,3 +1,5 @@
 
 # Exact public WebSocket JSONL replay fixture: preserve byte-for-byte SHA-256.
 research/reverse_regression/fixtures/*.jsonl -text
+# Immutable archived contract hash binds the committed LF bytes on every OS.
+research/guardian-shadow/TEST_CONTRACT.md text eol=lf

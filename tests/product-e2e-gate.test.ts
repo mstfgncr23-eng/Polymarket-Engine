@@ -3,6 +3,7 @@ import {
   createId,
   grokSignalSubmissionSchema,
   NATIVE_DETERMINISTIC_MODEL_VERSION,
+  d,
   triggerEventSchema,
   type Direction,
   type MarketSnapshot,
@@ -252,8 +253,16 @@ describe("PR20 true product end-to-end gate", () => {
       expect(types).toEqual(expect.arrayContaining([
         "EXPERIMENT_STARTED", "EXPERIMENT_START_VALIDATED", "TRIGGER_EVENT", "CONSENSUS_DECISION",
         "RISK_EVALUATION", "PAPER_ORDER_CREATED", "PAPER_FILL", "POSITION_SETTLED",
-        "EXPERIMENT_COMPLETED", "EXPERIMENT_SOURCE_SEALED", "EXPERIMENT_REPORT_GENERATED",
+        "EXPERIMENT_COMPLETED", "EXPERIMENT_REPORT_GENERATED",
       ]));
+      expect(types).not.toContain("EXPERIMENT_SOURCE_SEALED");
+      const owners = durable.filter(row => row.type === "RISK_REDUCTION_ADMITTED");
+      expect(owners).toHaveLength(1);
+      const fills = durable.filter(row => row.type === "PAPER_FILL");
+      expect(fills[0]!.sequence).toBeLessThan(owners[0]!.sequence);
+      expect(owners[0]!.sequence).toBeLessThan(fills[1]!.sequence);
+      expect(fills[1]!.sequence).toBeLessThan(durable.find(row => row.type === "POSITION_SETTLED")!.sequence);
+      expect(durable.find(row => row.type === "POSITION_SETTLED")!.sequence).toBeLessThan(durable.find(row => row.type === "EXPERIMENT_COMPLETED")!.sequence);
       expect(types).not.toContain("GROK_SIGNAL_ACCEPTED");
       const riskRows = await setup.journal.queryEvents({ types: ["RISK_EVALUATION"] });
       const revalidatedFirstLeg = riskRows.find((row) => {
@@ -582,13 +591,19 @@ describe("PR20 true product end-to-end gate", () => {
       expect(secondWindow[1]?.payload).toMatchObject({
         accepted: true,
         intent: "PROTECTIVE_DE_RISK",
-        deRisk: { retryCount: 2, finalState: "ORDER_ADMITTED" },
+        deRisk: { retryCount: 2, finalState: "PRECHECK_ACCEPTED" },
       });
       await waitFor(
         () => setup.journal.queryEvents({ types: ["PAPER_FILL"] }),
         (rows) => rows.some((row) => row.payload.intent === "PROTECTIVE_DE_RISK"),
       );
       expect(setup.engine.ledger.positions.has("btc-mkt")).toBe(false);
+      const owners = await setup.journal.queryDurableTransitions({ types: ["RISK_REDUCTION_ADMITTED"], limit: 20 });
+      const fills = (await setup.journal.queryEvents({ types: ["PAPER_FILL"] })).filter(row => row.payload.intent === "PROTECTIVE_DE_RISK");
+      expect(owners).toHaveLength(1); expect(fills).toHaveLength(1);
+      expect(fills[0]!.payload.orderId).toBe(owners[0]!.aggregateId);
+      const created = (await setup.journal.queryEvents({ types: ["PAPER_ORDER_CREATED"] })).filter(row => row.payload.intent === "PROTECTIVE_DE_RISK");
+      expect(created).toHaveLength(1); expect(created[0]!.payload.deRisk).toMatchObject({ finalState: "ORDER_ADMITTED" });
     } finally {
       await setup.engine.stop();
     }
@@ -669,10 +684,15 @@ describe("PR20 true product end-to-end gate", () => {
         message: expect.stringContaining("RISK_STATE_UNAVAILABLE"),
         deRisk: { finalState: "STATE_CHANGED" },
       });
-      // The admitted protective evaluation is still recorded exactly once.
-      const deriskRisks = (await setup.journal.queryEvents({ types: ["RISK_EVALUATION"] }))
-        .filter((row) => Boolean(row.payload.deRisk));
-      expect(deriskRisks).toHaveLength(1);
+      // An actual failed owner may cause a second, vetoed precheck. Neither
+      // precheck is an authorization to execute after the hard safety flip.
+      await waitFor(() => setup.journal.queryEvents({ types: ["RISK_EVALUATION"] }), rows => rows.filter(row => Boolean(row.payload.deRisk)).length === 2);
+      const finalRisks = (await setup.journal.queryEvents({ types: ["RISK_EVALUATION"] })).filter(row => Boolean(row.payload.deRisk));
+      expect(finalRisks).toHaveLength(2);
+      expect(finalRisks[0]!.payload).toMatchObject({ accepted: true, deRisk: { finalState: "PRECHECK_ACCEPTED" } });
+      expect(finalRisks[1]!.payload).toMatchObject({ accepted: false, vetoes: ["RISK_STATE_UNAVAILABLE"], deRisk: { finalState: "RISK_VETO" } });
+      expect(await setup.journal.queryDurableTransitions({ types: ["RISK_REDUCTION_ADMITTED"], limit: 20 })).toHaveLength(1);
+      expect(await setup.journal.queryDurableTransitions({ types: ["RISK_REDUCTION_FAILED"], limit: 20 })).toHaveLength(1);
     } finally {
       await setup.engine.stop();
     }
@@ -751,10 +771,22 @@ describe("PR20 true product end-to-end gate", () => {
         message: expect.stringContaining("MARKET_TOKEN_UNSYNCHRONIZED"),
         deRisk: { finalState: "STATE_CHANGED" },
       });
-      // The admitted protective evaluation is still recorded exactly once.
-      const deriskRisks = (await setup.journal.queryEvents({ types: ["RISK_EVALUATION"] }))
-        .filter((row) => Boolean(row.payload.deRisk));
-      expect(deriskRisks).toHaveLength(1);
+      // The precise token fence rejects execution. The next attempt stops at
+      // the synchronization gate before pricing another candidate.
+      const finalRisks = (await setup.journal.queryEvents({ types: ["RISK_EVALUATION"] })).filter(row => Boolean(row.payload.deRisk));
+      expect(finalRisks).toHaveLength(1);
+      expect(finalRisks[0]!.payload).toMatchObject({ accepted: true, deRisk: { finalState: "PRECHECK_ACCEPTED" } });
+      expect(await setup.journal.queryDurableTransitions({ types: ["RISK_REDUCTION_ADMITTED"], limit: 20 })).toHaveLength(1);
+      expect(await setup.journal.queryDurableTransitions({ types: ["RISK_REDUCTION_FAILED"], limit: 20 })).toHaveLength(1);
+      const unchanged = setup.engine.ledger.snapshot();
+      expect((await setup.journal.queryEvents({ types: ["PAPER_ORDER_CREATED"] })).filter(row => row.payload.intent === "PROTECTIVE_DE_RISK")).toHaveLength(1);
+      setup.market.markTokenSync("btc-up", "SYNCED"); setup.clock.nowMs += 5_001;
+      await setup.market.emitSnapshot(snapshot({ ...marketBook(setup.clock, "UP", 3), bids: [{ price: "0.30", quantity: "20" }], asks: [{ price: "0.31", quantity: "100" }] }));
+      const completed = await waitFor(() => setup.journal.queryEvents({ types: ["PAPER_FILL"] }), rows => rows.some(row => row.payload.intent === "PROTECTIVE_DE_RISK"));
+      const restoredFills = completed.filter(row => row.payload.intent === "PROTECTIVE_DE_RISK");
+      expect(restoredFills).toHaveLength(1); expect(restoredFills[0]!.payload.quantity).toBe("10");
+      expect(setup.engine.ledger.positions.has("btc-mkt")).toBe(false);
+      expect(Number(setup.engine.ledger.snapshot().cash)).toBeCloseTo(Number(unchanged.cash) + 3 - Number(restoredFills[0]!.payload.feeUsd), 8);
     } finally {
       await setup.engine.stop();
     }
@@ -917,14 +949,24 @@ describe("PR20 true product end-to-end gate", () => {
     const journal = new MemoryEventJournal();
     const clock = { nowMs: START_MS };
     const resolutions = new Map<string, Record<string, unknown>>();
-    const setup = await setupScenario({ journal, clock, resolutions, env: { PAPER_EXECUTION_LATENCY_MS: "200" } });
+    // The old 10s market is ineligible for a new entry (minimum remaining
+    // duration is 120s), so it never reaches the crash boundary.
+    const setup = await setupScenario({ journal, clock, resolutions, endDateOffsetMs: 180_000, env: { PAPER_EXECUTION_LATENCY_MS: "200" } });
     let durableFill: Awaited<ReturnType<EventJournal["readDurableTransitionsAfter"]>> = [];
     try {
       expect((await setup.engine.beginExperiment()).ok).toBe(true);
       await setup.market.emitSnapshot(marketBook(clock, "UP", 1));
       await setup.market.emitSnapshot(marketBook(clock, "DOWN", 1));
       await setup.engine.ingestReferenceTickForTest(referenceTick(clock, "100"));
-      setup.engine.setCrashInjectionForTest("AFTER_DURABLE_COMMIT_BEFORE_APPLY");
+      const originalCommit = journal.commitDurableTransition.bind(journal);
+      let crashKey: string | null = null;
+      journal.commitDurableTransition = (input, cursor, options) => {
+        if (input.type === "PAPER_FILL" && !crashKey) {
+          crashKey = input.operationKey;
+          setup.engine.setCrashInjectionForTest("AFTER_DURABLE_COMMIT_BEFORE_APPLY", { operationKey: crashKey });
+        }
+        return originalCommit(input, cursor, options);
+      };
       clock.nowMs = START_MS + 1_000;
       await setup.engine.ingestReferenceTickForTest(referenceTick(clock, "102"));
       await waitFor(() => journal.queryEvents({ types: ["PAPER_ORDER_CREATED"] }), (events) => events.length === 1);
@@ -934,6 +976,7 @@ describe("PR20 true product end-to-end gate", () => {
       expect(trigger).toBeTruthy();
       durableFill = (await journal.readDurableTransitionsAfter(0, 256)).filter((row) => row.type === "PAPER_FILL");
       expect(durableFill).toHaveLength(1);
+      expect(durableFill[0]!.operationKey).toBe(crashKey);
       expect(setup.engine.ledger.positions.size).toBe(0);
       await setup.engine.stop();
     } catch (error) {
@@ -944,11 +987,17 @@ describe("PR20 true product end-to-end gate", () => {
     const recovered = await setupScenario({ journal, clock, resolutions });
     try {
       const recoveredPosition = recovered.engine.ledger.positions.get("btc-mkt");
-      expect(recoveredPosition?.unpairedQuantity).not.toBe("0");
+      expect(recoveredPosition).toBeTruthy();
+      expect(Number(recoveredPosition!.unpairedQuantity)).toBeGreaterThan(0);
       const recoveredFillTimestamp = ((durableFill[0]!.payload.fill as { timestamp?: string }).timestamp);
       expect(recoveredPosition?.unhedgedStartedAt).toBe(recoveredFillTimestamp);
       expect((await journal.queryEvents({ types: ["PAPER_FILL"] })).length).toBe(1);
-      clock.nowMs = START_MS + 20_000;
+      const fill = durableFill[0]!.payload.fill as PaperFill;
+      const expectedAfterFill = d(recovered.engine.ledger.snapshot().startingBalance).minus(d(fill.quantity).mul(fill.fillPrice)).minus(fill.feeUsd);
+      expect(recovered.engine.ledger.snapshot().cash).toBe(expectedAfterFill.toFixed());
+      expect(d(recovered.engine.ledger.snapshot().fees).eq(fill.feeUsd)).toBe(true);
+      expect(d(recoveredPosition!.unpairedQuantity).eq(fill.quantity)).toBe(true);
+      clock.nowMs = START_MS + 180_001;
       resolutions.set("btc-mkt", {
         state: { closed: true },
         resolution: { umaResolutionStatus: "settled" },
@@ -963,6 +1012,19 @@ describe("PR20 true product end-to-end gate", () => {
       expect(durableEconomic.filter((row) => row.type === "POSITION_SETTLED")).toHaveLength(1);
       expect(recovered.engine.ledger.positions.has("btc-mkt")).toBe(false);
       expect(recovered.engine.experimentManifest()?.status).toBe("COMPLETED");
+      expect(recovered.engine.ledger.snapshot().cash).toBe(expectedAfterFill.plus(fill.quantity).toFixed());
+      expect(d(recovered.engine.ledger.snapshot().fees).eq(fill.feeUsd)).toBe(true);
+      const terminal = recovered.engine.ledger.snapshot();
+      await recovered.engine.stop();
+      const finalRestart = await setupScenario({ journal, clock, resolutions, endDateOffsetMs: 180_000 });
+      try {
+        await finalRestart.engine.tickMaintenance(); await finalRestart.engine.tickMaintenance();
+        expect(finalRestart.engine.ledger.snapshot().cash).toBe(terminal.cash);
+        expect(finalRestart.engine.ledger.snapshot().fees).toBe(terminal.fees);
+        expect(finalRestart.engine.ledger.positions.size).toBe(0);
+        expect((await journal.queryEvents({ types: ["PAPER_FILL"] })).length).toBe(1);
+        expect((await journal.queryEvents({ types: ["POSITION_SETTLED"] })).length).toBe(1);
+      } finally { await finalRestart.engine.stop(); }
     } finally {
       await recovered.engine.stop();
     }

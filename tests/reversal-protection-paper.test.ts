@@ -71,6 +71,7 @@ function event(s: Scenario, id: string, direction: "UP" | "DOWN" | "FLAT" = "DOW
   return createJournalEvent({ id, traceId: id, type: "CONSENSUS_DECISION", aggregateType: "consensus", aggregateId: id,
     occurredAt: new Date(s.clock.ms), sourceEventId: "same-source",
     payload: { marketId: MARKET, authority: NATIVE_DETERMINISTIC_AUTHORITY, consensusDirection: direction,
+      calculatedAt: new Date(s.clock.ms).toISOString(), expiresAt: new Date(s.clock.ms + 15000).toISOString(),
       consensusConfidence: 0.65, estimatedEdge: 0.015, evidenceIds: ["same-evidence"], triggerId: "same-trigger" } });
 }
 const observe = (s: Scenario, id: string, direction: "UP" | "DOWN" | "FLAT" = "DOWN") => s.engine.persistReportInput(event(s, id, direction));
@@ -129,6 +130,163 @@ async function armLate(s: Scenario) {
 }
 
 describe("Guardian V2 real PAPER lifecycle and unchanged A/B execution", () => {
+  it.each(["audit", "admission"] as const)("R2: relevant global cash/risk changes during %s still revalidate both candidates", async boundary => {
+    for (const change of ["cash", "errors", "drawdown", "dailyLoss"] as const) {
+      const s = await start();
+      try {
+        await seed(s); await armEarly(s); await timeout(s);
+        const up = book(s, "UP", "0.60", "0.81"), down = book(s, "DOWN", "0.29", "0.30");
+        internal(s).snapshots.set(MARKET, { UP: up, DOWN: down });
+        s.engine.state.marketSnapshots.set(UP, up); s.engine.state.marketSnapshots.set(DOWN, down);
+        let changed = false, plans = 0;
+        const mutate = () => {
+          if (changed) return; changed = true;
+          if (change === "cash") s.engine.ledger.reserve(s.engine.ledger.availableCash().minus("0.01"), new Date(s.clock.ms));
+          else if (change === "errors") (s.engine as unknown as { executionErrors: number[] }).executionErrors.push(...Array(5).fill(s.clock.ms));
+          else {
+            const ledger = s.engine.ledger.snapshot();
+            if (change === "drawdown") ledger.drawdown = "100"; else ledger.netTradingPnl = "-50";
+            s.engine.ledger.restore(ledger, [...s.engine.ledger.positions.values()]);
+          }
+        };
+        const audit = s.engine.persistReportInput.bind(s.engine);
+        s.engine.persistReportInput = async input => {
+          if (input.type === "RISK_EVALUATION" && input.payload.marketId === MARKET) {
+            plans++; if (boundary === "audit") mutate();
+          }
+          return audit(input);
+        };
+        if (boundary === "admission") {
+          const commit = s.journal.commitDurableTransition.bind(s.journal);
+          s.journal.commitDurableTransition = (input, cursor, options) => {
+            if (input.type === "RISK_REDUCTION_ADMITTED") mutate();
+            return commit(input, cursor, options);
+          };
+        }
+        await internal(s).maybeReversalProtection(MARKET);
+        expect(changed).toBe(true); expect(plans).toBe(2);
+        const fills = await riskFills(s);
+        expect(fills).toHaveLength(change === "errors" ? 0 : 1);
+        if (change === "errors") {
+          expect(residual(s)).toBe("5"); expect(await rows(s, "RISK_REDUCTION_ADMITTED")).toHaveLength(0);
+          expect((await rows(s, "RISK_EVALUATION")).some(e => (e.payload.vetoes as string[])?.includes("ABNORMAL_EXECUTION_ERRORS"))).toBe(true);
+        } else {
+          expect(fills[0]!.payload).toMatchObject({ intent: "PROTECTIVE_DE_RISK", quantity: "5", side: "SELL", fillPrice: "0.6" });
+          expect(await rows(s, "RISK_REDUCTION_ADMITTED")).toHaveLength(1); expect(residual(s)).toBe("0");
+        }
+        expect(s.engine.integrityFault()).toBe(false);
+        console.log(JSON.stringify({ evidence: "R2_REAL_RISK_REVALIDATION", boundary, change, plans, fills: fills.length }));
+      } finally { await s.engine.stop(); }
+    }
+  });
+
+  it.each(["expired", "future", "missing"])("inline LATE cannot arm from %s consensus, matching independent worker", async mode => {
+    const s = await start();
+    try {
+      await seed(s); s.clock.ms = START + 200000; await publishSensor(s, ".60");
+      const bad = event(s, "bad-" + mode);
+      if (mode === "expired") bad.payload.expiresAt = new Date(s.clock.ms - 1).toISOString();
+      if (mode === "future") bad.payload.calculatedAt = new Date(s.clock.ms + 1).toISOString();
+      if (mode === "missing") delete bad.payload.expiresAt;
+      await s.engine.persistReportInput(bad);
+      expect(state(s)?.phase).not.toBe("LATE_CONFIRMATION");
+      expect(await rows(s, "GUARDIAN_LATE_SEVERITY_ARMED")).toHaveLength(0);
+    } finally { await s.engine.stop(); }
+  });
+
+  it("continuous quote churn is bounded to three plans and leaves actual residual unprotected", async () => {
+    const s = await start();
+    try {
+      await seed(s); await armEarly(s); await timeout(s);
+      const install = () => {
+        const up = book(s, "UP", s.clock.ms % 2 ? "0.76" : "0.75", "0.81"), down = book(s, "DOWN", "0.29", "0.40");
+        internal(s).snapshots.set(MARKET, { UP: up, DOWN: down });
+        s.engine.state.marketSnapshots.set(UP, up); s.engine.state.marketSnapshots.set(DOWN, down);
+      };
+      install(); let plans = 0; const original = s.engine.persistReportInput.bind(s.engine);
+      s.engine.persistReportInput = async input => {
+        if (input.type === "RISK_EVALUATION" && input.payload.marketId === MARKET) { plans++; s.clock.ms++; install(); }
+        return original(input);
+      };
+      await internal(s).maybeReversalProtection(MARKET);
+      expect(plans).toBe(3); expect(await riskFills(s)).toHaveLength(0); expect(residual(s)).toBe("5");
+      expect(await rows(s, "RISK_REDUCTION_ADMITTED")).toHaveLength(0);
+    } finally { await s.engine.stop(); }
+  });
+
+  it("same economics with a new book sequence/timestamp do not consume requote budget", async () => {
+    const s = await start();
+    try {
+      await seed(s); await armEarly(s); await timeout(s);
+      const install = () => {
+        const up = book(s, "UP", "0.75", "0.81", "10000", s.clock.ms), down = book(s, "DOWN", "0.29", "0.40", "10000", s.clock.ms);
+        internal(s).snapshots.set(MARKET, { UP: up, DOWN: down });
+        s.engine.state.marketSnapshots.set(UP, up); s.engine.state.marketSnapshots.set(DOWN, down);
+      };
+      install(); let plans = 0; const original = s.engine.persistReportInput.bind(s.engine);
+      s.engine.persistReportInput = async input => {
+        if (input.type === "RISK_EVALUATION" && input.payload.marketId === MARKET) { plans++; s.clock.ms++; install(); }
+        return original(input);
+      };
+      await internal(s).maybeReversalProtection(MARKET);
+      expect(plans).toBe(1); expect(await riskFills(s)).toHaveLength(1); expect(residual(s)).toBe("0");
+    } finally { await s.engine.stop(); }
+  });
+  it.each(["audit", "admission"])("requotes BOTH A/B after a changed book during %s wait, with one actual full-residual fill", async boundary => {
+    const s = await start();
+    try {
+      await seed(s); await armEarly(s); await timeout(s);
+      const install = (bid: string, ask: string) => {
+        const up = book(s, "UP", bid, "0.81"), down = book(s, "DOWN", "0.29", ask);
+        internal(s).snapshots.set(MARKET, { UP: up, DOWN: down });
+        s.engine.state.marketSnapshots.set(UP, up); s.engine.state.marketSnapshots.set(DOWN, down);
+      };
+      install("0.75", "0.40"); // A initially dominates .60 B salvage
+      let changed = false;
+      if (boundary === "audit") {
+        const original = s.engine.persistReportInput.bind(s.engine);
+        s.engine.persistReportInput = async event => {
+          if (!changed && event.type === "RISK_EVALUATION" && event.payload.marketId === MARKET) {
+            changed = true; s.clock.ms++; install("0.30", "0.40");
+          }
+          return original(event);
+        };
+      } else {
+        const original = s.journal.commitDurableTransition.bind(s.journal);
+        s.journal.commitDurableTransition = async (input, cursor, options) => {
+          if (!changed && input.type === "RISK_REDUCTION_ADMITTED") {
+            changed = true; s.clock.ms++; install("0.30", "0.40");
+          }
+          return original(input, cursor, options);
+        };
+      }
+      await internal(s).maybeReversalProtection(MARKET);
+      expect(changed).toBe(true); const fills = await riskFills(s);
+      expect(fills).toHaveLength(1);
+      expect(fills[0]!.payload).toMatchObject({ intent: "RESCUE_SECOND_LEG", side: "BUY", quantity: "5", fillPrice: "0.4" });
+      expect(await rows(s, "RISK_REDUCTION_ADMITTED")).toHaveLength(1);
+      expect(await rows(s, "PAPER_ORDER_CREATED")).toHaveLength(1);
+      expect(residual(s)).toBe("0"); expect(s.engine.integrityFault()).toBe(false);
+      console.log(JSON.stringify({ evidence: "QUOTE_WAIT_REARBITRATION", boundary, selection: fills[0]!.payload.intent,
+        admittedOwners: 1, fullResidual: "5", actualFills: 1 }));
+    } finally { await s.engine.stop(); }
+  });
+
+  it("general V2 protection cannot fill a book which ages past freshness AFTER durable admission", async () => {
+    const s = await start();
+    try {
+      await seed(s); await armEarly(s); await timeout(s);
+      const up = book(s, "UP", "0.75", "0.81"), down = book(s, "DOWN", "0.29", "0.40");
+      internal(s).snapshots.set(MARKET, { UP: up, DOWN: down });
+      s.engine.state.marketSnapshots.set(UP, up); s.engine.state.marketSnapshots.set(DOWN, down);
+      const original = internal(s).admitRiskReduction.bind(internal(s));
+      internal(s).admitRiskReduction = async owner => { const admitted = await original(owner); s.clock.ms += 16000; return admitted; };
+      await internal(s).maybeReversalProtection(MARKET);
+      expect(await riskFills(s)).toHaveLength(0); expect(residual(s)).toBe("5");
+      expect(await rows(s, "RISK_REDUCTION_FAILED")).toHaveLength(1);
+      expect(s.engine.integrityFault()).toBe(false);
+    } finally { await s.engine.stop(); }
+  });
   it("EARLY arms from price/book snapshots with zero opposite consensus", async () => {
     const s = await start(); try { await seed(s); await armEarly(s);
       expect(await riskFills(s)).toHaveLength(0); expect(await rows(s, "GUARDIAN_EARLY_DETERIORATION_ARMED")).toHaveLength(1);
@@ -228,6 +386,9 @@ describe("Guardian V2 real PAPER lifecycle and unchanged A/B execution", () => {
       s.clock.ms++; await publish(s, "0.79", "0.08");
       await waitFor(s, () => internal(s).riskReductionOwners.size === 1 && s.journal.inFlightAppends > 0);
       s.clock.ms = START + 70000;
+      // The admitted hedge must resume on a genuinely fresh book after this
+      // 60s clock jump; the original admission-era book is no longer executable.
+      await publish(s, "0.79", "0.08", "10000", 2);
       const pending = internal(s).maybeReversalProtection(MARKET); release(); s.journal.setAppendInFlightHoldForTest(null);
       await pending; await waitFor(s, () => residual(s) === "0");
       expect((await rows(s, "PAPER_FILL")).filter(r => r.payload.intent === "HEDGE_SECOND_LEG")).toHaveLength(1);

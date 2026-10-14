@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import type { GuardianView, GuardianMarket } from "./guardian-link.js";
+import type { GuardianView, GuardianMarket, GuardianUpdate } from "./guardian-link.js";
+import { currentGuardianConsensus } from "./guardian-link.js";
 import { guardianV2StateSchema, type GuardianV2State } from "@pm/core";
 import { evaluateGuardianV2, lockedGuardianGeneration, GUARDIAN_V2_CONFIG, isGuardianV2State, projectGuardianBookSignal, reversalProtectionStateSchema, sameReversalEpisode, type GuardianV2Event, type ReversalProtectionState, type ReversalEpisode } from "@pm/core";
 import { nakedDirectionalDiagnosticSchema, observeNakedDirectionalPosition, noteNakedDirectionalAnomaly, compactNakedDirectionalObservation,
@@ -450,6 +451,7 @@ export class EngineService {
   /** Per-tick Guardian sensor state. Raw market observations stay off the durable ingress path. */
   private readonly guardianRuntimeStates = new Map<string, ReversalProtectionState>();
   private readonly guardianConsensus = new Map<string, NonNullable<GuardianMarket["consensus"]>>();
+  private readonly guardianAdmissions = new Map<string, { update: GuardianUpdate; done: Promise<GuardianPersistenceOutcome> }>();
   /** At most one coalescible ordinary checkpoint plus rare ordered critical transitions per market. */
   private readonly guardianPersistenceQueues = new Map<string, GuardianPersistenceRequest[]>();
   private guardianPersistenceBytes = 0;
@@ -1972,6 +1974,8 @@ export class EngineService {
     return this.durableGate.run(async () => {
       const gateWaitMs = performance.now() - requestedAt;
       let resolveMs = 0, postgresMs = 0;
+      let receiptAt: string | null = null;
+      let appliedAt: string | null = null;
       const occurredAt = input.occurredAt ?? this.nowFn();
       this.crashInjector.maybeCrash("BEFORE_DURABLE_COMMIT", input.operationKey);
       let commit: DurableCommitResult;
@@ -2007,6 +2011,7 @@ export class EngineService {
           }); } finally { postgresMs += performance.now() - postgresAt; }
         }, { ...this.persistenceRetryOptions("durable"), signal: input.signal, deadlineAt: input.deadlineAt });
         this.metrics.noteDurableCommit(input.type, commit.inserted);
+        receiptAt = new Date().toISOString();
       } catch (error) {
         if (error instanceof CrashInjectedError) throw error;
         if (error instanceof ExperimentStartGuardRejectedError) throw error;
@@ -2049,6 +2054,7 @@ export class EngineService {
           await this.replayDurableTail(this.lastAppliedDurableCursor);
         }
         applied = this.applyCommitted(commit.transition);
+        appliedAt = new Date().toISOString();
       } catch (error) {
         if (!(error instanceof CrashInjectedError)) this.failClosedIntegrity(error);
         throw error;
@@ -2066,8 +2072,11 @@ export class EngineService {
       if (input.checkpoint) await this.checkpointInsideGate();
       this.crashInjector.maybeCrash("AFTER_CHECKPOINT", input.operationKey);
       const totalMs = performance.now() - requestedAt;
-      if (this.env.GUARDIAN_SEPARATE_ENABLED && totalMs >= 1000) this.logger.info?.({
-        type: input.type, aggregateId: input.aggregateId, sequence: commit.sequence,
+      const criticalTrace = input.type === "RISK_REDUCTION_ADMITTED" || input.type === "PAPER_FILL"
+        || (input.type === "REVERSAL_PROTECTION_STATE_UPDATED" && parseDerivedAudit(commit.transition.payload).some(r => r.type.startsWith("GUARDIAN_")));
+      if (criticalTrace || (this.env.GUARDIAN_SEPARATE_ENABLED && totalMs >= 1000)) this.logger.info?.({
+        type: input.type, operationKey: input.operationKey, aggregateId: input.aggregateId, sequence: commit.sequence,
+        occurredAt: occurredAt.toISOString(), receiptAt, appliedAt,
         gateWaitMs, resolveMs, postgresMs, applyAuditMs: performance.now() - auditAt, totalMs,
       }, "durable phase timing");
       return commit;
@@ -3775,7 +3784,7 @@ export class EngineService {
     });
   }
 
-  private async admitRiskReduction(owner: RiskReductionOwnership, attempt?: EarlyAdmissionAttempt): Promise<boolean> {
+  private async admitRiskReduction(owner: RiskReductionOwnership, attempt?: EarlyAdmissionAttempt, admissionGuard?: () => void): Promise<boolean> {
     if (this.soakBlocksPostEntry(owner.marketId)) return false;
     const old = this.riskReductionOwners.get(owner.marketId);
     if (old) {
@@ -3796,6 +3805,7 @@ export class EngineService {
         operationKey: `risk-reduction:${owner.order.id}:admitted`, type: "RISK_REDUCTION_ADMITTED",
         aggregateType: "paper_order", aggregateId: owner.order.id,
         beforeCommit: () => {
+          admissionGuard?.();
           const position = this.ledger.positions.get(owner.marketId);
           if (this.riskReductionOwners.has(owner.marketId)) throw new RiskReductionLifecycleGuardRejectedError(owner.marketId, owner.intent, "TAKER_ALREADY_OWNS_RESIDUAL");
           if (!position?.unpairedOutcome || this.settledMarkets.has(owner.marketId)
@@ -3900,7 +3910,7 @@ export class EngineService {
     duplicateKey: string,
     intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK" | "RESCUE_SECOND_LEG" | "GUARDIAN_PROTECTIVE_SELL" = "OPEN_FIRST_LEG",
     deRisk?: ProtectiveDeRiskAudit,
-    options?: { skipPreCreateFirstLegCancel?: boolean; resume?: boolean; earlyAttempt?: EarlyAdmissionAttempt },
+    options?: { skipPreCreateFirstLegCancel?: boolean; resume?: boolean; earlyAttempt?: EarlyAdmissionAttempt; admissionGuard?: () => void },
   ): Promise<boolean> {
     if (intent === "OPEN_FIRST_LEG") return this.executeSubmittedPaperOrder(order, decisionSnapshot, duplicateKey, intent, deRisk, options);
     return this.durableGate.outside(() => this.executeSubmittedPaperOrder(order, decisionSnapshot, duplicateKey, intent, deRisk, options));
@@ -3912,7 +3922,7 @@ export class EngineService {
     duplicateKey: string,
     intent: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK" | "RESCUE_SECOND_LEG" | "GUARDIAN_PROTECTIVE_SELL" = "OPEN_FIRST_LEG",
     deRisk?: ProtectiveDeRiskAudit,
-    options?: { skipPreCreateFirstLegCancel?: boolean; resume?: boolean; earlyAttempt?: EarlyAdmissionAttempt },
+    options?: { skipPreCreateFirstLegCancel?: boolean; resume?: boolean; earlyAttempt?: EarlyAdmissionAttempt; admissionGuard?: () => void },
   ): Promise<boolean> {
     if (intent === "OPEN_FIRST_LEG" && this.experimentStartPending) return false;
     if (this.soakBlocksPostEntry(order.marketId) && (intent !== "OPEN_FIRST_LEG" || order.side !== "BUY"
@@ -4048,11 +4058,11 @@ export class EngineService {
             decisionReceivedAt: decisionSnapshot.receivedAt, state: "ADMITTED", ...(deRisk ? { deRisk } : {}) });
           // ORDER_ADMITTED is emitted only by the durable admission's derived
           // order audit, never by the preceding RISK_EVALUATION/RISK_ACCEPT.
-          if (deRisk?.deRiskReason === "EARLY_CATASTROPHIC_PAIR_LOCK") {
+          if (deRisk) {
             deRisk = { ...deRisk, finalState: "ORDER_ADMITTED" };
             durableOwner.deRisk = deRisk;
           }
-          if (!(await this.admitRiskReduction(durableOwner, options?.earlyAttempt))) return false;
+          if (!(await this.admitRiskReduction(durableOwner, options?.earlyAttempt, options?.admissionGuard))) return false;
         }
       }
       if (!options?.resume) this.metrics.paperOrders.inc({ type: order.orderType });
@@ -4087,9 +4097,21 @@ export class EngineService {
         await delay(this.env.PAPER_EXECUTION_LATENCY_MS);
         const current = this.state.marketSnapshots.get(order.tokenId);
         if (!current || new Date(current.receivedAt).getTime() < new Date(decisionSnapshot.receivedAt).getTime()) throw new Error("STALE_EXECUTION_SNAPSHOT");
-        if (intent === "GUARDIAN_PROTECTIVE_SELL" && !this.freshEarlyCatastrophicSnapshot(current, this.nowFn().getTime())) {
+        if (intent === "PROTECTIVE_DE_RISK" || intent === "GUARDIAN_PROTECTIVE_SELL") {
+          const reason = this.protectiveFillHardSafetyReason(order);
+          if (reason) {
+            this.recordProtectiveDeRiskSuppressed(order.marketId, "FINAL_FENCE", reason, {
+              snapshot: current, extra: { stage: "PRE_EXECUTION", orderId: order.id },
+            });
+            throw new RiskReductionLifecycleGuardRejectedError(order.marketId, intent, reason);
+          }
+        }
+        if (riskReductionOrder && !this.freshEarlyCatastrophicSnapshot(current, this.nowFn().getTime())) {
           throw new RiskReductionLifecycleGuardRejectedError(order.marketId, intent, "GUARDIAN_EXECUTION_BOOK_UNAVAILABLE");
         }
+        if (riskReductionOrder) this.logger.info?.({ stage: "EXECUTION_STARTED", orderId: order.id, marketId: order.marketId,
+          intent, sourceTimestamp: current.sourceTimestamp, receivedAt: current.receivedAt,
+          residual: this.ledger.positions.get(order.marketId)?.unpairedQuantity, localAt: performance.now() }, "risk reduction milestone");
         if (durableOwner) {
           const residual = this.ledger.positions.get(order.marketId);
           if (this.riskReductionOwners.get(order.marketId)?.order.id !== order.id
@@ -5299,6 +5321,8 @@ export class EngineService {
     const down = this.freshEarlyCatastrophicSnapshot(pair?.DOWN ?? null, nowMs);
     if (!up || !down || up.tokenId !== this.currentTokenIdFor(marketId, "UP")
       || down.tokenId !== this.currentTokenIdFor(marketId, "DOWN")) return null;
+    if ([up, down].some(book => !Number.isFinite(Date.parse(book.sourceTimestamp))
+      || Date.parse(book.sourceTimestamp) > nowMs || nowMs - Date.parse(book.sourceTimestamp) > this.riskLimits.staleFeedTimeoutMs)) return null;
     return projectGuardianBookSignal(up, down, heldOutcome);
   }
 
@@ -5349,6 +5373,8 @@ export class EngineService {
       direction: direction as Direction,
       confidence: Number(event.payload.consensusConfidence),
       estimatedEdge: Number(event.payload.estimatedEdge),
+      calculatedAt: typeof event.payload.calculatedAt === "string" ? event.payload.calculatedAt : event.occurredAt,
+      ...(typeof event.payload.expiresAt === "string" ? { expiresAt: event.payload.expiresAt } : {}),
     } : undefined;
     const evaluation = evaluateGuardianV2({
       generation: lockedGuardianGeneration(this.experiment!.riskConfiguration)!,
@@ -5359,7 +5385,7 @@ export class EngineService {
       observation,
       observationGap: !!raw?.lastObservationAt
         && now.getTime() - Date.parse(raw.lastObservationAt) > this.riskLimits.staleFeedTimeoutMs,
-      ...(consensus ? { consensus } : {}),
+      consensus: currentGuardianConsensus(consensus, this.nowFn().getTime(), this.riskLimits.staleFeedTimeoutMs),
     });
     if (!evaluation.stateChanged || !evaluation.nextState) return null;
     this.guardianRuntimeStates.set(marketId, evaluation.nextState);
@@ -5644,7 +5670,9 @@ export class EngineService {
       const direction = event.payload.consensusDirection;
       if (direction === "UP" || direction === "DOWN" || direction === "FLAT") {
         this.guardianConsensus.set(event.payload.marketId, { eventId: event.id, direction,
-          confidence: Number(event.payload.consensusConfidence), estimatedEdge: Number(event.payload.estimatedEdge) });
+          confidence: Number(event.payload.consensusConfidence), estimatedEdge: Number(event.payload.estimatedEdge),
+          calculatedAt: typeof event.payload.calculatedAt === "string" ? event.payload.calculatedAt : event.occurredAt,
+          ...(typeof event.payload.expiresAt === "string" ? { expiresAt: event.payload.expiresAt } : {}) });
       }
       return false;
     }
@@ -5753,10 +5781,13 @@ export class EngineService {
           ? { ...book, bids: book.bids.slice(0, 1), asks: book.asks.slice(0, 1) } : null;
       const stored = this.reversalProtectionStates.get(position.marketId);
       const consensus = this.guardianConsensus.get(position.marketId);
+      const admission = [...this.guardianAdmissions.values()].filter(a => a.update.state.marketId === position.marketId
+        && sameReversalEpisode(this.reversalEpisode(position), a.update.state)).at(-1)?.update.state;
       markets.push({ position: structuredClone(position),
         state: stored && isGuardianV2State(stored) ? structuredClone(stored) : null,
         up: trim(pair?.UP, "UP"), down: trim(pair?.DOWN, "DOWN"),
-        synchronized: this.isMarketSynchronized(position.marketId), ...(consensus ? { consensus } : {}) });
+        synchronized: this.isMarketSynchronized(position.marketId), ...(consensus ? { consensus } : {}),
+        ...(admission ? { admission: structuredClone(admission) } : {}) });
     }
     for (const key of this.guardianConsensus.keys()) if (!open.has(key)) this.guardianConsensus.delete(key);
     return { mode: "paper", enginePid: process.pid, engineStartedAt: this.state.startedAt.toISOString(),
@@ -5791,6 +5822,13 @@ export class EngineService {
       if (current.confirmedAt) this.kickReversalProtection(next.marketId);
       return { status: "REPLAY" };
     }
+    const admissionKey = `${next.positionId}:${next.unhedgedStartedAt}:${next.revision}`;
+    const pending = this.guardianAdmissions.get(admissionKey);
+    // A restarted observer may probe the same admitted state without its lost
+    // semantic event list. It cannot replace the original queued events.
+    if (pending) return JSON.stringify(pending.update.state) === JSON.stringify(next)
+      && (!raw.events.length || JSON.stringify(pending.update.events) === JSON.stringify(raw.events))
+      ? { status: "IN_FLIGHT" } : { status: "REJECTED", reason: "REVISION_CONFLICT" };
     const now = this.nowFn().getTime();
     if (Date.parse(next.updatedAt) > now || now - Date.parse(next.updatedAt) > this.riskLimits.staleFeedTimeoutMs)
       return { status: "REJECTED", reason: "STATE_STALE_OR_FUTURE" };
@@ -5798,7 +5836,22 @@ export class EngineService {
       return { status: "REJECTED", reason: "BOOK_UNAVAILABLE" };
     const critical = next.revision === 1 || raw.events.length > 0 || !!next.confirmedAt
       || (!!current && isGuardianV2State(current) && (current.phase !== next.phase || (current.badRegionSince !== null && next.badRegionSince === null)));
-    const persistence = this.enqueueGuardianPersistence(next, raw.events, critical ? "critical" : "checkpoint");
+    const persistence = this.enqueueGuardianPersistence(next, raw.events, critical ? "critical" : "checkpoint")
+      .catch((error): GuardianPersistenceOutcome => {
+        // Workers normally resolve FAILED. Also settle a rejected admission
+        // without leaving an orphan/unchecked child promise. No rejected state
+        // becomes authority, and an ambiguous durable failure stays fail closed.
+        this.failClosedIntegrity(error);
+        return { status: "FAILED", error, sourceEventId: null };
+      });
+    const admitted = { update: { experimentId: this.experiment!.id, state: next, events: raw.events as GuardianV2Event[] }, done: persistence };
+    this.guardianAdmissions.set(admissionKey, admitted);
+    void persistence.then(() => {
+      if (this.guardianAdmissions.get(admissionKey) === admitted) this.guardianAdmissions.delete(admissionKey);
+    });
+    if (critical) this.logger.info?.({ stage: "STATE_LANE_QUEUED", marketId: next.marketId, positionId: next.positionId,
+      unhedgedStartedAt: next.unhedgedStartedAt, revision: next.revision, updatedAt: next.updatedAt,
+      lastObservationAt: next.lastObservationAt, localAt: performance.now() }, "guardian critical milestone");
     // Routine observation checkpoints already have a bounded, coalescing Engine
     // persistence lane. Do not stall independent monitoring behind its durable
     // gate. QUEUED is admission only; critical watches/decisions still await commit.
@@ -7788,6 +7841,9 @@ private buildEarlyAudit(
     const reason = reversal ? "REVERSAL_CONFIRMED" : "MAX_UNHEDGED_DURATION";
     this.riskReductionInFlight.add(marketId);
     try {
+      // Quote/risk plans are immutable after durable ownership. Before admission
+      // only, retry at most twice when an async audit/gate invalidated the plan.
+      for (let quotePass = 0; quotePass < 3; quotePass++) {
       // Fence older entry/hedge makers before A/B. For reversal, cancellation
       // and episode validation share the mutation gate, so an old confirmation
       // cannot cancel orders belonging to a replacement episode.
@@ -7959,7 +8015,7 @@ private buildEarlyAudit(
         executionErrorsLastHour >= this.riskLimits.maxExecutionErrorsPerHour ? "execution:blocked" : "execution:healthy",
       ].join("|");
       const nextAttemptAt = this.protectiveDeRiskNextAttemptAt.get(marketId) ?? 0;
-      if (now.getTime() < nextAttemptAt) {
+      if (quotePass === 0 && now.getTime() < nextAttemptAt) {
         const vetoFingerprint = this.protectiveDeRiskVetoFingerprint.get(marketId);
         // A normal execution retry keeps its short cooldown. A hard-veto
         // backoff may be bypassed only when the blocker state materially changed.
@@ -8014,6 +8070,43 @@ private buildEarlyAudit(
         })
         : null;
       const ledger = this.ledger.snapshot();
+      const bookFacts = (book: MarketSnapshot | undefined) => book ? {
+        marketId: book.marketId, tokenId: book.tokenId, outcome: book.outcome,
+        bids: book.bids, asks: book.asks, tickSize: book.tickSize, minOrderSize: book.minOrderSize, feeSchedule: book.feeSchedule,
+        fresh: !!this.freshEarlyCatastrophicSnapshot(book, this.nowFn().getTime())
+          && Number.isFinite(Date.parse(book.sourceTimestamp)) && Date.parse(book.sourceTimestamp) <= this.nowFn().getTime()
+          && this.nowFn().getTime() - Date.parse(book.sourceTimestamp) <= this.riskLimits.staleFeedTimeoutMs,
+      } : null;
+      // Transport heartbeats/sequence changes with identical economic books
+      // must not exhaust retries. Freshness availability remains part of facts.
+      const riskFacts = () => {
+        const currentNow = this.nowFn().getTime(), currentLedger = this.ledger.snapshot();
+        const currentPosition = this.ledger.positions.get(marketId);
+        const currentExposure = computePaperExposures(this.ledger.positions.values(), marketId, this.assetByMarket, currentNow);
+        return JSON.stringify({ pair: {
+          UP: bookFacts(this.snapshots.get(marketId)?.UP), DOWN: bookFacts(this.snapshots.get(marketId)?.DOWN),
+        }, position: currentPosition ? { ...currentPosition, updatedAt: undefined } : null,
+          // Global quantity/cost exposures and available cash can change the
+          // two candidates' risk verdicts. Other markets' marks/audit metadata
+          // cannot, unless an existing risk threshold is actually crossed.
+          exposure: { ...currentExposure, unhedgedDurationMs: undefined },
+          cash: this.ledger.availableCash().toFixed(),
+          dailyLossBlocked: d(currentLedger.netTradingPnl).lte(d(this.riskLimits.maxDailyPaperLossUsd).negated()),
+          drawdownBlocked: d(currentLedger.drawdown).gte(this.riskLimits.maxDrawdownUsd),
+          executionBlocked: this.executionErrors.filter(at => currentNow - at < 3_600_000).length >= this.riskLimits.maxExecutionErrorsPerHour,
+          database: this.state.database, draining: this.state.draining, integrity: this.protectiveRiskStateAvailable(),
+          timestampDisorder: this.timestampDisorder, synchronized: this.isMarketSynchronized(marketId),
+          upToken: this.currentTokenIdFor(marketId, "UP"), downToken: this.currentTokenIdFor(marketId, "DOWN"),
+          experiment: this.experiment?.status });
+      };
+      const quotedFacts = riskFacts();
+      const quoteCurrent = () => {
+        const currentNow = this.nowFn().getTime();
+        const currentPair = this.snapshots.get(marketId);
+        return quotedFacts === riskFacts() && bookFacts(currentPair?.[position.unpairedOutcome!])?.fresh === true
+          && (!oppositeSnapshot || bookFacts(currentPair?.[oppositeOutcome])?.fresh === true)
+          && (eligibility.marketEndMs === null || currentNow < eligibility.marketEndMs);
+      };
       const rescuePosition: HedgePositionFacts = {
         marketId: position.marketId,
         unpairedOutcome: position.unpairedOutcome,
@@ -8159,7 +8252,7 @@ private buildEarlyAudit(
         residualQuantity: residualQuantity.gt(0) ? residualQuantity.toFixed() : "0",
         residualExposure: (selectedIntent === "RESCUE_SECOND_LEG" ? projectedB?.unhedged : projectedA?.unhedged) ?? exposure.unhedged,
         retryCount,
-        finalState: selectedDecision?.order ? "ORDER_ADMITTED" : "RISK_VETO",
+        finalState: selectedDecision?.order ? "PRECHECK_ACCEPTED" : "RISK_VETO",
         selection: arbitration.selection,
         selectionReason: arbitration.selectionReason,
         tieBreakUsed: arbitration.tieBreakUsed,
@@ -8177,6 +8270,11 @@ private buildEarlyAudit(
         bRequiredCashUsd: bDecision?.requiredCashUsd ?? null,
         bGuaranteedSalvageUsd: bDecision?.guaranteedSalvageUsd ?? null,
       };
+
+      if (selectedDecision?.order) this.logger.info?.({ stage: "ACTION_SELECTED", marketId, orderId: selectedDecision.order.id,
+        positionId: position.id, unhedgedStartedAt, revision: reversal?.revision, selection: selectedIntent,
+        createdAt: selectedDecision.order.createdAt, sourceTimestamp: snapshot.sourceTimestamp, receivedAt: snapshot.receivedAt,
+        residual: position.unpairedQuantity, quotePass, localAt: performance.now() }, "risk reduction milestone");
 
       await this.persistReportInput(createJournalEvent({
         traceId,
@@ -8207,6 +8305,11 @@ private buildEarlyAudit(
         return;
       }
 
+      if (!quoteCurrent()) {
+        this.logger.info?.({ stage: "REQUOTE", marketId, quotePass, reason: "ASYNC_RISK_FACTS_CHANGED" }, "risk reduction milestone");
+        continue;
+      }
+
       this.protectiveDeRiskVetoFingerprint.delete(marketId);
       this.record("RISK_ACCEPT", traceId, marketId, {
         orderId: selectedDecision.order.id,
@@ -8221,6 +8324,13 @@ private buildEarlyAudit(
         `${marketId}:${selectedIntent === "RESCUE_SECOND_LEG" ? oppositeOutcome : snapshot.outcome}:${selectedIntent}`,
         selectedIntent!,
         audit,
+        { admissionGuard: () => {
+          if (selectedIntent === "PROTECTIVE_DE_RISK") {
+            const reason = this.protectiveFillHardSafetyReason(selectedDecision.order!);
+            if (reason) throw new RiskReductionLifecycleGuardRejectedError(marketId, selectedIntent, reason);
+          }
+          if (!quoteCurrent()) throw new RiskReductionLifecycleGuardRejectedError(marketId, selectedIntent!, "QUOTE_RISK_CHANGED");
+        } },
       );
       const afterSubmit = this.ledger.positions.get(marketId);
       const unpairedAfterSubmit = afterSubmit?.unpairedOutcome
@@ -8230,6 +8340,9 @@ private buildEarlyAudit(
         // A successful reduction earns an immediate residual retry on the next
         // fresh book instead of waiting out the failure backoff.
         this.protectiveDeRiskNextAttemptAt.delete(marketId);
+      }
+      if (!this.riskReductionOwners.has(marketId) && unpairedAfterSubmit.eq(unpairedBeforeSubmit) && !quoteCurrent()) continue;
+      return;
       }
     } finally {
       this.riskReductionInFlight.delete(marketId);
@@ -8276,7 +8389,7 @@ private buildEarlyAudit(
    * protective economic mutation â€” rejected as a normal state change, never
    * as an integrity fault.
    */
-  private protectiveFillHardSafetyReason(fill: Parameters<PaperLedger["applyFill"]>[0]): string | null {
+  private protectiveFillHardSafetyReason(fill: Pick<Parameters<PaperLedger["applyFill"]>[0], "marketId" | "tokenId" | "outcome">): string | null {
     if (this.state.database !== "UP") return "DATABASE_UNAVAILABLE";
     if (this.state.journalDegraded || this.overload.hasIntegrityFault || this.overload.state === "FAIL_CLOSED") {
       return "RISK_STATE_UNAVAILABLE";

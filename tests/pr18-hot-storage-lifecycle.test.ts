@@ -2,7 +2,7 @@ import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   CANONICAL_REPORT_INPUT_EVENT_TYPES,
   createIdleExperiment,
@@ -30,6 +30,7 @@ import {
 import { defaultRetentionConfig, RetentionManager } from "../apps/engine/src/retention-manager.js";
 import { resolveCleanupLifecycle } from "../apps/engine/src/cleanup-lifecycle.js";
 import { EngineService } from "../apps/engine/src/engine.js";
+import { verifyRecoveryDirectory } from "../apps/engine/src/archive-recovery.js";
 import { paperFill, book, qualifiedPaperEnv, startQualifiedEngine } from "./paper-engine-testkit.js";
 import { order as fixtureOrder } from "./fixtures.js";
 
@@ -106,7 +107,7 @@ describe("PR18 hot operational storage lifecycle", () => {
   it("reconstructs compacted payloads in EngineService without reapplying them", async () => {
     const journal = new MemoryEventJournal();
     const engine = new EngineService(qualifiedPaperEnv(), journal, { error: () => undefined });
-    const resolve = (engine as unknown as { resolveDurablePayload: (input: unknown, occurredAt: Date) => Promise<Record<string, unknown>> }).resolveDurablePayload.bind(engine);
+    const resolve = (engine as unknown as { resolveDurablePayload: (input: unknown, occurredAt: Date, computed: Record<string, unknown>) => Promise<Record<string, unknown>> }).resolveDurablePayload.bind(engine);
     const lanes = [
       { operationKey: "fill:compacted", type: "PAPER_FILL", aggregateType: "paper_fill", aggregateId: "fill-compacted", payload: { fill: { id: "fill-compacted", marketId: "m" }, positionId: "pos:m", reservationAfter: null, restingAfter: null } },
       { operationKey: "maker:order-compacted:reserve", type: "PAPER_MAKER_RESERVED", aggregateType: "paper_order", aggregateId: "order-compacted", payload: { orderId: "order-compacted", reserved: "1", resting: { order: { id: "order-compacted" } } } },
@@ -123,7 +124,7 @@ describe("PR18 hot operational storage lifecycle", () => {
     await journal.compactDurableTransitionsThrough(cursor, { maxRows: lanes.length, batchSize: lanes.length, maxReplayKeys: 100, maxBatches: 1, budgetMs: 1000 });
     let retryCursor = cursor;
     for (const lane of lanes) {
-      const rebuilt = await resolve({ ...lane, buildPayload: () => lane.payload }, new Date("2026-01-01T00:00:00.000Z"));
+      const rebuilt = await resolve({ ...lane, buildPayload: () => lane.payload }, new Date("2026-01-01T00:00:00.000Z"), structuredClone(lane.payload));
       const retry = await journal.commitDurableTransition({ ...lane, payload: rebuilt }, retryCursor);
       expect(retry.inserted).toBe(false);
       expect(retry.existing).toBe(true);
@@ -329,12 +330,18 @@ describe("PR18 hot operational storage lifecycle", () => {
     expect((await journal.loadAnalyticsRollup!("exp-pr18"))?.sourceEventCount).toBe(1);
   });
 
-  it("closes terminal replay identities and keeps turnover bounded", async () => {
+  it("retains replay identities through TTL, evicts expired terminal keys and pins live fills", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const started = Date.parse("2026-01-01T00:00:00Z"); vi.setSystemTime(started);
+    try {
     const journal = new MemoryEventJournal();
+    const turnoverRows = 1024; // Four times the key-pressure target, bounded CI work.
     let cursor = 0;
-    for (let i = 0; i < 10_000; i += 1) {
+    for (let i = 0; i < turnoverRows; i += 1) {
+      const marketId = `m:${Math.floor(i / 2)}`;
       const committed = await journal.commitDurableTransition({
-        operationKey: `turnover:${i}`, type: i % 2 ? "PAPER_FILL" : "POSITION_SETTLED", aggregateType: i % 2 ? "paper_fill" : "position", aggregateId: `obligation:${i}`, payload: { experimentId: "exp-pr18", marketId: `m:${i}` },
+        operationKey: `turnover:${i}`, type: i % 2 ? "POSITION_SETTLED" : "PAPER_FILL", aggregateType: i % 2 ? "position" : "paper_fill", aggregateId: `obligation:${i}`,
+        payload: i % 2 ? { experimentId: "exp-pr18", marketId } : { experimentId: "exp-pr18", fill: paperFill(marketId, "UP", "0.4") },
       }, cursor);
       cursor = committed.sequence;
     }
@@ -344,9 +351,23 @@ describe("PR18 hot operational storage lifecycle", () => {
     }
     const footprint = journal.storageFootprintForTest();
     expect(footprint.durable_transitions.rows).toBe(0);
-    expect(footprint.durable_replay_keys.rows).toBeLessThanOrEqual(256);
+    // The max key setting cannot authorize loss of still-valid retry identity.
+    expect(footprint.durable_replay_keys.rows).toBe(turnoverRows);
     const replay = (journal as unknown as { compactedByKey: Map<string, { lifecycleState?: string }> }).compactedByKey;
     expect([...replay.values()].every((row) => row.lifecycleState !== "open")).toBe(true);
+    const pinnedInput = { operationKey: "turnover:live", type: "PAPER_FILL", aggregateType: "paper_fill", aggregateId: "live",
+      payload: { experimentId: "exp-pr18", fill: paperFill("live", "UP", "0.4") } };
+    const pinned = await journal.commitDurableTransition(pinnedInput, cursor); cursor = pinned.sequence;
+    await journal.compactDurableTransitionsThrough(cursor, { maxRows: 500, batchSize: 500, maxBatches: 1, maxReplayKeys: 256, budgetMs: 1000 });
+    const old = await journal.readDurableByOperationKey("turnover:0"); expect(old).toBeTruthy();
+    expect(old!.payload).toEqual({});
+    vi.setSystemTime(started + 7 * 24 * 60 * 60_000 + 1);
+    await journal.compactDurableTransitionsThrough(cursor, { maxRows: 500, batchSize: 500, maxBatches: 1, maxReplayKeys: 256, budgetMs: 1000 });
+    expect(journal.storageFootprintForTest().durable_replay_keys.rows).toBe(1);
+    expect(await journal.readDurableByOperationKey("turnover:0")).toBeNull();
+    expect((await journal.commitDurableTransition(pinnedInput, cursor)).inserted).toBe(false);
+    expect(await journal.latestDurableSequence()).toBe(cursor);
+    } finally { vi.useRealTimers(); }
   });
 
   it("enforces report-write capability for rollup persistence", async () => {
@@ -413,6 +434,10 @@ describe("PR18 hot operational storage lifecycle", () => {
     const fence = await journal.readJournalEventById("completed-fence");
     expect(fence).toBeTruthy();
     const sourceCommitSeq = await journal.latestCommitSeq();
+    const streamed = await streamExperimentSummary(journal, { id: experimentId, startedAt: "2026-01-01T00:00:00.000Z" }, {
+      status: "COMPLETED", complete: true, reportKind: "final", metricsScope: "complete",
+    });
+    expect(streamed.scan.scanned).toBe(501);
 
     const persisted = await journal.persistExperimentReport({
       experimentId,
@@ -428,17 +453,11 @@ describe("PR18 hot operational storage lifecycle", () => {
       sourceFenceId: "completed-fence",
       earliestIncludedAt: "2026-01-01T00:00:00.000Z",
       latestIncludedAt: fenceAt,
-      canonicalSummary: { status: "COMPLETED" },
+      canonicalSummary: streamed.summary,
       renderedMarkdown: "completed",
-      contentHash: "archive-final-hash",
+      contentHash: "",
     });
 
-    const acc = new ExperimentSummaryAccumulator(experimentId, {
-      status: "COMPLETED",
-      complete: true,
-      reportKind: "final",
-      metricsScope: "complete",
-    });
     await persistVerifiedAnalyticsRollup(journal, {
       experimentId,
       sourceCursor: 0,
@@ -449,7 +468,7 @@ describe("PR18 hot operational storage lifecycle", () => {
       sourceRecordedAt: fence!.recordedAt,
       stableRead: true,
       sourceCoverageComplete: true,
-      accumulator: { ...acc.serialize(), eventCount: 501 } as unknown as Record<string, unknown>,
+      accumulator: streamed.accumulatorSnapshot! as unknown as Record<string, unknown>,
     });
 
     const { directory, config } = await archiveConfig({
@@ -470,6 +489,7 @@ describe("PR18 hot operational storage lifecycle", () => {
       failClosed: false,
       databaseUp: true,
     });
+    expect(first.failures, first.skipReason ?? undefined).toBe(0);
     expect(first.deletedByClass.canonical_report_input).toBe(500);
     expect((await journal.countByType(["RISK_EVALUATION"])).RISK_EVALUATION ?? 0).toBe(0);
     expect((await journal.queryEvents({ types: ["EXPERIMENT_COMPLETED"] })).some((row) => row.id === "completed-fence")).toBe(true);
@@ -478,9 +498,16 @@ describe("PR18 hot operational storage lifecycle", () => {
       rawEvents: { eventCount: number; sha256: string };
       reportContentHash: string;
     };
-    expect(manifest.rawEvents.eventCount).toBe(500);
+    expect(manifest.rawEvents.eventCount).toBe(501);
     expect(manifest.rawEvents.sha256).toMatch(/^[a-f0-9]{64}$/);
-    expect(manifest.reportContentHash).toBe("archive-final-hash");
+    expect(manifest.reportContentHash).toBe(persisted.report.contentHash);
+    const rebuilt = await streamExperimentSummary(journal, { id: experimentId, startedAt: "2026-01-01T00:00:00.000Z" }, {
+      status: "COMPLETED", complete: true, reportKind: "final", metricsScope: "complete",
+    });
+    expect(rebuilt.summary.totalOpportunities).toBe(500);
+    expect(rebuilt.summary.acceptedOpportunities).toBe(500);
+    expect(rebuilt.scan.scanned).toBe(501);
+    expect(rebuilt.summary.decisionAccountingEventCount).toBe(501);
   });
 
   it("keeps journal rows hot when local archive is disabled", async () => {
@@ -756,21 +783,26 @@ describe("PR18 hot operational storage lifecycle", () => {
   });
 
   it("compacts automatically only behind the older of two verified snapshots", async () => {
-    const journal = new MemoryEventJournal();
-    let cursor = 0;
-    for (let i = 0; i < 3; i += 1) {
-      const committed = await journal.commitDurableTransition({ operationKey: `ret:${i}`, type: "PAPER_MAKER_RESERVED", aggregateType: "order", aggregateId: `o:${i}`, payload: { experimentId: "exp-pr18" } }, cursor);
-      cursor = committed.sequence;
-    }
-    await journal.saveCheckpoint({ experimentId: "exp-pr18", sequence: 1, payload: checkpointPayload(cursor) });
-    await journal.saveCheckpoint({ experimentId: "exp-pr18", sequence: 2, payload: checkpointPayload(cursor) });
-    const manager = new RetentionManager(journal, defaultRetentionConfig({ enabled: true, compactionEnabled: true, checkpointKeep: 4,
-      // Explicit legacy maintenance semantics only; production defaults HOLD.
-      guardianRecoveryHold: false }));
-    const result = await manager.runCycle({ experiment: null, now: new Date("2026-01-01T00:00:00.000Z"), degraded: false, failClosed: false, databaseUp: true });
+    const s = await startQualifiedEngine({ ESTIMATED_INFRA_COST_PER_HOUR_USD: "0" });
+    try {
+    const journal = s.journal;
+    await s.engine.beginExperiment(); await s.engine.closeExperimentEntries(); await s.engine.tickMaintenance();
+    expect(s.engine.experimentManifest()!.status).toBe("COMPLETED");
+    await s.engine.checkpointForTest(); await s.engine.checkpointForTest();
+    const cursor = await journal.latestDurableSequence(), cash = s.engine.ledger.snapshot().cash;
+    const { directory, config } = await archiveConfig({ enabled: true, compactionEnabled: true, checkpointKeep: 4, guardianRecoveryHold: false });
+    const archive = new LocalJournalArchive(directory), retained = (await journal.listVerifiedCheckpoints()).slice(0, 2);
+    const bundle = await archive.ensureRecoveryBundle(journal, { retained, candidates: [], prefixCursor: cursor, maxPrefixRows: 200 });
+    expect((await verifyRecoveryDirectory(bundle.directory)).status).toBe("PASSED");
+    const manager = new RetentionManager(journal, config, undefined, archive);
+    const result = await manager.runCycle({ experiment: null, now: new Date(), degraded: false, failClosed: false, databaseUp: true, hasEconomicObligations: false });
+    expect(result.failures, result.skipReason ?? undefined).toBe(0);
     expect(result.durableTransitionsPruned).toBe(true);
-    expect(result.durableCompaction?.deleted).toBe(3);
-    expect(await journal.latestDurableSequence()).toBe(3);
+    expect(result.durableCompaction?.deleted).toBe(cursor);
+    expect(await journal.latestDurableSequence()).toBe(cursor);
+    expect(s.engine.ledger.snapshot().cash).toBe(cash);
+    expect((await verifyRecoveryDirectory(bundle.directory)).status).toBe("PASSED");
+    } finally { await s.engine.stop(); }
   });
 
   it("resolves cleanup authority from a verified snapshot after lifecycle rows are compacted", async () => {

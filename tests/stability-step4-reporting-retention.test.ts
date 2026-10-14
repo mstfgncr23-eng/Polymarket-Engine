@@ -38,6 +38,7 @@ import {
   reportGeneratedAuditId,
   scanJournalEvents,
   SchemaVerificationError,
+  JournalAppendAbortedError,
 } from "@pm/db";
 import { createApiServer } from "../apps/engine/src/server.js";
 import { buildExperimentSummary, ExperimentSummaryAccumulator, writeExperimentSummary } from "../apps/engine/src/report.js";
@@ -51,14 +52,13 @@ import {
   REPORT_SOURCE_INTEGRITY_HARD_CAP,
   REPORT_SOURCE_INTEGRITY_REPAIRED,
   shouldLatchReportSourceIntegrity,
+  isReportInputBoundaryType,
 } from "../apps/engine/src/report-source-integrity.js";
-import { isSourceSealExemptType } from "../apps/engine/src/source-seal.js";
 import { isCriticalPersistenceType } from "../apps/engine/src/runtime-supervisor.js";
 import { readFileSync } from "node:fs";
 import { BoundedJournalWriter } from "../apps/engine/src/journal-writer.js";
 import { generateOperatorReport } from "../apps/engine/src/operator-report.js";
 import { defaultRetentionConfig, experimentIsActive, experimentIsMonitorOnly, RetentionManager } from "../apps/engine/src/retention-manager.js";
-import { loadSourceSeal } from "../apps/engine/src/source-seal.js";
 import { LOCAL_ARCHIVE_SENTINEL, LOCAL_ARCHIVE_SENTINEL_CONTENT } from "../apps/engine/src/archive.js";
 import { completeMetricsFlightKey, resetStrategyMetricsCacheForTest } from "../apps/engine/src/mcp.js";
 import { KeyedResultFlight } from "../apps/engine/src/runtime-supervisor.js";
@@ -75,6 +75,9 @@ import {
   ScriptedReferenceRegistry,
 } from "./paper-engine-testkit.js";
 import { NoopGrokActivationBridge } from "../apps/engine/src/activation/index.js";
+
+// Every legacy case is mapped in SOURCE_SEAL_TEST_MIGRATION.md. These tests
+// exercise current Engine finality/admission/integrity, not a restored seal API.
 
 function ev(type: string, occurredAt: string, payload: Record<string, unknown> = {}, id?: string): JournalEvent {
   return createJournalEvent({
@@ -122,7 +125,6 @@ function fixtureEvents(): JournalEvent[] {
       marketId: "m1", asset: "BTC", realizedDelta: 6, upQuantity: "10", downQuantity: "10", grossOutcome: "POSITION_WIN",
     }, "e-set"),
     ev("EXPERIMENT_COMPLETED", "2026-09-01T00:00:08.000Z", { status: "COMPLETED" }, "e-done"),
-    ev("EXPERIMENT_SOURCE_SEALED", "2026-09-01T00:00:09.000Z", { experimentId: "exp-1", sealed: true }, "sourceseal:exp-1"),
   ];
 }
 
@@ -608,11 +610,19 @@ describe("Step-4 acceptance: operator report CLI gates", () => {
     const missing = await generateOperatorReport(journal, { experimentId: "exp-missing", reportDirectory: dir, allowPersist: true });
     expect(missing.persisted).toBe(false);
     expect(missing.reason).toBe("EXPERIMENT_IDENTITY_MISSING");
-    const unsealed = new MemoryEventJournal();
-    await unsealed.appendMany(fixtureEvents().filter((event) => event.type !== "EXPERIMENT_SOURCE_SEALED"));
-    const noSeal = await generateOperatorReport(unsealed, { experimentId: "exp-1", reportDirectory: dir, allowPersist: true });
-    expect(noSeal.persisted).toBe(false);
-    expect(noSeal.reason).toBe("SOURCE_SEAL_MISSING");
+    // A completed, intact Engine source does not require a removed seal marker.
+    const intact = new MemoryEventJournal();
+    await intact.appendMany(fixtureEvents());
+    expect(await generateOperatorReport(intact, { experimentId: "exp-1", reportDirectory: dir, allowPersist: true }))
+      .toMatchObject({ persisted: true, reason: null, complete: true });
+    const damaged = new MemoryEventJournal();
+    await damaged.appendMany(fixtureEvents());
+    await damaged.append(ev(REPORT_SOURCE_INTEGRITY_FAULT, "2026-09-01T00:00:07.500Z", {
+      eventId: "missing-input", eventType: "TRIGGER_EVENT", unresolved: true,
+    }, "fault-op-report"));
+    expect(await generateOperatorReport(damaged, { experimentId: "exp-1", reportDirectory: dir, allowPersist: true }))
+      .toMatchObject({ persisted: false, reason: "REPORT_SOURCE_INTEGRITY_UNRESOLVED", complete: false });
+    expect(await damaged.loadExperimentReport("exp-1")).toBeNull();
     const resolved = await resolveAuthoritativeExperiment(journal, "exp-1");
     expect(resolved?.startedAt).toBe("2026-09-01T00:00:00.000Z");
     expect(resolved?.startedAt).not.toBe("2026-08-01T00:00:00.000Z");
@@ -824,8 +834,8 @@ async function waitUntil(predicate: () => boolean | Promise<boolean>, timeoutMs 
   }
 }
 
-describe("Step-4 acceptance: application-level source seal", () => {
-  it("holds a pre-completion TRIGGER_EVENT until the source seal drains", async () => {
+describe("Step-4 acceptance: runtime drain before canonical finality", () => {
+  it("holds a pre-completion TRIGGER_EVENT and defers finality until tracked admission drains", async () => {
     const journal = new MemoryEventJournal();
     const adapter = new ScriptedMarketAdapter();
     adapter.queue(discoveryReport([qualified("btc-mkt", "BTC", "btc-up", "btc-down")]));
@@ -839,7 +849,6 @@ describe("Step-4 acceptance: application-level source seal", () => {
       const started = await engine.beginExperiment();
       expect(started).toMatchObject({ ok: true });
       const experimentId = engine.experimentManifest()!.id;
-      engine.setSourceSealTimeoutForTest(80);
       let release!: () => void;
       engine.setTriggerEventPersistHoldForTest(new Promise<void>((resolve) => { release = resolve; }));
       const trigger = triggerEventSchema.parse({
@@ -853,14 +862,11 @@ describe("Step-4 acceptance: application-level source seal", () => {
       await engine.completeExperimentForTest();
       await engine.writeFinalReportForTest();
       expect(await journal.loadExperimentReport(experimentId)).toBeNull();
-      expect(await loadSourceSeal(journal, experimentId)).toBeNull();
       expect(engine.reportGeneratedForTest()).toBe(false);
       release();
       engine.setTriggerEventPersistHoldForTest(null);
-      engine.setSourceSealTimeoutForTest(5_000);
       await waitUntil(async () => (await journal.queryEvents({ types: ["TRIGGER_EVENT"] })).some((event) => event.payload.id === "trig-seal-1"));
       await engine.writeFinalReportForTest();
-      expect(await loadSourceSeal(journal, experimentId)).toBeTruthy();
       const first = await journal.loadExperimentReport(experimentId);
       expect(first && isCanonicalFinalReport(first)).toBe(true);
       const canonical = first!.canonicalSummary as {
@@ -915,7 +921,7 @@ describe("Step-4 acceptance: application-level source seal", () => {
     }
   });
 
-  it("source-seal timeout refuses a canonical final", async () => {
+  it("unresolved runtime work refuses a canonical final", async () => {
     const journal = new MemoryEventJournal();
     const adapter = new ScriptedMarketAdapter();
     adapter.queue(discoveryReport([qualified("btc-mkt", "BTC", "btc-up", "btc-down")]));
@@ -929,7 +935,6 @@ describe("Step-4 acceptance: application-level source seal", () => {
     try {
       const started = await engine.beginExperiment();
       expect(started).toMatchObject({ ok: true });
-      engine.setSourceSealTimeoutForTest(40);
       engine.setTriggerEventPersistHoldForTest(new Promise<void>((resolve) => { release = resolve; }));
       engine.enqueueTriggerStormForTest([triggerEventSchema.parse({
         id: "trig-timeout", traceId: "tr-timeout", marketId: "btc-mkt", asset: "BTC",
@@ -939,11 +944,9 @@ describe("Step-4 acceptance: application-level source seal", () => {
       })]);
       await waitUntil(() => engine.journalAdmissionSnapshot().active > 0);
       await engine.completeExperimentForTest();
-      const seal = await engine.ensureSourceSealForTest();
-      expect(seal.sealed).toBe(false);
-      expect(seal.reason).toBe("SOURCE_SEAL_TIMEOUT");
+      await engine.writeFinalReportForTest();
+      expect(engine.reportGeneratedForTest()).toBe(false);
       expect(await journal.loadExperimentReport(engine.experimentManifest()!.id)).toBeNull();
-      expect(await loadSourceSeal(journal, engine.experimentManifest()!.id)).toBeNull();
     } finally {
       release?.();
       engine.setTriggerEventPersistHoldForTest(null);
@@ -1096,7 +1099,7 @@ describe("Step-4 acceptance: invalid index inspection fail-closed", () => {
 });
 
 describe("Step-4 residual: experiment research ingress fence", () => {
-  it("held Grok submission is drained or rejected and cannot accept after the source seal", async () => {
+  it("held Grok submission is drained or rejected and cannot accept after experiment completion", async () => {
     const journal = new MemoryEventJournal();
     const adapter = new ScriptedMarketAdapter();
     adapter.queue(discoveryReport([qualified("btc-mkt", "BTC", "btc-up", "btc-down")]));
@@ -1132,16 +1135,13 @@ describe("Step-4 residual: experiment research ingress fence", () => {
       const grokPromise = engine.submitGrokSignal(submission, "fair_probability_analyst");
       await waitUntil(() => engine.researchIngressInFlightForTest() > 0);
       await engine.completeExperimentForTest();
-      expect(engine.sourceSealStateForTest().sealing).toBe(true);
-      const sealPromise = engine.ensureSourceSealForTest();
-      await waitUntil(() => engine.sourceSealStateForTest().generation > 0);
+      await engine.writeFinalReportForTest();
+      expect(await journal.loadExperimentReport(experimentId)).toBeNull();
       expect(engine.researchIngressInFlightForTest()).toBeGreaterThan(0);
       releaseGrok();
       engine.setGrokClaimHoldForTest(null);
-      const [grok, seal] = await Promise.all([grokPromise, sealPromise]);
-      expect(grok.status).toBe("source_sealed");
-      expect(seal.sealed).toBe(true);
-      expect(await loadSourceSeal(journal, experimentId)).toBeTruthy();
+      const grok = await grokPromise;
+      expect(grok.status).toBe("stale");
       expect((await journal.queryEvents({ types: ["GROK_SIGNAL_ACCEPTED"] })).length).toBe(0);
       expect((await journal.queryEvents({ types: ["STRATEGY_CHANGE_PROPOSED"] })).length).toBe(0);
       expect((await journal.queryEvents({ types: ["CONSENSUS_DECISION"] })).length).toBe(0);
@@ -1172,47 +1172,36 @@ describe("Step-4 residual: experiment research ingress fence", () => {
   });
 });
 
-describe("Step-4 residual: source-seal persist deadline", () => {
-  it("PRE-APPEND HOLD: stalls SOURCE_SEAL persistence itself and cannot later create a seal after timeout", async () => {
+describe("Step-4 current journal deadline: pre-admission abort", () => {
+  it("already-aborted admission cannot create a late canonical input; healthy retry is idempotent", async () => {
     const journal = new MemoryEventJournal();
-    const adapter = new ScriptedMarketAdapter();
-    adapter.queue(discoveryReport([qualified("btc-mkt", "BTC", "btc-up", "btc-down")]));
-    const engine = new EngineService(qualifiedPaperEnv(), journal, { error: () => undefined }, {
-      market: adapter as never,
-      referenceRegistry: new ScriptedReferenceRegistry() as never,
-      activation: new NoopGrokActivationBridge(),
-    });
+    const engine = paperEngine(journal);
     await engine.start();
-    let releasePersist!: () => void;
     try {
       expect(await engine.beginExperiment()).toMatchObject({ ok: true });
-      const experimentId = engine.experimentManifest()!.id;
-      engine.setSourceSealTimeoutForTest(40);
-      engine.setSourceSealPersistHoldForTest(new Promise<void>((resolve) => { releasePersist = resolve; }));
-      await engine.completeExperimentForTest();
-      const seal = await engine.ensureSourceSealForTest();
-      expect(seal.sealed).toBe(false);
-      expect(seal.reason).toBe("SOURCE_SEAL_TIMEOUT");
-      expect(await loadSourceSeal(journal, experimentId)).toBeNull();
-      expect(await journal.loadExperimentReport(experimentId)).toBeNull();
-      releasePersist();
-      engine.setSourceSealPersistHoldForTest(null);
-      await new Promise((resolve) => setTimeout(resolve, 30));
-      expect(await loadSourceSeal(journal, experimentId)).toBeNull();
-      expect(await journal.loadExperimentReport(experimentId)).toBeNull();
-      engine.setSourceSealTimeoutForTest(5_000);
-      const retry = await engine.ensureSourceSealForTest();
-      expect(retry.sealed).toBe(true);
-      expect(await loadSourceSeal(journal, experimentId)).toBeTruthy();
-      await engine.writeFinalReportForTest();
-      expect(await journal.loadExperimentReport(experimentId)).toMatchObject({ complete: true, truncated: false });
-    } finally {
-      releasePersist?.();
-      engine.setSourceSealPersistHoldForTest(null);
-      await engine.stop();
-    }
+      const event = ev("TRIGGER_EVENT", new Date().toISOString(), {
+        experimentId: engine.experimentManifest()!.id,
+      }, "pre-admission-abort");
+      const controller = new AbortController();
+      controller.abort();
+      // Noncritical admission rejection is recorded as a sticky integrity
+      // fault; the caller return alone is not proof of durable persistence.
+      await engine.persistReportInput(event, controller.signal);
+      expect(await journal.readJournalEventById(event.id)).toBeNull();
+      expect(engine.reportSourceIntegrityForTest()).toEqual([
+        expect.objectContaining({ eventId: event.id, reason: "JOURNAL_ADMISSION_CLOSED" }),
+      ]);
+      // Releasing/continuing unrelated work cannot resurrect rejected admission.
+      await engine.persistReportInput(ev("MCP_INTERACTION", new Date().toISOString(), {}, "unrelated-audit"));
+      expect(await journal.readJournalEventById(event.id)).toBeNull();
+      expect(await engine.repairReportSourceIntegrityForTest(event)).toBe(true);
+      await engine.persistReportInput(event);
+      await engine.persistReportInput(event);
+      expect(await journal.queryEvents({ types: ["TRIGGER_EVENT"] })).toHaveLength(1);
+    } finally { await engine.stop(); }
   });
 });
+
 
 describe("Step-4 residual: checkpoint prune honors remaining cycle rows", () => {
   async function seedCheckpoints(journal: MemoryEventJournal, n: number): Promise<void> {
@@ -1224,7 +1213,7 @@ describe("Step-4 residual: checkpoint prune honors remaining cycle rows", () => 
   it("deletes at most the remaining 50-row cycle budget from a 200+ checkpoint backlog", async () => {
     const journal = new MemoryEventJournal();
     await seedCheckpoints(journal, 220);
-    const manager = new RetentionManager(journal, defaultRetentionConfig({
+    const manager = new RetentionManager(journal, await localArchiveRetentionConfig({
       enabled: true, checkpointKeep: 1, guardianRecoveryHold: false,
       batchSize: 200, maxRowsPerCycle: 50,
       maxBatchesPerCycle: 8, cycleBudgetMs: 10_000, telemetryTtlMs: 1, monitorTtlMs: 1,
@@ -1381,7 +1370,7 @@ function paperEngine(journal: MemoryEventJournal) {
   });
 }
 
-describe("Step-4 closure: all REPORT_INPUT producers participate in source seal", () => {
+describe("Step-4 closure: all REPORT_INPUT producers use tracked admission", () => {
   it("proves MCP_INTERACTION and writer/engine paths: no untracked report-input append", () => {
     const mcp = readFileSync(new URL("../apps/engine/src/mcp.ts", import.meta.url), "utf8");
     expect(mcp).not.toMatch(/journal\.append\s*\(/);
@@ -1390,7 +1379,8 @@ describe("Step-4 closure: all REPORT_INPUT producers participate in source seal"
     expect(writer).toMatch(/REPORT_INPUT_MUST_USE_TRACKED_ADMISSION/);
     const engine = readFileSync(new URL("../apps/engine/src/engine.ts", import.meta.url), "utf8");
     expect(engine).toMatch(/persistReportInput\(event/);
-    expect(engine).toMatch(/reportInput: this\.isCanonicalWindowAdmission/);
+    expect(engine).toMatch(/const reportInput = this\.isCanonicalWindowAdmission/);
+    expect(engine).toMatch(/\{ reportInput \}/);
     expect(shouldLatchReportSourceIntegrity({ type: "MARKET_SNAPSHOT" }, { id: "e", status: "RUNNING" })).toBe(false);
     expect(shouldLatchReportSourceIntegrity({ type: "SYSTEM_HEALTH_EVENT" }, { id: "e", status: "RUNNING" })).toBe(false);
     expect(shouldLatchReportSourceIntegrity({ type: "MCP_INTERACTION" }, { id: "e", status: "RUNNING" })).toBe(true);
@@ -1407,7 +1397,7 @@ describe("Step-4 closure: all REPORT_INPUT producers participate in source seal"
     expect(await journal.queryEvents({ types: ["TRIGGER_EVENT"] })).toEqual([]);
   });
 
-  it("IN-FLIGHT MCP_INTERACTION persist cannot be sealed ahead of; release yields stable hash across restart", async () => {
+  it("IN-FLIGHT MCP_INTERACTION persist cannot be finalized ahead of; release yields stable hash across restart", async () => {
     const journal = new MemoryEventJournal();
     const engine = paperEngine(journal);
     await engine.start();
@@ -1427,16 +1417,14 @@ describe("Step-4 closure: all REPORT_INPUT producers participate in source seal"
       const persistP = engine.persistReportInput(mcpEvent);
       await waitUntil(() => journal.inFlightAppends > 0);
       await engine.completeExperimentForTest();
-      const sealPromise = engine.ensureSourceSealForTest();
+      await engine.writeFinalReportForTest();
       await new Promise((resolve) => setTimeout(resolve, 40));
-      expect(await loadSourceSeal(journal, experimentId)).toBeNull();
       expect(await journal.loadExperimentReport(experimentId)).toBeNull();
       expect((await journal.queryEvents({ types: ["MCP_INTERACTION"] })).length).toBe(0);
       release();
       journal.setAppendInFlightHoldForTest(null);
       await persistP;
-      const seal = await sealPromise;
-      expect(seal.sealed).toBe(true);
+
       expect((await journal.queryEvents({ types: ["MCP_INTERACTION"] })).some((event) => event.id === "mcp-inflight-1")).toBe(true);
       await engine.writeFinalReportForTest();
       const first = await journal.loadExperimentReport(experimentId);
@@ -1501,17 +1489,15 @@ describe("Step-4 closure: experiment-scoped report-source integrity", () => {
       await engine.persistEventForTest(ev("SYSTEM_HEALTH_EVENT", new Date().toISOString(), { experimentId, status: "OK" }, "health-ok"));
       expect(engine.reportSourceIntegrityForTest().some((fault) => fault.eventId === "grok-lost-1")).toBe(true);
       await engine.completeExperimentForTest();
-      const seal = await engine.ensureSourceSealForTest();
-      expect(seal.sealed).toBe(false);
-      expect(seal.reason).toBe("REPORT_SOURCE_INTEGRITY_UNRESOLVED");
       await engine.writeFinalReportForTest();
+      expect(engine.reportSourceIntegrityForTest().length).toBeGreaterThan(0);
       expect(await journal.loadExperimentReport(experimentId)).toBeNull();
     } finally {
       await engine.stop();
     }
   });
 
-  it("B: TRIGGER_EVENT loss refuses seal and canonical until verified durable repair", async () => {
+  it("B: TRIGGER_EVENT loss refuses canonical finality until verified durable repair", async () => {
     const journal = new MemoryEventJournal();
     const engine = paperEngine(journal);
     await engine.start();
@@ -1528,12 +1514,13 @@ describe("Step-4 closure: experiment-scoped report-source integrity", () => {
       journal.failAppendTypes.delete("TRIGGER_EVENT");
       await engine.persistEventForTest(ev("SYSTEM_HEALTH_EVENT", new Date().toISOString(), { experimentId }, "health-2"));
       await engine.completeExperimentForTest();
-      expect((await engine.ensureSourceSealForTest()).reason).toBe("REPORT_SOURCE_INTEGRITY_UNRESOLVED");
+      await engine.writeFinalReportForTest();
+      expect(engine.reportSourceIntegrityForTest().length).toBeGreaterThan(0);
+      expect(await journal.loadExperimentReport(engine.experimentManifest()!.id)).toBeNull();
       expect(await engine.repairReportSourceIntegrityForTest(lost)).toBe(true);
       expect(engine.reportSourceIntegrityForTest().length).toBe(0);
       expect((await journal.queryEvents({ types: [REPORT_SOURCE_INTEGRITY_REPAIRED] })).length).toBe(1);
-      const seal = await engine.ensureSourceSealForTest();
-      expect(seal.sealed).toBe(true);
+      expect(engine.reportSourceIntegrityForTest()).toEqual([]);
       await engine.writeFinalReportForTest();
       expect(await journal.loadExperimentReport(experimentId)).toMatchObject({ complete: true, truncated: false });
     } finally {
@@ -1563,7 +1550,8 @@ describe("Step-4 closure: experiment-scoped report-source integrity", () => {
       await restarted.start();
       try {
         expect(restarted.reportSourceIntegrityForTest().some((fault) => fault.eventId === "trig-stale-cp")).toBe(false);
-        expect((await restarted.ensureSourceSealForTest()).sealed).toBe(true);
+        await restarted.writeFinalReportForTest();
+        expect(await journal.loadExperimentReport(restarted.experimentManifest()!.id)).toMatchObject({ complete: true, truncated: false });
       } finally {
         await restarted.stop();
       }
@@ -1588,20 +1576,21 @@ describe("Step-4 closure: experiment-scoped report-source integrity", () => {
       await engine.persistEventForTest(lost);
       journal.failAppendTypes.delete("GROK_SIGNAL_ACCEPTED");
       await engine.completeExperimentForTest();
-      expect((await engine.ensureSourceSealForTest()).reason).toBe("REPORT_SOURCE_INTEGRITY_UNRESOLVED");
+      await engine.writeFinalReportForTest();
+      expect(engine.reportSourceIntegrityForTest().length).toBeGreaterThan(0);
+      expect(await journal.loadExperimentReport(engine.experimentManifest()!.id)).toBeNull();
       await engine.stop();
       const restarted = paperEngine(journal);
       await restarted.start();
       try {
         expect(restarted.reportSourceIntegrityForTest().some((fault) => fault.eventId === "grok-lost-restart")).toBe(true);
-        expect((await restarted.ensureSourceSealForTest()).reason).toBe("REPORT_SOURCE_INTEGRITY_UNRESOLVED");
         await restarted.writeFinalReportForTest();
+        expect(restarted.reportSourceIntegrityForTest().length).toBeGreaterThan(0);
         expect(await journal.loadExperimentReport(experimentId)).toBeNull();
         expect(await restarted.repairReportSourceIntegrityForTest({
           ...lost,
           payload: { ...lost.payload, experimentId },
         })).toBe(true);
-        expect((await restarted.ensureSourceSealForTest()).sealed).toBe(true);
         await restarted.writeFinalReportForTest();
         expect(await journal.loadExperimentReport(restarted.experimentManifest()!.id)).toMatchObject({ complete: true, truncated: false });
       } finally {
@@ -1778,8 +1767,8 @@ describe("Step-4 closure: authoritative cleanup lifecycle", () => {
   });
 });
 
-describe("Step-4 closure: in-flight source-seal database write hold", () => {
-  it("IN-FLIGHT DATABASE WRITE HOLD: stall inside EventJournal source-seal append cannot later commit a timed-out seal", async () => {
+describe("Step-4 current journal deadline: in-flight hold", () => {
+  it("in-flight hold cannot commit a confirmed deadline-aborted input; retry and restart keep one canonical report", async () => {
     const journal = new MemoryEventJournal();
     const engine = paperEngine(journal);
     await engine.start();
@@ -1787,26 +1776,22 @@ describe("Step-4 closure: in-flight source-seal database write hold", () => {
     try {
       expect(await engine.beginExperiment()).toMatchObject({ ok: true });
       const experimentId = engine.experimentManifest()!.id;
-      engine.setSourceSealTimeoutForTest(250);
-      journal.setAppendInFlightHoldForTest(new Promise<void>((resolve) => { release = resolve; }), ["EXPERIMENT_SOURCE_SEALED"]);
-      await engine.completeExperimentForTest();
-      const sealPromise = engine.ensureSourceSealForTest();
-      await waitUntil(() => journal.inFlightAppends > 0 || engine.sourceSealPersistInFlightForTest());
-      expect(engine.sourceSealPersistInFlightForTest() || journal.inFlightAppends > 0).toBe(true);
-      const seal = await sealPromise;
-      expect(seal.sealed).toBe(false);
-      expect(seal.reason).toBe("SOURCE_SEAL_TIMEOUT");
-      expect(await loadSourceSeal(journal, experimentId)).toBeNull();
-      expect(await journal.loadExperimentReport(experimentId)).toBeNull();
+      const event = ev("TRIGGER_EVENT", new Date().toISOString(), { experimentId }, "input-inflight-deadline");
+      journal.setAppendInFlightHoldForTest(new Promise<void>((resolve) => { release = resolve; }), [event.type]);
+      const result = engine.persistReportInput(event, undefined, { deadlineAt: Date.now() + 100 })
+        .then(() => null, (error: unknown) => error);
+      await waitUntil(() => journal.inFlightAppends > 0);
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      expect(await result).toBeInstanceOf(JournalAppendAbortedError);
+      expect(await journal.readJournalEventById(event.id)).toBeNull();
       release();
       journal.setAppendInFlightHoldForTest(null);
-      await new Promise((resolve) => setTimeout(resolve, 30));
-      expect(await loadSourceSeal(journal, experimentId)).toBeNull();
-      expect(await journal.loadExperimentReport(experimentId)).toBeNull();
-      engine.setSourceSealTimeoutForTest(5_000);
-      const retry = await engine.ensureSourceSealForTest();
-      expect(retry.sealed).toBe(true);
-      expect(await loadSourceSeal(journal, experimentId)).toBeTruthy();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(await journal.readJournalEventById(event.id)).toBeNull();
+      await engine.persistReportInput(event);
+      await engine.persistReportInput(event);
+      expect(await journal.queryEvents({ types: [event.type] })).toHaveLength(1);
+      await engine.completeExperimentForTest();
       await engine.writeFinalReportForTest();
       const first = await journal.loadExperimentReport(experimentId);
       expect(first && isCanonicalFinalReport(first)).toBe(true);
@@ -1814,17 +1799,17 @@ describe("Step-4 closure: in-flight source-seal database write hold", () => {
       const restarted = paperEngine(journal);
       await restarted.start();
       try {
+        await restarted.writeFinalReportForTest();
         expect((await journal.loadExperimentReport(experimentId))?.contentHash).toBe(first!.contentHash);
-      } finally {
-        await restarted.stop();
-      }
+        expect(await journal.queryEvents({ types: [event.type] })).toHaveLength(1);
+      } finally { await restarted.stop(); }
     } finally {
-      release?.();
-      journal.setAppendInFlightHoldForTest(null);
+      release?.(); journal.setAppendInFlightHoldForTest(null);
       if (!engine.state.draining) await engine.stop();
     }
   });
 });
+
 
 describe("Step-4 follow-up: cleanup authority from durable_transitions", () => {
   const now = new Date("2026-09-08T00:00:00.000Z");
@@ -1946,11 +1931,11 @@ describe("Step-4 follow-up: canonical report-input inventory", () => {
     }
     for (const type of CANONICAL_REPORT_INPUT_EVENT_TYPES) {
       const swallowable = !isCriticalPersistenceType(type);
-      const exempt = isSourceSealExemptType(type);
+      const boundary = isReportInputBoundaryType(type);
       const latches = shouldLatchReportSourceIntegrity({ type, payload: { experimentId: "e" } }, { id: "e", status: "RUNNING" });
-      if (swallowable && !exempt) expect(latches, type).toBe(true);
-      if (exempt) expect(latches, type).toBe(false);
-      expect(swallowable && !exempt && !latches, `${type} swallowable without integrity`).toBe(false);
+      if (swallowable && !boundary) expect(latches, type).toBe(true);
+      if (boundary) expect(latches, type).toBe(false);
+      expect(swallowable && !boundary && !latches, `${type} swallowable without integrity`).toBe(false);
     }
     for (const type of OPERATIONAL_MONITOR_EVENT_TYPES) {
       expect(shouldLatchReportSourceIntegrity({ type }, { id: "e", status: "RUNNING" }), type).toBe(false);
@@ -2065,7 +2050,9 @@ describe("Step-4 follow-up: crash-durable bounded integrity", () => {
         aggregateType: "engine", aggregateId: "engine", payload: { status: "UP" } }));
       await expect(engine.submitGrokSignal(submission, submission.agentId)).rejects.toThrow("REPORT_SOURCE_INTEGRITY_FAIL_CLOSED");
       expect(engine.reportSourceIntegrityForTest()).toHaveLength(1);
-      expect((await engine.ensureSourceSealForTest()).reason).toBe("REPORT_SOURCE_INTEGRITY_UNRESOLVED");
+      await engine.writeFinalReportForTest();
+      expect(engine.reportSourceIntegrityForTest().length).toBeGreaterThan(0);
+      expect(await journal.loadExperimentReport(engine.experimentManifest()!.id)).toBeNull();
     } finally {
       await engine.stop(); // Existing sticky integrity state forbids the shutdown checkpoint.
     }
@@ -2144,7 +2131,7 @@ describe("Step-4 follow-up: crash-durable bounded integrity", () => {
     }
   });
 
-  it("A: double-failure + crash before checkpoint → restart refuses seal/canonical", async () => {
+  it("A: double-failure + crash before checkpoint → restart refuses canonical finality", async () => {
     const journal = new MemoryEventJournal();
     const engine = paperEngine(journal);
     await engine.start();
@@ -2171,8 +2158,8 @@ describe("Step-4 follow-up: crash-durable bounded integrity", () => {
     await restarted.start();
     try {
       expect(restarted.reportSourceIntegrityForTest().some((fault) => fault.eventId === "grok-double-fail")).toBe(true);
-      expect((await restarted.ensureSourceSealForTest()).reason).toBe("REPORT_SOURCE_INTEGRITY_UNRESOLVED");
       await restarted.writeFinalReportForTest();
+      expect(restarted.reportSourceIntegrityForTest().length).toBeGreaterThan(0);
       expect(await journal.loadExperimentReport(restarted.experimentManifest()!.id)).toBeNull();
     } finally {
       await restarted.stop();
@@ -2212,7 +2199,9 @@ describe("Step-4 follow-up: crash-durable bounded integrity", () => {
       const payloadFaults = Array.isArray(checkpoint?.payload.reportSourceIntegrity) ? checkpoint!.payload.reportSourceIntegrity : [];
       expect(payloadFaults.length).toBe(1);
       expect(JSON.stringify(payloadFaults).length).toBeLessThan(2_000);
-      expect((await engine.ensureSourceSealForTest()).reason).toBe("REPORT_SOURCE_INTEGRITY_UNRESOLVED");
+      await engine.writeFinalReportForTest();
+      expect(engine.reportSourceIntegrityForTest().length).toBeGreaterThan(0);
+      expect(await journal.loadExperimentReport(engine.experimentManifest()!.id)).toBeNull();
     } finally {
       await engine.stop();
     }
@@ -2236,7 +2225,9 @@ describe("Step-4 follow-up: crash-durable bounded integrity", () => {
       await engine.persistEventForTest(ev("TRIGGER_EVENT", new Date().toISOString(), { experimentId }, "trig-ok"));
       expect(engine.reportSourceIntegrityForTest().some((fault) => fault.eventId === "grok-sticky")).toBe(true);
       await engine.completeExperimentForTest();
-      expect((await engine.ensureSourceSealForTest()).reason).toBe("REPORT_SOURCE_INTEGRITY_UNRESOLVED");
+      await engine.writeFinalReportForTest();
+      expect(engine.reportSourceIntegrityForTest().length).toBeGreaterThan(0);
+      expect(await journal.loadExperimentReport(engine.experimentManifest()!.id)).toBeNull();
     } finally {
       await engine.stop();
     }
@@ -2278,15 +2269,57 @@ describe("Step-4 follow-up: crash-durable bounded integrity", () => {
       expect(await engine.repairReportSourceIntegrityForTest(one)).toBe(false);
       expect(engine.reportSourceIntegrityForTest().some((fault) => fault.eventId === INTEGRITY_OVERFLOW_EVENT_ID)).toBe(true);
       await engine.completeExperimentForTest();
-      expect((await engine.ensureSourceSealForTest()).reason).toBe("REPORT_SOURCE_INTEGRITY_UNRESOLVED");
+      await engine.writeFinalReportForTest();
+      expect(engine.reportSourceIntegrityForTest().length).toBeGreaterThan(0);
+      expect(await journal.loadExperimentReport(engine.experimentManifest()!.id)).toBeNull();
     } finally {
       await engine.stop();
     }
   });
 });
 
-describe("Step-4 follow-up: seal recheck after drain + window-only work", () => {
-  it("fault during drain refuses seal and leaves no EXPERIMENT_SOURCE_SEALED row", async () => {
+describe("Step-4 follow-up: finality recheck after drain + window-only work", () => {
+  it("a canonical loss injected after snapshot capture is rechecked before report persistence", async () => {
+    const journal = new MemoryEventJournal();
+    const engine = paperEngine(journal);
+    await engine.start();
+    const snapshot = journal.withReadSnapshot.bind(journal);
+    try {
+      expect(await engine.beginExperiment()).toMatchObject({ ok: true });
+      const experimentId = engine.experimentManifest()!.id;
+      const lost = ev("GROK_SIGNAL_ACCEPTED", new Date().toISOString(), { experimentId }, "loss-after-snapshot");
+      await engine.completeExperimentForTest();
+      let injected = false;
+      journal.withReadSnapshot = async (work) => {
+        const result = await snapshot(work);
+        if (!injected) {
+          injected = true;
+          journal.failAppendTypes.add(lost.type);
+          // Simulates failure of previously admitted canonical work while the
+          // report reads its frozen prefix, using the existing integrity hook.
+          await engine.persistEventForTest(lost);
+        }
+        return result;
+      };
+      await engine.writeFinalReportForTest();
+      expect(injected).toBe(true);
+      expect(engine.reportSourceIntegrityForTest()).toEqual([
+        expect.objectContaining({ eventId: lost.id, experimentId }),
+      ]);
+      expect(await journal.loadExperimentReport(experimentId)).toBeNull();
+      expect(await journal.queryEvents({ types: ["EXPERIMENT_REPORT_GENERATED"] })).toEqual([]);
+      journal.failAppendTypes.delete(lost.type);
+      expect(await engine.repairReportSourceIntegrityForTest(lost)).toBe(true);
+      await engine.writeFinalReportForTest();
+      expect(await journal.loadExperimentReport(experimentId)).toMatchObject({ complete: true, truncated: false });
+    } finally {
+      journal.withReadSnapshot = snapshot;
+      journal.failAppendTypes.clear();
+      await engine.stop();
+    }
+  });
+
+  it("fault appearing during drain refuses canonical finality", async () => {
     const journal = new MemoryEventJournal();
     const engine = paperEngine(journal);
     await engine.start();
@@ -2304,14 +2337,12 @@ describe("Step-4 follow-up: seal recheck after drain + window-only work", () => 
       await waitUntil(() => journal.inFlightAppends > 0);
       expect(engine.reportSourceIntegrityForTest()).toEqual([]);
       await engine.completeExperimentForTest();
-      const sealPromise = engine.ensureSourceSealForTest();
+      await engine.writeFinalReportForTest();
       journal.failAppendTypes.add("GROK_SIGNAL_ACCEPTED");
       release();
       await persist;
-      const seal = await sealPromise;
-      expect(seal.sealed).toBe(false);
-      expect(seal.reason).toBe("REPORT_SOURCE_INTEGRITY_UNRESOLVED");
-      expect(await loadSourceSeal(journal, experimentId)).toBeNull();
+      await engine.writeFinalReportForTest();
+      expect(engine.reportSourceIntegrityForTest().length).toBeGreaterThan(0);
       expect(await journal.loadExperimentReport(experimentId)).toBeNull();
     } finally {
       release?.();
@@ -2320,18 +2351,21 @@ describe("Step-4 follow-up: seal recheck after drain + window-only work", () => 
     }
   });
 
-  it("COMPLETED+sealing with continuous post-window activity seals boundedly and keeps hash stable", async () => {
+  it("COMPLETED with continuous post-window activity finalizes boundedly and keeps hash stable", async () => {
     const journal = new MemoryEventJournal();
     const engine = paperEngine(journal);
     await engine.start();
+    let stop = false;
+    let flood: Promise<void> | undefined;
     try {
       expect(await engine.beginExperiment()).toMatchObject({ ok: true });
       const experimentId = engine.experimentManifest()!.id;
       await engine.persistEventForTest(ev("TRIGGER_EVENT", new Date().toISOString(), { experimentId }, "pre-window-trig"));
       await engine.completeExperimentForTest();
-      let stop = false;
+      // Keep operational timestamps strictly outside the completed window.
+      await new Promise((resolve) => setTimeout(resolve, 5));
       let posted = 0;
-      const flood = (async () => {
+      flood = (async () => {
         while (!stop) {
           posted += 1;
           await engine.persistEventForTest(ev("SYSTEM_HEALTH_EVENT", new Date().toISOString(), { status: "OK" }, `post-health-${posted}`));
@@ -2341,12 +2375,15 @@ describe("Step-4 follow-up: seal recheck after drain + window-only work", () => 
             payload: { clientId: "post-window", method: "tools/call", status: "ok" },
           }));
           await engine.persistEventForTest(ev("DISCOVERY_RECONCILED", new Date().toISOString(), { markets: 1 }, `post-disc-${posted}`));
+          // A realistic producer yields to I/O; a tight microtask loop can
+          // starve the test runner and allocate endlessly after an assertion.
+          await new Promise((resolve) => setTimeout(resolve, 1));
         }
       })();
       const started = Date.now();
-      const seal = await engine.ensureSourceSealForTest();
+      await engine.writeFinalReportForTest();
       expect(Date.now() - started).toBeLessThan(5_000);
-      expect(seal.sealed).toBe(true);
+      expect(await journal.loadExperimentReport(experimentId)).toMatchObject({ complete: true, truncated: false });
       stop = true;
       await flood;
       expect(posted).toBeGreaterThan(0);
@@ -2367,13 +2404,15 @@ describe("Step-4 follow-up: seal recheck after drain + window-only work", () => 
       expect(streamed.scan.scanned).toBe(first!.sourceEventCount);
       expect(engine.state.engineAlive()).toBe(true);
     } finally {
+      stop = true;
+      await flood;
       if (!engine.state.draining) await engine.stop();
     }
   });
 });
 
-describe("Step-4 follow-up: source-seal deadline covers acquired transaction", () => {
-  it("acquire-hold analogue: txn obtained near deadline cannot later commit a timed-out seal", async () => {
+describe("Step-4 current journal deadline: acquisition hold", () => {
+  it("acquisition hold cannot commit a confirmed deadline-aborted input; retry and restart keep one canonical report", async () => {
     const journal = new MemoryEventJournal();
     const engine = paperEngine(journal);
     await engine.start();
@@ -2381,24 +2420,22 @@ describe("Step-4 follow-up: source-seal deadline covers acquired transaction", (
     try {
       expect(await engine.beginExperiment()).toMatchObject({ ok: true });
       const experimentId = engine.experimentManifest()!.id;
-      engine.setSourceSealTimeoutForTest(200);
-      journal.setAppendAcquireHoldForTest(new Promise<void>((resolve) => { release = resolve; }), ["EXPERIMENT_SOURCE_SEALED"]);
-      await engine.completeExperimentForTest();
-      const sealPromise = engine.ensureSourceSealForTest();
+      const event = ev("TRIGGER_EVENT", new Date().toISOString(), { experimentId }, "input-acquire-deadline");
+      journal.setAppendAcquireHoldForTest(new Promise<void>((resolve) => { release = resolve; }), [event.type]);
+      const result = engine.persistReportInput(event, undefined, { deadlineAt: Date.now() + 100 })
+        .then(() => null, (error: unknown) => error);
       await waitUntil(() => journal.inFlightAppends > 0);
-      await new Promise((resolve) => setTimeout(resolve, 220));
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      expect(await result).toBeInstanceOf(JournalAppendAbortedError);
+      expect(await journal.readJournalEventById(event.id)).toBeNull();
       release();
-      const seal = await sealPromise;
-      expect(seal.sealed).toBe(false);
-      expect(seal.reason).toBe("SOURCE_SEAL_TIMEOUT");
-      expect(await loadSourceSeal(journal, experimentId)).toBeNull();
       journal.setAppendAcquireHoldForTest(null);
       await new Promise((resolve) => setTimeout(resolve, 20));
-      expect(await loadSourceSeal(journal, experimentId)).toBeNull();
-      engine.setSourceSealTimeoutForTest(5_000);
-      const retry = await engine.ensureSourceSealForTest();
-      expect(retry.sealed).toBe(true);
-      expect((await journal.queryEvents({ types: ["EXPERIMENT_SOURCE_SEALED"] })).length).toBe(1);
+      expect(await journal.readJournalEventById(event.id)).toBeNull();
+      await engine.persistReportInput(event);
+      await engine.persistReportInput(event);
+      expect(await journal.queryEvents({ types: [event.type] })).toHaveLength(1);
+      await engine.completeExperimentForTest();
       await engine.writeFinalReportForTest();
       const first = await journal.loadExperimentReport(experimentId);
       expect(first && isCanonicalFinalReport(first)).toBe(true);
@@ -2406,17 +2443,14 @@ describe("Step-4 follow-up: source-seal deadline covers acquired transaction", (
       const restarted = paperEngine(journal);
       await restarted.start();
       try {
+        await restarted.writeFinalReportForTest();
         expect((await journal.loadExperimentReport(experimentId))?.contentHash).toBe(first!.contentHash);
-        expect((await restarted.ensureSourceSealForTest()).sealed).toBe(true);
-      } finally {
-        await restarted.stop();
-      }
+        expect(await journal.queryEvents({ types: [event.type] })).toHaveLength(1);
+      } finally { await restarted.stop(); }
     } finally {
-      release?.();
-      journal.setAppendAcquireHoldForTest(null);
+      release?.(); journal.setAppendAcquireHoldForTest(null);
       if (!engine.state.draining) await engine.stop();
     }
   });
 });
-
 

@@ -1,4 +1,5 @@
 import {describe,it,expect} from "vitest";
+import {readFileSync} from "node:fs";
 import {mkdtemp,writeFile,readFile,rm} from "node:fs/promises";
 import {join} from "node:path";
 import {tmpdir} from "node:os";
@@ -16,6 +17,24 @@ import {guardianRpc,startGuardianSocket,type GuardianUpdate} from "../apps/engin
 
 const START=Date.parse("2026-10-05T00:00:00Z");
 describe.skipIf(process.env.SIMPLE_RETENTION_POSTGRES_TEST!=="1")("simple Engine retention on existing isolated PostgreSQL",()=>{
+  it("0010 is idempotent in an isolated existing PostgreSQL schema and preserves registration rows", async () => {
+    const pg = await isolatedPostgres();
+    try {
+      const schema = String((await pg.sql`SELECT current_schema() AS name`)[0].name);
+      expect(schema).toMatch(/^simple_retention_[a-f0-9]{32}$/);
+      await pg.sql.unsafe(`DROP TABLE "${schema}".guardian_recovery_pins`);
+      await pg.sql.unsafe(`DROP TABLE "${schema}".guardian_recovery_roster`);
+      const migration = readFileSync(new URL("../packages/db/migrations/0010_guardian_recovery_registry.sql", import.meta.url), "utf8");
+      await pg.sql.unsafe(migration);
+      await pg.sql`INSERT INTO guardian_recovery_roster (id,source_identity,member_count,member_hash) VALUES (1,'migration-fixture',1,${"a".repeat(64)})`;
+      const before = await pg.sql`SELECT * FROM guardian_recovery_roster`;
+      await pg.sql.unsafe(migration);
+      expect(await pg.sql`SELECT * FROM guardian_recovery_roster`).toEqual(before);
+      expect((await pg.sql`SELECT confdeltype FROM pg_constraint WHERE conrelid = ${schema + ".guardian_recovery_pins"}::regclass AND contype='f'`).map((row: { confdeltype: string }) => row.confdeltype)).toEqual(["r"]);
+      const rls = await pg.sql`SELECT relname,relrowsecurity FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=${schema} AND relname IN ('guardian_recovery_roster','guardian_recovery_pins') ORDER BY relname`;
+      expect(rls).toHaveLength(2); expect(rls.every((row: { relrowsecurity: boolean }) => row.relrowsecurity)).toBe(true);
+    } finally { await pg.close(); }
+  }, 15000);
   it("uses the existing startup checkpoint to keep both fallback cursors current without a new economic transition",async()=>{
     const f=await isolatedPostgres();let engine:EngineService|undefined;
     const start=async()=>{
@@ -68,7 +87,7 @@ describe.skipIf(process.env.SIMPLE_RETENTION_POSTGRES_TEST!=="1")("simple Engine
       clock.ms=START+70000;books();e.state.noteReferenceTick("SOL",new Date(clock.ms).toISOString());
       const update=monitor.evaluate(e.guardianView(),clock.ms).updates[0]!;expect(update.state.protectionReason).toBe("EARLY_TIMEOUT");
       const replies=await Promise.all([guardianRpc<{status:string}>(path,{kind:"UPDATE",update}),guardianRpc<{status:string}>(path,{kind:"UPDATE",update})]);
-      expect(replies.every(r=>["PERSISTED","REPLAY"].includes(r.status))).toBe(true);
+      expect(replies.every(r=>["PERSISTED","REPLAY","IN_FLIGHT"].includes(r.status))).toBe(true);
       const end=Date.now()+4000;let fills=[];
       do{fills=(await f.journal.queryEvents({types:["PAPER_FILL"]})).filter(row=>row.payload.intent==="PROTECTIVE_DE_RISK");if(fills.length)break;await new Promise(r=>setTimeout(r,10));}while(Date.now()<end);
       expect(fills).toHaveLength(1);

@@ -246,7 +246,7 @@ describe("profit trailing pair PAPER authority", () => {
       // Market endDate is START + 1h; at the exact 80s safety boundary.
       s.clock.ms = START + 3_600_000 - 80_000;
       await publish(s, "0.12", 3);
-      await waitFor(s, "pre-expiry-protection", () => !s.engine.ledger.positions.has(MARKET));
+      await waitFor(s, "pre-expiry-protection", () => !s.engine.ledger.positions.get(MARKET)?.unpairedOutcome);
       const fills = await s.journal.queryEvents({ types: ["PAPER_FILL"] });
       expect(fills.filter(row => row.payload.intent === "HEDGE_SECOND_LEG")).toHaveLength(0);
       expect(fills.filter(row => row.payload.intent === "PROTECTIVE_DE_RISK"

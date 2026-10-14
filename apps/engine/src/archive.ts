@@ -314,7 +314,9 @@ export class LocalJournalArchive {
         limit: EVENT_PAGE_SIZE,
       },
       include: (event) => (
-        event.occurredAt < fence
+        // The report/rollup count includes its canonical fence event. Archive
+        // that evidence too; destructive retention still uses a strict < fence.
+        event.occurredAt <= fence
         && (event.payload as { experimentId?: unknown }).experimentId === report.experimentId
       ),
     });

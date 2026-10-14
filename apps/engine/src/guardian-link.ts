@@ -9,7 +9,9 @@ export interface GuardianMarket {
   up: MarketSnapshot | null;
   down: MarketSnapshot | null;
   synchronized: boolean;
-  consensus?: { eventId: string; direction: "UP" | "DOWN" | "FLAT"; confidence: number; estimatedEdge: number };
+  admission?: GuardianV2State;
+  consensus?: { eventId: string; direction: "UP" | "DOWN" | "FLAT"; confidence: number; estimatedEdge: number;
+    calculatedAt?: string; expiresAt?: string };
 }
 export interface GuardianView {
   mode: "paper";
@@ -27,6 +29,13 @@ export interface GuardianUpdate {
   experimentId: string;
   state: GuardianV2State;
   events: GuardianV2Event[];
+  observed?: Record<"up" | "down", { tokenId: string; eventId: string; sequence: number; sourceTimestamp: string; receivedAt: string }>;
+}
+
+export function currentGuardianConsensus(consensus: GuardianMarket["consensus"], nowMs: number, staleMs: number) {
+  return consensus && Number.isFinite(Date.parse(consensus.calculatedAt ?? ""))
+    && Date.parse(consensus.calculatedAt!) <= nowMs && nowMs - Date.parse(consensus.calculatedAt!) <= staleMs
+    && Date.parse(consensus.expiresAt ?? "") > nowMs ? consensus : undefined;
 }
 
 const MAX_BYTES = 4 * 1024 * 1024;

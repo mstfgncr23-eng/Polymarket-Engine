@@ -214,6 +214,7 @@ it("C: entry extremely close to expiry never executes after market end; skips de
       // No protective economic mutation may exist after the expiry fence.
       expect((await protectiveFills(setup))).toHaveLength(0);
       expect(setup.engine.ledger.positions.get("btc-mkt")?.unpairedQuantity).toBe("10");
+      await waitFor(() => suppressed(setup), rows => rows.some(row => row.payload.gate === "FINAL_FENCE" && row.payload.reason === "MARKET_EXPIRED"));
       const fence = (await suppressed(setup)).find((row) => row.payload.gate === "FINAL_FENCE");
       expect(fence?.payload.reason).toBe("MARKET_EXPIRED");
       expect(setup.engine.integrityFault()).toBe(false);
