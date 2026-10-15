@@ -16,8 +16,47 @@ better fee-adjusted expected economics. Unknown metadata falls back to the
 existing path. ROI remains at least 0.015. Limit price is never widened.
 Outstanding entry quote remainders count as potential exposure; reservation
 and fill revalidate limits inside the durable gate. Cash is actually reserved.
-Only one directional first-leg lifecycle can own a market. Simultaneous UP
-and DOWN fresh quotes are not enabled or relabeled as hedges.
+Only one directional first-leg lifecycle can own a market. With the separate
+`PAPER_DUAL_SIDED_MAKER_ENABLED=true` flag, the conditional pair planner below
+may instead own two fresh quotes. They are not relabeled as already-filled hedges.
+
+## Dual Maker ownership and diagnostics
+
+Dual planning currently runs AFTER directional strategy/risk acceptance. A
+directional rejection therefore prevents dual planning too; the feature does
+not scan every book for independent market-making opportunities. Both passive
+prices and sizes must pass the conditional pair economics planner. The cheap
+side uses the explicit dual strategy policy, not the directional $0.65 floor.
+Conditional pair profit assumes both fills and is never booked as realized PnL.
+
+The first and second durable reservations atomically carry experiment-scoped
+`DUAL_MAKER_PLAN_STARTED` and `DUAL_MAKER_QUOTES_ADMITTED` audits. A known
+second-side rejection cancels/release the first reservation, records
+`DUAL_MAKER_PLAN_NOT_ADMITTED`, and permits ordinary directional fallback only
+if no position exists. A fatal/unknown commit fails closed without further
+rollback mutations; recovery repairs committed audit before cancelling quotes.
+Entry-close, expiry, current position and ownership are fenced again at commit.
+
+Opposite unfilled quotes receive no directional hedge credit: admission and
+serialized entry reservation/fill budget the worst one-sided pending cost per
+market. After an actual partial first fill, the opposite allocation is capped
+to the true residual while preserving the original public trade evidence.
+Remainders are cancelled, not turned into a new directional position. Both
+orders get scoped terminal results, including the sibling that becomes a hedge.
+All cancellation authorities share the existing durable gate. The first
+committed cancel wins; a different later reason cannot create an identity fault.
+An entry cancellation preserves alpha cooldown; hedge retries retain their
+separate risk-reduction handoff. Guardian/PT policies and 150 ms latency remain.
+
+`dual_maker_plans_total{outcome}` is a process-scoped bounded funnel, with
+ATTEMPT as its denominator. Reject evidence snapshots the actual reservation
+fence and distinguishes a changed best-bid join from a crossing limit without
+relaxing the join policy. Cancellation audit retains bounded per-quote counts
+of validated public flow, exact-price SELL flow, eligible volume, activation,
+queue and current book. This uses the same owned consumer and writes only at
+quote lifecycle boundaries. Counts do not reconstruct previously unretained
+trade history and are not authenticated account fills. Restart cancels quotes
+whose intervening flow is unknown. TTL/participation are unchanged by diagnostics.
 
 ## Maker hedge and emergency priority
 

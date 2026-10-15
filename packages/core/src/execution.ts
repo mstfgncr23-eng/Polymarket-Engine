@@ -104,7 +104,7 @@ export function evolveMakerOrder(
  * Exact-price aggressor flow consumes queue ahead; only 50% of excess can
  * fill us. Timestamp monotonicity deliberately undercounts ambiguous repeats.
  */
-export function evolveMakerTrade(resting:RestingPaperOrder,trade:MarketTrade,book:MarketSnapshot,activatedAt:string,nowMs:number):{resting:RestingPaperOrder;fill:PaperFill|null}{
+export function evolveMakerTrade(resting:RestingPaperOrder,trade:MarketTrade,book:MarketSnapshot,activatedAt:string,nowMs:number,maxFillQuantity?:string):{resting:RestingPaperOrder;fill:PaperFill|null}{
   const q=resting.order.makerFirst;
   if(!q || trade.tokenId!==resting.order.tokenId || trade.marketId!==resting.order.marketId
     || trade.outcome!==resting.order.outcome || trade.tokenEpoch!==q.tokenEpoch
@@ -114,7 +114,11 @@ export function evolveMakerTrade(resting:RestingPaperOrder,trade:MarketTrade,boo
     || Date.parse(trade.sourceTimestamp)>nowMs || Date.parse(trade.receivedAt)>nowMs
     || nowMs>=Date.parse(q.expiresAt) || !book.feeSchedule)return {resting,fill:null};
   const queue=d(resting.queueAhead),consumed=DecimalMin(queue,d(trade.quantity));
-  const eligible=d(trade.quantity).minus(consumed).mul(.5), quantity=DecimalMin(d(resting.remaining),eligible);
+  const eligible=d(trade.quantity).minus(consumed).mul(.5);
+  // A pre-posted dual sibling can be larger than the first actual partial fill.
+  // Cap execution, not the public trade evidence or the durable order remainder.
+  const capacity=maxFillQuantity===undefined?d(resting.remaining):DecimalMin(d(resting.remaining),DecimalMaxZero(d(maxFillQuantity)));
+  const quantity=DecimalMin(capacity,eligible);
   const next={...resting,queueAhead:queue.minus(consumed).toFixed(),lastTradeAt:trade.sourceTimestamp,
     observedAt:trade.receivedAt,remaining:d(resting.remaining).minus(quantity).toFixed()};
   if(quantity.lte(0))return {resting:next,fill:null};

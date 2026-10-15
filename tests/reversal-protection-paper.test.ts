@@ -399,12 +399,12 @@ describe("Guardian V2 real PAPER lifecycle with independent emergency execution"
       await waitFor(s, () => residual(s) === "0"); expect(await riskFills(s)).toHaveLength(1);
     } finally { await s.engine.stop(); }
   });
-  it.each([false,true])("confirmed Guardian cancels the normal hedge maker and fences a delayed partial fill and duplicate cancel (hybrid=%s)", async hybrid => {
-    const s = await start(undefined,undefined,{PAPER_MAKER_FIRST_ENABLED:String(hybrid)});
+  it.each([false,true,'dual'] as const)("confirmed Guardian cancels the normal hedge maker and fences a delayed partial fill and duplicate cancel (hybrid=%s)", async hybrid => {
+    const s = await start(undefined,undefined,{PAPER_MAKER_FIRST_ENABLED:String(Boolean(hybrid)),PAPER_DUAL_SIDED_MAKER_ENABLED:String(hybrid==='dual')});
     try {
       await seed(s); await armEarly(s);
       if(hybrid){s.clock.ms=START+69900;const up=book(s,"UP","0.60","0.81"),down=book(s,"DOWN","0.29","0.30");internal(s).snapshots.set(MARKET,{UP:up,DOWN:down});s.engine.state.marketSnapshots.set(UP,up);s.engine.state.marketSnapshots.set(DOWN,down);}
-      const maker = order("MAKER", { ...(hybrid?{makerFirst:{version:1,role:"HEDGE",postOnly:true,expiresAt:new Date(s.clock.ms+750).toISOString(),submissionLatencyMs:150,tokenEpoch:s.market.tokenEpoch(DOWN),postingBookEventId:"guardian-maker",takerReferencePrice:"0.30"}}:{}), id: "normal-maker-before-confirmation", marketId: MARKET, tokenId: DOWN,
+      const maker = order("MAKER", { ...(hybrid?{makerFirst:{version:1,role:hybrid==='dual'?"FIRST_LEG":"HEDGE",...(hybrid==='dual'?{dualGroupId:'guardian-dual-group'}:{}),postOnly:true,expiresAt:new Date(s.clock.ms+750).toISOString(),submissionLatencyMs:150,tokenEpoch:s.market.tokenEpoch(DOWN),postingBookEventId:"guardian-maker",takerReferencePrice:"0.30"}}:{}), id: "normal-maker-before-confirmation", marketId: MARKET, tokenId: DOWN,
         outcome: "DOWN", quantity: "5", requestedPrice: "0.29", createdAt: new Date(s.clock.ms).toISOString() });
       await s.engine.restMakerForTest(maker, book(s, "DOWN", "0.29", "0.30"), "HEDGE_SECOND_LEG");
       if(hybrid){s.clock.ms=START+70000;expect(Date.parse(maker.makerFirst!.expiresAt)).toBeGreaterThan(s.clock.ms);await internal(s).maybeReversalProtection(MARKET);}else await timeout(s);

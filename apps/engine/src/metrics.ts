@@ -61,6 +61,7 @@ export class EngineMetrics {
   readonly shardIngress = new Gauge({ name: "market_shard_ingress", help: "Bounded per-shard queue, cumulative source counts and subscription load", labelNames: ["shard", "measure"], registers: [this.registry] });
   readonly marketMessages = new Counter({ name: "market_messages_total", help: "Normalized market messages", registers: [this.registry] });
   readonly makerPublicTrades = new Counter({name:'maker_first_public_trades_total',help:'Validated public trade events delivered on the existing feed while Maker-First is enabled; process scoped',registers:[this.registry]});
+  readonly dualMakerPlans = new Counter({name:'dual_maker_plans_total',help:'Dual planner calls after directional acceptance and their bounded outcomes; process scoped, ATTEMPT is the denominator',labelNames:['outcome'],registers:[this.registry]});
   readonly bookSourceToIngress = new ScalarHistogram({ name: "book_source_to_ingress_seconds", help: "Source to owned WebSocket callback; absent when callback provenance is unavailable", buckets: DURATION_BUCKETS, registers: [this.registry] });
   readonly bookIngressToReceived = new ScalarHistogram({ name: "book_ingress_to_received_seconds", help: "Owned WebSocket callback to Engine received timestamp", buckets: DURATION_BUCKETS, registers: [this.registry] });
   readonly bookReceivedToProcessing = new ScalarHistogram({ name: "book_received_to_processing_seconds", help: "Engine received timestamp to processing; separate from source delay", buckets: DURATION_BUCKETS, registers: [this.registry] });

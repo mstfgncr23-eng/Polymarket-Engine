@@ -25,6 +25,153 @@ async function setup(enabled=true,journal:EventJournal=pg?.journal??new MemoryEv
  return {engine,journal,market,clock,intern,b,quote,submit,trade,errors};
 }
 describe('Maker-First real Engine lifecycle',()=>{
+ it('cancellation records eligible public volume exhausted by queue without inventing a fill',async()=>{
+  const s=await setup();try{
+   const o=s.quote();expect(await s.submit(o)).toBe(true);
+   s.clock.ms+=100;await s.intern.onMakerTrade(s.trade(o,'100'));
+   s.clock.ms+=51;await s.intern.onMakerTrade(s.trade(o,'1'));s.clock.ms++;await s.intern.onMakerTrade(s.trade(o,'1'));
+   s.clock.ms=T+2001;await s.intern.expireMakerQuotes();
+   const p=(await s.journal.queryEvents({types:['PAPER_ORDER_CANCELLED']}))[0]!.payload;
+   expect(p).toMatchObject({reason:'MAKER_FIRST_TTL_EXPIRED',makerExecutionEvidence:{queueAhead:'0',publicFlow:{observedTrades:3,exactPriceSellTrades:3,eligibleTrades:2,eligibleQuantity:'2'}}});
+   expect(await s.journal.queryEvents({types:['PAPER_FILL']})).toHaveLength(0);expect(s.engine.reservedCash()).toBe('0');
+  }finally{await s.engine.stop();}
+ });
+ it('a partial dual hedge cancels excess without reopening directional exposure or double spending',async()=>{
+  const s=await setup(true,undefined,{ms:T},{PAPER_DUAL_SIDED_MAKER_ENABLED:'true'});try{
+   const dual=s.engine as unknown as {trySubmitDualMakerPair(o:PaperOrder,k:string,p:Record<'UP'|'DOWN',MarketSnapshot>):Promise<boolean>};
+   expect(await dual.trySubmitDualMakerPair(s.quote(),'dual:hedge-partial',{UP:s.engine.state.marketSnapshots.get(U)!,DOWN:s.engine.state.marketSnapshots.get(D)!})).toBe(true);
+   const q=[...s.engine.restingOrdersForTest().values()].map(r=>r.order);s.clock.ms+=201;
+   await s.intern.onMakerTrade(s.trade(q.find(o=>o.outcome==='UP')!,'6'));s.clock.ms++;
+   const down=q.find(o=>o.outcome==='DOWN')!;await s.intern.onMakerTrade(s.trade(down,'3'));
+   expect(s.engine.ledger.positions.get(M)).toMatchObject({pairedQuantity:'0.5',unpairedOutcome:'UP',unpairedQuantity:'1.5'});
+   expect(s.engine.restingOrderCount()).toBe(0);expect(s.engine.reservedCash()).toBe('0');
+   const cash=s.engine.ledger.snapshot().cash;s.clock.ms++;await s.intern.onMakerTrade(s.trade(down,'100'));
+   expect(s.engine.ledger.snapshot().cash).toBe(cash);expect(await s.journal.queryEvents({types:['PAPER_FILL']})).toHaveLength(2);
+   expect(s.engine.integrityFault()).toBe(false);
+  }finally{await s.engine.stop();}
+ });
+ it('pending dual quotes receive no hedge credit in decision or serialized entry risk limits',async()=>{
+  const s=await setup(true,undefined,{ms:T},{PAPER_DUAL_SIDED_MAKER_ENABLED:'true'});
+  try{
+   (s.engine as unknown as {riskLimits:{maxDirectionalExposureUsd:number}}).riskLimits.maxDirectionalExposureUsd=2;
+   const dual=s.engine as unknown as {trySubmitDualMakerPair(o:PaperOrder,k:string,p:Record<'UP'|'DOWN',MarketSnapshot>):Promise<boolean>};
+   expect(await dual.trySubmitDualMakerPair(s.quote(),'dual:pending-risk',{UP:s.engine.state.marketSnapshots.get(U)!,DOWN:s.engine.state.marketSnapshots.get(D)!})).toBe(true);
+   const b={...s.b('UP',2),marketId:M+'-2',tokenId:U+'-2'};await s.market.emitSnapshot(b);
+   const c:StrategyCandidate={strategyId:'test',strategyVersion:'test',marketId:b.marketId,tokenId:b.tokenId,outcome:'UP',side:'BUY',quantity:'1',limitPrice:'0.7',intent:'OPEN_FIRST_LEG',rawExpectedEdge:.2,rawEdgeUsdPerShare:.2,reasonCodes:[]};
+   expect(s.engine.decideWithRuntimeBasisForTest(c,{UP:b,DOWN:s.b('DOWN')},new Date(s.clock.ms),'XRP').risk.vetoes).toContain('MAX_DIRECTIONAL_EXPOSURE');
+   const o={...s.quote(),id:'other-market-after-dual',marketId:b.marketId,tokenId:b.tokenId,quantity:'1',makerFirst:{...s.quote().makerFirst!,tokenEpoch:s.market.tokenEpoch(b.tokenId)}};
+   expect(await s.submit(o)).toBe(false);expect(s.engine.restingOrderCount()).toBe(2);expect(s.engine.reservedCash()).toBe('1.96');
+   expect(s.engine.integrityFault()).toBe(false);
+  }finally{await s.engine.stop();}
+ });
+ it('a sibling commit failure fails closed without later fills/cancels and recovery releases the committed first reservation',async()=>{
+  let s=await setup(true,undefined,{ms:T},{PAPER_DUAL_SIDED_MAKER_ENABLED:'true'});
+  try{
+   const dual=s.engine as unknown as {trySubmitDualMakerPair(o:PaperOrder,k:string,p:Record<'UP'|'DOWN',MarketSnapshot>):Promise<boolean>};
+   const commit=s.journal.commitDurableTransition.bind(s.journal);let count=0;
+   s.journal.commitDurableTransition=async(input,...args)=>{if(input.type==='PAPER_MAKER_RESERVED'&&++count===2)throw Error('TEST_SIBLING_COMMIT_FAILED');return commit(input,...args);};
+   await expect(dual.trySubmitDualMakerPair(s.quote(),'dual:db-fault',{UP:s.engine.state.marketSnapshots.get(U)!,DOWN:s.engine.state.marketSnapshots.get(D)!})).rejects.toThrow('TEST_SIBLING_COMMIT_FAILED');
+   expect(s.engine.integrityFault()).toBe(true);const sequence=await s.journal.latestDurableSequence();
+   const q=[...s.engine.restingOrdersForTest().values()][0]!.order;
+   s.clock.ms+=201;await s.intern.onMakerTrade(s.trade(q,'100'));s.clock.ms+=2001;await s.intern.expireMakerQuotes();
+   expect(await s.journal.latestDurableSequence()).toBe(sequence);expect(s.engine.ledger.positions.size).toBe(0);
+   await s.engine.stop();s.journal.commitDurableTransition=commit;
+   s=await setup(true,s.journal,s.clock,{PAPER_DUAL_SIDED_MAKER_ENABLED:'true'});
+   expect(s.engine.restingOrderCount()).toBe(0);expect(s.engine.reservedCash()).toBe('0');expect(s.engine.integrityFault()).toBe(false);
+   expect(await s.journal.queryEvents({types:['PAPER_FILL']})).toHaveLength(0);
+  }finally{await s.engine.stop();}
+ });
+ it.each(['BEFORE_DURABLE_COMMIT','AFTER_DURABLE_COMMIT_BEFORE_APPLY','AFTER_APPLY_BEFORE_DERIVED_AUDIT'] as const)('dual first partial crash %s replays once and cancels the unproven sibling',async point=>{
+  let s=await setup(true,undefined,{ms:T},{PAPER_DUAL_SIDED_MAKER_ENABLED:'true'});
+  try{
+   const dual=s.engine as unknown as {trySubmitDualMakerPair(o:PaperOrder,k:string,p:Record<'UP'|'DOWN',MarketSnapshot>):Promise<boolean>};
+   expect(await dual.trySubmitDualMakerPair(s.quote(),'dual:partial-crash',{UP:s.engine.state.marketSnapshots.get(U)!,DOWN:s.engine.state.marketSnapshots.get(D)!})).toBe(true);
+   const first=[...s.engine.restingOrdersForTest().values()].find(r=>r.order.outcome==='UP')!.order;
+   s.clock.ms+=201;const trade=s.trade(first,'3');s.engine.setCrashInjectionForTest(point,{operationKey:`fill:maker-fill:${first.id}:${trade.eventId}`});
+   await expect(s.intern.onMakerTrade(trade)).rejects.toThrow('CRASH_INJECTED');
+   await s.engine.stop();s=await setup(true,s.journal,s.clock,{PAPER_DUAL_SIDED_MAKER_ENABLED:'true'});
+   expect(s.engine.ledger.positions.get(M)?.unpairedQuantity??'0').toBe(point==='BEFORE_DURABLE_COMMIT'?'0':'0.5');
+   expect(s.engine.restingOrderCount()).toBe(0);expect(s.engine.reservedCash()).toBe('0');
+   expect(await s.journal.queryEvents({types:['PAPER_FILL']})).toHaveLength(point==='BEFORE_DURABLE_COMMIT'?0:1);
+   expect(await s.journal.queryEvents({types:['PAPER_ORDER_TERMINAL']})).toHaveLength(2);expect(s.engine.integrityFault()).toBe(false);
+  }finally{await s.engine.stop();}
+ });
+ it.each([false,true])('an unfilled first-leg cancellation preserves strategy cooldown (dual=%s)',async dualEnabled=>{
+  const s=await setup(true,undefined,{ms:T},{PAPER_DUAL_SIDED_MAKER_ENABLED:String(dualEnabled)});
+  try{
+   const key=`${M}:UP:OPEN_FIRST_LEG`;
+   if(dualEnabled){
+    const dual=s.engine as unknown as {trySubmitDualMakerPair(o:PaperOrder,k:string,p:Record<'UP'|'DOWN',MarketSnapshot>):Promise<boolean>};
+    expect(await dual.trySubmitDualMakerPair(s.quote(),key,{UP:s.engine.state.marketSnapshots.get(U)!,DOWN:s.engine.state.marketSnapshots.get(D)!})).toBe(true);
+   }else expect(await s.intern.submitPaperOrder(s.quote(),s.engine.state.marketSnapshots.get(U)!,key,'OPEN_FIRST_LEG')).toBe(true);
+   s.clock.ms+=2001;await s.intern.expireMakerQuotes();
+   expect(s.engine.reservedCash()).toBe('0');expect(s.engine.restingOrderCount()).toBe(0);
+   const candidate:StrategyCandidate={strategyId:'test',strategyVersion:'test',marketId:M,tokenId:U,outcome:'UP',side:'BUY',quantity:'2',limitPrice:'0.7',intent:'OPEN_FIRST_LEG',rawExpectedEdge:.2,rawEdgeUsdPerShare:.2,reasonCodes:[]};
+   expect(s.engine.decideWithRuntimeBasisForTest(candidate,{UP:s.b('UP'),DOWN:s.b('DOWN')},new Date(s.clock.ms),'XRP').risk.vetoes).toContain('DUPLICATE_TRADE');
+  }finally{await s.engine.stop();}
+ });
+ it('a rejected second dual reservation rolls back cash, records exact fence evidence and allows one directional fallback',async()=>{
+  const s=await setup(true,undefined,{ms:T},{PAPER_DUAL_SIDED_MAKER_ENABLED:'true'});
+  try{
+   const dual=s.engine as unknown as {trySubmitDualMakerPair(o:PaperOrder,k:string,p:Record<'UP'|'DOWN',MarketSnapshot>):Promise<boolean>};
+   const read=s.journal.readDurableByOperationKey.bind(s.journal);let calls=0;
+   s.journal.readDurableByOperationKey=async key=>{
+    if(key.startsWith('maker:')&&key.endsWith(':reserve')&&++calls===4)
+     s.engine.state.marketSnapshots.set(D,{...s.b('DOWN',2),bids:[{price:'0.28',quantity:'2'}]});
+    return read(key);
+   };
+   expect(await dual.trySubmitDualMakerPair(s.quote(),'dual:rollback',{UP:s.engine.state.marketSnapshots.get(U)!,DOWN:s.engine.state.marketSnapshots.get(D)!})).toBe(false);
+   expect(s.engine.reservedCash()).toBe('0');expect(s.engine.restingOrderCount()).toBe(0);
+   const failed=await s.journal.queryEvents({types:['DUAL_MAKER_PLAN_NOT_ADMITTED'],experimentId:s.engine.experimentManifest()!.id});expect(failed).toHaveLength(1);
+   expect(failed[0]?.payload).toMatchObject({fallbackAllowed:true,makerRejectionEvidence:{stage:'BEFORE_DURABLE_COMMIT',passiveAtOriginalLimit:true,passiveJoinPrice:'0.28'}});
+   expect(await s.journal.queryEvents({types:['DUAL_MAKER_QUOTES_ADMITTED']})).toHaveLength(0);
+   expect(await s.submit()).toBe(true);expect(s.engine.restingOrderCount()).toBe(1);
+   expect(await s.submit(s.quote())).toBe(false);expect(s.engine.restingOrderCount()).toBe(1);
+   expect(s.engine.runtimeBookkeepingForTest().executionErrors).toBe(0);expect(s.engine.integrityFault()).toBe(false);
+  }finally{await s.engine.stop();}
+ });
+ it.each(['BEFORE_DURABLE_COMMIT','AFTER_DURABLE_COMMIT_BEFORE_APPLY','AFTER_APPLY_BEFORE_DERIVED_AUDIT'] as const)('dual sibling reservation crash %s never falls through and recovers only committed authority',async point=>{
+  let s=await setup(true,undefined,{ms:T},{PAPER_DUAL_SIDED_MAKER_ENABLED:'true'});
+  try{
+   const dual=s.engine as unknown as {trySubmitDualMakerPair(o:PaperOrder,k:string,p:Record<'UP'|'DOWN',MarketSnapshot>):Promise<boolean>};
+   const read=s.journal.readDurableByOperationKey.bind(s.journal);let calls=0;
+   s.journal.readDurableByOperationKey=async key=>{
+    if(key.startsWith('maker:')&&key.endsWith(':reserve')&&++calls===4)s.engine.setCrashInjectionForTest(point,{operationKey:key});
+    return read(key);
+   };
+   await expect(dual.trySubmitDualMakerPair(s.quote(),'dual:crash',{UP:s.engine.state.marketSnapshots.get(U)!,DOWN:s.engine.state.marketSnapshots.get(D)!})).rejects.toThrow('CRASH_INJECTED');
+   await s.engine.stop();s=await setup(true,s.journal,s.clock,{PAPER_DUAL_SIDED_MAKER_ENABLED:'true'});
+   expect(s.engine.restingOrderCount()).toBe(0);expect(s.engine.reservedCash()).toBe('0');expect(s.engine.ledger.positions.size).toBe(0);
+   const orders=await s.journal.queryEvents({types:['PAPER_ORDER_CREATED'],experimentId:s.engine.experimentManifest()!.id});
+   expect(orders).toHaveLength(point==='BEFORE_DURABLE_COMMIT'?1:2);
+   expect(await s.journal.queryEvents({types:['PAPER_ORDER_TERMINAL']})).toHaveLength(orders.length);
+   expect(await s.journal.queryEvents({types:['DUAL_MAKER_QUOTES_ADMITTED']})).toHaveLength(point==='BEFORE_DURABLE_COMMIT'?0:1);
+   expect(await s.journal.queryEvents({types:['PAPER_FILL']})).toHaveLength(0);expect(s.engine.integrityFault()).toBe(false);
+  }finally{await s.engine.stop();}
+ });
+ it.each(['passive','crossed'] as const)('an actionable Profit-Trailing target wins a %s dual-sibling race with one terminal cancel and taker fill',async mode=>{
+  const s=await setup(true,undefined,{ms:T},{PAPER_DUAL_SIDED_MAKER_ENABLED:'true',PROFIT_TRAILING_PAIR_SOAK_ENABLED:'true',NORMAL_HEDGE_MIN_LOCKED_PAIR_EDGE:'0.12'});
+  try{
+   const dual=s.engine as unknown as {trySubmitDualMakerPair(o:PaperOrder,k:string,p:Record<'UP'|'DOWN',MarketSnapshot>):Promise<boolean>};
+   if(mode==='passive')await s.market.emitSnapshot({...s.b('DOWN',2),bids:[{price:'0.15',quantity:'2'}]});
+   expect(await dual.trySubmitDualMakerPair(s.quote(),'dual:pt',{UP:s.engine.state.marketSnapshots.get(U)!,DOWN:s.engine.state.marketSnapshots.get(D)!})).toBe(true);
+   const q=[...s.engine.restingOrdersForTest().values()].map(r=>r.order),up=q.find(o=>o.outcome==='UP')!,down=q.find(o=>o.outcome==='DOWN')!;
+   s.clock.ms+=201;await s.intern.onMakerTrade(s.trade(up,'6'));
+   await s.market.emitSnapshot({...s.b('DOWN',2),bids:[{price:'0.15',quantity:'2'}],asks:[{price:'0.16',quantity:'1000'}]});
+   const until=Date.now()+2500;while(s.engine.ledger.positions.get(M)?.unpairedQuantity!=='0'||(s.engine as unknown as {profitTrailingPairInFlight:Set<string>}).profitTrailingPairInFlight.has(M)){
+    if(Date.now()>until)throw Error('DUAL_PT_TARGET_TIMEOUT:'+JSON.stringify({errors:s.errors,position:s.engine.ledger.positions.get(M),events:(await s.journal.queryEvents({types:['RISK_EVALUATION','PAPER_EXECUTION_ERROR','PAPER_ORDER_CANCELLED']})).map(e=>({type:e.type,payload:e.payload}))}));await new Promise(r=>setTimeout(r,2));
+   }
+   s.clock.ms++;await s.intern.onMakerTrade(s.trade(down,'100'));
+   const hedge=(await s.journal.queryEvents({types:['PAPER_FILL']})).filter(e=>e.payload.intent==='HEDGE_SECOND_LEG');
+   expect(hedge).toHaveLength(1);expect(hedge[0]?.payload.liquidityRole).toBe('TAKER');expect(s.engine.ledger.positions.get(M)?.pairedQuantity).toBe('2');
+   const cancelled=(await s.journal.queryEvents({types:['PAPER_ORDER_CANCELLED']})).find(e=>e.payload.orderId===down.id);
+   expect(cancelled?.payload.reason).toBe(mode==='passive'?'PROFIT_TRAILING_PRIORITY':'MAKER_FIRST_MARKET_MOVED');
+   const facts=await s.journal.queryDurableTransitions({types:['PAPER_ORDER_CANCELLED','PAPER_FILL'],limit:100});
+   expect(facts.find(e=>e.aggregateId===down.id)!.sequence).toBeLessThan(facts.find(e=>e.aggregateId===hedge[0]!.aggregateId)!.sequence);
+   expect((await s.journal.queryEvents({types:['PAPER_ORDER_CANCELLED']})).filter(e=>e.payload.orderId===down.id)).toHaveLength(1);
+   expect(s.engine.restingOrderCount()).toBe(0);expect(s.engine.reservedCash()).toBe('0');expect(s.engine.integrityFault()).toBe(false);
+  }finally{await s.engine.stop();}
+ });
  it('a rejected passive hedge immediately hands off to taker without inheriting maker cooldown',async()=>{const s=await setup(true,undefined,{ms:T},{PROFIT_TRAILING_PAIR_SOAK_ENABLED:'true',NORMAL_HEDGE_MIN_LOCKED_PAIR_EDGE:'0.12'});try{await s.engine.applyObservedFill(paperFill(M,'UP','0.7',{tokenId:U,quantity:'2',timestamp:new Date(T).toISOString()}));const read=s.journal.readDurableByOperationKey.bind(s.journal);let moved=false;s.journal.readDurableByOperationKey=async key=>{if(!moved&&key.startsWith('maker:')&&key.endsWith(':reserve')){moved=true;s.engine.state.marketSnapshots.set(D,{...s.b('DOWN',3),bids:[{price:'0.14',quantity:'2'}],asks:[{price:'0.16',quantity:'1000'}]});}return read(key);};await s.market.emitSnapshot({...s.b('DOWN',2),bids:[{price:'0.15',quantity:'2'}],asks:[{price:'0.16',quantity:'1000'}]});const until=Date.now()+2500;while(s.engine.ledger.positions.get(M)?.unpairedQuantity!=='0'||(s.engine as unknown as {profitTrailingPairInFlight:Set<string>}).profitTrailingPairInFlight.has(M)){if(Date.now()>until)throw Error('REJECTED_MAKER_FALLBACK_TIMEOUT');await new Promise(r=>setTimeout(r,2));}expect(moved).toBe(true);expect(s.engine.restingOrderCount()).toBe(0);expect(s.engine.reservedCash()).toBe('0');const fills=(await s.journal.queryEvents({types:['PAPER_FILL']})).filter(r=>r.payload.intent==='HEDGE_SECOND_LEG');expect(fills).toHaveLength(1);expect(fills[0]?.payload.liquidityRole).toBe('TAKER');expect(s.engine.runtimeBookkeepingForTest().executionErrors).toBe(0);}finally{await s.engine.stop();}});
 
  it.each(['book','cash'] as const)('expected maker %s rejection cannot trip the execution-error breaker',async reason=>{const s=await setup();try{const o=s.quote(),before=s.engine.runtimeBookkeepingForTest().executionErrors;if(reason==='book')s.engine.state.marketSnapshots.set(U,{...s.b('UP',2),bids:[{price:'0.68',quantity:'2'}]});else{s.engine.ledger.restore({...s.engine.ledger.snapshot(),cash:'0.01'},[]);}expect(await s.submit(o)).toBe(false);expect(s.engine.runtimeBookkeepingForTest().executionErrors).toBe(before);expect(s.engine.reservedCash()).toBe('0');expect(s.engine.integrityFault()).toBe(false);const terminals=await s.journal.queryEvents({types:['PAPER_ORDER_TERMINAL']});expect(terminals).toHaveLength(1);if(reason==='book')expect(terminals[0]?.payload.reason).toBe('MAKER_FIRST_POST_ONLY_INVALID');else expect(String(terminals[0]?.payload.reason)).toMatch(/^MAKER_CASH_FENCE_REJECTED:/);}finally{await s.engine.stop();}});
@@ -147,5 +294,68 @@ describe('Maker-First real Engine lifecycle',()=>{
     expect(s.errors).toEqual([]);
   }finally{await s.engine.stop();}
  });
- it.each([false,true])('feature enabled=%s preserves original gates and selects only the authorized execution style',async enabled=>{const s=await setup(enabled);try{const c:StrategyCandidate={strategyId:'test',strategyVersion:'test',marketId:M,tokenId:U,outcome:'UP',side:'BUY',quantity:'2',limitPrice:'0.7',intent:'OPEN_FIRST_LEG',rawEdgeUsdPerShare:.2,rawExpectedEdge:.2,reasonCodes:[]};const decision=s.engine.decideWithRuntimeBasisForTest(c,{UP:s.b('UP'),DOWN:s.b('DOWN')},new Date(s.clock.ms),'XRP');expect(decision.accepted,JSON.stringify(decision.risk)).toBe(true);expect(decision.order?.orderType).toBe(enabled?'MAKER':'TAKER');if(enabled)expect(decision.order?.makerFirst?.postOnly).toBe(true);}finally{await s.engine.stop();}});
+ it.each(['UP','DOWN'] as const)('dual first partial %s caps the opposite fill to the actual residual',async outcome=>{
+  const s=await setup(true,undefined,{ms:T},{PAPER_DUAL_SIDED_MAKER_ENABLED:'true'});
+  try{
+   const dual=s.engine as unknown as {trySubmitDualMakerPair(o:PaperOrder,k:string,p:Record<'UP'|'DOWN',MarketSnapshot>):Promise<boolean>};
+   expect(await dual.trySubmitDualMakerPair(s.quote(),'dual:partial',{UP:s.engine.state.marketSnapshots.get(U)!,DOWN:s.engine.state.marketSnapshots.get(D)!})).toBe(true);
+   const quotes=[...s.engine.restingOrdersForTest().values()].map(r=>r.order);
+   s.clock.ms+=201;await s.intern.onMakerTrade(s.trade(quotes.find(o=>o.outcome===outcome)!,'3'));
+   expect(s.engine.ledger.positions.get(M)?.unpairedQuantity).toBe('0.5');
+   s.clock.ms++;await s.intern.onMakerTrade(s.trade(quotes.find(o=>o.outcome!==outcome)!,'100'));
+   expect(s.engine.ledger.positions.get(M)?.pairedQuantity).toBe('0.5');
+   expect(s.engine.ledger.positions.get(M)?.unpairedQuantity).toBe('0');
+   expect(s.engine.restingOrderCount()).toBe(0);expect(s.engine.reservedCash()).toBe('0');
+   const fills=await s.journal.queryEvents({types:['PAPER_FILL']});expect(fills).toHaveLength(2);
+   expect(fills.map(x=>x.payload.quantity)).toEqual(['0.5','0.5']);expect(s.errors).toEqual([]);
+  }finally{await s.engine.stop();}
+ });
+ it('dual creation and both terminal fills are experiment-scoped with durable group admission',async()=>{
+  const s=await setup(true,undefined,{ms:T},{PAPER_DUAL_SIDED_MAKER_ENABLED:'true'});
+  try{
+   const dual=s.engine as unknown as {trySubmitDualMakerPair(o:PaperOrder,k:string,p:Record<'UP'|'DOWN',MarketSnapshot>):Promise<boolean>};
+   expect(await dual.trySubmitDualMakerPair(s.quote(),'dual:scope',{UP:s.engine.state.marketSnapshots.get(U)!,DOWN:s.engine.state.marketSnapshots.get(D)!})).toBe(true);
+   const id=s.engine.experimentManifest()!.id;
+   expect(await s.journal.queryEvents({types:['PAPER_ORDER_CREATED'],experimentId:id})).toHaveLength(2);
+   expect(await s.journal.queryEvents({types:['DUAL_MAKER_QUOTES_ADMITTED'],experimentId:id})).toHaveLength(1);
+   const quotes=[...s.engine.restingOrdersForTest().values()].map(r=>r.order);s.clock.ms+=201;
+   for(const o of quotes){await s.intern.onMakerTrade(s.trade(o,'6'));s.clock.ms++;}
+   expect(await s.journal.queryEvents({types:['PAPER_ORDER_TERMINAL'],experimentId:id})).toHaveLength(2);
+   expect(s.engine.integrityFault()).toBe(false);
+  }finally{await s.engine.stop();}
+ });
+ it('close-entries during the second reservation cannot leave a new dual quote or reserved cash',async()=>{
+  const s=await setup(true,undefined,{ms:T},{PAPER_DUAL_SIDED_MAKER_ENABLED:'true'});let release!:()=>void;
+  try{
+   const dual=s.engine as unknown as {trySubmitDualMakerPair(o:PaperOrder,k:string,p:Record<'UP'|'DOWN',MarketSnapshot>):Promise<boolean>};
+   const read=s.journal.readDurableByOperationKey.bind(s.journal);let calls=0,reached!:()=>void;
+   const entered=new Promise<void>(r=>reached=r),hold=new Promise<void>(r=>release=r);
+   s.journal.readDurableByOperationKey=async key=>{if(key.startsWith('maker:')&&key.endsWith(':reserve')&&++calls===4){reached();await hold;}return read(key);};
+   const pending=dual.trySubmitDualMakerPair(s.quote(),'dual:close-race',{UP:s.engine.state.marketSnapshots.get(U)!,DOWN:s.engine.state.marketSnapshots.get(D)!});
+   await entered;await s.engine.closeExperimentEntries();release();await pending;
+   expect(s.engine.restingOrderCount()).toBe(0);expect(s.engine.reservedCash()).toBe('0');
+   const closed=(await s.journal.queryDurableTransitions({types:['EXPERIMENT_ENTRY_CLOSED'],limit:100}))[0]!;
+   const reserved=await s.journal.queryDurableTransitions({types:['PAPER_MAKER_RESERVED'],limit:100});
+   expect(reserved.filter(x=>x.sequence>closed.sequence)).toHaveLength(0);
+   expect(s.engine.integrityFault()).toBe(false);
+  }finally{release?.();await s.engine.stop();}
+ });
+ it('a first fill before sibling reservation cancels that plan without another first leg or fatal error',async()=>{
+  const s=await setup(true,undefined,{ms:T},{PAPER_DUAL_SIDED_MAKER_ENABLED:'true'});
+  try{
+   const dual=s.engine as unknown as {trySubmitDualMakerPair(o:PaperOrder,k:string,p:Record<'UP'|'DOWN',MarketSnapshot>):Promise<boolean>};
+   const read=s.journal.readDurableByOperationKey.bind(s.journal);let calls=0;
+   s.journal.readDurableByOperationKey=async key=>{
+    if(key.startsWith('maker:')&&key.endsWith(':reserve')&&++calls===4){
+     const first=[...s.engine.restingOrdersForTest().values()][0]!.order;s.clock.ms+=201;
+     await s.intern.onMakerTrade(s.trade(first,'6'));
+    }return read(key);
+   };
+   expect(await dual.trySubmitDualMakerPair(s.quote(),'dual:early-fill',{UP:s.engine.state.marketSnapshots.get(U)!,DOWN:s.engine.state.marketSnapshots.get(D)!})).toBe(true);
+   expect(s.engine.ledger.positions.get(M)?.unpairedQuantity).toBe('2');
+   expect(s.engine.restingOrderCount()).toBe(0);expect(s.engine.reservedCash()).toBe('0');
+   expect(s.engine.runtimeBookkeepingForTest().executionErrors).toBe(0);expect(s.engine.integrityFault()).toBe(false);
+  }finally{await s.engine.stop();}
+ });
+ it.each([false,true])('feature enabled=%s preserves original gates and selects only the authorized execution style',async enabled=>{const s=await setup(enabled);try{const c:StrategyCandidate={strategyId:'test',strategyVersion:'test',marketId:M,tokenId:U,outcome:'UP',side:'BUY',quantity:'2',limitPrice:'0.7',intent:'OPEN_FIRST_LEG',rawEdgeUsdPerShare:.2,rawExpectedEdge:.2,reasonCodes:[]};const decision=s.engine.decideWithRuntimeBasisForTest(c,{UP:s.engine.state.marketSnapshots.get(U)!,DOWN:s.engine.state.marketSnapshots.get(D)!},new Date(s.clock.ms),'XRP');expect(decision.accepted,JSON.stringify(decision.risk)).toBe(true);expect(decision.order?.orderType).toBe(enabled?'MAKER':'TAKER');if(enabled)expect(decision.order?.makerFirst?.postOnly).toBe(true);}finally{await s.engine.stop();}});
 });
