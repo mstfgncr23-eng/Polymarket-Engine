@@ -97,7 +97,7 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
   private readonly lifecycleSource = createId("ws");
   private lifecycleSequence = 0;
   /** One ordered callback lane per owned socket. Cross-shard async work must not head-of-line block healthy shards. */
-  private snapshotTails: Promise<void>[] = [];
+  private snapshotTails: Array<Promise<void> | null> = [];
 
   constructor(client?: SingleClient, options: ShardedPolymarketAdapterOptions = {}) {
     const { transports, sharedIngressBudget, ...singleOptions } = options;
@@ -112,7 +112,7 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
 
     this.shardCount = transports?.length ?? DEFAULT_POLYMARKET_MARKET_SHARD_COUNT;
     this.shardTokenIds = this.emptyShardTokenIds();
-    this.snapshotTails = Array.from({ length: this.shardCount }, () => Promise.resolve());
+    this.snapshotTails = Array.from({ length: this.shardCount }, () => null);
     this.connectionStates = this.stoppedConnectionStates();
     this.connectionReconnects = this.zeroReconnectCounts();
 
@@ -287,7 +287,7 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
     this.connectionReconnects = this.zeroReconnectCounts();
     this.lastConnectionSignature = "";
     this.connectionTail = Promise.resolve();
-    this.snapshotTails = Array.from({ length: this.shardCount }, () => Promise.resolve());
+    this.snapshotTails = Array.from({ length: this.shardCount }, () => null);
     this.publishShardSnapshots();
 
     await Promise.all(this.shards.map((shard, shardIndex) => shard.run(
@@ -464,7 +464,7 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
     shardIndex: number,
     snapshot: MarketSnapshot,
     handlers: PolymarketFeedHandlers,
-  ): Promise<void> {
+  ): Promise<void> | void {
     const market = super.getMarket(snapshot.tokenId);
     const token = market?.tokens.find((item) => item.tokenId === snapshot.tokenId);
     // Assignment is synchronous on the owning JS thread, so sequence remains
@@ -478,30 +478,30 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
       asset: market?.asset ?? snapshot.asset,
       feeSchedule: market ? market.feeSchedule : snapshot.feeSchedule,
     };
-    const previous = this.snapshotTails[shardIndex] ?? Promise.resolve();
-    const work = previous.then(async () => {
-      await handlers.onSnapshot(patched);
+    return this.inSnapshotLane(shardIndex, () => handlers.onSnapshot(patched));
+  }
+
+  /** Metadata and snapshots share one owning lane. Synchronous callbacks need
+   * no promise tail; real async work still serializes this shard and releases
+   * on both success and failure. Other shards remain independent. */
+  private inSnapshotLane(shardIndex: number, callback: () => Promise<void> | void): Promise<void> | void {
+    const previous = this.snapshotTails[shardIndex];
+    const work = previous ? previous.then(callback) : callback();
+    if (!work) return;
+    const tail = work.then(() => undefined, () => undefined);
+    this.snapshotTails[shardIndex] = tail;
+    void tail.then(() => {
+      if (this.snapshotTails[shardIndex] === tail) this.snapshotTails[shardIndex] = null;
     });
-    this.snapshotTails[shardIndex] = work.then(() => undefined, () => undefined);
     return work;
   }
 
-  /**
-   * Metadata for a token shares its shard callback lane with price snapshots,
-   * preserving token/epoch ordering without globally blocking the other three
-   * independent sockets. It never advances globalSequence.
-   */
   private dispatchMinOrderSizeHydrated(
     shardIndex: number,
     event: MinOrderSizeHydratedEvent,
     handlers: PolymarketFeedHandlers,
-  ): Promise<void> {
-    const previous = this.snapshotTails[shardIndex] ?? Promise.resolve();
-    const work = previous.then(async () => {
-      await handlers.onMinOrderSizeHydrated?.(event);
-    });
-    this.snapshotTails[shardIndex] = work.then(() => undefined, () => undefined);
-    return work;
+  ): Promise<void> | void {
+    return this.inSnapshotLane(shardIndex, () => handlers.onMinOrderSizeHydrated?.(event));
   }
 
   private reportShardConnection(

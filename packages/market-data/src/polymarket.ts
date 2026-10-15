@@ -607,7 +607,8 @@ export class PolymarketMarketDataAdapter {
               try {
                 for (const snapshot of this.normalizeEvent(event, handlers)) {
                   if (resubscribed || generation !== this.streamGeneration) break;
-                  await handlers.onSnapshot(snapshot);
+                  const pending = handlers.onSnapshot(snapshot);
+                  if (pending) await pending;
                 }
                 // Every source event and snapshot is still processed in order.
                 // A bounded batch amortizes scheduling without starving IO.

@@ -2668,7 +2668,7 @@ export class EngineService {
     await this.restoreAndRecover();
   }
 
-  private async onMarketSnapshot(snapshot: MarketSnapshot): Promise<void> {
+  private onMarketSnapshot(snapshot: MarketSnapshot): Promise<void> | void {
     if (!this.state.recoveryComplete) return;
     if (!this.tokenIdSet.has(snapshot.tokenId)) return;
     const started = performance.now();
@@ -2715,54 +2715,61 @@ export class EngineService {
     // raw observations are intentionally not permanent journal records.
     this.record("MARKET_EVENT", snapshot.traceId, snapshot.marketId, { tokenId: snapshot.tokenId, outcome: snapshot.outcome, sequence: snapshot.sequence }, snapshot.asset ?? null);
 
-    if (synchronized && previous) {
-      for (const orderId of this.restingIndex.orderIdsFor(snapshot.tokenId)) {
-        const resting = this.restingOrders.get(orderId);
-        if (!resting || resting.order.tokenId !== snapshot.tokenId) continue;
-        const currentPosition = this.ledger.positions.get(resting.order.marketId);
-        if (
-          this.restingOrderIntent(resting) === "OPEN_FIRST_LEG"
-          && currentPosition
-          && d(currentPosition.pairedQuantity).gt(0)
-        ) {
-          await this.releaseMaker(orderId, {
-            cancel: true,
-            reason: "FIRST_LEG_LIFECYCLE_CLOSED",
-          });
-          continue;
-        }
-        const evolved = evolveMakerOrder(resting, previous, snapshot);
-        if (evolved.fill) {
-          // Capture the maker lifecycle intent synchronously here, BEFORE the
-          // async fill path. Rescue/cancel of the resting order during the
-          // applyFill boundary must not erase this identity: the PR2 fill-time
-          // residual/token guards key off economicIntent. restingOrderIntent
-          // keeps the legacy pre-PR1 inference, evaluated against the state
-          // that derived the fill instead of re-read after an await.
-          const restingIntent = this.restingOrderIntent(resting);
-          await this.applyFill(evolved.fill, { restingAfter: evolved.resting, intent: restingIntent, executionSnapshot: snapshot });
-        } else {
-          this.restingOrders.set(orderId, evolved.resting);
-          if (Number(evolved.resting.remaining) === 0) {
-            this.restingOrders.delete(orderId);
-            this.restingIndex.remove(orderId);
-          }
+    // The usual TAKER feed callback is synchronous. Preserve the per-token
+    // awaited maker lifecycle only when a resting order actually exists.
+    if (previous && this.restingIndex.orderIdsFor(snapshot.tokenId).size > 0) {
+      return this.evolveSnapshotMakers(snapshot, previous).then(() => this.finishMarketSnapshot(snapshot, started));
+    }
+    this.finishMarketSnapshot(snapshot, started);
+  }
+
+  private async evolveSnapshotMakers(snapshot: MarketSnapshot, previous: MarketSnapshot): Promise<void> {
+    for (const orderId of this.restingIndex.orderIdsFor(snapshot.tokenId)) {
+      const resting = this.restingOrders.get(orderId);
+      if (!resting || resting.order.tokenId !== snapshot.tokenId) continue;
+      const currentPosition = this.ledger.positions.get(resting.order.marketId);
+      if (
+        this.restingOrderIntent(resting) === "OPEN_FIRST_LEG"
+        && currentPosition
+        && d(currentPosition.pairedQuantity).gt(0)
+      ) {
+        await this.releaseMaker(orderId, {
+          cancel: true,
+          reason: "FIRST_LEG_LIFECYCLE_CLOSED",
+        });
+        continue;
+      }
+      const evolved = evolveMakerOrder(resting, previous, snapshot);
+      if (evolved.fill) {
+        // Capture the maker lifecycle intent synchronously here, BEFORE the
+        // async fill path. Rescue/cancel of the resting order during the
+        // applyFill boundary must not erase this identity: the PR2 fill-time
+        // residual/token guards key off economicIntent. restingOrderIntent
+        // keeps the legacy pre-PR1 inference, evaluated against the state
+        // that derived the fill instead of re-read after an await.
+        const restingIntent = this.restingOrderIntent(resting);
+        await this.applyFill(evolved.fill, { restingAfter: evolved.resting, intent: restingIntent, executionSnapshot: snapshot });
+      } else {
+        this.restingOrders.set(orderId, evolved.resting);
+        if (Number(evolved.resting.remaining) === 0) {
+          this.restingOrders.delete(orderId);
+          this.restingIndex.remove(orderId);
         }
       }
-      this.metrics.restingOrderTokenIndexEntries.set(this.restingIndex.entryCount());
     }
+  }
 
-    if (synchronized) {
-      // Deterministic market state is a precursor for bounded scout warming;
-      // this admission is intentionally separate from economic triggers.
-      this.requestScoutRefresh(snapshot, "market");
-      const triggers = this.triggerEngine.ingestMarket(snapshot);
-      for (const trigger of triggers) this.admitTrigger(trigger, this.provenanceForGenerated(trigger, "MARKET"));
-      // Risk exits run outside the websocket consumer await-chain. The per-market
-      // flight below prevents duplicate unwind orders while a prior attempt is
-      // persisting or waiting through paper execution latency.
-      this.scheduleSnapshotProtectiveDeRisk(snapshot.marketId);
-    }
+  private finishMarketSnapshot(snapshot: MarketSnapshot, started: number): void {
+    this.metrics.restingOrderTokenIndexEntries.set(this.restingIndex.entryCount());
+    // Deterministic market state is a precursor for bounded scout warming;
+    // this admission is intentionally separate from economic triggers.
+    this.requestScoutRefresh(snapshot, "market");
+    const triggers = this.triggerEngine.ingestMarket(snapshot);
+    for (const trigger of triggers) this.admitTrigger(trigger, this.provenanceForGenerated(trigger, "MARKET"));
+    // Risk exits run outside the websocket consumer await-chain. The per-market
+    // flight below prevents duplicate unwind orders while a prior attempt is
+    // persisting or waiting through paper execution latency.
+    this.scheduleSnapshotProtectiveDeRisk(snapshot.marketId);
     this.state.eventLatencyMs = performance.now() - started;
     this.metrics.eventLatency.observe((performance.now() - started) / 1000);
   }
