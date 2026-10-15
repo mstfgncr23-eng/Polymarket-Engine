@@ -2870,7 +2870,7 @@ export class EngineService {
       if(!(error instanceof FirstLegLifecycleGuardRejectedError)
         &&!(error instanceof MakerReservationCashCommitGuardRejectedError)
         &&!(error instanceof RiskReductionLifecycleGuardRejectedError))throw error;
-      this.record('DUAL_MAKER_PLAN_NOT_ADMITTED',group,marketId,{group,reason:error.reason??error.message});
+      this.record('DUAL_MAKER_PLAN_NOT_ADMITTED',group,marketId,{group,reason:error.message});
       // A first maker may have filled while its sibling was being reserved:
       // never fall back into another fresh directional first leg in that case.
       return this.ledger.positions.has(marketId);
