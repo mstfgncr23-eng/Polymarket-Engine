@@ -28,7 +28,7 @@ async function setup(enabled=true,journal:EventJournal=pg?.journal??new MemoryEv
  return {engine,journal,market,clock,intern,b,quote,submit,trade,errors};
 }
 describe('Maker-First real Engine lifecycle',()=>{
- it.each(['fresh','price-worse','stale','closed','partial','dual','concurrent','cash','daily-loss','signal-expired','epoch','restart','book-expiry','close-race'] as const)('directional TTL fallback revalidates once without widening limits (%s)',async scenario=>{
+ it.each(['fresh','fresh-price','price-risk-veto','stale','closed','partial','dual','concurrent','cash','daily-loss','signal-expired','epoch','restart','book-expiry','close-race'] as const)('directional TTL fallback revalidates once within the original dollar budget (%s)',async scenario=>{
   const s=await setup(true,undefined,{ms:T},{PAPER_DUAL_SIDED_MAKER_ENABLED:String(scenario==='dual')});
   try{
    const intern=s.engine as any;
@@ -56,7 +56,8 @@ describe('Maker-First real Engine lifecycle',()=>{
    s.clock.ms=T+2001;
    if(scenario==='closed')expect((await s.engine.closeExperimentEntries()).ok).toBe(true);
    if(scenario!=='stale'){
-    const up=bk('UP',11);if(scenario==='price-worse')up.asks=[{price:'0.71',quantity:'10'}];
+    const up=bk('UP',11);if(scenario==='fresh-price')up.asks=[{price:'0.71',quantity:'1000'}];
+    if(scenario==='price-risk-veto')up.asks=[{price:'0.85',quantity:'1000'}];
     // Direct cache update keeps TTL as the cancellation authority under test.
     const down=bk('DOWN',11);intern.snapshots.set(M,{UP:up,DOWN:down});s.engine.state.marketSnapshots.set(U,up);s.engine.state.marketSnapshots.set(D,down);
     await s.engine.ingestReferenceTickForTest({eventId:'ttl-ref-new',traceId:'ttl-ref-new',asset:'XRP',symbol:'XRPUSDT',venue:'test',price:'1',quantity:'1',sourceTimestamp:new Date(s.clock.ms).toISOString(),receivedAt:new Date(s.clock.ms).toISOString(),tradeId:'ttl-ref-new'});
@@ -76,9 +77,11 @@ describe('Maker-First real Engine lifecycle',()=>{
    if(closing)await closing;
    await s.intern.expireMakerQuotes();
    const fills=(await s.journal.queryEvents({types:['PAPER_FILL']})).filter(r=>r.payload.liquidityRole==='TAKER');
-   const shouldFill=scenario==='fresh'||scenario==='concurrent'||scenario==='book-expiry';expect(fills,JSON.stringify((await s.journal.queryEvents({types:['RISK_EVALUATION']})).map(r=>r.payload))).toHaveLength(shouldFill?1:0);
+   const shouldFill=scenario==='fresh'||scenario==='fresh-price'||scenario==='concurrent'||scenario==='book-expiry';expect(fills,JSON.stringify((await s.journal.queryEvents({types:['RISK_EVALUATION']})).map(r=>r.payload))).toHaveLength(shouldFill?1:0);
    if(shouldFill){
-    expect(fills[0]!.payload).toMatchObject({fillPrice:'0.7',intent:'OPEN_FIRST_LEG'});
+    expect(fills[0]!.payload).toMatchObject({fillPrice:scenario==='fresh-price'?'0.71':'0.7',intent:'OPEN_FIRST_LEG'});
+    expect(Number(fills[0]!.payload.quantity)).toBeLessThanOrEqual(Number(first.quantity));
+    expect(Number(fills[0]!.payload.quantity)*Number(fills[0]!.payload.fillPrice)).toBeLessThanOrEqual(Number(first.quantity)*Number(first.makerFirst!.takerReferencePrice));
     const facts=await s.journal.queryDurableTransitions({limit:1000});
     expect(facts.find(f=>f.operationKey===`maker:${first.id}:cancel`)!.sequence)
       .toBeLessThan(facts.find(f=>f.type==='PAPER_FILL'&&f.aggregateId===fills[0]!.aggregateId)!.sequence);

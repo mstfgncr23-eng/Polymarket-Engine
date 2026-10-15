@@ -4062,14 +4062,16 @@ export class EngineService {
       pair = currentPair;
       if (!this.adapterTokenSynchronized(candidate.tokenId)) return;
       if(fallback){
-        // Continue the same entry, never enlarge its size or original taker
-        // limit and never turn a partial maker fill into another first leg.
+        // A replacement receives its own CURRENT taker decision and immutable
+        // limit. Preserve the original quantity and dollar budget, never an
+        // old fair probability; a partial maker cannot create another entry.
         if(candidate.tokenId!==fallback.parent.tokenId||candidate.outcome!==fallback.parent.outcome
           ||this.ledger.positions.has(candidate.marketId)||this.confirmedGuardianProtection(candidate.marketId))return;
-        candidate={...candidate,
-          quantity:d(candidate.quantity).lt(fallback.parent.quantity)?candidate.quantity:fallback.parent.quantity,
-          limitPrice:d(candidate.limitPrice).lt(fallback.parent.makerFirst!.takerReferencePrice)
-            ?candidate.limitPrice:fallback.parent.makerFirst!.takerReferencePrice};
+        const budget=d(fallback.parent.quantity).mul(fallback.parent.makerFirst!.takerReferencePrice);
+        const budgetQuantity=budget.div(candidate.limitPrice);
+        let quantity=d(candidate.quantity).lt(fallback.parent.quantity)?d(candidate.quantity):d(fallback.parent.quantity);
+        if(budgetQuantity.lt(quantity))quantity=budgetQuantity;
+        candidate={...candidate,quantity:quantity.toFixed(8,1)}; // Round DOWN to the preserved dollar budget.
       }
 
       const snapshotProvenance = (snapshot: MarketSnapshot) => ({

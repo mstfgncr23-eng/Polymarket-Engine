@@ -23,8 +23,11 @@ may instead own two fresh quotes. They are not relabeled as already-filled hedge
 An unfilled directional maker may continue once as TAKER after its TTL. Durable
 cancellation and cash release come first. The same trigger is evaluated again
 against current native probability, confidence, reference, full depth, fees,
-exposure, expiry and entry status. Quantity and the original taker reference
-limit cannot grow. Only the cooldown belonging to that identical quote is
+exposure, expiry and entry status. Quantity and the original taker dollar
+budget cannot grow. The replacement's price is its fresh accepted strategy
+limit, which cannot widen during its own submission latency. An old quote's
+fair probability never authorizes buying a more expensive current book.
+Only the cooldown belonging to that identical quote is
 excluded; another entry's cooldown and actual-trade cooldown remain binding.
 No second maker attempt is made. A partial fill, dual quote, gap, price-driven
 cancel or restart cannot acquire this continuation. It is bounded to a live
