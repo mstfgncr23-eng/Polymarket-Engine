@@ -51,5 +51,101 @@ describe('Maker-First real Engine lifecycle',()=>{
  it('gap/reconnect never reuses the old queue and a changed epoch cancels the quote',async()=>{const s=await setup();try{const o=s.quote();await s.submit(o);s.market.markTokenSync(U,'GAPPED');s.market.markTokenSync(U,'SYNCED');s.clock.ms+=151;await s.market.emitSnapshot(s.b('UP',2));await s.intern.onMakerTrade(s.trade(o,'100'));expect(s.engine.restingOrderCount()).toBe(0);expect(s.engine.ledger.positions.size).toBe(0);expect(s.engine.ledger.snapshot().reservedCash).toBe('0');}finally{await s.engine.stop();}});
  it('checkpoint restart reconciles open quote and reservation without inventing missed fills',async()=>{const s=await setup();await s.submit();await s.engine.checkpoint();await s.engine.stop();const recovered=await setup(true,s.journal,s.clock);try{expect(recovered.engine.restingOrderCount()).toBe(0);expect(recovered.engine.ledger.snapshot().reservedCash).toBe('0');expect(recovered.engine.ledger.positions.size).toBe(0);}finally{await recovered.engine.stop();}});
  it('the first-leg admission lock blocks a second outcome and double cash reservation',async()=>{const s=await setup();try{expect(await s.submit()).toBe(true);const opposite={...s.quote(),id:'other-side',tokenId:D,outcome:'DOWN' as const,requestedPrice:'0.29'};expect(await s.submit(opposite)).toBe(false);expect(s.engine.restingOrderCount()).toBe(1);expect(s.engine.ledger.snapshot().reservedCash).toBe('1.38');}finally{await s.engine.stop();}});
+ it.each(['UP','DOWN'] as const)('dual maker accepts %s as the first partial or full leg then pairs the opposite maker',async firstOutcome=>{
+  const s=await setup(true,undefined,{ms:T},{PAPER_DUAL_SIDED_MAKER_ENABLED:'true'});
+  try{
+    const dual=s.engine as unknown as {trySubmitDualMakerPair(o:PaperOrder,key:string,p:Record<'UP'|'DOWN',MarketSnapshot>):Promise<boolean>;restingOrders:Map<string,{order:PaperOrder;remaining:string}>};
+    const books={UP:s.engine.state.marketSnapshots.get(U)!,DOWN:s.engine.state.marketSnapshots.get(D)!};
+    const admitted=await dual.trySubmitDualMakerPair(s.quote(),'dual:test',books);
+    expect(admitted).toBe(true);
+    expect(s.engine.restingOrderCount()).toBe(2);
+    const q=[...dual.restingOrders.values()].map(v=>v.order);
+    expect(new Set(q.map(o=>o.makerFirst?.dualGroupId)).size).toBe(1);
+    expect(new Set(q.map(o=>o.outcome))).toEqual(new Set(['UP','DOWN']));
+    s.clock.ms+=201;
+    const first=q.find(x=>x.outcome===firstOutcome)!;
+    await s.intern.onMakerTrade(s.trade(first,'6',s.clock.ms));
+    const p=s.engine.ledger.positions.get(M);
+    expect(p?.unpairedOutcome).toBe(firstOutcome);
+    expect(p?.unpairedQuantity).toBe('2');
+    expect(s.engine.restingOrderCount()).toBe(1);
+    s.clock.ms+=10;
+    const sibling=q.find(x=>x.outcome!==firstOutcome)!;
+    await s.intern.onMakerTrade(s.trade(sibling,'6',s.clock.ms));
+    const completed=s.engine.ledger.positions.get(M);
+    expect(completed?.pairedQuantity).toBe('2');
+    expect(completed?.unpairedQuantity).toBe('0');
+    expect(s.engine.restingOrderCount()).toBe(0);
+    expect(s.engine.ledger.snapshot().reservedCash).toBe('0');
+    expect(s.errors).toEqual([]);
+  }finally{await s.engine.stop();}
+ });
+ it('serializes simultaneous dual-side public trades through one market lane',async()=>{
+  const s=await setup(true,undefined,{ms:T},{PAPER_DUAL_SIDED_MAKER_ENABLED:'true'});
+  try{
+    const dual=s.engine as unknown as {trySubmitDualMakerPair(o:PaperOrder,key:string,p:Record<'UP'|'DOWN',MarketSnapshot>):Promise<boolean>;restingOrders:Map<string,{order:PaperOrder}>};
+    expect(await dual.trySubmitDualMakerPair(s.quote(),'dual:simultaneous',{
+      UP:s.engine.state.marketSnapshots.get(U)!,DOWN:s.engine.state.marketSnapshots.get(D)!})).toBe(true);
+    const q=[...dual.restingOrders.values()].map(x=>x.order);
+    s.clock.ms+=201;
+    await Promise.all(q.map(o=>s.intern.onMakerTrade(s.trade(o,'6',s.clock.ms))));
+    expect(s.engine.ledger.positions.get(M)?.pairedQuantity).toBe('2');
+    expect(s.engine.ledger.positions.get(M)?.unpairedQuantity).toBe('0');
+    expect(s.engine.ledger.snapshot().reservedCash).toBe('0');
+    expect(s.errors).toEqual([]);
+  }finally{await s.engine.stop();}
+ });
+ it('dual-sided startup recovery cancels both quotes and releases both durable reservations',async()=>{
+  const s=await setup(true,undefined,{ms:T},{PAPER_DUAL_SIDED_MAKER_ENABLED:'true'});
+  const dual=s.engine as unknown as {trySubmitDualMakerPair(o:PaperOrder,key:string,p:Record<'UP'|'DOWN',MarketSnapshot>):Promise<boolean>};
+  expect(await dual.trySubmitDualMakerPair(s.quote(),'dual:restart',{
+    UP:s.engine.state.marketSnapshots.get(U)!,DOWN:s.engine.state.marketSnapshots.get(D)!})).toBe(true);
+  expect(s.engine.restingOrderCount()).toBe(2);
+  await s.engine.checkpoint();
+  await s.engine.stop();
+  const recovered=await setup(true,s.journal,s.clock,{PAPER_DUAL_SIDED_MAKER_ENABLED:'true'});
+  try{
+    expect(recovered.engine.restingOrderCount()).toBe(0);
+    expect(recovered.engine.ledger.snapshot().reservedCash).toBe('0');
+    expect(recovered.engine.ledger.positions.size).toBe(0);
+    expect(recovered.engine.integrityFault()).toBe(false);
+  }finally{await recovered.engine.stop();}
+ });
+ it('dual fresh quotes both cancel on close-entries without retaining cash or creating entries',async()=>{
+  const s=await setup(true,undefined,{ms:T},{PAPER_DUAL_SIDED_MAKER_ENABLED:'true'});
+  try{
+    const dual=s.engine as unknown as {trySubmitDualMakerPair(o:PaperOrder,k:string,p:Record<'UP'|'DOWN',MarketSnapshot>):Promise<boolean>;restingOrders:Map<string,{order:PaperOrder}>};
+    expect(await dual.trySubmitDualMakerPair(s.quote(),'dual:close',{
+      UP:s.engine.state.marketSnapshots.get(U)!,DOWN:s.engine.state.marketSnapshots.get(D)!})).toBe(true);
+    const quotes=[...dual.restingOrders.values()].map(r=>r.order);
+    expect(quotes).toHaveLength(2);
+    await s.engine.closeExperimentEntries();
+    expect(s.engine.restingOrderCount()).toBe(0);
+    expect(s.engine.reservedCash()).toBe('0');
+    s.clock.ms+=220;
+    await Promise.all(quotes.map(q=>s.intern.onMakerTrade(s.trade(q,'20',s.clock.ms))));
+    expect(s.engine.ledger.positions.size).toBe(0);
+    expect(s.errors).toEqual([]);
+  }finally{await s.engine.stop();}
+ });
+ it('dual first fill retains the opposite hedge across entry close while refusing new first legs',async()=>{
+  const s=await setup(true,undefined,{ms:T},{PAPER_DUAL_SIDED_MAKER_ENABLED:'true'});
+  try{
+    const dual=s.engine as unknown as {trySubmitDualMakerPair(o:PaperOrder,k:string,p:Record<'UP'|'DOWN',MarketSnapshot>):Promise<boolean>;restingOrders:Map<string,{order:PaperOrder}>};
+    expect(await dual.trySubmitDualMakerPair(s.quote(),'dual:close-with-residual',{
+      UP:s.engine.state.marketSnapshots.get(U)!,DOWN:s.engine.state.marketSnapshots.get(D)!})).toBe(true);
+    const quotes=[...dual.restingOrders.values()].map(r=>r.order);
+    const up=quotes.find(q=>q.outcome==='UP')!,down=quotes.find(q=>q.outcome==='DOWN')!;
+    s.clock.ms+=201;await s.intern.onMakerTrade(s.trade(up,'6',s.clock.ms));
+    expect(s.engine.ledger.positions.get(M)?.unpairedOutcome).toBe('UP');
+    await s.engine.closeExperimentEntries();
+    expect(s.engine.restingOrderCount()).toBe(1);
+    s.clock.ms+=10;await s.intern.onMakerTrade(s.trade(down,'6',s.clock.ms));
+    expect(s.engine.ledger.positions.get(M)?.unpairedQuantity).toBe('0');
+    expect(s.engine.ledger.positions.get(M)?.pairedQuantity).toBe('2');
+    expect(s.engine.reservedCash()).toBe('0');
+    expect(s.errors).toEqual([]);
+  }finally{await s.engine.stop();}
+ });
  it.each([false,true])('feature enabled=%s preserves original gates and selects only the authorized execution style',async enabled=>{const s=await setup(enabled);try{const c:StrategyCandidate={strategyId:'test',strategyVersion:'test',marketId:M,tokenId:U,outcome:'UP',side:'BUY',quantity:'2',limitPrice:'0.7',intent:'OPEN_FIRST_LEG',rawEdgeUsdPerShare:.2,rawExpectedEdge:.2,reasonCodes:[]};const decision=s.engine.decideWithRuntimeBasisForTest(c,{UP:s.b('UP'),DOWN:s.b('DOWN')},new Date(s.clock.ms),'XRP');expect(decision.accepted,JSON.stringify(decision.risk)).toBe(true);expect(decision.order?.orderType).toBe(enabled?'MAKER':'TAKER');if(enabled)expect(decision.order?.makerFirst?.postOnly).toBe(true);}finally{await s.engine.stop();}});
 });

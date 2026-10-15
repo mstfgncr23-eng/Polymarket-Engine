@@ -359,6 +359,8 @@ export const paperOrderSchema = z.object({
     tokenEpoch: z.number().int().nonnegative(), postingBookEventId: idSchema,
     takerReferencePrice: decimalStringSchema,
     postingFeeKey: z.string().optional(),
+    /** Two coordinated passive first quotes. One may become the opposite hedge only after an authoritative first fill. */
+    dualGroupId: idSchema.optional(),
   }).optional(),
   entryAdmission: z.object({ fairProbability: z.number().finite().min(0).max(1), signalExpiresAt: timestampSchema }).optional(),
   id: idSchema,

@@ -122,6 +122,7 @@ export const engineEnvSchema = z.object({
   PAPER_EXECUTION_LATENCY_MS: z.coerce.number().int().nonnegative().default(150),
   PAPER_EXECUTION_STYLE: z.enum(["TAKER", "MAKER"]).default("TAKER"),
   PAPER_MAKER_FIRST_ENABLED: z.preprocess(value => value === "true" ? true : value === "false" ? false : value, z.boolean().default(false)),
+  PAPER_DUAL_SIDED_MAKER_ENABLED: z.preprocess(value => value === "true" ? true : value === "false" ? false : value, z.boolean().default(false)),
   PAPER_MAKER_FIRST_QUOTE_TTL_MS: z.coerce.number().int().min(500).max(5000).default(2000),
   PAPER_MAKER_HEDGE_QUOTE_TTL_MS: z.coerce.number().int().min(250).max(2000).default(750),
   /** Runtime override for NORMAL HEDGE_SECOND_LEG gross locked pair edge floor. */

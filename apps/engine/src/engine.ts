@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { experimentWsEventSchema, marketWsReason, type ExperimentWsEvent } from "@pm/core";
-import { bookTiming, firstLegBookReason, officialMarketStartReason, firstLegEntryFilterReason, firstLegExecutionEconomics } from "./first-leg-admission.js";
+import { bookTiming, firstLegBookReason, officialMarketStartReason, firstLegEntryFilterReason, firstLegExecutionEconomics, FIRST_LEG_MIN_NET_ROI } from "./first-leg-admission.js";
 import type { GuardianView, GuardianMarket, GuardianUpdate } from "./guardian-link.js";
 import { currentGuardianConsensus } from "./guardian-link.js";
 import { guardianV2StateSchema, type GuardianV2State } from "@pm/core";
@@ -49,6 +49,7 @@ import {
   evolveMakerOrder,
   evolveMakerTrade,
   passiveMakerBuyPrice,
+  planDualMakerQuotes,
   type MarketTrade,
   grokSignalSubmissionSchema,
   grokSignalEnvelopeSchema,
@@ -638,6 +639,7 @@ export class EngineService {
         || env.PROFIT_TRAILING_PAIR_RETRACE_EDGE >= env.NORMAL_HEDGE_MIN_LOCKED_PAIR_EDGE)) {
       throw new Error("INVALID_PROFIT_TRAILING_PAIR_CONFIG");
     }
+    if(env.PAPER_DUAL_SIDED_MAKER_ENABLED&&!env.PAPER_MAKER_FIRST_ENABLED)throw new Error('DUAL_MAKER_REQUIRES_MAKER_FIRST');
     if(env.PAPER_MAKER_FIRST_ENABLED&&(env.PAPER_EXECUTION_STYLE!=='TAKER'
       ||env.PAPER_MAKER_FIRST_QUOTE_TTL_MS<=env.PAPER_EXECUTION_LATENCY_MS
       ||env.PAPER_MAKER_HEDGE_QUOTE_TTL_MS<=env.PAPER_EXECUTION_LATENCY_MS))throw new Error('INVALID_MAKER_FIRST_BASE_CONFIG');
@@ -721,7 +723,8 @@ export class EngineService {
     await this.recoverInterruptedFirstLegOrders();
     if(this.experiment&&['RUNNING','ENTRY_CLOSED'].includes(this.experiment.status)){
       const config=this.makerFirstConfig();
-      if(config.enabled!==this.env.PAPER_MAKER_FIRST_ENABLED||(config.enabled
+      if(config.enabled!==this.env.PAPER_MAKER_FIRST_ENABLED
+        ||config.twoSidedFreshEntries!==this.env.PAPER_DUAL_SIDED_MAKER_ENABLED||(config.enabled
         &&(config.firstLegTtlMs!==this.env.PAPER_MAKER_FIRST_QUOTE_TTL_MS||config.hedgeTtlMs!==this.env.PAPER_MAKER_HEDGE_QUOTE_TTL_MS)))
         throw new RecoveryFailClosedError('invariant','maker-first active manifest/runtime configuration mismatch');
     }
@@ -1203,7 +1206,7 @@ export class EngineService {
           profitTrailingPairRetraceEdge: this.env.PROFIT_TRAILING_PAIR_RETRACE_EDGE,
           profitTrailingPairExecutionStyle: "TAKER",
           makerFirst: {enabled:this.env.PAPER_MAKER_FIRST_ENABLED,firstLegTtlMs:this.env.PAPER_MAKER_FIRST_QUOTE_TTL_MS,
-            hedgeTtlMs:this.env.PAPER_MAKER_HEDGE_QUOTE_TTL_MS,fillModel:'public-trade-queue-50pct',twoSidedFreshEntries:false},
+            hedgeTtlMs:this.env.PAPER_MAKER_HEDGE_QUOTE_TTL_MS,fillModel:'public-trade-queue-50pct',twoSidedFreshEntries:this.env.PAPER_DUAL_SIDED_MAKER_ENABLED},
           reversalProtectionEnabled: this.env.REVERSAL_PROTECTION_ENABLED,
           guardianVersion: 2, guardianFormatGeneration: 3, guardianV2Config: { ...GUARDIAN_V2_CONFIG },
           reversalProtectionWindowMs: this.env.REVERSAL_PROTECTION_WINDOW_MS,
@@ -1615,6 +1618,12 @@ export class EngineService {
   }
 
   private restingOrderIntent(resting: RestingPaperOrder): "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" {
+    if (resting.order.makerFirst?.dualGroupId) {
+      const position=this.ledger.positions.get(resting.order.marketId);
+      if(position?.unpairedOutcome && resting.order.outcome!==position.unpairedOutcome)
+        return "HEDGE_SECOND_LEG";
+      return "OPEN_FIRST_LEG";
+    }
     if (resting.intent) return resting.intent;
     // Pre-PR1 checkpoints did not embed intent in RestingPaperOrder. Infer only
     // enough to fail safe: an opposite-side order against current unpaired
@@ -1669,6 +1678,12 @@ export class EngineService {
    * feed update cannot revoke that historical observation. Economic ownership,
    * cash, cancellation and settlement are still fenced at commit time. */
   private firstLegExecutionReason(order: PaperOrder, book: MarketSnapshot, at: Date): string | null {
+    if(order.makerFirst?.dualGroupId){
+      return officialMarketStartReason(this.marketsById.get(order.marketId),at.getTime())
+        ??(!this.firstLegExpiryAdmission(order.marketId,at).eligible?'DURATION_OUT_OF_RANGE':null)
+        ??firstLegBookReason({...order,book,canonicalTokenId:this.currentTokenIdFor(order.marketId,order.outcome),
+          synchronized:this.adapterTokenSynchronized(order.tokenId),nowMs:at.getTime(),maxAgeMs:this.riskLimits.staleFeedTimeoutMs});
+    }
     return officialMarketStartReason(this.marketsById.get(order.marketId), at.getTime())
       ?? (!this.firstLegExpiryAdmission(order.marketId, at).eligible ? "DURATION_OUT_OF_RANGE" : null)
       ?? firstLegBookReason({ ...order, book,
@@ -2803,11 +2818,74 @@ export class EngineService {
     }
   }
 
-  private makerFirstConfig():{enabled:boolean;firstLegTtlMs:number;hedgeTtlMs:number}{
-    const stored=this.experiment?.riskConfiguration.makerFirst as {enabled?:boolean;firstLegTtlMs?:number;hedgeTtlMs?:number}|undefined;
+  /** Dual maker is a separate PAPER strategy. Neither quote is a guaranteed fill;
+   * both share one economic group, but their cash reservations remain independent.
+   * The low-priced quote has a pair-plan admission, not the directional 0.65 floor. */
+  private async trySubmitDualMakerPair(directionOrder:PaperOrder, duplicateKey:string, pair:Record<Outcome,MarketSnapshot|null|undefined>):Promise<boolean>{
+    if(!this.dualMakerEnabled()||!this.isExperimentWindowOpen()
+      ||this.state.database!=='UP'||this.state.journalDegraded||this.overload.state==='FAIL_CLOSED')return false;
+    const up=pair.UP,down=pair.DOWN,marketId=directionOrder.marketId;
+    if(!up||!down||up.marketId!==marketId||down.marketId!==marketId
+      ||!this.entryQualified.has(marketId)||this.firstLegLifecycleBlocked(marketId)
+      ||!this.adapterTokenSynchronized(up.tokenId)||!this.adapterTokenSynchronized(down.tokenId)
+      ||this.firstLegAdmissionReason({marketId,tokenId:up.tokenId,outcome:"UP"},up)
+      ||this.firstLegAdmissionReason({marketId,tokenId:down.tokenId,outcome:"DOWN"},down)
+      ||!this.firstLegExpiryAdmission(marketId).eligible)return false;
+    const plan=planDualMakerQuotes({up,down,quantity:directionOrder.quantity,
+      perSideRiskCapUsd:String(this.riskLimits.maxOrderSizeUsd),availableCashUsd:this.ledger.availableCash().toFixed(),
+      minPairNetRoi:FIRST_LEG_MIN_NET_ROI,nowMs:this.nowFn().getTime(),maxBookAgeMs:this.riskLimits.staleFeedTimeoutMs});
+    if(!plan.plan)return false;
+    const group=createId('dual_pair'),ttl=this.makerFirstConfig().firstLegTtlMs;
+    const expiry=this.marketsById.get(marketId)?.endDate;
+    const end=Math.min(this.nowFn().getTime()+ttl,expiry?Date.parse(expiry)-PROTECTIVE_DE_RISK_PRE_EXPIRY_SAFETY_MS:Number.POSITIVE_INFINITY);
+    if(!Number.isFinite(end)||end<=this.nowFn().getTime()+this.env.PAPER_EXECUTION_LATENCY_MS)return false;
+    const build=(book:MarketSnapshot,price:string):PaperOrder=>({
+      ...directionOrder,id:createId('order'),strategyId:'two-sided-maker-v1',side:'BUY',outcome:book.outcome,tokenId:book.tokenId,
+      orderType:'MAKER',requestedPrice:price,status:'PENDING',createdAt:this.nowFn().toISOString(),entryAdmission:undefined,
+      makerFirst:{version:1,role:'FIRST_LEG',postOnly:true,dualGroupId:group,expiresAt:new Date(end).toISOString(),
+        submissionLatencyMs:this.env.PAPER_EXECUTION_LATENCY_MS,tokenEpoch:this.adapterTokenEpoch(book.tokenId),
+        postingBookEventId:book.eventId,takerReferencePrice:book.asks[0]!.price,
+        postingFeeKey:JSON.stringify([book.feeSchedule?.rate,book.feeSchedule?.exponent,book.feeSchedule?.takerOnly])},
+    });
+    const quotes=[build(up,plan.plan.up.price),build(down,plan.plan.down.price)];
+    if(!this.tryReserveFirstLegAdmission(marketId))return false;
+    try{
+      // A second reservation is allowed ONLY as the sibling of the same plan.
+      // Each remains within the original durable cash / exposure fences.
+      for(const quote of quotes){
+        if(this.ledger.positions.has(marketId)||!this.isExperimentWindowOpen()
+          ||this.confirmedGuardianProtection(marketId))throw new Error('DUAL_PLAN_SUPERSEDED');
+        await this.reserveMaker(quote,quote.outcome==='UP'?up:down,'OPEN_FIRST_LEG');
+      }
+      this.recentTrades.set(duplicateKey,Date.now());
+      this.record('DUAL_MAKER_QUOTES_ADMITTED',group,marketId,{
+        group,orderIds:quotes.map(q=>q.id),conditionalNetPairUsd:plan.plan.netPairPnlUsd,
+        maxUnpairedDownsideUsd:plan.plan.maxUnpairedDownsideUsd});
+      return true;
+    }catch(error){
+      for(const quote of quotes)if(this.restingOrders.has(quote.id))
+        await this.releaseMaker(quote.id,{cancel:true,reason:'DUAL_PLAN_ROLLBACK'});
+      // A durable fault or programmer error is NOT a normal no-quote result.
+      // Preserve existing fail-closed behavior instead of silently trading TAKER.
+      if(!(error instanceof FirstLegLifecycleGuardRejectedError)
+        &&!(error instanceof MakerReservationCashCommitGuardRejectedError)
+        &&!(error instanceof RiskReductionLifecycleGuardRejectedError))throw error;
+      this.record('DUAL_MAKER_PLAN_NOT_ADMITTED',group,marketId,{group,reason:error.reason??error.message});
+      // A first maker may have filled while its sibling was being reserved:
+      // never fall back into another fresh directional first leg in that case.
+      return this.ledger.positions.has(marketId);
+    }finally{this.pendingFirstLegMarkets.delete(marketId);}
+  }
+
+  private dualMakerEnabled():boolean{
+    return this.makerFirstConfig().twoSidedFreshEntries && this.makerFirstConfig().enabled;
+  }
+
+  private makerFirstConfig():{enabled:boolean;firstLegTtlMs:number;hedgeTtlMs:number;twoSidedFreshEntries:boolean}{
+    const stored=this.experiment?.riskConfiguration.makerFirst as {enabled?:boolean;firstLegTtlMs?:number;hedgeTtlMs?:number;twoSidedFreshEntries?:boolean}|undefined;
     if(this.experiment && ['RUNNING','ENTRY_CLOSED'].includes(this.experiment.status))return {
-      enabled:stored?.enabled===true,firstLegTtlMs:stored?.firstLegTtlMs??2000,hedgeTtlMs:stored?.hedgeTtlMs??750};
-    return {enabled:this.env.PAPER_MAKER_FIRST_ENABLED,firstLegTtlMs:this.env.PAPER_MAKER_FIRST_QUOTE_TTL_MS,hedgeTtlMs:this.env.PAPER_MAKER_HEDGE_QUOTE_TTL_MS};
+      enabled:stored?.enabled===true,firstLegTtlMs:stored?.firstLegTtlMs??2000,hedgeTtlMs:stored?.hedgeTtlMs??750,twoSidedFreshEntries:stored?.twoSidedFreshEntries===true};
+    return {enabled:this.env.PAPER_MAKER_FIRST_ENABLED,firstLegTtlMs:this.env.PAPER_MAKER_FIRST_QUOTE_TTL_MS,hedgeTtlMs:this.env.PAPER_MAKER_HEDGE_QUOTE_TTL_MS,twoSidedFreshEntries:this.env.PAPER_DUAL_SIDED_MAKER_ENABLED};
   }
 
   private entryProjectionLegs(excludeOrderId?:string):ReturnType<typeof projectableLegsFromPositions>{
@@ -2863,10 +2941,14 @@ export class EngineService {
     if(this.state.draining||!this.state.recoveryComplete||!this.makerFirstConfig().enabled)return;
     this.metrics.makerPublicTrades.inc();
     if(!this.restingIndex.orderIdsFor(trade.tokenId).size)return;
-    const previous=this.makerTradeTails.get(trade.tokenId);
+    // A dual pair needs one cross-token lane: two opposite fills must not both be
+    // classified as an empty-position FIRST_LEG across separate promise tails.
+    const key=[...this.restingIndex.orderIdsFor(trade.tokenId)].some(id=>this.restingOrders.get(id)?.order.makerFirst?.dualGroupId)
+      ? 'dual:'+trade.marketId:trade.tokenId;
+    const previous=this.makerTradeTails.get(key);
     const work=(previous??Promise.resolve()).then(()=>this.applyMakerTrade(trade));
-    const tail=work.then(()=>undefined,()=>undefined);this.makerTradeTails.set(trade.tokenId,tail);
-    void tail.then(()=>{if(this.makerTradeTails.get(trade.tokenId)===tail)this.makerTradeTails.delete(trade.tokenId);});
+    const tail=work.then(()=>undefined,()=>undefined);this.makerTradeTails.set(key,tail);
+    void tail.then(()=>{if(this.makerTradeTails.get(key)===tail)this.makerTradeTails.delete(key);});
     return work;
   }
 
@@ -2884,8 +2966,17 @@ export class EngineService {
           &&Date.parse(trade.sourceTimestamp)<=this.nowFn().getTime())this.makerQueuePrimed.add(orderId);
       }
       const evolved=evolveMakerTrade(r,trade,book,active,this.nowFn().getTime());
-      if(evolved.fill)await this.applyFill(evolved.fill,{restingAfter:evolved.resting,intent:this.restingOrderIntent(r),executionSnapshot:book,executionOrder:r.order});
-      else if(this.restingOrders.get(orderId)===r)this.restingOrders.set(orderId,evolved.resting);
+      if(evolved.fill){
+        const applied=await this.applyFill(evolved.fill,{restingAfter:evolved.resting,intent:this.restingOrderIntent(r),executionSnapshot:book,executionOrder:r.order});
+        if(applied&&r.order.makerFirst?.dualGroupId){
+          // No same-side remainders may increase the original directional exposure.
+          for(const sibling of [...this.restingOrders.values()]){
+            if(sibling.order.makerFirst?.dualGroupId===r.order.makerFirst.dualGroupId
+              &&sibling.order.outcome===r.order.outcome&&d(sibling.remaining).gt(0))
+              await this.releaseMaker(sibling.order.id,{cancel:true,reason:'DUAL_FILLED_SIDE_REMAINDER'});
+          }
+        }
+      }else if(this.restingOrders.get(orderId)===r)this.restingOrders.set(orderId,evolved.resting);
     }
     this.scheduleMakerQuoteExpiry();
   }
@@ -3975,6 +4066,7 @@ export class EngineService {
       return;
     }
     this.record("RISK_ACCEPT", trigger.traceId, trigger.marketId, { orderId: decision.order.id, netEvUsdPerShare: decision.netEvUsdPerShare }, asset);
+    if(candidate.intent==="OPEN_FIRST_LEG" && await this.trySubmitDualMakerPair(decision.order,duplicateKey,{UP:pair.UP,DOWN:pair.DOWN}))return;
     await this.submitPaperOrder(decision.order, snapshot, duplicateKey, candidate.intent);
   }
 
@@ -4935,7 +5027,8 @@ export class EngineService {
           ) {
             throw new FirstLegLifecycleGuardRejectedError(fill.marketId, "MAKER_NOT_ACTIVE");
           }
-          if (currentPosition && d(currentPosition.pairedQuantity).gt(0)) {
+          if (currentPosition && (d(currentPosition.pairedQuantity).gt(0)
+            || (currentResting.order.makerFirst?.dualGroupId && d(currentPosition.unpairedQuantity).gt(0)))) {
             throw new FirstLegLifecycleGuardRejectedError(fill.marketId, "PAIRING_ALREADY_STARTED");
           }
         },
@@ -4971,7 +5064,10 @@ export class EngineService {
                 extras.deRisk,
                 unhedgedStartedAtBefore,
                 executionBook && executionOrder ? {
-                  ...firstLegExecutionEconomics({ ...executionOrder, quantity: fill.quantity }, executionBook, executionAt.getTime()),
+                  ...(executionOrder.makerFirst?.dualGroupId
+                    ? { entryPolicy:"TWO_SIDED_MAKER",dualGroupId:executionOrder.makerFirst.dualGroupId,
+                        executablePrice:fill.fillPrice,quantity:fill.quantity,reason:null,conditionalPairOnly:true }
+                    : firstLegExecutionEconomics({ ...executionOrder, quantity: fill.quantity }, executionBook, executionAt.getTime())),
                   checkedAt: executionAt.toISOString(), book: { marketId: executionBook.marketId, tokenId: executionBook.tokenId,
                     outcome: executionBook.outcome, eventId: executionBook.eventId, sequence: executionBook.sequence, hash: executionBook.hash,
                     sourceTimestamp: executionBook.sourceTimestamp, receivedAt: executionBook.receivedAt, wsCallbackAt: executionBook.wsCallbackAt ?? null },
@@ -6391,7 +6487,10 @@ export class EngineService {
   }
 
   private async maybeProfitTrailingPair(marketId: string): Promise<void> {
-    if([...this.restingOrders.values()].some(r=>r.order.marketId===marketId&&r.order.makerFirst&&this.restingOrderIntent(r)==='HEDGE_SECOND_LEG'))return;
+    // Existing Maker-Hedge still controls its fallback. A pre-posted dual sibling,
+    // however, yields to an actionable Profit-Trailing target/retrace below.
+    if([...this.restingOrders.values()].some(r=>r.order.marketId===marketId&&r.order.makerFirst
+      &&!r.order.makerFirst.dualGroupId&&this.restingOrderIntent(r)==='HEDGE_SECOND_LEG'))return;
     const config = this.profitTrailingPairConfig();
     if (!config || this.soakBlocksPostEntry(marketId) || !experimentAllowsHedge(this.experiment)
       || this.state.database !== "UP" || this.state.journalDegraded || this.overload.hasIntegrityFault
@@ -6481,6 +6580,11 @@ export class EngineService {
         this.noteProfitTrailingRejectedEvidence(marketId, latestPosition, latestNow.getTime());
         return;
       }
+      // An actionable target/retrace outranks a speculative resting dual quote.
+      const dualSibling=[...this.restingOrders.values()].filter(r=>r.order.marketId===marketId
+        &&r.order.makerFirst?.dualGroupId&&this.restingOrderIntent(r)==='HEDGE_SECOND_LEG');
+      for(const resting of dualSibling)
+        await this.releaseMaker(resting.order.id,{cancel:true,reason:'PROFIT_TRAILING_PRIORITY'});
       const candidate: StrategyCandidate = {
         ...baseCandidate,
         strategyId: latestEvaluation.action === "TARGET" ? "profit-trailing-pair-target" : "profit-trailing-pair-trail",
@@ -6501,7 +6605,7 @@ export class EngineService {
         now: latestNow,
         databaseAvailable: this.state.database === "UP",
         orderTypeOverride: "TAKER",
-        allowMakerFirstHedge:!this.profitTrailingPairStates.get(marketId)?.makerAttemptedAt,
+        allowMakerFirstHedge:!dualSibling.length&&!this.profitTrailingPairStates.get(marketId)?.makerAttemptedAt,
         profitTrailingLockedPnlUsd: latest.lockedPnl,
       });
       this.record("PROFIT_TRAILING_PAIR_EVALUATION", latestPosition.id, marketId, {
