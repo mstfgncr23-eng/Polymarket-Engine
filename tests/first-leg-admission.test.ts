@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { bookTiming, firstLegBookReason } from "../apps/engine/src/first-leg-admission.js";
+import { bookTiming, firstLegBookReason, officialMarketStartReason } from "../apps/engine/src/first-leg-admission.js";
 import { EngineService } from "../apps/engine/src/engine.js";
 import { MemoryEventJournal } from "@pm/db";
 import { NoopGrokActivationBridge } from "../apps/engine/src/activation/index.js";
@@ -39,7 +39,9 @@ describe("P0-06 first-leg book authority", () => {
   });
   it.each(["fresh", "stale", "async-replaced", "async-stale"])("guards the actual durable first BUY with %s and leaves cash intact on veto", async scenario => {
     const adapter = new ScriptedMarketAdapter();
-    adapter.queue(discoveryReport([qualified("entry", "XRP", "entry-up", "entry-down", new Date(NOW + 900000).toISOString())]));
+    const market = qualified("entry", "XRP", "entry-up", "entry-down", new Date(NOW + 900000).toISOString());
+    market.raw = { eventStartTime: new Date(NOW - 1).toISOString() };
+    adapter.queue(discoveryReport([market]));
     const journal = new MemoryEventJournal();
     const engine = new EngineService(qualifiedPaperEnv(), journal, { error: () => undefined }, {
       market: adapter as never, referenceRegistry: new ScriptedReferenceRegistry() as never,
@@ -66,5 +68,21 @@ describe("P0-06 first-leg book authority", () => {
       if (scenario !== "fresh") expect(engine.ledger.snapshot().cash).toBe(before);
       expect(engine.integrityFault()).toBe(false);
     } finally { await engine.stop(); }
+  });
+});
+
+describe("P0-01 official fixing start", () => {
+  const market = { slug: `xrp-updown-15m-${NOW / 1000}`, endDate: new Date(NOW + 900000).toISOString(), raw: { eventStartTime: new Date(NOW).toISOString() } };
+  it.each([[-1, "ENTRY_MARKET_NOT_STARTED"], [0, null], [1, null]])("start boundary %s ms", (delta, result) => {
+    expect(officialMarketStartReason(market, NOW + delta!)).toBe(result);
+  });
+  it("rejects missing, listing-only, ambiguous timezone and conflicting fixing metadata", () => {
+    expect(officialMarketStartReason(undefined, NOW)).toBe("ENTRY_MARKET_START_MISSING");
+    for (const raw of [{}, { startDate: new Date(NOW - 100000).toISOString() }, { eventStartTime: "2026-10-15T02:00:00" }])
+      expect(officialMarketStartReason({ ...market, raw }, NOW)).toBe("ENTRY_MARKET_START_MISSING");
+    expect(officialMarketStartReason({ ...market, raw: { eventStartTime: new Date(NOW + 1).toISOString() } }, NOW)).toBe("ENTRY_MARKET_START_CONFLICT");
+  });
+  it("uses epoch time across timezones", () => {
+    expect(officialMarketStartReason({ ...market, raw: { eventStartTime: "2026-10-15T05:00:00+03:00" } }, NOW)).toBe(null);
   });
 });

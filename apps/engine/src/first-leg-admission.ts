@@ -1,4 +1,27 @@
 import type { MarketSnapshot } from "@pm/core";
+import type { DiscoveredMarket } from "@pm/market-data";
+
+/** Gamma eventStartTime is the fixing start; startDate is listing creation. */
+export function officialMarketStartReason(market: Pick<DiscoveredMarket, "slug" | "endDate" | "raw"> | undefined, nowMs: number): string | null {
+  if (!market) return "ENTRY_MARKET_START_MISSING";
+  const raw = market.raw;
+  const event = raw.event && typeof raw.event === "object" ? raw.event as Record<string, unknown> : {};
+  const values = [raw.eventStartTime, event.eventStartTime].filter(x => x !== undefined && x !== null);
+  const parse = (x: unknown) => typeof x === "string" && /T.*(?:Z|[+-]\d\d:\d\d)$/.test(x) ? Date.parse(x) : NaN;
+  const starts = values.map(parse);
+  if (!starts.length || starts.some(x => !Number.isFinite(x))) return "ENTRY_MARKET_START_MISSING";
+  const start = starts[0]!;
+  if (starts.some(x => x !== start)) return "ENTRY_MARKET_START_CONFLICT";
+  const end = market.endDate ? Date.parse(market.endDate) : NaN;
+  if (!Number.isFinite(end) || end <= start) return "ENTRY_MARKET_START_CONFLICT";
+  const slug = market.slug.match(/-updown-(\d+)([mh])-(\d{10})$/i);
+  if (slug) {
+    const slugStart = Number(slug[3]) * 1000;
+    const duration = Number(slug[1]) * (slug[2]!.toLowerCase() === "h" ? 3600000 : 60000);
+    if (start !== slugStart || end !== start + duration) return "ENTRY_MARKET_START_CONFLICT";
+  }
+  return Number.isFinite(nowMs) && nowMs >= start ? null : "ENTRY_MARKET_NOT_STARTED";
+}
 
 export function bookTiming(book: MarketSnapshot, nowMs: number) {
   const source = Date.parse(book.sourceTimestamp);

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { bookTiming, firstLegBookReason } from "./first-leg-admission.js";
+import { bookTiming, firstLegBookReason, officialMarketStartReason } from "./first-leg-admission.js";
 import type { GuardianView, GuardianMarket, GuardianUpdate } from "./guardian-link.js";
 import { currentGuardianConsensus } from "./guardian-link.js";
 import { guardianV2StateSchema, type GuardianV2State } from "@pm/core";
@@ -1615,7 +1615,7 @@ export class EngineService {
   }
 
   private firstLegAdmissionReason(order: Pick<PaperOrder, "marketId" | "tokenId" | "outcome">, expected?: MarketSnapshot): string | null {
-    return firstLegBookReason({ ...order,
+    return officialMarketStartReason(this.marketsById.get(order.marketId), this.nowFn().getTime()) ?? firstLegBookReason({ ...order,
       canonicalTokenId: this.currentTokenIdFor(order.marketId, order.outcome),
       synchronized: this.adapterTokenSynchronized(order.tokenId),
       book: this.state.marketSnapshots.get(order.tokenId), expected,
