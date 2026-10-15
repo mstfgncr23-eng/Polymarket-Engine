@@ -19,6 +19,13 @@ export function firstLegExecutionEconomics(order: PaperOrder, book: MarketSnapsh
     || !Number.isFinite(Date.parse(proof.signalExpiresAt)) || nowMs >= Date.parse(proof.signalExpiresAt))
     return { reason: "ENTRY_ECONOMICS_UNAVAILABLE", price: null, expectedROI: null };
   const walk = walkBook(book.asks, order.quantity, order.requestedPrice, "BUY");
+  if(order.makerFirst){
+    const price=order.requestedPrice;
+    if(order.orderType!=="MAKER"||!book.feeSchedule||!book.asks[0]||d(price).gte(book.asks[0].price))return {reason:"ENTRY_ECONOMICS_UNAVAILABLE",price,expectedROI:null};
+    const fee=calculateFee(order.quantity,price,"MAKER",book.feeSchedule);
+    const expectedROI=d(proof.fairProbability).minus(price).mul(order.quantity).minus(fee).div(d(order.quantity).mul(price)).toNumber();
+    return {reason:firstLegEntryFilterReason(price,expectedROI),price,expectedROI};
+  }
   const price = order.orderType === "MAKER" ? order.requestedPrice : walk.sufficientDepth ? walk.vwap : null;
   if (!price || !walk.sufficientDepth || !book.feeSchedule) return { reason: "ENTRY_ECONOMICS_UNAVAILABLE", price, expectedROI: null };
   const fee = calculateFee(order.quantity, price, order.orderType, book.feeSchedule);

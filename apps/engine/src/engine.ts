@@ -47,6 +47,9 @@ import {
   createRestingMakerOrder,
   restingPaperOrderSchema,
   evolveMakerOrder,
+  evolveMakerTrade,
+  passiveMakerBuyPrice,
+  type MarketTrade,
   grokSignalSubmissionSchema,
   grokSignalEnvelopeSchema,
   grokActivationRequestSchema,
@@ -437,6 +440,10 @@ export class EngineService {
   private readonly snapshots = new Map<string, Partial<Record<Outcome, MarketSnapshot>>>();
   private readonly restingOrders = new Map<string, RestingPaperOrder>();
   private readonly makerReservations = new Map<string, string>();
+  private readonly makerActiveAfter = new Map<string, string>();
+  private readonly makerQueuePrimed = new Set<string>();
+  private readonly makerTradeTails = new Map<string,Promise<void>>();
+  private makerQuoteTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly recentTrades = new Map<string, number>();
   /** Ephemeral reservation for a not-yet-durable first-leg submission. */
   private readonly pendingFirstLegMarkets = new Set<string>();
@@ -631,6 +638,9 @@ export class EngineService {
         || env.PROFIT_TRAILING_PAIR_RETRACE_EDGE >= env.NORMAL_HEDGE_MIN_LOCKED_PAIR_EDGE)) {
       throw new Error("INVALID_PROFIT_TRAILING_PAIR_CONFIG");
     }
+    if(env.PAPER_MAKER_FIRST_ENABLED&&(env.PAPER_EXECUTION_STYLE!=='TAKER'
+      ||env.PAPER_MAKER_FIRST_QUOTE_TTL_MS<=env.PAPER_EXECUTION_LATENCY_MS
+      ||env.PAPER_MAKER_HEDGE_QUOTE_TTL_MS<=env.PAPER_EXECUTION_LATENCY_MS))throw new Error('INVALID_MAKER_FIRST_BASE_CONFIG');
     this.marketAdapter = adapters?.market ?? new PolymarketMarketDataAdapter(undefined, { hydrateMinOrderSizeFromRest: true });
     if (this.marketAdapter instanceof PolymarketMarketDataAdapter) {
       this.marketAdapter.setNormalizeObserver(this.metrics.normalizeObserver());
@@ -709,6 +719,16 @@ export class EngineService {
     await this.restoreAndRecover();
     await this.restoreReportSourceIntegrity();
     await this.recoverInterruptedFirstLegOrders();
+    if(this.experiment&&['RUNNING','ENTRY_CLOSED'].includes(this.experiment.status)){
+      const config=this.makerFirstConfig();
+      if(config.enabled!==this.env.PAPER_MAKER_FIRST_ENABLED||(config.enabled
+        &&(config.firstLegTtlMs!==this.env.PAPER_MAKER_FIRST_QUOTE_TTL_MS||config.hedgeTtlMs!==this.env.PAPER_MAKER_HEDGE_QUOTE_TTL_MS)))
+        throw new RecoveryFailClosedError('invariant','maker-first active manifest/runtime configuration mismatch');
+    }
+    // A disconnected simulator cannot prove the intervening queue/trade flow.
+    // Reconcile durable fills first, then cancel ONLY hybrid quote remainders.
+    for(const resting of [...this.restingOrders.values()])if(resting.order.makerFirst)
+      await this.releaseMaker(resting.order.id,{cancel:true,reason:"MAKER_FIRST_RESTART_RECONCILE"});
     if (this.experiment?.wsStats && ["RUNNING", "ENTRY_CLOSED"].includes(this.experiment.status))
       await this.persistExperimentWsEvent({ eventId: createId("ws_restart"), kind: "PROCESS_RESTART", shard: 0,
         retry: false, reason: "unknown", at: this.nowFn().toISOString() });
@@ -774,6 +794,8 @@ export class EngineService {
     this.maintenanceTimer = null;
     if (this.guardianDeadlineTimer) clearTimeout(this.guardianDeadlineTimer);
     this.guardianDeadlineTimer = null;
+    if(this.makerQuoteTimer)clearTimeout(this.makerQuoteTimer);
+    this.makerQuoteTimer=null;
     if (this.soakPersistenceTimer) clearInterval(this.soakPersistenceTimer);
     this.soakPersistenceTimer = null;
     if (this.discoveryTimer) clearInterval(this.discoveryTimer);
@@ -788,6 +810,15 @@ export class EngineService {
     let remaining = Math.max(0, deadline - (Date.now() - started));
     this.lastGuardianShutdown = await this.joinGuardianPersistence(remaining);
     if (!this.lastGuardianShutdown.drained) this.guardianShutdownAbort.abort("GUARDIAN_SHUTDOWN_UNRESOLVED");
+    let makerDrained=this.makerTradeTails.size===0;
+    if(!makerDrained){
+      remaining=Math.max(0,deadline-(Date.now()-started));
+      makerDrained=await new Promise<boolean>(resolve=>{
+        const timer=setTimeout(()=>resolve(false),remaining);
+        void Promise.all([...this.makerTradeTails.values()]).then(()=>{clearTimeout(timer);resolve(true);});
+      });
+      if(!makerDrained)this.logger.error({unresolved:this.makerTradeTails.size},'maker trade shutdown unresolved; no clean checkpoint');
+    }
     this.journalAdmission.closeAdmission();
     remaining = Math.max(0, deadline - (Date.now() - started));
     this.lastJournalShutdown = await this.journalAdmission.join(remaining);
@@ -795,6 +826,7 @@ export class EngineService {
       ? await this.journal.latestDurableSequence() : null;
     const cleanDrain = Boolean(
       this.lastShutdown.drained
+      && makerDrained
       && this.lastGuardianShutdown.drained
       && this.lastJournalShutdown.drained
       && !this.lastShutdown.timedOut
@@ -1170,6 +1202,8 @@ export class EngineService {
           profitTrailingPairArmEdge: this.env.PROFIT_TRAILING_PAIR_ARM_EDGE,
           profitTrailingPairRetraceEdge: this.env.PROFIT_TRAILING_PAIR_RETRACE_EDGE,
           profitTrailingPairExecutionStyle: "TAKER",
+          makerFirst: {enabled:this.env.PAPER_MAKER_FIRST_ENABLED,firstLegTtlMs:this.env.PAPER_MAKER_FIRST_QUOTE_TTL_MS,
+            hedgeTtlMs:this.env.PAPER_MAKER_HEDGE_QUOTE_TTL_MS,fillModel:'public-trade-queue-50pct',twoSidedFreshEntries:false},
           reversalProtectionEnabled: this.env.REVERSAL_PROTECTION_ENABLED,
           guardianVersion: 2, guardianFormatGeneration: 3, guardianV2Config: { ...GUARDIAN_V2_CONFIG },
           reversalProtectionWindowMs: this.env.REVERSAL_PROTECTION_WINDOW_MS,
@@ -1406,6 +1440,7 @@ export class EngineService {
     this.marketLoopStarted = true;
     void this.marketAdapter.run(this.tokenIds, {
       onSnapshot: (snapshot) => this.onMarketSnapshot(snapshot),
+      ...(this.env.PAPER_MAKER_FIRST_ENABLED ? {onTrade:(trade:MarketTrade)=>this.onMakerTrade(trade)}:{}),
       onMinOrderSizeHydrated: (event) => this.onMinOrderSizeHydrated(event),
       onConnection: (event) => this.onConnection(event),
       onShardConnection: event => this.persistExperimentWsEvent({ eventId: event.eventId, kind: event.state,
@@ -1662,12 +1697,14 @@ export class EngineService {
       const page = await this.journal.queryEventsKeyset({ types: ["PAPER_ORDER_CREATED"], experimentId: this.experiment.id, after, limit: 200 });
       for (const row of page) {
         const p = row.payload;
-        if (p.executionLifecycleVersion !== 2 || p.intent !== "OPEN_FIRST_LEG" || p.orderType !== "TAKER") continue;
+        if (p.executionLifecycleVersion !== 2 || p.intent !== "OPEN_FIRST_LEG"
+          || (p.orderType !== "TAKER" && !(p.orderType==='MAKER'&&p.makerFirst))) continue;
         const id = typeof p.id === "string" ? p.id : row.aggregateId;
         if (await this.journal.readJournalEventById(derivedAuditEventId("PAPER_ORDER_TERMINAL", id))) continue;
-        if (await this.journal.readDurableByOperationKey(`fill:first-leg-fill:${id}`))
+        if(p.orderType==='MAKER'&&this.restingOrders.has(id))continue;
+        if (p.orderType==='TAKER' && await this.journal.readDurableByOperationKey(`fill:first-leg-fill:${id}`))
           throw new RecoveryFailClosedError("invariant", `missing terminal audit for committed first leg ${id}`);
-        await this.rejectFirstLegOrder({ id, marketId: String(p.marketId), traceId: row.traceId }, "PROCESS_RESTART_BEFORE_DURABLE_FILL", "RECOVERY");
+        await this.rejectFirstLegOrder({ id, marketId: String(p.marketId), traceId: row.traceId }, p.orderType==='MAKER'?'PROCESS_RESTART_BEFORE_MAKER_RESERVATION':"PROCESS_RESTART_BEFORE_DURABLE_FILL", "RECOVERY");
       }
       if (page.length < 200) break;
       const last = page[page.length - 1]!; after = { occurredAt: last.occurredAt, id: last.id };
@@ -2727,6 +2764,13 @@ export class EngineService {
     for (const orderId of this.restingIndex.orderIdsFor(snapshot.tokenId)) {
       const resting = this.restingOrders.get(orderId);
       if (!resting || resting.order.tokenId !== snapshot.tokenId) continue;
+      if(resting.order.makerFirst && this.hybridQuoteInvalidReason(resting,snapshot)){
+        await this.releaseMaker(orderId,{cancel:true,reason:this.hybridQuoteInvalidReason(resting,snapshot)!});continue;
+      }
+      if(resting.order.makerFirst&&!this.makerQueuePrimed.has(orderId)){
+        const displayed=snapshot.bids.find(l=>d(l.price).eq(resting.order.requestedPrice))?.quantity??'0';
+        if(d(displayed).gt(resting.queueAhead))resting.queueAhead=displayed;
+      }
       const currentPosition = this.ledger.positions.get(resting.order.marketId);
       if (
         this.restingOrderIntent(resting) === "OPEN_FIRST_LEG"
@@ -2757,6 +2801,93 @@ export class EngineService {
         }
       }
     }
+  }
+
+  private makerFirstConfig():{enabled:boolean;firstLegTtlMs:number;hedgeTtlMs:number}{
+    const stored=this.experiment?.riskConfiguration.makerFirst as {enabled?:boolean;firstLegTtlMs?:number;hedgeTtlMs?:number}|undefined;
+    if(this.experiment && ['RUNNING','ENTRY_CLOSED'].includes(this.experiment.status))return {
+      enabled:stored?.enabled===true,firstLegTtlMs:stored?.firstLegTtlMs??2000,hedgeTtlMs:stored?.hedgeTtlMs??750};
+    return {enabled:this.env.PAPER_MAKER_FIRST_ENABLED,firstLegTtlMs:this.env.PAPER_MAKER_FIRST_QUOTE_TTL_MS,hedgeTtlMs:this.env.PAPER_MAKER_HEDGE_QUOTE_TTL_MS};
+  }
+
+  private entryProjectionLegs(excludeOrderId?:string):ReturnType<typeof projectableLegsFromPositions>{
+    const legs=projectableLegsFromPositions(this.ledger.positions.values(),this.assetByMarket);
+    for(const r of this.restingOrders.values())if(r.order.makerFirst&&r.order.id!==excludeOrderId
+      &&this.restingOrderIntent(r)==='OPEN_FIRST_LEG'&&d(r.remaining).gt(0))legs.push({marketId:r.order.marketId,
+        outcome:r.order.outcome,quantity:r.remaining,avgCost:r.order.requestedPrice,asset:this.assetByMarket.get(r.order.marketId)??null});
+    return legs;
+  }
+
+  private pendingEntryExposureReason(order:Pick<PaperOrder,'id'|'marketId'|'outcome'|'quantity'|'requestedPrice'>):string|null{
+    if(!this.makerFirstConfig().enabled)return null;
+    const projected=projectPaperExposures({current:computePaperExposures(this.ledger.positions.values(),order.marketId,this.assetByMarket,this.nowFn().getTime()),
+      positions:this.entryProjectionLegs(order.id),candidate:{...order,price:order.requestedPrice,intent:'OPEN_FIRST_LEG',asset:this.assetByMarket.get(order.marketId)??null},nowMs:this.nowFn().getTime()});
+    for(const [key,limit] of [['market',this.riskLimits.maxMarketExposureUsd],['total',this.riskLimits.maxTotalExposureUsd],
+      ['directional',this.riskLimits.maxDirectionalExposureUsd],['unhedged',this.riskLimits.maxUnhedgedExposureUsd],['asset',this.riskLimits.maxAssetExposureUsd]] as const)
+      if(d(projected[key]).gt(limit))return `MAKER_FIRST_PENDING_${key.toUpperCase()}_EXPOSURE`;
+    return null;
+  }
+
+  private hybridQuoteInvalidReason(resting:RestingPaperOrder,book:MarketSnapshot|undefined):string|null{
+    const quote=resting.order.makerFirst;if(!quote)return null;
+    if(this.nowFn().getTime()>=Date.parse(quote.expiresAt))return 'MAKER_FIRST_TTL_EXPIRED';
+    if(this.restingOrderIntent(resting)==='OPEN_FIRST_LEG'&&!this.isExperimentWindowOpen())return 'MAKER_FIRST_ENTRIES_CLOSED';
+    if(this.confirmedGuardianProtection(resting.order.marketId))return 'GUARDIAN_PRIORITY';
+    if(!book || !this.freshEarlyCatastrophicSnapshot(book,this.nowFn().getTime())
+      ||!this.adapterTokenSynchronized(resting.order.tokenId)||this.adapterTokenEpoch(resting.order.tokenId)!==quote.tokenEpoch)return 'MAKER_FIRST_BOOK_UNTRUSTED';
+    if(!book.tickSize||!d(resting.order.requestedPrice).mod(book.tickSize).eq(0))return 'MAKER_FIRST_TICK_CHANGED';
+    if(!book.asks[0]||d(book.asks[0].price).lte(resting.order.requestedPrice))return 'MAKER_FIRST_MARKET_MOVED';
+    if(quote.postingFeeKey&&quote.postingFeeKey!==JSON.stringify([book.feeSchedule?.rate,book.feeSchedule?.exponent,book.feeSchedule?.takerOnly]))return 'MAKER_FIRST_FEES_CHANGED';
+    return null;
+  }
+
+  private scheduleMakerQuoteExpiry():void{
+    if(this.makerQuoteTimer)clearTimeout(this.makerQuoteTimer);this.makerQuoteTimer=null;
+    if(this.state.draining||!this.state.recoveryComplete)return;
+    const quotes=[...this.restingOrders.values()].filter(r=>r.order.makerFirst);
+    if(!quotes.length)return;
+    const delayMs=Math.max(1,Math.min(...quotes.map(r=>Date.parse(r.order.makerFirst!.expiresAt)))-this.nowFn().getTime());
+    this.makerQuoteTimer=setTimeout(()=>{this.makerQuoteTimer=null;void this.expireMakerQuotes().catch(error=>this.logger.error({err:error},'maker quote expiry failed'));},delayMs);
+    this.makerQuoteTimer.unref();
+  }
+
+  private async expireMakerQuotes():Promise<void>{
+    try{for(const r of [...this.restingOrders.values()]){
+      if(!r.order.makerFirst)continue;
+      const reason=this.hybridQuoteInvalidReason(r,this.state.marketSnapshots.get(r.order.tokenId));
+      if(reason)await this.releaseMaker(r.order.id,{cancel:true,reason});
+    }}finally{this.scheduleMakerQuoteExpiry();}
+  }
+
+  private onMakerTrade(trade:MarketTrade):Promise<void>|void{
+    if(this.state.draining||!this.state.recoveryComplete||!this.makerFirstConfig().enabled)return;
+    this.metrics.makerPublicTrades.inc();
+    if(!this.restingIndex.orderIdsFor(trade.tokenId).size)return;
+    const previous=this.makerTradeTails.get(trade.tokenId);
+    const work=(previous??Promise.resolve()).then(()=>this.applyMakerTrade(trade));
+    const tail=work.then(()=>undefined,()=>undefined);this.makerTradeTails.set(trade.tokenId,tail);
+    void tail.then(()=>{if(this.makerTradeTails.get(trade.tokenId)===tail)this.makerTradeTails.delete(trade.tokenId);});
+    return work;
+  }
+
+  private async applyMakerTrade(trade:MarketTrade):Promise<void>{
+    for(const orderId of this.restingIndex.orderIdsFor(trade.tokenId)){
+      const r=this.restingOrders.get(orderId);if(!r?.order.makerFirst)continue;
+      const book=this.state.marketSnapshots.get(trade.tokenId),reason=this.hybridQuoteInvalidReason(r,book);
+      if(reason){await this.releaseMaker(orderId,{cancel:true,reason});continue;}
+      const active=this.makerActiveAfter.get(orderId);if(!active||!book)continue;
+      if(this.nowFn().getTime()-Date.parse(trade.sourceTimestamp)>this.riskLimits.staleFeedTimeoutMs)continue;
+      if(!this.makerQueuePrimed.has(orderId)){
+        const displayed=book.bids.find(l=>d(l.price).eq(r.order.requestedPrice))?.quantity??'0';
+        if(d(displayed).gt(r.queueAhead))r.queueAhead=displayed;
+        if(trade.side==='SELL'&&d(trade.price).eq(r.order.requestedPrice)&&Date.parse(trade.sourceTimestamp)>Date.parse(active)
+          &&Date.parse(trade.sourceTimestamp)<=this.nowFn().getTime())this.makerQueuePrimed.add(orderId);
+      }
+      const evolved=evolveMakerTrade(r,trade,book,active,this.nowFn().getTime());
+      if(evolved.fill)await this.applyFill(evolved.fill,{restingAfter:evolved.resting,intent:this.restingOrderIntent(r),executionSnapshot:book,executionOrder:r.order});
+      else if(this.restingOrders.get(orderId)===r)this.restingOrders.set(orderId,evolved.resting);
+    }
+    this.scheduleMakerQuoteExpiry();
   }
 
   private finishMarketSnapshot(snapshot: MarketSnapshot, started: number): void {
@@ -4163,6 +4294,9 @@ export class EngineService {
       }
 
       if (riskReductionOrder && order.orderType === "TAKER") {
+        for(const resting of [...this.restingOrders.values()])if(resting.order.marketId===order.marketId
+          &&resting.order.makerFirst&&this.restingOrderIntent(resting)==='HEDGE_SECOND_LEG')
+          await this.releaseMaker(resting.order.id,{cancel:true,reason:'MAKER_FIRST_TAKER_HANDOFF'});
         if (options?.resume) {
           durableOwner = this.riskReductionOwners.get(order.marketId);
           if (durableOwner?.order.id !== order.id) return false;
@@ -4361,14 +4495,15 @@ export class EngineService {
       || (this.ledger.positions.get(order.marketId)?.unpairedOutcome
         && this.ledger.positions.get(order.marketId)!.unpairedOutcome !== order.outcome))) return;
     const notional = makerReserveNotional(order.quantity, order.requestedPrice, snapshot.feeSchedule);
+    const reservationBook=order.makerFirst?(this.state.marketSnapshots.get(order.tokenId)??snapshot):snapshot;
     const priorReserve = await this.journal.readDurableByOperationKey(`maker:${order.id}:reserve`);
     const compactedRetry = Boolean(priorReserve && Object.keys(priorReserve.payload).length === 0);
     if (this.ledger.availableCash().lt(notional) && !priorReserve) {
       throw new Error("INSUFFICIENT_CASH");
     }
     const resting = compactedRetry
-      ? (this.restingOrders.get(order.id) ?? createRestingMakerOrder(order, snapshot, intent))
-      : createRestingMakerOrder(order, snapshot, intent);
+      ? (this.restingOrders.get(order.id) ?? createRestingMakerOrder(order, reservationBook, intent))
+      : createRestingMakerOrder(order, reservationBook, intent);
     // Keep the durable resting identity byte-compatible with pre-PR1 rows.
     // intent has always been a top-level reserve fact; recovery reattaches it
     // to the in-memory resting order.
@@ -4393,6 +4528,23 @@ export class EngineService {
         // cash twice.
         const reserveAuthorityAtCommit = await this.journal.readDurableByOperationKey(`maker:${order.id}:reserve`);
         if (reserveAuthorityAtCommit) return;
+        if(order.makerFirst){
+          const current=this.state.marketSnapshots.get(order.tokenId);
+          const reason=!current || passiveMakerBuyPrice(current,order.quantity,order.requestedPrice)!==order.requestedPrice
+            ? 'MAKER_FIRST_POST_ONLY_INVALID':this.hybridQuoteInvalidReason(resting,current);
+          if(reason){
+            if(intent==='OPEN_FIRST_LEG')throw new FirstLegLifecycleGuardRejectedError(order.marketId,reason);
+            throw new RiskReductionLifecycleGuardRejectedError(order.marketId,'HEDGE_SECOND_LEG',reason);
+          }
+          if(intent==='OPEN_FIRST_LEG'){
+            const exposureReason=this.pendingEntryExposureReason(order);
+            if(exposureReason)throw new FirstLegLifecycleGuardRejectedError(order.marketId,exposureReason);
+          }
+          if(intent==='HEDGE_SECOND_LEG'&&(this.riskReductionOwners.has(order.marketId)
+            ||!this.ledger.positions.get(order.marketId)?.unpairedOutcome
+            ||d(order.quantity).gt(this.ledger.positions.get(order.marketId)!.unpairedQuantity)))
+            throw new RiskReductionLifecycleGuardRejectedError(order.marketId,'HEDGE_SECOND_LEG','MAKER_FIRST_RESIDUAL_CHANGED');
+        }
         if (intent === "OPEN_FIRST_LEG" && orderCreatedEvent) {
           const current = this.state.marketSnapshots.get(order.tokenId);
           const reason = current ? this.firstLegExecutionReason(order, current, this.nowFn()) : "ENTRY_BOOK_UNAVAILABLE";
@@ -4430,6 +4582,12 @@ export class EngineService {
           },
         ],
       }),
+      afterApply:async()=>{
+        if(order.makerFirst){
+          this.makerActiveAfter.set(order.id,new Date(this.nowFn().getTime()+order.makerFirst.submissionLatencyMs).toISOString());
+          this.scheduleMakerQuoteExpiry();
+        }
+      },
     });
   }
 
@@ -4473,6 +4631,13 @@ export class EngineService {
       }),
       afterApply: async () => {
         if (options.cancel) this.record("PAPER_ORDER_CANCELLED", orderId, null, { orderId, reason: options.reason ?? null });
+        this.makerActiveAfter.delete(orderId);
+        this.makerQueuePrimed.delete(orderId);
+        if(resting?.order.makerFirst){
+          this.recentTrades.delete(`${resting.order.marketId}:${resting.order.outcome}:${this.restingOrderIntent(resting)}`);
+          this.scheduleMakerQuoteExpiry();
+          if(!this.state.draining&&this.state.recoveryComplete)this.kickProfitTrailingPair(resting.order.marketId);
+        }
       },
     });
   }
@@ -4586,6 +4751,24 @@ export class EngineService {
             }
           }
           const currentPosition = this.ledger.positions.get(fill.marketId);
+          if(economicIntent==='OPEN_FIRST_LEG'&&this.makerFirstConfig().enabled){
+            const live=this.restingOrders.get(fill.orderId);
+            const exposureReason=this.pendingEntryExposureReason({id:fill.orderId,marketId:fill.marketId,outcome:fill.outcome,
+              quantity:live?.remaining??fill.quantity,requestedPrice:fill.fillPrice});
+            if(exposureReason)throw new FirstLegLifecycleGuardRejectedError(fill.marketId,exposureReason);
+          }
+
+          if(fill.makerEvidence){
+            const live=this.restingOrders.get(fill.orderId);
+            const reason=!live?'MAKER_FIRST_NOT_ACTIVE'
+              :economicIntent==='OPEN_FIRST_LEG'&&!this.isExperimentWindowOpen()?'MAKER_FIRST_ENTRIES_CLOSED'
+              :this.adapterTokenEpoch(fill.tokenId)!==live.order.makerFirst?.tokenEpoch?'MAKER_FIRST_EPOCH_CHANGED':null;
+            if(reason||!live||d(fill.quantity).gt(live.remaining)
+              ||Date.parse(fill.makerEvidence.trade.sourceTimestamp)<=Date.parse(this.makerActiveAfter.get(fill.orderId)??'9999-01-01T00:00:00Z')){
+              if(economicIntent==='OPEN_FIRST_LEG')throw new FirstLegLifecycleGuardRejectedError(fill.marketId,reason??'MAKER_FIRST_QUANTITY_OR_LATENCY');
+              throw new RiskReductionLifecycleGuardRejectedError(fill.marketId,'HEDGE_SECOND_LEG',reason??'MAKER_FIRST_QUANTITY_OR_LATENCY');
+            }
+          }
 
           const owner = this.riskReductionOwners.get(fill.marketId);
           if (extras.riskReductionOwnership && owner?.order.id !== extras.riskReductionOwnership.order.id) {
@@ -4797,6 +4980,10 @@ export class EngineService {
         },
         afterApply: async () => {
           this.observeSoakPosition(fill.marketId);
+          if(fill.makerEvidence){
+            if(!this.restingOrders.has(fill.orderId)){this.makerActiveAfter.delete(fill.orderId);this.makerQueuePrimed.delete(fill.orderId);}
+            this.scheduleMakerQuoteExpiry();
+          }
           this.record("PAPER_FILL", fill.traceId, fill.marketId, { fillId: fill.id, orderId: fill.orderId, price: fill.fillPrice, quantity: fill.quantity, role: fill.liquidityRole,
             ...(economicIntent ? { intent: economicIntent } : {}) });
           this.metrics.paperFills.inc({ role: fill.liquidityRole });
@@ -6199,6 +6386,7 @@ export class EngineService {
   }
 
   private async maybeProfitTrailingPair(marketId: string): Promise<void> {
+    if([...this.restingOrders.values()].some(r=>r.order.marketId===marketId&&r.order.makerFirst&&this.restingOrderIntent(r)==='HEDGE_SECOND_LEG'))return;
     const config = this.profitTrailingPairConfig();
     if (!config || this.soakBlocksPostEntry(marketId) || !experimentAllowsHedge(this.experiment)
       || this.state.database !== "UP" || this.state.journalDegraded || this.overload.hasIntegrityFault
@@ -6308,6 +6496,7 @@ export class EngineService {
         now: latestNow,
         databaseAvailable: this.state.database === "UP",
         orderTypeOverride: "TAKER",
+        allowMakerFirstHedge:!this.profitTrailingPairStates.get(marketId)?.makerAttemptedAt,
         profitTrailingLockedPnlUsd: latest.lockedPnl,
       });
       this.record("PROFIT_TRAILING_PAIR_EVALUATION", latestPosition.id, marketId, {
@@ -6320,7 +6509,18 @@ export class EngineService {
         this.noteProfitTrailingRejectedEvidence(marketId, latestPosition, latestNow.getTime());
         return;
       }
+      if(decision.order.makerFirst){
+        const current=this.profitTrailingPairStates.get(marketId);
+        if(!current||current.makerAttemptedAt)return;
+        const attempted={...current,makerAttemptedAt:latestNow.toISOString(),revision:current.revision+1,updatedAt:latestNow.toISOString()};
+        await this.commitAuthoritative({operationKey:`profit-trailing:${attempted.positionId}:${attempted.unhedgedStartedAt}:${attempted.revision}`,
+          type:'PROFIT_TRAILING_PAIR_STATE_UPDATED',aggregateType:'position',aggregateId:attempted.positionId,
+          buildPayload:()=>({state:attempted,derivedAudit:[{id:derivedAuditEventId('PROFIT_TRAILING_PAIR_STATE_UPDATED',`${attempted.positionId}:${attempted.unhedgedStartedAt}:${attempted.revision}`),
+            type:'PROFIT_TRAILING_PAIR_STATE_UPDATED',aggregateType:'position',aggregateId:attempted.positionId,traceId:attempted.positionId,
+            payload:{...attempted,experimentId:this.experiment?.id??null}}]})});
+      }
       const submitted = await this.submitPaperOrder(decision.order, latest.opposite, duplicateKey, "HEDGE_SECOND_LEG");
+      if(decision.order.makerFirst&&!submitted)this.profitTrailingPairPending.add(marketId);
       if (!submitted) this.noteProfitTrailingRejectedEvidence(marketId, latestPosition, this.nowFn().getTime());
       else this.profitTrailingRejectedEvidence.delete(marketId);
       return;
@@ -6737,6 +6937,7 @@ export class EngineService {
     orderTypeOverride?: "TAKER" | "MAKER";
     /** Only the profit-trailing controller supplies this current-book proof. */
     profitTrailingLockedPnlUsd?: string;
+    allowMakerFirstHedge?: boolean;
   }): { decision: ReturnType<typeof decidePaperOrder>; duplicateKey: string } {
     const { candidate, consensus, triggerId, signalExpiresAt, snapshot, pair, now, databaseAvailable, assetOverride } = input;
     const duplicateKey = `${candidate.marketId}:${candidate.outcome}:${candidate.intent}`;
@@ -6745,7 +6946,8 @@ export class EngineService {
     const exposure = computePaperExposures(this.ledger.positions.values(), candidate.marketId, this.assetByMarket, now.getTime());
     const projected = projectPaperExposures({
       current: exposure,
-      positions: projectableLegsFromPositions(this.ledger.positions.values(), this.assetByMarket),
+      positions: candidate.intent==='OPEN_FIRST_LEG'&&this.makerFirstConfig().enabled
+        ?this.entryProjectionLegs():projectableLegsFromPositions(this.ledger.positions.values(), this.assetByMarket),
       candidate: {
         marketId: candidate.marketId, outcome: candidate.outcome, quantity: candidate.quantity,
         price: candidate.limitPrice, side: candidate.side, intent: candidate.intent, asset,
@@ -6756,7 +6958,7 @@ export class EngineService {
     const referenceFeedAt = asset ? dateOrNull(this.state.referenceLastMessageAt(asset)) : null;
     const blocked = asset ? this.referenceBlocked.get(asset) : undefined;
     const marketFeedAt = collectMarketFeedAt(pair, candidate.outcome, candidate.intent, snapshot.receivedAt);
-    const decision = decidePaperOrder({
+    const paperInput:Parameters<typeof decidePaperOrder>[0]={
       candidate,
       consensus,
       snapshotAfterDecisionLatency: snapshot,
@@ -6805,7 +7007,29 @@ export class EngineService {
         executionErrorsLastHour: this.executionErrors.filter((at) => now.getTime() - at < 3_600_000).length,
         externalRiskRecommendedVeto: false, shuttingDown: this.state.draining,
       },
-    });
+    };
+    let decision=decidePaperOrder(paperInput);
+    const makerConfig=this.makerFirstConfig();
+    const role=candidate.intent==='OPEN_FIRST_LEG'?'FIRST_LEG':candidate.intent==='HEDGE_SECOND_LEG'&&input.allowMakerFirstHedge?'HEDGE':null;
+    if(makerConfig.enabled&&role&&decision.accepted&&decision.order?.orderType==='TAKER'
+      &&!this.confirmedGuardianProtection(candidate.marketId)){
+      const price=passiveMakerBuyPrice(snapshot,candidate.quantity,candidate.limitPrice);
+      if(price&&(role!=='FIRST_LEG'||!firstLegEntryFilterReason(price,decision.expectedROI))&&decision.bookVwap){
+        const improved=d(candidate.rawEdgeUsdPerShare??candidate.rawExpectedEdge).plus(decision.bookVwap).minus(price).toNumber();
+        const maker=decidePaperOrder({...paperInput,orderType:'MAKER',candidate:{...candidate,rawEdgeUsdPerShare:improved,rawExpectedEdge:improved}});
+        if(maker.accepted&&maker.order&&maker.netEvUsdTotal!==null&&decision.netEvUsdTotal!==null&&d(maker.netEvUsdTotal).gt(decision.netEvUsdTotal)){
+          const ttl=role==='FIRST_LEG'?makerConfig.firstLegTtlMs:makerConfig.hedgeTtlMs;
+          const end=this.marketsById.get(candidate.marketId)?.endDate;
+          const expiresAt=Math.min(now.getTime()+ttl,signalExpiresAt.getTime(),end?Date.parse(end)-PROTECTIVE_DE_RISK_PRE_EXPIRY_SAFETY_MS:Number.POSITIVE_INFINITY);
+          if(!Number.isFinite(expiresAt)||expiresAt<=now.getTime()+this.env.PAPER_EXECUTION_LATENCY_MS)return {decision,duplicateKey};
+          maker.order.makerFirst={version:1,role,postOnly:true,expiresAt:new Date(expiresAt).toISOString(),
+            submissionLatencyMs:this.env.PAPER_EXECUTION_LATENCY_MS,tokenEpoch:this.adapterTokenEpoch(snapshot.tokenId),
+            postingBookEventId:snapshot.eventId,takerReferencePrice:decision.bookVwap};
+          maker.order.makerFirst.postingFeeKey=JSON.stringify([snapshot.feeSchedule?.rate,snapshot.feeSchedule?.exponent,snapshot.feeSchedule?.takerOnly]);
+          decision=maker;
+        }
+      }
+    }
     return { decision, duplicateKey };
   }
 
@@ -9220,6 +9444,9 @@ private buildEarlyAudit(
       occurredAt: next.status === "COMPLETED" && next.completedAt ? new Date(next.completedAt) : undefined,
       checkpoint: true,
     });
+    if(next.status==='ENTRY_CLOSED')for(const r of [...this.restingOrders.values()])
+      if(r.order.makerFirst&&this.restingOrderIntent(r)==='OPEN_FIRST_LEG')
+        await this.releaseMaker(r.order.id,{cancel:true,reason:'MAKER_FIRST_ENTRIES_CLOSED'});
     if (next.status === "COMPLETED") {
       this.researchIngressGeneration += 1;
       this.clearResearchActivationState();

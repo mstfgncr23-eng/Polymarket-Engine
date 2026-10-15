@@ -61,6 +61,15 @@ export const marketSnapshotSchema = z.object({
 });
 export type MarketSnapshot = z.infer<typeof marketSnapshotSchema>;
 
+/** Public executed flow on the SAME owned market stream. Not an account fill. */
+export const marketTradeSchema = z.object({
+  eventId: idSchema, marketId: idSchema, tokenId: idSchema, outcome: outcomeSchema,
+  price: decimalStringSchema, quantity: decimalStringSchema, side: sideSchema,
+  sourceTimestamp: timestampSchema, receivedAt: timestampSchema,
+  tokenEpoch: z.number().int().nonnegative(), transactionHash: z.string().nullable(),
+});
+export type MarketTrade = z.infer<typeof marketTradeSchema>;
+
 export const referenceTickSchema = z.object({
   eventId: idSchema,
   traceId: idSchema,
@@ -344,6 +353,13 @@ export const riskEvaluationSchema = z.object({
 export type RiskEvaluation = z.infer<typeof riskEvaluationSchema>;
 
 export const paperOrderSchema = z.object({
+  makerFirst: z.object({
+    version: z.literal(1), role: z.enum(["FIRST_LEG", "HEDGE"]), postOnly: z.literal(true),
+    expiresAt: timestampSchema, submissionLatencyMs: z.number().int().nonnegative(),
+    tokenEpoch: z.number().int().nonnegative(), postingBookEventId: idSchema,
+    takerReferencePrice: decimalStringSchema,
+    postingFeeKey: z.string().optional(),
+  }).optional(),
   entryAdmission: z.object({ fairProbability: z.number().finite().min(0).max(1), signalExpiresAt: timestampSchema }).optional(),
   id: idSchema,
   traceId: idSchema,
@@ -362,6 +378,11 @@ export const paperOrderSchema = z.object({
 export type PaperOrder = z.infer<typeof paperOrderSchema>;
 
 export const paperFillSchema = z.object({
+  makerEvidence: z.object({
+    trade: marketTradeSchema, activatedAt: timestampSchema,
+    queueAheadBefore: decimalStringSchema, queueAheadAfter: decimalStringSchema,
+    participation: z.literal(0.5), quoteExpiresAt: timestampSchema,
+  }).optional(),
   id: idSchema,
   orderId: idSchema,
   traceId: idSchema,

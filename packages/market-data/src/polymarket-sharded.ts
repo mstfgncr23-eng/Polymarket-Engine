@@ -430,6 +430,7 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
   private handlersForShard(shardIndex: number, handlers: PolymarketFeedHandlers): PolymarketFeedHandlers {
     const result: PolymarketFeedHandlers = {
       onSnapshot: (snapshot) => this.dispatchSnapshot(shardIndex, snapshot, handlers),
+      ...(handlers.onTrade ? {onTrade:(trade: import("@pm/core").MarketTrade)=>this.inSnapshotLane(shardIndex,()=>handlers.onTrade!(trade))}:{}),
       onConnection: (event) => this.reportShardConnection(shardIndex, event, handlers),
       onError: (error) => {
         this.notifyShardObserver((observer) => observer.onError?.({ shard: shardIndex + 1, error }));

@@ -152,6 +152,10 @@ export function normalizeRawClobMarketEvent(event: unknown): unknown {
     });
   }
 
+  if(eventType==='tick_size_change')return canonicalMarketEvent('tick_size_change',{
+    market:value.market,tokenId:value.asset_id,newTickSize:value.new_tick_size,timestamp:value.timestamp,
+  });
+
   return event;
 }
 

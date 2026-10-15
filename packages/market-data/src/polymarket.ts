@@ -1,4 +1,5 @@
 import { createPublicClient } from "@polymarket/client";
+import { createHash } from "node:crypto";
 import {
   bookLevelSchema,
   createId,
@@ -10,6 +11,7 @@ import {
   qualificationConfigSchema,
   type BinaryNormalization,
   type MarketSnapshot,
+  type MarketTrade,
   type QualificationConfig,
   type QualificationReasonCode,
   type QualificationResult,
@@ -165,6 +167,7 @@ export interface MinOrderSizeHydratedEvent {
 
 export interface PolymarketFeedHandlers {
   onSnapshot(snapshot: MarketSnapshot): Promise<void> | void;
+  onTrade?(trade: MarketTrade): Promise<void> | void;
   onConnection(event: FeedConnectionEvent): Promise<void> | void;
   /** Raw owned-shard lifecycle; independent of aggregate UI connection state. */
   onShardConnection?(event: FeedConnectionEvent & { shard: number; eventId: string }): Promise<void> | void;
@@ -239,6 +242,7 @@ interface BookState {
   asksOwned: boolean;
   levelsValid: boolean;
   lastTradePrice: string | null;
+  tickSize: string | null;
   /**
    * Authoritative minimum order size for the token. Preferred sources, in
    * order: the CLOB full-book event's `min_order_size` (WS MarketBookEventSchema
@@ -610,6 +614,10 @@ export class PolymarketMarketDataAdapter {
                   const pending = handlers.onSnapshot(snapshot);
                   if (pending) await pending;
                 }
+                if(handlers.onTrade){
+                  const trade=this.normalizeTradeEvent(event);
+                  if(trade){const pending=handlers.onTrade(trade);if(pending)await pending;}
+                }
                 // Every source event and snapshot is still processed in order.
                 // A bounded batch amortizes scheduling without starving IO.
                 if (++turnEvents >= MARKET_DRAIN_BOUNDS.maxEventsPerTurn || performance.now() - turnStarted >= MARKET_DRAIN_BOUNDS.maxTurnMs) {
@@ -765,6 +773,22 @@ export class PolymarketMarketDataAdapter {
     this.invalidateMinOrderSizeHydration(tokenId);
   }
 
+  normalizeTradeEvent(event:unknown):MarketTrade|null{
+    const e=event as {type?:string;payload?:Record<string,unknown>};if(e.type!=="last_trade_price")return null;
+    const p=e.payload??{},tokenId=String(p.tokenId??p.assetId??""),market=this.marketsByToken.get(tokenId);
+    const sourceMs=parseSourceTimestamp(p.timestamp),price=String(p.price??""),quantity=String(p.size??"");
+    if(!market || !this.tokenIdSet.has(tokenId) || this.sync.stateOf(tokenId)!=="SYNCED" || !this.books.has(tokenId)
+      ||sourceMs===null||!decimalStringSchema.safeParse(price).success||!decimalStringSchema.safeParse(quantity).success
+      ||!(Number(price)>0&&Number(price)<1&&Number(quantity)>0&&Number.isFinite(Number(quantity)))
+      ||(p.side!=="SELL"&&p.side!=="BUY"))return null;
+    const token=market.tokens.find(t=>t.tokenId===tokenId);if(!token)return null;
+    const transactionHash=typeof p.transactionHash==='string'?p.transactionHash:null;
+    const sourceTimestamp=new Date(sourceMs).toISOString();
+    const eventId=createHash('sha256').update(JSON.stringify([tokenId,sourceTimestamp,p.side,price,quantity,transactionHash])).digest('hex');
+    return {eventId,marketId:market.id,tokenId,outcome:token.outcome,price,quantity,side:p.side,
+      sourceTimestamp,receivedAt:new Date().toISOString(),tokenEpoch:this.sync.epochOf(tokenId),transactionHash};
+  }
+
   private normalizeEvent(event: unknown, handlers: Pick<PolymarketFeedHandlers, "onAnomaly" | "onResync" | "onGap">): MarketSnapshot[] {
     const started = performance.now();
     try {
@@ -775,6 +799,14 @@ export class PolymarketMarketDataAdapter {
     }
     if (value.type === "price_change") {
       return this.commitPriceChange(payload, handlers);
+    }
+    if(value.type==='tick_size_change'){
+      const tokenId=String(payload.tokenId??''),state=this.books.get(tokenId),ms=parseSourceTimestamp(payload.timestamp),tick=nullableString(payload.newTickSize);
+      if(!state||this.sync.stateOf(tokenId)!=='SYNCED'||ms===null||ms<Date.parse(state.timestamp))return [];
+      if(!tick||!decimalStringSchema.safeParse(tick).success||!(Number(tick)>0&&Number(tick)<1))throw new MarketIngressMalformedError([tokenId]);
+      const staged={...state,tickSize:tick,timestamp:new Date(ms).toISOString()};
+      this.books.set(tokenId,staged);this.lastTimestampByToken.set(tokenId,ms);
+      return [this.toSnapshot(tokenId,staged,{...payload,tickSize:tick})];
     }
     if (value.type === "last_trade_price") {
       const tokenId = String(payload.tokenId ?? "");
@@ -827,6 +859,8 @@ export class PolymarketMarketDataAdapter {
       asksOwned: true,
       levelsValid: false,
       lastTradePrice: nullableString(payload.lastTradePrice),
+      tickSize: nullableString(payload.tickSize) ?? this.books.get(tokenId)?.tickSize
+        ?? nullableString(market.raw.orderPriceMinTickSize) ?? null,
       // Preserve the last known authoritative value across full books that
       // omit min_order_size (WS field is optional), so a committed REST-hydrated
       // or previously-supplied value is not lost until a book actively changes it.
@@ -837,6 +871,7 @@ export class PolymarketMarketDataAdapter {
     try {
       validateNormalizedBook(staged);
       assertDecimalString(staged.lastTradePrice);
+      assertDecimalString(staged.tickSize);
       assertDecimalString(nullableString(payload.tickSize));
       assertDecimalString(nullableString(payload.minOrderSize));
       if (market.feeSchedule != null) feeScheduleSchema.parse(market.feeSchedule);
@@ -1259,7 +1294,7 @@ export class PolymarketMarketDataAdapter {
     const token = market.tokens.find((item) => item.tokenId === tokenId);
     const bids = publishSide(state, "bids");
     const asks = publishSide(state, "asks");
-    const tickSize = nullableString(raw.tickSize);
+    const tickSize = nullableString(raw.tickSize) ?? state.tickSize;
     // Carry forward the last committed full-book min_order_size so a
     // price-change-derived snapshot keeps reporting the authoritative minimum
     // order size instead of silently nulling it.

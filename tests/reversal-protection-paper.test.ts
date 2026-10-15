@@ -399,14 +399,15 @@ describe("Guardian V2 real PAPER lifecycle with independent emergency execution"
       await waitFor(s, () => residual(s) === "0"); expect(await riskFills(s)).toHaveLength(1);
     } finally { await s.engine.stop(); }
   });
-  it("confirmed Guardian cancels the normal hedge maker and fences a delayed partial fill and duplicate cancel", async () => {
-    const s = await start();
+  it.each([false,true])("confirmed Guardian cancels the normal hedge maker and fences a delayed partial fill and duplicate cancel (hybrid=%s)", async hybrid => {
+    const s = await start(undefined,undefined,{PAPER_MAKER_FIRST_ENABLED:String(hybrid)});
     try {
       await seed(s); await armEarly(s);
-      const maker = order("MAKER", { id: "normal-maker-before-confirmation", marketId: MARKET, tokenId: DOWN,
+      if(hybrid){s.clock.ms=START+69900;const up=book(s,"UP","0.60","0.81"),down=book(s,"DOWN","0.29","0.30");internal(s).snapshots.set(MARKET,{UP:up,DOWN:down});s.engine.state.marketSnapshots.set(UP,up);s.engine.state.marketSnapshots.set(DOWN,down);}
+      const maker = order("MAKER", { ...(hybrid?{makerFirst:{version:1,role:"HEDGE",postOnly:true,expiresAt:new Date(s.clock.ms+750).toISOString(),submissionLatencyMs:150,tokenEpoch:s.market.tokenEpoch(DOWN),postingBookEventId:"guardian-maker",takerReferencePrice:"0.30"}}:{}), id: "normal-maker-before-confirmation", marketId: MARKET, tokenId: DOWN,
         outcome: "DOWN", quantity: "5", requestedPrice: "0.29", createdAt: new Date(s.clock.ms).toISOString() });
       await s.engine.restMakerForTest(maker, book(s, "DOWN", "0.29", "0.30"), "HEDGE_SECOND_LEG");
-      await timeout(s);
+      if(hybrid){s.clock.ms=START+70000;expect(Date.parse(maker.makerFirst!.expiresAt)).toBeGreaterThan(s.clock.ms);await internal(s).maybeReversalProtection(MARKET);}else await timeout(s);
       await publish(s, "0.60", "0.30");
       await waitFor(s, () => residual(s) === "0");
       const cash = s.engine.ledger.snapshot().cash;
@@ -420,6 +421,7 @@ describe("Guardian V2 real PAPER lifecycle with independent emergency execution"
       const cancel = transitions.find(t => t.operationKey === `maker:${maker.id}:cancel`)!;
       const admitted = transitions.find(t => t.type === "RISK_REDUCTION_ADMITTED")!;
       expect(cancel.sequence).toBeLessThan(admitted.sequence); expect(s.engine.integrityFault()).toBe(false);
+      expect((await riskFills(s))[0]?.payload.intent).toBe("GUARDIAN_PROTECTIVE_SELL");
       console.log(JSON.stringify({ evidence: "GUARDIAN_MAKER_HANDOFF", cancelSequence: cancel.sequence, admissionSequence: admitted.sequence, fills: 1, delayedPartialFillApplied: false }));
     } finally { await s.engine.stop(); }
   });

@@ -14,6 +14,7 @@ export const profitTrailingPairStateSchema = z.object({
   highWaterEdge: numberString,
   revision: z.number().int().positive(),
   updatedAt: timestamp,
+  makerAttemptedAt: timestamp.optional(),
 });
 export type ProfitTrailingPairState = z.infer<typeof profitTrailingPairStateSchema>;
 

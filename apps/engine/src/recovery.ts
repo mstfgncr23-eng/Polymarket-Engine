@@ -724,6 +724,10 @@ export function validatePostReplayInvariants(
     reasons.push(`reserved_cash_mismatch:${reserved.toFixed()}!=${reservationSum.toFixed()}`);
   }
   const status = state.experiment?.status;
+  const maker=state.experiment?.riskConfiguration.makerFirst as {enabled?:boolean;firstLegTtlMs?:number;hedgeTtlMs?:number;fillModel?:string;twoSidedFreshEntries?:boolean}|undefined;
+  if(maker?.enabled===true&&(!Number.isInteger(maker.firstLegTtlMs)||maker.firstLegTtlMs! < 500||maker.firstLegTtlMs! > 5000
+    ||!Number.isInteger(maker.hedgeTtlMs)||maker.hedgeTtlMs! < 250||maker.hedgeTtlMs! > 2000
+    ||maker.fillModel!=='public-trade-queue-50pct'||maker.twoSidedFreshEntries!==false))reasons.push('maker_first_config_invalid');
   for (const [marketId, diagnostic] of state.nakedDirectionalDiagnostics ?? []) {
     if (!nakedDirectionalDiagnosticSchema.safeParse(diagnostic).success
       || diagnostic.marketId !== marketId || state.ledger.positions.get(marketId)?.id !== diagnostic.positionId) {
