@@ -20,6 +20,19 @@ Only one directional first-leg lifecycle can own a market. With the separate
 `PAPER_DUAL_SIDED_MAKER_ENABLED=true` flag, the conditional pair planner below
 may instead own two fresh quotes. They are not relabeled as already-filled hedges.
 
+An unfilled directional maker may continue once as TAKER after its TTL. Durable
+cancellation and cash release come first. The same trigger is evaluated again
+against current native probability, confidence, reference, full depth, fees,
+exposure, expiry and entry status. Quantity and the original taker reference
+limit cannot grow. Only the cooldown belonging to that identical quote is
+excluded; another entry's cooldown and actual-trade cooldown remain binding.
+No second maker attempt is made. A partial fill, dual quote, gap, price-driven
+cancel or restart cannot acquire this continuation. It is bounded to a live
+quote in the same experiment and its terminal result is journaled with the
+parent and child order IDs. Taker latency runs outside the public feed consumer
+and is joined by the existing maker shutdown work set. This is a directional
+fallback, not evidence that either dual passive quote filled.
+
 ## Dual Maker ownership and diagnostics
 
 Dual planning currently runs AFTER directional strategy/risk acceptance. A

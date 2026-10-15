@@ -448,6 +448,11 @@ export class EngineService {
   private readonly makerTradeTails = new Map<string,Promise<void>>();
   private makerQuoteTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly recentTrades = new Map<string, number>();
+  // Only live directional quotes retain a continuation. Recovery cancels old
+  // quotes without guessing what happened to their signal or public flow.
+  private readonly makerEntryContinuations = new Map<string, {
+    trigger: TriggerEvent; consensus: ConsensusDecision; native: NativeDecision; experimentId:string;
+  }>();
   /** Ephemeral reservation for a not-yet-durable first-leg submission. */
   private readonly pendingFirstLegMarkets = new Set<string>();
   /**
@@ -2785,7 +2790,9 @@ export class EngineService {
       const resting = this.restingOrders.get(orderId);
       if (!resting || resting.order.tokenId !== snapshot.tokenId) continue;
       if(resting.order.makerFirst && this.hybridQuoteInvalidReason(resting,snapshot)){
-        await this.releaseMaker(orderId,{cancel:true,reason:this.hybridQuoteInvalidReason(resting,snapshot)!});continue;
+        const reason=this.hybridQuoteInvalidReason(resting,snapshot)!;
+        if(!this.deferDirectionalMakerExpiry(orderId,reason))await this.releaseMaker(orderId,{cancel:true,reason});
+        continue;
       }
       if(resting.order.makerFirst&&!this.makerQueuePrimed.has(orderId)){
         const displayed=snapshot.bids.find(l=>d(l.price).eq(resting.order.requestedPrice))?.quantity??'0';
@@ -2989,8 +2996,41 @@ export class EngineService {
     try{for(const r of [...this.restingOrders.values()]){
       if(!r.order.makerFirst)continue;
       const reason=this.hybridQuoteInvalidReason(r,this.state.marketSnapshots.get(r.order.tokenId));
-      if(reason)await this.releaseMaker(r.order.id,{cancel:true,reason});
+      if(reason){
+        // Claim before the first await: overlapping timer/book callbacks cannot
+        // both consume the same continuation. Only TTL, not gaps or repricing,
+        // permits a single fresh evaluation of the originally accepted taker.
+        const continuation=this.makerEntryContinuations.get(r.order.id);
+        this.makerEntryContinuations.delete(r.order.id);
+        const cooldownAt=this.recentTrades.get(`${r.order.marketId}:${r.order.outcome}:OPEN_FIRST_LEG`);
+        await this.releaseMaker(r.order.id,{cancel:true,reason});
+        if(reason==='MAKER_FIRST_TTL_EXPIRED'&&continuation&&!r.order.makerFirst.dualGroupId
+          &&this.restingOrderIntent(r)==='OPEN_FIRST_LEG'&&d(r.remaining).eq(r.order.quantity)){
+          const key='entry-continuation:'+r.order.id;
+          const work=this.experimentBoundaryGate.run(async()=>{
+            const result={parent:r.order,cooldownAt,outcome:'REVALIDATION_REJECTED',childOrderId:null as string|null};
+            if(this.experiment?.id===continuation.experimentId)
+              await this.evaluateTrade(continuation.trigger,continuation.consensus,continuation.native,result);
+            else result.outcome='EXPERIMENT_CHANGED';
+            if(!this.overload.hasIntegrityFault)await this.persistReportInput(createJournalEvent({
+              id:derivedAuditEventId('MAKER_FIRST_TAKER_FALLBACK_TERMINAL',r.order.id),
+              type:'MAKER_FIRST_TAKER_FALLBACK_TERMINAL',aggregateType:'paper_order',aggregateId:r.order.id,
+              traceId:r.order.traceId,payload:{parentOrderId:r.order.id,marketId:r.order.marketId,
+                childOrderId:result.childOrderId,outcome:result.outcome,experimentId:continuation.experimentId},
+            }));
+          });
+          // Reuse the existing joined maker-work set; taker latency must never
+          // be awaited by the public market-data consumer.
+          const tail=work.then(()=>undefined,()=>undefined);this.makerTradeTails.set(key,tail);
+          try{await work;}finally{if(this.makerTradeTails.get(key)===tail)this.makerTradeTails.delete(key);}
+        }
+      }
     }}finally{this.scheduleMakerQuoteExpiry();}
+  }
+
+  private deferDirectionalMakerExpiry(orderId:string,reason:string):boolean{
+    if(reason!=='MAKER_FIRST_TTL_EXPIRED'||!this.makerEntryContinuations.has(orderId))return false;
+    this.scheduleMakerQuoteExpiry();return true;
   }
 
   private onMakerTrade(trade:MarketTrade):Promise<void>|void{
@@ -3016,7 +3056,7 @@ export class EngineService {
       const flow=this.makerFlowStats.get(orderId);
       if(flow){flow.observedTrades++;if(trade.side==='SELL'&&d(trade.price).eq(r.order.requestedPrice))flow.exactPriceSellTrades++;}
       const book=this.state.marketSnapshots.get(trade.tokenId),reason=this.hybridQuoteInvalidReason(r,book);
-      if(reason){await this.releaseMaker(orderId,{cancel:true,reason});continue;}
+      if(reason){if(!this.deferDirectionalMakerExpiry(orderId,reason))await this.releaseMaker(orderId,{cancel:true,reason});continue;}
       const active=this.makerActiveAfter.get(orderId);if(!active||!book)continue;
       if(this.nowFn().getTime()-Date.parse(trade.sourceTimestamp)>this.riskLimits.staleFeedTimeoutMs)continue;
       if(flow&&trade.side==='SELL'&&d(trade.price).eq(r.order.requestedPrice)
@@ -3827,7 +3867,8 @@ export class EngineService {
     if (result.admitted) await result.done;
   }
 
-  private async evaluateTrade(trigger: TriggerEvent, consensus: NonNullable<EngineStateStore["latestConsensus"]>, native: NativeDecision): Promise<void> {
+  private async evaluateTrade(trigger: TriggerEvent, consensus: NonNullable<EngineStateStore["latestConsensus"]>, native: NativeDecision,
+    fallback?: {parent:PaperOrder;cooldownAt:number|undefined;outcome:string;childOrderId:string|null}): Promise<void> {
     if (this.researchIngressBlocked()) return;
     if (!this.isTriggerActionable(trigger.id)) return;
     let pair = this.snapshots.get(trigger.marketId ?? "");
@@ -3854,6 +3895,8 @@ export class EngineService {
       maxOrderSizeUsd: this.riskLimits.maxOrderSizeUsd, minimumLockedPairEdge: this.riskLimits.normalHedgeMinLockedPairEdge,
     });
     if (!candidate) return;
+    if(fallback&&(position||candidate.intent!=='OPEN_FIRST_LEG'
+      ||candidate.tokenId!==fallback.parent.tokenId||candidate.outcome!==fallback.parent.outcome))return;
     if (candidate.intent === "HEDGE_SECOND_LEG" && this.soakBlocksPostEntry(candidate.marketId)) return;
     // During the profit-trailing soak, one controller owns ALL second-leg timing
     // so best-ask normal hedges cannot race the full-executable .12/trailing policy.
@@ -4002,6 +4045,16 @@ export class EngineService {
       candidate = revalidatedCandidate;
       pair = currentPair;
       if (!this.adapterTokenSynchronized(candidate.tokenId)) return;
+      if(fallback){
+        // Continue the same entry, never enlarge its size or original taker
+        // limit and never turn a partial maker fill into another first leg.
+        if(candidate.tokenId!==fallback.parent.tokenId||candidate.outcome!==fallback.parent.outcome
+          ||this.ledger.positions.has(candidate.marketId)||this.confirmedGuardianProtection(candidate.marketId))return;
+        candidate={...candidate,
+          quantity:d(candidate.quantity).lt(fallback.parent.quantity)?candidate.quantity:fallback.parent.quantity,
+          limitPrice:d(candidate.limitPrice).lt(fallback.parent.makerFirst!.takerReferencePrice)
+            ?candidate.limitPrice:fallback.parent.makerFirst!.takerReferencePrice};
+      }
 
       const snapshotProvenance = (snapshot: MarketSnapshot) => ({
         eventId: snapshot.eventId,
@@ -4071,6 +4124,7 @@ export class EngineService {
       now,
       databaseAvailable,
       assetOverride: trigger.asset,
+      ...(fallback?{orderTypeOverride:'TAKER' as const,suppressMakerFirst:true,ownMakerCooldownAt:fallback.cooldownAt}:{}),
     });
     const asset = trigger.asset ?? this.assetByMarket.get(candidate.marketId) ?? snapshot.asset ?? null;
     if (candidate.intent === "OPEN_FIRST_LEG") {
@@ -4127,17 +4181,24 @@ export class EngineService {
     };
     await this.persistReportInput(createJournalEvent({ traceId: trigger.traceId, type: "RISK_EVALUATION", aggregateType: "risk", aggregateId: decision.risk.id, payload: {
       ...decision.risk, marketId: trigger.marketId, asset,
+      ...(fallback?{makerFallbackParentOrderId:fallback.parent.id}:{}),
       executablePrice: decision.executablePrice,
       ...(calibration ? { alpha: calibration } : {}),
     } }));
     if (!decision.accepted || !decision.order) {
+      if(fallback)fallback.outcome='RISK_REJECTED:'+decision.risk.vetoes.join('|');
       for (const reason of decision.risk.vetoes) this.metrics.riskVetoes.inc({ reason });
       this.record("RISK_VETO", trigger.traceId, trigger.marketId, { reasons: decision.risk.vetoes, netEvUsdPerShare: decision.netEvUsdPerShare }, asset);
       return;
     }
     this.record("RISK_ACCEPT", trigger.traceId, trigger.marketId, { orderId: decision.order.id, netEvUsdPerShare: decision.netEvUsdPerShare }, asset);
-    if(candidate.intent==="OPEN_FIRST_LEG" && await this.trySubmitDualMakerPair(decision.order,duplicateKey,{UP:pair.UP,DOWN:pair.DOWN}))return;
-    await this.submitPaperOrder(decision.order, snapshot, duplicateKey, candidate.intent);
+    if(!fallback&&candidate.intent==="OPEN_FIRST_LEG" && await this.trySubmitDualMakerPair(decision.order,duplicateKey,{UP:pair.UP,DOWN:pair.DOWN}))return;
+    if(!fallback&&candidate.intent==='OPEN_FIRST_LEG'&&decision.order.makerFirst&&!decision.order.makerFirst.dualGroupId)
+      this.makerEntryContinuations.set(decision.order.id,{trigger,consensus:decisionConsensus,native:decisionNative,experimentId:this.experiment!.id});
+    if(fallback)fallback.childOrderId=decision.order.id;
+    const submitted=await this.submitPaperOrder(decision.order, snapshot, duplicateKey, candidate.intent);
+    if(!submitted)this.makerEntryContinuations.delete(decision.order.id);
+    if(fallback)fallback.outcome=submitted?'FILLED':'EXECUTION_REJECTED';
   }
 
   private riskReductionBusy(marketId: string): boolean {
@@ -4832,6 +4893,7 @@ export class EngineService {
         this.makerActiveAfter.delete(orderId);
         this.makerQueuePrimed.delete(orderId);
         this.makerFlowStats.delete(orderId);
+        this.makerEntryContinuations.delete(orderId);
         if(resting?.order.makerFirst){
           // Only a hedge's retry cooldown may be released for risk reduction.
           // Cancelling an unfilled entry is not a new alpha opportunity.
@@ -4974,6 +5036,7 @@ export class EngineService {
           }
 
           if(fill.makerEvidence){
+            this.makerEntryContinuations.delete(fill.orderId);
             const live=this.restingOrders.get(fill.orderId);
             const reason=!live?'MAKER_FIRST_NOT_ACTIVE'
               :economicIntent==='OPEN_FIRST_LEG'&&!experimentAllowsFirstLeg(this.experiment,this.nowFn())?'MAKER_FIRST_ENTRIES_CLOSED'
@@ -7166,6 +7229,9 @@ export class EngineService {
     /** Only the profit-trailing controller supplies this current-book proof. */
     profitTrailingLockedPnlUsd?: string;
     allowMakerFirstHedge?: boolean;
+    suppressMakerFirst?: boolean;
+    /** Continuation of the identical cancelled quote, not a new alpha entry. */
+    ownMakerCooldownAt?: number;
   }): { decision: ReturnType<typeof decidePaperOrder>; duplicateKey: string } {
     const { candidate, consensus, triggerId, signalExpiresAt, snapshot, pair, now, databaseAvailable, assetOverride } = input;
     const duplicateKey = `${candidate.marketId}:${candidate.outcome}:${candidate.intent}`;
@@ -7230,7 +7296,8 @@ export class EngineService {
         marketEntryQualified: this.entryQualified.has(candidate.marketId),
         externalSignalsLastMinute: 0,
         lastStrategyTradeAt: this.lastTradeAt,
-        duplicateTrade: (this.recentTrades.get(duplicateKey) ?? 0) > now.getTime() - this.riskLimits.strategyCooldownMs,
+        duplicateTrade: (this.recentTrades.get(duplicateKey) ?? 0) > now.getTime() - this.riskLimits.strategyCooldownMs
+          && !(input.ownMakerCooldownAt!==undefined&&this.recentTrades.get(duplicateKey)===input.ownMakerCooldownAt),
         experimentEntryOpen: candidate.intent === "HEDGE_SECOND_LEG"
           ? experimentAllowsHedge(this.experiment)
           : experimentAllowsFirstLeg(this.experiment, now),
@@ -7241,7 +7308,7 @@ export class EngineService {
     let decision=decidePaperOrder(paperInput);
     const makerConfig=this.makerFirstConfig();
     const role=candidate.intent==='OPEN_FIRST_LEG'?'FIRST_LEG':candidate.intent==='HEDGE_SECOND_LEG'&&input.allowMakerFirstHedge?'HEDGE':null;
-    if(makerConfig.enabled&&role&&decision.accepted&&decision.order?.orderType==='TAKER'
+    if(!input.suppressMakerFirst&&makerConfig.enabled&&role&&decision.accepted&&decision.order?.orderType==='TAKER'
       &&!this.confirmedGuardianProtection(candidate.marketId)){
       const price=passiveMakerBuyPrice(snapshot,candidate.quantity,candidate.limitPrice);
       if(price&&(role!=='FIRST_LEG'||!firstLegEntryFilterReason(price,decision.expectedROI))&&decision.bookVwap){

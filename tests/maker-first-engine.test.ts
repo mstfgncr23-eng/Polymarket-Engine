@@ -1,5 +1,5 @@
 import {describe,it,expect,beforeEach,afterEach} from 'vitest';
-import {type PaperOrder,type MarketSnapshot,type MarketTrade,type StrategyCandidate} from '@pm/core';
+import {evaluateNativeDecision,triggerEventSchema,type PaperOrder,type MarketSnapshot,type MarketTrade,type StrategyCandidate} from '@pm/core';
 import {MemoryEventJournal,type EventJournal,hashDurablePayload} from '@pm/db';
 import {EngineService} from '../apps/engine/src/engine.js';
 import {NoopGrokActivationBridge} from '../apps/engine/src/activation/index.js';
@@ -28,6 +28,60 @@ async function setup(enabled=true,journal:EventJournal=pg?.journal??new MemoryEv
  return {engine,journal,market,clock,intern,b,quote,submit,trade,errors};
 }
 describe('Maker-First real Engine lifecycle',()=>{
+ it.each(['fresh','price-worse','stale','closed','partial','dual','concurrent','cash','daily-loss','signal-expired','epoch','restart','book-expiry','close-race'] as const)('directional TTL fallback revalidates once without widening limits (%s)',async scenario=>{
+  const s=await setup(true,undefined,{ms:T},{PAPER_DUAL_SIDED_MAKER_ENABLED:String(scenario==='dual')});
+  try{
+   const bk=(outcome:'UP'|'DOWN',seq:number)=>({...s.b(outcome,seq),bids:[{price:outcome==='UP'?'0.69':'0.26',quantity:outcome==='UP'?'100000':'1000'}],asks:[{price:outcome==='UP'?'0.70':'0.27',quantity:outcome==='UP'?'1000':'100000'}]});
+   await s.market.emitSnapshot(bk('UP',10));await s.market.emitSnapshot(bk('DOWN',10));
+   const trigger=triggerEventSchema.parse({id:'ttl-fallback-trigger',traceId:'ttl-fallback-trace',marketId:M,asset:'XRP',source:'polymarket',kind:'BOOK_IMBALANCE',severity:2,score:.9,dedupeKey:'ttl-fallback',evidence:{},sourceEventIds:['ttl-source'],createdAt:new Date(T).toISOString(),expiresAt:new Date(T+(scenario==='signal-expired'?1000:60000)).toISOString()});
+   const native=evaluateNativeDecision({trigger,up:bk('UP',10),down:bk('DOWN',10),reference:null,referenceRequired:false,marketSynchronized:true,triggerProvenanceValid:true,now:new Date(T)})!;
+   expect(native.direction).toBe('UP');
+   const intern=s.engine as any;intern.activeTriggers.set(trigger.id,trigger);intern.triggerProvenance.set(trigger.id,{kind:'NONE'});
+   await intern.evaluateTrade(trigger,intern.nativeCompatibilityDecision(trigger,native),native);
+   const initial=[...s.engine.restingOrdersForTest().values()].map(r=>r.order);expect(initial,JSON.stringify({risk:s.engine.state.latestRisk,decisions:s.engine.state.decisions,events:await s.journal.queryEvents({types:['RISK_EVALUATION']})})).toHaveLength(scenario==='dual'?2:1);
+   const first=initial.find(o=>o.outcome==='UP')!;
+   if(scenario==='restart'){
+    await s.engine.stop();const recovered=await setup(true,s.journal,s.clock);
+    try{s.clock.ms=T+2001;await recovered.intern.expireMakerQuotes();expect(recovered.engine.restingOrderCount()).toBe(0);expect(recovered.engine.reservedCash()).toBe('0');expect(await s.journal.queryEvents({types:['PAPER_FILL']})).toHaveLength(0);expect((recovered.engine as any).makerEntryContinuations.size).toBe(0);}finally{await recovered.engine.stop();}
+    return;
+   }
+   if(scenario==='partial'){s.clock.ms+=201;await s.intern.onMakerTrade(s.trade(first,'100001'));expect(s.engine.ledger.positions.get(M)?.unpairedQuantity).toBe('0.5');}
+   s.clock.ms=T+2001;
+   if(scenario==='closed')expect((await s.engine.closeExperimentEntries()).ok).toBe(true);
+   if(scenario!=='stale'){
+    const up=bk('UP',11);if(scenario==='price-worse')up.asks=[{price:'0.71',quantity:'10'}];
+    // Direct cache update keeps TTL as the cancellation authority under test.
+    intern.snapshots.set(M,{UP:up,DOWN:bk('DOWN',11)});s.engine.state.marketSnapshots.set(U,up);s.engine.state.marketSnapshots.set(D,bk('DOWN',11));
+    await s.engine.ingestReferenceTickForTest({eventId:'ttl-ref-new',traceId:'ttl-ref-new',asset:'XRP',symbol:'XRPUSDT',venue:'test',price:'1',quantity:'1',sourceTimestamp:new Date(s.clock.ms).toISOString(),receivedAt:new Date(s.clock.ms).toISOString(),tradeId:'ttl-ref-new'});
+   }else s.clock.ms=T+16001;
+   if(scenario==='cash')s.engine.ledger.restore({...s.engine.ledger.snapshot(),cash:'0.01'},[]);
+   if(scenario==='daily-loss')s.engine.ledger.restore({...s.engine.ledger.snapshot(),netTradingPnl:'-51'},[]);
+   if(scenario==='epoch')s.market.markTokenSync(U,'GAPPED');
+   if(scenario==='book-expiry'){
+    await s.market.emitSnapshot(bk('UP',12));expect((await s.journal.queryEvents({types:['PAPER_FILL']}))).toHaveLength(0);
+   }
+   let closing:Promise<Record<string,unknown>>|undefined;
+   if(scenario==='close-race'){
+    const read=s.journal.readDurableByOperationKey.bind(s.journal);let once=false;
+    s.journal.readDurableByOperationKey=async key=>{if(!once&&key===`maker:${first.id}:cancel`){once=true;closing=intern.durableGate.outside(()=>s.engine.closeExperimentEntries());}return read(key);};
+   }
+   if(scenario==='concurrent')await Promise.all([s.intern.expireMakerQuotes(),s.intern.expireMakerQuotes()]);else await s.intern.expireMakerQuotes();
+   if(closing)await closing;
+   await s.intern.expireMakerQuotes();
+   const fills=(await s.journal.queryEvents({types:['PAPER_FILL']})).filter(r=>r.payload.liquidityRole==='TAKER');
+   const shouldFill=scenario==='fresh'||scenario==='concurrent'||scenario==='book-expiry';expect(fills,JSON.stringify((await s.journal.queryEvents({types:['RISK_EVALUATION']})).map(r=>r.payload))).toHaveLength(shouldFill?1:0);
+   if(shouldFill){
+    expect(fills[0]!.payload).toMatchObject({fillPrice:'0.7',intent:'OPEN_FIRST_LEG'});
+    const facts=await s.journal.queryDurableTransitions({limit:1000});
+    expect(facts.find(f=>f.operationKey===`maker:${first.id}:cancel`)!.sequence)
+      .toBeLessThan(facts.find(f=>f.type==='PAPER_FILL'&&f.aggregateId===fills[0]!.aggregateId)!.sequence);
+    const attempts=await s.journal.queryEvents({types:['MAKER_FIRST_TAKER_FALLBACK_TERMINAL']});expect(attempts).toHaveLength(1);expect(attempts[0]!.payload).toMatchObject({parentOrderId:first.id,outcome:'FILLED'});
+    s.clock.ms++;await s.intern.onMakerTrade(s.trade(first,'100000'));expect((await s.journal.queryEvents({types:['PAPER_FILL']}))).toHaveLength(1);
+   }
+   expect(s.engine.reservedCash()).toBe('0');expect(s.engine.integrityFault()).toBe(false);
+   expect((s.engine as any).makerEntryContinuations.size).toBe(0);
+  }finally{await s.engine.stop();}
+ });
  it('cancellation records eligible public volume exhausted by queue without inventing a fill',async()=>{
   const s=await setup();try{
    const o=s.quote();expect(await s.submit(o)).toBe(true);
