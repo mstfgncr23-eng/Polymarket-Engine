@@ -4499,7 +4499,12 @@ export class EngineService {
     const priorReserve = await this.journal.readDurableByOperationKey(`maker:${order.id}:reserve`);
     const compactedRetry = Boolean(priorReserve && Object.keys(priorReserve.payload).length === 0);
     if (this.ledger.availableCash().lt(notional) && !priorReserve) {
+      if(order.makerFirst)throw new MakerReservationCashCommitGuardRejectedError(order.id,order.marketId,notional,this.ledger.availableCash().toFixed());
       throw new Error("INSUFFICIENT_CASH");
+    }
+    if(order.makerFirst&&passiveMakerBuyPrice(reservationBook,order.quantity,order.requestedPrice)!==order.requestedPrice){
+      if(intent==='OPEN_FIRST_LEG')throw new FirstLegLifecycleGuardRejectedError(order.marketId,'MAKER_FIRST_POST_ONLY_INVALID');
+      throw new RiskReductionLifecycleGuardRejectedError(order.marketId,'HEDGE_SECOND_LEG','MAKER_FIRST_POST_ONLY_INVALID');
     }
     const resting = compactedRetry
       ? (this.restingOrders.get(order.id) ?? createRestingMakerOrder(order, reservationBook, intent))
