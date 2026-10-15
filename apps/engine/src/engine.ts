@@ -5322,7 +5322,7 @@ export class EngineService {
       aggregateType: "ledger",
       aggregateId,
       occurredAt,
-      buildPayload: () => ({
+      buildPayload: (at) => ({
         ...auth,
         derivedAudit: [{
           id: derivedAuditEventId("INFRASTRUCTURE_COST_ACCRUED", `${aggregateId}:${auth.accrualKey}`),
@@ -5331,7 +5331,13 @@ export class EngineService {
           aggregateId,
           traceId: aggregateId,
           payload: { ...auth, experimentId: this.experiment?.id ?? null },
-        }],
+        }, ...this.projectDerivedAudit({ operationKey: `infra:${aggregateId}:${previousAccrualKey}`,
+          type: "INFRASTRUCTURE_COST_ACCRUED", aggregateType: "ledger", aggregateId, payload: auth }, at,
+          (projected) => [{ id: derivedAuditEventId("PNL_SNAPSHOT", `infra:${aggregateId}:${auth.accrualKey}`),
+            type: "PNL_SNAPSHOT", aggregateType: "ledger", aggregateId, traceId: aggregateId,
+            payload: { ...projected.ledger.snapshot(), experimentId: this.experiment?.id ?? null,
+              source: "OPERATING_COST", economicResults: projected.resultAccounting ? economicResults(projected.resultAccounting) : null,
+              tradingResults: projected.resultAccounting ? tradingResults(projected.resultAccounting) : null } }])],
       }),
     });
   }
@@ -9073,9 +9079,16 @@ private buildEarlyAudit(
       type,
       aggregateType: "experiment",
       aggregateId: next.id,
-      buildPayload: () => ({
+      buildPayload: (at) => ({
         experiment: next,
-        derivedAudit: [this.experimentDerivedAudit(type, next)],
+        derivedAudit: [this.experimentDerivedAudit(type, next), ...(next.status === "COMPLETED"
+          ? this.projectDerivedAudit({ operationKey: `experiment:${next.id}:completed`, type,
+            aggregateType: "experiment", aggregateId: next.id, payload: { experiment: next } }, at,
+            (projected) => [{ id: derivedAuditEventId("PNL_SNAPSHOT", `experiment:${next.id}:completed`),
+              type: "PNL_SNAPSHOT", aggregateType: "ledger", aggregateId: next.id, traceId: next.id,
+              payload: { ...projected.ledger.snapshot(), experimentId: next.id, source: "EXPERIMENT_COMPLETED",
+                economicResults: projected.resultAccounting ? economicResults(projected.resultAccounting) : null,
+                tradingResults: projected.resultAccounting ? tradingResults(projected.resultAccounting) : null } }]) : [])],
       }),
       // Keep the durable completion event inside the manifest's authoritative
       // report window.  The manifest timestamp is captured before the durable

@@ -158,13 +158,63 @@ describe("P1-10 dollar cashflow authority", () => {
       expect(engine.state.snapshot().economicResults).toEqual(before.economicResults);
     } finally { await engine.stop(); }
   });
+  it("concurrent operating-cost accrual publishes the same current dollars without double charging", async () => {
+    const journal = new MemoryEventJournal(); const clock = { ms: Date.now() };
+    const engine = await startEngine(journal, { ESTIMATED_INFRA_COST_PER_HOUR_USD: "1" }, clock);
+    try {
+      clock.ms = Date.now(); expect((await engine.beginExperiment()).ok).toBe(true);
+      await engine.applyObservedFill(paperFill("btc-mkt", "UP", "0.65", { feeUsd: "0.1" }));
+      await engine.applyObservedFill(paperFill("btc-mkt", "UP", "0.40", { side: "SELL", feeUsd: "0.1" }));
+      const authority = engine as unknown as { lastInfrastructureAccrualAt: number; accrueInfrastructureCost(ms: number): Promise<void> };
+      clock.ms = authority.lastInfrastructureAccrualAt + 3600000;
+      await Promise.all([authority.accrueInfrastructureCost(clock.ms), authority.accrueInfrastructureCost(clock.ms)]);
+      const actual = engine.state.snapshot();
+      expect(actual.balance.infrastructureCost).toBe("1");
+      expect(actual.balance.netEconomicPnl).toBe("-3.7");
+      const events = await journal.queryEvents({ experimentId: engine.experimentManifest()!.id, limit: 1000 });
+      const costSnapshots = events.filter(e => e.type === "PNL_SNAPSHOT" && e.payload.source === "OPERATING_COST");
+      expect(costSnapshots).toHaveLength(1);
+      expect(costSnapshots[0]!.payload.economicResults).toEqual(actual.economicResults);
+      const summary = buildExperimentSummary(events, engine.experimentManifest()!.id);
+      expect(summary.netTradingPnlUsd).toBe(-2.7); expect(summary.economicPnlUsd).toBe(-3.7);
+      expect(summary.estimatedInfrastructureCostUsd).toBe(1);
+    } finally { await engine.stop(); }
+  });
+  it.each(["zero", "cost_only", "closed_trade"] as const)("completion publishes authoritative totals for %s even without a prior fill snapshot", async kind => {
+    const journal = new MemoryEventJournal(); const clock = { ms: Date.now() };
+    const engine = await startEngine(journal, { ESTIMATED_INFRA_COST_PER_HOUR_USD: kind === "zero" ? "0" : "1" }, clock);
+    try {
+      clock.ms = Date.now(); expect((await engine.beginExperiment()).ok).toBe(true);
+      if (kind === "closed_trade") {
+        await engine.applyObservedFill(paperFill("btc-mkt", "UP", "0.65", { feeUsd: "0.1" }));
+        await engine.applyObservedFill(paperFill("btc-mkt", "UP", "0.40", { side: "SELL", feeUsd: "0.1" }));
+      }
+      const authority = engine as unknown as { lastInfrastructureAccrualAt: number; accrueInfrastructureCost(ms: number): Promise<void>; commitExperimentStatus(next: NonNullable<ReturnType<EngineService["experimentManifest"]>>): Promise<void> };
+      clock.ms = authority.lastInfrastructureAccrualAt + 3600000;
+      if (kind !== "zero") await authority.accrueInfrastructureCost(clock.ms);
+      await engine.closeExperimentEntries();
+      const next = { ...engine.experimentManifest()!, status: "COMPLETED" as const, completedAt: new Date(clock.ms).toISOString(), unresolvedPositionCount: 0 };
+      await authority.commitExperimentStatus(next);
+      const actual = engine.state.snapshot();
+      const events = await journal.queryEvents({ experimentId: next.id, limit: 1000 });
+      const final = events.filter(e => e.type === "PNL_SNAPSHOT" && e.payload.source === "EXPERIMENT_COMPLETED");
+      expect(final).toHaveLength(1); expect(final[0]!.occurredAt).toBe(next.completedAt);
+      const summary = buildExperimentSummary(events, next.id);
+      expect(summary.economicResults).toEqual(actual.economicResults);
+      expect(summary.netTradingPnlUsd).toBe(Number(actual.balance.netTradingPnl));
+      expect(summary.economicPnlUsd).toBe(Number(actual.balance.netEconomicPnl));
+      expect(summary.estimatedInfrastructureCostUsd).toBe(Number(actual.balance.infrastructureCost));
+      expect(summary.winLossDistribution.losses).toBe(kind === "closed_trade" ? 1 : 0);
+    } finally { await engine.stop(); }
+  });
 });
 
-async function startEngine(journal: MemoryEventJournal) {
+async function startEngine(journal: MemoryEventJournal, overrides: Record<string, string> = {}, clock?: { ms: number }) {
   const market = new ScriptedMarketAdapter();
   market.queue(discoveryReport([qualified("btc-mkt", "BTC", "btc-up", "btc-down")]));
-  const engine = new EngineService(qualifiedPaperEnv({ ESTIMATED_INFRA_COST_PER_HOUR_USD: "0" }), journal, { error: () => undefined }, {
+  const engine = new EngineService(qualifiedPaperEnv({ ESTIMATED_INFRA_COST_PER_HOUR_USD: "0", ...overrides }), journal, { error: () => undefined }, {
     market: market as never, referenceRegistry: new ScriptedReferenceRegistry() as never, activation: new NoopGrokActivationBridge(),
+    ...(clock ? { now: () => new Date(clock.ms) } : {}),
   });
   await engine.start();
   return engine;
