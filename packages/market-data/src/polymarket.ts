@@ -19,6 +19,7 @@ import { BoundedIngressQueue, IngressOverflowError, type IngressQueueObserver } 
 import {
   CLOB_MARKET_WS_URL,
   MARKET_CONNECT_BOUNDS,
+  MARKET_DRAIN_BOUNDS,
   type IngressGapReason,
   type IngressQueueSnapshot,
   type TokenSyncState,
@@ -194,6 +195,7 @@ export interface MinOrderSizeHydrationObserver {
 export interface MarketNormalizeObserver {
   onNormalizedSnapshot(input: { durationSeconds: number; bidLevels: number; askLevels: number }): void;
   onPriceChangeEvent(entriesInPayload: number, processed: number): void;
+  onSourceEventNormalized?(durationSeconds: number): void;
 }
 
 export interface DiscoveryReport {
@@ -592,6 +594,7 @@ export class PolymarketMarketDataAdapter {
           if (signal.aborted || connectAbort.signal.aborted) this.closeCurrentStream();
           try {
             await handlers.onConnection({ feed: "polymarket", state: "CONNECTED", at: new Date().toISOString(), reconnectCount });
+            let turnStarted = performance.now(), turnEvents = 0;
             for await (const event of stream) {
               if (signal.aborted) { await stream.close(); break; }
               if (resubscribed || generation !== this.streamGeneration) break;
@@ -600,10 +603,12 @@ export class PolymarketMarketDataAdapter {
                   if (resubscribed || generation !== this.streamGeneration) break;
                   await handlers.onSnapshot(snapshot);
                 }
-                // A buffered async iterator otherwise drains via microtasks and
-                // can starve local socket reads and PostgreSQL reply processing.
-                // Yield once per source frame; preserve every event and ordering.
-                await new Promise<void>(resolve => setImmediate(resolve));
+                // Every source event and snapshot is still processed in order.
+                // A bounded batch amortizes scheduling without starving IO.
+                if (++turnEvents >= MARKET_DRAIN_BOUNDS.maxEventsPerTurn || performance.now() - turnStarted >= MARKET_DRAIN_BOUNDS.maxTurnMs) {
+                  await new Promise<void>(resolve => setImmediate(resolve));
+                  turnEvents = 0; turnStarted = performance.now();
+                }
               } catch (error) {
                 const normalized = error instanceof Error ? error : new Error(String(error));
                 if (normalized instanceof IngressOverflowError) {
@@ -748,6 +753,8 @@ export class PolymarketMarketDataAdapter {
   }
 
   private normalizeEvent(event: unknown, handlers: Pick<PolymarketFeedHandlers, "onAnomaly" | "onResync" | "onGap">): MarketSnapshot[] {
+    const started = performance.now();
+    try {
     const value = event as { type?: string; payload?: Record<string, unknown> };
     const payload = value.payload ?? {};
     if (value.type === "book") {
@@ -762,6 +769,7 @@ export class PolymarketMarketDataAdapter {
       if (state) state.lastTradePrice = nullableString(payload.price);
     }
     return [];
+    } finally { this.normalizeObserver?.onSourceEventNormalized?.((performance.now() - started) / 1000); }
   }
 
   /**
@@ -916,13 +924,17 @@ export class PolymarketMarketDataAdapter {
     for (const item of accepted) {
       let copy = working.get(item.tokenId);
       if (!copy) {
-        copy = cloneBookState(item.state, item.side);
+        copy = cloneBookState(item.state);
         working.set(item.tokenId, copy);
-      } else {
-        ownBookSide(copy, item.side);
       }
-      if (item.side === "BUY") applyLevelChange(copy.bids, copy.bidLevels, item.price, item.size, "desc");
-      else applyLevelChange(copy.asks, copy.askLevels, item.price, item.size, "asc");
+      const sideMap = item.side === "BUY" ? copy.bids : copy.asks;
+      // An unchanged level is still a distinct source observation, with its
+      // timestamp/hash/sequence and callback. Only redundant copies are skipped.
+      if (Number(item.size) <= 0 ? sideMap.has(item.price) : sideMap.get(item.price) !== item.size) {
+        ownBookSide(copy, item.side);
+        if (item.side === "BUY") applyLevelChange(copy.bids, copy.bidLevels, item.price, item.size, "desc");
+        else applyLevelChange(copy.asks, copy.askLevels, item.price, item.size, "asc");
+      }
       copy.timestamp = new Date(sourceMs).toISOString();
       copy.hash = nullableString(item.hash) ?? copy.hash;
       const changedLevel = Number(item.size) <= 0 ? null : { price: item.price, quantity: item.size };
@@ -1551,27 +1563,8 @@ function insertIndex(levels: readonly BookLevel[], price: string, order: "asc" |
  * - levelsValid is preserved: previously validated unchanged levels stay
  *   trusted; only the inserted/replaced level is rechecked.
  */
-function cloneBookState(state: BookState, side: "BUY" | "SELL"): BookState {
-  if (side === "BUY") {
-    return {
-      ...state,
-      bids: new Map(state.bids),
-      bidLevels: state.bidLevels.slice(),
-      publishedBids: null,
-      bidsDirty: true,
-      bidsOwned: true,
-      asksOwned: false,
-    };
-  }
-  return {
-    ...state,
-    asks: new Map(state.asks),
-    askLevels: state.askLevels.slice(),
-    publishedAsks: null,
-    asksDirty: true,
-    bidsOwned: false,
-    asksOwned: true,
-  };
+function cloneBookState(state: BookState): BookState {
+  return { ...state, bidsOwned: false, asksOwned: false };
 }
 
 function ownBookSide(state: BookState, side: "BUY" | "SELL"): void {

@@ -33,6 +33,10 @@ export const MARKET_CONNECT_BOUNDS = {
   stableAfterMs: 5_000,
 } as const;
 
+/** Fair bounded drain: avoid one event-loop callback per tiny source event,
+ * while guaranteeing socket/PG/timer service during a sustained backlog. */
+export const MARKET_DRAIN_BOUNDS = { maxEventsPerTurn: 32, maxTurnMs: 2 } as const;
+
 export const REFERENCE_INGRESS_BOUNDS = {
   maxEvents: 2_048,
   maxBytes: 1 * 1024 * 1024,

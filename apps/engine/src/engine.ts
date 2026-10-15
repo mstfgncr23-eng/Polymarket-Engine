@@ -637,6 +637,7 @@ export class EngineService {
       this.marketAdapter.setIngressObserver({
         onChange: (snapshot) => this.metrics.noteIngressSnapshot(snapshot),
       });
+      this.marketAdapter.setShardObserver({ onChange: snapshots => this.metrics.noteShardSnapshots(snapshots) });
     }
     this.legacyBtcAdapter = adapters?.btc ?? null;
     this.referenceRegistry = adapters?.referenceRegistry ?? new ReferenceFeedRegistry(
@@ -6143,6 +6144,7 @@ export class EngineService {
 
   private kickProfitTrailingPair(marketId: string): void {
     if (!this.profitTrailingPairSoakEnabled()) return;
+    if (!this.ledger.positions.get(marketId)?.unpairedOutcome) return;
     if (this.profitTrailingPairInFlight.has(marketId)) {
       this.profitTrailingPairPending.add(marketId);
       return;
@@ -6483,6 +6485,13 @@ export class EngineService {
    * Pre-expiry protection also remains immediate.
    */
   private scheduleSnapshotProtectiveDeRisk(marketId: string): void {
+    // No asynchronous risk work exists for an empty/paired market. Pending
+    // durable ownership still gets its recovery pass even if inventory closed.
+    if (!this.ledger.positions.get(marketId)?.unpairedOutcome
+      && !this.riskReductionOwners.has(marketId) && !this.riskReductionInFlight.has(marketId)) {
+      this.clearProtectiveDeRiskState(marketId);
+      return;
+    }
     const run = () => {
       if (!this.state.draining) void this.maybeProtectiveDeRisk(marketId).catch((error) => {
         this.logger.error({ err: error, marketId }, "protective de-risk attempt failed");
