@@ -1,4 +1,4 @@
-import type { MarketSnapshot } from "@pm/core";
+import { createId, type MarketSnapshot } from "@pm/core";
 import { type IngressQueueObserver } from "./bounded-ingress.js";
 import type { IngressGapReason, IngressQueueSnapshot, TokenSyncState } from "./ingress-bounds.js";
 import { isBoundedMarketStreamTransport, type MarketStreamTransport } from "./market-stream-transport.js";
@@ -90,6 +90,8 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
   private connectionReconnects: number[];
   private lastConnectionSignature = "";
   private connectionTail: Promise<void> = Promise.resolve();
+  private readonly lifecycleSource = createId("ws");
+  private lifecycleSequence = 0;
   /** One ordered callback lane per owned socket. Cross-shard async work must not head-of-line block healthy shards. */
   private snapshotTails: Promise<void>[] = [];
 
@@ -260,7 +262,10 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
     handlers: PolymarketFeedHandlers,
     signal: AbortSignal,
   ): Promise<void> {
-    if (!this.sharded) return super.run(tokenIds, handlers, signal);
+    if (!this.sharded) return super.run(tokenIds, { ...handlers, onConnection: async event => {
+      const lifecycle = handlers.onShardConnection?.({ ...event, shard: 1, eventId: `${this.lifecycleSource}:${++this.lifecycleSequence}` });
+      await Promise.all([lifecycle, handlers.onConnection(event)]);
+    } }, signal);
 
     this.shardedRunStarted = true;
     this.setTokenIds(this.currentTokenIds.length > 0 ? this.currentTokenIds : tokenIds);
@@ -490,6 +495,12 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
     event: FeedConnectionEvent,
     handlers: PolymarketFeedHandlers,
   ): Promise<void> {
+    // Capture at source arrival, before aggregate serialization can delay or
+    // suppress the raw shard event. Experiment attribution owns this fact.
+    const lifecycle = Promise.resolve(handlers.onShardConnection?.({ ...event, shard: shardIndex + 1,
+      eventId: `${this.lifecycleSource}:${++this.lifecycleSequence}` }));
+    // Install the rejection handler immediately while the UI lane may be busy.
+    const observedLifecycle = lifecycle.then(() => ({ error: null as unknown }), error => ({ error }));
     const work = this.connectionTail.then(async () => {
       this.connectionStates[shardIndex] = event.state;
       this.connectionReconnects[shardIndex] = event.reconnectCount;
@@ -498,6 +509,8 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
       const reconnectCount = this.connectionReconnects.reduce((sum, value) => sum + value, 0);
       const message = event.message ? `shard=${shardIndex + 1}:${event.message}` : undefined;
       const signature = `${aggregate}:${reconnectCount}:${message ?? ""}`;
+      const outcome = await observedLifecycle;
+      if (outcome.error) throw outcome.error;
       if (signature === this.lastConnectionSignature) return;
       this.lastConnectionSignature = signature;
       await handlers.onConnection({

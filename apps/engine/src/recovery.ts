@@ -1,4 +1,5 @@
 import { lockedGuardianGeneration, guardianStateMatchesGeneration, isGuardianV2State, reversalProtectionStateSchema, sameReversalEpisode, type ReversalProtectionState } from "@pm/core";
+import { applyExperimentWsEvent, emptyExperimentWsStats, experimentWsEventSchema } from "@pm/core";
 import { createNakedDirectionalDiagnostic, nakedDirectionalDiagnosticSchema, mergeNakedDirectionalObservation,
   profitTrailingPairStateSchema, type NakedDirectionalDiagnostic, type ProfitTrailingPairState } from "@pm/core";
 import {
@@ -230,6 +231,8 @@ export function durableIdentityConflicts(
     case "INFRASTRUCTURE_COST_ACCRUED":
       return hashDurablePayload(pick(existing, ["aiCost", "infrastructureCost", "accrualKey"]))
         !== hashDurablePayload(pick(incoming, ["aiCost", "infrastructureCost", "accrualKey"]));
+    case "EXPERIMENT_WS_EVENT":
+      return hashDurablePayload(pick(existing, ["experimentId", "event"])) !== hashDurablePayload(pick(incoming, ["experimentId", "event"]));
     case "EXPERIMENT_STARTED":
     case "EXPERIMENT_START_VALIDATED":
     case "EXPERIMENT_ENTRY_CLOSED":
@@ -408,7 +411,12 @@ export function applyDurableTransition(state: RecoverableEngineState, transition
     case "EXPERIMENT_START_ABORTED":
     case "EXPERIMENT_ENTRY_CLOSED":
     case "EXPERIMENT_COMPLETED":
-        state.experiment = experimentManifestSchema.parse(transition.payload.experiment ?? transition.payload);
+        {
+          const parsed = experimentManifestSchema.parse(transition.payload.experiment ?? transition.payload);
+          if (transition.type !== "EXPERIMENT_STARTED" && parsed.id === state.experiment?.id && state.experiment.wsStats)
+            parsed.wsStats = state.experiment.wsStats;
+          state.experiment = parsed;
+        }
         if (transition.type === "EXPERIMENT_STARTED") {
           state.reportQuarantine = null;
           const at = state.experiment.startedAt ? new Date(state.experiment.startedAt) : new Date(transition.occurredAt);
@@ -439,6 +447,13 @@ export function applyDurableTransition(state: RecoverableEngineState, transition
           state.lastInfrastructureAccrualAt = at.getTime();
         }
         return;
+      case "EXPERIMENT_WS_EVENT": {
+        if (!state.experiment || state.experiment.id !== transition.payload.experimentId)
+          throw new RecoveryFailClosedError("invariant", "WS lifecycle event belongs to another experiment");
+        state.experiment.wsStats = applyExperimentWsEvent(state.experiment.wsStats ?? emptyExperimentWsStats(),
+          experimentWsEventSchema.parse(transition.payload.event));
+        return;
+      }
       case "PAPER_MAKER_RESERVED": {
         const payload = reservePayloadSchema.parse(transition.payload);
         state.ledger.reserve(payload.reserved, new Date(transition.occurredAt));

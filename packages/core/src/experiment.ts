@@ -1,4 +1,6 @@
 import { createId, type ExperimentClosePolicy, type ExperimentManifest, type Position } from "./domain.js";
+import { emptyExperimentWsStats } from "./experiment-ws.js";
+import type { ExperimentWsStats } from "./experiment-ws.js";
 
 export interface ExperimentStartInput {
   durationHours: number;
@@ -36,6 +38,7 @@ export function startExperiment(input: ExperimentStartInput): ExperimentManifest
     startedAt, entryClosesAt: new Date(input.now.getTime() + input.durationHours * 3_600_000).toISOString(),
     completedAt: null, unresolvedPositionCount: 0, markToMarketAt: null,
     startValidationPending: true, abortedAt: null, abortReason: null,
+    wsStats: emptyExperimentWsStats(),
   };
 }
 
@@ -100,6 +103,7 @@ export interface GuardianOutcomeCounts {
   earlyExits: number; lateExits: number; pairedSettlements: number; nakedSettlements: number;
 }
 export interface ExperimentSummary {
+  experimentWsStats?: ExperimentWsStats;
   economicResults?: { trades: number; meteors: number; completedNetPnl: string; completedFees: string; worstTradeNetPnl: string;
     buySpend: string; sellProceeds: string; settlementPayout: string; fees: string } | null;
   realizedNetTradingPnlUsd?: number;

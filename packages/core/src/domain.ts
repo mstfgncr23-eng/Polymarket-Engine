@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
+import { experimentWsStatsSchema } from "./experiment-ws.js";
 
 export const decimalStringSchema = z.string().regex(/^-?\d+(?:\.\d+)?$/, "decimal string required");
 export const probabilitySchema = z.number().min(0).max(1);
@@ -448,6 +449,7 @@ export const experimentManifestSchema = z.object({
   startValidationPending: z.boolean().optional(),
   abortedAt: timestampSchema.nullable().optional(),
   abortReason: z.string().nullable().optional(),
+  wsStats: experimentWsStatsSchema.optional(),
 });
 export type ExperimentManifest = z.infer<typeof experimentManifestSchema>;
 

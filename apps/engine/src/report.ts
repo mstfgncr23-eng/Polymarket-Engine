@@ -1,4 +1,5 @@
 import { mkdir, writeFile } from "node:fs/promises";
+import { applyExperimentWsEvent, emptyExperimentWsStats, experimentWsStatsSchema, experimentWsEventSchema, type ExperimentWsStats } from "@pm/core";
 import { resolve } from "node:path";
 import type { EconomicResults, TradingResults } from "./trading-results.js";
 import { d, renderExperimentSummaryMarkdown, type ExperimentSummary, type GuardianOutcomeCounts, type JournalEvent, type LedgerState, type MarketAssetAttribution, type PaperFill, type Position } from "@pm/core";
@@ -30,6 +31,7 @@ export type ExperimentSummaryExtras = Partial<Pick<ExperimentSummary,
 >>;
 
 export interface ExperimentSummaryAccumulatorSnapshot {
+  experimentWsStats?: ExperimentWsStats | null;
   guardianOutcomes?: GuardianOutcomeCounts;
   nakedDirectionalDiagnostics?: Array<[string, Record<string, unknown>]>;
   schemaVersion: number;
@@ -92,6 +94,7 @@ export interface ExperimentSummaryAccumulatorSnapshot {
 
 export class ExperimentSummaryAccumulator {
   private guardianOutcomes: GuardianOutcomeCounts = { earlyExits: 0, lateExits: 0, pairedSettlements: 0, nakedSettlements: 0 };
+  private experimentWsStats: ExperimentWsStats | null = null;
   private readonly nakedDirectionalDiagnostics = new Map<string, Record<string, unknown>>();
   private readonly extras: ExperimentSummaryExtras;
   private readonly experimentId: string;
@@ -171,7 +174,7 @@ export class ExperimentSummaryAccumulator {
   /** JSON-safe bounded rollup state. No raw JournalEvent objects are retained. */
   serialize(): ExperimentSummaryAccumulatorSnapshot {
     return {
-      guardianOutcomes: { ...this.guardianOutcomes }, schemaVersion: 1, experimentId: this.experimentId, extras: structuredClone(this.extras), eventCount: this.eventCount,
+      guardianOutcomes: { ...this.guardianOutcomes }, experimentWsStats: this.experimentWsStats ? structuredClone(this.experimentWsStats) : null, schemaVersion: 1, experimentId: this.experimentId, extras: structuredClone(this.extras), eventCount: this.eventCount,
       ...(this.nakedDirectionalDiagnostics.size ? { nakedDirectionalDiagnostics: structuredClone([...this.nakedDirectionalDiagnostics]) } : {}),
       earliestOccurredAt: this.earliestOccurredAt, latestOccurredAt: this.latestOccurredAt,
       fillReplay: [...this.fillReplay.entries()].map(([marketId, s]) => ({ marketId, upQty: s.upQty.toString(), downQty: s.downQty.toString(), upCost: s.upCost.toString(), downCost: s.downCost.toString(), realized: s.realized.toString(), fees: s.fees.toString(), slippage: s.slippage.toString(), fills: s.fills })),
@@ -193,6 +196,7 @@ export class ExperimentSummaryAccumulator {
   }
   snapshot(): ExperimentSummaryAccumulatorSnapshot { return this.serialize(); }
   restore(snapshot: ExperimentSummaryAccumulatorSnapshot): void {
+    this.experimentWsStats = snapshot.experimentWsStats ? experimentWsStatsSchema.parse(snapshot.experimentWsStats) : null;
     if (snapshot.schemaVersion !== 1 || snapshot.experimentId !== this.experimentId) throw new Error("ANALYTICS_ROLLUP_SCHEMA_MISMATCH");
     this.guardianOutcomes = { earlyExits: 0, lateExits: 0, pairedSettlements: 0, nakedSettlements: 0, ...snapshot.guardianOutcomes };
     this.nakedDirectionalDiagnostics.clear();
@@ -212,6 +216,10 @@ export class ExperimentSummaryAccumulator {
   static fromSnapshot(snapshot: ExperimentSummaryAccumulatorSnapshot): ExperimentSummaryAccumulator { const acc = new ExperimentSummaryAccumulator(snapshot.experimentId, snapshot.extras); acc.restore(snapshot); return acc; }
 
   fold(event: JournalEvent): void {
+    if (event.type === "EXPERIMENT_STARTED" && event.payload.wsStats)
+      this.experimentWsStats = experimentWsStatsSchema.parse(event.payload.wsStats);
+    if (event.type === "EXPERIMENT_WS_EVENT")
+      this.experimentWsStats = applyExperimentWsEvent(this.experimentWsStats ?? emptyExperimentWsStats(), experimentWsEventSchema.parse(event.payload.event));
     this.eventCount += 1;
     if (!this.earliestOccurredAt || event.occurredAt < this.earliestOccurredAt) this.earliestOccurredAt = event.occurredAt;
     if (!this.latestOccurredAt || event.occurredAt > this.latestOccurredAt) this.latestOccurredAt = event.occurredAt;
@@ -372,6 +380,7 @@ export class ExperimentSummaryAccumulator {
     this.refreshHighWater();
     return {
       guardianOutcomes: { ...this.guardianOutcomes }, experimentId: this.experimentId, generatedAt: extras.generatedAt ?? new Date().toISOString(),
+      ...(this.experimentWsStats ? { experimentWsStats: structuredClone(this.experimentWsStats) } : {}),
       ...(this.nakedDirectionalDiagnostics.size ? { nakedDirectionalDiagnostics: structuredClone([...this.nakedDirectionalDiagnostics.values()]) } : {}),
       status: extras.status ?? String((ledger as { experimentStatus?: unknown } | undefined)?.experimentStatus ?? "unknown"),
       closePolicy: extras.closePolicy ?? "observe_until_settlement",

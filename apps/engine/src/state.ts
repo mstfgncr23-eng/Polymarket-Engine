@@ -1,4 +1,6 @@
 import type { ActivationLatency, ConsensusDecision, ExternalAgentRoleId, GrokSignalEnvelope, LedgerState, MarketSnapshot, Position, QualificationReasonCode, RiskEvaluation, TriggerEvent } from "@pm/core";
+import type { ExperimentWsStats } from "@pm/core";
+export interface ExperimentWsWindow { experimentId:string; startedAt:string|null; entryClosedAt:string|null; completedAt:string|null; stats:ExperimentWsStats }
 import { emptyResultAccounting, tradingResults, economicResults, type EconomicResults, type ResultAccounting, type TradingResults } from "./trading-results.js";
 
 export interface DecisionFeedItem {
@@ -57,6 +59,7 @@ export interface DashboardSnapshot {
     queueDepth: number;
     experimentId: string | null;
     experimentStatus: string | null;
+    experimentWs?: ExperimentWsWindow | null;
     discoveryStatus: DiscoveryStatus;
     discoveryLoopActive: boolean;
     marketMonitoring: boolean;
@@ -118,6 +121,7 @@ export class EngineStateStore {
   queueDepth = 0;
   experimentId: string | null = null;
   experimentStatus: string | null = null;
+  experimentWs: ExperimentWsWindow | null = null;
   experimentStartedAt: string | null = null;
   experimentCompletedAt: string | null = null;
   database: "UP" | "DOWN" = "DOWN";
@@ -312,6 +316,7 @@ export class EngineStateStore {
         ready: this.ready, draining: this.draining, alive,
         uptimeSeconds: Math.floor((Date.now() - this.startedAt.getTime()) / 1000), queueDepth: this.queueDepth,
         experimentId: this.experimentId, experimentStatus: this.experimentStatus,
+        experimentWs: this.experimentWs ? structuredClone(this.experimentWs) : null,
         discoveryStatus: this.discoveryStatus, discoveryLoopActive: this.discoveryLoopActive,
         marketMonitoring: this.marketMonitoring, qualifiedMarketCount: this.qualifiedMarketCount,
         overloadState: this.overloadState, journalDegraded: this.journalDegraded,

@@ -120,6 +120,8 @@ export interface FeedConnectionEvent {
   state: "CONNECTING" | "CONNECTED" | "DISCONNECTED" | "STALE" | "STOPPED";
   at: string;
   reconnectCount: number;
+  /** This attempt follows an unexpected stream failure, not discovery resubscription. */
+  reconnecting?: boolean;
   message?: string;
 }
 
@@ -164,6 +166,8 @@ export interface MinOrderSizeHydratedEvent {
 export interface PolymarketFeedHandlers {
   onSnapshot(snapshot: MarketSnapshot): Promise<void> | void;
   onConnection(event: FeedConnectionEvent): Promise<void> | void;
+  /** Raw owned-shard lifecycle; independent of aggregate UI connection state. */
+  onShardConnection?(event: FeedConnectionEvent & { shard: number; eventId: string }): Promise<void> | void;
   onError(error: Error): Promise<void> | void;
   onAnomaly?(anomaly: PolymarketFeedAnomaly): void;
   onGap?(event: MarketIngressGapEvent): void;
@@ -538,6 +542,7 @@ export class PolymarketMarketDataAdapter {
     this.setTokenIds(this.tokenIds.length > 0 ? this.tokenIds : tokenIds);
     const backoff = new ExponentialBackoff({ initialDelayMs: 500, maxDelayMs: 30_000, multiplier: 2, jitterRatio: 0.2 });
     let reconnectCount = 0;
+    let reconnectPending = false;
     const onAbort = () => { this.closeCurrentStream?.(); };
     if (signal.aborted) {
       await handlers.onConnection({ feed: "polymarket", state: "STOPPED", at: new Date().toISOString(), reconnectCount });
@@ -554,7 +559,7 @@ export class PolymarketMarketDataAdapter {
           try { await this.waitForTokens(signal); } catch { break; }
           continue;
         }
-        await handlers.onConnection({ feed: "polymarket", state: "CONNECTING", at: new Date().toISOString(), reconnectCount });
+        await handlers.onConnection({ feed: "polymarket", state: "CONNECTING", at: new Date().toISOString(), reconnectCount, reconnecting: reconnectPending });
         let resubscribed = false;
         const generation = ++this.streamGeneration;
         try {
@@ -593,7 +598,8 @@ export class PolymarketMarketDataAdapter {
           };
           if (signal.aborted || connectAbort.signal.aborted) this.closeCurrentStream();
           try {
-            await handlers.onConnection({ feed: "polymarket", state: "CONNECTED", at: new Date().toISOString(), reconnectCount });
+            await handlers.onConnection({ feed: "polymarket", state: "CONNECTED", at: new Date().toISOString(), reconnectCount, reconnecting: reconnectPending });
+            reconnectPending = false;
             let turnStarted = performance.now(), turnEvents = 0;
             for await (const event of stream) {
               if (signal.aborted) { await stream.close(); break; }
@@ -657,6 +663,7 @@ export class PolymarketMarketDataAdapter {
           }
           this.noteUnexpectedStreamLoss(unexpectedLossReason(normalized), handlers);
           reconnectCount += 1;
+          reconnectPending = true;
           if (!(normalized instanceof IngressOverflowError)) await handlers.onError(normalized);
           await handlers.onConnection({ feed: "polymarket", state: "DISCONNECTED", at: new Date().toISOString(), reconnectCount, message: normalized.message });
           const delay = backoff.nextDelay();

@@ -65,6 +65,24 @@ function registerMarket(adapter: PolymarketMarketDataAdapter, market: number): s
 }
 
 describe("pair-aware sharded Polymarket market feed", () => {
+  it("distinguishes unexpected reconnect from a later discovery resubscription with the same cumulative count", async () => {
+    const transport=new RecordingTransport();
+    const adapter=new PolymarketMarketDataAdapter(undefined,{transports:[transport],stableAfterMs:0});
+    const first=registerMarket(adapter,1);adapter.setTokenIds(first);
+    const abort=new AbortController();
+    const events:Array<{state:string;reconnecting?:boolean;reconnectCount:number}>=[];
+    const run=adapter.run(first,{onSnapshot:()=>undefined,onConnection:()=>undefined,onError:()=>undefined,
+      onShardConnection:e=>{events.push(e);}},abort.signal);
+    try{
+      await waitFor(()=>events.filter(e=>e.state==="CONNECTED").length===1);
+      transport.current().fail(new Error("MARKET_INGRESS_OVERFLOW:count_limit"));
+      await waitFor(()=>events.filter(e=>e.state==="CONNECTED").length===2);
+      expect(events.filter(e=>e.state==="CONNECTED")[1]).toMatchObject({reconnecting:true,reconnectCount:1});
+      const second=registerMarket(adapter,2);adapter.setTokenIds([...first,...second]);
+      await waitFor(()=>events.filter(e=>e.state==="CONNECTED").length===3);
+      expect(events.filter(e=>e.state==="CONNECTED")[2]).toMatchObject({reconnecting:false,reconnectCount:1});
+    }finally{abort.abort();await run;}
+  });
   it("uses four shards by default in the zero-argument production path", () => {
     const adapter = new PolymarketMarketDataAdapter();
     expect(DEFAULT_POLYMARKET_MARKET_SHARD_COUNT).toBe(4);
@@ -88,6 +106,7 @@ describe("pair-aware sharded Polymarket market feed", () => {
 
     const abort = new AbortController();
     const sequences: number[] = [];
+    const lifecycle: Array<{state:string;shard:number;eventId:string}> = [];
     let handlersInFlight = 0;
     let maxHandlersInFlight = 0;
 
@@ -100,10 +119,14 @@ describe("pair-aware sharded Polymarket market feed", () => {
         handlersInFlight -= 1;
       },
       onConnection: () => undefined,
+      onShardConnection: event => { lifecycle.push(event); },
       onError: () => undefined,
     }, abort.signal);
 
     await waitFor(() => transports.every((transport) => transport.subscribeCalls === 1));
+    await waitFor(() => lifecycle.filter(e=>e.state==="CONNECTED").length===4);
+    expect(lifecycle.filter(e=>e.state==="CONNECTED").map(e=>e.shard).sort()).toEqual([1,2,3,4]);
+    expect(new Set(lifecycle.map(e=>e.eventId)).size).toBe(lifecycle.length);
 
     for (let index = 0; index < transports.length; index += 1) {
       const market = index + 1;

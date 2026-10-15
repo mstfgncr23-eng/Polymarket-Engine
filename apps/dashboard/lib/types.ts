@@ -24,6 +24,9 @@ export interface DashboardSnapshot {
     queueDepth: number;
     experimentId: string | null;
     experimentStatus: string | null;
+    experimentWs?: { experimentId:string; startedAt:string|null; entryClosedAt:string|null; completedAt:string|null;
+      stats:{disconnects:number;reconnects:number;reconnectAttempts:number;overflows:number;slowConsumers:number;processRestarts:number;
+        reasons:Record<string,number>;shards:Array<{shard:number;disconnects:number;reconnects:number;overflows:number}>} } | null;
     discoveryStatus?: "ZERO_QUALIFIED" | "MONITORING" | "RECONCILING";
     discoveryLoopActive?: boolean;
     marketMonitoring?: boolean;

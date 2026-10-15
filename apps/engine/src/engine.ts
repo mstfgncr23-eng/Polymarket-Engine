@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { experimentWsEventSchema, marketWsReason, type ExperimentWsEvent } from "@pm/core";
 import { bookTiming, firstLegBookReason, officialMarketStartReason, firstLegEntryFilterReason, firstLegExecutionEconomics } from "./first-leg-admission.js";
 import type { GuardianView, GuardianMarket, GuardianUpdate } from "./guardian-link.js";
 import { currentGuardianConsensus } from "./guardian-link.js";
@@ -708,6 +709,9 @@ export class EngineService {
     await this.restoreAndRecover();
     await this.restoreReportSourceIntegrity();
     await this.recoverInterruptedFirstLegOrders();
+    if (this.experiment?.wsStats && ["RUNNING", "ENTRY_CLOSED"].includes(this.experiment.status))
+      await this.persistExperimentWsEvent({ eventId: createId("ws_restart"), kind: "PROCESS_RESTART", shard: 0,
+        retry: false, reason: "unknown", at: this.nowFn().toISOString() });
     // Pair the shutdown/recovered snapshot with a current Engine snapshot. This
     // avoids copying a multi-hour fallback replay tail for each small purge batch.
     if (this.env.GUARDIAN_SEPARATE_ENABLED && this.env.RETENTION_ENABLED && this.env.RETENTION_COMPACTION_ENABLED)
@@ -1404,6 +1408,8 @@ export class EngineService {
       onSnapshot: (snapshot) => this.onMarketSnapshot(snapshot),
       onMinOrderSizeHydrated: (event) => this.onMinOrderSizeHydrated(event),
       onConnection: (event) => this.onConnection(event),
+      onShardConnection: event => this.persistExperimentWsEvent({ eventId: event.eventId, kind: event.state,
+        shard: event.shard, retry: event.reconnecting ?? event.reconnectCount > 0, reason: marketWsReason(event.message), at: event.at }),
       onError: (error) => this.onFeedError("polymarket", error),
       onAnomaly: (anomaly) => this.onPolymarketAnomaly(anomaly),
       onGap: (event) => {
@@ -4546,8 +4552,10 @@ export class EngineService {
         aggregateId: fill.id,
         beforeCommit: async () => {
           if (priorFillAuthority) return;
-          if (this.settledMarkets.has(fill.marketId))
-            throw new FirstLegLifecycleGuardRejectedError(fill.marketId, "MARKET_ALREADY_SETTLED");
+          if (this.settledMarkets.has(fill.marketId)) {
+            if (economicIntent === "OPEN_FIRST_LEG") throw new FirstLegLifecycleGuardRejectedError(fill.marketId, "MARKET_ALREADY_SETTLED");
+            throw new RiskReductionLifecycleGuardRejectedError(fill.marketId, economicIntent ?? "HEDGE_SECOND_LEG", "MARKET_ALREADY_SETTLED");
+          }
           // NEW-fill TAKER BUY cash linearization at the serialized durable
           // boundary. The admission-time availableCash read is stale while this
           // call waits on DurableMutationGate: two TAKER BUYs on different
@@ -4978,6 +4986,27 @@ export class EngineService {
       residualExposure,
       finalState: d(residualQuantity).gt(0) ? "RESIDUAL_UNHEDGED" : "RISK_NEUTRALIZED",
     };
+  }
+
+  private async persistExperimentWsEvent(input: ExperimentWsEvent): Promise<void> {
+    const event = experimentWsEventSchema.parse(input), experimentId = this.experiment?.id;
+    if (!experimentId || event.kind === "STOPPED" || event.kind === "STALE"
+      || ((event.kind === "CONNECTED" || event.kind === "CONNECTING") && !event.retry)) return;
+    // Enqueue at callback arrival, on the same authority as entry-close and
+    // completion. No polling, per-book writes, or process-counter subtraction.
+    await this.durableGate.run(async () => {
+      const current = this.experiment;
+      if (!current || current.id !== experimentId || !["RUNNING", "ENTRY_CLOSED"].includes(current.status)
+        || !current.startedAt || Date.parse(event.at) < Date.parse(current.startedAt)) return;
+      await this.commitAuthoritative({ operationKey: `experiment-ws:${experimentId}:${event.eventId}`,
+        type: "EXPERIMENT_WS_EVENT", aggregateType: "experiment", aggregateId: experimentId,
+        buildPayload: () => ({ experimentId, event, derivedAudit: [{
+          id: derivedAuditEventId("EXPERIMENT_WS_EVENT", event.eventId), type: "EXPERIMENT_WS_EVENT",
+          aggregateType: "experiment", aggregateId: experimentId, traceId: experimentId,
+          payload: { experimentId, event },
+        }] }),
+      });
+    });
   }
 
   private async onConnection(event: FeedConnectionEvent): Promise<void> {
@@ -9497,6 +9526,9 @@ private buildEarlyAudit(
     this.state.experimentStatus = this.experiment?.status ?? null;
     this.state.experimentStartedAt = this.experiment?.startedAt ?? null;
     this.state.experimentCompletedAt = this.experiment?.completedAt ?? null;
+    this.state.experimentWs = this.experiment?.wsStats ? { experimentId: this.experiment.id,
+      startedAt: this.experiment.startedAt, entryClosedAt: this.experiment.status === "RUNNING" ? null : this.experiment.entryClosesAt,
+      completedAt: this.experiment.completedAt, stats: structuredClone(this.experiment.wsStats) } : null;
   }
 
   private pruneRuntimeBookkeeping(now = this.nowFn()): void {
