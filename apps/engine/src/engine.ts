@@ -447,6 +447,7 @@ export class EngineService {
   private readonly makerFlowStats = new Map<string,{observedTrades:number;exactPriceSellTrades:number;eligibleTrades:number;eligibleQuantity:string;firstEligibleEventId:string|null;lastEligibleEventId:string|null}>();
   private readonly makerTradeTails = new Map<string,Promise<void>>();
   private makerQuoteTimer: ReturnType<typeof setTimeout> | null = null;
+  private makerQuoteExpiryInFlight:Promise<void>|null=null;
   private readonly recentTrades = new Map<string, number>();
   // Only live directional quotes retain a continuation. Recovery cancels old
   // quotes without guessing what happened to their signal or public flow.
@@ -2987,11 +2988,26 @@ export class EngineService {
     const quotes=[...this.restingOrders.values()].filter(r=>r.order.makerFirst);
     if(!quotes.length)return;
     const delayMs=Math.max(1,Math.min(...quotes.map(r=>Date.parse(r.order.makerFirst!.expiresAt)))-this.nowFn().getTime());
-    this.makerQuoteTimer=setTimeout(()=>{this.makerQuoteTimer=null;void this.expireMakerQuotes().catch(error=>this.logger.error({err:error},'maker quote expiry failed'));},delayMs);
+    this.makerQuoteTimer=setTimeout(()=>{
+      this.makerQuoteTimer=null;
+      void this.durableGate.outside(()=>this.experimentBoundaryGate.outside(()=>this.expireMakerQuotes()))
+        .catch(error=>this.logger.error({err:error},'maker quote expiry failed'));
+    },delayMs);
     this.makerQuoteTimer.unref();
   }
 
-  private async expireMakerQuotes():Promise<void>{
+  private expireMakerQuotes():Promise<void>{
+    if(this.makerQuoteExpiryInFlight)return this.makerQuoteExpiryInFlight;
+    const work=this.expireMakerQuotesOnce();this.makerQuoteExpiryInFlight=work;
+    const tail=work.then(()=>undefined,()=>undefined);this.makerTradeTails.set('maker-expiry',tail);
+    void tail.then(()=>{
+      if(this.makerQuoteExpiryInFlight===work)this.makerQuoteExpiryInFlight=null;
+      if(this.makerTradeTails.get('maker-expiry')===tail)this.makerTradeTails.delete('maker-expiry');
+    });
+    return work;
+  }
+
+  private async expireMakerQuotesOnce():Promise<void>{
     if(this.overload.hasIntegrityFault)return;
     try{for(const r of [...this.restingOrders.values()]){
       if(!r.order.makerFirst)continue;
