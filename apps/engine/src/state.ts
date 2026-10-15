@@ -1,5 +1,5 @@
 import type { ActivationLatency, ConsensusDecision, ExternalAgentRoleId, GrokSignalEnvelope, LedgerState, MarketSnapshot, Position, QualificationReasonCode, RiskEvaluation, TriggerEvent } from "@pm/core";
-import { emptyResultAccounting, tradingResults, type ResultAccounting, type TradingResults } from "./trading-results.js";
+import { emptyResultAccounting, tradingResults, economicResults, type EconomicResults, type ResultAccounting, type TradingResults } from "./trading-results.js";
 
 export interface DecisionFeedItem {
   id: string;
@@ -46,6 +46,7 @@ export interface EngineReadiness {
 
 export interface DashboardSnapshot {
   tradingResults: TradingResults | null;
+  economicResults: EconomicResults | null;
   paperMode: true;
   generatedAt: string;
   engine: {
@@ -306,6 +307,7 @@ export class EngineStateStore {
     return {
       paperMode: true, generatedAt: new Date().toISOString(),
       tradingResults: tradingResults(this.resultAccounting),
+      economicResults: economicResults(this.resultAccounting),
       engine: {
         ready: this.ready, draining: this.draining, alive,
         uptimeSeconds: Math.floor((Date.now() - this.startedAt.getTime()) / 1000), queueDepth: this.queueDepth,

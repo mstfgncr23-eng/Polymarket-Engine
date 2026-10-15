@@ -15,7 +15,8 @@ export function firstLegEntryFilterReason(price: string | number | null | undefi
 /** Same net EV / executable notional semantics as decidePaperOrder. */
 export function firstLegExecutionEconomics(order: PaperOrder, book: MarketSnapshot, nowMs: number) {
   const proof = order.entryAdmission;
-  if (!proof || !Number.isFinite(proof.fairProbability) || nowMs > Date.parse(proof.signalExpiresAt))
+  if (!proof || !Number.isFinite(proof.fairProbability) || !Number.isFinite(nowMs)
+    || !Number.isFinite(Date.parse(proof.signalExpiresAt)) || nowMs >= Date.parse(proof.signalExpiresAt))
     return { reason: "ENTRY_ECONOMICS_UNAVAILABLE", price: null, expectedROI: null };
   const walk = walkBook(book.asks, order.quantity, order.requestedPrice, "BUY");
   const price = order.orderType === "MAKER" ? order.requestedPrice : walk.sufficientDepth ? walk.vwap : null;
@@ -32,7 +33,8 @@ export function officialMarketStartReason(market: Pick<DiscoveredMarket, "slug" 
   if (!market) return "ENTRY_MARKET_START_MISSING";
   const raw = market.raw;
   const event = raw.event && typeof raw.event === "object" ? raw.event as Record<string, unknown> : {};
-  const values = [raw.eventStartTime, event.eventStartTime].filter(x => x !== undefined && x !== null);
+  const eventSchedule = event.schedule && typeof event.schedule === "object" ? event.schedule as Record<string, unknown> : {};
+  const values = [raw.eventStartTime, event.eventStartTime, eventSchedule.startTime].filter(x => x !== undefined && x !== null);
   const parse = (x: unknown) => typeof x === "string" && /T.*(?:Z|[+-]\d\d:\d\d)$/.test(x) ? Date.parse(x) : NaN;
   const starts = values.map(parse);
   if (!starts.length || starts.some(x => !Number.isFinite(x))) return "ENTRY_MARKET_START_MISSING";

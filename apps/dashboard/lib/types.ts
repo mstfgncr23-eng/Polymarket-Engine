@@ -10,6 +10,8 @@ export interface CacheMetadata {
 }
 
 export interface DashboardSnapshot {
+  economicResults?: { trades: number; meteors: number; completedNetPnl: string; completedFees: string; worstTradeNetPnl: string;
+    buySpend: string; sellProceeds: string; settlementPayout: string; fees: string } | null;
   cache?: CacheMetadata;
   tradingResults?: { completed: number; wins: number; losses: number; breakeven: number; winRate: number | null } | null;
   paperMode: true;

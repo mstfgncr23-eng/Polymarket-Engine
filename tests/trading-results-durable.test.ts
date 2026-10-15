@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { createIdleExperiment, PaperLedger, type PaperFill } from "@pm/core";
 import { MemoryEventJournal } from "@pm/db";
 import { applyDurableTransition, cloneRecoverableState, plannedDurableTransition, validatePostReplayInvariants, type RecoverableEngineState } from "../apps/engine/src/recovery.js";
-import { emptyResultAccounting, tradingResults } from "../apps/engine/src/trading-results.js";
+import { emptyResultAccounting, tradingResults, economicResults } from "../apps/engine/src/trading-results.js";
 import { EngineStateStore } from "../apps/engine/src/state.js";
 import { EngineService } from "../apps/engine/src/engine.js";
 import { NoopGrokActivationBridge } from "../apps/engine/src/activation/index.js";
@@ -43,6 +43,9 @@ describe("durable episode result accounting", () => {
     settle(state); // Remaining inventory wins $1, prior safety sell loses $3.5 => loss.
     expect(tradingResults(state.resultAccounting!)).toEqual({ completed: 1, wins: 0, losses: 1, breakeven: 0, winRate: 0 });
     expect(state.resultAccounting!.episodes).toEqual({});
+    expect(economicResults(state.resultAccounting!)).toEqual({ trades: 1, meteors: 1, completedNetPnl: "-2.7", completedFees: "0.2",
+      worstTradeNetPnl: "-2.7", buySpend: "8", sellProceeds: "0.5", settlementPayout: "5", fees: "0.2" });
+    expect(state.ledger.snapshot().netTradingPnl).toBe("-2.7");
   });
 
   it("fully closed safety-exit episodes count once; a new market episode counts separately", () => {
@@ -80,6 +83,50 @@ describe("durable episode result accounting", () => {
     expect(store.snapshot().tradingResults).toEqual({ completed: 1, wins: 1, losses: 0, breakeven: 0, winRate: 1 });
     state.resultAccounting!.completed += 1;
     expect(validatePostReplayInvariants(state, 1, 1).reasons).toContain("result_accounting_invalid");
+  });
+});
+
+describe("P1-10 dollar cashflow authority", () => {
+  it.each(["0", "1"])("does not realize a locked pair before settlement; payout=%s gives identical real dollars", payoff => {
+    const state = bag();
+    applyFill(state, paperFill("btc-mkt", "UP", "0.65", { feeUsd: "0.05" }));
+    applyFill(state, paperFill("btc-mkt", "DOWN", "0.30", { feeUsd: "0.04" }));
+    expect(economicResults(state.resultAccounting!)!.completedNetPnl).toBe("0");
+    expect(tradingResults(state.resultAccounting!)!.completed).toBe(0);
+    settle(state, "btc-mkt", payoff);
+    expect(economicResults(state.resultAccounting!)).toMatchObject({ trades: 1, completedNetPnl: "0.41", completedFees: "0.09", settlementPayout: "10", fees: "0.09", meteors: 0 });
+    expect(state.ledger.snapshot().cash).toBe("1000.41");
+  });
+  it("includes partial entry fills, maker rebates, taker fees and safety SELL exactly once per closed trade", () => {
+    const state = bag();
+    applyFill(state, paperFill("btc-mkt", "UP", "0.65", { quantity: "4", feeUsd: "-0.01", liquidityRole: "MAKER" }));
+    applyFill(state, paperFill("btc-mkt", "UP", "0.70", { quantity: "6", feeUsd: "0.03" }));
+    applyFill(state, paperFill("btc-mkt", "UP", "0.30", { side: "SELL", quantity: "10", feeUsd: "0.02" }));
+    expect(economicResults(state.resultAccounting!)).toMatchObject({ trades: 1, completedNetPnl: "-3.84", completedFees: "0.04", fees: "0.04", meteors: 1, worstTradeNetPnl: "-3.84" });
+    expect(state.ledger.snapshot().cash).toBe("996.16");
+    applyFill(state, paperFill("btc-mkt", "UP", "0.65", { feeUsd: "0" }));
+    settle(state);
+    expect(economicResults(state.resultAccounting!)).toMatchObject({ trades: 2, completedNetPnl: "-0.34", meteors: 1 });
+  });
+  it("keeps legacy totals unavailable rather than inventing historical profit", () => {
+    const legacy = emptyResultAccounting(); delete legacy.economics;
+    expect(economicResults(legacy)).toBe(null);
+  });
+  it("same fill retry, checkpoint and restart preserve net dollars, fees and trade counts", async () => {
+    const journal = new MemoryEventJournal(); let engine = await startEngine(journal);
+    try {
+      await engine.beginExperiment();
+      const buy = paperFill("btc-mkt", "UP", "0.65", { feeUsd: "0.1" });
+      await engine.applyObservedFill(buy); await engine.applyObservedFill(buy);
+      const sell = paperFill("btc-mkt", "UP", "0.40", { side: "SELL", feeUsd: "0.1" });
+      await engine.applyObservedFill(sell); await engine.applyObservedFill(sell);
+      const before = engine.state.snapshot();
+      expect(before.economicResults).toMatchObject({ trades: 1, completedNetPnl: "-2.7", fees: "0.2", meteors: 1 });
+      await engine.checkpointForTest(); await engine.stop(); engine = await startEngine(journal);
+      expect(engine.state.snapshot().economicResults).toEqual(before.economicResults);
+      expect(engine.ledger.snapshot()).toEqual(before.balance);
+      expect((await journal.queryEvents({ types: ["PNL_SNAPSHOT"] })).at(-1)?.payload.economicResults).toEqual(before.economicResults);
+    } finally { await engine.stop(); }
   });
 });
 

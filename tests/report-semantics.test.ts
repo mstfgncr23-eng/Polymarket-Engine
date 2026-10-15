@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import { createJournalEvent } from "@pm/db";
 import type { Position } from "@pm/core";
 import { buildExperimentSummary } from "../apps/engine/src/report.js";
+import { emptyResultAccounting, economicResults, tradingResults } from "../apps/engine/src/trading-results.js";
+import { PaperLedger } from "@pm/core";
 
 const baseAt = new Date("2026-09-16T15:00:00.000Z");
 
@@ -37,6 +39,21 @@ function event(type: string, aggregateType: string, aggregateId: string, payload
 }
 
 describe("native final report semantics", () => {
+  it("uses durable whole-trade dollar totals instead of a settlement WIN count", () => {
+    const accounting = emptyResultAccounting();
+    accounting.completed = 1; accounting.losses = 1;
+    accounting.economics = { trades: 1, meteors: 1, completedNetPnl: "-2.7", completedFees: "0.2", worstTradeNetPnl: "-2.7",
+      buySpend: "8", sellProceeds: "0.5", settlementPayout: "5", fees: "0.2" };
+    const ledger = new PaperLedger("1000").snapshot();
+    ledger.realizedPnl = "-2.5"; ledger.fees = "0.2"; ledger.netTradingPnl = "-2.7";
+    const summary = buildExperimentSummary([
+      event("POSITION_WIN", "position", "pos:m1", { marketId: "m1" }, 1),
+      event("PNL_SNAPSHOT", "ledger", "exp", { ...ledger, economicResults: economicResults(accounting), tradingResults: tradingResults(accounting) }, 2),
+    ], "exp");
+    expect(summary.winLossDistribution).toEqual({ wins: 0, losses: 1, breakeven: 0 });
+    expect(summary.economicResults).toEqual(economicResults(accounting));
+    expect(summary.realizedNetTradingPnlUsd).toBe(-2.7);
+  });
   it("preserves historical directional exposure after the position settles", () => {
     const position = pos();
     const summary = buildExperimentSummary([

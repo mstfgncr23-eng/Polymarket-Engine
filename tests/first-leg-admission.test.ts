@@ -37,10 +37,12 @@ describe("P0-06 first-leg book authority", () => {
     expect(reason(book(), { canonicalTokenId: "new" })).toBe("ENTRY_BOOK_IDENTITY_CHANGED");
     expect(reason(book(), { expected: book({ sequence: 9 }) })).toBe("ENTRY_BOOK_CHANGED");
   });
-  it.each(["fresh", "stale", "async-replaced", "async-stale"])("guards the actual durable first BUY with %s and leaves cash intact on veto", async scenario => {
+  it.each(["fresh", "stale", "async-replaced", "async-stale", "before-start", "missing-start", "low-price", "low-roi", "boundary"])("guards the actual durable first BUY with %s and leaves cash intact on veto", async scenario => {
     const adapter = new ScriptedMarketAdapter();
     const market = qualified("entry", "XRP", "entry-up", "entry-down", new Date(NOW + 900000).toISOString());
     market.raw = { eventStartTime: new Date(NOW - 1).toISOString() };
+    if (scenario === "before-start") market.raw = { eventStartTime: new Date(NOW + 1).toISOString() };
+    if (scenario === "missing-start") market.raw = {};
     adapter.queue(discoveryReport([market]));
     const journal = new MemoryEventJournal();
     const engine = new EngineService(qualifiedPaperEnv(), journal, { error: () => undefined }, {
@@ -49,6 +51,8 @@ describe("P0-06 first-leg book authority", () => {
     await engine.start();
     try {
       const b = book(scenario === "stale" ? { sourceTimestamp: new Date(NOW - 60000).toISOString() } : {});
+      if (scenario === "low-price") b.asks[0]!.price = "0.6499";
+      if (scenario === "boundary") { b.asks[0]!.price = "0.65"; b.feeSchedule = { ...b.feeSchedule!, rate: "0" }; }
       adapter.markTokenSync(b.tokenId, "SYNCED"); engine.state.marketSnapshots.set(b.tokenId, b);
       const originalRead = journal.readDurableByOperationKey.bind(journal);
       let reads = 0;
@@ -61,13 +65,14 @@ describe("P0-06 first-leg book authority", () => {
         return result;
       };
       const before = engine.ledger.snapshot().cash;
-      const executionOrder = order("TAKER", { marketId: "entry", tokenId: b.tokenId, quantity: "2", requestedPrice: "0.70",
-        entryAdmission: { fairProbability: 0.9, signalExpiresAt: new Date(NOW + 60000).toISOString() } });
+      const executionOrder = order("TAKER", { marketId: "entry", tokenId: b.tokenId, quantity: "2", requestedPrice: b.asks[0]!.price,
+        entryAdmission: { fairProbability: scenario === "low-roi" ? 0.71 : scenario === "boundary" ? 0.65975 : 0.9, signalExpiresAt: new Date(NOW + 60000).toISOString() } });
       await (engine as unknown as { applyFill: (f: ReturnType<typeof paperFill>, e: { intent: "OPEN_FIRST_LEG"; executionSnapshot: MarketSnapshot; executionOrder: PaperOrder }) => Promise<boolean> })
         .applyFill(paperFill("entry", "UP", "0.70", { tokenId: b.tokenId, quantity: "2" }), { intent: "OPEN_FIRST_LEG", executionSnapshot: b, executionOrder });
       const rows = await journal.queryDurableTransitions({ types: ["PAPER_FILL"], limit: 10 });
-      expect(rows).toHaveLength(scenario === "fresh" ? 1 : 0);
-      if (scenario !== "fresh") expect(engine.ledger.snapshot().cash).toBe(before);
+      const accepted = scenario === "fresh" || scenario === "boundary";
+      expect(rows).toHaveLength(accepted ? 1 : 0);
+      if (!accepted) expect(engine.ledger.snapshot().cash).toBe(before);
       expect(engine.integrityFault()).toBe(false);
     } finally { await engine.stop(); }
   });
@@ -104,5 +109,9 @@ describe("P0-01 official fixing start", () => {
   });
   it("uses epoch time across timezones", () => {
     expect(officialMarketStartReason({ ...market, raw: { eventStartTime: "2026-10-15T05:00:00+03:00" } }, NOW)).toBe(null);
+  });
+  it("accepts the official SDK event schedule fixing time, never its listing startDate", () => {
+    expect(officialMarketStartReason({ ...market, raw: { event: { schedule: { startTime: new Date(NOW).toISOString() } } } }, NOW)).toBe(null);
+    expect(officialMarketStartReason({ ...market, raw: { event: { schedule: { startDate: new Date(NOW).toISOString() } } } }, NOW)).toBe("ENTRY_MARKET_START_MISSING");
   });
 });

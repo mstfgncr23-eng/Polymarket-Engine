@@ -100,6 +100,10 @@ export interface GuardianOutcomeCounts {
   earlyExits: number; lateExits: number; pairedSettlements: number; nakedSettlements: number;
 }
 export interface ExperimentSummary {
+  economicResults?: { trades: number; meteors: number; completedNetPnl: string; completedFees: string; worstTradeNetPnl: string;
+    buySpend: string; sellProceeds: string; settlementPayout: string; fees: string } | null;
+  realizedNetTradingPnlUsd?: number;
+  unrealizedPnlUsd?: number;
   /** Guardian exits include both SELL and rescue BUY; settlements retain their economic classification. */
   guardianOutcomes?: GuardianOutcomeCounts;
   /** Actual diagnostic positions, finalized only by canonical settlement. */

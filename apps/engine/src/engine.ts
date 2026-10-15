@@ -167,7 +167,7 @@ import { HotResearchCache, isScoutRole, SCOUT_ROLES } from "./activation/hot-res
 import { BoundedJournalWriter } from "./journal-writer.js";
 import { evaluateExperimentPreflight, isGenuineEntryQualifiedMarket } from "./preflight.js";
 import { CrashInjectedError, CrashInjector, type CrashInjectionPoint } from "./crash-injection.js";
-import { emptyResultAccounting, resultAccountingSchema } from "./trading-results.js";
+import { emptyResultAccounting, resultAccountingSchema, economicResults, tradingResults } from "./trading-results.js";
 import { DurableMutationGate } from "./durable-gate.js";
 import {
   applyDurableTransition,
@@ -1970,7 +1970,7 @@ export class EngineService {
     type: string;
     aggregateType: string;
     aggregateId: string;
-    buildPayload: (occurredAt: Date) => Record<string, unknown>;
+    buildPayload: (occurredAt: Date, existing?: DurableTransition | null) => Record<string, unknown>;
     occurredAt?: Date;
     beforeCommit?: () => void | Promise<void>;
     afterApply?: (transition: DurableTransition) => Promise<void>;
@@ -1991,7 +1991,10 @@ export class EngineService {
       try {
         // Build once before the first lookup. Both attempts retain the same
         // revision, audit records and authoritative business plan.
-        const built = input.buildPayload(occurredAt);
+        // A queued duplicate SELL may have already closed inventory. Resolve
+        // its identity inside this gate before attempting a NEW-fill projection.
+        const existingFill = input.type === "PAPER_FILL" ? await this.journal.readDurableByOperationKey(input.operationKey) : undefined;
+        const built = input.buildPayload(occurredAt, existingFill);
         const recordedAt = new Date().toISOString();
         // Complete current identities once, before either durable retry attempt.
         if (Array.isArray(built.derivedAudit)) built.derivedAudit = (built.derivedAudit as DerivedAuditRecord[]).map(r => ({
@@ -4661,7 +4664,7 @@ export class EngineService {
             throw new FirstLegLifecycleGuardRejectedError(fill.marketId, "PAIRING_ALREADY_STARTED");
           }
         },
-        buildPayload: (occurredAt) => {
+        buildPayload: (occurredAt, existingFill) => {
           const previousAtCommit = this.ledger.positions.get(fill.marketId);
           const wasEmptyAtCommit = !previousAtCommit
             || (!d(previousAtCommit.upQuantity).gt(0) && !d(previousAtCommit.downQuantity).gt(0));
@@ -4681,7 +4684,7 @@ export class EngineService {
           };
           return {
             ...auth,
-            derivedAudit: this.projectDerivedAudit(
+            derivedAudit: existingFill ? [] : this.projectDerivedAudit(
               { operationKey: `fill:${fill.id}`, type: "PAPER_FILL", aggregateType: "paper_fill", aggregateId: fill.id, payload: auth },
               occurredAt,
               (projected) => this.buildFillDerivedAudit(
@@ -4692,6 +4695,15 @@ export class EngineService {
                 economicIntent,
                 extras.deRisk,
                 unhedgedStartedAtBefore,
+                extras.executionSnapshot && (extras.executionOrder ?? restingAtAdmission?.order) ? {
+                  ...firstLegExecutionEconomics((extras.executionOrder ?? restingAtAdmission!.order), extras.executionSnapshot, this.nowFn().getTime()),
+                  checkedAt: this.nowFn().toISOString(), book: { marketId: extras.executionSnapshot.marketId, tokenId: extras.executionSnapshot.tokenId,
+                    outcome: extras.executionSnapshot.outcome, eventId: extras.executionSnapshot.eventId, sequence: extras.executionSnapshot.sequence,
+                    sourceTimestamp: extras.executionSnapshot.sourceTimestamp, receivedAt: extras.executionSnapshot.receivedAt, wsCallbackAt: extras.executionSnapshot.wsCallbackAt ?? null },
+                  timing: bookTiming(extras.executionSnapshot, this.nowFn().getTime()), maxBookAgeMs: this.riskLimits.staleFeedTimeoutMs,
+                  marketSlug: this.marketsById.get(fill.marketId)?.slug ?? null,
+                  startVerified: officialMarketStartReason(this.marketsById.get(fill.marketId), this.nowFn().getTime()) === null,
+                } : undefined,
               ),
             ),
           };
@@ -4757,6 +4769,7 @@ export class EngineService {
     intent?: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK" | "RESCUE_SECOND_LEG" | "GUARDIAN_PROTECTIVE_SELL",
     deRisk?: ProtectiveDeRiskAudit,
     unhedgedStartedAtBefore: string | null = null,
+    entryAdmission?: Record<string, unknown>,
   ): DerivedAuditRecord[] {
     const position = projected.ledger.positions.get(fill.marketId);
     const experimentId = projected.experiment?.id ?? this.experiment?.id ?? null;
@@ -4770,6 +4783,7 @@ export class EngineService {
         ...fill,
         asset: this.assetByMarket.get(fill.marketId) ?? null,
         ...(intent ? { intent } : {}),
+        ...(intent === "OPEN_FIRST_LEG" && entryAdmission ? { entryAdmission } : {}),
         ...(deRisk ? {
           deRisk: this.finalizeProtectiveDeRiskAudit(deRisk, fill, position),
         } : {}),
@@ -4856,7 +4870,9 @@ export class EngineService {
       aggregateType: "ledger",
       aggregateId: experimentId ?? "paper",
       traceId: fill.traceId,
-      payload: { ...projected.ledger.snapshot(), experimentId, source: "FILL", fillId: fill.id },
+      payload: { ...projected.ledger.snapshot(), experimentId, source: "FILL", fillId: fill.id,
+        economicResults: projected.resultAccounting ? economicResults(projected.resultAccounting) : null,
+        tradingResults: projected.resultAccounting ? tradingResults(projected.resultAccounting) : null },
     });
     const completedOwner = this.riskReductionOwners.get(fill.marketId);
     if (completedOwner?.order.id === fill.orderId) {
@@ -8886,7 +8902,9 @@ private buildEarlyAudit(
         if (positionBefore) {
           const cashDelta = settlementCashDelta(positionBefore, upPayoff, downPayoff);
           const realizedDelta = settlementRealizedDelta(positionBefore, upPayoff, downPayoff);
-          const outcome = classifySettledOutcome(realizedDelta, positionBefore.totalFees);
+          const priorRealized = this.state.resultAccounting.episodes[marketId]?.realized ?? "0";
+          const wholeEpisodeRealized = d(realizedDelta).plus(priorRealized).toFixed();
+          const outcome = classifySettledOutcome(wholeEpisodeRealized, positionBefore.totalFees);
           const grossOutcome = classifySettledOutcome(realizedDelta, "0");
           extra.push({
             id: derivedAuditEventId("POSITION_SETTLED", marketId),
@@ -8895,7 +8913,7 @@ private buildEarlyAudit(
             aggregateId: positionBefore.id,
             traceId: positionBefore.id,
             payload: {
-              marketId, asset, cashDelta, realizedDelta,
+              marketId, asset, cashDelta, realizedDelta, episodeNetPnl: d(wholeEpisodeRealized).minus(positionBefore.totalFees).toFixed(),
               upPayoff, downPayoff, winner: parsed.winner,
               upQuantity: positionBefore.upQuantity, downQuantity: positionBefore.downQuantity,
               feesUsd: positionBefore.totalFees, grossOutcome, outcome, experimentId,
@@ -8934,7 +8952,9 @@ private buildEarlyAudit(
           aggregateType: "ledger",
           aggregateId: experimentId ?? "paper",
           traceId: experimentId ?? "paper",
-          payload: { ...state.ledger.snapshot(), experimentId, source: "SETTLEMENT", marketId },
+          payload: { ...state.ledger.snapshot(), experimentId, source: "SETTLEMENT", marketId,
+            economicResults: state.resultAccounting ? economicResults(state.resultAccounting) : null,
+            tradingResults: state.resultAccounting ? tradingResults(state.resultAccounting) : null },
         });
         return extra;
       },

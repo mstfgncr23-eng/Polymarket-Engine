@@ -584,7 +584,11 @@ export function applyDurableTransition(state: RecoverableEngineState, transition
       case "POSITION_SETTLED": {
         const payload = settlementPayloadSchema.parse(transition.payload);
         const settled = state.ledger.settlePosition(payload.marketId, payload.upPayoff, payload.downPayoff, new Date(payload.settledAt));
-        if (settled) completeResult(state.resultAccounting ??= emptyResultAccounting(), payload.marketId, settled.realizedDelta, settled.position.totalFees);
+        if (settled) {
+          const accounting = state.resultAccounting ??= emptyResultAccounting();
+          if (accounting.economics) accounting.economics.settlementPayout = d(accounting.economics.settlementPayout).plus(settled.cashDelta).toFixed();
+          completeResult(accounting, payload.marketId, settled.realizedDelta, settled.position.totalFees);
+        }
         state.settlementLookups?.delete(payload.marketId);
         state.riskReductionOwners?.delete(payload.marketId);
         state.riskReductionFailures?.delete(payload.marketId);

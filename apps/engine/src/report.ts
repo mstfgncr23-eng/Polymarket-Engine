@@ -1,5 +1,6 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
+import type { EconomicResults, TradingResults } from "./trading-results.js";
 import { d, renderExperimentSummaryMarkdown, type ExperimentSummary, type GuardianOutcomeCounts, type JournalEvent, type LedgerState, type MarketAssetAttribution, type PaperFill, type Position } from "@pm/core";
 
 export function includeCurrentExperimentEvent(
@@ -356,13 +357,15 @@ export class ExperimentSummaryAccumulator {
     const completedPairs = positions.filter((position) => Number(position.pairedQuantity) > 0 && Number(position.unpairedQuantity) === 0).length
       + this.settlementBothQty;
     const unhedged = positions.filter((position) => Number(position.unpairedQuantity) > 0);
-    const ledger = this.lastLedger;
+    const ledger = this.lastLedger as (LedgerState & { economicResults?: EconomicResults | null; tradingResults?: TradingResults | null }) | undefined;
     const grossPnl = Number(ledger?.grossPnl ?? 0);
     const netTradingPnl = Number(ledger?.netTradingPnl ?? 0);
     const aiCost = Number(ledger?.aiCost ?? 0);
     const infraCost = Number(ledger?.infrastructureCost ?? 0);
     const pairCosts = positions.filter((position) => Number(position.pairedQuantity) > 0).map((position) => Number(position.combinedPairCost));
-    const netWl = { wins: this.positionWins, losses: this.positionLosses, breakeven: this.positionBreakeven };
+    const netWl = ledger?.tradingResults
+      ? { wins: ledger.tradingResults.wins, losses: ledger.tradingResults.losses, breakeven: ledger.tradingResults.breakeven }
+      : { wins: this.positionWins, losses: this.positionLosses, breakeven: this.positionBreakeven };
     const grossWl = (this.grossWins + this.grossLosses + this.grossBreakeven) === 0
       ? netWl
       : { wins: this.grossWins, losses: this.grossLosses, breakeven: this.grossBreakeven };
@@ -386,6 +389,9 @@ export class ExperimentSummaryAccumulator {
       grossPnlUsd: grossPnl, feesUsd: Number(ledger?.fees ?? 0), slippageUsd: Number(ledger?.slippage ?? 0),
       netTradingPnlUsd: netTradingPnl, aiCostUsd: aiCost, estimatedInfrastructureCostUsd: infraCost,
       economicPnlUsd: Number(ledger?.netEconomicPnl ?? netTradingPnl - aiCost - infraCost),
+      economicResults: ledger?.economicResults ?? null,
+      realizedNetTradingPnlUsd: d(ledger?.realizedPnl ?? "0").minus(ledger?.fees ?? "0").toNumber(),
+      unrealizedPnlUsd: Number(ledger?.unrealizedPnl ?? 0),
       maximumDrawdownUsd: Math.max(0, this.maxDrawdown),
       maximumDirectionalExposureUsd: Math.max(0, this.maxDirectionalExposureUsd),
       averageUnhedgedDurationMs: this.hedgeDurationN ? this.hedgeDurationSum / this.hedgeDurationN : 0,
