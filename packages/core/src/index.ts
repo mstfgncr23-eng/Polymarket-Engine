@@ -10,6 +10,7 @@ export * from "./decision.js";
 export * from "./domain.js";
 export * from "./execution.js";
 export * from "./maker-first.js";
+export * from "./two-sided-maker.js";
 export * from "./experiment.js";
 export * from "./fair-edge.js";
 export * from "./journal-types.js";
