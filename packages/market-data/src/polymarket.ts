@@ -15,7 +15,7 @@ import {
   type QualificationResult,
 } from "@pm/core";
 import { BoundedClobMarketTransport, ClobMarketCloseError } from "./bounded-clob-market.js";
-import { BoundedIngressQueue, IngressOverflowError, type IngressQueueObserver } from "./bounded-ingress.js";
+import { BoundedIngressQueue, IngressOverflowError, type IngressQueueObserver, type SharedIngressBudget } from "./bounded-ingress.js";
 import {
   CLOB_MARKET_WS_URL,
   MARKET_CONNECT_BOUNDS,
@@ -396,6 +396,8 @@ export class PolymarketMarketDataAdapter {
     const state = this.books.get(tokenId);
     return state ? { bids: new Map(state.bidLevels.map(x=>[x.price,x.quantity])), asks: new Map(state.askLevels.map(x=>[x.price,x.quantity])), timestamp: state.timestamp } : undefined;
   }
+  attachSharedIngressBudget(budget: SharedIngressBudget): void {this.ingress.attachSharedBudget(budget);}
+  ingressLimits(): {maxEvents:number;maxBytes:number} {return {maxEvents:this.ingress.maxEvents,maxBytes:this.ingress.maxBytes};}
   activeStreamCount(): number { return this.activeStreams; }
 
   /** Same normalize path as the live feed. Intended for replay/equivalence tests. */
@@ -640,8 +642,13 @@ export class PolymarketMarketDataAdapter {
             ) {
               backoff.reset();
             }
-            this.closeCurrentStream = null;
-            this.activeStreams = Math.max(0, this.activeStreams - 1);
+            // Iterator failure/end is also a transport terminal. Close before
+            // opening another generation; close is idempotent and preserves an
+            // already-recorded remote/overflow diagnostic.
+            try { await stream.close(); } finally {
+              this.closeCurrentStream = null;
+              this.activeStreams = Math.max(0, this.activeStreams - 1);
+            }
           }
           if (signal.aborted) break;
           if (resubscribed || this.tokenIds.length === 0 || generation !== this.streamGeneration) continue;

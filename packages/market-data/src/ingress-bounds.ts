@@ -63,6 +63,10 @@ export interface IngressQueueSnapshot {
   accepted: number;
   processed: number;
   gapTotal: number;
+  borrowedEvents?: number;
+  borrowedBytes?: number;
+  poolMaxEvents?: number;
+  poolMaxBytes?: number;
 }
 
 export interface TokenSyncSnapshot {

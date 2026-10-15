@@ -55,6 +55,9 @@ export class EngineMetrics {
   readonly sourceEventNormalization = new ScalarHistogram({ name: "market_source_event_normalization_seconds", help: "Complete source event normalization including validation and copy-on-write, before Engine dispatch", buckets: DURATION_BUCKETS, registers: [this.registry] });
   readonly ingressAccepted = new Gauge({ name: "market_ingress_accepted_events", help: "Cumulative raw source events admitted in this process; never reset per experiment", registers: [this.registry] });
   readonly ingressProcessed = new Gauge({ name: "market_ingress_processed_events", help: "Cumulative raw source events dequeued in this process; never reset per experiment", registers: [this.registry] });
+  readonly ingressCapacityEvents = new Gauge({name:"market_ingress_capacity_events",help:"Fixed total event quota across owned shards",registers:[this.registry]});
+  readonly ingressCapacityBytes = new Gauge({name:"market_ingress_capacity_bytes",help:"Fixed total approximate-byte quota across owned shards",registers:[this.registry]});
+  readonly ingressBorrowedEvents = new Gauge({name:"market_ingress_borrowed_events",help:"Hot shard queued events borrowing idle quota; total cap remains fixed",registers:[this.registry]});
   readonly shardIngress = new Gauge({ name: "market_shard_ingress", help: "Bounded per-shard queue, cumulative source counts and subscription load", labelNames: ["shard", "measure"], registers: [this.registry] });
   readonly marketMessages = new Counter({ name: "market_messages_total", help: "Normalized market messages", registers: [this.registry] });
   readonly bookSourceToIngress = new ScalarHistogram({ name: "book_source_to_ingress_seconds", help: "Source to owned WebSocket callback; absent when callback provenance is unavailable", buckets: DURATION_BUCKETS, registers: [this.registry] });
@@ -764,13 +767,16 @@ export class EngineMetrics {
     };
   }
 
-  noteIngressSnapshot(input: { depth: number; bytes: number; highWaterEvents: number; highWaterBytes: number; accepted?: number; processed?: number }): void {
+  noteIngressSnapshot(input: { depth: number; bytes: number; highWaterEvents: number; highWaterBytes: number; accepted?: number; processed?: number; poolMaxEvents?:number;poolMaxBytes?:number;borrowedEvents?:number }): void {
     this.marketIngressQueueDepth.set(input.depth);
     this.marketIngressQueueBytes.set(input.bytes);
     this.marketIngressHighWater.set(input.highWaterEvents);
     this.marketIngressHighWaterBytes.set(input.highWaterBytes);
     if (input.accepted !== undefined) this.ingressAccepted.set(input.accepted);
     if (input.processed !== undefined) this.ingressProcessed.set(input.processed);
+    if(input.poolMaxEvents!==undefined)this.ingressCapacityEvents.set(input.poolMaxEvents);
+    if(input.poolMaxBytes!==undefined)this.ingressCapacityBytes.set(input.poolMaxBytes);
+    this.ingressBorrowedEvents.set(input.borrowedEvents??0);
   }
 
   noteShardSnapshots(input: readonly { shard: number; tokenCount: number; unsynchronizedTokens: number;

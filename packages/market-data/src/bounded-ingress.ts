@@ -35,6 +35,50 @@ export interface IngressQueueObserver {
   onChange(snapshot: IngressQueueSnapshot): void;
 }
 
+/** Redistributes the existing aggregate budget across owned socket FIFOs.
+ * Idle-shard capacity may absorb a hot shard's burst; every other shard keeps
+ * a reserved admission allowance. Total event/byte limits never increase. */
+export class SharedIngressBudget {
+  private readonly queues = new Set<BoundedIngressQueue>();
+  private events = 0;
+  private bytes = 0;
+  private highWaterEvents = 0;
+  private highWaterBytes = 0;
+  constructor(readonly maxQueues: number, readonly maxEvents: number, readonly maxBytes: number,
+    readonly reserveEvents = 1024, readonly reserveBytes = 512 * 1024) {
+    if (![maxQueues,maxEvents,maxBytes,reserveEvents,reserveBytes].every(x=>Number.isInteger(x)&&x>0)
+      || reserveEvents*maxQueues>maxEvents || reserveBytes*maxQueues>maxBytes) throw Error("INVALID_SHARED_INGRESS_BUDGET");
+  }
+  register(queue: BoundedIngressQueue): void {
+    if (this.queues.has(queue) || this.queues.size >= this.maxQueues || queue.depth || queue.accepted)
+      throw Error("SHARED_INGRESS_REGISTRATION_INVALID");
+    this.queues.add(queue);
+  }
+  canAdmit(queue: BoundedIngressQueue, count: number, bytes: number): {ok:true}|{ok:false;reason:"count_limit"|"byte_limit"} {
+    let reservedEvents=(this.maxQueues-this.queues.size)*this.reserveEvents;
+    let reservedBytes=(this.maxQueues-this.queues.size)*this.reserveBytes;
+    for (const other of this.queues) if (other!==queue) {
+      reservedEvents+=Math.max(0,Math.min(this.reserveEvents,other.maxEvents)-other.depth);
+      reservedBytes+=Math.max(0,Math.min(this.reserveBytes,other.maxBytes)-other.queuedBytes);
+    }
+    if(this.events+count+reservedEvents>this.maxEvents)return {ok:false,reason:"count_limit"};
+    if(this.bytes+bytes+reservedBytes>this.maxBytes)return {ok:false,reason:"byte_limit"};
+    return {ok:true};
+  }
+  recordEnqueue(bytes: number): void {
+    this.events++;this.bytes+=bytes;
+    this.highWaterEvents=Math.max(this.highWaterEvents,this.events);
+    this.highWaterBytes=Math.max(this.highWaterBytes,this.bytes);
+  }
+  release(count: number, bytes: number): void {
+    this.events-=count;this.bytes-=bytes;
+    if(this.events<0||this.bytes < -1e-7)throw Error("SHARED_INGRESS_ACCOUNTING_INVALID");
+    if(Math.abs(this.bytes)<1e-7)this.bytes=0;
+  }
+  snapshot() {return {depth:this.events,bytes:this.bytes,highWaterEvents:this.highWaterEvents,highWaterBytes:this.highWaterBytes,
+    poolMaxEvents:this.maxEvents,poolMaxBytes:this.maxBytes};}
+}
+
 export class BoundedIngressQueue {
   private readonly items: QueuedIngress[] = [];
   private head = 0;
@@ -56,6 +100,12 @@ export class BoundedIngressQueue {
     readonly maxBytes: number = MARKET_INGRESS_BOUNDS.maxBytes,
   ) {}
 
+  private sharedBudget: SharedIngressBudget | null = null;
+  attachSharedBudget(budget: SharedIngressBudget): void {
+    if(this.sharedBudget)throw Error("SHARED_INGRESS_ALREADY_ATTACHED");
+    budget.register(this);this.sharedBudget=budget;
+  }
+
   get depth(): number { return this.items.length - this.head; }
   get queuedBytes(): number { return this.bytes; }
 
@@ -70,17 +120,12 @@ export class BoundedIngressQueue {
     bytes: number,
   ): { ok: true } | { ok: false; reason: Extract<IngressGapReason, "count_limit" | "byte_limit"> } {
     const size = Number.isFinite(bytes) && bytes >= 0 ? bytes : 16;
-    if (this.depth >= this.maxEvents) {
-      this.noteGap("count_limit");
-      return { ok: false, reason: "count_limit" };
-    }
-    if (this.bytes + size > this.maxBytes) {
-      this.noteGap("byte_limit");
-      return { ok: false, reason: "byte_limit" };
-    }
+    const admission=this.canAdmit(1,size);
+    if(!admission.ok){this.noteGap(admission.reason);return admission;}
     this.items.push({ event, bytes: size });
     this.bytes += size;
     this.accepted += 1;
+    this.sharedBudget?.recordEnqueue(size);
     if (this.depth > this.highWaterEvents) this.highWaterEvents = this.depth;
     if (this.bytes > this.highWaterBytes) this.highWaterBytes = this.bytes;
     this.publish(false);
@@ -88,6 +133,7 @@ export class BoundedIngressQueue {
   }
 
   canAdmit(count: number, bytes: number): { ok: true } | { ok: false; reason: Extract<IngressGapReason, "count_limit" | "byte_limit"> } {
+    if(this.sharedBudget)return this.sharedBudget.canAdmit(this,count,bytes);
     if (this.depth + count > this.maxEvents) return { ok: false, reason: "count_limit" };
     if (this.bytes + bytes > this.maxBytes) return { ok: false, reason: "byte_limit" };
     return { ok: true };
@@ -105,6 +151,7 @@ export class BoundedIngressQueue {
     this.head += 1;
     this.bytes -= item.bytes;
     this.processed += 1;
+    this.sharedBudget?.release(1,item.bytes);
     if (this.head >= 1_024) {
       this.items.splice(0, this.head);
       this.head = 0;
@@ -115,9 +162,11 @@ export class BoundedIngressQueue {
 
   /** Drain queued events. Does not increment gapTotal — overflow already counted at tryEnqueue. */
   clear(): void {
+    const count=this.depth,bytes=this.bytes;
     this.items.length = 0;
     this.head = 0;
     this.bytes = 0;
+    this.sharedBudget?.release(count,bytes);
     this.publish(false);
   }
 
@@ -134,6 +183,8 @@ export class BoundedIngressQueue {
       accepted: this.accepted,
       processed: this.processed,
       gapTotal: this.gapTotal,
+      ...(this.sharedBudget ? {borrowedEvents:Math.max(0,this.depth-this.maxEvents),borrowedBytes:Math.max(0,this.bytes-this.maxBytes),
+        poolMaxEvents:this.sharedBudget.maxEvents,poolMaxBytes:this.sharedBudget.maxBytes} : {}),
     };
   }
 

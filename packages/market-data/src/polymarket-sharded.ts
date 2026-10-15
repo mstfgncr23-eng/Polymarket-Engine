@@ -1,5 +1,5 @@
 import { createId, type MarketSnapshot } from "@pm/core";
-import { type IngressQueueObserver } from "./bounded-ingress.js";
+import { SharedIngressBudget, type IngressQueueObserver } from "./bounded-ingress.js";
 import type { IngressGapReason, IngressQueueSnapshot, TokenSyncState } from "./ingress-bounds.js";
 import { isBoundedMarketStreamTransport, type MarketStreamTransport } from "./market-stream-transport.js";
 import {
@@ -24,6 +24,9 @@ type ConnectionState = FeedConnectionEvent["state"];
 type TokenGroup = { key: string; tokenIds: string[] };
 
 export interface ShardedPolymarketAdapterOptions extends SingleOptions {
+  /** Production shares the existing aggregate quota; explicit legacy test
+   * transports opt in to exercise the same policy. */
+  sharedIngressBudget?: boolean;
   /**
    * Test seam only. Production constructs DEFAULT_POLYMARKET_MARKET_SHARD_COUNT
    * independent owned transports. Supplying transports makes their positive
@@ -74,6 +77,7 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
   private readonly sharded: boolean;
   private readonly shardCount: number;
   private readonly shards: readonly SinglePolymarketMarketDataAdapter[];
+  private sharedBudget: SharedIngressBudget | null = null;
   private shardedRunStarted = false;
   private readonly ownerByToken = new Map<string, number>();
   private readonly ownerByGroup = new Map<string, number>();
@@ -96,7 +100,7 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
   private snapshotTails: Promise<void>[] = [];
 
   constructor(client?: SingleClient, options: ShardedPolymarketAdapterOptions = {}) {
-    const { transports, ...singleOptions } = options;
+    const { transports, sharedIngressBudget, ...singleOptions } = options;
     super(client, singleOptions);
 
     if (transports && transports.length === 0) {
@@ -134,6 +138,13 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
       if (singleOptions.minOrderSizeMaxAttempts !== undefined) childOptions.minOrderSizeMaxAttempts = singleOptions.minOrderSizeMaxAttempts;
       return new SinglePolymarketMarketDataAdapter(client, childOptions);
     });
+    if (sharedIngressBudget ?? !transports) {
+      const limits=this.shards.map(shard=>shard.ingressLimits());
+      this.sharedBudget=new SharedIngressBudget(this.shardCount,
+        limits.reduce((n,x)=>n+x.maxEvents,0),limits.reduce((n,x)=>n+x.maxBytes,0),
+        Math.min(1024,...limits.map(x=>x.maxEvents)),Math.min(512*1024,...limits.map(x=>x.maxBytes)));
+      for(const shard of this.shards)shard.attachSharedIngressBudget(this.sharedBudget);
+    }
   }
 
   marketShardCount(): number { return this.sharded ? this.shardCount : 1; }
@@ -194,14 +205,17 @@ export class ShardedPolymarketMarketDataAdapter extends SinglePolymarketMarketDa
     const bytes = snapshots.reduce((sum, item) => sum + item.bytes, 0);
     this.aggregateIngressHighWaterEvents = Math.max(this.aggregateIngressHighWaterEvents, depth);
     this.aggregateIngressHighWaterBytes = Math.max(this.aggregateIngressHighWaterBytes, bytes);
+    const shared=this.sharedBudget?.snapshot();
     return {
       depth,
       bytes,
-      highWaterEvents: this.aggregateIngressHighWaterEvents,
-      highWaterBytes: this.aggregateIngressHighWaterBytes,
+      highWaterEvents: shared?.highWaterEvents ?? this.aggregateIngressHighWaterEvents,
+      highWaterBytes: shared?.highWaterBytes ?? this.aggregateIngressHighWaterBytes,
       accepted: snapshots.reduce((sum, item) => sum + item.accepted, 0),
       processed: snapshots.reduce((sum, item) => sum + item.processed, 0),
       gapTotal: snapshots.reduce((sum, item) => sum + item.gapTotal, 0),
+      ...(shared ? {poolMaxEvents:shared.poolMaxEvents,poolMaxBytes:shared.poolMaxBytes,
+        borrowedEvents:snapshots.reduce((n,s)=>n+(s.borrowedEvents??0),0),borrowedBytes:snapshots.reduce((n,s)=>n+(s.borrowedBytes??0),0)} : {}),
     };
   }
 
