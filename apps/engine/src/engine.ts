@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { bookTiming, firstLegBookReason, officialMarketStartReason } from "./first-leg-admission.js";
+import { bookTiming, firstLegBookReason, officialMarketStartReason, firstLegEntryFilterReason, firstLegExecutionEconomics } from "./first-leg-admission.js";
 import type { GuardianView, GuardianMarket, GuardianUpdate } from "./guardian-link.js";
 import { currentGuardianConsensus } from "./guardian-link.js";
 import { guardianV2StateSchema, type GuardianV2State } from "@pm/core";
@@ -3719,6 +3719,15 @@ export class EngineService {
       assetOverride: trigger.asset,
     });
     const asset = trigger.asset ?? this.assetByMarket.get(candidate.marketId) ?? snapshot.asset ?? null;
+    if (candidate.intent === "OPEN_FIRST_LEG") {
+      const entryReason = firstLegEntryFilterReason(decision.executablePrice, decision.expectedROI);
+      if (entryReason) {
+        decision.accepted = false; decision.order = null; decision.risk.accepted = false;
+        if (!decision.risk.vetoes.includes(entryReason)) decision.risk.vetoes.push(entryReason);
+      } else if (decision.order && executableFair) {
+        decision.order.entryAdmission = { fairProbability: executableFair.fairProbabilityForTradedOutcome, signalExpiresAt: decisionNative.expiresAt };
+      }
+    }
     this.state.latestRisk = decision.risk;
     const executionStyle = decision.order?.orderType ?? this.env.PAPER_EXECUTION_STYLE;
     const calibration = executableFair ? {
@@ -4031,6 +4040,12 @@ export class EngineService {
           this.record("FIRST_LEG_REVALIDATION_REJECTED", order.traceId, order.marketId, { orderId: order.id, reason });
           return false;
         }
+        const economics = firstLegExecutionEconomics(order, decisionSnapshot, this.nowFn().getTime());
+        if (economics.reason) {
+          this.metrics.riskVetoes.inc({ reason: economics.reason });
+          this.record("FIRST_LEG_REVALIDATION_REJECTED", order.traceId, order.marketId, { orderId: order.id, ...economics });
+          return false;
+        }
         const expiry = this.firstLegExpiryAdmission(order.marketId);
         if (!expiry.eligible) {
           this.record("FIRST_LEG_REVALIDATION_REJECTED", order.traceId, order.marketId, {
@@ -4128,6 +4143,8 @@ export class EngineService {
         if (intent === "OPEN_FIRST_LEG") {
           const reason = this.firstLegAdmissionReason(order, current);
           if (reason) throw new FirstLegLifecycleGuardRejectedError(order.marketId, reason);
+          const economics = firstLegExecutionEconomics(order, current, this.nowFn().getTime());
+          if (economics.reason) throw new FirstLegLifecycleGuardRejectedError(order.marketId, economics.reason);
         }
         if (intent === "PROTECTIVE_DE_RISK" || intent === "GUARDIAN_PROTECTIVE_SELL") {
           const reason = this.protectiveFillHardSafetyReason(order);
@@ -4156,7 +4173,7 @@ export class EngineService {
         if (durableOwner) takerFill.id = `risk-reduction-fill:${order.id}`;
         const applied = await this.applyFill(
           takerFill,
-          { intent, deRisk, riskReductionOwnership: durableOwner, executionSnapshot: current },
+          { intent, deRisk, riskReductionOwnership: durableOwner, executionSnapshot: current, executionOrder: order },
         );
         if (applied) this.lastTradeAt = this.nowFn();
         else if (durableOwner) await this.failRiskReduction(durableOwner, "FILL_NOT_APPLIED");
@@ -4291,6 +4308,8 @@ export class EngineService {
         if (intent === "OPEN_FIRST_LEG" && orderCreatedEvent) {
           const reason = this.firstLegAdmissionReason(order, snapshot);
           if (reason) throw new FirstLegLifecycleGuardRejectedError(order.marketId, reason);
+          const economics = firstLegExecutionEconomics(order, snapshot, this.nowFn().getTime());
+          if (economics.reason) throw new FirstLegLifecycleGuardRejectedError(order.marketId, economics.reason);
         }
         if (this.ledger.availableCash().lt(notional)) {
           throw new MakerReservationCashCommitGuardRejectedError(
@@ -4380,6 +4399,7 @@ export class EngineService {
       deRisk?: ProtectiveDeRiskAudit;
       riskReductionOwnership?: RiskReductionOwnership;
       executionSnapshot?: MarketSnapshot;
+      executionOrder?: PaperOrder;
     } = {},
   ): Promise<boolean> {
     // Capture before any asynchronous fill work can lose live discovery context.
@@ -4597,6 +4617,12 @@ export class EngineService {
           // test-only economic fixture injection, not order execution.
           const entryBookReason = extras.executionSnapshot ? this.firstLegAdmissionReason(fill, extras.executionSnapshot) : null;
           if (entryBookReason) throw new FirstLegLifecycleGuardRejectedError(fill.marketId, entryBookReason);
+          if (extras.executionSnapshot) {
+            const executionOrder = extras.executionOrder ?? restingAtAdmission?.order;
+            if (!executionOrder) throw new FirstLegLifecycleGuardRejectedError(fill.marketId, "ENTRY_ECONOMICS_UNAVAILABLE");
+            const economics = firstLegExecutionEconomics({ ...executionOrder, quantity: fill.quantity }, extras.executionSnapshot, this.nowFn().getTime());
+            if (economics.reason) throw new FirstLegLifecycleGuardRejectedError(fill.marketId, economics.reason);
+          }
           if (fill.liquidityRole === "TAKER") {
             if (currentPosition) {
               throw new FirstLegLifecycleGuardRejectedError(fill.marketId, "POSITION_ALREADY_EXISTS");

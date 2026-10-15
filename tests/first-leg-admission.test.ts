@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { bookTiming, firstLegBookReason, officialMarketStartReason } from "../apps/engine/src/first-leg-admission.js";
+import { bookTiming, firstLegBookReason, officialMarketStartReason, firstLegEntryFilterReason, firstLegExecutionEconomics } from "../apps/engine/src/first-leg-admission.js";
 import { EngineService } from "../apps/engine/src/engine.js";
 import { MemoryEventJournal } from "@pm/db";
 import { NoopGrokActivationBridge } from "../apps/engine/src/activation/index.js";
 import { ScriptedMarketAdapter, ScriptedReferenceRegistry, discoveryReport, qualified, qualifiedPaperEnv, paperFill } from "./paper-engine-testkit.js";
-import { snapshot } from "./fixtures.js";
-import type { MarketSnapshot } from "@pm/core";
+import { snapshot, order } from "./fixtures.js";
+import type { MarketSnapshot, PaperOrder } from "@pm/core";
 
 const NOW = Date.parse("2026-10-15T02:00:00Z");
 const book = (extra: Partial<MarketSnapshot> = {}) => snapshot({ marketId: "entry", tokenId: "entry-up", outcome: "UP", asset: "XRP",
@@ -61,13 +61,33 @@ describe("P0-06 first-leg book authority", () => {
         return result;
       };
       const before = engine.ledger.snapshot().cash;
-      await (engine as unknown as { applyFill: (f: ReturnType<typeof paperFill>, e: { intent: "OPEN_FIRST_LEG"; executionSnapshot: MarketSnapshot }) => Promise<boolean> })
-        .applyFill(paperFill("entry", "UP", "0.70", { tokenId: b.tokenId, quantity: "2" }), { intent: "OPEN_FIRST_LEG", executionSnapshot: b });
+      const executionOrder = order("TAKER", { marketId: "entry", tokenId: b.tokenId, quantity: "2", requestedPrice: "0.70",
+        entryAdmission: { fairProbability: 0.9, signalExpiresAt: new Date(NOW + 60000).toISOString() } });
+      await (engine as unknown as { applyFill: (f: ReturnType<typeof paperFill>, e: { intent: "OPEN_FIRST_LEG"; executionSnapshot: MarketSnapshot; executionOrder: PaperOrder }) => Promise<boolean> })
+        .applyFill(paperFill("entry", "UP", "0.70", { tokenId: b.tokenId, quantity: "2" }), { intent: "OPEN_FIRST_LEG", executionSnapshot: b, executionOrder });
       const rows = await journal.queryDurableTransitions({ types: ["PAPER_FILL"], limit: 10 });
       expect(rows).toHaveLength(scenario === "fresh" ? 1 : 0);
       if (scenario !== "fresh") expect(engine.ledger.snapshot().cash).toBe(before);
       expect(engine.integrityFault()).toBe(false);
     } finally { await engine.stop(); }
+  });
+});
+
+describe("direct first-entry price and net ROI policy", () => {
+  it.each([0.6499, 0.6500, 0.6501].flatMap(p => [0.01499, 0.01500, 0.01501].map(roi => [p, roi])))
+    ("price=%s ROI=%s", (price, roi) => expect(firstLegEntryFilterReason(price, roi)).toBe(price! < 0.65 ? "FIRST_LEG_PRICE_BELOW_FLOOR" : roi! < 0.015 ? "FIRST_LEG_NET_ROI_BELOW_FLOOR" : null));
+  it("rejects missing, NaN and infinite inputs", () => {
+    for (const price of [undefined, null, NaN, Infinity, "garbage"]) expect(firstLegEntryFilterReason(price, 1)).not.toBe(null);
+    for (const roi of [undefined, null, NaN, Infinity]) expect(firstLegEntryFilterReason("0.65", roi)).not.toBe(null);
+  });
+  it("re-walks full executable depth, preserves fees and rejects a late price or ROI deterioration", () => {
+    const o = order("TAKER", { requestedPrice: "0.90", quantity: "10", entryAdmission: { fairProbability: 0.8, signalExpiresAt: new Date(NOW + 1000).toISOString() } });
+    expect(firstLegExecutionEconomics(o, book(), NOW).reason).toBe(null);
+    expect(firstLegExecutionEconomics(o, book({ asks: [{ price: "0.64", quantity: "100" }] }), NOW).reason).toBe("FIRST_LEG_PRICE_BELOW_FLOOR");
+    expect(firstLegExecutionEconomics(o, book({ asks: [{ price: "0.79", quantity: "100" }] }), NOW).reason).toBe("FIRST_LEG_NET_ROI_BELOW_FLOOR");
+    expect(firstLegExecutionEconomics(o, book({ asks: [{ price: "0.70", quantity: "2" }] }), NOW).reason).toBe("ENTRY_ECONOMICS_UNAVAILABLE");
+    expect(firstLegExecutionEconomics(o, book({ feeSchedule: null }), NOW).reason).toBe("ENTRY_ECONOMICS_UNAVAILABLE");
+    expect(firstLegExecutionEconomics(o, book(), NOW + 1001).reason).toBe("ENTRY_ECONOMICS_UNAVAILABLE");
   });
 });
 

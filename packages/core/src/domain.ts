@@ -309,6 +309,8 @@ export const riskReasonCodeSchema = z.enum([
   "MINIMUM_LIQUIDITY",
   "MINIMUM_EXPECTED_EDGE",
   "MINIMUM_EXPECTED_ROI",
+  "FIRST_LEG_PRICE_BELOW_FLOOR",
+  "FIRST_LEG_NET_ROI_BELOW_FLOOR",
   "MAXIMUM_SPREAD",
   "MINIMUM_SIGNAL_CONFIDENCE",
   "SIGNAL_EXPIRED",
@@ -341,6 +343,7 @@ export const riskEvaluationSchema = z.object({
 export type RiskEvaluation = z.infer<typeof riskEvaluationSchema>;
 
 export const paperOrderSchema = z.object({
+  entryAdmission: z.object({ fairProbability: z.number().finite().min(0).max(1), signalExpiresAt: timestampSchema }).optional(),
   id: idSchema,
   traceId: idSchema,
   triggerId: idSchema,

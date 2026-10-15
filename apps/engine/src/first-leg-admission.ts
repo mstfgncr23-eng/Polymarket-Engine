@@ -1,5 +1,31 @@
-import type { MarketSnapshot } from "@pm/core";
+import { calculateFee, calculateSlippageUsd, d, walkBook, type MarketSnapshot, type PaperOrder } from "@pm/core";
 import type { DiscoveredMarket } from "@pm/market-data";
+
+export const FIRST_LEG_MIN_PRICE = 0.65;
+export const FIRST_LEG_MIN_NET_ROI = 0.015;
+
+export function firstLegEntryFilterReason(price: string | number | null | undefined, expectedROI: number | null | undefined) {
+  try {
+    if (price === null || price === undefined || !d(price).isFinite() || d(price).lt(FIRST_LEG_MIN_PRICE)) return "FIRST_LEG_PRICE_BELOW_FLOOR" as const;
+  } catch { return "FIRST_LEG_PRICE_BELOW_FLOOR" as const; }
+  return typeof expectedROI !== "number" || !Number.isFinite(expectedROI) || expectedROI < FIRST_LEG_MIN_NET_ROI
+    ? "FIRST_LEG_NET_ROI_BELOW_FLOOR" as const : null;
+}
+
+/** Same net EV / executable notional semantics as decidePaperOrder. */
+export function firstLegExecutionEconomics(order: PaperOrder, book: MarketSnapshot, nowMs: number) {
+  const proof = order.entryAdmission;
+  if (!proof || !Number.isFinite(proof.fairProbability) || nowMs > Date.parse(proof.signalExpiresAt))
+    return { reason: "ENTRY_ECONOMICS_UNAVAILABLE", price: null, expectedROI: null };
+  const walk = walkBook(book.asks, order.quantity, order.requestedPrice, "BUY");
+  const price = order.orderType === "MAKER" ? order.requestedPrice : walk.sufficientDepth ? walk.vwap : null;
+  if (!price || !walk.sufficientDepth || !book.feeSchedule) return { reason: "ENTRY_ECONOMICS_UNAVAILABLE", price, expectedROI: null };
+  const fee = calculateFee(order.quantity, price, order.orderType, book.feeSchedule);
+  const slippage = order.orderType === "MAKER" ? "0" : calculateSlippageUsd(order.requestedPrice, price, order.quantity, "BUY");
+  const notional = d(order.quantity).mul(price);
+  const roi = d(proof.fairProbability).minus(walk.vwap).mul(order.quantity).minus(fee).minus(slippage).div(notional).toNumber();
+  return { reason: firstLegEntryFilterReason(price, roi), price, expectedROI: roi };
+}
 
 /** Gamma eventStartTime is the fixing start; startDate is listing creation. */
 export function officialMarketStartReason(market: Pick<DiscoveredMarket, "slug" | "endDate" | "raw"> | undefined, nowMs: number): string | null {
