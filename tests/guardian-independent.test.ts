@@ -75,7 +75,7 @@ describe("simple independent Guardian", () => {
         await Promise.all(ids.map(id => execute.maybeReversalProtection(id)));
       }
       const elapsed = performance.now() - started, used = process.cpuUsage(cpu);
-      const fills = (await s.journal.queryEvents({ types: ["PAPER_FILL"] })).filter(e => e.payload.intent === "PROTECTIVE_DE_RISK");
+      const fills = (await s.journal.queryEvents({ types: ["PAPER_FILL"] })).filter(e => e.payload.intent === "GUARDIAN_PROTECTIVE_SELL");
       expect(fills).toHaveLength(7); expect(new Set(fills.map(e => e.payload.orderId)).size).toBe(7);
       expect(await s.journal.queryEvents({ types: ["RISK_REDUCTION_ADMITTED"] })).toHaveLength(7);
       expect(s.engine.guardianView().markets).toHaveLength(0);
@@ -157,10 +157,10 @@ describe("simple independent Guardian", () => {
           s.clock.ms = START + age; books(s, "first", ratio);
           await s.engine.acceptGuardianUpdate(monitor.evaluate(s.engine.guardianView(), s.clock.ms).updates[0]!);
         }
-        await waitFor(async () => (await s.journal.queryEvents({ types: ["PAPER_FILL"] })).some(e => e.payload.intent === "PROTECTIVE_DE_RISK"));
+        await waitFor(async () => (await s.journal.queryEvents({ types: ["PAPER_FILL"] })).some(e => e.payload.intent === "GUARDIAN_PROTECTIVE_SELL"));
         const ledger = s.engine.ledger.snapshot(); await s.engine.stop(); s = await setup(pg.journal, s.clock);
         expect(s.engine.ledger.snapshot().cash).toBe(ledger.cash); expect(s.engine.ledger.snapshot().fees).toBe(ledger.fees);
-        const fills = (await s.journal.queryEvents({ types: ["PAPER_FILL"] })).filter(e => e.payload.intent === "PROTECTIVE_DE_RISK");
+        const fills = (await s.journal.queryEvents({ types: ["PAPER_FILL"] })).filter(e => e.payload.intent === "GUARDIAN_PROTECTIVE_SELL");
         expect(fills).toHaveLength(1); expect(s.engine.integrityFault()).toBe(false);
         console.log(JSON.stringify({ evidence: "R1_REAL_PG_FAILURE_RECOVERY", mode, pgCode, committedBeforeRestart: Number(committed),
           orphans: 0, unhandled: unhandled.length, fills: fills.length, cashParity: true, feeParity: true }));
@@ -195,7 +195,7 @@ describe("simple independent Guardian", () => {
       expect((await s.engine.acceptGuardianUpdate(update)).status).toBe(boundary === "admission" ? "IN_FLIGHT" : "REPLAY");
       release(); journal.setAppendInFlightHoldForTest(null); await receipt;
       await waitFor(() => (s.engine.ledger.positions.get("first")?.unpairedQuantity ?? "0") === "0");
-      const fills = (await journal.queryEvents({ types: ["PAPER_FILL"] })).filter(e => e.payload.intent === "PROTECTIVE_DE_RISK");
+      const fills = (await journal.queryEvents({ types: ["PAPER_FILL"] })).filter(e => e.payload.intent === "GUARDIAN_PROTECTIVE_SELL");
       expect(fills).toHaveLength(1);
       expect((fills[0]!.payload.deRisk as { guardianReason: string }).guardianReason).toBe("EARLY_TIMEOUT");
       expect(await journal.queryEvents({ types: ["RISK_REDUCTION_ADMITTED"] })).toHaveLength(1);
@@ -222,7 +222,7 @@ describe("simple independent Guardian", () => {
       expect(unhandled).toHaveLength(0); expect(s.engine.integrityFault()).toBe(true);
       expect(s.engine.guardianView().markets[0]!.state).toBeNull();
       expect((await s.engine.acceptGuardianUpdate(update)).reason).toBe("ENGINE_UNAVAILABLE");
-      expect((await s.journal.queryEvents({ types: ["PAPER_FILL"] })).filter(e => e.payload.intent === "PROTECTIVE_DE_RISK")).toHaveLength(0);
+      expect((await s.journal.queryEvents({ types: ["PAPER_FILL"] })).filter(e => e.payload.intent === "GUARDIAN_PROTECTIVE_SELL")).toHaveLength(0);
     } finally { process.off("unhandledRejection", listener); await s.engine.stop(); }
   });
 
@@ -275,7 +275,7 @@ describe("simple independent Guardian", () => {
       expect(next.state.protectionReason).toBe(offset < 0 ? null : "EARLY_TIMEOUT");
       expect((await s.engine.acceptGuardianUpdate(next)).status).toBe("PERSISTED");
       if (offset >= 0) await waitFor(() => (s.engine.ledger.positions.get("first")?.unpairedQuantity ?? "0") === "0");
-      const fills = (await s.journal.queryEvents({ types: ["PAPER_FILL"] })).filter(e => e.payload.intent === "PROTECTIVE_DE_RISK");
+      const fills = (await s.journal.queryEvents({ types: ["PAPER_FILL"] })).filter(e => e.payload.intent === "GUARDIAN_PROTECTIVE_SELL");
       expect(fills).toHaveLength(offset < 0 ? 0 : 1);
       console.log(JSON.stringify({ evidence: "R4_RECOVERY_DEADLINE", age, offset, phase: next.state.phase, fills: fills.length, unchangedDeadline: offset >= 0 }));
     } finally { await s.engine.stop(); }
@@ -290,15 +290,15 @@ describe("simple independent Guardian", () => {
         s.clock.ms = START + age; books(s, "first", ratio);
         await s.engine.acceptGuardianUpdate(monitor.evaluate(s.engine.guardianView(), s.clock.ms).updates.find(u => u.state.marketId === "first")!);
       }
-      let plans = 0; const original = s.engine.persistReportInput.bind(s.engine);
-      s.engine.persistReportInput = async input => {
-        if (input.type === "RISK_EVALUATION" && input.payload.marketId === "first") {
+      let plans = 0; const original = s.journal.commitDurableTransition.bind(s.journal);
+      s.journal.commitDurableTransition = async (input, cursor, options) => {
+        if (input.type === "RISK_REDUCTION_ADMITTED" && input.aggregateId) {
           plans++;
           for (const id of ids.slice(1)) books(s, id, .75 + plans / 10000);
           s.engine.ledger.revalue(Object.fromEntries(ids.slice(1).map(id => [id, { up: String(.8 + plans / 10000), down: ".71" }])), new Date(s.clock.ms).toISOString());
           (s.engine as unknown as { executionErrors: number[] }).executionErrors.push(s.clock.ms - 3600001);
         }
-        return original(input);
+        return original(input, cursor, options);
       };
       s.clock.ms = START + 70000; books(s, "first", .70);
       const confirm = monitor.evaluate(s.engine.guardianView(), s.clock.ms).updates.find(u => u.state.marketId === "first")!;
@@ -306,7 +306,7 @@ describe("simple independent Guardian", () => {
       await waitFor(() => plans > 0);
       await waitFor(async () => !(s.engine as unknown as { riskReductionInFlight: Set<string> }).riskReductionInFlight.has("first"));
       expect(plans).toBe(1);
-      const fills = (await s.journal.queryEvents({ types: ["PAPER_FILL"] })).filter(e => e.payload.intent === "PROTECTIVE_DE_RISK");
+      const fills = (await s.journal.queryEvents({ types: ["PAPER_FILL"] })).filter(e => e.payload.intent === "GUARDIAN_PROTECTIVE_SELL");
       expect(fills).toHaveLength(1); expect(fills[0]!.payload.quantity).toBe("5");
       expect(s.engine.ledger.positions.get("first")?.unpairedQuantity ?? "0").toBe("0");
       expect((await s.journal.queryEvents({ types: ["RISK_REDUCTION_ADMITTED"] }))).toHaveLength(1);
@@ -322,13 +322,13 @@ describe("simple independent Guardian", () => {
         s.clock.ms = START + age; books(s, "first", ratio);
         expect((await s.engine.acceptGuardianUpdate(monitor.evaluate(s.engine.guardianView(), s.clock.ms).updates[0]!)).status).toBe("PERSISTED");
       }
-      await waitFor(async () => (await s.journal.queryEvents({ types: ["PAPER_FILL"] })).filter(e => e.payload.intent === "PROTECTIVE_DE_RISK").length === 1);
+      await waitFor(async () => (await s.journal.queryEvents({ types: ["PAPER_FILL"] })).filter(e => e.payload.intent === "GUARDIAN_PROTECTIVE_SELL").length === 1);
       const ledger = s.engine.ledger.snapshot();
       await s.engine.stop(); s = await setup(pg.journal, s.clock);
       expect(s.engine.ledger.snapshot().cash).toBe(ledger.cash);
       expect(s.engine.ledger.snapshot().fees).toBe(ledger.fees);
       expect(s.engine.guardianView().markets).toHaveLength(0);
-      expect((await s.journal.queryEvents({ types: ["PAPER_FILL"] })).filter(e => e.payload.intent === "PROTECTIVE_DE_RISK")).toHaveLength(1);
+      expect((await s.journal.queryEvents({ types: ["PAPER_FILL"] })).filter(e => e.payload.intent === "GUARDIAN_PROTECTIVE_SELL")).toHaveLength(1);
       expect(s.engine.integrityFault()).toBe(false);
     } finally { await s.engine.stop(); await pg.close(); }
   }, 15000);
@@ -389,10 +389,10 @@ describe("simple independent Guardian", () => {
       expect(probe.state).toEqual(update.state); expect(probe.events).toHaveLength(0);
       expect((await s.engine.acceptGuardianUpdate(probe)).status).toBe("IN_FLIGHT");
       release();
-      await waitFor(async () => (await s.journal.queryEvents({ types: ["PAPER_FILL"] })).filter(e => e.payload.intent === "PROTECTIVE_DE_RISK").length === 1);
+      await waitFor(async () => (await s.journal.queryEvents({ types: ["PAPER_FILL"] })).filter(e => e.payload.intent === "GUARDIAN_PROTECTIVE_SELL").length === 1);
       await server.stop(); server = undefined; await s.engine.stop(); s = await setup(s.journal, s.clock);
       expect(s.engine.guardianView().markets).toHaveLength(0);
-      expect((await s.journal.queryEvents({ types: ["PAPER_FILL"] })).filter(e => e.payload.intent === "PROTECTIVE_DE_RISK")).toHaveLength(1);
+      expect((await s.journal.queryEvents({ types: ["PAPER_FILL"] })).filter(e => e.payload.intent === "GUARDIAN_PROTECTIVE_SELL")).toHaveLength(1);
       expect(s.engine.integrityFault()).toBe(false);
     } finally { release(); await server?.stop(); await s.engine.stop(); }
   }, 12000);
@@ -478,7 +478,7 @@ describe("simple independent Guardian", () => {
       expect(fresh.state.deadlineAt).toBe(old.state.deadlineAt);
       expect(fresh.events).toContain("EARLY_TIMEOUT_PROTECT");
       expect((await s.engine.acceptGuardianUpdate(fresh)).status).toBe("PERSISTED");
-      await waitFor(async () => (await s.journal.queryEvents({ types: ["PAPER_FILL"] })).filter(e => e.payload.intent === "PROTECTIVE_DE_RISK").length === 1);
+      await waitFor(async () => (await s.journal.queryEvents({ types: ["PAPER_FILL"] })).filter(e => e.payload.intent === "GUARDIAN_PROTECTIVE_SELL").length === 1);
       console.log(JSON.stringify({ evidence: "5588451_RECOVERY", staleRetries: 89, durableBefore: 1, requestedRevision: old.state.revision,
         marketId: id, heldOutcome: "DOWN", entry: "0.63", quantity: "7.93650794", retryWindow: "22:03:12.623Z..22:03:45.223Z",
         acceptedAfterReevaluation: 1, protectiveFills: 1, syntheticQuoteFixture: true }));
@@ -587,13 +587,13 @@ describe("simple independent Guardian", () => {
       expect(update.state.protectionReason).toBe("EARLY_TIMEOUT");
       const replies = await Promise.all([s.engine.acceptGuardianUpdate(update), s.engine.acceptGuardianUpdate(update)]);
       expect(replies.every(r => ["PERSISTED", "REPLAY", "IN_FLIGHT"].includes(r.status))).toBe(true);
-      await waitFor(async () => (await s.journal.queryEvents({ types: ["PAPER_FILL"] })).some(e => e.payload.intent === "PROTECTIVE_DE_RISK"));
+      await waitFor(async () => (await s.journal.queryEvents({ types: ["PAPER_FILL"] })).some(e => e.payload.intent === "GUARDIAN_PROTECTIVE_SELL"));
       const fills = await s.journal.queryEvents({ types: ["PAPER_FILL"] });
-      expect(fills.filter(e => e.payload.intent === "PROTECTIVE_DE_RISK")).toHaveLength(1);
+      expect(fills.filter(e => e.payload.intent === "GUARDIAN_PROTECTIVE_SELL")).toHaveLength(1);
       expect((await s.engine.acceptGuardianUpdate(update)).reason).toBe("EPISODE_CHANGED");
       await s.engine.stop(); s = await setup(s.journal, s.clock);
       expect(s.engine.guardianView().markets).toHaveLength(0);
-      expect((await s.journal.queryEvents({ types: ["PAPER_ORDER_CREATED"] })).filter(e => e.payload.intent === "PROTECTIVE_DE_RISK")).toHaveLength(1);
+      expect((await s.journal.queryEvents({ types: ["PAPER_ORDER_CREATED"] })).filter(e => e.payload.intent === "GUARDIAN_PROTECTIVE_SELL")).toHaveLength(1);
       expect(s.engine.integrityFault()).toBe(false);
     } finally { await s.engine.stop(); }
   });
@@ -653,11 +653,11 @@ describe("simple independent Guardian", () => {
       child = spawn(process.execPath, ["apps/engine/dist/guardian-main.js"], {
         env: { ...process.env, TRADING_MODE: "paper", GUARDIAN_SOCKET_PATH: path }, stdio: ["ignore", "pipe", "pipe"] });
       let output = ""; child.stdout!.on("data", chunk => { output += chunk; });
-      await waitFor(async () => (await s.journal.queryEvents({ types: ["PAPER_FILL"] })).some(e => e.payload.intent === "PROTECTIVE_DE_RISK"));
+      await waitFor(async () => (await s.journal.queryEvents({ types: ["PAPER_FILL"] })).some(e => e.payload.intent === "GUARDIAN_PROTECTIVE_SELL"));
       expect(protection).toBeTruthy();
       expect((await guardianRpc<{ status: string; reason: string }>(path, protection)).reason).toBe("EPISODE_CHANGED");
-      const fills = (await s.journal.queryEvents({ types: ["PAPER_FILL"] })).filter(e => e.payload.intent === "PROTECTIVE_DE_RISK");
-      const orders = (await s.journal.queryEvents({ types: ["PAPER_ORDER_CREATED"] })).filter(e => e.payload.intent === "PROTECTIVE_DE_RISK");
+      const fills = (await s.journal.queryEvents({ types: ["PAPER_FILL"] })).filter(e => e.payload.intent === "GUARDIAN_PROTECTIVE_SELL");
+      const orders = (await s.journal.queryEvents({ types: ["PAPER_ORDER_CREATED"] })).filter(e => e.payload.intent === "GUARDIAN_PROTECTIVE_SELL");
       expect(fills).toHaveLength(1); expect(orders).toHaveLength(1); expect(child.pid).not.toBe(process.pid);
       console.log(JSON.stringify({ evidence: "CONTROLLED_PAPER_SOCKET_PROTECTION", enginePid: process.pid, guardianPid: child.pid,
         orderId: fills[0]!.payload.orderId, intent: fills[0]!.payload.intent, side: fills[0]!.payload.side,
