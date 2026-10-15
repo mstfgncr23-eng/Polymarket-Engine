@@ -31,12 +31,19 @@ describe('Maker-First real Engine lifecycle',()=>{
  it.each(['fresh','price-worse','stale','closed','partial','dual','concurrent','cash','daily-loss','signal-expired','epoch','restart','book-expiry','close-race'] as const)('directional TTL fallback revalidates once without widening limits (%s)',async scenario=>{
   const s=await setup(true,undefined,{ms:T},{PAPER_DUAL_SIDED_MAKER_ENABLED:String(scenario==='dual')});
   try{
+   const intern=s.engine as any;
+   expect((await intern.supervisor.waitUnresolved(5000)).drained).toBe(true);
    const bk=(outcome:'UP'|'DOWN',seq:number)=>({...s.b(outcome,seq),bids:[{price:outcome==='UP'?'0.69':'0.26',quantity:outcome==='UP'?'100000':'1000'}],asks:[{price:outcome==='UP'?'0.70':'0.27',quantity:outcome==='UP'?'1000':'100000'}]});
-   await s.market.emitSnapshot(bk('UP',10));await s.market.emitSnapshot(bk('DOWN',10));
+   // This test explicitly invokes the native trade lane below. Seed its book
+   // cache after prior setup work drains, rather than generating a competing
+   // automatic trigger whose PG awaits can steal this entry's ownership.
+   const books={UP:bk('UP',10),DOWN:bk('DOWN',10)};
+   intern.snapshots.set(M,books);
+   s.engine.state.marketSnapshots.set(U,books.UP);s.engine.state.marketSnapshots.set(D,books.DOWN);
    const trigger=triggerEventSchema.parse({id:'ttl-fallback-trigger',traceId:'ttl-fallback-trace',marketId:M,asset:'XRP',source:'polymarket',kind:'BOOK_IMBALANCE',severity:2,score:.9,dedupeKey:'ttl-fallback',evidence:{},sourceEventIds:['ttl-source'],createdAt:new Date(T).toISOString(),expiresAt:new Date(T+(scenario==='signal-expired'?1000:60000)).toISOString()});
-   const native=evaluateNativeDecision({trigger,up:bk('UP',10),down:bk('DOWN',10),reference:null,referenceRequired:false,marketSynchronized:true,triggerProvenanceValid:true,now:new Date(T)})!;
+   const native=evaluateNativeDecision({trigger,up:books.UP,down:books.DOWN,reference:null,referenceRequired:false,marketSynchronized:true,triggerProvenanceValid:true,now:new Date(T)})!;
    expect(native.direction).toBe('UP');
-   const intern=s.engine as any;intern.activeTriggers.set(trigger.id,trigger);intern.triggerProvenance.set(trigger.id,{kind:'NONE'});
+   intern.activeTriggers.set(trigger.id,trigger);intern.triggerProvenance.set(trigger.id,{kind:'NONE'});
    await intern.evaluateTrade(trigger,intern.nativeCompatibilityDecision(trigger,native),native);
    const initial=[...s.engine.restingOrdersForTest().values()].map(r=>r.order);expect(initial,JSON.stringify({risk:s.engine.state.latestRisk,decisions:s.engine.state.decisions,events:await s.journal.queryEvents({types:['RISK_EVALUATION']})})).toHaveLength(scenario==='dual'?2:1);
    const first=initial.find(o=>o.outcome==='UP')!;
@@ -51,7 +58,7 @@ describe('Maker-First real Engine lifecycle',()=>{
    if(scenario!=='stale'){
     const up=bk('UP',11);if(scenario==='price-worse')up.asks=[{price:'0.71',quantity:'10'}];
     // Direct cache update keeps TTL as the cancellation authority under test.
-    intern.snapshots.set(M,{UP:up,DOWN:bk('DOWN',11)});s.engine.state.marketSnapshots.set(U,up);s.engine.state.marketSnapshots.set(D,bk('DOWN',11));
+    const down=bk('DOWN',11);intern.snapshots.set(M,{UP:up,DOWN:down});s.engine.state.marketSnapshots.set(U,up);s.engine.state.marketSnapshots.set(D,down);
     await s.engine.ingestReferenceTickForTest({eventId:'ttl-ref-new',traceId:'ttl-ref-new',asset:'XRP',symbol:'XRPUSDT',venue:'test',price:'1',quantity:'1',sourceTimestamp:new Date(s.clock.ms).toISOString(),receivedAt:new Date(s.clock.ms).toISOString(),tradeId:'ttl-ref-new'});
    }else s.clock.ms=T+16001;
    if(scenario==='cash')s.engine.ledger.restore({...s.engine.ledger.snapshot(),cash:'0.01'},[]);
