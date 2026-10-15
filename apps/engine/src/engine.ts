@@ -706,6 +706,7 @@ export class EngineService {
     await this.initializeJournalWithRetry();
     await this.restoreAndRecover();
     await this.restoreReportSourceIntegrity();
+    await this.recoverInterruptedFirstLegOrders();
     // Pair the shutdown/recovered snapshot with a current Engine snapshot. This
     // avoids copying a multi-hour fallback replay tail for each small purge batch.
     if (this.env.GUARDIAN_SEPARATE_ENABLED && this.env.RETENTION_ENABLED && this.env.RETENTION_COMPACTION_ENABLED)
@@ -1620,6 +1621,50 @@ export class EngineService {
       synchronized: this.adapterTokenSynchronized(order.tokenId),
       book: this.state.marketSnapshots.get(order.tokenId), expected,
       nowMs: this.nowFn().getTime(), maxAgeMs: this.riskLimits.staleFeedTimeoutMs });
+  }
+
+  /** Validate a quote at execution time, before any persistence await. A later
+   * feed update cannot revoke that historical observation. Economic ownership,
+   * cash, cancellation and settlement are still fenced at commit time. */
+  private firstLegExecutionReason(order: PaperOrder, book: MarketSnapshot, at: Date): string | null {
+    return officialMarketStartReason(this.marketsById.get(order.marketId), at.getTime())
+      ?? (!this.firstLegExpiryAdmission(order.marketId, at).eligible ? "DURATION_OUT_OF_RANGE" : null)
+      ?? firstLegBookReason({ ...order, book,
+        canonicalTokenId: this.currentTokenIdFor(order.marketId, order.outcome),
+        synchronized: this.adapterTokenSynchronized(order.tokenId),
+        nowMs: at.getTime(), maxAgeMs: this.riskLimits.staleFeedTimeoutMs })
+      ?? firstLegExecutionEconomics(order, book, at.getTime()).reason;
+  }
+
+  private async rejectFirstLegOrder(order: Pick<PaperOrder, "id" | "marketId" | "traceId">, reason: string, stage: string): Promise<void> {
+    const id = derivedAuditEventId("PAPER_ORDER_TERMINAL", order.id);
+    if (await this.journal.readJournalEventById(id)) return;
+    await this.persistReportInput(createJournalEvent({ id, traceId: order.traceId,
+      type: "PAPER_ORDER_TERMINAL", aggregateType: "paper_order", aggregateId: order.id,
+      payload: { orderId: order.id, marketId: order.marketId, intent: "OPEN_FIRST_LEG",
+        status: "REJECTED", reason, stage, terminalAt: this.nowFn().toISOString() } }));
+  }
+
+  private async recoverInterruptedFirstLegOrders(): Promise<void> {
+    // Recovery repairs committed fills (including their atomic terminal audit)
+    // before this scan. An uncommitted TAKER quote is never executed on restart.
+    // Versioning leaves completed historical experiments byte-for-byte intact.
+    if (!this.experiment || !["RUNNING", "ENTRY_CLOSED"].includes(this.experiment.status)) return;
+    let after: { occurredAt: string; id: string } | undefined;
+    for (;;) {
+      const page = await this.journal.queryEventsKeyset({ types: ["PAPER_ORDER_CREATED"], experimentId: this.experiment.id, after, limit: 200 });
+      for (const row of page) {
+        const p = row.payload;
+        if (p.executionLifecycleVersion !== 2 || p.intent !== "OPEN_FIRST_LEG" || p.orderType !== "TAKER") continue;
+        const id = typeof p.id === "string" ? p.id : row.aggregateId;
+        if (await this.journal.readJournalEventById(derivedAuditEventId("PAPER_ORDER_TERMINAL", id))) continue;
+        if (await this.journal.readDurableByOperationKey(`fill:first-leg-fill:${id}`))
+          throw new RecoveryFailClosedError("invariant", `missing terminal audit for committed first leg ${id}`);
+        await this.rejectFirstLegOrder({ id, marketId: String(p.marketId), traceId: row.traceId }, "PROCESS_RESTART_BEFORE_DURABLE_FILL", "RECOVERY");
+      }
+      if (page.length < 200) break;
+      const last = page[page.length - 1]!; after = { occurredAt: last.occurredAt, id: last.id };
+    }
   }
 
   private firstLegExpiryAdmission(marketId: string, now = this.nowFn()): {
@@ -4047,13 +4092,14 @@ export class EngineService {
       // experimentBoundaryGate, while deadline expiry closes durably here.
       if (intent === "OPEN_FIRST_LEG" && !(await this.ensureFirstLegEntryOpen())) return false;
       if (intent === "OPEN_FIRST_LEG") {
-        const reason = this.firstLegAdmissionReason(order, decisionSnapshot);
+        const admissionBook = this.state.marketSnapshots.get(order.tokenId);
+        const reason = admissionBook ? this.firstLegExecutionReason(order, admissionBook, this.nowFn()) : "ENTRY_BOOK_UNAVAILABLE";
         if (reason) {
           this.metrics.riskVetoes.inc({ reason });
           this.record("FIRST_LEG_REVALIDATION_REJECTED", order.traceId, order.marketId, { orderId: order.id, reason });
           return false;
         }
-        const economics = firstLegExecutionEconomics(order, decisionSnapshot, this.nowFn().getTime());
+        const economics = firstLegExecutionEconomics(order, admissionBook!, this.nowFn().getTime());
         if (economics.reason) {
           this.metrics.riskVetoes.inc({ reason: economics.reason });
           this.record("FIRST_LEG_REVALIDATION_REJECTED", order.traceId, order.marketId, { orderId: order.id, ...economics });
@@ -4132,7 +4178,7 @@ export class EngineService {
         orderCreatedEvent = createJournalEvent({
           id: derivedAuditEventId("PAPER_ORDER_CREATED", order.id),
           traceId: order.traceId, type: "PAPER_ORDER_CREATED", aggregateType: "paper_order", aggregateId: order.id,
-          payload: { ...order, intent, ...(deRisk ? { deRisk } : {}),
+          payload: { ...order, intent, ...(intent === "OPEN_FIRST_LEG" ? { executionLifecycleVersion: 2 } : {}), ...(deRisk ? { deRisk } : {}),
             ...(makerExperimentId ? { experimentId: makerExperimentId } : {}) },
         });
         // Freeze the final stamped maker event before the direct append can
@@ -4187,15 +4233,22 @@ export class EngineService {
         }
         const takerFill = executePaperTaker({ order, snapshotAfterLatency: current, measuredLatencyMs: this.env.PAPER_EXECUTION_LATENCY_MS });
         if (durableOwner) takerFill.id = `risk-reduction-fill:${order.id}`;
+        if (intent === "OPEN_FIRST_LEG") takerFill.id = `first-leg-fill:${order.id}`;
         const applied = await this.applyFill(
           takerFill,
           { intent, deRisk, riskReductionOwnership: durableOwner, executionSnapshot: current, executionOrder: order },
         );
         if (applied) this.lastTradeAt = this.nowFn();
         else if (durableOwner) await this.failRiskReduction(durableOwner, "FILL_NOT_APPLIED");
-        if (!applied) return false;
+        if (!applied) {
+          if (intent === "OPEN_FIRST_LEG") await this.rejectFirstLegOrder(order, "FILL_NOT_APPLIED", "COMMIT_FENCE");
+          return false;
+        }
       } catch (error) {
         if (this.overload.hasIntegrityFault || error instanceof IdempotencyConflictError || error instanceof CrashInjectedError || (error instanceof JournalAdmissionRejected && error.critical)) throw error;
+        if (intent === "OPEN_FIRST_LEG") await this.rejectFirstLegOrder(order,
+          error instanceof FirstLegLifecycleGuardRejectedError ? error.reason : error instanceof Error ? error.message : String(error),
+          "EXECUTION_OR_COMMIT");
         if (error instanceof FirstLegLifecycleGuardRejectedError) {
           this.metrics.riskVetoes.inc({ reason: error.reason });
           this.record("FIRST_LEG_LIFECYCLE_BLOCKED", order.traceId, order.marketId, { orderId: order.id, reason: error.reason });
@@ -4327,9 +4380,10 @@ export class EngineService {
         const reserveAuthorityAtCommit = await this.journal.readDurableByOperationKey(`maker:${order.id}:reserve`);
         if (reserveAuthorityAtCommit) return;
         if (intent === "OPEN_FIRST_LEG" && orderCreatedEvent) {
-          const reason = this.firstLegAdmissionReason(order, snapshot);
+          const current = this.state.marketSnapshots.get(order.tokenId);
+          const reason = current ? this.firstLegExecutionReason(order, current, this.nowFn()) : "ENTRY_BOOK_UNAVAILABLE";
           if (reason) throw new FirstLegLifecycleGuardRejectedError(order.marketId, reason);
-          const economics = firstLegExecutionEconomics(order, snapshot, this.nowFn().getTime());
+          const economics = firstLegExecutionEconomics(order, current!, this.nowFn().getTime());
           if (economics.reason) throw new FirstLegLifecycleGuardRejectedError(order.marketId, economics.reason);
         }
         if (this.ledger.availableCash().lt(notional)) {
@@ -4373,6 +4427,7 @@ export class EngineService {
     const leftover = reserved ? d(reserved).minus(options.filledNotional ?? 0) : d(0);
     const released = leftover.gt(0) ? decimal(leftover) : "0";
     const type = options.cancel ? "PAPER_ORDER_CANCELLED" : "PAPER_MAKER_RELEASED";
+    const resting = this.restingOrders.get(orderId);
     await this.commitAuthoritative({
       operationKey,
       type,
@@ -4393,7 +4448,14 @@ export class EngineService {
             orderId, released, reason: options.reason ?? null,
             experimentId: this.experiment?.id ?? null, updatedAt: occurredAt.toISOString(),
           },
-        }],
+        }, ...(options.cancel && resting && this.restingOrderIntent(resting) === "OPEN_FIRST_LEG" ? [{
+          id: derivedAuditEventId("PAPER_ORDER_TERMINAL", orderId), type: "PAPER_ORDER_TERMINAL",
+          aggregateType: "paper_order", aggregateId: orderId, traceId: resting.order.traceId,
+          payload: { orderId, marketId: resting.order.marketId, intent: "OPEN_FIRST_LEG", status: "CANCELLED",
+            reason: options.reason ?? "MAKER_CANCELLED", stage: "DURABLE_CANCEL", remainingQuantity: resting.remaining,
+            filledQuantity: d(resting.order.quantity).minus(resting.remaining).toFixed(), terminalAt: occurredAt.toISOString(),
+            experimentId: this.experiment?.id ?? null },
+        }] : [])],
       }),
       afterApply: async () => {
         if (options.cancel) this.record("PAPER_ORDER_CANCELLED", orderId, null, { orderId, reason: options.reason ?? null });
@@ -4423,6 +4485,18 @@ export class EngineService {
       executionOrder?: PaperOrder;
     } = {},
   ): Promise<boolean> {
+    // Capture pricing, provenance and admission synchronously. PG identity reads
+    // and queueing may admit later books; those are evidence for future orders.
+    const executionAt = this.nowFn();
+    const executionBook = extras.executionSnapshot ? structuredClone(extras.executionSnapshot) : undefined;
+    const orderAtExecution = extras.executionOrder ?? this.restingOrders.get(fill.orderId)?.order;
+    const executionOrder = orderAtExecution ? structuredClone(orderAtExecution) : undefined;
+    const executionIntent = extras.intent ?? (this.restingOrders.get(fill.orderId)
+      ? this.restingOrderIntent(this.restingOrders.get(fill.orderId)!) : undefined);
+    const executionReason = executionIntent === "OPEN_FIRST_LEG" && executionBook
+      ? executionOrder ? this.firstLegExecutionReason({ ...executionOrder, quantity: fill.quantity }, executionBook, executionAt)
+        : "ENTRY_ECONOMICS_UNAVAILABLE"
+      : null;
     // Capture before any asynchronous fill work can lose live discovery context.
     // The same lookup type used by learning/CF is persisted with economic authority.
     const settlementLookup = this.resolveSettlementLookup(fill.marketId, true);
@@ -4471,6 +4545,8 @@ export class EngineService {
         aggregateId: fill.id,
         beforeCommit: async () => {
           if (priorFillAuthority) return;
+          if (this.settledMarkets.has(fill.marketId))
+            throw new FirstLegLifecycleGuardRejectedError(fill.marketId, "MARKET_ALREADY_SETTLED");
           // NEW-fill TAKER BUY cash linearization at the serialized durable
           // boundary. The admission-time availableCash read is stale while this
           // call waits on DurableMutationGate: two TAKER BUYs on different
@@ -4639,14 +4715,9 @@ export class EngineService {
           if (economicIntent !== "OPEN_FIRST_LEG") return;
           // Production fills carry the execution book; observed-fill is a
           // test-only economic fixture injection, not order execution.
-          const entryBookReason = extras.executionSnapshot ? this.firstLegAdmissionReason(fill, extras.executionSnapshot) : null;
-          if (entryBookReason) throw new FirstLegLifecycleGuardRejectedError(fill.marketId, entryBookReason);
-          if (extras.executionSnapshot) {
-            const executionOrder = extras.executionOrder ?? restingAtAdmission?.order;
-            if (!executionOrder) throw new FirstLegLifecycleGuardRejectedError(fill.marketId, "ENTRY_ECONOMICS_UNAVAILABLE");
-            const economics = firstLegExecutionEconomics({ ...executionOrder, quantity: fill.quantity }, extras.executionSnapshot, this.nowFn().getTime());
-            if (economics.reason) throw new FirstLegLifecycleGuardRejectedError(fill.marketId, economics.reason);
-          }
+          if (executionReason) throw new FirstLegLifecycleGuardRejectedError(fill.marketId, executionReason);
+          if (executionBook && this.currentTokenIdFor(fill.marketId, fill.outcome) !== fill.tokenId)
+            throw new FirstLegLifecycleGuardRejectedError(fill.marketId, "ENTRY_BOOK_IDENTITY_CHANGED");
           if (fill.liquidityRole === "TAKER") {
             if (currentPosition) {
               throw new FirstLegLifecycleGuardRejectedError(fill.marketId, "POSITION_ALREADY_EXISTS");
@@ -4695,14 +4766,14 @@ export class EngineService {
                 economicIntent,
                 extras.deRisk,
                 unhedgedStartedAtBefore,
-                extras.executionSnapshot && (extras.executionOrder ?? restingAtAdmission?.order) ? {
-                  ...firstLegExecutionEconomics((extras.executionOrder ?? restingAtAdmission!.order), extras.executionSnapshot, this.nowFn().getTime()),
-                  checkedAt: this.nowFn().toISOString(), book: { marketId: extras.executionSnapshot.marketId, tokenId: extras.executionSnapshot.tokenId,
-                    outcome: extras.executionSnapshot.outcome, eventId: extras.executionSnapshot.eventId, sequence: extras.executionSnapshot.sequence,
-                    sourceTimestamp: extras.executionSnapshot.sourceTimestamp, receivedAt: extras.executionSnapshot.receivedAt, wsCallbackAt: extras.executionSnapshot.wsCallbackAt ?? null },
-                  timing: bookTiming(extras.executionSnapshot, this.nowFn().getTime()), maxBookAgeMs: this.riskLimits.staleFeedTimeoutMs,
+                executionBook && executionOrder ? {
+                  ...firstLegExecutionEconomics({ ...executionOrder, quantity: fill.quantity }, executionBook, executionAt.getTime()),
+                  checkedAt: executionAt.toISOString(), book: { marketId: executionBook.marketId, tokenId: executionBook.tokenId,
+                    outcome: executionBook.outcome, eventId: executionBook.eventId, sequence: executionBook.sequence, hash: executionBook.hash,
+                    sourceTimestamp: executionBook.sourceTimestamp, receivedAt: executionBook.receivedAt, wsCallbackAt: executionBook.wsCallbackAt ?? null },
+                  timing: bookTiming(executionBook, executionAt.getTime()), maxBookAgeMs: this.riskLimits.staleFeedTimeoutMs,
                   marketSlug: this.marketsById.get(fill.marketId)?.slug ?? null,
-                  startVerified: officialMarketStartReason(this.marketsById.get(fill.marketId), this.nowFn().getTime()) === null,
+                  startVerified: officialMarketStartReason(this.marketsById.get(fill.marketId), executionAt.getTime()) === null,
                 } : undefined,
               ),
             ),
@@ -4737,6 +4808,7 @@ export class EngineService {
         return false;
       }
       if (!(error instanceof FirstLegLifecycleGuardRejectedError)) throw error;
+      if (fill.liquidityRole === "TAKER") await this.rejectFirstLegOrder({ id: fill.orderId, marketId: fill.marketId, traceId: fill.traceId }, error.reason, "COMMIT_FENCE");
       this.record("FIRST_LEG_LIFECYCLE_BLOCKED", fill.traceId, fill.marketId, {
         fillId: fill.id,
         orderId: fill.orderId,
@@ -4790,6 +4862,12 @@ export class EngineService {
       },
       sourceEventId: fill.sourceMarketEventId,
     }];
+    if (intent === "OPEN_FIRST_LEG" && (fill.liquidityRole === "TAKER" || !projected.restingOrders.has(fill.orderId))) {
+      records.push({ id: derivedAuditEventId("PAPER_ORDER_TERMINAL", fill.orderId), type: "PAPER_ORDER_TERMINAL",
+        aggregateType: "paper_order", aggregateId: fill.orderId, traceId: fill.traceId,
+        payload: { orderId: fill.orderId, marketId: fill.marketId, intent, status: "FILLED", reason: "EXECUTED",
+          stage: "DURABLE_FILL", fillId: fill.id, terminalAt: occurredAt.toISOString(), experimentId } });
+    }
     if (deRisk?.guardianSensor && (!position?.unpairedOutcome || d(position.unpairedQuantity).eq(0))) {
       records.push({ id: derivedAuditEventId("GUARDIAN_EXECUTION_COMPLETED", fill.id), type: "GUARDIAN_EXECUTION_COMPLETED",
         aggregateType: "position", aggregateId: deRisk.positionId ?? fill.marketId, traceId: fill.traceId,

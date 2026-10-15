@@ -70,7 +70,7 @@ describe("P0-06 first-leg book authority", () => {
       await (engine as unknown as { applyFill: (f: ReturnType<typeof paperFill>, e: { intent: "OPEN_FIRST_LEG"; executionSnapshot: MarketSnapshot; executionOrder: PaperOrder }) => Promise<boolean> })
         .applyFill(paperFill("entry", "UP", "0.70", { tokenId: b.tokenId, quantity: "2" }), { intent: "OPEN_FIRST_LEG", executionSnapshot: b, executionOrder });
       const rows = await journal.queryDurableTransitions({ types: ["PAPER_FILL"], limit: 10 });
-      const accepted = scenario === "fresh" || scenario === "boundary";
+      const accepted = scenario === "fresh" || scenario === "boundary" || scenario.startsWith("async");
       expect(rows).toHaveLength(accepted ? 1 : 0);
       if (!accepted) expect(engine.ledger.snapshot().cash).toBe(before);
       expect(engine.integrityFault()).toBe(false);
