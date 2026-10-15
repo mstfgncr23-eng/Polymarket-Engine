@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { bookTiming, firstLegBookReason } from "./first-leg-admission.js";
 import type { GuardianView, GuardianMarket, GuardianUpdate } from "./guardian-link.js";
 import { currentGuardianConsensus } from "./guardian-link.js";
 import { guardianV2StateSchema, type GuardianV2State } from "@pm/core";
@@ -1613,6 +1614,14 @@ export class EngineService {
       || (!ignoreOwnPending && this.pendingFirstLegMarkets.has(marketId));
   }
 
+  private firstLegAdmissionReason(order: Pick<PaperOrder, "marketId" | "tokenId" | "outcome">, expected?: MarketSnapshot): string | null {
+    return firstLegBookReason({ ...order,
+      canonicalTokenId: this.currentTokenIdFor(order.marketId, order.outcome),
+      synchronized: this.adapterTokenSynchronized(order.tokenId),
+      book: this.state.marketSnapshots.get(order.tokenId), expected,
+      nowMs: this.nowFn().getTime(), maxAgeMs: this.riskLimits.staleFeedTimeoutMs });
+  }
+
   private firstLegExpiryAdmission(marketId: string, now = this.nowFn()): {
     eligible: boolean;
     endDate: string | null;
@@ -2609,6 +2618,10 @@ export class EngineService {
     if (!this.tokenIdSet.has(snapshot.tokenId)) return;
     const started = performance.now();
     this.metrics.marketMessages.inc();
+    const timing = bookTiming(snapshot, this.nowFn().getTime());
+    if (timing.sourceToIngressMs !== null && Number.isFinite(timing.sourceToIngressMs) && timing.sourceToIngressMs >= 0) this.metrics.bookSourceToIngress.observe(timing.sourceToIngressMs / 1000);
+    if (timing.ingressToReceivedMs !== null && Number.isFinite(timing.ingressToReceivedMs) && timing.ingressToReceivedMs >= 0) this.metrics.bookIngressToReceived.observe(timing.ingressToReceivedMs / 1000);
+    if (Number.isFinite(timing.receivedToDecisionMs) && timing.receivedToDecisionMs >= 0) this.metrics.bookReceivedToProcessing.observe(timing.receivedToDecisionMs / 1000);
     this.state.connections.polymarket.lastMessageAt = snapshot.receivedAt;
     const synchronized = this.adapterTokenSynchronized(snapshot.tokenId);
     if (!synchronized) {
@@ -2672,7 +2685,7 @@ export class EngineService {
           // keeps the legacy pre-PR1 inference, evaluated against the state
           // that derived the fill instead of re-read after an await.
           const restingIntent = this.restingOrderIntent(resting);
-          await this.applyFill(evolved.fill, { restingAfter: evolved.resting, intent: restingIntent });
+          await this.applyFill(evolved.fill, { restingAfter: evolved.resting, intent: restingIntent, executionSnapshot: snapshot });
         } else {
           this.restingOrders.set(orderId, evolved.resting);
           if (Number(evolved.resting.remaining) === 0) {
@@ -3664,6 +3677,14 @@ export class EngineService {
       ? pair[candidate.outcome]
       : this.state.marketSnapshots.get(candidate.tokenId);
     if (!snapshot || snapshot.tokenId !== candidate.tokenId) return;
+    if (candidate.intent === "OPEN_FIRST_LEG") {
+      const reason = this.firstLegAdmissionReason(candidate, snapshot);
+      if (reason) {
+        this.metrics.riskVetoes.inc({ reason });
+        this.record("FIRST_LEG_REVALIDATION_REJECTED", trigger.traceId, candidate.marketId, { reason, timing: bookTiming(snapshot, this.nowFn().getTime()) });
+        return;
+      }
+    }
 
     let executableFair: ReturnType<typeof executableFairEdge> = null;
     if (candidate.intent === "OPEN_FIRST_LEG" && (decisionNative.direction === "UP" || decisionNative.direction === "DOWN")) {
@@ -4004,6 +4025,12 @@ export class EngineService {
       // experimentBoundaryGate, while deadline expiry closes durably here.
       if (intent === "OPEN_FIRST_LEG" && !(await this.ensureFirstLegEntryOpen())) return false;
       if (intent === "OPEN_FIRST_LEG") {
+        const reason = this.firstLegAdmissionReason(order, decisionSnapshot);
+        if (reason) {
+          this.metrics.riskVetoes.inc({ reason });
+          this.record("FIRST_LEG_REVALIDATION_REJECTED", order.traceId, order.marketId, { orderId: order.id, reason });
+          return false;
+        }
         const expiry = this.firstLegExpiryAdmission(order.marketId);
         if (!expiry.eligible) {
           this.record("FIRST_LEG_REVALIDATION_REJECTED", order.traceId, order.marketId, {
@@ -4098,6 +4125,10 @@ export class EngineService {
         await delay(this.env.PAPER_EXECUTION_LATENCY_MS);
         const current = this.state.marketSnapshots.get(order.tokenId);
         if (!current || new Date(current.receivedAt).getTime() < new Date(decisionSnapshot.receivedAt).getTime()) throw new Error("STALE_EXECUTION_SNAPSHOT");
+        if (intent === "OPEN_FIRST_LEG") {
+          const reason = this.firstLegAdmissionReason(order, current);
+          if (reason) throw new FirstLegLifecycleGuardRejectedError(order.marketId, reason);
+        }
         if (intent === "PROTECTIVE_DE_RISK" || intent === "GUARDIAN_PROTECTIVE_SELL") {
           const reason = this.protectiveFillHardSafetyReason(order);
           if (reason) {
@@ -4125,12 +4156,17 @@ export class EngineService {
         if (durableOwner) takerFill.id = `risk-reduction-fill:${order.id}`;
         const applied = await this.applyFill(
           takerFill,
-          { intent, deRisk, riskReductionOwnership: durableOwner },
+          { intent, deRisk, riskReductionOwnership: durableOwner, executionSnapshot: current },
         );
         if (applied) this.lastTradeAt = this.nowFn();
         else if (durableOwner) await this.failRiskReduction(durableOwner, "FILL_NOT_APPLIED");
       } catch (error) {
         if (this.overload.hasIntegrityFault || error instanceof IdempotencyConflictError || error instanceof CrashInjectedError || (error instanceof JournalAdmissionRejected && error.critical)) throw error;
+        if (error instanceof FirstLegLifecycleGuardRejectedError) {
+          this.metrics.riskVetoes.inc({ reason: error.reason });
+          this.record("FIRST_LEG_LIFECYCLE_BLOCKED", order.traceId, order.marketId, { orderId: order.id, reason: error.reason });
+          return false;
+        }
         if (durableOwner) await this.failRiskReduction(durableOwner, error instanceof Error ? error.message : String(error),
           !(error instanceof RiskReductionLifecycleGuardRejectedError) && !(error instanceof TakerCashCommitGuardRejectedError) && !(error instanceof MakerReservationCashCommitGuardRejectedError));
         if (error instanceof RiskReductionLifecycleGuardRejectedError) {
@@ -4252,6 +4288,10 @@ export class EngineService {
         // cash twice.
         const reserveAuthorityAtCommit = await this.journal.readDurableByOperationKey(`maker:${order.id}:reserve`);
         if (reserveAuthorityAtCommit) return;
+        if (intent === "OPEN_FIRST_LEG" && orderCreatedEvent) {
+          const reason = this.firstLegAdmissionReason(order, snapshot);
+          if (reason) throw new FirstLegLifecycleGuardRejectedError(order.marketId, reason);
+        }
         if (this.ledger.availableCash().lt(notional)) {
           throw new MakerReservationCashCommitGuardRejectedError(
             order.id,
@@ -4339,6 +4379,7 @@ export class EngineService {
       intent?: "OPEN_FIRST_LEG" | "HEDGE_SECOND_LEG" | "PROTECTIVE_DE_RISK" | "RESCUE_SECOND_LEG" | "GUARDIAN_PROTECTIVE_SELL";
       deRisk?: ProtectiveDeRiskAudit;
       riskReductionOwnership?: RiskReductionOwnership;
+      executionSnapshot?: MarketSnapshot;
     } = {},
   ): Promise<boolean> {
     // Capture before any asynchronous fill work can lose live discovery context.
@@ -4552,6 +4593,10 @@ export class EngineService {
           }
 
           if (economicIntent !== "OPEN_FIRST_LEG") return;
+          // Production fills carry the execution book; observed-fill is a
+          // test-only economic fixture injection, not order execution.
+          const entryBookReason = extras.executionSnapshot ? this.firstLegAdmissionReason(fill, extras.executionSnapshot) : null;
+          if (entryBookReason) throw new FirstLegLifecycleGuardRejectedError(fill.marketId, entryBookReason);
           if (fill.liquidityRole === "TAKER") {
             if (currentPosition) {
               throw new FirstLegLifecycleGuardRejectedError(fill.marketId, "POSITION_ALREADY_EXISTS");

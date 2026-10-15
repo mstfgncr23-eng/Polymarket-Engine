@@ -51,6 +51,9 @@ export interface MarketNormalizeObserver {
 export class EngineMetrics {
   readonly registry = new Registry();
   readonly marketMessages = new Counter({ name: "market_messages_total", help: "Normalized market messages", registers: [this.registry] });
+  readonly bookSourceToIngress = new Histogram({ name: "book_source_to_ingress_seconds", help: "Source to owned WebSocket callback; absent when callback provenance is unavailable", buckets: DURATION_BUCKETS, registers: [this.registry] });
+  readonly bookIngressToReceived = new Histogram({ name: "book_ingress_to_received_seconds", help: "Owned WebSocket callback to Engine received timestamp", buckets: DURATION_BUCKETS, registers: [this.registry] });
+  readonly bookReceivedToProcessing = new Histogram({ name: "book_received_to_processing_seconds", help: "Engine received timestamp to processing; separate from source delay", buckets: DURATION_BUCKETS, registers: [this.registry] });
   // MinOrderSize hydration observability: low-cardinality, no token/market labels.
   readonly minOrderSizeHydrationAttempts = new Counter({
     name: "polymarket_min_order_size_hydration_attempt_total",
