@@ -228,15 +228,13 @@ const MIN_ORDER_SIZE_REST_RETRY_MS = 60_000;
 
 interface BookState {
   marketId: string;
-  bids: Map<string, string>;
-  asks: Map<string, string>;
   bidLevels: BookLevel[];
   askLevels: BookLevel[];
   publishedBids: readonly BookLevel[] | null;
   publishedAsks: readonly BookLevel[] | null;
   bidsDirty: boolean;
   asksDirty: boolean;
-  /** Working maps/arrays are unique to this object and safe to mutate. */
+  /** Working arrays are unique to this object and safe to mutate. */
   bidsOwned: boolean;
   asksOwned: boolean;
   levelsValid: boolean;
@@ -396,7 +394,7 @@ export class PolymarketMarketDataAdapter {
   lastAcceptedTimestamp(tokenId: string): number | undefined { return this.lastTimestampByToken.get(tokenId); }
   bookState(tokenId: string): { bids: Map<string, string>; asks: Map<string, string>; timestamp: string } | undefined {
     const state = this.books.get(tokenId);
-    return state ? { bids: new Map(state.bids), asks: new Map(state.asks), timestamp: state.timestamp } : undefined;
+    return state ? { bids: new Map(state.bidLevels.map(x=>[x.price,x.quantity])), asks: new Map(state.askLevels.map(x=>[x.price,x.quantity])), timestamp: state.timestamp } : undefined;
   }
   activeStreamCount(): number { return this.activeStreams; }
 
@@ -811,8 +809,6 @@ export class PolymarketMarketDataAdapter {
     const started = performance.now();
     const staged: BookState = {
       marketId: String(payload.market ?? market.id),
-      bids,
-      asks,
       bidLevels: sortedFrozenLevels(bids, "desc"),
       askLevels: sortedFrozenLevels(asks, "asc"),
       publishedBids: null,
@@ -934,13 +930,14 @@ export class PolymarketMarketDataAdapter {
         copy = cloneBookState(item.state);
         working.set(item.tokenId, copy);
       }
-      const sideMap = item.side === "BUY" ? copy.bids : copy.asks;
+      const levels = item.side === "BUY" ? copy.bidLevels : copy.askLevels;
+      const direction = item.side === "BUY" ? "desc" : "asc";
+      const existing = findExactPriceIndex(levels, item.price, direction);
       // An unchanged level is still a distinct source observation, with its
       // timestamp/hash/sequence and callback. Only redundant copies are skipped.
-      if (Number(item.size) <= 0 ? sideMap.has(item.price) : sideMap.get(item.price) !== item.size) {
+      if (Number(item.size) <= 0 ? existing >= 0 : existing < 0 || levels[existing]!.quantity !== item.size) {
         ownBookSide(copy, item.side);
-        if (item.side === "BUY") applyLevelChange(copy.bids, copy.bidLevels, item.price, item.size, "desc");
-        else applyLevelChange(copy.asks, copy.askLevels, item.price, item.size, "asc");
+        applyLevelChange(item.side === "BUY" ? copy.bidLevels : copy.askLevels, item.price, item.size, direction, existing);
       }
       copy.timestamp = new Date(sourceMs).toISOString();
       copy.hash = nullableString(item.hash) ?? copy.hash;
@@ -1558,11 +1555,11 @@ function insertIndex(levels: readonly BookLevel[], price: string, order: "asc" |
 
 /**
  * Stage a price_change onto a trusted BookState without exposing partial
- * mutation. Copy-on-write clones only the side that will be mutated.
+ * mutation. Copy-on-write clones only the sorted side array that will be mutated.
  *
  * Invariants that make sharing the unchanged side safe:
  * - Trusted books in `this.books` are only installed after validation.
- * - applyLevelChange mutates only the maps/arrays passed to it (the cloned
+ * - applyLevelChange mutates only the array passed to it (the cloned
  *   side). The opposite side is never written.
  * - Published snapshot arrays are frozen slices, not the working arrays.
  * - A later mutation always forks the side it writes before splicing, so an
@@ -1581,7 +1578,6 @@ function ownBookSide(state: BookState, side: "BUY" | "SELL"): void {
       state.bidsDirty = true;
       return;
     }
-    state.bids = new Map(state.bids);
     state.bidLevels = state.bidLevels.slice();
     state.publishedBids = null;
     state.bidsDirty = true;
@@ -1593,7 +1589,6 @@ function ownBookSide(state: BookState, side: "BUY" | "SELL"): void {
     state.asksDirty = true;
     return;
   }
-  state.asks = new Map(state.asks);
   state.askLevels = state.askLevels.slice();
   state.publishedAsks = null;
   state.asksDirty = true;
@@ -1603,8 +1598,7 @@ function ownBookSide(state: BookState, side: "BUY" | "SELL"): void {
 /**
  * Freeze independent published arrays for one accepted entry while the
  * per-token working state continues to accept later entries in the same
- * payload. Maps may still be shared with the working state; toSnapshot
- * and observers read the captured arrays, not those maps.
+ * payload. toSnapshot and observers read the captured frozen arrays.
  */
 function captureStagedSnapshot(state: BookState): BookState {
   const bids = !state.bidsDirty && state.publishedBids
@@ -1627,26 +1621,21 @@ function captureStagedSnapshot(state: BookState): BookState {
 }
 
 function applyLevelChange(
-  map: Map<string, string>,
   levels: BookLevel[],
   price: string,
   size: string,
   order: "asc" | "desc",
+  existing: number,
 ): boolean {
   if (Number(size) <= 0) {
-    if (!map.has(price)) return false;
-    map.delete(price);
-    const index = findExactPriceIndex(levels, price, order);
-    if (index >= 0) levels.splice(index, 1);
+    if (existing < 0) return false;
+    levels.splice(existing, 1);
     return true;
   }
-  const existing = findExactPriceIndex(levels, price, order);
   if (existing >= 0) {
-    map.set(price, size);
     levels[existing] = freezeLevel(price, size);
     return true;
   }
-  map.set(price, size);
   levels.splice(insertIndex(levels, price, order), 0, freezeLevel(price, size));
   return true;
 }

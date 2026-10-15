@@ -1,6 +1,6 @@
 import { d } from "./calculations.js";
 import { AssetMarketIndex } from "./asset-market-index.js";
-import { deriveBook, sameDerivedBookInputs, type BookDerived } from "./book-derived.js";
+import { deriveBookState, type DerivedBookState } from "./book-derived.js";
 import { createId, type ConsensusDecision, type MarketSnapshot, type Outcome, type Position, type ReferenceTick, type TriggerEvent, type TriggerKind, type TriggerSource } from "./domain.js";
 import type { TriggerConfig } from "./config.js";
 import { ReferenceTickWindow } from "./reference-window.js";
@@ -10,10 +10,7 @@ import {
   triggerDedupeScopeKey,
 } from "./stability-bounds.js";
 
-interface BookState {
-  snapshot: MarketSnapshot;
-  derived: BookDerived;
-}
+type BookState = DerivedBookState;
 
 interface MarketWindow {
   asset: string | null;
@@ -92,9 +89,8 @@ export class TriggerEngine {
       const key = bookKey(snapshot.marketId, snapshot.outcome);
       const previous = this.books.get(key);
       const previousSameOutcome = previous && previous.snapshot.outcome === snapshot.outcome && previous.snapshot.tokenId === snapshot.tokenId ? previous : null;
-      const derived = previousSameOutcome && sameDerivedBookInputs(previousSameOutcome.snapshot, snapshot)
-        ? previousSameOutcome.derived
-        : deriveBook(snapshot);
+      const nextBook = deriveBookState(snapshot, previousSameOutcome);
+      const derived = nextBook.derived;
       const candidates: Candidate[] = [];
       let newsScore = -1;
       const imbalance = derived.imbalanceAbs;
@@ -158,7 +154,7 @@ export class TriggerEngine {
       if (newsScore >= 0) {
         candidates.push({ kind: "NEWS_INFORMATION", score: newsScore, severity: 2, evidence: { because: "BOOK_IMBALANCE" }, source: "news" });
       }
-      this.books.set(key, { snapshot, derived });
+      this.books.set(key, nextBook);
       if (snapshot.asset) this.assetIndex.add(snapshot.asset, snapshot.marketId);
       return this.emit(snapshot.traceId, snapshot.marketId, snapshot.asset ?? window?.asset ?? null, snapshot.eventId, candidates, this.marketEmitted(snapshot.marketId));
     } finally {

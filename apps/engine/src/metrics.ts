@@ -1,3 +1,4 @@
+import { ScalarHistogram } from "./scalar-histogram.js";
 import { performance } from "node:perf_hooks";
 import { Counter, Gauge, Histogram, Registry, collectDefaultMetrics } from "prom-client";
 import { triggerKindSchema, type TriggerEmitObserver } from "@pm/core";
@@ -51,14 +52,14 @@ export interface MarketNormalizeObserver {
 
 export class EngineMetrics {
   readonly registry = new Registry();
-  readonly sourceEventNormalization = new Histogram({ name: "market_source_event_normalization_seconds", help: "Complete source event normalization including validation and copy-on-write, before Engine dispatch", buckets: DURATION_BUCKETS, registers: [this.registry] });
+  readonly sourceEventNormalization = new ScalarHistogram({ name: "market_source_event_normalization_seconds", help: "Complete source event normalization including validation and copy-on-write, before Engine dispatch", buckets: DURATION_BUCKETS, registers: [this.registry] });
   readonly ingressAccepted = new Gauge({ name: "market_ingress_accepted_events", help: "Cumulative raw source events admitted in this process; never reset per experiment", registers: [this.registry] });
   readonly ingressProcessed = new Gauge({ name: "market_ingress_processed_events", help: "Cumulative raw source events dequeued in this process; never reset per experiment", registers: [this.registry] });
   readonly shardIngress = new Gauge({ name: "market_shard_ingress", help: "Bounded per-shard queue, cumulative source counts and subscription load", labelNames: ["shard", "measure"], registers: [this.registry] });
   readonly marketMessages = new Counter({ name: "market_messages_total", help: "Normalized market messages", registers: [this.registry] });
-  readonly bookSourceToIngress = new Histogram({ name: "book_source_to_ingress_seconds", help: "Source to owned WebSocket callback; absent when callback provenance is unavailable", buckets: DURATION_BUCKETS, registers: [this.registry] });
-  readonly bookIngressToReceived = new Histogram({ name: "book_ingress_to_received_seconds", help: "Owned WebSocket callback to Engine received timestamp", buckets: DURATION_BUCKETS, registers: [this.registry] });
-  readonly bookReceivedToProcessing = new Histogram({ name: "book_received_to_processing_seconds", help: "Engine received timestamp to processing; separate from source delay", buckets: DURATION_BUCKETS, registers: [this.registry] });
+  readonly bookSourceToIngress = new ScalarHistogram({ name: "book_source_to_ingress_seconds", help: "Source to owned WebSocket callback; absent when callback provenance is unavailable", buckets: DURATION_BUCKETS, registers: [this.registry] });
+  readonly bookIngressToReceived = new ScalarHistogram({ name: "book_ingress_to_received_seconds", help: "Owned WebSocket callback to Engine received timestamp", buckets: DURATION_BUCKETS, registers: [this.registry] });
+  readonly bookReceivedToProcessing = new ScalarHistogram({ name: "book_received_to_processing_seconds", help: "Engine received timestamp to processing; separate from source delay", buckets: DURATION_BUCKETS, registers: [this.registry] });
   // MinOrderSize hydration observability: low-cardinality, no token/market labels.
   readonly minOrderSizeHydrationAttempts = new Counter({
     name: "polymarket_min_order_size_hydration_attempt_total",
@@ -99,7 +100,7 @@ export class EngineMetrics {
   readonly riskVetoes = new Counter({ name: "risk_veto_total", help: "Risk vetoes", labelNames: ["reason"], registers: [this.registry] });
   readonly openPositions = new Gauge({ name: "open_positions", help: "Open positions", registers: [this.registry] });
   readonly unhedgedPositions = new Gauge({ name: "unhedged_positions", help: "Unhedged positions", registers: [this.registry] });
-  readonly eventLatency = new Histogram({ name: "event_processing_latency", help: "Event processing latency seconds", buckets: [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5], registers: [this.registry] });
+  readonly eventLatency = new ScalarHistogram({ name: "event_processing_latency", help: "Event processing latency seconds", buckets: [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5], registers: [this.registry] });
   readonly mcpLatency = new Histogram({ name: "grok_mcp_latency_seconds", help: "Grok MCP request latency seconds", labelNames: ["method"], buckets: [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5], registers: [this.registry] });
   readonly queueDepth = new Gauge({ name: "engine_queue_depth", help: "Pending decision count", registers: [this.registry] });
   readonly activations = new Counter({ name: "grok_activation_total", help: "Grok activation adapter attempts (not observed Bot wakes)", labelNames: ["provider", "status"], registers: [this.registry] });
@@ -119,25 +120,25 @@ export class EngineMetrics {
     help: "Price-change entries that produced a normalized snapshot",
     registers: [this.registry],
   });
-  readonly priceChangeEntriesPerEvent = new Histogram({
+  readonly priceChangeEntriesPerEvent = new ScalarHistogram({
     name: "price_change_entries_per_event",
     help: "Price-change entries present on each source event payload",
     buckets: COUNT_BUCKETS,
     registers: [this.registry],
   });
-  readonly marketBookBidLevels = new Histogram({
+  readonly marketBookBidLevels = new ScalarHistogram({
     name: "market_book_bid_levels",
-    help: "Bid-side book level count at normalization time (map size, no extra scan)",
+    help: "Bid-side book level count at normalization time (array length, no extra scan)",
     buckets: LEVEL_BUCKETS,
     registers: [this.registry],
   });
-  readonly marketBookAskLevels = new Histogram({
+  readonly marketBookAskLevels = new ScalarHistogram({
     name: "market_book_ask_levels",
-    help: "Ask-side book level count at normalization time (map size, no extra scan)",
+    help: "Ask-side book level count at normalization time (array length, no extra scan)",
     buckets: LEVEL_BUCKETS,
     registers: [this.registry],
   });
-  readonly marketNormalizationDuration = new Histogram({
+  readonly marketNormalizationDuration = new ScalarHistogram({
     name: "market_normalization_duration_seconds",
     help: "Time to convert one book state into a MarketSnapshot, including ordered-book construction or incremental level update",
     buckets: DURATION_BUCKETS,
@@ -251,7 +252,7 @@ export class EngineMetrics {
     help: "Reference feed ticks accepted for processing",
     registers: [this.registry],
   });
-  readonly referenceTickProcessingDuration = new Histogram({
+  readonly referenceTickProcessingDuration = new ScalarHistogram({
     name: "reference_tick_processing_duration_seconds",
     help: "Reference tick ingest duration including telemetry persist and trigger ingest",
     buckets: DURATION_BUCKETS,
@@ -263,13 +264,13 @@ export class EngineMetrics {
     buckets: LEVEL_BUCKETS,
     registers: [this.registry],
   });
-  readonly triggerMarketIngestDuration = new Histogram({
+  readonly triggerMarketIngestDuration = new ScalarHistogram({
     name: "trigger_market_ingest_duration_seconds",
     help: "TriggerEngine.ingestMarket duration (one histogram for CPU attribution)",
     buckets: DURATION_BUCKETS,
     registers: [this.registry],
   });
-  readonly triggerReferenceIngestDuration = new Histogram({
+  readonly triggerReferenceIngestDuration = new ScalarHistogram({
     name: "trigger_reference_ingest_duration_seconds",
     help: "TriggerEngine.ingestReference duration (one histogram for CPU attribution)",
     buckets: DURATION_BUCKETS,

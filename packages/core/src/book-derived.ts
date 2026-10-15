@@ -1,4 +1,4 @@
-import { bookImbalance, spread } from "./calculations.js";
+import { bookImbalance, d, spread } from "./calculations.js";
 import { TRIGGER_STABILITY_BOUNDS } from "./stability-bounds.js";
 import type { MarketSnapshot } from "./types-internal.js";
 
@@ -44,6 +44,7 @@ function sameQuantityPrefix(
   right: readonly { quantity: string }[],
   limit: number,
 ): boolean {
+  if (left === right) return true;
   const leftCount = Math.min(limit, left.length);
   const rightCount = Math.min(limit, right.length);
   if (leftCount != rightCount) return false;
@@ -92,4 +93,31 @@ export function deriveBook(snapshot: MarketSnapshot): BookDerived {
     imbalance,
     imbalanceAbs: Math.abs(imbalance),
   };
+}
+
+export interface DerivedBookState {
+  snapshot: MarketSnapshot;
+  derived: BookDerived;
+  bidSum: ReturnType<typeof d>;
+  askSum: ReturnType<typeof d>;
+}
+
+/** Exact component reuse: imbalance reads quantities only, spread reads best
+ * prices only. Decimal sums retain the original left-to-right arithmetic. */
+export function deriveBookState(snapshot: MarketSnapshot, previous?: DerivedBookState | null): DerivedBookState {
+  const sum = (levels: MarketSnapshot["bids"]) => {
+    let value = d(0);
+    for (let i=0; i<Math.min(5,levels.length); i++) value=value.plus(levels[i]!.quantity);
+    return value;
+  };
+  const bidSum = previous && sameQuantityPrefix(previous.snapshot.bids,snapshot.bids,5) ? previous.bidSum : sum(snapshot.bids);
+  const askSum = previous && sameQuantityPrefix(previous.snapshot.asks,snapshot.asks,5) ? previous.askSum : sum(snapshot.asks);
+  let imbalance: number;
+  if (previous && bidSum===previous.bidSum && askSum===previous.askSum) imbalance=previous.derived.imbalance;
+  else { const total=bidSum.plus(askSum);imbalance=total.eq(0)?0:bidSum.minus(askSum).div(total).toNumber(); }
+  const unchangedPrices = previous && previous.snapshot.bids[0]?.price===snapshot.bids[0]?.price
+    && previous.snapshot.asks[0]?.price===snapshot.asks[0]?.price;
+  const spreadText = unchangedPrices ? previous.derived.spread : spread(snapshot);
+  return {snapshot,bidSum,askSum,derived:{spread:spreadText,spreadNumber:Number(spreadText??0),
+    totalDepth:totalDepthCombined(snapshot),imbalance,imbalanceAbs:Math.abs(imbalance)}};
 }
