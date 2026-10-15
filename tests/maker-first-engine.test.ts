@@ -77,6 +77,7 @@ describe('Maker-First real Engine lifecycle',()=>{
    expect(s.engine.integrityFault()).toBe(true);const sequence=await s.journal.latestDurableSequence();
    const q=[...s.engine.restingOrdersForTest().values()][0]!.order;
    s.clock.ms+=201;await s.intern.onMakerTrade(s.trade(q,'100'));s.clock.ms+=2001;await s.intern.expireMakerQuotes();
+   await s.market.emitSnapshot(s.b('UP',99));
    expect(await s.journal.latestDurableSequence()).toBe(sequence);expect(s.engine.ledger.positions.size).toBe(0);
    await s.engine.stop();s.journal.commitDurableTransition=commit;
    s=await setup(true,s.journal,s.clock,{PAPER_DUAL_SIDED_MAKER_ENABLED:'true'});

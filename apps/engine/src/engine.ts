@@ -2778,6 +2778,9 @@ export class EngineService {
   }
 
   private async evolveSnapshotMakers(snapshot: MarketSnapshot, previous: MarketSnapshot): Promise<void> {
+    // An unresolved durable fault freezes maker mutations from books as well
+    // as trade callbacks/timers; only recovery may reconcile that authority.
+    if(this.overload.hasIntegrityFault)return;
     for (const orderId of this.restingIndex.orderIdsFor(snapshot.tokenId)) {
       const resting = this.restingOrders.get(orderId);
       if (!resting || resting.order.tokenId !== snapshot.tokenId) continue;
