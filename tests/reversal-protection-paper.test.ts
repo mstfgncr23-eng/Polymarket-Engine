@@ -423,7 +423,7 @@ describe("Guardian V2 real PAPER lifecycle with independent emergency execution"
       console.log(JSON.stringify({ evidence: "GUARDIAN_MAKER_HANDOFF", cancelSequence: cancel.sequence, admissionSequence: admitted.sequence, fills: 1, delayedPartialFillApplied: false }));
     } finally { await s.engine.stop(); }
   });
-  it("confirmed Guardian releases a previously admitted normal taker before its fill and prevents duplicate execution", async () => {
+  it.each([false, true])("confirmed Guardian releases a previously admitted normal taker even with oppositeBookMissing=%s and prevents duplicate execution", async missingOpposite => {
     const s = await start();
     try {
       await seed(s); await armEarly(s);
@@ -433,7 +433,13 @@ describe("Guardian V2 real PAPER lifecycle with independent emergency execution"
       const owner: RiskReductionOwnership = { marketId: MARKET, unhedgedStartedAt: position.unhedgedStartedAt ?? position.openedAt,
         intent: "HEDGE_SECOND_LEG", order: hedge, admittedResidualQuantity: "5", decisionReceivedAt: new Date(s.clock.ms).toISOString(), state: "ADMITTED" };
       expect(await internal(s).admitRiskReduction(owner)).toBe(true);
-      await timeout(s); await publish(s, "0.60", "0.30");
+      await timeout(s);
+      if (missingOpposite) {
+        const held = book(s, "UP", "0.60", "0.81");
+        internal(s).snapshots.set(MARKET, { UP: held });
+        s.engine.state.marketSnapshots.set(UP, held); s.engine.state.marketSnapshots.delete(DOWN);
+        await internal(s).maybeReversalProtection(MARKET);
+      } else await publish(s, "0.60", "0.30");
       await waitFor(s, () => residual(s) === "0");
       expect(await riskFills(s)).toHaveLength(1);
       expect((await rows(s, "PAPER_FILL")).filter(r => r.payload.intent === "HEDGE_SECOND_LEG")).toHaveLength(0);

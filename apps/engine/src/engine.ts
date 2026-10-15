@@ -5879,7 +5879,16 @@ export class EngineService {
       || this.state.journalDegraded || this.overload.hasIntegrityFault || this.overload.state === "FAIL_CLOSED") return;
     const owner = this.riskReductionOwners.get(marketId);
     if (owner) {
-      await this.resumeRiskReduction(owner);
+      if (owner.intent !== "GUARDIAN_PROTECTIVE_SELL" && !this.riskReductionInFlight.has(marketId)) {
+        // A recovered/admitted but non-running PAPER taker has not executed.
+        // Revoke its durable authority before requiring its opposite book;
+        // a missing hedge book cannot trap a valid held-token emergency SELL.
+        await this.durableGate.run(async () => {
+          if (this.confirmedGuardianProtection(marketId)
+            && this.riskReductionOwners.get(marketId)?.order.id === owner.order.id
+            && !this.riskReductionInFlight.has(marketId)) await this.failRiskReduction(owner, "GUARDIAN_PRIORITY");
+        });
+      } else await this.resumeRiskReduction(owner);
       if (this.riskReductionOwners.has(marketId)) return;
     }
     if (this.riskReductionBusy(marketId)) {
