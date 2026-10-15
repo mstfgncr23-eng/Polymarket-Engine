@@ -9027,6 +9027,8 @@ private buildEarlyAudit(
                 payload: {
                   ...projected.ledger.snapshot(), experimentId: this.experiment?.id ?? null,
                   source: "MARK_TO_MARKET", unresolvedPositionCount: unresolvedCount, markToMarket: true,
+                  economicResults: projected.resultAccounting ? economicResults(projected.resultAccounting) : null,
+                  tradingResults: projected.resultAccounting ? tradingResults(projected.resultAccounting) : null,
                 },
               },
             ],

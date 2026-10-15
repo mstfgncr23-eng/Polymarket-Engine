@@ -8,6 +8,8 @@ import { EngineService } from "../apps/engine/src/engine.js";
 import { NoopGrokActivationBridge } from "../apps/engine/src/activation/index.js";
 import { CrashInjectedError, type CrashInjectionPoint } from "../apps/engine/src/crash-injection.js";
 import { paperFill, qualifiedPaperEnv, qualified, discoveryReport, ScriptedMarketAdapter, ScriptedReferenceRegistry } from "./paper-engine-testkit.js";
+import { snapshot } from "./fixtures.js";
+import { buildExperimentSummary } from "../apps/engine/src/report.js";
 
 const at = new Date("2026-09-01T00:00:00.000Z");
 function bag(): RecoverableEngineState {
@@ -126,6 +128,34 @@ describe("P1-10 dollar cashflow authority", () => {
       expect(engine.state.snapshot().economicResults).toEqual(before.economicResults);
       expect(engine.ledger.snapshot()).toEqual(before.balance);
       expect((await journal.queryEvents({ types: ["PNL_SNAPSHOT"] })).at(-1)?.payload.economicResults).toEqual(before.economicResults);
+    } finally { await engine.stop(); }
+  });
+  it("actual mark-to-market closure keeps completed economics beside unrealized residual and survives report replay", async () => {
+    const journal = new MemoryEventJournal(); const engine = await startEngine(journal);
+    try {
+      expect((await engine.beginExperiment()).ok).toBe(true);
+      await engine.applyObservedFill(paperFill("btc-mkt", "UP", "0.65", { feeUsd: "0.1" }));
+      await engine.applyObservedFill(paperFill("btc-mkt", "UP", "0.40", { side: "SELL", feeUsd: "0.1" }));
+      await engine.applyObservedFill(paperFill("btc-mkt", "UP", "0.65", { feeUsd: "0.1" }));
+      const before = engine.state.snapshot();
+      const book = snapshot({ marketId: "btc-mkt", tokenId: "btc-up", outcome: "UP",
+        bids: [{ price: "0.60", quantity: "1000" }], asks: [{ price: "0.61", quantity: "1000" }] });
+      const authority = engine as unknown as { snapshots: Map<string, object>; markToMarketClose(n: number): Promise<boolean> };
+      authority.snapshots.set("btc-mkt", { UP: book });
+      expect(await authority.markToMarketClose(1)).toBe(true);
+      const events = await journal.queryEvents({ experimentId: engine.experimentManifest()!.id, limit: 1000 });
+      const mtm = events.filter(e => e.type === "PNL_SNAPSHOT").at(-1)!;
+      expect(mtm.payload.source).toBe("MARK_TO_MARKET");
+      expect(mtm.payload.economicResults).toEqual(before.economicResults);
+      expect(mtm.payload.tradingResults).toEqual(before.tradingResults);
+      const summary = buildExperimentSummary(events, engine.experimentManifest()!.id);
+      expect(summary.economicResults).toEqual(before.economicResults);
+      expect(summary.winLossDistribution).toEqual({ wins: 0, losses: 1, breakeven: 0 });
+      expect(summary.unrealizedPnlUsd).toBe(-0.5);
+      expect(summary.realizedNetTradingPnlUsd).toBe(-2.8);
+      expect(summary.netTradingPnlUsd).toBe(-3.3);
+      await engine.checkpointForTest();
+      expect(engine.state.snapshot().economicResults).toEqual(before.economicResults);
     } finally { await engine.stop(); }
   });
 });
