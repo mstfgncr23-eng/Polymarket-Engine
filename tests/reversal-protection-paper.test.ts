@@ -6,7 +6,7 @@ import { EngineService } from "../apps/engine/src/engine.js";
 import { NoopGrokActivationBridge } from "../apps/engine/src/activation/index.js";
 import { type RiskReductionOwnership } from "../apps/engine/src/recovery.js";
 import { ScriptedMarketAdapter, ScriptedReferenceRegistry, discoveryReport, qualified, qualifiedPaperEnv, paperFill } from "./paper-engine-testkit.js";
-import { snapshot } from "./fixtures.js";
+import { snapshot, order } from "./fixtures.js";
 
 const START = Date.parse("2026-10-05T00:00:00Z"), MARKET = "reversal-mkt", UP = "reversal-up", DOWN = "reversal-down";
 type Internals = {
@@ -24,6 +24,7 @@ type Internals = {
   awaitGuardianPersistence(marketId: string): Promise<void>;
   onMinOrderSizeHydrated(event: { tokenId: string; minOrderSize: string; tokenEpoch: number }): void;
   applyFill(...args: unknown[]): Promise<boolean>;
+  cancelRestingHedgeMakers(marketId: string, reason: string): Promise<void>;
 };
 const internal = (s: Scenario) => s.engine as unknown as Internals;
 async function start(journal = new MemoryEventJournal(), clock = { ms: START }, env: Record<string, string> = {}) {
@@ -45,7 +46,7 @@ type Scenario = Awaited<ReturnType<typeof start>>;
 const rows = (s: Scenario, type: string) => s.journal.queryEvents({ types: [type] });
 const state = (s: Scenario) => internal(s).reversalProtectionStates.get(MARKET);
 const residual = (s: Scenario) => s.engine.ledger.positions.get(MARKET)?.unpairedQuantity ?? "0";
-async function riskFills(s: Scenario) { return (await rows(s, "PAPER_FILL")).filter(r => ["PROTECTIVE_DE_RISK", "RESCUE_SECOND_LEG"].includes(String(r.payload.intent))); }
+async function riskFills(s: Scenario) { return (await rows(s, "PAPER_FILL")).filter(r => ["PROTECTIVE_DE_RISK", "RESCUE_SECOND_LEG", "GUARDIAN_PROTECTIVE_SELL"].includes(String(r.payload.intent))); }
 async function waitFor(s: Scenario, test: () => boolean | Promise<boolean>) {
   const until = Date.now() + 3000;
   while (!await test()) {
@@ -129,8 +130,8 @@ async function armLate(s: Scenario) {
   expect(state(s)?.phase).toBe("LATE_CONFIRMATION");
 }
 
-describe("Guardian V2 real PAPER lifecycle and unchanged A/B execution", () => {
-  it.each(["audit", "admission"] as const)("R2: relevant global cash/risk changes during %s still revalidate both candidates", async boundary => {
+describe("Guardian V2 real PAPER lifecycle with independent emergency execution", () => {
+  it.each(["cancellation", "admission"] as const)("confirmed Guardian survives normal strategy cash/risk vetoes during %s", async boundary => {
     for (const change of ["cash", "errors", "drawdown", "dailyLoss"] as const) {
       const s = await start();
       try {
@@ -149,31 +150,21 @@ describe("Guardian V2 real PAPER lifecycle and unchanged A/B execution", () => {
             s.engine.ledger.restore(ledger, [...s.engine.ledger.positions.values()]);
           }
         };
-        const audit = s.engine.persistReportInput.bind(s.engine);
-        s.engine.persistReportInput = async input => {
-          if (input.type === "RISK_EVALUATION" && input.payload.marketId === MARKET) {
-            plans++; if (boundary === "audit") mutate();
-          }
-          return audit(input);
+        const commit = s.journal.commitDurableTransition.bind(s.journal);
+        s.journal.commitDurableTransition = (input, cursor, options) => {
+          if (input.type === "RISK_REDUCTION_ADMITTED") { plans++; if (boundary === "admission") mutate(); }
+          return commit(input, cursor, options);
         };
-        if (boundary === "admission") {
-          const commit = s.journal.commitDurableTransition.bind(s.journal);
-          s.journal.commitDurableTransition = (input, cursor, options) => {
-            if (input.type === "RISK_REDUCTION_ADMITTED") mutate();
-            return commit(input, cursor, options);
-          };
+        if (boundary === "cancellation") {
+          const cancel = internal(s).cancelRestingHedgeMakers.bind(internal(s));
+          internal(s).cancelRestingHedgeMakers = async (marketId, reason) => { mutate(); await cancel(marketId, reason); };
         }
         await internal(s).maybeReversalProtection(MARKET);
-        expect(changed).toBe(true); expect(plans).toBe(2);
+        expect(changed).toBe(true); expect(plans).toBe(1);
         const fills = await riskFills(s);
-        expect(fills).toHaveLength(change === "errors" ? 0 : 1);
-        if (change === "errors") {
-          expect(residual(s)).toBe("5"); expect(await rows(s, "RISK_REDUCTION_ADMITTED")).toHaveLength(0);
-          expect((await rows(s, "RISK_EVALUATION")).some(e => (e.payload.vetoes as string[])?.includes("ABNORMAL_EXECUTION_ERRORS"))).toBe(true);
-        } else {
-          expect(fills[0]!.payload).toMatchObject({ intent: "PROTECTIVE_DE_RISK", quantity: "5", side: "SELL", fillPrice: "0.6" });
-          expect(await rows(s, "RISK_REDUCTION_ADMITTED")).toHaveLength(1); expect(residual(s)).toBe("0");
-        }
+        expect(fills).toHaveLength(1);
+        expect(fills[0]!.payload).toMatchObject({ intent: "GUARDIAN_PROTECTIVE_SELL", quantity: "5", side: "SELL", fillPrice: "0.6" });
+        expect(await rows(s, "RISK_REDUCTION_ADMITTED")).toHaveLength(1); expect(residual(s)).toBe("0");
         expect(s.engine.integrityFault()).toBe(false);
         console.log(JSON.stringify({ evidence: "R2_REAL_RISK_REVALIDATION", boundary, change, plans, fills: fills.length }));
       } finally { await s.engine.stop(); }
@@ -194,7 +185,7 @@ describe("Guardian V2 real PAPER lifecycle and unchanged A/B execution", () => {
     } finally { await s.engine.stop(); }
   });
 
-  it("continuous quote churn is bounded to three plans and leaves actual residual unprotected", async () => {
+  it("continuous book churn no longer waits on normal A/B audit or exhausts its REQUOTE budget", async () => {
     const s = await start();
     try {
       await seed(s); await armEarly(s); await timeout(s);
@@ -203,14 +194,17 @@ describe("Guardian V2 real PAPER lifecycle and unchanged A/B execution", () => {
         internal(s).snapshots.set(MARKET, { UP: up, DOWN: down });
         s.engine.state.marketSnapshots.set(UP, up); s.engine.state.marketSnapshots.set(DOWN, down);
       };
-      install(); let plans = 0; const original = s.engine.persistReportInput.bind(s.engine);
-      s.engine.persistReportInput = async input => {
-        if (input.type === "RISK_EVALUATION" && input.payload.marketId === MARKET) { plans++; s.clock.ms++; install(); }
-        return original(input);
+      install(); let plans = 0; const original = s.journal.commitDurableTransition.bind(s.journal);
+      s.journal.commitDurableTransition = async (input, cursor, options) => {
+        if (input.type === "RISK_REDUCTION_ADMITTED") { plans++; s.clock.ms++; install(); }
+        return original(input, cursor, options);
       };
+      const started = performance.now();
       await internal(s).maybeReversalProtection(MARKET);
-      expect(plans).toBe(3); expect(await riskFills(s)).toHaveLength(0); expect(residual(s)).toBe("5");
-      expect(await rows(s, "RISK_REDUCTION_ADMITTED")).toHaveLength(0);
+      expect(plans).toBe(1); expect(await riskFills(s)).toHaveLength(1); expect(residual(s)).toBe("0");
+      expect(await rows(s, "RISK_REDUCTION_ADMITTED")).toHaveLength(1);
+      console.log(JSON.stringify({ evidence: "GUARDIAN_CHURN_TO_REAL_FILL", attempts: plans, elapsedMs: performance.now() - started,
+        chain: (await rows(s, "GUARDIAN_EVALUATION")).map(r => r.payload), fills: (await riskFills(s)).map(r => r.payload) }));
     } finally { await s.engine.stop(); }
   });
 
@@ -223,16 +217,16 @@ describe("Guardian V2 real PAPER lifecycle and unchanged A/B execution", () => {
         internal(s).snapshots.set(MARKET, { UP: up, DOWN: down });
         s.engine.state.marketSnapshots.set(UP, up); s.engine.state.marketSnapshots.set(DOWN, down);
       };
-      install(); let plans = 0; const original = s.engine.persistReportInput.bind(s.engine);
-      s.engine.persistReportInput = async input => {
-        if (input.type === "RISK_EVALUATION" && input.payload.marketId === MARKET) { plans++; s.clock.ms++; install(); }
-        return original(input);
+      install(); let plans = 0; const original = s.journal.commitDurableTransition.bind(s.journal);
+      s.journal.commitDurableTransition = async (input, cursor, options) => {
+        if (input.type === "RISK_REDUCTION_ADMITTED") { plans++; s.clock.ms++; install(); }
+        return original(input, cursor, options);
       };
       await internal(s).maybeReversalProtection(MARKET);
       expect(plans).toBe(1); expect(await riskFills(s)).toHaveLength(1); expect(residual(s)).toBe("0");
     } finally { await s.engine.stop(); }
   });
-  it.each(["audit", "admission"])("requotes BOTH A/B after a changed book during %s wait, with one actual full-residual fill", async boundary => {
+  it.each(["cancellation", "admission"])("revalidates Guardian SELL after a changed book during %s wait, with one real fill", async boundary => {
     const s = await start();
     try {
       await seed(s); await armEarly(s); await timeout(s);
@@ -243,13 +237,11 @@ describe("Guardian V2 real PAPER lifecycle and unchanged A/B execution", () => {
       };
       install("0.75", "0.40"); // A initially dominates .60 B salvage
       let changed = false;
-      if (boundary === "audit") {
-        const original = s.engine.persistReportInput.bind(s.engine);
-        s.engine.persistReportInput = async event => {
-          if (!changed && event.type === "RISK_EVALUATION" && event.payload.marketId === MARKET) {
-            changed = true; s.clock.ms++; install("0.30", "0.40");
-          }
-          return original(event);
+      if (boundary === "cancellation") {
+        const original = internal(s).cancelRestingHedgeMakers.bind(internal(s));
+        internal(s).cancelRestingHedgeMakers = async (marketId, reason) => {
+          if (!changed) { changed = true; s.clock.ms++; install("0.30", "0.40"); }
+          await original(marketId, reason);
         };
       } else {
         const original = s.journal.commitDurableTransition.bind(s.journal);
@@ -263,7 +255,7 @@ describe("Guardian V2 real PAPER lifecycle and unchanged A/B execution", () => {
       await internal(s).maybeReversalProtection(MARKET);
       expect(changed).toBe(true); const fills = await riskFills(s);
       expect(fills).toHaveLength(1);
-      expect(fills[0]!.payload).toMatchObject({ intent: "RESCUE_SECOND_LEG", side: "BUY", quantity: "5", fillPrice: "0.4" });
+      expect(fills[0]!.payload).toMatchObject({ intent: "GUARDIAN_PROTECTIVE_SELL", side: "SELL", quantity: "5", fillPrice: "0.3" });
       expect(await rows(s, "RISK_REDUCTION_ADMITTED")).toHaveLength(1);
       expect(await rows(s, "PAPER_ORDER_CREATED")).toHaveLength(1);
       expect(residual(s)).toBe("0"); expect(s.engine.integrityFault()).toBe(false);
@@ -297,12 +289,12 @@ describe("Guardian V2 real PAPER lifecycle and unchanged A/B execution", () => {
     ["0.75", "0.30", "PROTECTIVE_DE_RISK", false],
     ["0.60", "0.30", "RESCUE_SECOND_LEG", false],
     ["0.70", "0.30", "PROTECTIVE_DE_RISK", true],
-  ] as const)("greater guaranteed salvage: held bid %s opposite ask %s -> %s", async (bid, ask, intent, tie) => {
+  ] as const)("confirmed Guardian owns execution at held bid %s opposite ask %s regardless of normal %s", async (bid, ask, _intent, _tie) => {
     const s = await start(); try { await seed(s); await armEarly(s); await timeout(s); await publish(s, bid, ask);
       await waitFor(s, () => residual(s) === "0");
       const fills = await riskFills(s); expect(fills).toHaveLength(1);
-      expect(fills[0]?.payload).toMatchObject({ intent, side: intent === "PROTECTIVE_DE_RISK" ? "SELL" : "BUY", quantity: "5",
-        deRisk: { deRiskReason: "REVERSAL_CONFIRMED", guardianSensor: "EARLY", guardianReason: "EARLY_TIMEOUT", selection: intent, tieBreakUsed: tie } });
+      expect(fills[0]?.payload).toMatchObject({ intent: "GUARDIAN_PROTECTIVE_SELL", side: "SELL", quantity: "5",
+        deRisk: { deRiskReason: "REVERSAL_CONFIRMED", guardianSensor: "EARLY", guardianReason: "EARLY_TIMEOUT", selection: "PROTECTIVE_DE_RISK", tieBreakUsed: false } });
       expect(state(s)).toBeUndefined(); expect(await rows(s, "GUARDIAN_EXECUTION_COMPLETED")).toHaveLength(1);
       expect((await rows(s, "PAPER_ORDER_CREATED"))[0]?.payload.orderType).toBe("TAKER"); expect(s.engine.integrityFault()).toBe(false);
     } finally { await s.engine.stop(); }
@@ -405,6 +397,50 @@ describe("Guardian V2 real PAPER lifecycle and unchanged A/B execution", () => {
   it("ENTRY_CLOSED still protects the current episode", async () => {
     const s = await start(); try { await seed(s); await armEarly(s); await s.engine.closeExperimentEntries(); await timeout(s); await publish(s);
       await waitFor(s, () => residual(s) === "0"); expect(await riskFills(s)).toHaveLength(1);
+    } finally { await s.engine.stop(); }
+  });
+  it("confirmed Guardian cancels the normal hedge maker and fences a delayed partial fill and duplicate cancel", async () => {
+    const s = await start();
+    try {
+      await seed(s); await armEarly(s);
+      const maker = order("MAKER", { id: "normal-maker-before-confirmation", marketId: MARKET, tokenId: DOWN,
+        outcome: "DOWN", quantity: "5", requestedPrice: "0.29", createdAt: new Date(s.clock.ms).toISOString() });
+      await s.engine.restMakerForTest(maker, book(s, "DOWN", "0.29", "0.30"), "HEDGE_SECOND_LEG");
+      await timeout(s);
+      await publish(s, "0.60", "0.30");
+      await waitFor(s, () => residual(s) === "0");
+      const cash = s.engine.ledger.snapshot().cash;
+      const delayed = paperFill(MARKET, "DOWN", "0.29", { orderId: maker.id, tokenId: DOWN, quantity: "2", liquidityRole: "MAKER" });
+      expect(await internal(s).applyFill(delayed, { intent: "HEDGE_SECOND_LEG" })).toBe(false);
+      await s.engine.cancelMakerForTest(maker.id, "GUARDIAN_PRIORITY");
+      expect(s.engine.ledger.snapshot().cash).toBe(cash);
+      expect(await riskFills(s)).toHaveLength(1);
+      expect(s.engine.restingOrderCount()).toBe(0); expect(s.engine.reservedCash()).toBe("0");
+      const transitions = await s.journal.queryDurableTransitions({ limit: 1000 });
+      const cancel = transitions.find(t => t.operationKey === `maker:${maker.id}:cancel`)!;
+      const admitted = transitions.find(t => t.type === "RISK_REDUCTION_ADMITTED")!;
+      expect(cancel.sequence).toBeLessThan(admitted.sequence); expect(s.engine.integrityFault()).toBe(false);
+      console.log(JSON.stringify({ evidence: "GUARDIAN_MAKER_HANDOFF", cancelSequence: cancel.sequence, admissionSequence: admitted.sequence, fills: 1, delayedPartialFillApplied: false }));
+    } finally { await s.engine.stop(); }
+  });
+  it("confirmed Guardian releases a previously admitted normal taker before its fill and prevents duplicate execution", async () => {
+    const s = await start();
+    try {
+      await seed(s); await armEarly(s);
+      const position = s.engine.ledger.positions.get(MARKET)!;
+      const hedge = order("TAKER", { id: "normal-pending-before-confirmation", marketId: MARKET, tokenId: DOWN,
+        outcome: "DOWN", quantity: "5", requestedPrice: "0.30", createdAt: new Date(s.clock.ms).toISOString() });
+      const owner: RiskReductionOwnership = { marketId: MARKET, unhedgedStartedAt: position.unhedgedStartedAt ?? position.openedAt,
+        intent: "HEDGE_SECOND_LEG", order: hedge, admittedResidualQuantity: "5", decisionReceivedAt: new Date(s.clock.ms).toISOString(), state: "ADMITTED" };
+      expect(await internal(s).admitRiskReduction(owner)).toBe(true);
+      await timeout(s); await publish(s, "0.60", "0.30");
+      await waitFor(s, () => residual(s) === "0");
+      expect(await riskFills(s)).toHaveLength(1);
+      expect((await rows(s, "PAPER_FILL")).filter(r => r.payload.intent === "HEDGE_SECOND_LEG")).toHaveLength(0);
+      expect((await rows(s, "RISK_REDUCTION_FAILED"))[0]?.payload.reason).toBe("GUARDIAN_PRIORITY");
+      const delayed = paperFill(MARKET, "DOWN", "0.30", { orderId: hedge.id, tokenId: DOWN, quantity: "5" });
+      await expect(internal(s).applyFill(delayed, { intent: "HEDGE_SECOND_LEG", riskReductionOwnership: owner })).rejects.toThrow("TAKER_AUTHORITY_RELEASED");
+      expect(await riskFills(s)).toHaveLength(1); expect(s.engine.integrityFault()).toBe(false);
     } finally { await s.engine.stop(); }
   });
   it("OFF preserves existing behavior; incompatible candidate settings reject start", async () => {
