@@ -152,6 +152,9 @@ async function writeJournalEvents(
   await mkdir(dirname(input.path), { recursive: true });
   const temp = `${input.path}.tmp-${process.pid}-${Date.now()}`;
   const stream = createWriteStream(temp, { flags: "wx" });
+  // Observe errors before the first write, including writes still in flight
+  // when a later source/verification failure destroys this stream.
+  const completion = finished(stream);void completion.catch(() => undefined);
   const hash = createHash("sha256");
   let bytes = 0;
   let eventCount = 0;
@@ -167,12 +170,13 @@ async function writeJournalEvents(
         hash.update(line);
         bytes += line.length;
         eventCount += 1;
+        if(stream.destroyed)throw stream.errored??new Error('ARCHIVE_STREAM_CLOSED');
         if (!stream.write(line)) await once(stream, "drain");
       }
       if (page.length < EVENT_PAGE_SIZE) break;
     }
     stream.end();
-    await finished(stream);
+    await completion;
     await rename(temp, input.path);
     return {
       file: basename(input.path),
@@ -182,6 +186,7 @@ async function writeJournalEvents(
     };
   } catch (error) {
     stream.destroy();
+    await completion.catch(() => undefined);
     await rm(temp, { force: true }).catch(() => undefined);
     throw error;
   }
@@ -254,9 +259,11 @@ export class LocalJournalArchive {
     const checkpoints = await writeJsonArchiveFile(directory, "checkpoints.json", snapshots);
     const path = resolve(directory, "durable-transitions.jsonl"), temp = path + ".tmp";
     const stream = createWriteStream(temp), digest = createHash("sha256"); let bytes = 0, count = 0;
+    const completion = finished(stream);void completion.catch(() => undefined);
     const write = async (row: Awaited<ReturnType<EventJournal["queryDurableTransitions"]>>[number]) => {
       if (row.payloadHash !== hashDurablePayload(row.payload)) throw new Error("RECOVERY_ARCHIVE_DURABLE_HASH");
       const line = Buffer.from(JSON.stringify(row) + "\n"); digest.update(line); bytes += line.length; count++;
+      if(stream.destroyed)throw stream.errored??new Error('ARCHIVE_STREAM_CLOSED');
       if (!stream.write(line)) await once(stream, "drain");
     };
     try {
@@ -272,8 +279,8 @@ export class LocalJournalArchive {
         }
         await new Promise<void>(resolve => setImmediate(resolve));
       }
-      stream.end(); await finished(stream); await rename(temp, path);
-    } catch (error) { stream.destroy(); await rm(temp, { force: true }); throw error; }
+      stream.end(); await completion; await rename(temp, path);
+    } catch (error) { stream.destroy(); await completion.catch(() => undefined); await rm(temp, { force: true }); throw error; }
     const manifest: RecoveryArchiveManifest = { archiveSchemaVersion: 1, kind: "engine_recovery", createdAt: new Date().toISOString(),
       replayFromCursor, throughCursor, prefixThroughCursor, checkpoints,
       durableTransitions: { file: "durable-transitions.jsonl", bytes, sha256: digest.digest("hex"), eventCount: count } };

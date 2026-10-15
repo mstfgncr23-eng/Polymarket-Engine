@@ -123,3 +123,14 @@ Fee reference: https://docs.polymarket.com/trading/fees
 Historical fee savings are conditional modeled bounds; real profitability
 requires all fills, missed opportunities, losses, fees and settlement from the
 new PAPER experiment. Do not count a quoted order or ADMITTED as a fill.
+
+## Historical archive failures
+
+Historical dual reservations written with the undefined proof field remain
+unchanged. Their stored JSON cannot independently reproduce the producer hash;
+archive verification must refuse deletion rather than silently accepting them.
+Archive output streams observe errors from creation through completed teardown.
+A hash/source failure while writes are outstanding returns the original failure,
+removes the incomplete temporary file and cannot crash the Engine with a late
+unhandled `ERR_STREAM_DESTROYED`. Separate child-process regressions exercise
+both recovery and journal writers after real filesystem backpressure.
