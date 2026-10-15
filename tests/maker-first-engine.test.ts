@@ -1,6 +1,6 @@
 import {describe,it,expect,beforeEach,afterEach} from 'vitest';
 import {type PaperOrder,type MarketSnapshot,type MarketTrade,type StrategyCandidate} from '@pm/core';
-import {MemoryEventJournal,type EventJournal} from '@pm/db';
+import {MemoryEventJournal,type EventJournal,hashDurablePayload} from '@pm/db';
 import {EngineService} from '../apps/engine/src/engine.js';
 import {NoopGrokActivationBridge} from '../apps/engine/src/activation/index.js';
 import {qualifiedPaperEnv,qualified,discoveryReport,ScriptedMarketAdapter,ScriptedReferenceRegistry,paperFill} from './paper-engine-testkit.js';
@@ -8,7 +8,10 @@ import {snapshot,order} from './fixtures.js';
 import {p0PostgresFixture} from './p0-postgres-fixture.js';
 let pg:Awaited<ReturnType<typeof p0PostgresFixture>>|undefined;
 beforeEach(async()=>{if(process.env.P0_EXECUTION_TEST_DATABASE_URL)pg=await p0PostgresFixture(process.env.P0_EXECUTION_TEST_DATABASE_URL);});
-afterEach(async()=>{if(pg){await pg.close();pg=undefined;}});
+afterEach(async()=>{if(pg){try{
+ for(const fact of await pg.journal.queryDurableTransitions({limit:1000}))if(Object.keys(fact.payload).length)
+  expect(hashDurablePayload(fact.payload),`persisted ${fact.operationKey}`).toBe(fact.payloadHash);
+}finally{await pg.close();pg=undefined;}}});
 const T=Date.parse('2026-10-15T18:00:00Z'),M='maker-mkt',U='maker-up',D='maker-down';
 async function setup(enabled=true,journal:EventJournal=pg?.journal??new MemoryEventJournal(),clock={ms:T},overrides:Record<string,string>={}){
  const market=new ScriptedMarketAdapter(),listing=qualified(M,'XRP',U,D,new Date(T+900000).toISOString());listing.raw={eventStartTime:new Date(T-1000).toISOString()};const second=qualified(M+'-2','XRP',U+'-2',D+'-2',new Date(T+900000).toISOString());second.raw=listing.raw;market.queue(discoveryReport([listing,second]));
@@ -316,6 +319,8 @@ describe('Maker-First real Engine lifecycle',()=>{
    const dual=s.engine as unknown as {trySubmitDualMakerPair(o:PaperOrder,k:string,p:Record<'UP'|'DOWN',MarketSnapshot>):Promise<boolean>};
    expect(await dual.trySubmitDualMakerPair(s.quote(),'dual:scope',{UP:s.engine.state.marketSnapshots.get(U)!,DOWN:s.engine.state.marketSnapshots.get(D)!})).toBe(true);
    const id=s.engine.experimentManifest()!.id;
+   for(const fact of await s.journal.queryDurableTransitions({types:['PAPER_MAKER_RESERVED'],limit:100}))
+    expect(hashDurablePayload(JSON.parse(JSON.stringify(fact.payload)))).toBe(fact.payloadHash);
    expect(await s.journal.queryEvents({types:['PAPER_ORDER_CREATED'],experimentId:id})).toHaveLength(2);
    expect(await s.journal.queryEvents({types:['DUAL_MAKER_QUOTES_ADMITTED'],experimentId:id})).toHaveLength(1);
    const quotes=[...s.engine.restingOrdersForTest().values()].map(r=>r.order);s.clock.ms+=201;

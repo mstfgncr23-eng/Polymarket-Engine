@@ -28,6 +28,10 @@ not scan every book for independent market-making opportunities. Both passive
 prices and sizes must pass the conditional pair economics planner. The cheap
 side uses the explicit dual strategy policy, not the directional $0.65 floor.
 Conditional pair profit assumes both fills and is never booked as realized PnL.
+The directional `entryAdmission` field is omitted from dual orders rather than
+set to `undefined`; JSONB drops undefined object keys, so assigning one would
+make the pre-insert hash disagree with the persisted authoritative payload.
+Real PostgreSQL lifecycle tests independently re-hash every persisted transition.
 
 The first and second durable reservations atomically carry experiment-scoped
 `DUAL_MAKER_PLAN_STARTED` and `DUAL_MAKER_QUOTES_ADMITTED` audits. A known

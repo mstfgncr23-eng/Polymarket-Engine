@@ -2843,9 +2843,12 @@ export class EngineService {
     const expiry=this.marketsById.get(marketId)?.endDate;
     const end=Math.min(this.nowFn().getTime()+ttl,expiry?Date.parse(expiry)-PROTECTIVE_DE_RISK_PRE_EXPIRY_SAFETY_MS:Number.POSITIVE_INFINITY);
     if(!Number.isFinite(end)||end<=this.nowFn().getTime()+this.env.PAPER_EXECUTION_LATENCY_MS)return this.dualMakerNoQuote('EXPIRY');
+    // Omit the directional proof rather than assigning undefined: the latter
+    // hashes a key that JSONB drops, making the persisted authority unverifiable.
+    const {entryAdmission:_directionalProof,...dualBase}=directionOrder;
     const build=(book:MarketSnapshot,price:string):PaperOrder=>({
-      ...directionOrder,id:createId('order'),strategyId:'two-sided-maker-v1',side:'BUY',outcome:book.outcome,tokenId:book.tokenId,
-      orderType:'MAKER',requestedPrice:price,status:'PENDING',createdAt:this.nowFn().toISOString(),entryAdmission:undefined,
+      ...dualBase,id:createId('order'),strategyId:'two-sided-maker-v1',side:'BUY',outcome:book.outcome,tokenId:book.tokenId,
+      orderType:'MAKER',requestedPrice:price,status:'PENDING',createdAt:this.nowFn().toISOString(),
       makerFirst:{version:1,role:'FIRST_LEG',postOnly:true,dualGroupId:group,expiresAt:new Date(end).toISOString(),
         submissionLatencyMs:this.env.PAPER_EXECUTION_LATENCY_MS,tokenEpoch:this.adapterTokenEpoch(book.tokenId),
         postingBookEventId:book.eventId,takerReferencePrice:book.asks[0]!.price,
