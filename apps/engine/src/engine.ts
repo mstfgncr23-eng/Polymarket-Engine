@@ -630,7 +630,10 @@ export class EngineService {
     this.ledger = new PaperLedger(env.PAPER_START_BALANCE, this.nowFn());
     this.state = new EngineStateStore(this.ledger.snapshot(), this.ledger.positions);
     this.triggerConfig = triggerConfigSchema.parse({ scheduledReviewIntervalMs: env.SCHEDULED_REVIEW_INTERVAL_MS });
-    this.qualificationConfig = qualificationConfigSchema.parse({ maxQualifiedMarkets: env.MAX_QUALIFIED_MARKETS });
+    this.qualificationConfig = qualificationConfigSchema.parse({
+      maxQualifiedMarkets: env.MAX_QUALIFIED_MARKETS,
+      selectionPolicy: env.MARKET_SELECTION_POLICY,
+    });
     this.triggerEngine = new TriggerEngine(this.triggerConfig, this.nowFn, this.metrics.triggerObserver());
     this.nativeDecisionConfig = {
       ...defaultNativeDecisionConfig,

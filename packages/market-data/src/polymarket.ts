@@ -443,7 +443,11 @@ export class PolymarketMarketDataAdapter {
         rejected.push({ id: market.id, slug: market.slug, title: market.title, reasonCodes: result.reasonCodes });
       }
     }
-    discovered.sort((left, right) => (left.remainingDurationMs ?? Number.POSITIVE_INFINITY) - (right.remainingDurationMs ?? Number.POSITIVE_INFINITY));
+    if (config.selectionPolicy === "readiness_economic") {
+      discovered.sort((left, right) => compareReadinessSelection(left, right, now.getTime()));
+    } else {
+      discovered.sort((left, right) => (left.remainingDurationMs ?? Number.POSITIVE_INFINITY) - (right.remainingDurationMs ?? Number.POSITIVE_INFINITY));
+    }
     const qualified = discovered.filter((market) => market.qualification.qualified).slice(0, config.maxQualifiedMarkets);
     return { discovered, qualified, rejected };
   }
@@ -1826,4 +1830,71 @@ export function closestDirectionalDiagnostics(report: DiscoveryReport, limit = 2
         : market.feeSchedule && Number(market.feeSchedule.rate) === 0 ? "zero" : "known",
       reasonCodes: market.qualification.reasonCodes,
     }));
+}
+
+/**
+ * Market-selection readiness tier used ONLY for ranking the already-qualified
+ * population down to the cap. It mirrors the start-metadata parsing of
+ * apps/engine/src/first-leg-admission.ts `officialMarketStartReason()` and can
+ * never weaken that admission guard: markets whose start metadata is missing or
+ * conflicting (tier -1) rank AFTER every tradable/future window, because the
+ * guard permanently rejects them at execution time.
+ *
+ * Tier: -1 = never tradable (guard rejects), 0 = started (tradable now),
+ * 1 = starts within 15m, 2 = within 60m, 3 = later.
+ */
+export type MarketSelectionTier = -1 | 0 | 1 | 2 | 3;
+
+const START_TIMESTAMP_SHAPE = /T.*(?:Z|[+-]\d\d:\d\d)$/;
+const START_SLUG_SHAPE = /-updown-(\d+)([mh])-(\d{10})$/i;
+
+export function marketSelectionTier(
+  raw: Record<string, unknown> | undefined,
+  endDate: string | null | undefined,
+  slug: string | undefined,
+  nowMs: number,
+): MarketSelectionTier {
+  if (!raw) return -1;
+  const event = typeof raw.event === "object" && raw.event ? raw.event as Record<string, unknown> : {};
+  const schedule = typeof event.schedule === "object" && event.schedule ? event.schedule as Record<string, unknown> : {};
+  const values = [raw.eventStartTime, event.eventStartTime, schedule.startTime]
+    .filter((value) => value !== undefined && value !== null);
+  const parse = (value: unknown): number =>
+    typeof value === "string" && START_TIMESTAMP_SHAPE.test(value) ? Date.parse(value) : Number.NaN;
+  const starts = values.map(parse);
+  if (starts.length === 0 || starts.some((value) => !Number.isFinite(value))) return -1;
+  const startMs = starts[0]!;
+  if (starts.some((value) => value !== startMs)) return -1;
+  const endMs = endDate ? Date.parse(endDate) : Number.NaN;
+  if (!Number.isFinite(endMs) || endMs <= startMs) return -1;
+  const slugMatch = START_SLUG_SHAPE.exec(slug ?? "");
+  if (slugMatch) {
+    const slugStartMs = Number(slugMatch[3]) * 1000;
+    const durationMs = Number(slugMatch[1]) * (slugMatch[2]!.toLowerCase() === "h" ? 3_600_000 : 60_000);
+    if (startMs !== slugStartMs || endMs !== startMs + durationMs) return -1;
+  }
+  if (nowMs >= startMs) return 0;
+  const delayMs = startMs - nowMs;
+  if (delayMs <= 15 * 60_000) return 1;
+  if (delayMs <= 60 * 60_000) return 2;
+  return 3;
+}
+
+function readinessSelectionRank(market: DiscoveredMarket, nowMs: number): readonly number[] {
+  const tier = marketSelectionTier(market.raw, market.endDate, market.slug, nowMs);
+  const tierRank = tier === -1 ? 4 : tier; // never-tradable markets rank after every tier
+  const spread = market.spread ?? Number.POSITIVE_INFINITY;
+  const liquidity = market.liquidityUsd === null || !Number.isFinite(Number(market.liquidityUsd))
+    ? 0 : Number(market.liquidityUsd);
+  const remaining = market.remainingDurationMs ?? Number.POSITIVE_INFINITY;
+  return [tierRank, spread, -liquidity, remaining];
+}
+
+function compareReadinessSelection(left: DiscoveredMarket, right: DiscoveredMarket, nowMs: number): number {
+  const l = readinessSelectionRank(left, nowMs);
+  const r = readinessSelectionRank(right, nowMs);
+  for (let i = 0; i < l.length; i += 1) {
+    if (l[i] !== r[i]) return l[i]! < r[i]! ? -1 : 1;
+  }
+  return 0;
 }

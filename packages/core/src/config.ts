@@ -81,6 +81,20 @@ export const qualificationConfigSchema = z.object({
   minLiquidityUsd: z.number().nonnegative().default(50),
   maxSpread: z.number().min(0).max(1).default(0.12),
   maxQualifiedMarkets: z.number().int().positive().default(40),
+  /**
+   * How the qualified (post-structural) candidate population is reduced to the
+   * 40-slot cap:
+   *  - "duration": current behavior — nearest-expiry first (remainingDurationMs ascending).
+   *  - "readiness_economic": NEVER weakens the official market-start admission guard.
+   *    It only RANKS the already-qualified population so that slots are spent on
+   *    markets that can actually be entered: started-now first, then starting within
+   *    15m, then within 60m, then later; never-tradable (missing/conflicting start
+   *    metadata, which the guard permanently rejects) rank LAST. Inside each
+   *    readiness tier the selection prefers tick-floor spread, then liquidity.
+   *    The 40-slot cap and every admission/execution/hedge/settlement invariant
+   *    are unchanged.
+   */
+  selectionPolicy: z.enum(["duration", "readiness_economic"]).default("duration"),
   allowPolymarketOnlyIfReferenceUnsupported: z.boolean().default(true),
   requireUnderlyingAsset: z.boolean().default(true),
 });
@@ -177,6 +191,8 @@ export const engineEnvSchema = z.object({
   XAI_SCOUT_NEWS_TTL_MS: z.coerce.number().int().positive().max(3_600_000).default(60_000),
   DISCOVERY_INTERVAL_MS: z.coerce.number().int().positive().default(300_000),
   MAX_QUALIFIED_MARKETS: z.coerce.number().int().positive().default(40),
+  /** Cap ranking policy; default preserves the historical duration-only order. */
+  MARKET_SELECTION_POLICY: z.enum(["duration", "readiness_economic"]).default("duration"),
   ESTIMATED_INFRA_COST_PER_HOUR_USD: z.coerce.number().nonnegative().default(0.08),
   DASHBOARD_ORIGIN: z.string().url().default("http://localhost:3000"),
   ENGINE_READ_TOKEN: z.string().min(8).optional(),
