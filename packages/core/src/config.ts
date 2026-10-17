@@ -150,6 +150,24 @@ export const engineEnvSchema = z.object({
    *  in the 6h dual-maker experiment) while quotes 1-6 ticks below the best bid
    *  showed 0 exact-price sell trades across every 2s window of a 2h soak. */
   PAPER_DUAL_MAKER_TOUCH_PRICING_ENABLED: z.preprocess(value => value === "true" ? true : value === "false" ? false : value, z.boolean().default(false)),
+  /** Fill-zone admission (opt-in; requires TOUCH_PRICING for its flow semantics):
+   *  only price a dual-maker quote when the observed exact-price SELL flow at the
+   *  touch is non-trivial AND the displayed depth at the touch can plausibly be
+   *  consumed inside the bounded resting window [base, MAX_QUOTE_TTL_MS]. PAPER
+   *  evidence: 15+ B2 touch quotes all cancelled with zero fills because flow
+   *  (0-4 trades/2s) was below the displayed queue-ahead (104-1438) in EVERY
+   *  window - even the FIFO-correct model max(0, flow-depth) stays zero. This
+   *  gate skips structurally unfillable windows instead of wasting reservations. */
+  PAPER_DUAL_MAKER_FILL_ZONE_ADMISSION_ENABLED: z.preprocess(value => value === "true" ? true : value === "false" ? false : value, z.boolean().default(false)),
+  /** Rolling window over which exact-price SELL flow at the touch is measured for
+   *  fill-zone admission. Memory-bounded in-memory only; never durable telemetry. */
+  PAPER_DUAL_MAKER_FLOW_WINDOW_MS: z.coerce.number().int().min(5000).max(120000).default(30000),
+  /** Minimum exact-price SELL trades at the touch required inside the window for
+   *  admission (guards the rate estimate against single-trade flukes). */
+  PAPER_DUAL_MAKER_MIN_EXACT_FLOW_PER_WINDOW: z.coerce.number().int().min(1).max(1000).default(2),
+  /** Upper bound for the per-quote resting window when fill-zone admission scales
+   *  TTL by depth/flow. Stays inside the validated maker-first schema ceiling. */
+  PAPER_DUAL_MAKER_MAX_QUOTE_TTL_MS: z.coerce.number().int().min(2000).max(5000).default(5000),
   PAPER_MAKER_FIRST_QUOTE_TTL_MS: z.coerce.number().int().min(500).max(5000).default(2000),
   PAPER_MAKER_HEDGE_QUOTE_TTL_MS: z.coerce.number().int().min(250).max(2000).default(750),
   /** Runtime override for NORMAL HEDGE_SECOND_LEG gross locked pair edge floor. */

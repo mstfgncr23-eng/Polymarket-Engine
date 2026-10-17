@@ -446,6 +446,9 @@ export class EngineService {
   private readonly makerActiveAfter = new Map<string, string>();
   private readonly makerQueuePrimed = new Set<string>();
   private readonly makerFlowStats = new Map<string,{observedTrades:number;exactPriceSellTrades:number;eligibleTrades:number;eligibleQuantity:string;firstEligibleEventId:string|null;lastEligibleEventId:string|null}>();
+  /** Per-token bounded in-memory sliding window of exact-price SELL trades at each
+   *  price level, for fill-zone admission. Never durable; bounded by eviction. */
+  private readonly makerTouchFlow = new Map<string,{price:string;qty:string;ts:number}[]>();
   private readonly makerTradeTails = new Map<string,Promise<void>>();
   private makerQuoteTimer: ReturnType<typeof setTimeout> | null = null;
   private makerQuoteExpiryInFlight:Promise<void>|null=null;
@@ -2850,12 +2853,14 @@ export class EngineService {
       ||this.firstLegAdmissionReason({marketId,tokenId:up.tokenId,outcome:"UP"},up)
       ||this.firstLegAdmissionReason({marketId,tokenId:down.tokenId,outcome:"DOWN"},down)
       ||!this.firstLegExpiryAdmission(marketId).eligible)return this.dualMakerNoQuote('BOOK_OR_OWNERSHIP');
+    const fillZone=this.fillZoneAdmission(up,down);
+    if(fillZone.reason)return this.dualMakerNoQuote('PLANNER_'+fillZone.reason);
     const plan=planDualMakerQuotes({up,down,quantity:directionOrder.quantity,
       perSideRiskCapUsd:String(this.riskLimits.maxOrderSizeUsd),availableCashUsd:this.ledger.availableCash().toFixed(),
       minPairNetRoi:FIRST_LEG_MIN_NET_ROI,nowMs:this.nowFn().getTime(),maxBookAgeMs:this.riskLimits.staleFeedTimeoutMs,
       costBound:this.env.PAPER_DUAL_MAKER_COST_BOUND_ENABLED,touchPricing:this.env.PAPER_DUAL_MAKER_TOUCH_PRICING_ENABLED});
     if(!plan.plan)return this.dualMakerNoQuote('PLANNER_'+plan.reason);
-    const group=createId('dual_pair'),ttl=this.makerFirstConfig().firstLegTtlMs;
+    const group=createId('dual_pair'),ttl=fillZone.ttlMs;
     const expiry=this.marketsById.get(marketId)?.endDate;
     const end=Math.min(this.nowFn().getTime()+ttl,expiry?Date.parse(expiry)-PROTECTIVE_DE_RISK_PRE_EXPIRY_SAFETY_MS:Number.POSITIVE_INFINITY);
     if(!Number.isFinite(end)||end<=this.nowFn().getTime()+this.env.PAPER_EXECUTION_LATENCY_MS)return this.dualMakerNoQuote('EXPIRY');
@@ -2888,7 +2893,7 @@ export class EngineService {
       this.recentTrades.set(duplicateKey,Date.now());
       this.metrics.dualMakerPlans.inc({outcome:'ADMITTED'});
       this.record('DUAL_MAKER_QUOTES_ADMITTED',group,marketId,{
-        group,orderIds:quotes.map(q=>q.id),conditionalNetPairUsd:plan.plan.netPairPnlUsd,
+        group,orderIds:quotes.map(q=>q.id),conditionalNetPairUsd:plan.plan.netPairPnlUsd,fillZoneTtlMs:ttl,
         maxUnpairedDownsideUsd:plan.plan.maxUnpairedDownsideUsd});
       return true;
     }catch(error){
@@ -3057,6 +3062,7 @@ export class EngineService {
   private onMakerTrade(trade:MarketTrade):Promise<void>|void{
     if(this.state.draining||!this.state.recoveryComplete||this.overload.hasIntegrityFault
       ||this.state.database!=='UP'||this.state.journalDegraded||!this.makerFirstConfig().enabled)return;
+    this.recordMakerTouchFlow(trade);
     this.metrics.makerPublicTrades.inc();
     if(!this.restingIndex.orderIdsFor(trade.tokenId).size)return;
     // A dual pair needs one cross-token lane: two opposite fills must not both be
@@ -3068,6 +3074,52 @@ export class EngineService {
     const tail=work.then(()=>undefined,()=>undefined);this.makerTradeTails.set(key,tail);
     void tail.then(()=>{if(this.makerTradeTails.get(key)===tail)this.makerTradeTails.delete(key);});
     return work;
+  }
+
+  /** Record exact-price SELL flow per token for fill-zone admission. The window
+   *  is the only source: side/price semantics match the CLOB trade reporting
+   *  validated against the exchange docs (aggressor side at the execution price
+   *  on a transparent FIFO book). */
+  private recordMakerTouchFlow(trade: MarketTrade): void {
+    if(!this.env.PAPER_DUAL_MAKER_FILL_ZONE_ADMISSION_ENABLED)return;
+    const windowMs=this.env.PAPER_DUAL_MAKER_FLOW_WINDOW_MS, list=this.makerTouchFlow.get(trade.tokenId)??[];
+    list.push({price:trade.price,qty:trade.quantity,ts:Date.parse(trade.sourceTimestamp)});
+    const cutoff=this.nowFn().getTime()-windowMs;
+    let i=0;while(i<list.length&&(list[i]!.ts<cutoff||list.length-i>4096))i++;
+    if(i>0)this.makerTouchFlow.set(trade.tokenId,list.slice(i));
+    else this.makerTouchFlow.set(trade.tokenId,list.slice(Math.max(0,list.length-4096)));
+  }
+
+  /** Exact SELL flow at ONE price level inside the rolling window. */
+  private touchFlowAt(tokenId:string, price:string, nowMs:number):{count:number;qty:string}{
+    const list=this.makerTouchFlow.get(tokenId)??[], windowMs=this.env.PAPER_DUAL_MAKER_FLOW_WINDOW_MS;
+    let count=0;let qty=d('0');
+    for(const e of list){if(nowMs-e.ts<=windowMs&&e.ts<=nowMs&&d(e.price).eq(price)){count++;qty=qty.plus(e.qty);}}
+    return {count,qty:qty.toFixed()};
+  }
+
+  /** Fill-zone admission for a dual-maker plan (touch pricing only; no-op when
+   *  disabled). Returns a rejection reason, or the bounded per-quote resting
+   *  window scaled from measured touch flow and displayed depth. */
+  private fillZoneAdmission(up:MarketSnapshot,down:MarketSnapshot):{reason:string|null;ttlMs:number}{
+    const base=this.makerFirstConfig().firstLegTtlMs;
+    if(!this.env.PAPER_DUAL_MAKER_FILL_ZONE_ADMISSION_ENABLED)return {reason:null,ttlMs:base};
+    const now=this.nowFn().getTime(),windowMs=this.env.PAPER_DUAL_MAKER_FLOW_WINDOW_MS,
+      minCount=this.env.PAPER_DUAL_MAKER_MIN_EXACT_FLOW_PER_WINDOW,maxTtl=this.env.PAPER_DUAL_MAKER_MAX_QUOTE_TTL_MS;
+    let ttl=base,reject:string|null=null;
+    for(const leg of [up,down]){
+      const touch=leg.bids[0]?.price;
+      if(!touch)return {reason:'FILL_ZONE_NO_BID',ttlMs:base};
+      const flow=this.touchFlowAt(leg.tokenId,touch,now);
+      if(flow.count<minCount)return {reason:'FILL_ZONE_NO_FLOW:'+(leg.outcome==='UP'?'UP':'DOWN'),ttlMs:base};
+      const depth=leg.bids.find(l=>d(l.price).eq(touch))?.quantity??'0';
+      const perSec=windowMs>0?d(flow.qty).div(windowMs).mul(1000).toNumber():0;
+      if(perSec<=0)return {reason:'FILL_ZONE_NO_FLOW:'+(leg.outcome==='UP'?'UP':'DOWN'),ttlMs:base};
+      const consumeMs=Math.ceil(d(depth).toNumber()/perSec*1000);
+      if(consumeMs>maxTtl)reject=reject??'FILL_ZONE_QUEUE_DEPTH:'+(leg.outcome==='UP'?'UP':'DOWN');
+      if(consumeMs>=base)ttl=Math.min(maxTtl,Math.max(ttl,consumeMs));
+    }
+    return {reason:reject,ttlMs:ttl};
   }
 
   private async applyMakerTrade(trade:MarketTrade):Promise<void>{
