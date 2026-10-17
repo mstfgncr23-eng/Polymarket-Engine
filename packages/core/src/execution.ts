@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { calculateFee, calculateSlippageUsd, d, decimal, walkBook } from "./calculations.js";
 import { createId, decimalStringSchema, paperOrderSchema, timestampSchema, type MarketSnapshot, type MarketTrade, type PaperFill, type PaperOrder } from "./domain.js";
-import { passiveMakerBuyPrice } from "./maker-first.js";
+import { passiveMakerBuyPrice, passiveMakerLimitPrice } from "./maker-first.js";
 
 export interface TakerExecutionInput {
   order: PaperOrder;
@@ -54,7 +54,14 @@ export function createRestingMakerOrder(
   intent?: RestingPaperOrder["intent"],
 ): RestingPaperOrder {
   if (order.orderType !== "MAKER") throw new Error("ORDER_IS_NOT_MAKER");
-  if (order.makerFirst && (order.side!=="BUY" || passiveMakerBuyPrice(snapshot,order.quantity,order.requestedPrice)!==order.requestedPrice)) throw new Error("MAKER_FIRST_POST_ONLY_INVALID");
+  // Genuine post-only admission: the BUY limit must not immediately cross (be at
+  // least one tick below the best ASK) and be on the known tick. It does NOT have
+  // to equal the best bid - a lower passive bid or a price-improving bid are both
+  // valid post-only orders and are filled by exact-price SELL flow in
+  // evolveMakerTrade. This replaces the old best-bid-equality constraint.
+  if (order.makerFirst && (order.side !== "BUY" || passiveMakerLimitPrice(snapshot, order.requestedPrice, order.quantity) === null)) {
+    throw new Error("MAKER_FIRST_POST_ONLY_INVALID");
+  }
   const sameSide = order.side === "BUY" ? snapshot.bids : snapshot.asks;
   const atPrice = sameSide.find((level) => d(level.price).eq(order.requestedPrice));
   return {

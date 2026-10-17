@@ -61,17 +61,24 @@ async function setup(overrides: Record<string, string> = {}) {
 }
 
 describe("engine cost-bound dual maker quoting (flag ON)", () => {
-  it("refuses a plan whose worst-case single-fill taker hedge is not covered", async () => {
+  it("prices both legs at the cost-bound affordable passive quotes (below the best bid)", async () => {
     const s = await setup({ PAPER_DUAL_SIDED_MAKER_ENABLED: "true", PAPER_DUAL_MAKER_COST_BOUND_ENABLED: "true" });
     try {
       const books = { UP: s.engine.state.marketSnapshots.get(U)!, DOWN: s.engine.state.marketSnapshots.get(D)! };
-      // 0.69 UP / 0.29 DOWN join: if only one leg fills as a maker, the residual
-      // is hedged at the opposite ASK (0.30 / 0.70) which does not clear the ROI
-      // floor, so the cost-bound admission gate refuses the plan entirely.
-      expect(await s.intern.trySubmitDualMakerPair(s.quote(), "cb:plan", books)).toBe(false);
-      expect(s.engine.restingOrderCount()).toBe(0);
-      expect(s.engine.ledger.positions.size).toBe(0);
-      expect(s.engine.reservedCash()).toBe("0");
+      // 0.69 UP / 0.29 DOWN joins leave the single-fill residual hedge uncovered.
+      // The cost-bound prices each leg at the maximum passive quote that still
+      // covers that hedge (UP 0.67, DOWN 0.27) - lower, safe, post-only quotes
+      // that the corrected post-only admission accepts.
+      expect(await s.intern.trySubmitDualMakerPair(s.quote(), "cb:plan", books)).toBe(true);
+      expect(s.engine.restingOrderCount()).toBe(2);
+      const q = [...s.intern.restingOrders.values()].map((v) => v.order);
+      const upQuote = q.find((o) => o.outcome === "UP")!;
+      const downQuote = q.find((o) => o.outcome === "DOWN")!;
+      expect(upQuote.requestedPrice).toBe("0.67");
+      expect(downQuote.requestedPrice).toBe("0.27");
+      expect(upQuote.makerFirst?.postOnly).toBe(true);
+      expect(downQuote.makerFirst?.postOnly).toBe(true);
+      expect(new Set(q.map((o) => o.makerFirst?.dualGroupId)).size).toBe(1);
       expect(s.errors).toEqual([]);
     } finally { await s.engine.stop(); }
   });

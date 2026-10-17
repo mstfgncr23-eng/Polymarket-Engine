@@ -49,6 +49,7 @@ import {
   evolveMakerOrder,
   evolveMakerTrade,
   passiveMakerBuyPrice,
+  passiveMakerLimitPrice,
   planDualMakerQuotes,
   type MarketTrade,
   grokSignalSubmissionSchema,
@@ -4748,7 +4749,7 @@ export class EngineService {
       if(order.makerFirst)throw new MakerReservationCashCommitGuardRejectedError(order.id,order.marketId,notional,this.ledger.availableCash().toFixed());
       throw new Error("INSUFFICIENT_CASH");
     }
-    if(order.makerFirst&&passiveMakerBuyPrice(reservationBook,order.quantity,order.requestedPrice)!==order.requestedPrice){
+    if(order.makerFirst&&passiveMakerLimitPrice(reservationBook,order.requestedPrice,order.quantity)===null){
       const evidence=this.makerReservationEvidence(order,reservationBook,'PRE_RESERVATION');
       if(intent==='OPEN_FIRST_LEG')throw new FirstLegLifecycleGuardRejectedError(order.marketId,'MAKER_FIRST_POST_ONLY_INVALID',evidence);
       throw new RiskReductionLifecycleGuardRejectedError(order.marketId,'HEDGE_SECOND_LEG','MAKER_FIRST_POST_ONLY_INVALID',evidence);
@@ -4782,7 +4783,7 @@ export class EngineService {
         if (reserveAuthorityAtCommit) return;
         if(order.makerFirst){
           const current=this.state.marketSnapshots.get(order.tokenId);
-          const reason=!current || passiveMakerBuyPrice(current,order.quantity,order.requestedPrice)!==order.requestedPrice
+          const reason=!current || passiveMakerLimitPrice(current,order.requestedPrice,order.quantity)===null
             ? 'MAKER_FIRST_POST_ONLY_INVALID':this.hybridQuoteInvalidReason(resting,current);
           if(reason){
             const evidence=this.makerReservationEvidence(order,current,'BEFORE_DURABLE_COMMIT');

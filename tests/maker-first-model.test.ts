@@ -1,5 +1,5 @@
 import {describe,it,expect} from 'vitest';
-import {createRestingMakerOrder,evolveMakerOrder,evolveMakerTrade,passiveMakerBuyPrice,makerPairNetPnl,engineEnvSchema,type MarketTrade} from '@pm/core';
+import {createRestingMakerOrder,evolveMakerOrder,evolveMakerTrade,passiveMakerBuyPrice,passiveMakerLimitPrice,makerPairNetPnl,engineEnvSchema,type MarketTrade} from '@pm/core';
 import {snapshot,order} from './fixtures.js';
 const T=Date.parse('2026-10-15T18:00:00Z'),iso=(n:number)=>new Date(T+n).toISOString();
 const book=()=>snapshot({bids:[{price:'0.69',quantity:'2'}],asks:[{price:'0.7',quantity:'1000'}],sourceTimestamp:iso(0),receivedAt:iso(0)});
@@ -41,5 +41,25 @@ describe('Maker-First conservative executed-flow model',()=>{
   expect(createRestingMakerOrder({...quote(),id:'new'},book()).queueAhead).toBe('2');
   expect(engineEnvSchema.parse({}).PAPER_MAKER_FIRST_ENABLED).toBe(false);
   expect(engineEnvSchema.safeParse({PAPER_MAKER_HEDGE_QUOTE_TTL_MS:2001}).success).toBe(false);
+ });
+ it('post-only validates any non-crossing on-tick passive price, not just the best bid',()=>{
+  // Sub-best-bid and price-improving (but below ask) quotes are valid post-only.
+  expect(passiveMakerLimitPrice(book(),'0.67','2')).toBe('0.67');
+  expect(passiveMakerLimitPrice(book(),'0.69','2')).toBe('0.69');
+  expect(passiveMakerLimitPrice(book(),'0.7','2')).toBeNull();      // at/above best ask crosses
+  expect(passiveMakerLimitPrice(book(),'0.71','2')).toBeNull();     // crosses
+  expect(passiveMakerLimitPrice(book(),'0.685','2')).toBeNull();    // off tick
+  expect(passiveMakerLimitPrice(book(),'0','2')).toBeNull();        // non-positive
+  expect(passiveMakerLimitPrice(snapshot({...book(),tickSize:null}),'0.69','2')).toBeNull();
+  expect(passiveMakerLimitPrice(book(),'0.69','.5')).toBeNull();    // below minimum size
+ });
+ it('createRestingMakerOrder accepts a sub-best-bid passive quote with queue ahead at that level',()=>{
+  const b=snapshot({...book(),bids:[{price:'0.69',quantity:'2'},{price:'0.67',quantity:'7'}]});
+  const sub=createRestingMakerOrder({...quote(),id:'sub',requestedPrice:'0.67'},b,'OPEN_FIRST_LEG');
+  expect(sub.queueAhead).toBe('7');
+  expect(sub.remaining).toBe('2');
+  // The improved (above best bid, below ask) passive quote is also accepted.
+  const improved=createRestingMakerOrder({...quote(),id:'imp',requestedPrice:'0.69'},book(),'OPEN_FIRST_LEG');
+  expect(improved.queueAhead).toBe('2');
  });
 });

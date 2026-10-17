@@ -78,13 +78,20 @@ describe("planDualMakerQuotes cost-bound integration", () => {
     expect(result.plan.worstCaseSingleFill).toBeUndefined();
     expect(result.plan.fillAssumption).toBe("BOTH_QUOTES_FILL_AT_LIMIT");
   });
-  it("rejects a high-priced plan whose worst-case single-fill taker hedge is not covered", () => {
-    // 0.95 UP / 0.02 DOWN join: the paired spread looks fine, but if only one leg
-    // fills as a maker, the residual must be hedged at the opposite ASK (0.04 /
-    // 0.96) which does not clear the ROI floor -> the cost-bound gate refuses.
+  it("prices a high-priced plan at the cost-bound affordable level (below the best bid), not rejects it", () => {
+    // 0.95 UP / 0.02 DOWN best-bid join would leave the single-fill residual
+    // hedge uncovered. Approach 3 prices each leg at the maximum passive price
+    // that still covers that hedge: UP 0.94 (one tick below its join), DOWN 0.02.
     const result = candidate({ costBound: true });
-    expect(result.plan).toBeNull();
-    expect(result.reason).toBe("HEDGE_COST_NOT_COVERED");
+    expect(result.reason).toBeNull();
+    if (!result.plan) throw new Error("missing plan");
+    expect(result.plan.up.price).toBe("0.94");
+    expect(result.plan.down.price).toBe("0.02");
+    expect(result.plan.worstCaseSingleFill).toBeDefined();
+    expect(result.plan.worstCaseSingleFill!.up.covered).toBe(true);
+    expect(result.plan.worstCaseSingleFill!.down.covered).toBe(true);
+    // The lower safe quotes still lock a positive paired edge.
+    expect(Number(result.plan.netPairPnlUsd)).toBeGreaterThan(0);
   });
   it("admits a plan whose single-fill worst case is covered and keeps the best-bid join prices", () => {
     const result = planDualMakerQuotes({

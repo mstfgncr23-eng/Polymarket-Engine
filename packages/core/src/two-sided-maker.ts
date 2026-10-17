@@ -1,7 +1,7 @@
 import { Decimal } from "decimal.js";
 import { calculateFee, d, walkBook } from "./calculations.js";
 import type { MarketSnapshot } from "./domain.js";
-import { passiveMakerBuyPrice } from "./maker-first.js";
+import { passiveMakerBuyPrice, passiveMakerLimitPrice } from "./maker-first.js";
 
 export type DualMakerRejection =
   | "INVALID_CONFIGURATION"
@@ -47,12 +47,14 @@ export interface SingleFillHedgeEconomics {
  * This is the corrected cost-bound quote ("maliyet sınırlı kotasyon"):
  *  - It uses the ACTUAL opposite-ASK depth walk (fee-adjusted), not a fitted
  *    quote, for the hedge cost.
- *  - It is a strict safety cap: it can only lower or reject a quote, never
- *    raise it, so it never loosens the planner's existing guards.
+ *  - It prices the leg at the MAXIMUM passive affordable price: any on-tick
+ *    price strictly below the quoted side's best ASK (post-only) that still
+ *    clears the ROI floor. This may be below the best bid (a less aggressive
+ *    passive quote) or above it (a price-improving passive quote); both are
+ *    valid post-only orders filled by exact-price SELL flow in evolveMakerTrade.
  *
- * Returns the floored-tick price (always passive: strictly below the quoted
- * side's ask, at most one tick above its best bid), or a rejection reason when
- * the opposite depth cannot cover the residual at the ROI floor.
+ * Returns the floored-tick price, or a rejection reason when the opposite depth
+ * cannot cover the residual at the ROI floor.
  */
 export function costBoundMakerBuyPrice(input: {
   book: MarketSnapshot;
@@ -81,12 +83,10 @@ export function costBoundMakerBuyPrice(input: {
   const bound = numerator.div(denominator);
   if (bound.lte(0)) return { reason: "ROI_UNREACHABLE" };
   let price = bound.div(tick).floor().mul(tick);
-  // Keep the quote passive on the side being quoted: strictly below its ask and
-  // at most one tick above its best bid (never a crossed/aggressive quote).
-  const bid = input.book.bids[0];
+  // Post-only passive bound on the quoted side: strictly below its best ASK
+  // (at least one tick). No best-bid equality requirement.
   const ask = input.book.asks[0];
   if (ask) price = Decimal.min(price, d(ask.price).minus(tick));
-  if (bid) price = Decimal.min(price, d(bid.price).plus(tick));
   price = price.div(tick).floor().mul(tick);
   if (price.lte(0)) return { reason: "ROI_UNREACHABLE" };
   const makerFee = d(calculateFee(q, price, "MAKER", input.book.feeSchedule!));
@@ -161,8 +161,10 @@ export function planDualMakerQuotes(input: {
   minPairNetRoi: number;
   nowMs: number;
   maxBookAgeMs: number;
-  /** Enable the cost-bound quote: cap each price so the worst-case single-fill
-   *  taker hedge at the opposite ASK is still covered at minPairNetRoi. */
+  /** Enable cost-bound dual maker pricing: price each leg at the maximum passive
+   *  affordable quote (below or above the best bid, still post-only) so the
+   *  worst-case single-fill taker hedge at the opposite ASK is covered at
+   *  minPairNetRoi. Default false preserves the historical join-the-bid price. */
   costBound?: boolean;
 }): { plan: DualMakerQuotePlan; reason: null } | { plan: null; reason: DualMakerRejection } {
   const { up, down } = input;
@@ -194,13 +196,30 @@ export function planDualMakerQuotes(input: {
   const upPrice = passiveMakerBuyPrice(up, input.quantity, up.bids[0]?.price ?? "0");
   const downPrice = passiveMakerBuyPrice(down, input.quantity, down.bids[0]?.price ?? "0");
   if (!upPrice || !downPrice) return { plan: null, reason: "NON_PASSIVE_QUOTE" };
-  // The engine posts maker quotes that join the best bid exactly. The cost-bound
-  // therefore acts as an admission GATE (not a price change): it evaluates the
-  // worst-case single-fill hedge economics at those join prices and refuses the
-  // plan unless BOTH legs' residuals can be hedged by TAKING the opposite ASK at
-  // the ROI floor. It can only reject, never loosen an existing guard.
-  const costUp = upPrice;
-  const costDown = downPrice;
+  // Approach 3 (cost-bound pricing, opt-in): price each leg at the MAXIMUM
+  // passive affordable quote - the highest on-tick price strictly below its own
+  // best ASK (post-only) such that the worst-case single-fill residual can be
+  // hedged by TAKING the opposite ASK at the ROI floor. This may be below the
+  // best bid (a less aggressive passive quote) or above it (a price-improving
+  // passive quote); both are valid post-only orders filled by exact-price SELL
+  // flow. The Engine's post-only admission now accepts any such passive price
+  // (passiveMakerLimitPrice), so the old best-bid-equality constraint no longer
+  // forces this planner into a 100%-rejection gate.
+  let costUp = upPrice;
+  let costDown = downPrice;
+  if (input.costBound) {
+    const upBound = costBoundMakerBuyPrice({ book: up, opposite: down, quantity: input.quantity, minPairNetRoi: input.minPairNetRoi });
+    const downBound = costBoundMakerBuyPrice({ book: down, opposite: up, quantity: input.quantity, minPairNetRoi: input.minPairNetRoi });
+    if ("reason" in upBound || "reason" in downBound) return { plan: null, reason: "HEDGE_COST_NOT_COVERED" };
+    if ("price" in upBound) costUp = upBound.price;
+    if ("price" in downBound) costDown = downBound.price;
+    // Double-check the produced prices are genuine post-only limits (non-crossing
+    // and on-tick). Fail closed rather than trusting the solver.
+    if (passiveMakerLimitPrice(up, costUp, input.quantity) === null
+      || passiveMakerLimitPrice(down, costDown, input.quantity) === null) {
+      return { plan: null, reason: "HEDGE_COST_NOT_COVERED" };
+    }
+  }
   const upCost = qty.mul(costUp);
   const downCost = qty.mul(costDown);
   if (upCost.gt(perSideCap) || downCost.gt(perSideCap)) return { plan: null, reason: "SIDE_EXPOSURE_CAP" };
