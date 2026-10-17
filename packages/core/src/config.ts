@@ -142,6 +142,14 @@ export const engineEnvSchema = z.object({
    *  by TAKING the opposite ASK at the pair ROI floor. Default false preserves the
    *  historical join-the-bid behavior. */
   PAPER_DUAL_MAKER_COST_BOUND_ENABLED: z.preprocess(value => value === "true" ? true : value === "false" ? false : value, z.boolean().default(false)),
+  /** Touch fill-zone pricing (opt-in, requires PAPER_DUAL_MAKER_COST_BOUND_ENABLED=true):
+   *  keep dual-maker quotes at the best-bid JOIN price (the zone where exact-price
+   *  public SELL flow fills) and report the worst-case single-fill taker hedge as
+   *  an AUDIT bounded by reservation/risk limits instead of shaving the quote below
+   *  the touch. PAPER evidence: join-best-bid quotes filled ~49% (111 quotes/54 fills
+   *  in the 6h dual-maker experiment) while quotes 1-6 ticks below the best bid
+   *  showed 0 exact-price sell trades across every 2s window of a 2h soak. */
+  PAPER_DUAL_MAKER_TOUCH_PRICING_ENABLED: z.preprocess(value => value === "true" ? true : value === "false" ? false : value, z.boolean().default(false)),
   PAPER_MAKER_FIRST_QUOTE_TTL_MS: z.coerce.number().int().min(500).max(5000).default(2000),
   PAPER_MAKER_HEDGE_QUOTE_TTL_MS: z.coerce.number().int().min(250).max(2000).default(750),
   /** Runtime override for NORMAL HEDGE_SECOND_LEG gross locked pair edge floor. */

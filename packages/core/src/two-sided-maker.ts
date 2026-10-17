@@ -142,8 +142,10 @@ export type DualMakerQuotePlan = {
   netPairPnlUsd: string;
   netPairRoi: number;
   maxUnpairedDownsideUsd: string;
-  /** Present only when costBound is enabled. Worst-case single-fill hedge
-   *  coverage for each leg, always guaranteed by the cost-bound cap. */
+  /** Present when costBound is enabled. Worst-case single-fill hedge
+   *  coverage for each leg: always guaranteed by the cost-bound cap in
+   *  classic mode; with touchPricing it is an AUDIT and may be uncovered
+   *  (the tail is governed by reservation/risk limits + hedge machinery). */
   worstCaseSingleFill?: {
     up: SingleFillHedgeEconomics;
     down: SingleFillHedgeEconomics;
@@ -166,6 +168,14 @@ export function planDualMakerQuotes(input: {
    *  worst-case single-fill taker hedge at the opposite ASK is covered at
    *  minPairNetRoi. Default false preserves the historical join-the-bid price. */
   costBound?: boolean;
+  /** Touch fill-zone pricing (opt-in, default false; requires costBound=true):
+   *  keep each leg at the best-bid JOIN price (the zone where exact-price public
+   *  SELL flow actually fills maker quotes) even when the worst-case single-fill
+   *  taker hedge alone would not clear the ROI floor at that price. The
+   *  single-fill tail is then an AUDIT (worstCaseSingleFill may be uncovered)
+   *  bounded by the existing reservation/risk limits and the hedge machinery,
+   *  instead of shaving the quote below the touch into the zero-fill zone. */
+  touchPricing?: boolean;
 }): { plan: DualMakerQuotePlan; reason: null } | { plan: null; reason: DualMakerRejection } {
   const { up, down } = input;
   const qty = d(input.quantity);
@@ -205,14 +215,25 @@ export function planDualMakerQuotes(input: {
   // flow. The Engine's post-only admission now accepts any such passive price
   // (passiveMakerLimitPrice), so the old best-bid-equality constraint no longer
   // forces this planner into a 100%-rejection gate.
+  //
+  // Touch fill-zone pricing (costBound && touchPricing): paper evidence showed
+  // that quotes 1-6 ticks BELOW the best bid never fill (0 eligible exact-price
+  // SELL trades over hundreds of 2s windows) while join-best-bid quotes fill at
+  // ~49% of quotes. The single-fill tail hedge is therefore reported as an AUDIT
+  // (worstCaseSingleFill, may be uncovered) and governed by the existing
+  // reservation/risk limits and the hedge machinery, not by shaving the quote
+  // below the touch where public flow does not exist.
   let costUp = upPrice;
   let costDown = downPrice;
+  const touch = input.costBound && input.touchPricing === true;
   if (input.costBound) {
-    const upBound = costBoundMakerBuyPrice({ book: up, opposite: down, quantity: input.quantity, minPairNetRoi: input.minPairNetRoi });
-    const downBound = costBoundMakerBuyPrice({ book: down, opposite: up, quantity: input.quantity, minPairNetRoi: input.minPairNetRoi });
-    if ("reason" in upBound || "reason" in downBound) return { plan: null, reason: "HEDGE_COST_NOT_COVERED" };
-    if ("price" in upBound) costUp = upBound.price;
-    if ("price" in downBound) costDown = downBound.price;
+    if (!touch) {
+      const upBound = costBoundMakerBuyPrice({ book: up, opposite: down, quantity: input.quantity, minPairNetRoi: input.minPairNetRoi });
+      const downBound = costBoundMakerBuyPrice({ book: down, opposite: up, quantity: input.quantity, minPairNetRoi: input.minPairNetRoi });
+      if ("reason" in upBound || "reason" in downBound) return { plan: null, reason: "HEDGE_COST_NOT_COVERED" };
+      if ("price" in upBound) costUp = upBound.price;
+      if ("price" in downBound) costDown = downBound.price;
+    }
     // Double-check the produced prices are genuine post-only limits (non-crossing
     // and on-tick). Fail closed rather than trusting the solver.
     if (passiveMakerLimitPrice(up, costUp, input.quantity) === null
@@ -241,7 +262,11 @@ export function planDualMakerQuotes(input: {
       makerFeeUsd: feeDown.toFixed(), minPairNetRoi: input.minPairNetRoi,
     }),
   } : undefined;
-  if (worstCaseSingleFill && (!worstCaseSingleFill.up.covered || !worstCaseSingleFill.down.covered)) {
+  // Binding single-fill ROI gate for classic cost-bound pricing. With touch
+  // fill-zone pricing the tail is an AUDIT: rejecting here would push the quote
+  // below the touch where no exact-price SELL flow exists (0 fills on paper),
+  // which is economically worse than reporting the bounded tail.
+  if (worstCaseSingleFill && !touch && (!worstCaseSingleFill.up.covered || !worstCaseSingleFill.down.covered)) {
     return { plan: null, reason: "HEDGE_COST_NOT_COVERED" };
   }
   return {

@@ -2853,7 +2853,7 @@ export class EngineService {
     const plan=planDualMakerQuotes({up,down,quantity:directionOrder.quantity,
       perSideRiskCapUsd:String(this.riskLimits.maxOrderSizeUsd),availableCashUsd:this.ledger.availableCash().toFixed(),
       minPairNetRoi:FIRST_LEG_MIN_NET_ROI,nowMs:this.nowFn().getTime(),maxBookAgeMs:this.riskLimits.staleFeedTimeoutMs,
-      costBound:this.env.PAPER_DUAL_MAKER_COST_BOUND_ENABLED});
+      costBound:this.env.PAPER_DUAL_MAKER_COST_BOUND_ENABLED,touchPricing:this.env.PAPER_DUAL_MAKER_TOUCH_PRICING_ENABLED});
     if(!plan.plan)return this.dualMakerNoQuote('PLANNER_'+plan.reason);
     const group=createId('dual_pair'),ttl=this.makerFirstConfig().firstLegTtlMs;
     const expiry=this.marketsById.get(marketId)?.endDate;
