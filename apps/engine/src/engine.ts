@@ -1232,7 +1232,7 @@ export class EngineService {
           profitTrailingPairArmEdge: this.env.PROFIT_TRAILING_PAIR_ARM_EDGE,
           profitTrailingPairRetraceEdge: this.env.PROFIT_TRAILING_PAIR_RETRACE_EDGE,
           profitTrailingPairExecutionStyle: "TAKER",
-          profitPairNetRoiFloor: this.env.PAPER_PROFIT_PAIR_NET_ROI_FLOOR,
+          ...(this.env.PAPER_PROFIT_PAIR_NET_ROI_FLOOR === undefined ? {} : {profitPairNetRoiFloor:this.env.PAPER_PROFIT_PAIR_NET_ROI_FLOOR}),
           makerFirst: {enabled:this.env.PAPER_MAKER_FIRST_ENABLED,firstLegTtlMs:this.env.PAPER_MAKER_FIRST_QUOTE_TTL_MS,
             hedgeTtlMs:this.env.PAPER_MAKER_HEDGE_QUOTE_TTL_MS,fillModel:'public-trade-queue-50pct',twoSidedFreshEntries:this.env.PAPER_DUAL_SIDED_MAKER_ENABLED,
             flowPolicy:this.env.PAPER_DUAL_MAKER_FLOW_POLICY,flowWindowMs:this.env.PAPER_DUAL_MAKER_FLOW_WINDOW_MS,
