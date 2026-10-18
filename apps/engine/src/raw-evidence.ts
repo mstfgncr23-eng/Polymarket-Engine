@@ -9,6 +9,7 @@ import { BookEvidenceEncoder } from "./book-evidence-codec.js";
  * decisions, positions or orders. Bounded gzip backpressure is an explicit gap. */
 export class RawEvidence {
   private stream: Gzip | null = null;
+  private readonly parts = new Set<Gzip>();
   private bucket = -1;
   private root = "";
   private experiment = "";
@@ -27,11 +28,17 @@ export class RawEvidence {
   private batch = '';
   private batchBytes = 0;
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
-  constructor(private readonly directory: string) {}
+  constructor(private readonly directory: string,private readonly queueLimit=64*1024**2) {
+    if(!Number.isSafeInteger(queueLimit)||queueLimit<1024||queueLimit>64*1024**2)throw Error('INVALID_RAW_QUEUE_LIMIT');
+  }
   status() { return { experimentId: this.experiment, accepted: this.accepted, dropped: this.dropped,
     rawBytes: this.rawBytes, compressedBytes: this.compressedBytes, maxQueuedBytes:this.maxQueuedBytes,
-    maxCompressedBytes:3*1024**3,fault: this.fault, gaps: this.gaps, files: this.files }; }
+    maxCompressedBytes:3*1024**3,maxQueueBytes:this.queueLimit,codecVersion:2,fault: this.fault, gaps: this.gaps, files: this.files }; }
   recordBook(experimentId:string,snapshot:MarketSnapshot,context:{tokenEpoch:number;synchronized:boolean;siblingEventId:string|null}):void{
+    if(this.sealed&&experimentId===this.experiment)return;
+    if(experimentId===this.experiment&&(this.fault||this.compressedBytes>=3*1024**3||this.queuedBytes()>=this.queueLimit)){
+      this.noteGap(Date.now());this.books.forget(snapshot.tokenId);return;
+    }
     if(this.bookExperiment!==experimentId){this.books.clear();this.bookExperiment=experimentId;}
     const now=Date.now(),encoded=this.books.encode(snapshot,Math.floor(now/60000),context.tokenEpoch,context.synchronized);
     if(!this.record(experimentId,{kind:'book',...context,...encoded},now))this.books.forget(snapshot.tokenId);
@@ -48,8 +55,9 @@ export class RawEvidence {
         this.bucket = -1; this.accepted = 0; this.dropped = 0; this.rawBytes = 0; this.compressedBytes = 0;
         this.gaps = []; this.files = []; this.fault = null;this.maxQueuedBytes=0;
       }
-      this.maxQueuedBytes=Math.max(this.maxQueuedBytes,(this.stream?.writableLength??0)+this.batchBytes);
-      if (this.fault || this.compressedBytes >= 3 * 1024 ** 3 || (this.stream?.writableLength ?? 0) > 8 * 1024 ** 2) {
+      const queued=this.queuedBytes();
+      this.maxQueuedBytes=Math.max(this.maxQueuedBytes,queued);
+      if (this.fault || this.compressedBytes >= 3 * 1024 ** 3 || queued >= this.queueLimit) {
         this.noteGap(now); return false;
       }
       const bucket = Math.floor(now / 60000);
@@ -57,22 +65,24 @@ export class RawEvidence {
         this.finishPart(); this.bucket = bucket;
         const name = `${bucket}-${process.pid}.jsonl.gz`;
         const output = createWriteStream(join(this.root,name), { flags: "wx" });
-        const gzip = createGzip({ level: 1 });
+        const gzip = createGzip({ level: 1, chunkSize:256*1024 });
+        this.parts.add(gzip);
         this.stream = gzip; this.files.push(name);
         output.on("error",e => { this.fault = String(e); gzip.destroy(e); });
         gzip.on("error",e => { this.fault = String(e); });
         gzip.on("data", chunk => { this.compressedBytes += chunk.length; });
         gzip.pipe(output);
-        const done = finished(output).catch(e => { this.fault = String(e); });
+        const done = finished(output).catch(e => { this.fault = String(e); }).finally(()=>this.parts.delete(gzip));
         this.closing.push(done);
         this.persistStatus();
       }
       const line = JSON.stringify({ recordedAt: new Date(now).toISOString(), ...value as object }) + "\n";
       const bytes = Buffer.byteLength(line);
-      if (bytes > 4 * 1024 ** 2) { this.noteGap(now); return false; }
+      if (bytes > 4 * 1024 ** 2 || this.queuedBytes()+bytes>this.queueLimit) { this.noteGap(now); return false; }
       this.batch+=line;this.batchBytes+=bytes;
-      if(this.batchBytes>=64*1024)this.flushBatch();
+      if(this.batchBytes>=256*1024)this.flushBatch();
       else if(!this.flushTimer){this.flushTimer=setTimeout(()=>{this.flushTimer=null;this.flushBatch();},50);this.flushTimer.unref();}
+      this.maxQueuedBytes=Math.max(this.maxQueuedBytes,this.queuedBytes());
       this.accepted++; this.rawBytes += bytes;return true;
     } catch (error) { this.fault = String(error); this.noteGap(now);return false; }
   }
@@ -85,6 +95,7 @@ export class RawEvidence {
     if(this.stream&&this.batchBytes){this.stream.write(this.batch);this.batch='';this.batchBytes=0;}
   }
   private finishPart(): void {this.flushBatch();if (this.stream) { this.stream.end(); this.stream = null; } }
+  private queuedBytes():number{let bytes=this.batchBytes;for(const part of this.parts)bytes+=part.writableLength;return bytes;}
   private noteGap(now: number): void {
     this.dropped++;
     const at = new Date(now).toISOString(), last = this.gaps.at(-1);

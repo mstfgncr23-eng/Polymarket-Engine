@@ -21,3 +21,14 @@ it('retains its own depth when the adapter reuses an array',()=>{
   book.bids[0]!.quantity='999';book.eventId='changed';
   expect(decoder.apply(encoder.encode(book,1,1,true))).toEqual(book);
 });
+it('retains headers losslessly across changes, deletions and mutable fee schedules',()=>{
+  const encoder=new BookEvidenceEncoder(),decoder=new BookEvidenceDecoder(),book=snapshot();
+  decoder.apply(encoder.encode(book,1,1,true));
+  book.eventId='new-header';delete book.wsCallbackAt;
+  if(book.feeSchedule)book.feeSchedule.rate='0.03';
+  const encoded=encoder.encode(book,1,1,true);
+  expect(encoded.encoding).toBe('DELTA_V2');
+  expect(decoder.apply(JSON.parse(JSON.stringify(encoded)))).toEqual(book);
+  const next={...book,eventId:'next',feeSchedule:null};
+  expect(decoder.apply(JSON.parse(JSON.stringify(encoder.encode(next,1,1,true))))).toEqual(next);
+});

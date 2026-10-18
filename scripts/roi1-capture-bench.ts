@@ -10,20 +10,20 @@ import {isDeepStrictEqual} from 'node:util';
 
 const input=process.argv[2]!,output=process.argv[3]!;
 if(!input||!output)throw Error('INPUT_AND_OUTPUT_REQUIRED');
-const archive=new RawEvidence(output),encoder=new BookEvidenceEncoder(),decoder=new BookEvidenceDecoder();
+const archive=new RawEvidence(output),encoder=new BookEvidenceEncoder(),decoder=new BookEvidenceDecoder(),inputDecoder=new BookEvidenceDecoder();
 const lag=monitorEventLoopDelay({resolution:10});lag.enable();
 const started=performance.now(),cpu=process.cpuUsage();let count=0,fullBytes=0,encodedBytes=0;
-const rate=2000; // Above the observed normalized input rate; no market subscriptions.
+const rate=Number(process.argv[4]??2000),limit=Number(process.argv[5]??40000); // Offline input only; no market subscriptions.
 for await(const line of createInterface({input:createReadStream(input).pipe(createGunzip()),crlfDelay:Infinity})){
   const item=JSON.parse(line);if(item.kind!=='book'||!item.snapshot)continue;
-  const book=item.snapshot as MarketSnapshot;
+  const book=(item.encoding?inputDecoder.apply(item):item.snapshot) as MarketSnapshot;
   const encoded=encoder.encode(book,1,item.tokenEpoch,item.synchronized);
   if(!isDeepStrictEqual(decoder.apply(JSON.parse(JSON.stringify(encoded))),book))throw Error('LOSSLESS_ROUNDTRIP_FAILED');
   fullBytes+=Buffer.byteLength(JSON.stringify(item));encodedBytes+=Buffer.byteLength(JSON.stringify(encoded));
   archive.recordBook('offline_capture_bench',book,{tokenEpoch:item.tokenEpoch,synchronized:item.synchronized,siblingEventId:item.siblingEventId??null});
   count++;
   if(count%100===0){const wait=count/rate*1000-(performance.now()-started);if(wait>0)await new Promise(r=>setTimeout(r,wait));}
-  if(count>=40000)break;
+  if(count>=limit)break;
 }
 await archive.close();lag.disable();
 const used=process.cpuUsage(cpu),result={kind:'OFFLINE_CAPTURE_LOAD_TEST_NOT_TRADING',count,elapsedMs:performance.now()-started,
