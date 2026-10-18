@@ -1505,6 +1505,8 @@ export class EngineService {
           || this.restingOrders.size > 0 || this.riskReductionOwners.size > 0,
       });
       if (retentionResult.failures) this.logger.error({ reason: retentionResult.skipReason }, "retention deferred");
+      if (retentionResult.heldCanonicalCount) this.logger.error({ heldCanonicalCount: retentionResult.heldCanonicalCount }, "retention legacy canonical source held (no purge)");
+      if (retentionResult.recoveryIntegrityHeldReason) this.logger.error({ reason: retentionResult.recoveryIntegrityHeldReason }, "retention recovery integrity held (no checkpoint/durable purge)");
     });
   }
 

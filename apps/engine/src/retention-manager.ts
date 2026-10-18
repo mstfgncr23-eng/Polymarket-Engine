@@ -63,6 +63,10 @@ export interface RetentionCycleResult {
   guardianRecoveryHeld: boolean;
   durableCompaction?: { deleted: number; cursor: number; highWater: number; compactedOperationKeys: number };
   eligibleBacklog: number;
+  /** Legacy raw sources lacking complete canonical evidence are preserved, not purged. */
+  heldCanonicalCount?: number;
+  /** Non-destructive sticky hold if historical recovery payload hashes cannot be proved. */
+  recoveryIntegrityHeldReason?: string | null;
 }
 
 type RetentionEnv = Pick<EngineEnv,
@@ -199,6 +203,9 @@ export interface RetentionReplicaVerifier {
 
 export class RetentionManager {
   private running = false;
+  // Once a durable hash mismatch is found, never retry/compact recovery in this
+  // process. Recovery repair must be independently authorized and revalidated.
+  private recoveryIntegrityHeldReason: string | null = null;
   // Three retention classes only. Reuse a sealed bucket across bounded drains;
   // a moving global commit fence must not re-export all remaining rows each cycle.
   private readonly sealedBuckets = new Map<string, JournalBucketArchiveManifest>();
@@ -264,6 +271,7 @@ export class RetentionManager {
     let lastBatchDurationMs = 0;
     let totalDeleted = 0;
     let canonicalBacklog = 0;
+    let heldCanonicalCount = 0;
 
     try {
       const transientEligible = await completedReportUnlocksTransient(
@@ -311,7 +319,7 @@ export class RetentionManager {
       // engine's currently attached manifest.
       if (this.archive) {
         let canonicalDrainPrepared = false;
-        const candidates = await this.journal.listArchiveCandidates(32);
+        const candidates = await this.journal.listArchiveCandidates(256);
         for (const candidate of candidates) {
           if (candidate.report.experimentId === context.experiment?.id && experimentIsActive(context.experiment)) continue;
           if (context.now.getTime() - Date.parse(candidate.report.persistedAt) < this.config.completedGraceMs) continue;
@@ -323,7 +331,16 @@ export class RetentionManager {
             sourceRecordedAt: new Date(candidate.rollup.sourceRecordedAt),
           });
           if (backlog.count <= 0) continue;
-          canonicalBacklog = backlog.count;
+          canonicalBacklog += backlog.count;
+          // Old experiments can have raw rows pruned by an earlier deployment.
+          // Their persisted final count is immutable; a short hot-source count
+          // cannot reconstruct the sealed archive. Keep these canonical rows
+          // hot rather than allowing one legacy gap to block unrelated retention.
+          // The report fence event is at the upper boundary (strictly excluded).
+          if (backlog.count + 1 < candidate.report.sourceEventCount) {
+            heldCanonicalCount += 1;
+            continue;
+          }
           const archived = await this.archive.ensureExperimentCanonical(this.journal, candidate);
           if (!archived.verified || !archived.manifest) throw new Error("LOCAL_ARCHIVE_CANONICAL_VERIFY_FAILED");
           const manifest = archived.manifest;
@@ -411,7 +428,7 @@ export class RetentionManager {
       }
 
       let checkpointKeep = this.config.checkpointKeep, archivedCheckpointIds: string[] = [], compactCursor = 0;
-      if (!this.config.guardianRecoveryHold && this.journal.listVerifiedCheckpoints && this.archive) {
+      if (!this.config.guardianRecoveryHold && !this.recoveryIntegrityHeldReason && this.journal.listVerifiedCheckpoints && this.archive) {
         const verified = await this.journal.listVerifiedCheckpoints();
         const retained = verified.slice(0, 2);
         if (retained.length === 2) {
@@ -435,12 +452,22 @@ export class RetentionManager {
             : [];
           const compactable = prefix.some(row => row.type !== "EXPERIMENT_NON_FINAL_QUARANTINED");
           if (candidates.length || compactable) {
-            const recovery = await this.archive.ensureRecoveryBundle(this.journal, {
-              retained, candidates, prefixCursor: compactable ? compactCursor : 0, maxPrefixRows: this.config.batchSize });
-            if (!recovery.verified || !recovery.manifest) throw new Error("RECOVERY_ARCHIVE_NOT_VERIFIED");
-            if (this.config.offsiteReplicaRequired) await this.replicaVerifier!.verifyRecovery({ directory: recovery.directory, manifest: recovery.manifest });
-            archivedCheckpointIds = candidates.map(c => c.id);
-            compactCursor = this.config.compactionEnabled ? Math.min(compactCursor, recovery.manifest.prefixThroughCursor) : 0;
+            try {
+              const recovery = await this.archive.ensureRecoveryBundle(this.journal, {
+                retained, candidates, prefixCursor: compactable ? compactCursor : 0, maxPrefixRows: this.config.batchSize });
+              if (!recovery.verified || !recovery.manifest) throw new Error("RECOVERY_ARCHIVE_NOT_VERIFIED");
+              if (this.config.offsiteReplicaRequired) await this.replicaVerifier!.verifyRecovery({ directory: recovery.directory, manifest: recovery.manifest });
+              archivedCheckpointIds = candidates.map(c => c.id);
+              compactCursor = this.config.compactionEnabled ? Math.min(compactCursor, recovery.manifest.prefixThroughCursor) : 0;
+            } catch (error) {
+              // A corrupt historical durable hash must NEVER be accepted as
+              // recovery authority. Keep ALL checkpoint and durable rows, while
+              // unrelated checksum/offsite-verified journal drains may proceed.
+              if (!(error instanceof Error) || error.message !== "RECOVERY_ARCHIVE_DURABLE_HASH") throw error;
+              this.recoveryIntegrityHeldReason = error.message;
+              archivedCheckpointIds = [];
+              compactCursor = 0;
+            }
           } else compactCursor = 0;
         }
       }
@@ -599,6 +626,8 @@ export class RetentionManager {
         guardianRecoveryHeld: this.config.guardianRecoveryHold,
         durableCompaction,
         eligibleBacklog: telemetryEligible.count + monitorEligible.count + operationalEligible.count + canonicalBacklog,
+        heldCanonicalCount,
+        recoveryIntegrityHeldReason: this.recoveryIntegrityHeldReason,
       };
     } catch (error) {
       failures += 1;
@@ -618,6 +647,8 @@ export class RetentionManager {
         durableTransitionsPruned: false,
         guardianRecoveryHeld: this.config.guardianRecoveryHold,
         eligibleBacklog: 0,
+        heldCanonicalCount,
+        recoveryIntegrityHeldReason: this.recoveryIntegrityHeldReason,
       };
     } finally {
       this.running = false;
