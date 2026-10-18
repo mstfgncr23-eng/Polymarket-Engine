@@ -22,7 +22,7 @@ export type ProfitTrailingPairAction = "NONE" | "TARGET" | "TRAIL";
 
 export interface ProfitTrailingPairEvaluation {
   action: ProfitTrailingPairAction;
-  reason: "BELOW_ARM" | "ARMED" | "HIGH_WATER" | "TARGET_REACHED" | "RETRACE_NOT_REACHED" | "TRAIL_TRIGGERED";
+  reason: "NET_ROI_TARGET_REACHED" | "NET_ROI_BELOW_TARGET" | "BELOW_ARM" | "ARMED" | "HIGH_WATER" | "TARGET_REACHED" | "RETRACE_NOT_REACHED" | "TRAIL_TRIGGERED";
   nextState: ProfitTrailingPairState | null;
   stateChanged: boolean;
 }
@@ -35,12 +35,23 @@ export function evaluateProfitTrailingPair(input: {
   now: Date;
   currentGrossEdge: string;
   currentLockedPnl: string;
+  currentLockedCost?: string;
+  netRoiTarget?: number;
   targetEdge: number;
   armEdge: number;
   retraceEdge: number;
 }): ProfitTrailingPairEvaluation {
   const current = d(input.currentGrossEdge);
   const lockedPnl = d(input.currentLockedPnl);
+  if (input.netRoiTarget !== undefined) {
+    const cost = d(input.currentLockedCost ?? "NaN");
+    const floor = d(input.netRoiTarget);
+    if (!cost.isFinite() || cost.lte(0) || !lockedPnl.isFinite() || !floor.isFinite() || floor.lte(0) || floor.gt(1))
+      throw new Error("INVALID_NET_PAIR_ROI_INPUT");
+    const reached = lockedPnl.gte(cost.mul(floor));
+    return { action: reached ? "TARGET" : "NONE", reason: reached ? "NET_ROI_TARGET_REACHED" : "NET_ROI_BELOW_TARGET",
+      nextState: null, stateChanged: false };
+  }
   const target = d(input.targetEdge);
   const arm = d(input.armEdge);
   const retrace = d(input.retraceEdge);

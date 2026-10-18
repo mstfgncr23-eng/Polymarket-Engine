@@ -4,6 +4,7 @@ export const riskLimitsSchema = z.object({
   /** Explicit fresh-entry policy: decimal return on executable notional.
    * When present it supersedes both historical edge/ROI price regimes. */
   freshEntryNetRoiFloor: z.number().min(0).max(1).optional(),
+  freshEntryExitFeeReserve: z.boolean().optional(),
   freshEntryMinPrice: z.number().min(0).max(1).optional(),
   maxOrderSizeUsd: z.number().positive().default(25),
   maxMarketExposureUsd: z.number().positive().default(100),
@@ -140,6 +141,8 @@ export const engineEnvSchema = z.object({
   PAPER_EXECUTION_LATENCY_MS: z.coerce.number().int().nonnegative().default(150),
   PAPER_EXECUTION_STYLE: z.enum(["TAKER", "MAKER"]).default("TAKER"),
   PAPER_ENTRY_NET_ROI_FLOOR: z.coerce.number().min(0).max(1).optional(),
+  PAPER_ENTRY_EXIT_FEE_RESERVE: z.preprocess(value => value === "true" ? true : value === "false" ? false : value, z.boolean().default(false)),
+  PAPER_PROFIT_PAIR_NET_ROI_FLOOR: z.coerce.number().positive().max(1).optional(),
   PAPER_ENTRY_MIN_PRICE: z.coerce.number().min(0).max(1).optional(),
   PAPER_DUAL_MAKER_FLOW_POLICY: z.enum(["both", "hedge_covered"]).default("both"),
   PAPER_RAW_EVIDENCE_ENABLED: z.preprocess(value => value === "true" ? true : value === "false" ? false : value, z.boolean().default(false)),

@@ -344,3 +344,22 @@ it("15: verified HEDGE_SECOND_LEG below 0.90 gets NO normal first-leg policy", (
     expect(risk.accepted).toBe(false);
   });
   });
+
+describe("full-cycle first-leg economic budget",()=>{
+  it("subtracts the exit allowance from net EV while preserving actual entry fee reporting",()=>{
+    const book=snapshot({marketId:MARKET,tokenId:TOKEN,bids:[{price:"0.94",quantity:"1000"}],asks:[{price:"0.95",quantity:"1000"}]});
+    const input={candidate:openCandidate({quantity:"5",limitPrice:"0.95",rawExpectedEdge:0.02}),consensus:openConsensus(),
+      snapshotAfterDecisionLatency:book,limits:riskLimitsSchema.parse({freshEntryNetRoiFloor:0.01}),triggerId:"g",
+      signalExpiresAt:new Date(now.getTime()+60000),baseRisk:openDecisionBaseRisk()};
+    const legacy=decidePaperOrder(input);
+    const cycle=decidePaperOrder({...input,limits:{...input.limits,freshEntryExitFeeReserve:true}});
+    expect(legacy.accepted).toBe(true);
+    expect(cycle.risk.vetoes).toContain("MINIMUM_EXPECTED_ROI");
+    expect(cycle.exitFeeReserveUsd).toBe("0.08750");
+    expect(cycle.feeUsdTotal).toBe(legacy.feeUsdTotal);
+    expect(Number(legacy.netEvUsdTotal)-Number(cycle.netEvUsdTotal)).toBeCloseTo(0.0875,8);
+    expect(cycle.executableNotionalUsd).toBe(legacy.executableNotionalUsd);
+    const dual=decidePaperOrder({...input,limits:{...input.limits,freshEntryExitFeeReserve:true},baseRisk:{...input.baseRisk,dualPairEconomics:{netRoi:0.02,netUsdPerShare:0.019}}});
+    expect(dual.exitFeeReserveUsd).toBe("0");
+  });
+});

@@ -10,6 +10,23 @@ const base = {
   retraceEdge: 0.02,
 };
 
+describe("fee-inclusive net pair return policy", () => {
+  const input = {...base, state:null, now:new Date(base.unhedgedStartedAt),
+    currentGrossEdge:"0.02", currentLockedPnl:"0.10", currentLockedCost:"4.90", netRoiTarget:0.01};
+  it("locks a reachable 2 cent edge below the legacy arm", () => {
+    expect(evaluateProfitTrailingPair(input).action).toBe("TARGET");
+    expect(evaluateProfitTrailingPair({...input, netRoiTarget:undefined}).action).toBe("NONE");
+  });
+  it("uses all-in capital and an exact inclusive 1 percent boundary", () => {
+    expect(evaluateProfitTrailingPair({...input,currentLockedCost:"5",currentLockedPnl:"0.05"}).action).toBe("TARGET");
+    expect(evaluateProfitTrailingPair({...input,currentLockedCost:"5",currentLockedPnl:"0.049999999"}).action).toBe("NONE");
+    expect(evaluateProfitTrailingPair({...input,currentLockedPnl:"-0.01"}).action).toBe("NONE");
+  });
+  it.each(["0", "-1", "NaN"])("rejects invalid capital %s", cost => {
+    expect(()=>evaluateProfitTrailingPair({...input,currentLockedCost:cost})).toThrow("INVALID_NET_PAIR_ROI_INPUT");
+  });
+});
+
 function evaluate(edge: string, pnl: string, state: ProfitTrailingPairState | null, second: number) {
   return evaluateProfitTrailingPair({
     ...base,
