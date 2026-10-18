@@ -21,6 +21,8 @@ export class RawEvidence {
   private compressedBytes = 0;
   private maxQueuedBytes = 0;
   private fault: string | null = null;
+  private lastStatusAt = 0;
+  private lastGapReason: string | null = null;
   private gaps: { from: string; to: string; count: number }[] = [];
   private files: string[] = [];
   private readonly books = new BookEvidenceEncoder();
@@ -28,15 +30,16 @@ export class RawEvidence {
   private batch = '';
   private batchBytes = 0;
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
-  constructor(private readonly directory: string,private readonly queueLimit=64*1024**2) {
+  constructor(private readonly directory: string,private readonly queueLimit=64*1024**2, private readonly compressedLimit=3*1024**3) {
     if(!Number.isSafeInteger(queueLimit)||queueLimit<1024||queueLimit>64*1024**2)throw Error('INVALID_RAW_QUEUE_LIMIT');
+    if(!Number.isSafeInteger(compressedLimit)||compressedLimit<1024||compressedLimit>16*1024**3)throw Error('INVALID_RAW_COMPRESSED_LIMIT');
   }
   status() { return { experimentId: this.experiment, accepted: this.accepted, dropped: this.dropped,
     rawBytes: this.rawBytes, compressedBytes: this.compressedBytes, maxQueuedBytes:this.maxQueuedBytes,
-    maxCompressedBytes:3*1024**3,maxQueueBytes:this.queueLimit,codecVersion:2,fault: this.fault, gaps: this.gaps, files: this.files }; }
+    maxCompressedBytes:this.compressedLimit,statusWrittenAt:this.lastStatusAt,lastGapReason:this.lastGapReason,recordingDegraded:this.dropped>0,maxQueueBytes:this.queueLimit,codecVersion:2,fault: this.fault, gaps: this.gaps, files: this.files }; }
   recordBook(experimentId:string,snapshot:MarketSnapshot,context:{tokenEpoch:number;synchronized:boolean;siblingEventId:string|null}):void{
     if(this.sealed&&experimentId===this.experiment)return;
-    if(experimentId===this.experiment&&(this.fault||this.compressedBytes>=3*1024**3||this.queuedBytes()>=this.queueLimit)){
+    if(experimentId===this.experiment&&(this.fault||this.compressedBytes>=this.compressedLimit||this.queuedBytes()>=this.queueLimit)){
       this.noteGap(Date.now());this.books.forget(snapshot.tokenId);return;
     }
     if(this.bookExperiment!==experimentId){this.books.clear();this.bookExperiment=experimentId;}
@@ -53,11 +56,11 @@ export class RawEvidence {
         this.root = join(this.directory, "roi1-evidence", experimentId.replace(/[^a-zA-Z0-9_-]/g,"_"));
         mkdirSync(this.root, { recursive: true });
         this.bucket = -1; this.accepted = 0; this.dropped = 0; this.rawBytes = 0; this.compressedBytes = 0;
-        this.gaps = []; this.files = []; this.fault = null;this.maxQueuedBytes=0;
+        this.gaps = []; this.files = []; this.fault = null;this.maxQueuedBytes=0;this.lastGapReason=null;this.lastStatusAt=0;
       }
       const queued=this.queuedBytes();
       this.maxQueuedBytes=Math.max(this.maxQueuedBytes,queued);
-      if (this.fault || this.compressedBytes >= 3 * 1024 ** 3 || queued >= this.queueLimit) {
+      if (this.fault || this.compressedBytes >= this.compressedLimit || queued >= this.queueLimit) {
         this.noteGap(now); return false;
       }
       const bucket = Math.floor(now / 60000);
@@ -98,13 +101,17 @@ export class RawEvidence {
   private queuedBytes():number{let bytes=this.batchBytes;for(const part of this.parts)bytes+=part.writableLength;return bytes;}
   private noteGap(now: number): void {
     this.dropped++;
+    this.lastGapReason = this.fault ? "WRITE_FAULT" : this.compressedBytes >= this.compressedLimit ? "COMPRESSED_LIMIT" : "QUEUE_OR_RECORD_LIMIT";
     const at = new Date(now).toISOString(), last = this.gaps.at(-1);
     if (last && now - Date.parse(last.to) <= 1000) { last.to = at; last.count++; }
     else if (this.gaps.length < 1024) this.gaps.push({ from: at, to: at, count: 1 });
+    // Cap/backpressure stops rotations; publish the first gap immediately and
+    // subsequent progress at most once per second using the existing callback.
+    if (this.dropped === 1 || now-this.lastStatusAt >= 1000) this.persistStatus(now);
   }
-  private persistStatus(): void {
+  private persistStatus(now=Date.now()): void {
     if (!this.root) return;
-    try { const path = join(this.root,"capture-status.json"); writeFileSync(path+".tmp",JSON.stringify(this.status(),null,2)); renameSync(path+".tmp",path); }
+    try { this.lastStatusAt=now; const path = join(this.root,"capture-status.json"); writeFileSync(path+".tmp",JSON.stringify(this.status(),null,2)); renameSync(path+".tmp",path); }
     catch (error) { this.fault = String(error); }
   }
 }

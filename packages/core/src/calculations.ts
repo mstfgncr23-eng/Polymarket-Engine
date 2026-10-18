@@ -78,6 +78,17 @@ export function calculateFee(
   return fee.toDecimalPlaces(5, Decimal.ROUND_HALF_UP).toFixed(5);
 }
 
+/** Conditional exit-fee forecast; never a realized fee or a guaranteed exit price.
+ * fair_value assumes the existing alpha fair value is the expected exit price.
+ * maximum is a separate price-independent stress allowance. */
+export function estimateExitFee(quantity: Decimal.Value, fairValue: Decimal.Value,
+  schedule: FeeSchedule, mode: "maximum" | "fair_value" = "maximum"): string | null {
+  if (mode === "maximum") return calculateFee(quantity, "0.5", "TAKER", schedule);
+  const fair = d(fairValue);
+  if (!fair.isFinite() || fair.lt(0) || fair.gt(1)) return null;
+  return calculateFee(quantity, fair, "TAKER", schedule);
+}
+
 /** Adverse execution cost only. Price improvement is 0, never an absolute "cost". */
 export function calculateSlippageUsd(
   requestedPrice: Decimal.Value,

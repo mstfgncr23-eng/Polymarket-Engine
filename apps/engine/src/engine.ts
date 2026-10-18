@@ -648,6 +648,8 @@ export class EngineService {
       referenceRapidMoveBps: this.triggerConfig.referenceRapidMoveBps,
     };
     this.riskLimits = riskLimitsSchema.parse({
+      freshEntryExitFeeMode: env.PAPER_ENTRY_EXIT_FEE_MODE,
+      freshEntryPreferExecutableNetEdge: env.PAPER_FIRST_LEG_PREFER_EXECUTABLE_NET_EDGE,
       freshEntryExitFeeReserve: env.PAPER_ENTRY_EXIT_FEE_RESERVE,
       ...(env.PAPER_ENTRY_NET_ROI_FLOOR!==undefined?{freshEntryNetRoiFloor:env.PAPER_ENTRY_NET_ROI_FLOOR}:{}),
       ...(env.PAPER_ENTRY_MIN_PRICE!==undefined?{freshEntryMinPrice:env.PAPER_ENTRY_MIN_PRICE}:{}),
@@ -656,8 +658,10 @@ export class EngineService {
     });
     if (env.PAPER_PROFIT_PAIR_NET_ROI_FLOOR !== undefined && !env.PROFIT_TRAILING_PAIR_SOAK_ENABLED)
       throw new Error("NET_PAIR_LOCK_REQUIRES_PROFIT_PAIR_SOAK");
+    if (env.PAPER_FIRST_LEG_PREFER_EXECUTABLE_NET_EDGE && (env.PAPER_ENTRY_NET_ROI_FLOOR === undefined || !env.PAPER_ENTRY_EXIT_FEE_RESERVE))
+      throw new Error("EXECUTABLE_NET_EDGE_REQUIRES_EXPLICIT_FULL_CYCLE_POLICY");
     this.makerTouchFlow = new MakerTouchFlow(env.PAPER_DUAL_MAKER_FLOW_WINDOW_MS);
-    this.rawEvidence = env.PAPER_RAW_EVIDENCE_ENABLED ? new RawEvidence(env.LOCAL_ARCHIVE_DIR) : null;
+    this.rawEvidence = env.PAPER_RAW_EVIDENCE_ENABLED ? new RawEvidence(env.LOCAL_ARCHIVE_DIR,64*1024**2,env.PAPER_RAW_EVIDENCE_MAX_COMPRESSED_BYTES) : null;
     if (env.PROFIT_TRAILING_PAIR_SOAK_ENABLED
       && (env.NAKED_DIRECTIONAL_SOAK_ENABLED
         || env.PAPER_EXECUTION_STYLE !== "TAKER"
@@ -1237,7 +1241,7 @@ export class EngineService {
             hedgeTtlMs:this.env.PAPER_MAKER_HEDGE_QUOTE_TTL_MS,fillModel:'public-trade-queue-50pct',twoSidedFreshEntries:this.env.PAPER_DUAL_SIDED_MAKER_ENABLED,
             flowPolicy:this.env.PAPER_DUAL_MAKER_FLOW_POLICY,flowWindowMs:this.env.PAPER_DUAL_MAKER_FLOW_WINDOW_MS,
             minExactFlow:this.env.PAPER_DUAL_MAKER_MIN_EXACT_FLOW_PER_WINDOW,maxQuoteTtlMs:this.env.PAPER_DUAL_MAKER_MAX_QUOTE_TTL_MS,
-            pairNetRoiFloor:this.entryEconomicPolicy().minNetRoi,rawEvidenceEnabled:!!this.rawEvidence},
+            pairNetRoiFloor:this.entryEconomicPolicy().minNetRoi,rawEvidenceEnabled:!!this.rawEvidence,rawEvidenceMaxCompressedBytes:this.env.PAPER_RAW_EVIDENCE_MAX_COMPRESSED_BYTES},
           reversalProtectionEnabled: this.env.REVERSAL_PROTECTION_ENABLED,
           guardianVersion: 2, guardianFormatGeneration: 3, guardianV2Config: { ...GUARDIAN_V2_CONFIG },
           reversalProtectionWindowMs: this.env.REVERSAL_PROTECTION_WINDOW_MS,
@@ -2998,7 +3002,7 @@ export class EngineService {
   }
 
   private entryEconomicPolicy(){
-    return {reserveExitFee:this.riskLimits.freshEntryExitFeeReserve,minNetRoi:this.riskLimits.freshEntryNetRoiFloor??FIRST_LEG_MIN_NET_ROI,
+    return {exitFeeMode:this.riskLimits.freshEntryExitFeeMode,reserveExitFee:this.riskLimits.freshEntryExitFeeReserve,minNetRoi:this.riskLimits.freshEntryNetRoiFloor??FIRST_LEG_MIN_NET_ROI,
       minPrice:this.riskLimits.freshEntryMinPrice??0.65};
   }
 
@@ -4305,6 +4309,7 @@ export class EngineService {
       usedComplement: executableFair.usedComplement,
       executionStyle,
       exitFeeReserveUsd: decision.exitFeeReserveUsd ?? "0",
+      executionChoiceReason: decision.executionChoiceReason ?? "LEGACY_MAKER_FIRST",
       ...(executionStyle === "MAKER"
         ? {
           makerLimitPrice: decision.order?.requestedPrice ?? snapshot.bids[0]?.price ?? candidate.limitPrice,
@@ -7531,6 +7536,11 @@ export class EngineService {
       },
     };
     let decision=decidePaperOrder(paperInput);
+    if (candidate.intent === "OPEN_FIRST_LEG" && this.riskLimits.freshEntryPreferExecutableNetEdge
+      && decision.accepted && decision.order?.orderType === "TAKER") {
+      decision.executionChoiceReason = "EXECUTABLE_NET_EDGE_FIRST";
+      return {decision,duplicateKey};
+    }
     const makerConfig=this.makerFirstConfig();
     const role=candidate.intent==='OPEN_FIRST_LEG'?'FIRST_LEG':candidate.intent==='HEDGE_SECOND_LEG'&&input.allowMakerFirstHedge?'HEDGE':null;
     const independentMaker=role==='FIRST_LEG'&&this.riskLimits.freshEntryNetRoiFloor!==undefined;
@@ -7550,6 +7560,7 @@ export class EngineService {
             submissionLatencyMs:this.env.PAPER_EXECUTION_LATENCY_MS,tokenEpoch:this.adapterTokenEpoch(snapshot.tokenId),
             postingBookEventId:snapshot.eventId,takerReferencePrice:decision.bookVwap};
           maker.order.makerFirst.postingFeeKey=JSON.stringify([snapshot.feeSchedule?.rate,snapshot.feeSchedule?.exponent,snapshot.feeSchedule?.takerOnly]);
+          maker.executionChoiceReason=this.riskLimits.freshEntryPreferExecutableNetEdge?"PASSIVE_ENTRY_EXECUTABLE_NOT_QUALIFIED":"MAKER_FIRST_CONDITIONAL_EV";
           decision=maker;
         }
       }
@@ -7764,11 +7775,12 @@ export class EngineService {
     pair: Record<Outcome, MarketSnapshot>,
     now: Date,
     assetOverride: string | null,
+    fairProbability?: number,
   ): ReturnType<typeof decidePaperOrder> {
     const snapshot = candidate.outcome === "UP" ? pair.UP : pair.DOWN;
     return this.decideWithRuntimeBasis({
       candidate,
-      consensus: HEDGE_CHECK_CONSENSUS,
+      consensus: {...HEDGE_CHECK_CONSENSUS,...(fairProbability===undefined?{}:{fairProbability})},
       triggerId: "runtime-basis-parity-test",
       signalExpiresAt: new Date(now.getTime() + 60_000),
       snapshot,

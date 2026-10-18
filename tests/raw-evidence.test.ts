@@ -43,3 +43,19 @@ it('bounds a burst across all closing parts and resumes with a full book after a
     expect(rows).toHaveLength(archive.status().accepted);expect(archive.status().fault).toBeNull();
   }finally{await rm(dir,{recursive:true,force:true});}
 });
+
+it('publishes compressed-limit loss immediately while recording is blocked, before close',async()=>{
+ const dir=await mkdtemp(join(tmpdir(),'roi1-cap-'));
+ try{
+  const a=new RawEvidence(dir,64*1024,1024);
+  const {randomBytes}=await import('node:crypto');
+  a.record('experiment_cap',{kind:'noise',value:randomBytes(24000).toString('hex')});
+  await new Promise(r=>setTimeout(r,120));
+  expect(a.status().compressedBytes).toBeGreaterThan(1024);
+  expect(a.record('experiment_cap',{kind:'over-cap'})).toBe(false);
+  const status=JSON.parse(await readFile(join(dir,'roi1-evidence','experiment_cap','capture-status.json'),'utf8'));
+  expect(status).toMatchObject({dropped:1,recordingDegraded:true,lastGapReason:'COMPRESSED_LIMIT',maxCompressedBytes:1024});
+  expect(status.statusWrittenAt).toBeGreaterThan(0);
+  await a.close();
+ }finally{await rm(dir,{recursive:true,force:true});}
+});

@@ -475,3 +475,26 @@ it.each([true,false])('keeps optional full-cycle/net-pair policy JSON-roundtrip 
   }
  }finally{await s.engine.stop();}
 });
+
+
+it.each([true,false])('prefers a qualified executable first leg only with the explicit policy (%s)',async prefer=>{
+ const s=await setup(true,undefined,undefined,{PAPER_ENTRY_NET_ROI_FLOOR:'0.01',PAPER_ENTRY_EXIT_FEE_RESERVE:'true',PAPER_ENTRY_EXIT_FEE_MODE:'fair_value',PAPER_FIRST_LEG_PREFER_EXECUTABLE_NET_EDGE:String(prefer)});
+ try{
+  const c:StrategyCandidate={strategyId:'test',strategyVersion:'test',marketId:M,tokenId:U,outcome:'UP',side:'BUY',quantity:'2',limitPrice:'0.7',intent:'OPEN_FIRST_LEG',rawEdgeUsdPerShare:.2,rawExpectedEdge:.2,reasonCodes:[]};
+  const pair={UP:s.engine.state.marketSnapshots.get(U)!,DOWN:s.engine.state.marketSnapshots.get(D)!};
+  const decision=s.engine.decideWithRuntimeBasisForTest(c,pair,new Date(s.clock.ms),'XRP',.9);
+  expect(decision.accepted,JSON.stringify(decision.risk)).toBe(true);
+  expect(decision.order?.orderType).toBe(prefer?'TAKER':'MAKER');
+  if(prefer)expect(decision.executionChoiceReason).toBe('EXECUTABLE_NET_EDGE_FIRST');
+  const negative=s.engine.decideWithRuntimeBasisForTest({...c,rawEdgeUsdPerShare:-.1,rawExpectedEdge:-.1},pair,new Date(s.clock.ms),'XRP',.6);
+  expect(negative.accepted).toBe(false);expect(negative.order).toBeNull();
+ }finally{await s.engine.stop();}
+});
+it('retains a passive opportunity when the executable entry fails the full-cycle ROI',async()=>{
+ const s=await setup(true,undefined,undefined,{PAPER_ENTRY_NET_ROI_FLOOR:'0.01',PAPER_ENTRY_EXIT_FEE_RESERVE:'true',PAPER_ENTRY_EXIT_FEE_MODE:'fair_value',PAPER_FIRST_LEG_PREFER_EXECUTABLE_NET_EDGE:'true'});
+ try{
+  const c:StrategyCandidate={strategyId:'test',strategyVersion:'test',marketId:M,tokenId:U,outcome:'UP',side:'BUY',quantity:'2',limitPrice:'0.7',intent:'OPEN_FIRST_LEG',rawEdgeUsdPerShare:.025,rawExpectedEdge:.025,reasonCodes:[]};
+  const d=s.engine.decideWithRuntimeBasisForTest(c,{UP:s.engine.state.marketSnapshots.get(U)!,DOWN:s.engine.state.marketSnapshots.get(D)!},new Date(s.clock.ms),'XRP',.725);
+  expect(d.accepted,JSON.stringify(d.risk)).toBe(true);expect(d.order?.orderType).toBe('MAKER');
+ }finally{await s.engine.stop();}
+});

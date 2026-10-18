@@ -1,0 +1,3242 @@
+[
+  {
+    "price": "0.1",
+    "quantity": "50.00000000",
+    "fair": "0.1025",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.87500",
+        "expectedROI": "-0.150"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.32198",
+        "expectedROI": "-0.039396"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.31500",
+        "exitFee": "0.87500",
+        "expectedROI": "-0.2130"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.31500",
+        "exitFee": "0.32198",
+        "expectedROI": "-0.102396"
+      }
+    }
+  },
+  {
+    "price": "0.1",
+    "quantity": "50.00000000",
+    "fair": "0.1075",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.87500",
+        "expectedROI": "-0.100"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.33580",
+        "expectedROI": "0.00784"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.31500",
+        "exitFee": "0.87500",
+        "expectedROI": "-0.1630"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.31500",
+        "exitFee": "0.33580",
+        "expectedROI": "-0.05516"
+      }
+    }
+  },
+  {
+    "price": "0.1",
+    "quantity": "50.00000000",
+    "fair": "0.120",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.87500",
+        "expectedROI": "0.025"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.36960",
+        "expectedROI": "0.12608"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.31500",
+        "exitFee": "0.87500",
+        "expectedROI": "-0.038"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.31500",
+        "exitFee": "0.36960",
+        "expectedROI": "0.06308"
+      }
+    }
+  },
+  {
+    "price": "0.1",
+    "quantity": "50.00000000",
+    "fair": "0.1325",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.87500",
+        "expectedROI": "0.150"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.40230",
+        "expectedROI": "0.24454"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.31500",
+        "exitFee": "0.87500",
+        "expectedROI": "0.0870"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.31500",
+        "exitFee": "0.40230",
+        "expectedROI": "0.18154"
+      }
+    }
+  },
+  {
+    "price": "0.1",
+    "quantity": "50.00000000",
+    "fair": "0.145",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.87500",
+        "expectedROI": "0.275"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.43391",
+        "expectedROI": "0.363218"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.31500",
+        "exitFee": "0.87500",
+        "expectedROI": "0.212"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.31500",
+        "exitFee": "0.43391",
+        "expectedROI": "0.300218"
+      }
+    }
+  },
+  {
+    "price": "0.1",
+    "quantity": "50.00000000",
+    "fair": "0.0975",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.87500",
+        "expectedROI": "-0.200"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.30798",
+        "expectedROI": "-0.086596"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.31500",
+        "exitFee": "0.87500",
+        "expectedROI": "-0.2630"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.31500",
+        "exitFee": "0.30798",
+        "expectedROI": "-0.149596"
+      }
+    }
+  },
+  {
+    "price": "0.1",
+    "quantity": "50.00000000",
+    "fair": "0.1025",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.87500",
+        "expectedROI": "-0.150"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.32198",
+        "expectedROI": "-0.039396"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.31500",
+        "exitFee": "0.87500",
+        "expectedROI": "-0.2130"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.31500",
+        "exitFee": "0.32198",
+        "expectedROI": "-0.102396"
+      }
+    }
+  },
+  {
+    "price": "0.1",
+    "quantity": "50.00000000",
+    "fair": "0.115",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.87500",
+        "expectedROI": "-0.025"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.35621",
+        "expectedROI": "0.078758"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.31500",
+        "exitFee": "0.87500",
+        "expectedROI": "-0.088"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.31500",
+        "exitFee": "0.35621",
+        "expectedROI": "0.015758"
+      }
+    }
+  },
+  {
+    "price": "0.1",
+    "quantity": "50.00000000",
+    "fair": "0.1275",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.87500",
+        "expectedROI": "0.100"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.38935",
+        "expectedROI": "0.19713"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.31500",
+        "exitFee": "0.87500",
+        "expectedROI": "0.0370"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.31500",
+        "exitFee": "0.38935",
+        "expectedROI": "0.13413"
+      }
+    }
+  },
+  {
+    "price": "0.1",
+    "quantity": "50.00000000",
+    "fair": "0.14",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.87500",
+        "expectedROI": "0.225"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.42140",
+        "expectedROI": "0.31572"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.31500",
+        "exitFee": "0.87500",
+        "expectedROI": "0.162"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.31500",
+        "exitFee": "0.42140",
+        "expectedROI": "0.25272"
+      }
+    }
+  },
+  {
+    "price": "0.1",
+    "quantity": "50.00000000",
+    "fair": "0.0675",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.87500",
+        "expectedROI": "-0.500"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.22030",
+        "expectedROI": "-0.36906"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.31500",
+        "exitFee": "0.87500",
+        "expectedROI": "-0.5630"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.31500",
+        "exitFee": "0.22030",
+        "expectedROI": "-0.43206"
+      }
+    }
+  },
+  {
+    "price": "0.1",
+    "quantity": "50.00000000",
+    "fair": "0.0725",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.87500",
+        "expectedROI": "-0.450"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.23535",
+        "expectedROI": "-0.32207"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.31500",
+        "exitFee": "0.87500",
+        "expectedROI": "-0.5130"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.31500",
+        "exitFee": "0.23535",
+        "expectedROI": "-0.38507"
+      }
+    }
+  },
+  {
+    "price": "0.1",
+    "quantity": "50.00000000",
+    "fair": "0.085",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.87500",
+        "expectedROI": "-0.325"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.27221",
+        "expectedROI": "-0.204442"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.31500",
+        "exitFee": "0.87500",
+        "expectedROI": "-0.388"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.31500",
+        "exitFee": "0.27221",
+        "expectedROI": "-0.267442"
+      }
+    }
+  },
+  {
+    "price": "0.1",
+    "quantity": "50.00000000",
+    "fair": "0.0975",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.87500",
+        "expectedROI": "-0.200"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.30798",
+        "expectedROI": "-0.086596"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.31500",
+        "exitFee": "0.87500",
+        "expectedROI": "-0.2630"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.31500",
+        "exitFee": "0.30798",
+        "expectedROI": "-0.149596"
+      }
+    }
+  },
+  {
+    "price": "0.1",
+    "quantity": "50.00000000",
+    "fair": "0.11",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.87500",
+        "expectedROI": "-0.075"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.34265",
+        "expectedROI": "0.03147"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.31500",
+        "exitFee": "0.87500",
+        "expectedROI": "-0.138"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.31500",
+        "exitFee": "0.34265",
+        "expectedROI": "-0.03153"
+      }
+    }
+  },
+  {
+    "price": "0.2",
+    "quantity": "25.00000000",
+    "fair": "0.2025",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.43750",
+        "expectedROI": "-0.075"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.28261",
+        "expectedROI": "-0.044022"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.28000",
+        "exitFee": "0.43750",
+        "expectedROI": "-0.1310"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.28000",
+        "exitFee": "0.28261",
+        "expectedROI": "-0.100022"
+      }
+    }
+  },
+  {
+    "price": "0.2",
+    "quantity": "25.00000000",
+    "fair": "0.2075",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.43750",
+        "expectedROI": "-0.050"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.28778",
+        "expectedROI": "-0.020056"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.28000",
+        "exitFee": "0.43750",
+        "expectedROI": "-0.1060"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.28000",
+        "exitFee": "0.28778",
+        "expectedROI": "-0.076056"
+      }
+    }
+  },
+  {
+    "price": "0.2",
+    "quantity": "25.00000000",
+    "fair": "0.220",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.43750",
+        "expectedROI": "0.0125"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.30030",
+        "expectedROI": "0.03994"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.28000",
+        "exitFee": "0.43750",
+        "expectedROI": "-0.0435"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.28000",
+        "exitFee": "0.30030",
+        "expectedROI": "-0.01606"
+      }
+    }
+  },
+  {
+    "price": "0.2",
+    "quantity": "25.00000000",
+    "fair": "0.2325",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.43750",
+        "expectedROI": "0.075"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.31228",
+        "expectedROI": "0.100044"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.28000",
+        "exitFee": "0.43750",
+        "expectedROI": "0.0190"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.28000",
+        "exitFee": "0.31228",
+        "expectedROI": "0.044044"
+      }
+    }
+  },
+  {
+    "price": "0.2",
+    "quantity": "25.00000000",
+    "fair": "0.245",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.43750",
+        "expectedROI": "0.1375"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.32371",
+        "expectedROI": "0.160258"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.28000",
+        "exitFee": "0.43750",
+        "expectedROI": "0.0815"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.28000",
+        "exitFee": "0.32371",
+        "expectedROI": "0.104258"
+      }
+    }
+  },
+  {
+    "price": "0.2",
+    "quantity": "25.00000000",
+    "fair": "0.1975",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.43750",
+        "expectedROI": "-0.100"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.27736",
+        "expectedROI": "-0.067972"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.28000",
+        "exitFee": "0.43750",
+        "expectedROI": "-0.1560"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.28000",
+        "exitFee": "0.27736",
+        "expectedROI": "-0.123972"
+      }
+    }
+  },
+  {
+    "price": "0.2",
+    "quantity": "25.00000000",
+    "fair": "0.2025",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.43750",
+        "expectedROI": "-0.075"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.28261",
+        "expectedROI": "-0.044022"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.28000",
+        "exitFee": "0.43750",
+        "expectedROI": "-0.1310"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.28000",
+        "exitFee": "0.28261",
+        "expectedROI": "-0.100022"
+      }
+    }
+  },
+  {
+    "price": "0.2",
+    "quantity": "25.00000000",
+    "fair": "0.215",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.43750",
+        "expectedROI": "-0.0125"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.29536",
+        "expectedROI": "0.015928"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.28000",
+        "exitFee": "0.43750",
+        "expectedROI": "-0.0685"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.28000",
+        "exitFee": "0.29536",
+        "expectedROI": "-0.040072"
+      }
+    }
+  },
+  {
+    "price": "0.2",
+    "quantity": "25.00000000",
+    "fair": "0.2275",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.43750",
+        "expectedROI": "0.050"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.30755",
+        "expectedROI": "0.07599"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.28000",
+        "exitFee": "0.43750",
+        "expectedROI": "-0.0060"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.28000",
+        "exitFee": "0.30755",
+        "expectedROI": "0.01999"
+      }
+    }
+  },
+  {
+    "price": "0.2",
+    "quantity": "25.00000000",
+    "fair": "0.24",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.43750",
+        "expectedROI": "0.1125"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.31920",
+        "expectedROI": "0.13616"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.28000",
+        "exitFee": "0.43750",
+        "expectedROI": "0.0565"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.28000",
+        "exitFee": "0.31920",
+        "expectedROI": "0.08016"
+      }
+    }
+  },
+  {
+    "price": "0.2",
+    "quantity": "25.00000000",
+    "fair": "0.1675",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.43750",
+        "expectedROI": "-0.250"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.24403",
+        "expectedROI": "-0.211306"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.28000",
+        "exitFee": "0.43750",
+        "expectedROI": "-0.3060"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.28000",
+        "exitFee": "0.24403",
+        "expectedROI": "-0.267306"
+      }
+    }
+  },
+  {
+    "price": "0.2",
+    "quantity": "25.00000000",
+    "fair": "0.1725",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.43750",
+        "expectedROI": "-0.225"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.24980",
+        "expectedROI": "-0.18746"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.28000",
+        "exitFee": "0.43750",
+        "expectedROI": "-0.2810"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.28000",
+        "exitFee": "0.24980",
+        "expectedROI": "-0.24346"
+      }
+    }
+  },
+  {
+    "price": "0.2",
+    "quantity": "25.00000000",
+    "fair": "0.185",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.43750",
+        "expectedROI": "-0.1625"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.26386",
+        "expectedROI": "-0.127772"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.28000",
+        "exitFee": "0.43750",
+        "expectedROI": "-0.2185"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.28000",
+        "exitFee": "0.26386",
+        "expectedROI": "-0.183772"
+      }
+    }
+  },
+  {
+    "price": "0.2",
+    "quantity": "25.00000000",
+    "fair": "0.1975",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.43750",
+        "expectedROI": "-0.100"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.27736",
+        "expectedROI": "-0.067972"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.28000",
+        "exitFee": "0.43750",
+        "expectedROI": "-0.1560"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.28000",
+        "exitFee": "0.27736",
+        "expectedROI": "-0.123972"
+      }
+    }
+  },
+  {
+    "price": "0.2",
+    "quantity": "25.00000000",
+    "fair": "0.21",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.43750",
+        "expectedROI": "-0.0375"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.29033",
+        "expectedROI": "-0.008066"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.28000",
+        "exitFee": "0.43750",
+        "expectedROI": "-0.0935"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.28000",
+        "exitFee": "0.29033",
+        "expectedROI": "-0.064066"
+      }
+    }
+  },
+  {
+    "price": "0.5",
+    "quantity": "10.00000000",
+    "fair": "0.5025",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.17500",
+        "expectedROI": "-0.030"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.17500",
+        "expectedROI": "-0.030"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.17500",
+        "exitFee": "0.17500",
+        "expectedROI": "-0.0650"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.17500",
+        "exitFee": "0.17500",
+        "expectedROI": "-0.0650"
+      }
+    }
+  },
+  {
+    "price": "0.5",
+    "quantity": "10.00000000",
+    "fair": "0.5075",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.17500",
+        "expectedROI": "-0.020"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.17496",
+        "expectedROI": "-0.019992"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.17500",
+        "exitFee": "0.17500",
+        "expectedROI": "-0.0550"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.17500",
+        "exitFee": "0.17496",
+        "expectedROI": "-0.054992"
+      }
+    }
+  },
+  {
+    "price": "0.5",
+    "quantity": "10.00000000",
+    "fair": "0.520",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.17500",
+        "expectedROI": "0.005"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.17472",
+        "expectedROI": "0.005056"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.17500",
+        "exitFee": "0.17500",
+        "expectedROI": "-0.030"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.17500",
+        "exitFee": "0.17472",
+        "expectedROI": "-0.029944"
+      }
+    }
+  },
+  {
+    "price": "0.5",
+    "quantity": "10.00000000",
+    "fair": "0.5325",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.17500",
+        "expectedROI": "0.030"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.17426",
+        "expectedROI": "0.030148"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.17500",
+        "exitFee": "0.17500",
+        "expectedROI": "-0.0050"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.17500",
+        "exitFee": "0.17426",
+        "expectedROI": "-0.004852"
+      }
+    }
+  },
+  {
+    "price": "0.5",
+    "quantity": "10.00000000",
+    "fair": "0.545",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.17500",
+        "expectedROI": "0.055"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.17358",
+        "expectedROI": "0.055284"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.17500",
+        "exitFee": "0.17500",
+        "expectedROI": "0.020"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.17500",
+        "exitFee": "0.17358",
+        "expectedROI": "0.020284"
+      }
+    }
+  },
+  {
+    "price": "0.5",
+    "quantity": "10.00000000",
+    "fair": "0.4975",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.17500",
+        "expectedROI": "-0.040"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.17500",
+        "expectedROI": "-0.040"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.17500",
+        "exitFee": "0.17500",
+        "expectedROI": "-0.0750"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.17500",
+        "exitFee": "0.17500",
+        "expectedROI": "-0.0750"
+      }
+    }
+  },
+  {
+    "price": "0.5",
+    "quantity": "10.00000000",
+    "fair": "0.5025",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.17500",
+        "expectedROI": "-0.030"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.17500",
+        "expectedROI": "-0.030"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.17500",
+        "exitFee": "0.17500",
+        "expectedROI": "-0.0650"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.17500",
+        "exitFee": "0.17500",
+        "expectedROI": "-0.0650"
+      }
+    }
+  },
+  {
+    "price": "0.5",
+    "quantity": "10.00000000",
+    "fair": "0.515",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.17500",
+        "expectedROI": "-0.005"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.17484",
+        "expectedROI": "-0.004968"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.17500",
+        "exitFee": "0.17500",
+        "expectedROI": "-0.040"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.17500",
+        "exitFee": "0.17484",
+        "expectedROI": "-0.039968"
+      }
+    }
+  },
+  {
+    "price": "0.5",
+    "quantity": "10.00000000",
+    "fair": "0.5275",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.17500",
+        "expectedROI": "0.020"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.17447",
+        "expectedROI": "0.020106"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.17500",
+        "exitFee": "0.17500",
+        "expectedROI": "-0.0150"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.17500",
+        "exitFee": "0.17447",
+        "expectedROI": "-0.014894"
+      }
+    }
+  },
+  {
+    "price": "0.5",
+    "quantity": "10.00000000",
+    "fair": "0.54",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.17500",
+        "expectedROI": "0.045"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.17388",
+        "expectedROI": "0.045224"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.17500",
+        "exitFee": "0.17500",
+        "expectedROI": "0.01"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.17500",
+        "exitFee": "0.17388",
+        "expectedROI": "0.010224"
+      }
+    }
+  },
+  {
+    "price": "0.5",
+    "quantity": "10.00000000",
+    "fair": "0.4675",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.17500",
+        "expectedROI": "-0.100"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.17426",
+        "expectedROI": "-0.099852"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.17500",
+        "exitFee": "0.17500",
+        "expectedROI": "-0.1350"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.17500",
+        "exitFee": "0.17426",
+        "expectedROI": "-0.134852"
+      }
+    }
+  },
+  {
+    "price": "0.5",
+    "quantity": "10.00000000",
+    "fair": "0.4725",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.17500",
+        "expectedROI": "-0.090"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.17447",
+        "expectedROI": "-0.089894"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.17500",
+        "exitFee": "0.17500",
+        "expectedROI": "-0.1250"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.17500",
+        "exitFee": "0.17447",
+        "expectedROI": "-0.124894"
+      }
+    }
+  },
+  {
+    "price": "0.5",
+    "quantity": "10.00000000",
+    "fair": "0.485",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.17500",
+        "expectedROI": "-0.065"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.17484",
+        "expectedROI": "-0.064968"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.17500",
+        "exitFee": "0.17500",
+        "expectedROI": "-0.100"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.17500",
+        "exitFee": "0.17484",
+        "expectedROI": "-0.099968"
+      }
+    }
+  },
+  {
+    "price": "0.5",
+    "quantity": "10.00000000",
+    "fair": "0.4975",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.17500",
+        "expectedROI": "-0.040"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.17500",
+        "expectedROI": "-0.040"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.17500",
+        "exitFee": "0.17500",
+        "expectedROI": "-0.0750"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.17500",
+        "exitFee": "0.17500",
+        "expectedROI": "-0.0750"
+      }
+    }
+  },
+  {
+    "price": "0.5",
+    "quantity": "10.00000000",
+    "fair": "0.51",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.17500",
+        "expectedROI": "-0.015"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.17493",
+        "expectedROI": "-0.014986"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.17500",
+        "exitFee": "0.17500",
+        "expectedROI": "-0.05"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.17500",
+        "exitFee": "0.17493",
+        "expectedROI": "-0.049986"
+      }
+    }
+  },
+  {
+    "price": "0.65",
+    "quantity": "7.69230769",
+    "fair": "0.6525",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.13462",
+        "expectedROI": "-0.02307784616192335384857700615"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.12209",
+        "expectedROI": "-0.02057184616117155384835146615"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.12250",
+        "exitFee": "0.13462",
+        "expectedROI": "-0.047577846155"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.12250",
+        "exitFee": "0.12209",
+        "expectedROI": "-0.045071846155"
+      }
+    }
+  },
+  {
+    "price": "0.65",
+    "quantity": "7.69230769",
+    "fair": "0.6575",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.13462",
+        "expectedROI": "-0.01538553846961566154088469846"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.12126",
+        "expectedROI": "-0.01271353846881406154064421846"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.12250",
+        "exitFee": "0.13462",
+        "expectedROI": "-0.039885538465"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.12250",
+        "exitFee": "0.12126",
+        "expectedROI": "-0.037213538465"
+      }
+    }
+  },
+  {
+    "price": "0.65",
+    "quantity": "7.69230769",
+    "fair": "0.670",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.13462",
+        "expectedROI": "0.003845230761153569228346070769"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.11905",
+        "expectedROI": "0.006959230762087769228626330769"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.12250",
+        "exitFee": "0.13462",
+        "expectedROI": "-0.02065476924"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.12250",
+        "exitFee": "0.11905",
+        "expectedROI": "-0.01754076924"
+      }
+    }
+  },
+  {
+    "price": "0.65",
+    "quantity": "7.69230769",
+    "fair": "0.6825",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.13462",
+        "expectedROI": "0.02307599999192279999757684000"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.11668",
+        "expectedROI": "0.02666399999299919999789976000"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.12250",
+        "exitFee": "0.13462",
+        "expectedROI": "-0.001424000015"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.12250",
+        "exitFee": "0.11668",
+        "expectedROI": "0.002163999985"
+      }
+    }
+  },
+  {
+    "price": "0.65",
+    "quantity": "7.69230769",
+    "fair": "0.695",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.13462",
+        "expectedROI": "0.04230676922269203076680760923"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.11414",
+        "expectedROI": "0.04640276922392083076717624923"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.12250",
+        "exitFee": "0.13462",
+        "expectedROI": "0.01780676921"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.12250",
+        "exitFee": "0.11414",
+        "expectedROI": "0.02190276921"
+      }
+    }
+  },
+  {
+    "price": "0.65",
+    "quantity": "7.69230769",
+    "fair": "0.6475",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.13462",
+        "expectedROI": "-0.03077015385423104615626931385"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.12290",
+        "expectedROI": "-0.02842615385352784615605835385"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.12250",
+        "exitFee": "0.13462",
+        "expectedROI": "-0.055270153845"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.12250",
+        "exitFee": "0.12290",
+        "expectedROI": "-0.052926153845"
+      }
+    }
+  },
+  {
+    "price": "0.65",
+    "quantity": "7.69230769",
+    "fair": "0.6525",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.13462",
+        "expectedROI": "-0.02307784616192335384857700615"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.12209",
+        "expectedROI": "-0.02057184616117155384835146615"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.12250",
+        "exitFee": "0.13462",
+        "expectedROI": "-0.047577846155"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.12250",
+        "exitFee": "0.12209",
+        "expectedROI": "-0.045071846155"
+      }
+    }
+  },
+  {
+    "price": "0.65",
+    "quantity": "7.69230769",
+    "fair": "0.665",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.13462",
+        "expectedROI": "-0.003847076931154123079346236924"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.11996",
+        "expectedROI": "-0.0009150769302745230790823569237"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.12250",
+        "exitFee": "0.13462",
+        "expectedROI": "-0.02834707693"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.12250",
+        "exitFee": "0.11996",
+        "expectedROI": "-0.02541507693"
+      }
+    }
+  },
+  {
+    "price": "0.65",
+    "quantity": "7.69230769",
+    "fair": "0.6775",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.13462",
+        "expectedROI": "0.01538369229961510768988453231"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.11765",
+        "expectedROI": "0.01877769230063330769018999231"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.12250",
+        "exitFee": "0.13462",
+        "expectedROI": "-0.009116307705"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.12250",
+        "exitFee": "0.11765",
+        "expectedROI": "-0.005722307705"
+      }
+    }
+  },
+  {
+    "price": "0.65",
+    "quantity": "7.69230769",
+    "fair": "0.69",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.13462",
+        "expectedROI": "0.03461446153038433845911530154"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.11518",
+        "expectedROI": "0.03850246153155073845946522154"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.12250",
+        "exitFee": "0.13462",
+        "expectedROI": "0.01011446152"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.12250",
+        "exitFee": "0.11518",
+        "expectedROI": "0.01400246152"
+      }
+    }
+  },
+  {
+    "price": "0.65",
+    "quantity": "7.69230769",
+    "fair": "0.6175",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.13462",
+        "expectedROI": "-0.07692400000807720000242316000"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.12718",
+        "expectedROI": "-0.07543600000763080000228924000"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.12250",
+        "exitFee": "0.13462",
+        "expectedROI": "-0.101423999985"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.12250",
+        "exitFee": "0.12718",
+        "expectedROI": "-0.099935999985"
+      }
+    }
+  },
+  {
+    "price": "0.65",
+    "quantity": "7.69230769",
+    "fair": "0.6225",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.13462",
+        "expectedROI": "-0.06923169231576950769473085231"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.12654",
+        "expectedROI": "-0.06761569231528470769458541231"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.12250",
+        "exitFee": "0.13462",
+        "expectedROI": "-0.093731692295"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.12250",
+        "exitFee": "0.12654",
+        "expectedROI": "-0.092115692295"
+      }
+    }
+  },
+  {
+    "price": "0.65",
+    "quantity": "7.69230769",
+    "fair": "0.635",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.13462",
+        "expectedROI": "-0.05000092308500027692550008308"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.12480",
+        "expectedROI": "-0.04803692308441107692532332308"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.12250",
+        "exitFee": "0.13462",
+        "expectedROI": "-0.07450092307"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.12250",
+        "exitFee": "0.12480",
+        "expectedROI": "-0.07253692307"
+      }
+    }
+  },
+  {
+    "price": "0.65",
+    "quantity": "7.69230769",
+    "fair": "0.6475",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.13462",
+        "expectedROI": "-0.03077015385423104615626931385"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.12290",
+        "expectedROI": "-0.02842615385352784615605835385"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.12250",
+        "exitFee": "0.13462",
+        "expectedROI": "-0.055270153845"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.12250",
+        "exitFee": "0.12290",
+        "expectedROI": "-0.052926153845"
+      }
+    }
+  },
+  {
+    "price": "0.65",
+    "quantity": "7.69230769",
+    "fair": "0.66",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.13462",
+        "expectedROI": "-0.01153938462346181538703854462"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.12083",
+        "expectedROI": "-0.008781384622634415386790324616"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.12250",
+        "exitFee": "0.13462",
+        "expectedROI": "-0.03603938462"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.12250",
+        "exitFee": "0.12083",
+        "expectedROI": "-0.03328138462"
+      }
+    }
+  },
+  {
+    "price": "0.8",
+    "quantity": "6.25000000",
+    "fair": "0.8025",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.10938",
+        "expectedROI": "-0.018751"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.06934",
+        "expectedROI": "-0.010743"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.07000",
+        "exitFee": "0.10938",
+        "expectedROI": "-0.032751"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.07000",
+        "exitFee": "0.06934",
+        "expectedROI": "-0.024743"
+      }
+    }
+  },
+  {
+    "price": "0.8",
+    "quantity": "6.25000000",
+    "fair": "0.8075",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.10938",
+        "expectedROI": "-0.012501"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.06801",
+        "expectedROI": "-0.004227"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.07000",
+        "exitFee": "0.10938",
+        "expectedROI": "-0.026501"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.07000",
+        "exitFee": "0.06801",
+        "expectedROI": "-0.018227"
+      }
+    }
+  },
+  {
+    "price": "0.8",
+    "quantity": "6.25000000",
+    "fair": "0.820",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.10938",
+        "expectedROI": "0.003124"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.06458",
+        "expectedROI": "0.012084"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.07000",
+        "exitFee": "0.10938",
+        "expectedROI": "-0.010876"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.07000",
+        "exitFee": "0.06458",
+        "expectedROI": "-0.001916"
+      }
+    }
+  },
+  {
+    "price": "0.8",
+    "quantity": "6.25000000",
+    "fair": "0.8325",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.10938",
+        "expectedROI": "0.018749"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.06101",
+        "expectedROI": "0.028423"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.07000",
+        "exitFee": "0.10938",
+        "expectedROI": "0.004749"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.07000",
+        "exitFee": "0.06101",
+        "expectedROI": "0.014423"
+      }
+    }
+  },
+  {
+    "price": "0.8",
+    "quantity": "6.25000000",
+    "fair": "0.845",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.10938",
+        "expectedROI": "0.034374"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.05730",
+        "expectedROI": "0.04479"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.07000",
+        "exitFee": "0.10938",
+        "expectedROI": "0.020374"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.07000",
+        "exitFee": "0.05730",
+        "expectedROI": "0.03079"
+      }
+    }
+  },
+  {
+    "price": "0.8",
+    "quantity": "6.25000000",
+    "fair": "0.7975",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.10938",
+        "expectedROI": "-0.025001"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.07065",
+        "expectedROI": "-0.017255"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.07000",
+        "exitFee": "0.10938",
+        "expectedROI": "-0.039001"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.07000",
+        "exitFee": "0.07065",
+        "expectedROI": "-0.031255"
+      }
+    }
+  },
+  {
+    "price": "0.8",
+    "quantity": "6.25000000",
+    "fair": "0.8025",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.10938",
+        "expectedROI": "-0.018751"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.06934",
+        "expectedROI": "-0.010743"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.07000",
+        "exitFee": "0.10938",
+        "expectedROI": "-0.032751"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.07000",
+        "exitFee": "0.06934",
+        "expectedROI": "-0.024743"
+      }
+    }
+  },
+  {
+    "price": "0.8",
+    "quantity": "6.25000000",
+    "fair": "0.815",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.10938",
+        "expectedROI": "-0.003126"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.06596",
+        "expectedROI": "0.005558"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.07000",
+        "exitFee": "0.10938",
+        "expectedROI": "-0.017126"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.07000",
+        "exitFee": "0.06596",
+        "expectedROI": "-0.008442"
+      }
+    }
+  },
+  {
+    "price": "0.8",
+    "quantity": "6.25000000",
+    "fair": "0.8275",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.10938",
+        "expectedROI": "0.012499"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.06245",
+        "expectedROI": "0.021885"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.07000",
+        "exitFee": "0.10938",
+        "expectedROI": "-0.001501"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.07000",
+        "exitFee": "0.06245",
+        "expectedROI": "0.007885"
+      }
+    }
+  },
+  {
+    "price": "0.8",
+    "quantity": "6.25000000",
+    "fair": "0.84",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.10938",
+        "expectedROI": "0.028124"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.05880",
+        "expectedROI": "0.03824"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.07000",
+        "exitFee": "0.10938",
+        "expectedROI": "0.014124"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.07000",
+        "exitFee": "0.05880",
+        "expectedROI": "0.02424"
+      }
+    }
+  },
+  {
+    "price": "0.8",
+    "quantity": "6.25000000",
+    "fair": "0.7675",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.10938",
+        "expectedROI": "-0.062501"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.07807",
+        "expectedROI": "-0.056239"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.07000",
+        "exitFee": "0.10938",
+        "expectedROI": "-0.076501"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.07000",
+        "exitFee": "0.07807",
+        "expectedROI": "-0.070239"
+      }
+    }
+  },
+  {
+    "price": "0.8",
+    "quantity": "6.25000000",
+    "fair": "0.7725",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.10938",
+        "expectedROI": "-0.056251"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.07689",
+        "expectedROI": "-0.049753"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.07000",
+        "exitFee": "0.10938",
+        "expectedROI": "-0.070251"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.07000",
+        "exitFee": "0.07689",
+        "expectedROI": "-0.063753"
+      }
+    }
+  },
+  {
+    "price": "0.8",
+    "quantity": "6.25000000",
+    "fair": "0.785",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.10938",
+        "expectedROI": "-0.040626"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.07384",
+        "expectedROI": "-0.033518"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.07000",
+        "exitFee": "0.10938",
+        "expectedROI": "-0.054626"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.07000",
+        "exitFee": "0.07384",
+        "expectedROI": "-0.047518"
+      }
+    }
+  },
+  {
+    "price": "0.8",
+    "quantity": "6.25000000",
+    "fair": "0.7975",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.10938",
+        "expectedROI": "-0.025001"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.07065",
+        "expectedROI": "-0.017255"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.07000",
+        "exitFee": "0.10938",
+        "expectedROI": "-0.039001"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.07000",
+        "exitFee": "0.07065",
+        "expectedROI": "-0.031255"
+      }
+    }
+  },
+  {
+    "price": "0.8",
+    "quantity": "6.25000000",
+    "fair": "0.81",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.10938",
+        "expectedROI": "-0.009376"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.06733",
+        "expectedROI": "-0.000966"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.07000",
+        "exitFee": "0.10938",
+        "expectedROI": "-0.023376"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.07000",
+        "exitFee": "0.06733",
+        "expectedROI": "-0.014966"
+      }
+    }
+  },
+  {
+    "price": "0.9",
+    "quantity": "5.55555556",
+    "fair": "0.9025",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.09722",
+        "expectedROI": "-0.01666622220666702223466638221"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.03422",
+        "expectedROI": "-0.004066222216747022226602382219"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.03500",
+        "exitFee": "0.09722",
+        "expectedROI": "-0.02366622222"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.03500",
+        "exitFee": "0.03422",
+        "expectedROI": "-0.01106622222"
+      }
+    }
+  },
+  {
+    "price": "0.9",
+    "quantity": "5.55555556",
+    "fair": "0.9075",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.09722",
+        "expectedROI": "-0.01111066665111146667911082666"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.03264",
+        "expectedROI": "0.001805333338555733329155413337"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.03500",
+        "exitFee": "0.09722",
+        "expectedROI": "-0.01811066666"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.03500",
+        "exitFee": "0.03264",
+        "expectedROI": "-0.00519466666"
+      }
+    }
+  },
+  {
+    "price": "0.9",
+    "quantity": "5.55555556",
+    "fair": "0.920",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.09722",
+        "expectedROI": "0.002778222237777422209778062232"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.02862",
+        "expectedROI": "0.01649822222680142221855886223"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.03500",
+        "exitFee": "0.09722",
+        "expectedROI": "-0.00422177776"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.03500",
+        "exitFee": "0.02862",
+        "expectedROI": "0.00949822224"
+      }
+    }
+  },
+  {
+    "price": "0.9",
+    "quantity": "5.55555556",
+    "fair": "0.9325",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.09722",
+        "expectedROI": "0.01666711112666631109866695112"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.02448",
+        "expectedROI": "0.03121511111502791110797767111"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.03500",
+        "exitFee": "0.09722",
+        "expectedROI": "0.00966711114"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.03500",
+        "exitFee": "0.02448",
+        "expectedROI": "0.02421511114"
+      }
+    }
+  },
+  {
+    "price": "0.9",
+    "quantity": "5.55555556",
+    "fair": "0.945",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.09722",
+        "expectedROI": "0.03055600001555519998755584001"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.02021",
+        "expectedROI": "0.04595800000323359999741312000"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.03500",
+        "exitFee": "0.09722",
+        "expectedROI": "0.02355600004"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.03500",
+        "exitFee": "0.02021",
+        "expectedROI": "0.03895800004"
+      }
+    }
+  },
+  {
+    "price": "0.9",
+    "quantity": "5.55555556",
+    "fair": "0.8975",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.09722",
+        "expectedROI": "-0.02222177776222257779022193777"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.03578",
+        "expectedROI": "-0.009933777772052977782357617774"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.03500",
+        "exitFee": "0.09722",
+        "expectedROI": "-0.02922177778"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.03500",
+        "exitFee": "0.03578",
+        "expectedROI": "-0.01693377778"
+      }
+    }
+  },
+  {
+    "price": "0.9",
+    "quantity": "5.55555556",
+    "fair": "0.9025",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.09722",
+        "expectedROI": "-0.01666622220666702223466638221"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.03422",
+        "expectedROI": "-0.004066222216747022226602382219"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.03500",
+        "exitFee": "0.09722",
+        "expectedROI": "-0.02366622222"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.03500",
+        "exitFee": "0.03422",
+        "expectedROI": "-0.01106622222"
+      }
+    }
+  },
+  {
+    "price": "0.9",
+    "quantity": "5.55555556",
+    "fair": "0.915",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.09722",
+        "expectedROI": "-0.002777333317778133345777493323"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.03025",
+        "expectedROI": "0.01061666667150666666279466667"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.03500",
+        "exitFee": "0.09722",
+        "expectedROI": "-0.00977733332"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.03500",
+        "exitFee": "0.03025",
+        "expectedROI": "0.00361666668"
+      }
+    }
+  },
+  {
+    "price": "0.9",
+    "quantity": "5.55555556",
+    "fair": "0.9275",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.09722",
+        "expectedROI": "0.01111155557111075554311139557"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.02615",
+        "expectedROI": "0.02532555555973955555220835556"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.03500",
+        "exitFee": "0.09722",
+        "expectedROI": "0.00411155558"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.03500",
+        "exitFee": "0.02615",
+        "expectedROI": "0.01832555558"
+      }
+    }
+  },
+  {
+    "price": "0.9",
+    "quantity": "5.55555556",
+    "fair": "0.94",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.09722",
+        "expectedROI": "0.02500044445999964443200028445"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.02193",
+        "expectedROI": "0.04005844444795324444163740445"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.03500",
+        "exitFee": "0.09722",
+        "expectedROI": "0.01800044448"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.03500",
+        "exitFee": "0.02193",
+        "expectedROI": "0.03305844448"
+      }
+    }
+  },
+  {
+    "price": "0.9",
+    "quantity": "5.55555556",
+    "fair": "0.8675",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.09722",
+        "expectedROI": "-0.05555511109555591112355527110"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.04470",
+        "expectedROI": "-0.04505111110395911111683271111"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.03500",
+        "exitFee": "0.09722",
+        "expectedROI": "-0.06255511114"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.03500",
+        "exitFee": "0.04470",
+        "expectedROI": "-0.05205111114"
+      }
+    }
+  },
+  {
+    "price": "0.9",
+    "quantity": "5.55555556",
+    "fair": "0.8725",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.09722",
+        "expectedROI": "-0.04999955554000035556799971555"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.04326",
+        "expectedROI": "-0.03920755554863395556109283555"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.03500",
+        "exitFee": "0.09722",
+        "expectedROI": "-0.05699955558"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.03500",
+        "exitFee": "0.04326",
+        "expectedROI": "-0.04620755558"
+      }
+    }
+  },
+  {
+    "price": "0.9",
+    "quantity": "5.55555556",
+    "fair": "0.885",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.09722",
+        "expectedROI": "-0.03611066665111146667911082666"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.03958",
+        "expectedROI": "-0.02458266666033386667173290666"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.03500",
+        "exitFee": "0.09722",
+        "expectedROI": "-0.04311066668"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.03500",
+        "exitFee": "0.03958",
+        "expectedROI": "-0.03158266668"
+      }
+    }
+  },
+  {
+    "price": "0.9",
+    "quantity": "5.55555556",
+    "fair": "0.8975",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.09722",
+        "expectedROI": "-0.02222177776222257779022193777"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.03578",
+        "expectedROI": "-0.009933777772052977782357617774"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.03500",
+        "exitFee": "0.09722",
+        "expectedROI": "-0.02922177778"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.03500",
+        "exitFee": "0.03578",
+        "expectedROI": "-0.01693377778"
+      }
+    }
+  },
+  {
+    "price": "0.9",
+    "quantity": "5.55555556",
+    "fair": "0.91",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.09722",
+        "expectedROI": "-0.008332888873333688901333048879"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.03185",
+        "expectedROI": "0.004741111116207111107034311114"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.03500",
+        "exitFee": "0.09722",
+        "expectedROI": "-0.01533288888"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.03500",
+        "exitFee": "0.03185",
+        "expectedROI": "-0.00225888888"
+      }
+    }
+  },
+  {
+    "price": "0.95",
+    "quantity": "5.26315789",
+    "fair": "0.9525",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.09211",
+        "expectedROI": "-0.01579042106921137896229024107"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.01667",
+        "expectedROI": "-0.0007024210556321789500689610551"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.01750",
+        "exitFee": "0.09211",
+        "expectedROI": "-0.019290421055"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.01750",
+        "exitFee": "0.01667",
+        "expectedROI": "-0.004202421055"
+      }
+    }
+  },
+  {
+    "price": "0.95",
+    "quantity": "5.26315789",
+    "fair": "0.9575",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.09211",
+        "expectedROI": "-0.01052726317447453685702708317"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.01499",
+        "expectedROI": "0.004896736839407063155466356840"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.01750",
+        "exitFee": "0.09211",
+        "expectedROI": "-0.014027263165"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.01750",
+        "exitFee": "0.01499",
+        "expectedROI": "0.001396736835"
+      }
+    }
+  },
+  {
+    "price": "0.95",
+    "quantity": "5.26315789",
+    "fair": "0.970",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.09211",
+        "expectedROI": "0.002630631562367568406130811566"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.01072",
+        "expectedROI": "0.01890863157701776841931599158"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.01750",
+        "exitFee": "0.09211",
+        "expectedROI": "-0.00086936844"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.01750",
+        "exitFee": "0.01072",
+        "expectedROI": "0.01540863156"
+      }
+    }
+  },
+  {
+    "price": "0.95",
+    "quantity": "5.26315789",
+    "fair": "0.9825",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.09211",
+        "expectedROI": "0.01578852629920967366928870630"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.00633",
+        "expectedROI": "0.03294452631465007368318506631"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.01750",
+        "exitFee": "0.09211",
+        "expectedROI": "0.012288526285"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.01750",
+        "exitFee": "0.00633",
+        "expectedROI": "0.029444526285"
+      }
+    }
+  },
+  {
+    "price": "0.95",
+    "quantity": "5.26315789",
+    "fair": "0.99",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.09211",
+        "expectedROI": "0.02368326314131493682718344314"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.00365",
+        "expectedROI": "0.04137526315723773684151396316"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.01750",
+        "exitFee": "0.09211",
+        "expectedROI": "0.02018326312"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.01750",
+        "exitFee": "0.00365",
+        "expectedROI": "0.03787526312"
+      }
+    }
+  },
+  {
+    "price": "0.95",
+    "quantity": "5.26315789",
+    "fair": "0.9475",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.09211",
+        "expectedROI": "-0.02105357896394822106755339896"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.01833",
+        "expectedROI": "-0.006297578950667821055601038950"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.01750",
+        "exitFee": "0.09211",
+        "expectedROI": "-0.024553578945"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.01750",
+        "exitFee": "0.01833",
+        "expectedROI": "-0.009797578945"
+      }
+    }
+  },
+  {
+    "price": "0.95",
+    "quantity": "5.26315789",
+    "fair": "0.9525",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.09211",
+        "expectedROI": "-0.01579042106921137896229024107"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.01667",
+        "expectedROI": "-0.0007024210556321789500689610551"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.01750",
+        "exitFee": "0.09211",
+        "expectedROI": "-0.019290421055"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.01750",
+        "exitFee": "0.01667",
+        "expectedROI": "-0.004202421055"
+      }
+    }
+  },
+  {
+    "price": "0.95",
+    "quantity": "5.26315789",
+    "fair": "0.965",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.09211",
+        "expectedROI": "-0.002632526332369273699132346329"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.01244",
+        "expectedROI": "0.01330147368197132631377419368"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.01750",
+        "exitFee": "0.09211",
+        "expectedROI": "-0.00613252633"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.01750",
+        "exitFee": "0.01244",
+        "expectedROI": "0.00980147367"
+      }
+    }
+  },
+  {
+    "price": "0.95",
+    "quantity": "5.26315789",
+    "fair": "0.9775",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.09211",
+        "expectedROI": "0.01052536840447283156402554841"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.00810",
+        "expectedROI": "0.02732736841959463157763516842"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.01750",
+        "exitFee": "0.09211",
+        "expectedROI": "0.007025368395"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.01750",
+        "exitFee": "0.00810",
+        "expectedROI": "0.023827368395"
+      }
+    }
+  },
+  {
+    "price": "0.95",
+    "quantity": "5.26315789",
+    "fair": "0.99",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.09211",
+        "expectedROI": "0.02368326314131493682718344314"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.00365",
+        "expectedROI": "0.04137526315723773684151396316"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.01750",
+        "exitFee": "0.09211",
+        "expectedROI": "0.02018326312"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.01750",
+        "exitFee": "0.00365",
+        "expectedROI": "0.03787526312"
+      }
+    }
+  },
+  {
+    "price": "0.95",
+    "quantity": "5.26315789",
+    "fair": "0.9175",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.09211",
+        "expectedROI": "-0.05263252633236927369913234633"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.02789",
+        "expectedROI": "-0.03978852632080967368872870632"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.01750",
+        "exitFee": "0.09211",
+        "expectedROI": "-0.056132526285"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.01750",
+        "exitFee": "0.02789",
+        "expectedROI": "-0.043288526285"
+      }
+    }
+  },
+  {
+    "price": "0.95",
+    "quantity": "5.26315789",
+    "fair": "0.9225",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.09211",
+        "expectedROI": "-0.04736936843763243159386918843"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.02634",
+        "expectedROI": "-0.03421536842579383158321444842"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.01750",
+        "exitFee": "0.09211",
+        "expectedROI": "-0.050869368395"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.01750",
+        "exitFee": "0.02634",
+        "expectedROI": "-0.037715368395"
+      }
+    }
+  },
+  {
+    "price": "0.95",
+    "quantity": "5.26315789",
+    "fair": "0.935",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.09211",
+        "expectedROI": "-0.03421147370079032633071129370"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.02239",
+        "expectedROI": "-0.02026747368824072631941665369"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.01750",
+        "exitFee": "0.09211",
+        "expectedROI": "-0.03771147367"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.01750",
+        "exitFee": "0.02239",
+        "expectedROI": "-0.02376747367"
+      }
+    }
+  },
+  {
+    "price": "0.95",
+    "quantity": "5.26315789",
+    "fair": "0.9475",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.09211",
+        "expectedROI": "-0.02105357896394822106755339896"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.01833",
+        "expectedROI": "-0.006297578950667821055601038950"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.01750",
+        "exitFee": "0.09211",
+        "expectedROI": "-0.024553578945"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.01750",
+        "exitFee": "0.01833",
+        "expectedROI": "-0.009797578945"
+      }
+    }
+  },
+  {
+    "price": "0.95",
+    "quantity": "5.26315789",
+    "fair": "0.96",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.09211",
+        "expectedROI": "-0.007895684227106115804395504224"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.01415",
+        "expectedROI": "0.007696315786926684208234015787"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.01750",
+        "exitFee": "0.09211",
+        "expectedROI": "-0.01139568422"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.01750",
+        "exitFee": "0.01415",
+        "expectedROI": "0.00419631578"
+      }
+    }
+  },
+  {
+    "price": "0.97",
+    "quantity": "5.15463918",
+    "fair": "0.9725",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.09021",
+        "expectedROI": "-0.01546468039577249403588930549"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.00965",
+        "expectedROI": "0.0006473195894044659777478913005"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.01050",
+        "exitFee": "0.09021",
+        "expectedROI": "-0.01756468041"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.01050",
+        "exitFee": "0.00965",
+        "expectedROI": "-0.00145268041"
+      }
+    }
+  },
+  {
+    "price": "0.97",
+    "quantity": "5.15463918",
+    "fair": "0.9775",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.09021",
+        "expectedROI": "-0.01031004122051476207712641889"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.00794",
+        "expectedROI": "0.006143958764347557936800246698"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.01050",
+        "exitFee": "0.09021",
+        "expectedROI": "-0.01241004123"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.01050",
+        "exitFee": "0.00794",
+        "expectedROI": "0.00404395877"
+      }
+    }
+  },
+  {
+    "price": "0.97",
+    "quantity": "5.15463918",
+    "fair": "0.99",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.09021",
+        "expectedROI": "0.002576556717629567819780797606"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.00357",
+        "expectedROI": "0.01990455670168780783444721679"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.01050",
+        "exitFee": "0.09021",
+        "expectedROI": "0.00047655672"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.01050",
+        "exitFee": "0.00357",
+        "expectedROI": "0.01780455672"
+      }
+    }
+  },
+  {
+    "price": "0.97",
+    "quantity": "5.15463918",
+    "fair": "0.99",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.09021",
+        "expectedROI": "0.002576556717629567819780797606"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.00357",
+        "expectedROI": "0.01990455670168780783444721679"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.01050",
+        "exitFee": "0.09021",
+        "expectedROI": "0.00047655672"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.01050",
+        "exitFee": "0.00357",
+        "expectedROI": "0.01780455672"
+      }
+    }
+  },
+  {
+    "price": "0.97",
+    "quantity": "5.15463918",
+    "fair": "0.99",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.09021",
+        "expectedROI": "0.002576556717629567819780797606"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.00357",
+        "expectedROI": "0.01990455670168780783444721679"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.01050",
+        "exitFee": "0.09021",
+        "expectedROI": "0.00047655672"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.01050",
+        "exitFee": "0.00357",
+        "expectedROI": "0.01780455672"
+      }
+    }
+  },
+  {
+    "price": "0.97",
+    "quantity": "5.15463918",
+    "fair": "0.9675",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.09021",
+        "expectedROI": "-0.02061931957103022599465219208"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.01135",
+        "expectedROI": "-0.004847319585540465981302771297"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.01050",
+        "exitFee": "0.09021",
+        "expectedROI": "-0.02271931959"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.01050",
+        "exitFee": "0.01135",
+        "expectedROI": "-0.00694731959"
+      }
+    }
+  },
+  {
+    "price": "0.97",
+    "quantity": "5.15463918",
+    "fair": "0.9725",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.09021",
+        "expectedROI": "-0.01546468039577249403588930549"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.00965",
+        "expectedROI": "0.0006473195894044659777478913005"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.01050",
+        "exitFee": "0.09021",
+        "expectedROI": "-0.01756468041"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.01050",
+        "exitFee": "0.00965",
+        "expectedROI": "-0.00145268041"
+      }
+    }
+  },
+  {
+    "price": "0.97",
+    "quantity": "5.15463918",
+    "fair": "0.985",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.09021",
+        "expectedROI": "-0.002578082457628164138982088992"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.00533",
+        "expectedROI": "0.01439791752675391587538639739"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.01050",
+        "exitFee": "0.09021",
+        "expectedROI": "-0.00467808246"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.01050",
+        "exitFee": "0.00533",
+        "expectedROI": "0.01229791754"
+      }
+    }
+  },
+  {
+    "price": "0.97",
+    "quantity": "5.15463918",
+    "fair": "0.99",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.09021",
+        "expectedROI": "0.002576556717629567819780797606"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.00357",
+        "expectedROI": "0.01990455670168780783444721679"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.01050",
+        "exitFee": "0.09021",
+        "expectedROI": "0.00047655672"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.01050",
+        "exitFee": "0.00357",
+        "expectedROI": "0.01780455672"
+      }
+    }
+  },
+  {
+    "price": "0.97",
+    "quantity": "5.15463918",
+    "fair": "0.99",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.09021",
+        "expectedROI": "0.002576556717629567819780797606"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.00357",
+        "expectedROI": "0.01990455670168780783444721679"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.01050",
+        "exitFee": "0.09021",
+        "expectedROI": "0.00047655672"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.01050",
+        "exitFee": "0.00357",
+        "expectedROI": "0.01780455672"
+      }
+    }
+  },
+  {
+    "price": "0.97",
+    "quantity": "5.15463918",
+    "fair": "0.9375",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.09021",
+        "expectedROI": "-0.05154715462257661774722951167"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.02114",
+        "expectedROI": "-0.03773315463528549773553734208"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.01050",
+        "exitFee": "0.09021",
+        "expectedROI": "-0.05364715467"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.01050",
+        "exitFee": "0.02114",
+        "expectedROI": "-0.03983315467"
+      }
+    }
+  },
+  {
+    "price": "0.97",
+    "quantity": "5.15463918",
+    "fair": "0.9425",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.09021",
+        "expectedROI": "-0.04639251544731888578846662507"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.01955",
+        "expectedROI": "-0.03226051546032032577650530029"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.01050",
+        "exitFee": "0.09021",
+        "expectedROI": "-0.04849251549"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.01050",
+        "exitFee": "0.01955",
+        "expectedROI": "-0.03436051549"
+      }
+    }
+  },
+  {
+    "price": "0.97",
+    "quantity": "5.15463918",
+    "fair": "0.955",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.09021",
+        "expectedROI": "-0.03350591750917455589155940858"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.01551",
+        "expectedROI": "-0.01856591752291935587891419259"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.01050",
+        "exitFee": "0.09021",
+        "expectedROI": "-0.03560591754"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.01050",
+        "exitFee": "0.01551",
+        "expectedROI": "-0.02066591754"
+      }
+    }
+  },
+  {
+    "price": "0.97",
+    "quantity": "5.15463918",
+    "fair": "0.9675",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.09021",
+        "expectedROI": "-0.02061931957103022599465219208"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.01135",
+        "expectedROI": "-0.004847319585540465981302771297"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.01050",
+        "exitFee": "0.09021",
+        "expectedROI": "-0.02271931959"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.01050",
+        "exitFee": "0.01135",
+        "expectedROI": "-0.00694731959"
+      }
+    }
+  },
+  {
+    "price": "0.97",
+    "quantity": "5.15463918",
+    "fair": "0.98",
+    "modes": {
+      "MAKER:maximum": {
+        "entryFee": "0",
+        "exitFee": "0.09021",
+        "expectedROI": "-0.007732721632885896097744975590"
+      },
+      "MAKER:fair_value": {
+        "entryFee": "0",
+        "exitFee": "0.00707",
+        "expectedROI": "0.008895278351816343916328963597"
+      },
+      "TAKER:maximum": {
+        "entryFee": "0.01050",
+        "exitFee": "0.09021",
+        "expectedROI": "-0.00983272164"
+      },
+      "TAKER:fair_value": {
+        "entryFee": "0.01050",
+        "exitFee": "0.00707",
+        "expectedROI": "0.00679527836"
+      }
+    }
+  }
+]

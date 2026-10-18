@@ -1,4 +1,4 @@
-import { calculateFee, calculateSlippageUsd, d, orderBookLiquidityUsd, walkBook } from "./calculations.js";
+import { estimateExitFee, calculateFee, calculateSlippageUsd, d, orderBookLiquidityUsd, walkBook } from "./calculations.js";
 import { createId, type ConsensusDecision, type MarketSnapshot, type PaperOrder, type RiskEvaluation } from "./domain.js";
 import type { RiskLimits } from "./config.js";
 import { evaluateRisk, type HedgePositionFacts, type RiskInput } from "./risk.js";
@@ -20,6 +20,7 @@ export interface PaperOrderDecision {
   expectedROI: number | null;
   quantity: string;
   exitFeeReserveUsd?: string;
+  executionChoiceReason?: string;
   feeUsdTotal: string | null;
   slippageUsdTotal: string | null;
   /** @deprecated Compatibility aliases; all are in the units documented above. */
@@ -93,16 +94,16 @@ export function decidePaperOrder(input: {
   const notional = orderType === "MAKER" ? d(input.candidate.quantity).mul(makerPrice) : walk.sufficientDepth ? d(walk.notional) : d(input.candidate.quantity).mul(input.candidate.limitPrice);
   const quantity = d(input.candidate.quantity);
   const rawEdgeUsdPerShare = input.candidate.rawEdgeUsdPerShare ?? input.candidate.rawExpectedEdge;
-  // Budget one mandatory future taker exit at the maximum fee over p in [0,1].
-  // This is a conservative forecast allowance under the observed schedule, not
-  // an executed fee, future-price forecast, or cash reservation. Dual pair EV
+  // Budget one future taker exit using the explicit manifest forecast policy.
+  // This is a forecast allowance under the observed schedule, not
+  // an executed fee or cash reservation. Dual pair EV
   // already includes both legs; protective/hedge actions never pay this gate.
   const exitFeeReserve = input.candidate.intent === "OPEN_FIRST_LEG"
     && !input.baseRisk.dualPairEconomics && input.limits.freshEntryExitFeeReserve && schedule
-    ? calculateFee(quantity, "0.5", "TAKER", schedule) : "0";
+    ? estimateExitFee(quantity, input.consensus.fairProbability ?? NaN, schedule, input.limits.freshEntryExitFeeMode) : "0";
   const feeUsdPerShare = fee ? d(fee).div(quantity).toFixed() : null;
   const slippageUsdPerShare = slippage ? d(slippage).div(quantity).toFixed() : null;
-  const costUsdPerShare = feeUsdPerShare !== null && slippageUsdPerShare !== null
+  const costUsdPerShare = exitFeeReserve !== null && feeUsdPerShare !== null && slippageUsdPerShare !== null
     ? d(feeUsdPerShare).plus(slippageUsdPerShare).plus(d(exitFeeReserve).div(quantity)).toFixed()
     : null;
   // Unknown fee/depth inputs remain a hard risk veto. They must not be
@@ -161,7 +162,7 @@ export function decidePaperOrder(input: {
     rawEdgeUsdPerShare, feeUsdPerShare, slippageUsdPerShare, costUsdPerShare,
     netEvUsdPerShare, grossEvUsdTotal, netEvUsdTotal,
     executableNotionalUsd: notional.toFixed(), expectedROI, quantity: quantity.toFixed(),
-    feeUsdTotal: fee, exitFeeReserveUsd: exitFeeReserve, slippageUsdTotal: slippage,
+    feeUsdTotal: fee, exitFeeReserveUsd: exitFeeReserve ?? undefined, slippageUsdTotal: slippage,
     rawEdge: rawEdgeUsdPerShare, feeUsd: fee, slippageUsd: slippage,
     netExpectedEdge: netEvUsdPerShare,
     bookVwap: orderType === "TAKER" && walk.sufficientDepth ? walk.vwap : null,
