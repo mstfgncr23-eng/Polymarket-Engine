@@ -3144,10 +3144,10 @@ export class EngineService {
     return work;
   }
 
-  /** Record exact-price SELL flow per token for fill-zone admission. The window
-   *  is the only source: side/price semantics match the CLOB trade reporting
-   *  validated against the exchange docs (aggressor side at the execution price
-   *  on a transparent FIFO book). */
+  /** Record exact-price SELL observations per token for PAPER fill-zone
+   * admission. The public API exposes side/price/size; it does not expose our
+   * hypothetical queue position or prove a counterfactual account execution.
+   * SELL-only flow and the conservative queue model remain explicit assumptions. */
   private recordMakerTouchFlow(trade: MarketTrade): void {
     if(!this.env.PAPER_DUAL_MAKER_FILL_ZONE_ADMISSION_ENABLED)return;
     if(this.currentTokenIdFor(trade.marketId,trade.outcome)!==trade.tokenId)return;
@@ -4340,6 +4340,7 @@ export class EngineService {
     if(candidate.intent==='OPEN_FIRST_LEG')await this.persistReportInput(createJournalEvent({traceId:trigger.traceId,
       type:'ENTRY_CANDIDATE_EVALUATED',aggregateType:'entry_candidate',aggregateId:decision.risk.id,
       payload:{candidateId:decision.risk.id,triggerId:trigger.id,marketId:candidate.marketId,candidate,
+        proposedOrderId:decision.order?.id??null,
         accepted:decision.accepted,vetoes:decision.risk.vetoes,alpha:calibration,books:{UP:pair.UP,DOWN:pair.DOWN},policy:this.entryEconomicPolicy()}}));
     if (!decision.accepted || !decision.order) {
       if(fallback)fallback.outcome='RISK_REJECTED:'+decision.risk.vetoes.join('|');
@@ -4538,10 +4539,18 @@ export class EngineService {
     deRisk?: ProtectiveDeRiskAudit,
     options?: { skipPreCreateFirstLegCancel?: boolean; resume?: boolean; earlyAttempt?: EarlyAdmissionAttempt; admissionGuard?: () => void },
   ): Promise<boolean> {
+    const rejectEntry=async(reason:string,evidence?:Record<string,unknown>)=>{
+      // No new candidate can originate after the completed report fence. A
+      // stale external/test submission must not create a late canonical row.
+      if(!this.experiment||!['RUNNING','ENTRY_CLOSED'].includes(this.experiment.status))return false;
+      await this.rejectFirstLegOrder(order,reason,'PRE_CREATE_REVALIDATION',evidence);return false;
+    };
     if (intent === "OPEN_FIRST_LEG" && this.experimentStartPending) return false;
     if (this.soakBlocksPostEntry(order.marketId) && (intent !== "OPEN_FIRST_LEG" || order.side !== "BUY"
       || (this.ledger.positions.get(order.marketId)?.unpairedOutcome
-        && this.ledger.positions.get(order.marketId)!.unpairedOutcome !== order.outcome))) return false;
+        && this.ledger.positions.get(order.marketId)!.unpairedOutcome !== order.outcome))) {
+      return intent==='OPEN_FIRST_LEG'?rejectEntry('SOAK_POST_ENTRY_BLOCKED'):false;
+    }
     if ((intent === "PROTECTIVE_DE_RISK" || intent === "GUARDIAN_PROTECTIVE_SELL") && order.orderType !== "TAKER") {
       throw new Error("PROTECTIVE_DE_RISK_REQUIRES_TAKER");
     }
@@ -4607,7 +4616,8 @@ export class EngineService {
     const firstLegReserved = intent === "OPEN_FIRST_LEG"
       ? this.tryReserveFirstLegAdmission(order.marketId)
       : false;
-    if (intent === "OPEN_FIRST_LEG" && !firstLegReserved) return false;
+    if (intent === "OPEN_FIRST_LEG" && !firstLegReserved) return rejectEntry('FIRST_LEG_OWNERSHIP_BUSY',{
+      positionExists:this.ledger.positions.has(order.marketId),lifecycleBlocked:this.firstLegLifecycleBlocked(order.marketId)});
     const positionAtSubmission = this.ledger.positions.get(order.marketId);
     let durableOwner: RiskReductionOwnership | undefined;
 
@@ -4615,20 +4625,20 @@ export class EngineService {
       // Last economic admission fence immediately before PAPER_ORDER_CREATED.
       // close-entries and the native decision path are serialized by the same
       // experimentBoundaryGate, while deadline expiry closes durably here.
-      if (intent === "OPEN_FIRST_LEG" && !(await this.ensureFirstLegEntryOpen())) return false;
+      if (intent === "OPEN_FIRST_LEG" && !(await this.ensureFirstLegEntryOpen())) return await rejectEntry('EXPERIMENT_ENTRIES_CLOSED');
       if (intent === "OPEN_FIRST_LEG") {
         const admissionBook = this.state.marketSnapshots.get(order.tokenId);
         const reason = admissionBook ? this.firstLegExecutionReason(order, admissionBook, this.nowFn()) : "ENTRY_BOOK_UNAVAILABLE";
         if (reason) {
           this.metrics.riskVetoes.inc({ reason });
           this.record("FIRST_LEG_REVALIDATION_REJECTED", order.traceId, order.marketId, { orderId: order.id, reason });
-          return false;
+          return await rejectEntry(reason,{book:admissionBook??null});
         }
         const economics = firstLegExecutionEconomics(order, admissionBook!, this.nowFn().getTime(), this.entryEconomicPolicy());
         if (economics.reason) {
           this.metrics.riskVetoes.inc({ reason: economics.reason });
           this.record("FIRST_LEG_REVALIDATION_REJECTED", order.traceId, order.marketId, { orderId: order.id, ...economics });
-          return false;
+          return await rejectEntry(economics.reason,{economics,book:admissionBook??null});
         }
         const expiry = this.firstLegExpiryAdmission(order.marketId);
         if (!expiry.eligible) {
@@ -4639,13 +4649,13 @@ export class EngineService {
             remainingDurationMs: expiry.remainingDurationMs,
             minRemainingDurationMs: expiry.minRemainingDurationMs,
           }, decisionSnapshot.asset ?? null);
-          return false;
+          return await rejectEntry('DURATION_OUT_OF_RANGE',{expiry});
         }
       }
       if (
         intent === "OPEN_FIRST_LEG"
         && this.firstLegLifecycleBlocked(order.marketId, true)
-      ) return false;
+      ) return await rejectEntry('FIRST_LEG_LIFECYCLE_BLOCKED');
       if (intent === "HEDGE_SECOND_LEG" || intent === "PROTECTIVE_DE_RISK" || intent === "RESCUE_SECOND_LEG" || intent === "GUARDIAN_PROTECTIVE_SELL") {
         if (deRisk?.deRiskReason === "REVERSAL_CONFIRMED") {
           // The reversal executor already fenced makers under the episode's

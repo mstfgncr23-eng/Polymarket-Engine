@@ -28,6 +28,36 @@ async function setup(enabled=true,journal:EventJournal=pg?.journal??new MemoryEv
  return {engine,journal,market,clock,intern,b,quote,submit,trade,errors};
 }
 describe('Maker-First real Engine lifecycle',()=>{
+ it.each(['ownership','gapped','roi','expiry'] as const)('persists the pre-create rejection without an order or economic mutation (%s)',async scenario=>{
+  const s=await setup();const intern=s.engine as any;
+  try{
+   expect((await intern.supervisor.waitUnresolved(5000)).drained).toBe(true);
+   const o=s.quote();
+   if(scenario==='ownership')intern.pendingFirstLegMarkets.add(M);
+   if(scenario==='gapped')s.market.markTokenSync(U,'GAPPED');
+   if(scenario==='roi')o.entryAdmission={fairProbability:.60,signalExpiresAt:new Date(T+60000).toISOString()};
+   if(scenario==='expiry')s.clock.ms=T+800001;
+   const cash=s.engine.ledger.snapshot().cash;
+   expect(await s.submit(o)).toBe(false);expect(await s.submit(o)).toBe(false);
+   const terminals=(await s.journal.queryEvents({types:['PAPER_ORDER_TERMINAL']})).filter(e=>e.payload.orderId===o.id);
+   expect(terminals).toHaveLength(1);
+   expect(terminals[0]!.payload).toMatchObject({stage:'PRE_CREATE_REVALIDATION',status:'REJECTED',reason:{ownership:'FIRST_LEG_OWNERSHIP_BUSY',gapped:'ENTRY_BOOK_UNAVAILABLE',roi:'FIRST_LEG_NET_ROI_BELOW_FLOOR',expiry:'DURATION_OUT_OF_RANGE'}[scenario]});
+   expect((await s.journal.queryEvents({types:['PAPER_ORDER_CREATED']})).filter(e=>e.payload.id===o.id)).toHaveLength(0);
+   expect(s.engine.ledger.snapshot().cash).toBe(cash);expect(s.engine.reservedCash()).toBe('0');
+   expect(s.engine.integrityFault()).toBe(false);
+  }finally{intern.experimentStartPending=false;intern.pendingFirstLegMarkets.delete(M);await s.engine.stop();}
+ });
+ it('does not write canonical submission audits before start validation or after the completed report fence',async()=>{
+  const s=await setup();const intern=s.engine as any;
+  try{
+   expect((await intern.supervisor.waitUnresolved(5000)).drained).toBe(true);
+   const o=s.quote();intern.experimentStartPending=true;expect(await s.submit(o)).toBe(false);
+   intern.experimentStartPending=false;await s.engine.closeExperimentEntries();await s.engine.completeExperimentForTest();expect(s.engine.experimentManifest()?.status).toBe('COMPLETED');
+   expect(await s.submit(o)).toBe(false);
+   expect((await s.journal.queryEvents({types:['PAPER_ORDER_TERMINAL','PAPER_ORDER_CREATED','PAPER_FILL']})).filter(e=>e.payload.orderId===o.id||e.payload.id===o.id)).toHaveLength(0);
+   expect(s.engine.reservedCash()).toBe('0');expect(s.engine.integrityFault()).toBe(false);
+  }finally{intern.experimentStartPending=false;await s.engine.stop();}
+ });
  it.each(['fresh','fresh-price','price-risk-veto','stale','closed','partial','dual','concurrent','cash','daily-loss','signal-expired','epoch','restart','book-expiry','close-race'] as const)('directional TTL fallback revalidates once within the original dollar budget (%s)',async scenario=>{
   const s=await setup(true,undefined,{ms:T},{PAPER_DUAL_SIDED_MAKER_ENABLED:String(scenario==='dual')});
   try{
@@ -47,6 +77,9 @@ describe('Maker-First real Engine lifecycle',()=>{
    await intern.evaluateTrade(trigger,intern.nativeCompatibilityDecision(trigger,native),native);
    const initial=[...s.engine.restingOrdersForTest().values()].map(r=>r.order);expect(initial,JSON.stringify({risk:s.engine.state.latestRisk,decisions:s.engine.state.decisions,events:await s.journal.queryEvents({types:['RISK_EVALUATION']})})).toHaveLength(scenario==='dual'?2:1);
    const first=initial.find(o=>o.outcome==='UP')!;
+   const candidates=await s.journal.queryEvents({types:['ENTRY_CANDIDATE_EVALUATED']});
+   expect(candidates.some(e=>typeof e.payload.proposedOrderId==='string')).toBe(true);
+   if(scenario!=='dual')expect(candidates.some(e=>e.payload.proposedOrderId===first.id)).toBe(true);
    if(scenario==='restart'){
     await s.engine.stop();const recovered=await setup(true,s.journal,s.clock);
     try{s.clock.ms=T+2001;await recovered.intern.expireMakerQuotes();expect(recovered.engine.restingOrderCount()).toBe(0);expect(recovered.engine.reservedCash()).toBe('0');expect(await s.journal.queryEvents({types:['PAPER_FILL']})).toHaveLength(0);expect((recovered.engine as any).makerEntryContinuations.size).toBe(0);}finally{await recovered.engine.stop();}
