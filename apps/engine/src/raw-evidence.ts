@@ -2,6 +2,8 @@ import { createWriteStream, mkdirSync, writeFileSync, renameSync } from "node:fs
 import { join } from "node:path";
 import { createGzip, type Gzip } from "node:zlib";
 import { finished } from "node:stream/promises";
+import type { MarketSnapshot } from "@pm/core";
+import { BookEvidenceEncoder } from "./book-evidence-codec.js";
 
 /** Inside the sole Engine, using its existing normalized inputs. No subscriptions,
  * decisions, positions or orders. Bounded gzip backpressure is an explicit gap. */
@@ -19,11 +21,21 @@ export class RawEvidence {
   private fault: string | null = null;
   private gaps: { from: string; to: string; count: number }[] = [];
   private files: string[] = [];
+  private readonly books = new BookEvidenceEncoder();
+  private bookExperiment = '';
+  private batch = '';
+  private batchBytes = 0;
+  private flushTimer: ReturnType<typeof setTimeout> | null = null;
   constructor(private readonly directory: string) {}
   status() { return { experimentId: this.experiment, accepted: this.accepted, dropped: this.dropped,
     rawBytes: this.rawBytes, compressedBytes: this.compressedBytes, fault: this.fault, gaps: this.gaps, files: this.files }; }
-  record(experimentId: string, value: unknown): void {
-    if (this.sealed && experimentId === this.experiment) return;
+  recordBook(experimentId:string,snapshot:MarketSnapshot,context:{tokenEpoch:number;synchronized:boolean;siblingEventId:string|null}):void{
+    if(this.bookExperiment!==experimentId){this.books.clear();this.bookExperiment=experimentId;}
+    const encoded=this.books.encode(snapshot,Math.floor(Date.now()/60000),context.tokenEpoch,context.synchronized);
+    if(!this.record(experimentId,{kind:'book',...context,...encoded}))this.books.forget(snapshot.tokenId);
+  }
+  record(experimentId: string, value: unknown): boolean {
+    if (this.sealed && experimentId === this.experiment) return false;
     const now = Date.now();
     try {
       if (experimentId !== this.experiment) {
@@ -36,7 +48,7 @@ export class RawEvidence {
         this.gaps = []; this.files = []; this.fault = null;
       }
       if (this.fault || this.compressedBytes >= 2 * 1024 ** 3 || (this.stream?.writableLength ?? 0) > 8 * 1024 ** 2) {
-        this.noteGap(now); return;
+        this.noteGap(now); return false;
       }
       const bucket = Math.floor(now / 60000);
       if (!this.stream || bucket !== this.bucket) {
@@ -55,15 +67,22 @@ export class RawEvidence {
       }
       const line = JSON.stringify({ recordedAt: new Date(now).toISOString(), ...value as object }) + "\n";
       const bytes = Buffer.byteLength(line);
-      if (bytes > 4 * 1024 ** 2) { this.noteGap(now); return; }
-      this.stream!.write(line); this.accepted++; this.rawBytes += bytes;
-    } catch (error) { this.fault = String(error); this.noteGap(now); }
+      if (bytes > 4 * 1024 ** 2) { this.noteGap(now); return false; }
+      this.batch+=line;this.batchBytes+=bytes;
+      if(this.batchBytes>=64*1024)this.flushBatch();
+      else if(!this.flushTimer){this.flushTimer=setTimeout(()=>{this.flushTimer=null;this.flushBatch();},50);this.flushTimer.unref();}
+      this.accepted++; this.rawBytes += bytes;return true;
+    } catch (error) { this.fault = String(error); this.noteGap(now);return false; }
   }
   async close(): Promise<void> {
     this.sealed = true;
     this.finishPart(); await Promise.all(this.closing); this.closing = []; this.persistStatus();
   }
-  private finishPart(): void { if (this.stream) { this.stream.end(); this.stream = null; } }
+  private flushBatch():void{
+    if(this.flushTimer){clearTimeout(this.flushTimer);this.flushTimer=null;}
+    if(this.stream&&this.batchBytes){this.stream.write(this.batch);this.batch='';this.batchBytes=0;}
+  }
+  private finishPart(): void {this.flushBatch();if (this.stream) { this.stream.end(); this.stream = null; } }
   private noteGap(now: number): void {
     this.dropped++;
     const at = new Date(now).toISOString(), last = this.gaps.at(-1);

@@ -2766,7 +2766,7 @@ export class EngineService {
         this.rawEvidenceMarkets.add(key);
         this.rawEvidence.record(this.experiment.id,{kind:'market_metadata',market:this.marketsById.get(snapshot.marketId)});
       }
-      this.rawEvidence.record(this.experiment.id,{kind:'book',snapshot,synchronized,
+      this.rawEvidence.recordBook(this.experiment.id,snapshot,{synchronized,
         tokenEpoch:this.adapterTokenEpoch(snapshot.tokenId),siblingEventId:this.snapshots.get(snapshot.marketId)?.[snapshot.outcome==='UP'?'DOWN':'UP']?.eventId??null});
     }
     if (!synchronized) {
