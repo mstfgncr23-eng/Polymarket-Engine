@@ -648,8 +648,8 @@ export class EngineService {
       referenceRapidMoveBps: this.triggerConfig.referenceRapidMoveBps,
     };
     this.riskLimits = riskLimitsSchema.parse({
-      freshEntryNetRoiFloor: env.PAPER_ENTRY_NET_ROI_FLOOR,
-      freshEntryMinPrice: env.PAPER_ENTRY_MIN_PRICE,
+      ...(env.PAPER_ENTRY_NET_ROI_FLOOR!==undefined?{freshEntryNetRoiFloor:env.PAPER_ENTRY_NET_ROI_FLOOR}:{}),
+      ...(env.PAPER_ENTRY_MIN_PRICE!==undefined?{freshEntryMinPrice:env.PAPER_ENTRY_MIN_PRICE}:{}),
       maxExternalSignalsPerMinute: env.GROK_MCP_RATE_LIMIT_PER_MINUTE,
       normalHedgeMinLockedPairEdge: env.NORMAL_HEDGE_MIN_LOCKED_PAIR_EDGE,
     });
