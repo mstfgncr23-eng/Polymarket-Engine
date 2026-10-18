@@ -150,6 +150,9 @@ export function verifiedRescuePairLock(input: {
 }
 
 export interface RiskInput {
+  /** Only the canonical dual planner supplies current, fee-inclusive pair economics.
+   * This changes strategic alpha gates; every cash/exposure/source gate remains. */
+  dualPairEconomics?: { netRoi: number; netUsdPerShare: number };
   traceId: string;
   now: Date;
   marketFeedAt: Date | null;
@@ -234,6 +237,7 @@ export interface RiskInput {
 }
 
 export function evaluateRisk(input: RiskInput, limits: RiskLimits): RiskEvaluation {
+  const pair = input.intent === "OPEN_FIRST_LEG" && input.dualPairEconomics;
   const vetoes: RiskReasonCode[] = [];
   const age = (value: Date | null) => value ? input.now.getTime() - value.getTime() : Number.POSITIVE_INFINITY;
   const hedge = input.intent === "HEDGE_SECOND_LEG";
@@ -284,7 +288,7 @@ export function evaluateRisk(input: RiskInput, limits: RiskLimits): RiskEvaluati
   // Protective/rescue actions keep their existing exemption. The trailing
   // exemption is narrower: it is granted only when the HEDGE is structurally
   // reducing AND the engine proves current-book fee-inclusive locked PnL > 0.
-  const directionalReferenceGated = !protective && !rescue && !verifiedProfitableTrailingHedge;
+  const directionalReferenceGated = !pair && !protective && !rescue && !verifiedProfitableTrailingHedge;
   if (directionalReferenceGated && input.referenceProviderBlocked === true) vetoes.push("REFERENCE_PROVIDER_BLOCKED");
   if (directionalReferenceGated && input.referenceRequired === true) {
     if (age(input.referenceFeedAt ?? null) > limits.staleFeedTimeoutMs) {
@@ -317,19 +321,21 @@ export function evaluateRisk(input: RiskInput, limits: RiskLimits): RiskEvaluati
     && input.executablePrice !== undefined
     && input.executablePrice !== null
     && d(input.executablePrice).lt(limits.normalFirstLegMaxPriceExclusive);
-  const firstLegMinExpectedEdge = normalFirstLegRegime ? limits.normalFirstLegMinExpectedEdge : limits.minExpectedEdge;
-  const firstLegMinExpectedROI = normalFirstLegRegime ? limits.normalFirstLegMinExpectedROI : limits.minExpectedROI;
+  const explicitEntry = input.intent === "OPEN_FIRST_LEG" && limits.freshEntryNetRoiFloor !== undefined;
+  const firstLegMinExpectedEdge = pair || explicitEntry ? 0 : normalFirstLegRegime ? limits.normalFirstLegMinExpectedEdge : limits.minExpectedEdge;
+  const firstLegMinExpectedROI = explicitEntry ? limits.freshEntryNetRoiFloor! : pair ? 0.015 : normalFirstLegRegime ? limits.normalFirstLegMinExpectedROI : limits.minExpectedROI;
   // A rescue pair-lock may intentionally lock a small loss; the alpha floors
   // are skipped ONLY for structurally verified rescue candidates.
   if (!protective && !rescue && !verifiedProfitableTrailingHedge
-    && input.expectedEdge < firstLegMinExpectedEdge) vetoes.push("MINIMUM_EXPECTED_EDGE");
-  if (!riskReducingIntent && (!Number.isFinite(input.expectedROI) || input.expectedROI < firstLegMinExpectedROI)) {
+    && (!Number.isFinite(pair ? pair.netUsdPerShare : input.expectedEdge) || (pair ? pair.netUsdPerShare : input.expectedEdge) < firstLegMinExpectedEdge)) vetoes.push("MINIMUM_EXPECTED_EDGE");
+  const roi = pair ? pair.netRoi : input.expectedROI;
+  if (!riskReducingIntent && (!Number.isFinite(roi) || roi < firstLegMinExpectedROI)) {
     vetoes.push("MINIMUM_EXPECTED_ROI");
   }
   if (!protective && !rescue && !verifiedProfitableTrailingHedge
     && input.spread > limits.maxSpread) vetoes.push("MAXIMUM_SPREAD");
-  if (!protective && !verifiedHedge && !verifiedRescue && input.signalConfidence < limits.minSignalConfidence) vetoes.push("MINIMUM_SIGNAL_CONFIDENCE");
-  if (!protective && !verifiedHedge && !verifiedRescue && input.signalExpiresAt.getTime() <= input.now.getTime()) vetoes.push("SIGNAL_EXPIRED");
+  if (!pair && !protective && !verifiedHedge && !verifiedRescue && input.signalConfidence < limits.minSignalConfidence) vetoes.push("MINIMUM_SIGNAL_CONFIDENCE");
+  if (!pair && !protective && !verifiedHedge && !verifiedRescue && input.signalExpiresAt.getTime() <= input.now.getTime()) vetoes.push("SIGNAL_EXPIRED");
   if (!protective && !rescue && input.externalSignalsLastMinute >= limits.maxExternalSignalsPerMinute) vetoes.push("MAXIMUM_EXTERNAL_SIGNAL_RATE");
   // Cooldown throttles fresh directional entries. It must never trap a risk-reducing action.
   if (!riskReducingIntent && input.lastStrategyTradeAt && input.now.getTime() - input.lastStrategyTradeAt.getTime() < limits.strategyCooldownMs) vetoes.push("STRATEGY_COOLDOWN");

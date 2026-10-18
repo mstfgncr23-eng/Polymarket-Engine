@@ -658,7 +658,9 @@ function applyFillReservation(
   if (!reserved || fill.liquidityRole !== "MAKER") return;
   const fillCost = d(fill.quantity).mul(fill.fillPrice).plus(fill.feeUsd);
   const reservedAmount = d(reserved);
-  state.ledger.release(reservedAmount.lt(fillCost) ? reservedAmount : fillCost, at);
+  // A full dual fill also releases its unused hedge cash buffer. Partial fills
+  // retain that buffer until the same-side remainder is durably cancelled.
+  state.ledger.release(!reservationAfter ? reservedAmount : reservedAmount.lt(fillCost) ? reservedAmount : fillCost, at);
   if (reservationAfter && d(reservationAfter).gt(0)) state.makerReservations.set(fill.orderId, reservationAfter);
   else state.makerReservations.delete(fill.orderId);
 }

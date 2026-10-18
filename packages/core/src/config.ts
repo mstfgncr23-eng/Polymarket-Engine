@@ -1,6 +1,10 @@
 import { z } from "zod";
 
 export const riskLimitsSchema = z.object({
+  /** Explicit fresh-entry policy: decimal return on executable notional.
+   * When present it supersedes both historical edge/ROI price regimes. */
+  freshEntryNetRoiFloor: z.number().min(0).max(1).optional(),
+  freshEntryMinPrice: z.number().min(0).max(1).optional(),
   maxOrderSizeUsd: z.number().positive().default(25),
   maxMarketExposureUsd: z.number().positive().default(100),
   maxAssetExposureUsd: z.number().positive().default(150),
@@ -135,6 +139,10 @@ export const engineEnvSchema = z.object({
   PAPER_START_BALANCE: z.coerce.number().positive().default(1000),
   PAPER_EXECUTION_LATENCY_MS: z.coerce.number().int().nonnegative().default(150),
   PAPER_EXECUTION_STYLE: z.enum(["TAKER", "MAKER"]).default("TAKER"),
+  PAPER_ENTRY_NET_ROI_FLOOR: z.coerce.number().min(0).max(1).optional(),
+  PAPER_ENTRY_MIN_PRICE: z.coerce.number().min(0).max(1).optional(),
+  PAPER_DUAL_MAKER_FLOW_POLICY: z.enum(["both", "hedge_covered"]).default("both"),
+  PAPER_RAW_EVIDENCE_ENABLED: z.preprocess(value => value === "true" ? true : value === "false" ? false : value, z.boolean().default(false)),
   PAPER_MAKER_FIRST_ENABLED: z.preprocess(value => value === "true" ? true : value === "false" ? false : value, z.boolean().default(false)),
   PAPER_DUAL_SIDED_MAKER_ENABLED: z.preprocess(value => value === "true" ? true : value === "false" ? false : value, z.boolean().default(false)),
   /** Cost-bound dual maker admission gate: refuse a dual maker plan unless the

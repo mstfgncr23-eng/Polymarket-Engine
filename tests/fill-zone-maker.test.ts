@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { engineEnvSchema, type PaperOrder, type MarketSnapshot, type MarketTrade } from "@pm/core";
+import { engineEnvSchema, triggerEventSchema, type PaperOrder, type MarketSnapshot, type MarketTrade } from "@pm/core";
 import { MemoryEventJournal } from "@pm/db";
 import { EngineService } from "../apps/engine/src/engine.js";
 import { NoopGrokActivationBridge } from "../apps/engine/src/activation/index.js";
@@ -17,7 +17,7 @@ afterEach(async () => {
 const T = Date.parse("2026-10-15T18:00:00Z"), M = "fz-mkt", U = "fz-up", D = "fz-down";
 const FZ = { PAPER_DUAL_SIDED_MAKER_ENABLED: "true", PAPER_DUAL_MAKER_COST_BOUND_ENABLED: "true", PAPER_DUAL_MAKER_TOUCH_PRICING_ENABLED: "true", PAPER_DUAL_MAKER_FILL_ZONE_ADMISSION_ENABLED: "true" };
 
-async function setup(overrides: Record<string, string> = {}, clock = { ms: T }) {
+async function setup(overrides: Record<string, string> = {}, clock = { ms: T }, balanced=false) {
   const market = new ScriptedMarketAdapter();
   const listing = qualified(M, "XRP", U, D, new Date(T + 900000).toISOString());
   listing.raw = { eventStartTime: new Date(T - 1000).toISOString() };
@@ -38,9 +38,9 @@ async function setup(overrides: Record<string, string> = {}, clock = { ms: T }) 
   const b = (outcome: "UP" | "DOWN", seq = 1, upDepth = "2", downDepth = "2"): MarketSnapshot => snapshot({
     marketId: M, tokenId: outcome === "UP" ? U : D, outcome, asset: "XRP",
     bids: outcome === "UP"
-      ? [{ price: "0.69", quantity: upDepth }, { price: "0.68", quantity: "0.4" }]
-      : [{ price: "0.29", quantity: downDepth }, { price: "0.28", quantity: "0.4" }],
-    asks: [{ price: outcome === "UP" ? "0.7" : "0.3", quantity: "1000" }],
+      ? [{ price: balanced?"0.49":"0.69", quantity: upDepth }, { price: "0.48", quantity: "0.4" }]
+      : [{ price: balanced?"0.49":"0.29", quantity: downDepth }, { price: "0.28", quantity: "0.4" }],
+    asks: [{ price: balanced?"0.5":outcome === "UP" ? "0.7" : "0.3", quantity: "1000" }],
     receivedAt: new Date(T).toISOString(), sourceTimestamp: new Date(T).toISOString(), sequence: seq,
   });
   await market.emitSnapshot(b("UP"));
@@ -70,6 +70,30 @@ async function setup(overrides: Record<string, string> = {}, clock = { ms: T }) 
 }
 
 describe("dual maker fill-zone admission (B3, opt-in)", () => {
+  it("admits balanced low-price pairs before directional native gates in the single canonical Engine",async()=>{
+    const s=await setup({PAPER_DUAL_SIDED_MAKER_ENABLED:'true',PAPER_ENTRY_NET_ROI_FLOOR:'0.01',PAPER_ENTRY_MIN_PRICE:'0'}, {ms:T},true);
+    try{
+      await s.engine.registerTriggerForResearch(triggerEventSchema.parse({id:'balanced-pair',traceId:'balanced-pair-trace',marketId:M,asset:'XRP',source:'polymarket',kind:'BOOK_IMBALANCE',severity:2,score:0.9,dedupeKey:'balanced',evidence:{},sourceEventIds:['balanced-book'],createdAt:new Date(T).toISOString(),expiresAt:new Date(T+30000).toISOString()}));
+      const quotes=[...s.intern.restingOrders.values()].map(x=>x.order);
+      expect(quotes).toHaveLength(2);
+      expect(quotes.every(x=>x.requestedPrice==='0.49'&&x.strategyId==='two-sided-maker-v1'&&!x.entryAdmission)).toBe(true);
+      expect(new Set(quotes.map(x=>x.makerFirst!.dualGroupId)).size).toBe(1);
+      expect(quotes.every(x=>Number(x.makerFirst!.hedgeCashBufferUsd)>0)).toBe(true);
+      const first=quotes.find(x=>x.outcome==='UP')!;
+      s.clock.ms=T+201;
+      await s.intern.onMakerTrade({...s.trade(U,'UP','0.49','100',T+201),tokenEpoch:first.makerFirst!.tokenEpoch});
+      expect(s.engine.ledger.positions.get(M)?.unpairedQuantity).toBe(first.quantity);
+      const reservations=(s.engine as any).makerReservations as Map<string,string>;
+      expect(reservations.size).toBe(1);
+      expect(Number(s.engine.reservedCash())).toBeCloseTo(Number([...reservations.values()][0]),8);
+      s.clock.ms++;
+      await s.intern.onMakerTrade(s.trade(D,'DOWN','0.49','100',T+202));
+      expect(s.engine.reservedCash()).toBe('0');
+      expect(s.engine.ledger.positions.get(M)?.pairedQuantity).toBe(first.quantity);
+      expect((await (s.engine as any).journal.queryEvents({types:['DUAL_MAKER_QUOTES_ADMITTED']})).length).toBeGreaterThan(0);
+      expect(s.engine.integrityFault()).toBe(false);
+    }finally{await s.engine.stop();}
+  });
   it("parses bounded fill-zone configuration and stays OFF by default", () => {
     const p = engineEnvSchema.parse({});
     expect(p.PAPER_DUAL_MAKER_FILL_ZONE_ADMISSION_ENABLED).toBe(false);
@@ -127,12 +151,13 @@ describe("dual maker fill-zone admission (B3, opt-in)", () => {
       // UP touch 0.69, DOWN touch 0.29. Seed 15 units of exact-price SELL flow per leg
       // across 30s -> 0.5 units/s; displayed depth 2 -> consumeMs = 2/0.5*1000 = 4000.
       for (const n of [0, 1, 2, 3, 4]) {
+        s.clock.ms = T + 1000 + n;
         await s.intern.onMakerTrade(s.trade(U, "UP", "0.69", "3", T + 1000 + n));
         await s.intern.onMakerTrade(s.trade(D, "DOWN", "0.29", "3", T + 1000 + n));
       }
       s.clock.ms = T + 6000;
       const books = { UP: s.engine.state.marketSnapshots.get(U)!, DOWN: s.engine.state.marketSnapshots.get(D)! };
-      expect(await s.intern.trySubmitDualMakerPair(s.quote(), "fz:flow", books)).toBe(true);
+      expect(await s.intern.trySubmitDualMakerPair(s.quote(), "fz:flow", books),JSON.stringify(await (s.engine as any).journal.queryEvents({types:['DUAL_MAKER_PLAN_REJECTED']}))).toBe(true);
       expect(s.engine.restingOrderCount()).toBe(2);
       const q = [...s.intern.restingOrders.values()].map((v) => v.order);
       expect(new Set(q.map((o) => o.makerFirst!.dualGroupId)).size).toBe(1);
@@ -147,6 +172,7 @@ describe("dual maker fill-zone admission (B3, opt-in)", () => {
     const s = await setup(FZ);
     try {
       for (const n of [0, 1, 2, 3, 4]) {
+        s.clock.ms = T + 1000 + n;
         await s.intern.onMakerTrade(s.trade(U, "UP", "0.69", "3", T + 1000 + n));
         await s.intern.onMakerTrade(s.trade(D, "DOWN", "0.29", "3", T + 1000 + n));
       }
@@ -163,6 +189,7 @@ describe("dual maker fill-zone admission (B3, opt-in)", () => {
     const s = await setup(FZ);
     try {
       for (const n of [0, 1, 2, 3, 4]) {
+        s.clock.ms = T + 1000 + n;
         await s.intern.onMakerTrade(s.trade(U, "UP", "0.69", "3", T + 1000 + n));
         await s.intern.onMakerTrade(s.trade(D, "DOWN", "0.29", "3", T + 1000 + n));
       }

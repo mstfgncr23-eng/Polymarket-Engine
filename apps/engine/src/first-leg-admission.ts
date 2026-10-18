@@ -4,16 +4,18 @@ import type { DiscoveredMarket } from "@pm/market-data";
 export const FIRST_LEG_MIN_PRICE = 0.65;
 export const FIRST_LEG_MIN_NET_ROI = 0.015;
 
-export function firstLegEntryFilterReason(price: string | number | null | undefined, expectedROI: number | null | undefined) {
+export type EntryEconomicPolicy = { minPrice: number; minNetRoi: number };
+export function firstLegEntryFilterReason(price: string | number | null | undefined, expectedROI: number | null | undefined,
+  policy: EntryEconomicPolicy = { minPrice: FIRST_LEG_MIN_PRICE, minNetRoi: FIRST_LEG_MIN_NET_ROI }) {
   try {
-    if (price === null || price === undefined || !d(price).isFinite() || d(price).lt(FIRST_LEG_MIN_PRICE)) return "FIRST_LEG_PRICE_BELOW_FLOOR" as const;
+    if (price === null || price === undefined || !d(price).isFinite() || d(price).lte(0) || d(price).gte(1) || d(price).lt(policy.minPrice)) return "FIRST_LEG_PRICE_BELOW_FLOOR" as const;
   } catch { return "FIRST_LEG_PRICE_BELOW_FLOOR" as const; }
-  return typeof expectedROI !== "number" || !Number.isFinite(expectedROI) || expectedROI < FIRST_LEG_MIN_NET_ROI
+  return typeof expectedROI !== "number" || !Number.isFinite(expectedROI) || expectedROI < policy.minNetRoi
     ? "FIRST_LEG_NET_ROI_BELOW_FLOOR" as const : null;
 }
 
 /** Same net EV / executable notional semantics as decidePaperOrder. */
-export function firstLegExecutionEconomics(order: PaperOrder, book: MarketSnapshot, nowMs: number) {
+export function firstLegExecutionEconomics(order: PaperOrder, book: MarketSnapshot, nowMs: number, policy?: EntryEconomicPolicy) {
   const proof = order.entryAdmission;
   if (!proof || !Number.isFinite(proof.fairProbability) || !Number.isFinite(nowMs)
     || !Number.isFinite(Date.parse(proof.signalExpiresAt)) || nowMs >= Date.parse(proof.signalExpiresAt))
@@ -24,7 +26,7 @@ export function firstLegExecutionEconomics(order: PaperOrder, book: MarketSnapsh
     if(order.orderType!=="MAKER"||!book.feeSchedule||!book.asks[0]||d(price).gte(book.asks[0].price))return {reason:"ENTRY_ECONOMICS_UNAVAILABLE",price,expectedROI:null};
     const fee=calculateFee(order.quantity,price,"MAKER",book.feeSchedule);
     const expectedROI=d(proof.fairProbability).minus(price).mul(order.quantity).minus(fee).div(d(order.quantity).mul(price)).toNumber();
-    return {reason:firstLegEntryFilterReason(price,expectedROI),price,expectedROI};
+    return {reason:firstLegEntryFilterReason(price,expectedROI,policy),price,expectedROI};
   }
   const price = order.orderType === "MAKER" ? order.requestedPrice : walk.sufficientDepth ? walk.vwap : null;
   if (!price || !walk.sufficientDepth || !book.feeSchedule) return { reason: "ENTRY_ECONOMICS_UNAVAILABLE", price, expectedROI: null };
@@ -32,7 +34,7 @@ export function firstLegExecutionEconomics(order: PaperOrder, book: MarketSnapsh
   const slippage = order.orderType === "MAKER" ? "0" : calculateSlippageUsd(order.requestedPrice, price, order.quantity, "BUY");
   const notional = d(order.quantity).mul(price);
   const roi = d(proof.fairProbability).minus(walk.vwap).mul(order.quantity).minus(fee).minus(slippage).div(notional).toNumber();
-  return { reason: firstLegEntryFilterReason(price, roi), price, expectedROI: roi };
+  return { reason: firstLegEntryFilterReason(price, roi, policy), price, expectedROI: roi };
 }
 
 /** Gamma eventStartTime is the fixing start; startDate is listing creation. */

@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { MakerTouchFlow } from "./maker-touch-flow.js";
+import { RawEvidence } from "./raw-evidence.js";
 import { experimentWsEventSchema, marketWsReason, type ExperimentWsEvent } from "@pm/core";
 import { bookTiming, firstLegBookReason, officialMarketStartReason, firstLegEntryFilterReason, firstLegExecutionEconomics, FIRST_LEG_MIN_NET_ROI } from "./first-leg-admission.js";
 import type { GuardianView, GuardianMarket, GuardianUpdate } from "./guardian-link.js";
@@ -448,7 +450,9 @@ export class EngineService {
   private readonly makerFlowStats = new Map<string,{observedTrades:number;exactPriceSellTrades:number;eligibleTrades:number;eligibleQuantity:string;firstEligibleEventId:string|null;lastEligibleEventId:string|null}>();
   /** Per-token bounded in-memory sliding window of exact-price SELL trades at each
    *  price level, for fill-zone admission. Never durable; bounded by eviction. */
-  private readonly makerTouchFlow = new Map<string,{price:string;qty:string;ts:number}[]>();
+  private readonly makerTouchFlow: MakerTouchFlow;
+  private readonly rawEvidence: RawEvidence | null;
+  private readonly rawEvidenceMarkets = new Set<string>();
   private readonly makerTradeTails = new Map<string,Promise<void>>();
   private makerQuoteTimer: ReturnType<typeof setTimeout> | null = null;
   private makerQuoteExpiryInFlight:Promise<void>|null=null;
@@ -644,9 +648,13 @@ export class EngineService {
       referenceRapidMoveBps: this.triggerConfig.referenceRapidMoveBps,
     };
     this.riskLimits = riskLimitsSchema.parse({
+      freshEntryNetRoiFloor: env.PAPER_ENTRY_NET_ROI_FLOOR,
+      freshEntryMinPrice: env.PAPER_ENTRY_MIN_PRICE,
       maxExternalSignalsPerMinute: env.GROK_MCP_RATE_LIMIT_PER_MINUTE,
       normalHedgeMinLockedPairEdge: env.NORMAL_HEDGE_MIN_LOCKED_PAIR_EDGE,
     });
+    this.makerTouchFlow = new MakerTouchFlow(env.PAPER_DUAL_MAKER_FLOW_WINDOW_MS);
+    this.rawEvidence = env.PAPER_RAW_EVIDENCE_ENABLED ? new RawEvidence(env.LOCAL_ARCHIVE_DIR) : null;
     if (env.PROFIT_TRAILING_PAIR_SOAK_ENABLED
       && (env.NAKED_DIRECTIONAL_SOAK_ENABLED
         || env.PAPER_EXECUTION_STYLE !== "TAKER"
@@ -858,6 +866,7 @@ export class EngineService {
       await this.checkpoint();
       this.lastShutdownCheckpointed = true;
     }
+    await this.rawEvidence?.close();
     this.sse.close();
     await this.journal.close();
     this.clearResearchActivationState();
@@ -1221,7 +1230,10 @@ export class EngineService {
           profitTrailingPairRetraceEdge: this.env.PROFIT_TRAILING_PAIR_RETRACE_EDGE,
           profitTrailingPairExecutionStyle: "TAKER",
           makerFirst: {enabled:this.env.PAPER_MAKER_FIRST_ENABLED,firstLegTtlMs:this.env.PAPER_MAKER_FIRST_QUOTE_TTL_MS,
-            hedgeTtlMs:this.env.PAPER_MAKER_HEDGE_QUOTE_TTL_MS,fillModel:'public-trade-queue-50pct',twoSidedFreshEntries:this.env.PAPER_DUAL_SIDED_MAKER_ENABLED},
+            hedgeTtlMs:this.env.PAPER_MAKER_HEDGE_QUOTE_TTL_MS,fillModel:'public-trade-queue-50pct',twoSidedFreshEntries:this.env.PAPER_DUAL_SIDED_MAKER_ENABLED,
+            flowPolicy:this.env.PAPER_DUAL_MAKER_FLOW_POLICY,flowWindowMs:this.env.PAPER_DUAL_MAKER_FLOW_WINDOW_MS,
+            minExactFlow:this.env.PAPER_DUAL_MAKER_MIN_EXACT_FLOW_PER_WINDOW,maxQuoteTtlMs:this.env.PAPER_DUAL_MAKER_MAX_QUOTE_TTL_MS,
+            pairNetRoiFloor:this.entryEconomicPolicy().minNetRoi,rawEvidenceEnabled:!!this.rawEvidence},
           reversalProtectionEnabled: this.env.REVERSAL_PROTECTION_ENABLED,
           guardianVersion: 2, guardianFormatGeneration: 3, guardianV2Config: { ...GUARDIAN_V2_CONFIG },
           reversalProtectionWindowMs: this.env.REVERSAL_PROTECTION_WINDOW_MS,
@@ -1707,7 +1719,7 @@ export class EngineService {
         canonicalTokenId: this.currentTokenIdFor(order.marketId, order.outcome),
         synchronized: this.adapterTokenSynchronized(order.tokenId),
         nowMs: at.getTime(), maxAgeMs: this.riskLimits.staleFeedTimeoutMs })
-      ?? firstLegExecutionEconomics(order, book, at.getTime()).reason;
+      ?? firstLegExecutionEconomics(order, book, at.getTime(), this.entryEconomicPolicy()).reason;
   }
 
   private async rejectFirstLegOrder(order: Pick<PaperOrder, "id" | "marketId" | "traceId">, reason: string, stage: string,evidence?:Record<string,unknown>): Promise<void> {
@@ -2748,6 +2760,15 @@ export class EngineService {
     if (Number.isFinite(timing.receivedToDecisionMs) && timing.receivedToDecisionMs >= 0) this.metrics.bookReceivedToProcessing.observe(timing.receivedToDecisionMs / 1000);
     this.state.connections.polymarket.lastMessageAt = snapshot.receivedAt;
     const synchronized = this.adapterTokenSynchronized(snapshot.tokenId);
+    if (this.rawEvidence && this.experiment && ["RUNNING","ENTRY_CLOSED"].includes(this.experiment.status)) {
+      const key = this.experiment.id + ':' + snapshot.marketId;
+      if (!this.rawEvidenceMarkets.has(key)) {
+        this.rawEvidenceMarkets.add(key);
+        this.rawEvidence.record(this.experiment.id,{kind:'market_metadata',market:this.marketsById.get(snapshot.marketId)});
+      }
+      this.rawEvidence.record(this.experiment.id,{kind:'book',snapshot,synchronized,
+        tokenEpoch:this.adapterTokenEpoch(snapshot.tokenId),siblingEventId:this.snapshots.get(snapshot.marketId)?.[snapshot.outcome==='UP'?'DOWN':'UP']?.eventId??null});
+    }
     if (!synchronized) {
       this.observeGuardianSnapshot(snapshot.marketId);
       this.updateReady();
@@ -2846,26 +2867,59 @@ export class EngineService {
   private async trySubmitDualMakerPair(directionOrder:PaperOrder, duplicateKey:string, pair:Record<Outcome,MarketSnapshot|null|undefined>):Promise<boolean>{
     if(!this.dualMakerEnabled())return false;
     this.metrics.dualMakerPlans.inc({outcome:'ATTEMPT'});
+    const reject=(reason:string,evidence:Record<string,unknown>={})=>this.dualMakerNoQuote(reason,directionOrder,evidence);
+    await this.persistReportInput(createJournalEvent({traceId:directionOrder.traceId,type:'DUAL_MAKER_CANDIDATE',
+      aggregateType:'dual_maker_candidate',aggregateId:directionOrder.id,payload:{candidateId:directionOrder.id,
+        marketId:directionOrder.marketId,quantity:directionOrder.quantity,postingBooks:pair,policy:this.entryEconomicPolicy()}}));
     if(!experimentAllowsFirstLeg(this.experiment,this.nowFn())
-      ||this.state.database!=='UP'||this.state.journalDegraded||this.overload.state==='FAIL_CLOSED')return this.dualMakerNoQuote('ENTRY_OR_RUNTIME');
+      ||this.state.database!=='UP'||this.state.journalDegraded||this.overload.state==='FAIL_CLOSED')return reject('ENTRY_OR_RUNTIME');
     const up=pair.UP,down=pair.DOWN,marketId=directionOrder.marketId;
     if(!up||!down||up.marketId!==marketId||down.marketId!==marketId
       ||!this.entryQualified.has(marketId)||this.firstLegLifecycleBlocked(marketId)
       ||!this.adapterTokenSynchronized(up.tokenId)||!this.adapterTokenSynchronized(down.tokenId)
       ||this.firstLegAdmissionReason({marketId,tokenId:up.tokenId,outcome:"UP"},up)
       ||this.firstLegAdmissionReason({marketId,tokenId:down.tokenId,outcome:"DOWN"},down)
-      ||!this.firstLegExpiryAdmission(marketId).eligible)return this.dualMakerNoQuote('BOOK_OR_OWNERSHIP');
+      ||!this.firstLegExpiryAdmission(marketId).eligible)return reject('BOOK_OR_OWNERSHIP',{
+        upReason:up?this.firstLegAdmissionReason({marketId,tokenId:up.tokenId,outcome:'UP'},up):'MISSING',
+        downReason:down?this.firstLegAdmissionReason({marketId,tokenId:down.tokenId,outcome:'DOWN'},down):'MISSING',
+        qualified:this.entryQualified.has(marketId),lifecycleBlocked:this.firstLegLifecycleBlocked(marketId),expiry:this.firstLegExpiryAdmission(marketId)});
     const fillZone=this.fillZoneAdmission(up,down);
-    if(fillZone.reason)return this.dualMakerNoQuote('PLANNER_'+fillZone.reason);
     const plan=planDualMakerQuotes({up,down,quantity:directionOrder.quantity,
       perSideRiskCapUsd:String(this.riskLimits.maxOrderSizeUsd),availableCashUsd:this.ledger.availableCash().toFixed(),
-      minPairNetRoi:FIRST_LEG_MIN_NET_ROI,nowMs:this.nowFn().getTime(),maxBookAgeMs:this.riskLimits.staleFeedTimeoutMs,
+      minPairNetRoi:this.entryEconomicPolicy().minNetRoi,nowMs:this.nowFn().getTime(),maxBookAgeMs:this.riskLimits.staleFeedTimeoutMs,
       costBound:this.env.PAPER_DUAL_MAKER_COST_BOUND_ENABLED,touchPricing:this.env.PAPER_DUAL_MAKER_TOUCH_PRICING_ENABLED});
-    if(!plan.plan)return this.dualMakerNoQuote('PLANNER_'+plan.reason);
+    if(!plan.plan)return reject('PLANNER_'+plan.reason,{fillZone});
+    if(fillZone.reason){
+      // One observed side can quote only when BOTH possible one-fill + current
+      // opposite ASK/FOK scenarios cover the same net ROI floor. No probability
+      // inferred from public flow and no optimistic PAPER fills.
+      const oneFlowing=[up,down].some(b=>this.touchFlowAt(b.tokenId,b.bids[0]!.price,this.nowFn().getTime()).count>=this.env.PAPER_DUAL_MAKER_MIN_EXACT_FLOW_PER_WINDOW);
+      if(this.env.PAPER_DUAL_MAKER_FLOW_POLICY!=='hedge_covered'||!oneFlowing
+        ||!plan.plan.worstCaseSingleFill?.up.covered||!plan.plan.worstCaseSingleFill.down.covered)
+        return reject('PLANNER_'+fillZone.reason,{fillZone,conditionalPlan:plan.plan});
+    }
+    const dualRisk=this.decideWithRuntimeBasis({candidate:{...directionOrder,strategyVersion:'roi1',limitPrice:plan.plan.up.price,
+      rawExpectedEdge:0,intent:'OPEN_FIRST_LEG',reasonCodes:['TWO_SIDED_MAKER']},consensus:HEDGE_CHECK_CONSENSUS,
+      triggerId:directionOrder.triggerId,signalExpiresAt:new Date(this.nowFn().getTime()+fillZone.ttlMs),snapshot:up,pair:{UP:up,DOWN:down},
+      now:this.nowFn(),databaseAvailable:this.state.database==='UP',suppressMakerFirst:true,orderTypeOverride:'MAKER',
+      dualPairEconomics:{netRoi:plan.plan.netPairRoi,netUsdPerShare:d(plan.plan.netPairPnlUsd).div(plan.plan.quantity).toNumber()}}).decision;
+    if(!dualRisk.risk.accepted)return reject('PAIR_RISK',{vetoes:dualRisk.risk.vetoes,conditionalPlan:plan.plan,fillZone});
+    const hedgeBuffers:Record<Outcome,string>={UP:'0',DOWN:'0'};
+    if(this.riskLimits.freshEntryNetRoiFloor!==undefined){
+      for(const book of [up,down]){
+        const hedge=walkBook(book.asks,directionOrder.quantity,undefined,'BUY');
+        if(!book.feeSchedule||!hedge.sufficientDepth)return reject('HEDGE_DEPTH_OR_FEE',{outcome:book.outcome});
+        const cost=d(hedge.notional).plus(calculateFee(directionOrder.quantity,hedge.vwap,'TAKER',book.feeSchedule));
+        const quoted=book.outcome==='UP'?plan.plan.up.reserveUsd:plan.plan.down.reserveUsd;
+        hedgeBuffers[book.outcome]=cost.gt(quoted)?cost.minus(quoted).toFixed():'0';
+      }
+      const required=d(plan.plan.combinedReserveUsd).plus(hedgeBuffers.UP).plus(hedgeBuffers.DOWN);
+      if(required.gt(this.ledger.availableCash()))return reject('HEDGE_RESERVE_CASH',{requiredCashUsd:required.toFixed(),hedgeBuffers});
+    }
     const group=createId('dual_pair'),ttl=fillZone.ttlMs;
     const expiry=this.marketsById.get(marketId)?.endDate;
     const end=Math.min(this.nowFn().getTime()+ttl,expiry?Date.parse(expiry)-PROTECTIVE_DE_RISK_PRE_EXPIRY_SAFETY_MS:Number.POSITIVE_INFINITY);
-    if(!Number.isFinite(end)||end<=this.nowFn().getTime()+this.env.PAPER_EXECUTION_LATENCY_MS)return this.dualMakerNoQuote('EXPIRY');
+    if(!Number.isFinite(end)||end<=this.nowFn().getTime()+this.env.PAPER_EXECUTION_LATENCY_MS)return reject('EXPIRY');
     // Omit the directional proof rather than assigning undefined: the latter
     // hashes a key that JSONB drops, making the persisted authority unverifiable.
     const {entryAdmission:_directionalProof,...dualBase}=directionOrder;
@@ -2875,10 +2929,11 @@ export class EngineService {
       makerFirst:{version:1,role:'FIRST_LEG',postOnly:true,dualGroupId:group,expiresAt:new Date(end).toISOString(),
         submissionLatencyMs:this.env.PAPER_EXECUTION_LATENCY_MS,tokenEpoch:this.adapterTokenEpoch(book.tokenId),
         postingBookEventId:book.eventId,takerReferencePrice:book.asks[0]!.price,
+        ...(this.riskLimits.freshEntryNetRoiFloor!==undefined?{hedgeCashBufferUsd:hedgeBuffers[book.outcome]}:{}),
         postingFeeKey:JSON.stringify([book.feeSchedule?.rate,book.feeSchedule?.exponent,book.feeSchedule?.takerOnly])},
     });
     const quotes=[build(up,plan.plan.up.price),build(down,plan.plan.down.price)];
-    if(!this.tryReserveFirstLegAdmission(marketId))return this.dualMakerNoQuote('OWNERSHIP');
+    if(!this.tryReserveFirstLegAdmission(marketId))return reject('OWNERSHIP');
     try{
       // A second reservation is allowed ONLY as the sibling of the same plan.
       // Each remains within the original durable cash / exposure fences.
@@ -2889,7 +2944,7 @@ export class EngineService {
         await this.reserveMaker(quote,quote.outcome==='UP'?up:down,'OPEN_FIRST_LEG',undefined,[{
           id:derivedAuditEventId(type,group),type,aggregateType:'dual_maker_plan',aggregateId:group,traceId:directionOrder.traceId,
           payload:{group,marketId,experimentId:this.experiment?.id??null,orderIds:quotes.map(q=>q.id),
-            conditionalPlan:plan.plan,postingBooks:{UP:up,DOWN:down}},
+            candidateId:directionOrder.id,conditionalPlan:plan.plan,fillZone,hedgeBuffers,postingBooks:{UP:up,DOWN:down}},
         }]);
       }
       this.recentTrades.set(duplicateKey,Date.now());
@@ -2930,8 +2985,17 @@ export class EngineService {
     return this.makerFirstConfig().twoSidedFreshEntries && this.makerFirstConfig().enabled;
   }
 
-  private dualMakerNoQuote(outcome:string):false{
-    this.metrics.dualMakerPlans.inc({outcome});return false;
+  private async dualMakerNoQuote(outcome:string,candidate:PaperOrder,evidence:Record<string,unknown>):Promise<false>{
+    this.metrics.dualMakerPlans.inc({outcome});
+    await this.persistReportInput(createJournalEvent({traceId:candidate.traceId,type:'DUAL_MAKER_PLAN_REJECTED',
+      aggregateType:'dual_maker_candidate',aggregateId:candidate.id,payload:{candidateId:candidate.id,
+        marketId:candidate.marketId,reason:outcome,directionalFallback:true,...evidence}}));
+    return false;
+  }
+
+  private entryEconomicPolicy(){
+    return {minNetRoi:this.riskLimits.freshEntryNetRoiFloor??FIRST_LEG_MIN_NET_ROI,
+      minPrice:this.riskLimits.freshEntryMinPrice??0.65};
   }
 
   private makerFirstConfig():{enabled:boolean;firstLegTtlMs:number;hedgeTtlMs:number;twoSidedFreshEntries:boolean}{
@@ -3062,6 +3126,8 @@ export class EngineService {
   }
 
   private onMakerTrade(trade:MarketTrade):Promise<void>|void{
+    if(this.rawEvidence&&this.experiment&&['RUNNING','ENTRY_CLOSED'].includes(this.experiment.status))
+      this.rawEvidence.record(this.experiment.id,{kind:'public_trade',trade});
     if(this.state.draining||!this.state.recoveryComplete||this.overload.hasIntegrityFault
       ||this.state.database!=='UP'||this.state.journalDegraded||!this.makerFirstConfig().enabled)return;
     this.recordMakerTouchFlow(trade);
@@ -3084,44 +3150,39 @@ export class EngineService {
    *  on a transparent FIFO book). */
   private recordMakerTouchFlow(trade: MarketTrade): void {
     if(!this.env.PAPER_DUAL_MAKER_FILL_ZONE_ADMISSION_ENABLED)return;
-    const windowMs=this.env.PAPER_DUAL_MAKER_FLOW_WINDOW_MS, list=this.makerTouchFlow.get(trade.tokenId)??[];
-    list.push({price:trade.price,qty:trade.quantity,ts:Date.parse(trade.sourceTimestamp)});
-    const cutoff=this.nowFn().getTime()-windowMs;
-    let i=0;while(i<list.length&&(list[i]!.ts<cutoff||list.length-i>4096))i++;
-    if(i>0)this.makerTouchFlow.set(trade.tokenId,list.slice(i));
-    else this.makerTouchFlow.set(trade.tokenId,list.slice(Math.max(0,list.length-4096)));
+    if(this.currentTokenIdFor(trade.marketId,trade.outcome)!==trade.tokenId)return;
+    this.makerTouchFlow.retain(this.tokenIdSet);
+    this.makerTouchFlow.record(trade,this.nowFn().getTime(),this.adapterTokenEpoch(trade.tokenId),this.adapterTokenSynchronized(trade.tokenId));
   }
 
-  /** Exact SELL flow at ONE price level inside the rolling window. */
   private touchFlowAt(tokenId:string, price:string, nowMs:number):{count:number;qty:string}{
-    const list=this.makerTouchFlow.get(tokenId)??[], windowMs=this.env.PAPER_DUAL_MAKER_FLOW_WINDOW_MS;
-    let count=0;let qty=d('0');
-    for(const e of list){if(nowMs-e.ts<=windowMs&&e.ts<=nowMs&&d(e.price).eq(price)){count++;qty=qty.plus(e.qty);}}
-    return {count,qty:qty.toFixed()};
+    return this.makerTouchFlow.at(tokenId,price,nowMs,this.adapterTokenEpoch(tokenId));
   }
 
   /** Fill-zone admission for a dual-maker plan (touch pricing only; no-op when
    *  disabled). Returns a rejection reason, or the bounded per-quote resting
    *  window scaled from measured touch flow and displayed depth. */
-  private fillZoneAdmission(up:MarketSnapshot,down:MarketSnapshot):{reason:string|null;ttlMs:number}{
+  private fillZoneAdmission(up:MarketSnapshot,down:MarketSnapshot):{reason:string|null;ttlMs:number;evidence?:Record<string,unknown>}{
     const base=this.makerFirstConfig().firstLegTtlMs;
     if(!this.env.PAPER_DUAL_MAKER_FILL_ZONE_ADMISSION_ENABLED)return {reason:null,ttlMs:base};
     const now=this.nowFn().getTime(),windowMs=this.env.PAPER_DUAL_MAKER_FLOW_WINDOW_MS,
       minCount=this.env.PAPER_DUAL_MAKER_MIN_EXACT_FLOW_PER_WINDOW,maxTtl=this.env.PAPER_DUAL_MAKER_MAX_QUOTE_TTL_MS;
     let ttl=base,reject:string|null=null;
+    const evidence:Record<string,unknown>={};
     for(const leg of [up,down]){
       const touch=leg.bids[0]?.price;
-      if(!touch)return {reason:'FILL_ZONE_NO_BID',ttlMs:base};
+      if(!touch){reject??='FILL_ZONE_NO_BID:'+leg.outcome;continue;}
       const flow=this.touchFlowAt(leg.tokenId,touch,now);
-      if(flow.count<minCount)return {reason:'FILL_ZONE_NO_FLOW:'+(leg.outcome==='UP'?'UP':'DOWN'),ttlMs:base};
       const depth=leg.bids.find(l=>d(l.price).eq(touch))?.quantity??'0';
       const perSec=windowMs>0?d(flow.qty).div(windowMs).mul(1000).toNumber():0;
-      if(perSec<=0)return {reason:'FILL_ZONE_NO_FLOW:'+(leg.outcome==='UP'?'UP':'DOWN'),ttlMs:base};
+      evidence[leg.outcome]={price:touch,flow,displayedQueue:depth,perSec,windowMs,
+        activationLatencyMs:this.env.PAPER_EXECUTION_LATENCY_MS,forecast:'HISTORICAL_QUEUE_CLEAR_TIME_NOT_FILL_PROBABILITY'};
+      if(flow.count<minCount||perSec<=0){reject??='FILL_ZONE_NO_FLOW:'+leg.outcome;continue;}
       const consumeMs=Math.ceil(d(depth).toNumber()/perSec*1000);
-      if(consumeMs>maxTtl)reject=reject??'FILL_ZONE_QUEUE_DEPTH:'+(leg.outcome==='UP'?'UP':'DOWN');
-      if(consumeMs>=base)ttl=Math.min(maxTtl,Math.max(ttl,consumeMs));
+      if(consumeMs+this.env.PAPER_EXECUTION_LATENCY_MS>maxTtl)reject??='FILL_ZONE_QUEUE_DEPTH:'+leg.outcome;
+      if(consumeMs>=base)ttl=Math.min(maxTtl,Math.max(ttl,consumeMs+this.env.PAPER_EXECUTION_LATENCY_MS));
     }
-    return {reason:reject,ttlMs:ttl};
+    return {reason:reject,ttlMs:ttl,evidence};
   }
 
   private async applyMakerTrade(trade:MarketTrade):Promise<void>{
@@ -3413,6 +3474,20 @@ export class EngineService {
     if (!this.isMarketSynchronized(trigger.marketId)) return;
     const pair = this.snapshots.get(trigger.marketId);
     if (!pair?.UP || !pair.DOWN) return;
+    // Pair economics own an admission path before directional fair/confidence,
+    // native HOLD, strategy candidate selection and directional price gates.
+    // This remains in the existing experiment boundary and durable executor.
+    if (this.riskLimits.freshEntryNetRoiFloor!==undefined && this.dualMakerEnabled() && experimentAllowsFirstLeg(this.experiment,this.nowFn())
+      && pair.UP.bids[0] && pair.DOWN.bids[0]) {
+      const maxPrice=d(pair.UP.bids[0].price).gte(pair.DOWN.bids[0].price)?d(pair.UP.bids[0].price):d(pair.DOWN.bids[0].price);
+      if(maxPrice.gt(0)){
+        const quantity=d(Math.min(5,this.riskLimits.maxOrderSizeUsd)).div(maxPrice).toFixed(8,1);
+        const seed:PaperOrder={id:createId('pair_candidate'),traceId:trigger.traceId,triggerId:trigger.id,
+          strategyId:'two-sided-maker-v1',marketId:trigger.marketId,tokenId:pair.UP.tokenId,outcome:'UP',side:'BUY',
+          orderType:'MAKER',requestedPrice:pair.UP.bids[0].price,quantity,status:'PENDING',createdAt:this.nowFn().toISOString()};
+        if(await this.trySubmitDualMakerPair(seed,`${trigger.marketId}:UP:OPEN_FIRST_LEG`,{UP:pair.UP,DOWN:pair.DOWN}))return;
+      }
+    }
     const asset = trigger.asset ?? this.assetByMarket.get(trigger.marketId) ?? pair.UP.asset ?? pair.DOWN.asset ?? null;
     const referenceContext = asset
       ? this.state.getReferenceContext(asset, this.nowFn().getTime(), this.riskLimits.staleFeedTimeoutMs)
@@ -4205,7 +4280,7 @@ export class EngineService {
     });
     const asset = trigger.asset ?? this.assetByMarket.get(candidate.marketId) ?? snapshot.asset ?? null;
     if (candidate.intent === "OPEN_FIRST_LEG") {
-      const entryReason = firstLegEntryFilterReason(decision.executablePrice, decision.expectedROI);
+      const entryReason = firstLegEntryFilterReason(decision.executablePrice, decision.expectedROI, this.entryEconomicPolicy());
       if (entryReason) {
         decision.accepted = false; decision.order = null; decision.risk.accepted = false;
         if (!decision.risk.vetoes.includes(entryReason)) decision.risk.vetoes.push(entryReason);
@@ -4262,6 +4337,10 @@ export class EngineService {
       executablePrice: decision.executablePrice,
       ...(calibration ? { alpha: calibration } : {}),
     } }));
+    if(candidate.intent==='OPEN_FIRST_LEG')await this.persistReportInput(createJournalEvent({traceId:trigger.traceId,
+      type:'ENTRY_CANDIDATE_EVALUATED',aggregateType:'entry_candidate',aggregateId:decision.risk.id,
+      payload:{candidateId:decision.risk.id,triggerId:trigger.id,marketId:candidate.marketId,candidate,
+        accepted:decision.accepted,vetoes:decision.risk.vetoes,alpha:calibration,books:{UP:pair.UP,DOWN:pair.DOWN},policy:this.entryEconomicPolicy()}}));
     if (!decision.accepted || !decision.order) {
       if(fallback)fallback.outcome='RISK_REJECTED:'+decision.risk.vetoes.join('|');
       for (const reason of decision.risk.vetoes) this.metrics.riskVetoes.inc({ reason });
@@ -4269,7 +4348,8 @@ export class EngineService {
       return;
     }
     this.record("RISK_ACCEPT", trigger.traceId, trigger.marketId, { orderId: decision.order.id, netEvUsdPerShare: decision.netEvUsdPerShare }, asset);
-    if(!fallback&&candidate.intent==="OPEN_FIRST_LEG" && await this.trySubmitDualMakerPair(decision.order,duplicateKey,{UP:pair.UP,DOWN:pair.DOWN}))return;
+    if(this.riskLimits.freshEntryNetRoiFloor===undefined&&!fallback&&candidate.intent==='OPEN_FIRST_LEG'
+      &&await this.trySubmitDualMakerPair(decision.order,duplicateKey,{UP:pair.UP,DOWN:pair.DOWN}))return;
     if(!fallback&&candidate.intent==='OPEN_FIRST_LEG'&&decision.order.makerFirst&&!decision.order.makerFirst.dualGroupId)
       this.makerEntryContinuations.set(decision.order.id,{trigger,consensus:decisionConsensus,native:decisionNative,experimentId:this.experiment!.id});
     if(fallback)fallback.childOrderId=decision.order.id;
@@ -4544,7 +4624,7 @@ export class EngineService {
           this.record("FIRST_LEG_REVALIDATION_REJECTED", order.traceId, order.marketId, { orderId: order.id, reason });
           return false;
         }
-        const economics = firstLegExecutionEconomics(order, admissionBook!, this.nowFn().getTime());
+        const economics = firstLegExecutionEconomics(order, admissionBook!, this.nowFn().getTime(), this.entryEconomicPolicy());
         if (economics.reason) {
           this.metrics.riskVetoes.inc({ reason: economics.reason });
           this.record("FIRST_LEG_REVALIDATION_REJECTED", order.traceId, order.marketId, { orderId: order.id, ...economics });
@@ -4650,7 +4730,7 @@ export class EngineService {
         if (intent === "OPEN_FIRST_LEG") {
           const reason = this.firstLegAdmissionReason(order, current);
           if (reason) throw new FirstLegLifecycleGuardRejectedError(order.marketId, reason);
-          const economics = firstLegExecutionEconomics(order, current, this.nowFn().getTime());
+          const economics = firstLegExecutionEconomics(order, current, this.nowFn().getTime(), this.entryEconomicPolicy());
           if (economics.reason) throw new FirstLegLifecycleGuardRejectedError(order.marketId, economics.reason);
         }
         if (intent === "PROTECTIVE_DE_RISK" || intent === "GUARDIAN_PROTECTIVE_SELL") {
@@ -4795,7 +4875,7 @@ export class EngineService {
     if (this.soakBlocksPostEntry(order.marketId) && (intent !== "OPEN_FIRST_LEG" || order.side !== "BUY"
       || (this.ledger.positions.get(order.marketId)?.unpairedOutcome
         && this.ledger.positions.get(order.marketId)!.unpairedOutcome !== order.outcome))) return;
-    const notional = makerReserveNotional(order.quantity, order.requestedPrice, snapshot.feeSchedule);
+    const notional = d(makerReserveNotional(order.quantity, order.requestedPrice, snapshot.feeSchedule)).plus(order.makerFirst?.hedgeCashBufferUsd??0).toFixed();
     const reservationBook=order.makerFirst?(this.state.marketSnapshots.get(order.tokenId)??snapshot):snapshot;
     const priorReserve = await this.journal.readDurableByOperationKey(`maker:${order.id}:reserve`);
     const compactedRetry = Boolean(priorReserve && Object.keys(priorReserve.payload).length === 0);
@@ -4852,6 +4932,12 @@ export class EngineService {
                 throw new FirstLegLifecycleGuardRejectedError(order.marketId,'DUAL_PLAN_SUPERSEDED');
               const entryReason=this.firstLegExecutionReason(order,current!,this.nowFn());
               if(entryReason)throw new FirstLegLifecycleGuardRejectedError(order.marketId,entryReason);
+              if(order.makerFirst.hedgeCashBufferUsd!==undefined){
+                const hedge=walkBook(current!.asks,order.quantity,undefined,'BUY');
+                const hedgeCash=current!.feeSchedule&&hedge.sufficientDepth
+                  ?d(hedge.notional).plus(calculateFee(order.quantity,hedge.vwap,'TAKER',current!.feeSchedule)):null;
+                if(!hedgeCash||hedgeCash.gt(notional))throw new FirstLegLifecycleGuardRejectedError(order.marketId,'DUAL_HEDGE_CASH_CHANGED');
+              }
             }
             const exposureReason=this.pendingEntryExposureReason(order);
             if(exposureReason)throw new FirstLegLifecycleGuardRejectedError(order.marketId,exposureReason);
@@ -4865,7 +4951,7 @@ export class EngineService {
           const current = this.state.marketSnapshots.get(order.tokenId);
           const reason = current ? this.firstLegExecutionReason(order, current, this.nowFn()) : "ENTRY_BOOK_UNAVAILABLE";
           if (reason) throw new FirstLegLifecycleGuardRejectedError(order.marketId, reason);
-          const economics = firstLegExecutionEconomics(order, current!, this.nowFn().getTime());
+          const economics = firstLegExecutionEconomics(order, current!, this.nowFn().getTime(), this.entryEconomicPolicy());
           if (economics.reason) throw new FirstLegLifecycleGuardRejectedError(order.marketId, economics.reason);
         }
         if (this.ledger.availableCash().lt(notional)) {
@@ -5063,7 +5149,7 @@ export class EngineService {
     if (reserved && fill.liquidityRole === "MAKER" && !compactedRetry) {
       const fillCost = d(fill.quantity).mul(fill.fillPrice).plus(fill.feeUsd);
       const next = d(reserved).minus(fillCost);
-      reservationAfter = next.gt(0) ? decimal(next) : null;
+      reservationAfter = extras.restingAfter && d(extras.restingAfter.remaining).lte(0) ? null : next.gt(0) ? decimal(next) : null;
     }
     const previous = this.ledger.positions.get(fill.marketId);
     const positionId = previous?.id ?? stablePositionId(fill.marketId);
@@ -5325,7 +5411,7 @@ export class EngineService {
                   ...(executionOrder.makerFirst?.dualGroupId
                     ? { entryPolicy:"TWO_SIDED_MAKER",dualGroupId:executionOrder.makerFirst.dualGroupId,
                         executablePrice:fill.fillPrice,quantity:fill.quantity,reason:null,conditionalPairOnly:true }
-                    : firstLegExecutionEconomics({ ...executionOrder, quantity: fill.quantity }, executionBook, executionAt.getTime())),
+                    : firstLegExecutionEconomics({ ...executionOrder, quantity: fill.quantity }, executionBook, executionAt.getTime(), this.entryEconomicPolicy())),
                   checkedAt: executionAt.toISOString(), book: { marketId: executionBook.marketId, tokenId: executionBook.tokenId,
                     outcome: executionBook.outcome, eventId: executionBook.eventId, sequence: executionBook.sequence, hash: executionBook.hash,
                     sourceTimestamp: executionBook.sourceTimestamp, receivedAt: executionBook.receivedAt, wsCallbackAt: executionBook.wsCallbackAt ?? null },
@@ -7309,6 +7395,7 @@ export class EngineService {
     suppressMakerFirst?: boolean;
     /** Continuation of the identical cancelled quote, not a new alpha entry. */
     ownMakerCooldownAt?: number;
+    dualPairEconomics?: {netRoi:number;netUsdPerShare:number};
   }): { decision: ReturnType<typeof decidePaperOrder>; duplicateKey: string } {
     const { candidate, consensus, triggerId, signalExpiresAt, snapshot, pair, now, databaseAvailable, assetOverride } = input;
     const duplicateKey = `${candidate.marketId}:${candidate.outcome}:${candidate.intent}`;
@@ -7340,6 +7427,7 @@ export class EngineService {
       signalExpiresAt,
       orderType: input.orderTypeOverride ?? this.env.PAPER_EXECUTION_STYLE,
       baseRisk: {
+        ...(input.dualPairEconomics?{dualPairEconomics:input.dualPairEconomics}:{}),
         now, marketFeedAt,
         btcFeedAt: asset === "BTC" ? referenceFeedAt ?? dateOrNull(this.state.lastBtcMessageAt) : now,
         referenceFeedAt, referenceRequired, asset, assetExposureUsd: exposure.asset,
@@ -7388,7 +7476,7 @@ export class EngineService {
     if(!input.suppressMakerFirst&&makerConfig.enabled&&role&&decision.accepted&&decision.order?.orderType==='TAKER'
       &&!this.confirmedGuardianProtection(candidate.marketId)){
       const price=passiveMakerBuyPrice(snapshot,candidate.quantity,candidate.limitPrice);
-      if(price&&(role!=='FIRST_LEG'||!firstLegEntryFilterReason(price,decision.expectedROI))&&decision.bookVwap){
+      if(price&&(role!=='FIRST_LEG'||!firstLegEntryFilterReason(price,decision.expectedROI,this.entryEconomicPolicy()))&&decision.bookVwap){
         const improved=d(candidate.rawEdgeUsdPerShare??candidate.rawExpectedEdge).plus(decision.bookVwap).minus(price).toNumber();
         const maker=decidePaperOrder({...paperInput,orderType:'MAKER',candidate:{...candidate,rawEdgeUsdPerShare:improved,rawExpectedEdge:improved}});
         if(maker.accepted&&maker.order&&maker.netEvUsdTotal!==null&&decision.netEvUsdTotal!==null&&d(maker.netEvUsdTotal).gt(decision.netEvUsdTotal)){
@@ -9787,6 +9875,11 @@ private buildEarlyAudit(
   }
 
   private async commitExperimentStatus(next: ExperimentManifest): Promise<void> {
+    if(next.status==='COMPLETED'&&this.rawEvidence){
+      await this.rawEvidence.close();
+      await this.persistReportInput(createJournalEvent({traceId:next.id,type:'RAW_EVIDENCE_STATUS',aggregateType:'experiment',
+        aggregateId:next.id,payload:{...this.rawEvidence.status(),experimentId:next.id}}));
+    }
     const type = next.status === "ENTRY_CLOSED" ? "EXPERIMENT_ENTRY_CLOSED"
       : next.status === "COMPLETED" ? "EXPERIMENT_COMPLETED"
       : null;

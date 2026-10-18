@@ -361,6 +361,8 @@ export const paperOrderSchema = z.object({
     postingFeeKey: z.string().optional(),
     /** Two coordinated passive first quotes. One may become the opposite hedge only after an authoritative first fill. */
     dualGroupId: idSchema.optional(),
+    /** Extra canonical cash held for replacing this dual quote with a full ASK/FOK hedge. */
+    hedgeCashBufferUsd: decimalStringSchema.optional(),
   }).optional(),
   entryAdmission: z.object({ fairProbability: z.number().finite().min(0).max(1), signalExpiresAt: timestampSchema }).optional(),
   id: idSchema,

@@ -67,8 +67,8 @@ export function costBoundMakerBuyPrice(input: {
   const opposite = input.opposite;
   if (!opposite.asks.length) return { reason: "NO_OPPOSITE_ASK" };
   if (!opposite.feeSchedule) return { reason: "NO_OPPOSITE_FEE_SCHEDULE" };
-  if (!opposite.tickSize || d(opposite.tickSize).lte(0)) return { reason: "NO_TICK_SIZE" };
-  const tick = d(opposite.tickSize);
+  if (!input.book.tickSize || d(input.book.tickSize).lte(0) || !opposite.tickSize || d(opposite.tickSize).lte(0)) return { reason: "NO_TICK_SIZE" };
+  const tick = d(input.book.tickSize);
   // Worst-case hedge: TAKER BUY of the full residual from the opposite ASK.
   const walk = walkBook(opposite.asks, q, undefined, "BUY");
   if (!walk.sufficientDepth || d(walk.filledQuantity).lt(q)) return { reason: "INSUFFICIENT_OPPOSITE_DEPTH" };
@@ -113,7 +113,7 @@ export function singleFillHedgeEconomics(input: {
   const price = d(input.price);
   const makerFee = d(input.makerFeeUsd);
   const walk = walkBook(input.opposite.asks, q, undefined, "BUY");
-  if (!walk.sufficientDepth || d(walk.filledQuantity).lt(q)) {
+  if (!input.opposite.feeSchedule || !walk.sufficientDepth || d(walk.filledQuantity).lt(q)) {
     // The residual cannot be fully hedged at the opposite ASK: the worst case is
     // an unhedged tail, which is never covered.
     return { covered: false, netRoi: Number.NEGATIVE_INFINITY, residualNetUsd: "0", hedgeCostUsd: "0" };
