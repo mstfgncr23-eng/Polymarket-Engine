@@ -4,7 +4,7 @@ import { MemoryEventJournal } from "@pm/db";
 import { EngineService } from "../apps/engine/src/engine.js";
 import { NoopGrokActivationBridge } from "../apps/engine/src/activation/index.js";
 import { ScriptedMarketAdapter, ScriptedReferenceRegistry, discoveryReport, qualified, qualifiedPaperEnv, paperFill } from "./paper-engine-testkit.js";
-import { snapshot, order } from "./fixtures.js";
+import { snapshot } from "./fixtures.js";
 
 const START = Date.parse("2026-10-05T00:00:00.000Z");
 const MARKET = "trail-mkt";
@@ -19,7 +19,7 @@ type Internals = {
 };
 const internal = (engine: EngineService) => engine as unknown as Internals;
 
-async function start(journal = new MemoryEventJournal(), clock = { ms: START }, overrides:Record<string,string> = {}) {
+async function start(journal = new MemoryEventJournal(), clock = { ms: START }) {
   const market = new ScriptedMarketAdapter();
   market.queue(discoveryReport([qualified(MARKET, "SOL", UP, DOWN, new Date(START + 3_600_000).toISOString())]));
   const errors: Array<{ detail: unknown; message?: string }> = [];
@@ -32,7 +32,6 @@ async function start(journal = new MemoryEventJournal(), clock = { ms: START }, 
     PROFIT_TRAILING_PAIR_SOAK_ENABLED: "true",
     PROFIT_TRAILING_PAIR_ARM_EDGE: "0.05",
     PROFIT_TRAILING_PAIR_RETRACE_EDGE: "0.02",
-    ...overrides,
   }), journal, { error: (detail: unknown, message?: string) => { errors.push({ detail, ...(message ? { message } : {}) }); } }, {
     market: market as never,
     referenceRegistry: new ScriptedReferenceRegistry() as never,
@@ -282,60 +281,5 @@ describe("profit trailing pair PAPER authority", () => {
       const fills = await s.journal.queryEvents({ types: ["PAPER_FILL"] });
       expect(fills.filter((row) => row.payload.intent === "HEDGE_SECOND_LEG")).toHaveLength(1);
     } finally { await s.engine.stop(); }
-  });
-});
-
-
-describe("net ROI pair lock in the canonical engine",()=>{
-  it("locks a 96 cent first leg below the legacy arm, with both fees",async()=>{
-    const s=await start(undefined,undefined,{PAPER_PROFIT_PAIR_NET_ROI_FLOOR:"0.01"});
-    try{
-      expect((await s.engine.beginExperiment()).ok).toBe(true);
-      await s.engine.applyObservedFill(paperFill(MARKET,"UP","0.96",{tokenId:UP,quantity:"5",feeUsd:"0.01344",timestamp:new Date(s.clock.ms).toISOString()}));
-      await s.market.emitSnapshot(book(s,"UP","0.98",1));
-      await s.market.emitSnapshot(book(s,"DOWN","0.02",1));
-      await waitFor(s,"net pair lock",()=>s.engine.ledger.positions.get(MARKET)?.unpairedQuantity==="0");
-      const fills=await s.journal.queryEvents({types:["PAPER_FILL"]});
-      expect(fills.filter(e=>e.payload.intent==="HEDGE_SECOND_LEG")).toHaveLength(1);
-      const orders=await s.journal.queryEvents({types:["PAPER_ORDER_CREATED"]});
-      expect(orders.some(e=>e.payload.strategyId==="profit-trailing-pair-target"&&e.payload.orderType==="TAKER")).toBe(true);
-    }finally{await s.engine.stop();}
-  });
-  it("rejects a positive gross edge below the net floor",async()=>{
-    const s=await start(undefined,undefined,{PAPER_PROFIT_PAIR_NET_ROI_FLOOR:"0.01"});
-    try{
-      await s.engine.beginExperiment();
-      await s.engine.applyObservedFill(paperFill(MARKET,"UP","0.96",{tokenId:UP,quantity:"5",feeUsd:"0.01344",timestamp:new Date(s.clock.ms).toISOString()}));
-      await s.market.emitSnapshot(book(s,"UP","0.98",1));
-      await s.market.emitSnapshot(book(s,"DOWN","0.03",1));
-      await new Promise(resolve=>setTimeout(resolve,25));
-      expect(s.engine.ledger.positions.get(MARKET)?.unpairedQuantity).toBe("5");
-      expect((await s.journal.queryEvents({types:["PAPER_FILL"]})).filter(e=>e.payload.intent==="HEDGE_SECOND_LEG")).toHaveLength(0);
-    }finally{await s.engine.stop();}
-  });
-});
-
-
-describe("net pair lock boundary revalidation",()=>{
-  it("rejects adverse fill prices, partial fills, fee changes and the expiry boundary",async()=>{
-    const s=await start(undefined,undefined,{PAPER_PROFIT_PAIR_NET_ROI_FLOOR:"0.01"});
-    const controller=s.engine as unknown as {
-      kickProfitTrailingPair(market:string):void;
-      netPairLockOrderReason(o:ReturnType<typeof order>,f?:ReturnType<typeof paperFill>):string|null;
-    };
-    try{
-      controller.kickProfitTrailingPair=()=>{};
-      await s.engine.beginExperiment();
-      await s.engine.applyObservedFill(paperFill(MARKET,"UP","0.96",{tokenId:UP,quantity:"5",feeUsd:"0.01344",timestamp:new Date(s.clock.ms).toISOString()}));
-      await s.market.emitSnapshot(book(s,"UP","0.98",1));
-      await s.market.emitSnapshot(book(s,"DOWN","0.02",1));
-      const o=order("TAKER",{marketId:MARKET,tokenId:DOWN,outcome:"DOWN",strategyId:"profit-trailing-pair-target",quantity:"5",requestedPrice:"0.02"});
-      expect(controller.netPairLockOrderReason(o)).toBe(null);
-      expect(controller.netPairLockOrderReason(o,paperFill(MARKET,"DOWN","0.04",{tokenId:DOWN,quantity:"5",feeUsd:"0.01344"}))).toBe("NET_PAIR_LOCK_FILL_ROI_BELOW_FLOOR");
-      expect(controller.netPairLockOrderReason(o,paperFill(MARKET,"DOWN","0.02",{tokenId:DOWN,quantity:"4"}))).toBe("NET_PAIR_LOCK_PARTIAL_FILL");
-      expect(controller.netPairLockOrderReason(o,paperFill(MARKET,"DOWN","0.02",{tokenId:DOWN,quantity:"5",feeUsd:"0.1"}))).toBe("NET_PAIR_LOCK_FILL_ROI_BELOW_FLOOR");
-      s.clock.ms=START+3600000-80000;
-      expect(controller.netPairLockOrderReason(o)).toBe("NET_PAIR_LOCK_STATE_CHANGED");
-    }finally{await s.engine.stop();}
   });
 });

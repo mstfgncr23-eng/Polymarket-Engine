@@ -5,16 +5,6 @@ import { firstLegEntryFilterReason, firstLegExecutionEconomics } from "../apps/e
 import { MakerTouchFlow } from "../apps/engine/src/maker-touch-flow.js";
 
 const policy={minNetRoi:0.01,minPrice:0};
-describe("mandatory exit fee forecast budget",()=>{
-  it.each(["TAKER","MAKER"] as const)("revalidates %s entry with a full-cycle budget",type=>{
-    const b=snapshot({bids:[{price:"0.95",quantity:"1000"}],asks:[{price:type==="MAKER"?"0.96":"0.95",quantity:"1000"}]});
-    const o=order(type,{requestedPrice:"0.95",quantity:"5",entryAdmission:{fairProbability:0.97,signalExpiresAt:new Date(now.getTime()+60000).toISOString()},
-      ...(type==="MAKER"?{makerFirst:{version:1,role:"FIRST_LEG",postOnly:true,expiresAt:new Date(now.getTime()+2000).toISOString(),submissionLatencyMs:150,tokenEpoch:1,postingBookEventId:"b",takerReferencePrice:"0.96"}}:{})});
-    expect(firstLegExecutionEconomics(o,b,now.getTime(),policy).reason).toBe(null);
-    expect(firstLegExecutionEconomics(o,b,now.getTime(),{...policy,reserveExitFee:true}).reason).toBe("FIRST_LEG_NET_ROI_BELOW_FLOOR");
-    expect(firstLegExecutionEconomics({...o,entryAdmission:{...o.entryAdmission!,fairProbability:0.99}},b,now.getTime(),{...policy,reserveExitFee:true}).reason).toBe(null);
-  });
-});
 const limits=riskLimitsSchema.parse({freshEntryNetRoiFloor:policy.minNetRoi,freshEntryMinPrice:policy.minPrice});
 describe("explicit ROI1 entry policy",()=>{
   it.each([0.29,0.6499,0.65,0.89999,0.9,0.97])("uses one decimal net return floor at price %s",price=>{

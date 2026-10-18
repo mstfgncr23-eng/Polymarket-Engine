@@ -364,9 +364,6 @@ export const paperOrderSchema = z.object({
     /** Extra canonical cash held for replacing this dual quote with a full ASK/FOK hedge. */
     hedgeCashBufferUsd: decimalStringSchema.optional(),
   }).optional(),
-  pairLockAdmission: z.object({ minNetRoi: z.number().positive().max(1),
-    expectedLockedPnlUsd: decimalStringSchema, expectedTotalCostUsd: decimalStringSchema,
-    upBookEventId: idSchema, downBookEventId: idSchema }).optional(),
   entryAdmission: z.object({ fairProbability: z.number().finite().min(0).max(1), signalExpiresAt: timestampSchema }).optional(),
   id: idSchema,
   traceId: idSchema,

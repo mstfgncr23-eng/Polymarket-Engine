@@ -648,18 +648,11 @@ export class EngineService {
       referenceRapidMoveBps: this.triggerConfig.referenceRapidMoveBps,
     };
     this.riskLimits = riskLimitsSchema.parse({
-      freshEntryExitFeeMode: env.PAPER_ENTRY_EXIT_FEE_MODE,
-      freshEntryPreferExecutableNetEdge: env.PAPER_FIRST_LEG_PREFER_EXECUTABLE_NET_EDGE,
-      freshEntryExitFeeReserve: env.PAPER_ENTRY_EXIT_FEE_RESERVE,
       ...(env.PAPER_ENTRY_NET_ROI_FLOOR!==undefined?{freshEntryNetRoiFloor:env.PAPER_ENTRY_NET_ROI_FLOOR}:{}),
       ...(env.PAPER_ENTRY_MIN_PRICE!==undefined?{freshEntryMinPrice:env.PAPER_ENTRY_MIN_PRICE}:{}),
       maxExternalSignalsPerMinute: env.GROK_MCP_RATE_LIMIT_PER_MINUTE,
       normalHedgeMinLockedPairEdge: env.NORMAL_HEDGE_MIN_LOCKED_PAIR_EDGE,
     });
-    if (env.PAPER_PROFIT_PAIR_NET_ROI_FLOOR !== undefined && !env.PROFIT_TRAILING_PAIR_SOAK_ENABLED)
-      throw new Error("NET_PAIR_LOCK_REQUIRES_PROFIT_PAIR_SOAK");
-    if (env.PAPER_FIRST_LEG_PREFER_EXECUTABLE_NET_EDGE && (env.PAPER_ENTRY_NET_ROI_FLOOR === undefined || !env.PAPER_ENTRY_EXIT_FEE_RESERVE))
-      throw new Error("EXECUTABLE_NET_EDGE_REQUIRES_EXPLICIT_FULL_CYCLE_POLICY");
     this.makerTouchFlow = new MakerTouchFlow(env.PAPER_DUAL_MAKER_FLOW_WINDOW_MS);
     this.rawEvidence = env.PAPER_RAW_EVIDENCE_ENABLED ? new RawEvidence(env.LOCAL_ARCHIVE_DIR,64*1024**2,env.PAPER_RAW_EVIDENCE_MAX_COMPRESSED_BYTES) : null;
     if (env.PROFIT_TRAILING_PAIR_SOAK_ENABLED
@@ -1236,7 +1229,6 @@ export class EngineService {
           profitTrailingPairArmEdge: this.env.PROFIT_TRAILING_PAIR_ARM_EDGE,
           profitTrailingPairRetraceEdge: this.env.PROFIT_TRAILING_PAIR_RETRACE_EDGE,
           profitTrailingPairExecutionStyle: "TAKER",
-          ...(this.env.PAPER_PROFIT_PAIR_NET_ROI_FLOOR === undefined ? {} : {profitPairNetRoiFloor:this.env.PAPER_PROFIT_PAIR_NET_ROI_FLOOR}),
           makerFirst: {enabled:this.env.PAPER_MAKER_FIRST_ENABLED,firstLegTtlMs:this.env.PAPER_MAKER_FIRST_QUOTE_TTL_MS,
             hedgeTtlMs:this.env.PAPER_MAKER_HEDGE_QUOTE_TTL_MS,fillModel:'public-trade-queue-50pct',twoSidedFreshEntries:this.env.PAPER_DUAL_SIDED_MAKER_ENABLED,
             flowPolicy:this.env.PAPER_DUAL_MAKER_FLOW_POLICY,flowWindowMs:this.env.PAPER_DUAL_MAKER_FLOW_WINDOW_MS,
@@ -3002,7 +2994,7 @@ export class EngineService {
   }
 
   private entryEconomicPolicy(){
-    return {exitFeeMode:this.riskLimits.freshEntryExitFeeMode,reserveExitFee:this.riskLimits.freshEntryExitFeeReserve,minNetRoi:this.riskLimits.freshEntryNetRoiFloor??FIRST_LEG_MIN_NET_ROI,
+    return {minNetRoi:this.riskLimits.freshEntryNetRoiFloor??FIRST_LEG_MIN_NET_ROI,
       minPrice:this.riskLimits.freshEntryMinPrice??0.65};
   }
 
@@ -4308,8 +4300,6 @@ export class EngineService {
       tradedOutcome: executableFair.consensusOutcome,
       usedComplement: executableFair.usedComplement,
       executionStyle,
-      exitFeeReserveUsd: decision.exitFeeReserveUsd ?? "0",
-      executionChoiceReason: decision.executionChoiceReason ?? "LEGACY_MAKER_FIRST",
       ...(executionStyle === "MAKER"
         ? {
           makerLimitPrice: decision.order?.requestedPrice ?? snapshot.bids[0]?.price ?? candidate.limitPrice,
@@ -4600,7 +4590,7 @@ export class EngineService {
         : undefined;
       const profitTrailingStillOwns = profitTrailingOrder
         && this.profitTrailingRetainsAuthority(order.marketId, posAtAdmission, this.nowFn().getTime());
-      if (profitTrailingOrder && (!profitTrailingStillOwns || this.netPairLockOrderReason(order))) {
+      if (profitTrailingOrder && !profitTrailingStillOwns) {
         this.record("HEDGE_SUPPRESSED_RESCUE_EXCLUSIVE", order.traceId, order.marketId, {
           unpairedOutcome: posAtAdmission?.unpairedOutcome ?? null,
           reason: "PROFIT_TRAILING_AUTHORITY_EXPIRED",
@@ -4779,9 +4769,6 @@ export class EngineService {
             throw new RiskReductionLifecycleGuardRejectedError(order.marketId, durableOwner.intent, "ADMITTED_RESIDUAL_CHANGED");
           }
         }
-        const netLockReason = this.netPairLockOrderReason(order);
-        if (intent === "HEDGE_SECOND_LEG" && netLockReason)
-          throw new RiskReductionLifecycleGuardRejectedError(order.marketId, intent, netLockReason);
         const takerFill = executePaperTaker({ order, snapshotAfterLatency: current, measuredLatencyMs: this.env.PAPER_EXECUTION_LATENCY_MS });
         if (durableOwner) takerFill.id = `risk-reduction-fill:${order.id}`;
         if (intent === "OPEN_FIRST_LEG") takerFill.id = `first-leg-fill:${order.id}`;
@@ -5253,10 +5240,6 @@ export class EngineService {
             }
           }
 
-          if (economicIntent === "HEDGE_SECOND_LEG" && executionOrder) {
-            const netLockReason = this.netPairLockOrderReason(executionOrder, fill);
-            if (netLockReason) throw new RiskReductionLifecycleGuardRejectedError(fill.marketId, economicIntent, netLockReason);
-          }
           if (economicIntent === "HEDGE_SECOND_LEG" || economicIntent === "PROTECTIVE_DE_RISK" || economicIntent === "RESCUE_SECOND_LEG" || economicIntent === "GUARDIAN_PROTECTIVE_SELL") {
             if (economicIntent !== "GUARDIAN_PROTECTIVE_SELL" && this.confirmedGuardianProtection(fill.marketId)) {
               throw new RiskReductionLifecycleGuardRejectedError(fill.marketId, economicIntent, "GUARDIAN_PRIORITY");
@@ -6801,7 +6784,7 @@ export class EngineService {
     return { status: outcome.status === "PERSISTED" ? "PERSISTED" : "REPLAY" };
   }
 
-  private profitTrailingPairConfig(): { target: number; arm: number; retrace: number; netRoiTarget?: number } | null {
+  private profitTrailingPairConfig(): { target: number; arm: number; retrace: number } | null {
     if (!this.profitTrailingPairSoakEnabled()) return null;
     const risk = this.experiment!.riskConfiguration;
     const target = Number(risk.profitTrailingPairTargetEdge ?? risk.normalHedgeMinLockedPairEdge);
@@ -6809,9 +6792,7 @@ export class EngineService {
     const retrace = Number(risk.profitTrailingPairRetraceEdge);
     if (!Number.isFinite(target) || !Number.isFinite(arm) || !Number.isFinite(retrace)
       || target <= 0 || arm < 0 || retrace <= 0 || arm >= target || retrace >= target) return null;
-    const netRoiTarget = risk.profitPairNetRoiFloor === undefined ? undefined : Number(risk.profitPairNetRoiFloor);
-    if (netRoiTarget !== undefined && (!Number.isFinite(netRoiTarget) || netRoiTarget <= 0 || netRoiTarget > 1)) return null;
-    return { target, arm, retrace, ...(netRoiTarget === undefined ? {} : {netRoiTarget}) };
+    return { target, arm, retrace };
   }
 
   private profitTrailingPairOpportunity(marketId: string, position: Position, now: Date): {
@@ -6819,7 +6800,6 @@ export class EngineService {
     opposite: MarketSnapshot;
     grossEdge: string;
     lockedPnl: string;
-    lockedCost: string;
     worstPrice: string;
   } | null {
     if (!position.unpairedOutcome || d(position.unpairedQuantity).lte(0)
@@ -6838,27 +6818,7 @@ export class EngineService {
     const grossEdge = d(1).minus(firstAverage).minus(walk.vwap).toFixed();
     const fee = calculateFee(quantity, walk.vwap, "TAKER", opposite.feeSchedule);
     const lockedPnl = quantity.mul(grossEdge).minus(position.totalFees).minus(fee).toFixed();
-    const lockedCost = quantity.mul(firstAverage).plus(walk.notional).plus(position.totalFees).plus(fee).toFixed();
-    return { pair: { UP: up, DOWN: down }, opposite, grossEdge, lockedPnl, lockedCost, worstPrice: walk.worstPrice };
-  }
-
-  /** Same single owner/executor; recheck both current FOK book and actual fill before commit. */
-  private netPairLockOrderReason(order: PaperOrder, fill?: Parameters<PaperLedger["applyFill"]>[0]): string | null {
-    const floor = this.profitTrailingPairConfig()?.netRoiTarget;
-    if (floor === undefined || !["profit-trailing-pair-target", "profit-trailing-pair-trail"].includes(order.strategyId)) return null;
-    const position = this.ledger.positions.get(order.marketId);
-    if (!position?.unpairedOutcome || !d(order.quantity).eq(position.unpairedQuantity)
-      || order.side !== "BUY" || order.outcome === position.unpairedOutcome
-      || !this.profitTrailingRetainsAuthority(order.marketId, position)) return "NET_PAIR_LOCK_STATE_CHANGED";
-    const opportunity = this.profitTrailingPairOpportunity(order.marketId, position, this.nowFn());
-    if (!opportunity || d(opportunity.lockedPnl).lt(d(opportunity.lockedCost).mul(floor))) return "NET_PAIR_LOCK_ROI_BELOW_FLOOR";
-    if (fill) {
-      if (!d(fill.quantity).eq(position.unpairedQuantity)) return "NET_PAIR_LOCK_PARTIAL_FILL";
-      const firstAverage = position.unpairedOutcome === "UP" ? position.averageUpCost : position.averageDownCost;
-      const cost = d(fill.quantity).mul(d(firstAverage).plus(fill.fillPrice)).plus(position.totalFees).plus(fill.feeUsd);
-      if (d(fill.quantity).minus(cost).lt(cost.mul(floor))) return "NET_PAIR_LOCK_FILL_ROI_BELOW_FLOOR";
-    }
-    return null;
+    return { pair: { UP: up, DOWN: down }, opposite, grossEdge, lockedPnl, worstPrice: walk.worstPrice };
   }
 
   private kickProfitTrailingPair(marketId: string): void {
@@ -6906,7 +6866,6 @@ export class EngineService {
         now,
         currentGrossEdge: opportunity.grossEdge,
         currentLockedPnl: opportunity.lockedPnl,
-        currentLockedCost: opportunity.lockedCost, netRoiTarget: config.netRoiTarget,
         targetEdge: config.target,
         armEdge: config.arm,
         retraceEdge: config.retrace,
@@ -6959,7 +6918,6 @@ export class EngineService {
         now: latestNow,
         currentGrossEdge: latest.grossEdge,
         currentLockedPnl: latest.lockedPnl,
-        currentLockedCost: latest.lockedCost, netRoiTarget: config.netRoiTarget,
         targetEdge: config.target,
         armEdge: config.arm,
         retraceEdge: config.retrace,
@@ -7002,31 +6960,19 @@ export class EngineService {
         now: latestNow,
         databaseAvailable: this.state.database === "UP",
         orderTypeOverride: "TAKER",
-        allowMakerFirstHedge:config.netRoiTarget===undefined&&!dualSibling.length&&!this.profitTrailingPairStates.get(marketId)?.makerAttemptedAt,
+        allowMakerFirstHedge:!dualSibling.length&&!this.profitTrailingPairStates.get(marketId)?.makerAttemptedAt,
         profitTrailingLockedPnlUsd: latest.lockedPnl,
       });
       this.record("PROFIT_TRAILING_PAIR_EVALUATION", latestPosition.id, marketId, {
         action: latestEvaluation.action, accepted: decision.accepted, vetoes: decision.risk.vetoes,
         grossEdge: latest.grossEdge, lockedPnl: latest.lockedPnl,
-        totalCostUsd: latest.lockedCost, netRoiTarget: config.netRoiTarget ?? null,
         highWaterEdge: this.profitTrailingPairStates.get(marketId)?.highWaterEdge ?? null,
         targetEdge: config.target, armEdge: config.arm, retraceEdge: config.retrace,
       }, this.assetByMarket.get(marketId) ?? null);
-      if (config.netRoiTarget !== undefined) await this.persistReportInput(createJournalEvent({
-        traceId: latestPosition.id, type: "PROFIT_TRAILING_PAIR_EVALUATION", aggregateType: "position", aggregateId: latestPosition.id,
-        payload: { experimentId: this.experiment?.id ?? null, marketId, positionId: latestPosition.id,
-          proposedOrderId: decision.order?.id ?? null, accepted: decision.accepted, vetoes: decision.risk.vetoes,
-          policy: "NET_PAIR_ROI", minNetRoi: config.netRoiTarget, lockedPnlUsd: latest.lockedPnl,
-          totalCostUsd: latest.lockedCost, upBookEventId: latest.pair.UP.eventId, downBookEventId: latest.pair.DOWN.eventId },
-      }));
       if (!decision.accepted || !decision.order) {
         this.noteProfitTrailingRejectedEvidence(marketId, latestPosition, latestNow.getTime());
         return;
       }
-      if (config.netRoiTarget !== undefined) decision.order.pairLockAdmission = {
-        minNetRoi: config.netRoiTarget, expectedLockedPnlUsd: latest.lockedPnl, expectedTotalCostUsd: latest.lockedCost,
-        upBookEventId: latest.pair.UP.eventId, downBookEventId: latest.pair.DOWN.eventId,
-      };
       if(decision.order.makerFirst){
         const current=this.profitTrailingPairStates.get(marketId);
         if(!current||current.makerAttemptedAt)return;
@@ -7225,7 +7171,6 @@ export class EngineService {
       now,
       currentGrossEdge: opportunity.grossEdge,
       currentLockedPnl: opportunity.lockedPnl,
-      currentLockedCost: opportunity.lockedCost, netRoiTarget: config.netRoiTarget,
       targetEdge: config.target,
       armEdge: config.arm,
       retraceEdge: config.retrace,
@@ -7536,11 +7481,6 @@ export class EngineService {
       },
     };
     let decision=decidePaperOrder(paperInput);
-    if (candidate.intent === "OPEN_FIRST_LEG" && this.riskLimits.freshEntryPreferExecutableNetEdge
-      && decision.accepted && decision.order?.orderType === "TAKER") {
-      decision.executionChoiceReason = "EXECUTABLE_NET_EDGE_FIRST";
-      return {decision,duplicateKey};
-    }
     const makerConfig=this.makerFirstConfig();
     const role=candidate.intent==='OPEN_FIRST_LEG'?'FIRST_LEG':candidate.intent==='HEDGE_SECOND_LEG'&&input.allowMakerFirstHedge?'HEDGE':null;
     const independentMaker=role==='FIRST_LEG'&&this.riskLimits.freshEntryNetRoiFloor!==undefined;
@@ -7560,7 +7500,6 @@ export class EngineService {
             submissionLatencyMs:this.env.PAPER_EXECUTION_LATENCY_MS,tokenEpoch:this.adapterTokenEpoch(snapshot.tokenId),
             postingBookEventId:snapshot.eventId,takerReferencePrice:decision.bookVwap};
           maker.order.makerFirst.postingFeeKey=JSON.stringify([snapshot.feeSchedule?.rate,snapshot.feeSchedule?.exponent,snapshot.feeSchedule?.takerOnly]);
-          maker.executionChoiceReason=this.riskLimits.freshEntryPreferExecutableNetEdge?"PASSIVE_ENTRY_EXECUTABLE_NOT_QUALIFIED":"MAKER_FIRST_CONDITIONAL_EV";
           decision=maker;
         }
       }
@@ -7775,12 +7714,11 @@ export class EngineService {
     pair: Record<Outcome, MarketSnapshot>,
     now: Date,
     assetOverride: string | null,
-    fairProbability?: number,
   ): ReturnType<typeof decidePaperOrder> {
     const snapshot = candidate.outcome === "UP" ? pair.UP : pair.DOWN;
     return this.decideWithRuntimeBasis({
       candidate,
-      consensus: {...HEDGE_CHECK_CONSENSUS,...(fairProbability===undefined?{}:{fairProbability})},
+      consensus: HEDGE_CHECK_CONSENSUS,
       triggerId: "runtime-basis-parity-test",
       signalExpiresAt: new Date(now.getTime() + 60_000),
       snapshot,

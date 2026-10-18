@@ -1,10 +1,10 @@
-import { estimateExitFee, calculateFee, calculateSlippageUsd, d, walkBook, type MarketSnapshot, type PaperOrder } from "@pm/core";
+import { calculateFee, calculateSlippageUsd, d, walkBook, type MarketSnapshot, type PaperOrder } from "@pm/core";
 import type { DiscoveredMarket } from "@pm/market-data";
 
 export const FIRST_LEG_MIN_PRICE = 0.65;
 export const FIRST_LEG_MIN_NET_ROI = 0.015;
 
-export type EntryEconomicPolicy = { minPrice: number; minNetRoi: number; reserveExitFee?: boolean; exitFeeMode?: "maximum" | "fair_value" };
+export type EntryEconomicPolicy = { minPrice: number; minNetRoi: number };
 export function firstLegEntryFilterReason(price: string | number | null | undefined, expectedROI: number | null | undefined,
   policy: EntryEconomicPolicy = { minPrice: FIRST_LEG_MIN_PRICE, minNetRoi: FIRST_LEG_MIN_NET_ROI }) {
   try {
@@ -20,23 +20,20 @@ export function firstLegExecutionEconomics(order: PaperOrder, book: MarketSnapsh
   if (!proof || !Number.isFinite(proof.fairProbability) || !Number.isFinite(nowMs)
     || !Number.isFinite(Date.parse(proof.signalExpiresAt)) || nowMs >= Date.parse(proof.signalExpiresAt))
     return { reason: "ENTRY_ECONOMICS_UNAVAILABLE", price: null, expectedROI: null };
-  const exitFeeReserve = policy?.reserveExitFee && book.feeSchedule
-    ? estimateExitFee(order.quantity, proof.fairProbability, book.feeSchedule, policy?.exitFeeMode) : "0";
-  if (exitFeeReserve === null) return {reason:"ENTRY_ECONOMICS_UNAVAILABLE",price:null,expectedROI:null};
   const walk = walkBook(book.asks, order.quantity, order.requestedPrice, "BUY");
   if(order.makerFirst){
     const price=order.requestedPrice;
     if(order.orderType!=="MAKER"||!book.feeSchedule||!book.asks[0]||d(price).gte(book.asks[0].price))return {reason:"ENTRY_ECONOMICS_UNAVAILABLE",price,expectedROI:null};
     const fee=calculateFee(order.quantity,price,"MAKER",book.feeSchedule);
-    const expectedROI=d(proof.fairProbability).minus(price).mul(order.quantity).minus(fee).minus(exitFeeReserve).div(d(order.quantity).mul(price)).toNumber();
+    const expectedROI=d(proof.fairProbability).minus(price).mul(order.quantity).minus(fee).div(d(order.quantity).mul(price)).toNumber();
     return {reason:firstLegEntryFilterReason(price,expectedROI,policy),price,expectedROI};
   }
   const price = order.orderType === "MAKER" ? order.requestedPrice : walk.sufficientDepth ? walk.vwap : null;
   if (!price || !walk.sufficientDepth || !book.feeSchedule) return { reason: "ENTRY_ECONOMICS_UNAVAILABLE", price, expectedROI: null };
   const fee = calculateFee(order.quantity, price, order.orderType, book.feeSchedule);
   const slippage = order.orderType === "MAKER" ? "0" : calculateSlippageUsd(order.requestedPrice, price, order.quantity, "BUY");
-  const notional = order.orderType === "MAKER" ? d(order.quantity).mul(price) : d(walk.notional);
-  const roi = d(proof.fairProbability).minus(walk.vwap).mul(order.quantity).minus(fee).minus(exitFeeReserve).minus(slippage).div(notional).toNumber();
+  const notional = d(order.quantity).mul(price);
+  const roi = d(proof.fairProbability).minus(walk.vwap).mul(order.quantity).minus(fee).minus(slippage).div(notional).toNumber();
   return { reason: firstLegEntryFilterReason(price, roi, policy), price, expectedROI: roi };
 }
 
