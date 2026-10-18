@@ -28,7 +28,9 @@ it('bounds a burst across all closing parts and resumes with a full book after a
     const archive=new RawEvidence(dir,32*1024),book=snapshot(),context={tokenEpoch:1,synchronized:true,siblingEventId:null};
     archive.recordBook('experiment_burst',book,context);
     for(let i=0;i<100;i++)archive.record('experiment_burst',{kind:'burst',value:'x'.repeat(4000)});
-    archive.recordBook('experiment_burst',{...book,eventId:'dropped'},context);
+    const beforeGap=archive.status().dropped;
+    archive.recordBook('experiment_burst',{...book,eventId:'dropped',traceId:'x'.repeat(33000)},context);
+    expect(archive.status().dropped).toBe(beforeGap+1);
     expect(archive.status().dropped).toBeGreaterThan(0);
     expect(archive.status().maxQueuedBytes).toBeLessThanOrEqual(32*1024);
     await new Promise(r=>setTimeout(r,150));
