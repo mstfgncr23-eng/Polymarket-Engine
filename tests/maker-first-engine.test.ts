@@ -462,3 +462,16 @@ describe('Maker-First real Engine lifecycle',()=>{
  });
  it.each([false,true])('feature enabled=%s preserves original gates and selects only the authorized execution style',async enabled=>{const s=await setup(enabled);try{const c:StrategyCandidate={strategyId:'test',strategyVersion:'test',marketId:M,tokenId:U,outcome:'UP',side:'BUY',quantity:'2',limitPrice:'0.7',intent:'OPEN_FIRST_LEG',rawEdgeUsdPerShare:.2,rawExpectedEdge:.2,reasonCodes:[]};const decision=s.engine.decideWithRuntimeBasisForTest(c,{UP:s.engine.state.marketSnapshots.get(U)!,DOWN:s.engine.state.marketSnapshots.get(D)!},new Date(s.clock.ms),'XRP');expect(decision.accepted,JSON.stringify(decision.risk)).toBe(true);expect(decision.order?.orderType).toBe(enabled?'MAKER':'TAKER');if(enabled)expect(decision.order?.makerFirst?.postOnly).toBe(true);}finally{await s.engine.stop();}});
 });
+
+
+it.each([true,false])('keeps optional full-cycle/net-pair policy JSON-roundtrip hash stable (enabled=%s)',async enabled=>{
+ const s=await setup(true,undefined,undefined,enabled?{PROFIT_TRAILING_PAIR_SOAK_ENABLED:'true',NORMAL_HEDGE_MIN_LOCKED_PAIR_EDGE:'0.12',PAPER_PROFIT_PAIR_NET_ROI_FLOOR:'0.01',PAPER_ENTRY_EXIT_FEE_RESERVE:'true'}:{});
+ try{
+  const manifest=s.engine.experimentManifest()!;
+  expect(manifest.riskConfiguration.profitPairNetRoiFloor).toBe(enabled?0.01:undefined);
+  expect(manifest.riskConfiguration.freshEntryExitFeeReserve).toBe(enabled);
+  for(const fact of await s.journal.queryDurableTransitions({limit:1000})){
+   if(Object.keys(fact.payload).length)expect(hashDurablePayload(JSON.parse(JSON.stringify(fact.payload)))).toBe(fact.payloadHash);
+  }
+ }finally{await s.engine.stop();}
+});
