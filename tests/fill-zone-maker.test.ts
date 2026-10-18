@@ -70,6 +70,19 @@ async function setup(overrides: Record<string, string> = {}, clock = { ms: T }, 
 }
 
 describe("dual maker fill-zone admission (B3, opt-in)", () => {
+  it('evaluates directional Maker ROI even when TAKER fees reject the entry, retaining cash fences',async()=>{
+    const s=await setup({PAPER_ENTRY_NET_ROI_FLOOR:'0.01',PAPER_ENTRY_MIN_PRICE:'0'});
+    try{
+      const pair={UP:s.engine.state.marketSnapshots.get(U)!,DOWN:s.engine.state.marketSnapshots.get(D)!};
+      const candidate={strategyId:'roi1-test',strategyVersion:'1',marketId:M,tokenId:U,outcome:'UP' as const,side:'BUY' as const,
+        intent:'OPEN_FIRST_LEG' as const,quantity:'2',limitPrice:'0.7',rawExpectedEdge:0.007,reasonCodes:[]};
+      const decision=s.engine.decideWithRuntimeBasisForTest(candidate,pair,new Date(T),'XRP');
+      expect(decision.accepted,JSON.stringify(decision.risk)).toBe(true);
+      expect(decision.order?.orderType).toBe('MAKER');expect(decision.expectedROI).toBeGreaterThanOrEqual(.01);
+      s.engine.ledger.reserve(s.engine.ledger.availableCash());
+      expect(s.engine.decideWithRuntimeBasisForTest(candidate,pair,new Date(T),'XRP').risk.vetoes).toContain('INSUFFICIENT_CASH');
+    }finally{await s.engine.stop();}
+  });
   it("admits balanced low-price pairs before directional native gates in the single canonical Engine",async()=>{
     const s=await setup({PAPER_DUAL_SIDED_MAKER_ENABLED:'true',PAPER_ENTRY_NET_ROI_FLOOR:'0.01',PAPER_ENTRY_MIN_PRICE:'0'}, {ms:T},true);
     try{

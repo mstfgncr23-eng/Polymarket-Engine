@@ -7473,13 +7473,15 @@ export class EngineService {
     let decision=decidePaperOrder(paperInput);
     const makerConfig=this.makerFirstConfig();
     const role=candidate.intent==='OPEN_FIRST_LEG'?'FIRST_LEG':candidate.intent==='HEDGE_SECOND_LEG'&&input.allowMakerFirstHedge?'HEDGE':null;
-    if(!input.suppressMakerFirst&&makerConfig.enabled&&role&&decision.accepted&&decision.order?.orderType==='TAKER'
+    const independentMaker=role==='FIRST_LEG'&&this.riskLimits.freshEntryNetRoiFloor!==undefined;
+    if(!input.suppressMakerFirst&&makerConfig.enabled&&role&&(independentMaker||(decision.accepted&&decision.order?.orderType==='TAKER'))
       &&!this.confirmedGuardianProtection(candidate.marketId)){
       const price=passiveMakerBuyPrice(snapshot,candidate.quantity,candidate.limitPrice);
-      if(price&&(role!=='FIRST_LEG'||!firstLegEntryFilterReason(price,decision.expectedROI,this.entryEconomicPolicy()))&&decision.bookVwap){
+      if(price&&(independentMaker||role!=='FIRST_LEG'||!firstLegEntryFilterReason(price,decision.expectedROI,this.entryEconomicPolicy()))&&decision.bookVwap){
         const improved=d(candidate.rawEdgeUsdPerShare??candidate.rawExpectedEdge).plus(decision.bookVwap).minus(price).toNumber();
         const maker=decidePaperOrder({...paperInput,orderType:'MAKER',candidate:{...candidate,rawEdgeUsdPerShare:improved,rawExpectedEdge:improved}});
-        if(maker.accepted&&maker.order&&maker.netEvUsdTotal!==null&&decision.netEvUsdTotal!==null&&d(maker.netEvUsdTotal).gt(decision.netEvUsdTotal)){
+        if(maker.accepted&&maker.order&&maker.netEvUsdTotal!==null&&decision.netEvUsdTotal!==null&&d(maker.netEvUsdTotal).gt(decision.netEvUsdTotal)
+          &&(role!=='FIRST_LEG'||!firstLegEntryFilterReason(maker.executablePrice,maker.expectedROI,this.entryEconomicPolicy()))){
           const ttl=role==='FIRST_LEG'?makerConfig.firstLegTtlMs:makerConfig.hedgeTtlMs;
           const end=this.marketsById.get(candidate.marketId)?.endDate;
           const expiresAt=Math.min(now.getTime()+ttl,signalExpiresAt.getTime(),end?Date.parse(end)-PROTECTIVE_DE_RISK_PRE_EXPIRY_SAFETY_MS:Number.POSITIVE_INFINITY);
