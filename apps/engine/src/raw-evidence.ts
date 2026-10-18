@@ -18,6 +18,7 @@ export class RawEvidence {
   private dropped = 0;
   private rawBytes = 0;
   private compressedBytes = 0;
+  private maxQueuedBytes = 0;
   private fault: string | null = null;
   private gaps: { from: string; to: string; count: number }[] = [];
   private files: string[] = [];
@@ -28,15 +29,15 @@ export class RawEvidence {
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
   constructor(private readonly directory: string) {}
   status() { return { experimentId: this.experiment, accepted: this.accepted, dropped: this.dropped,
-    rawBytes: this.rawBytes, compressedBytes: this.compressedBytes, fault: this.fault, gaps: this.gaps, files: this.files }; }
+    rawBytes: this.rawBytes, compressedBytes: this.compressedBytes, maxQueuedBytes:this.maxQueuedBytes,
+    maxCompressedBytes:3*1024**3,fault: this.fault, gaps: this.gaps, files: this.files }; }
   recordBook(experimentId:string,snapshot:MarketSnapshot,context:{tokenEpoch:number;synchronized:boolean;siblingEventId:string|null}):void{
     if(this.bookExperiment!==experimentId){this.books.clear();this.bookExperiment=experimentId;}
-    const encoded=this.books.encode(snapshot,Math.floor(Date.now()/60000),context.tokenEpoch,context.synchronized);
-    if(!this.record(experimentId,{kind:'book',...context,...encoded}))this.books.forget(snapshot.tokenId);
+    const now=Date.now(),encoded=this.books.encode(snapshot,Math.floor(now/60000),context.tokenEpoch,context.synchronized);
+    if(!this.record(experimentId,{kind:'book',...context,...encoded},now))this.books.forget(snapshot.tokenId);
   }
-  record(experimentId: string, value: unknown): boolean {
+  record(experimentId: string, value: unknown, now=Date.now()): boolean {
     if (this.sealed && experimentId === this.experiment) return false;
-    const now = Date.now();
     try {
       if (experimentId !== this.experiment) {
         this.finishPart();
@@ -45,9 +46,10 @@ export class RawEvidence {
         this.root = join(this.directory, "roi1-evidence", experimentId.replace(/[^a-zA-Z0-9_-]/g,"_"));
         mkdirSync(this.root, { recursive: true });
         this.bucket = -1; this.accepted = 0; this.dropped = 0; this.rawBytes = 0; this.compressedBytes = 0;
-        this.gaps = []; this.files = []; this.fault = null;
+        this.gaps = []; this.files = []; this.fault = null;this.maxQueuedBytes=0;
       }
-      if (this.fault || this.compressedBytes >= 2 * 1024 ** 3 || (this.stream?.writableLength ?? 0) > 8 * 1024 ** 2) {
+      this.maxQueuedBytes=Math.max(this.maxQueuedBytes,(this.stream?.writableLength??0)+this.batchBytes);
+      if (this.fault || this.compressedBytes >= 3 * 1024 ** 3 || (this.stream?.writableLength ?? 0) > 8 * 1024 ** 2) {
         this.noteGap(now); return false;
       }
       const bucket = Math.floor(now / 60000);
